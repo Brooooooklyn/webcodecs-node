@@ -35,35 +35,62 @@ export declare class AudioData {
  *
  * Decodes EncodedAudioChunk objects into AudioData objects using FFmpeg.
  *
- * Note: This implementation uses a synchronous output queue model instead of
- * callbacks for simpler integration. Use `takeDecodedAudio()` to retrieve
- * decoded output after calling `decode()` or `flush()`.
+ * Per the WebCodecs spec, the constructor requires callbacks for output and error handling.
+ *
+ * Example:
+ * ```javascript
+ * const decoder = new AudioDecoder(
+ *   (data) => { console.log('decoded audio', data); },
+ *   (e) => { console.error('error', e); }
+ * );
+ *
+ * decoder.configure({
+ *   codec: 'opus',
+ *   sampleRate: 48000,
+ *   numberOfChannels: 2
+ * });
+ *
+ * decoder.decode(chunk);
+ * await decoder.flush();
+ * ```
  */
 export declare class AudioDecoder {
-  /** Create a new AudioDecoder */
-  constructor()
+  /**
+   * Create a new AudioDecoder with required callbacks (per WebCodecs spec)
+   *
+   * @param output - Callback invoked when decoded audio is available
+   * @param error - Callback invoked when an error occurs
+   */
+  constructor(output: (data: AudioData) => void, error: (error: Error) => void)
   /** Get decoder state */
   get state(): CodecState
-  /** Get number of pending output audio data objects */
+  /** Get number of pending decode operations (per WebCodecs spec) */
   get decodeQueueSize(): number
+  /**
+   * Set the dequeue event handler (per WebCodecs spec)
+   *
+   * The dequeue event fires when decodeQueueSize decreases,
+   * allowing backpressure management.
+   */
+  set ondequeue(callback?: DequeueCallback | undefined | null)
   /** Configure the decoder */
   configure(config: AudioDecoderConfig): void
   /** Decode an encoded audio chunk */
   decode(chunk: EncodedAudioChunk): void
-  /** Flush the decoder and return all remaining audio data */
-  flush(): void
-  /** Take all decoded audio from the output queue */
-  takeDecodedAudio(): Array<AudioData>
-  /** Check if there are any pending decoded audio data */
-  hasOutput(): boolean
-  /** Take the next decoded audio data from the output queue (if any) */
-  takeNextAudio(): AudioData | null
+  /**
+   * Flush the decoder
+   * Returns a Promise that resolves when flushing is complete
+   */
+  flush(): Promise<void>
   /** Reset the decoder */
   reset(): void
   /** Close the decoder */
   close(): void
-  /** Check if a configuration is supported */
-  static isConfigSupported(config: AudioDecoderConfig): AudioDecoderSupport
+  /**
+   * Check if a configuration is supported
+   * Returns a Promise that resolves with support information
+   */
+  static isConfigSupported(config: AudioDecoderConfig): Promise<AudioDecoderSupport>
 }
 
 /**
@@ -71,35 +98,62 @@ export declare class AudioDecoder {
  *
  * Encodes AudioData objects into EncodedAudioChunk objects using FFmpeg.
  *
- * Note: This implementation uses a synchronous output queue model instead of
- * callbacks for simpler integration. Use `takeEncodedChunks()` to retrieve
- * encoded output after calling `encode()` or `flush()`.
+ * Per the WebCodecs spec, the constructor requires callbacks for output and error handling.
+ *
+ * Example:
+ * ```javascript
+ * const encoder = new AudioEncoder(
+ *   (chunk, metadata) => { console.log('encoded chunk', chunk); },
+ *   (e) => { console.error('error', e); }
+ * );
+ *
+ * encoder.configure({
+ *   codec: 'opus',
+ *   sampleRate: 48000,
+ *   numberOfChannels: 2
+ * });
+ *
+ * encoder.encode(audioData);
+ * await encoder.flush();
+ * ```
  */
 export declare class AudioEncoder {
-  /** Create a new AudioEncoder */
-  constructor()
+  /**
+   * Create a new AudioEncoder with required callbacks (per WebCodecs spec)
+   *
+   * @param output - Callback invoked when an encoded chunk is available
+   * @param error - Callback invoked when an error occurs
+   */
+  constructor(output: (chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadata) => void, error: (error: Error) => void)
   /** Get encoder state */
   get state(): CodecState
-  /** Get number of pending output chunks */
+  /** Get number of pending encode operations (per WebCodecs spec) */
   get encodeQueueSize(): number
+  /**
+   * Set the dequeue event handler (per WebCodecs spec)
+   *
+   * The dequeue event fires when encodeQueueSize decreases,
+   * allowing backpressure management.
+   */
+  set ondequeue(callback?: DequeueCallback | undefined | null)
   /** Configure the encoder */
   configure(config: AudioEncoderConfig): void
   /** Encode audio data */
   encode(data: AudioData): void
-  /** Flush the encoder and return all remaining chunks */
-  flush(): void
-  /** Take all encoded chunks from the output queue */
-  takeEncodedChunks(): Array<EncodedAudioChunk>
-  /** Check if there are any pending encoded chunks */
-  hasOutput(): boolean
-  /** Take the next encoded chunk from the output queue (if any) */
-  takeNextChunk(): EncodedAudioChunk | null
+  /**
+   * Flush the encoder
+   * Returns a Promise that resolves when flushing is complete
+   */
+  flush(): Promise<void>
   /** Reset the encoder */
   reset(): void
   /** Close the encoder */
   close(): void
-  /** Check if a configuration is supported */
-  static isConfigSupported(config: AudioEncoderConfig): AudioEncoderSupport
+  /**
+   * Check if a configuration is supported
+   * Returns a Promise that resolves with support information
+   */
+  static isConfigSupported(config: AudioEncoderConfig): Promise<AudioEncoderSupport>
 }
 
 /**
@@ -122,8 +176,6 @@ export declare class EncodedAudioChunk {
   copyTo(destination: Uint8Array): void
   /** Get the raw data as a Uint8Array (extension, not in spec) */
   get data(): Uint8Array
-  /** Close and release resources */
-  close(): void
 }
 
 /**
@@ -149,39 +201,117 @@ export declare class EncodedVideoChunk {
 }
 
 /**
- * VideoDecoder - WebCodecs-compliant video decoder
+ * ImageDecoder - WebCodecs-compliant image decoder
  *
- * Decodes EncodedVideoChunk objects into VideoFrame objects using FFmpeg.
+ * Decodes image data (JPEG, PNG, WebP, GIF, BMP) into VideoFrame objects.
  *
- * Note: This implementation uses a synchronous output queue model instead of
- * callbacks for simpler integration. Use `takeDecodedFrames()` to retrieve
- * decoded output after calling `decode()` or `flush()`.
+ * Example:
+ * ```javascript
+ * const decoder = new ImageDecoder({
+ *   data: imageBytes,
+ *   type: 'image/png'
+ * });
+ *
+ * const result = await decoder.decode();
+ * const frame = result.image;
+ * ```
  */
-export declare class VideoDecoder {
-  /** Create a new VideoDecoder */
-  constructor()
-  /** Get decoder state */
-  get state(): CodecState
-  /** Get number of pending output frames */
-  get decodeQueueSize(): number
-  /** Configure the decoder */
-  configure(config: VideoDecoderConfig): void
-  /** Decode an encoded video chunk */
-  decode(chunk: EncodedVideoChunk): void
-  /** Flush the decoder and return all remaining frames */
-  flush(): void
-  /** Take all decoded frames from the output queue */
-  takeDecodedFrames(): Array<VideoFrame>
-  /** Check if there are any pending decoded frames */
-  hasOutput(): boolean
-  /** Take the next decoded frame from the output queue (if any) */
-  takeNextFrame(): VideoFrame | null
+export declare class ImageDecoder {
+  /** Create a new ImageDecoder */
+  constructor(init: ImageDecoderInit)
+  /** Whether the data is fully buffered */
+  get complete(): boolean
+  /** Get the MIME type */
+  get type(): string
+  /** Get the track list */
+  get tracks(): ImageTrackList
+  /** Decode the image (or a specific frame) */
+  decode(options?: ImageDecodeOptions | undefined | null): Promise<ImageDecodeResult>
   /** Reset the decoder */
   reset(): void
   /** Close the decoder */
   close(): void
-  /** Check if a configuration is supported */
-  static isConfigSupported(config: VideoDecoderConfig): VideoDecoderSupport
+  /** Check if a MIME type is supported */
+  static isTypeSupported(mimeType: string): Promise<boolean>
+}
+
+/** Image decode result */
+export declare class ImageDecodeResult {
+  /** Get the decoded image */
+  get image(): VideoFrame
+  /** Get whether the decode is complete */
+  get complete(): boolean
+}
+
+/** Image track list */
+export declare class ImageTrackList {
+  /** Get the number of tracks */
+  get length(): number
+  /** Get the currently selected track (if any) */
+  get selectedTrack(): ImageTrack | null
+  /** Get the selected track index */
+  get selectedIndex(): number | null
+}
+
+/**
+ * VideoDecoder - WebCodecs-compliant video decoder
+ *
+ * Decodes EncodedVideoChunk objects into VideoFrame objects using FFmpeg.
+ *
+ * Per the WebCodecs spec, the constructor requires callbacks for output and error handling.
+ *
+ * Example:
+ * ```javascript
+ * const decoder = new VideoDecoder(
+ *   (frame) => { console.log('decoded frame', frame); },
+ *   (e) => { console.error('error', e); }
+ * );
+ *
+ * decoder.configure({
+ *   codec: 'avc1.42001E'
+ * });
+ *
+ * decoder.decode(chunk);
+ * await decoder.flush();
+ * ```
+ */
+export declare class VideoDecoder {
+  /**
+   * Create a new VideoDecoder with required callbacks (per WebCodecs spec)
+   *
+   * @param output - Callback invoked when a decoded frame is available
+   * @param error - Callback invoked when an error occurs
+   */
+  constructor(output: (frame: VideoFrame) => void, error: (error: Error) => void)
+  /** Get decoder state */
+  get state(): CodecState
+  /** Get number of pending decode operations (per WebCodecs spec) */
+  get decodeQueueSize(): number
+  /**
+   * Set the dequeue event handler (per WebCodecs spec)
+   *
+   * The dequeue event fires when decodeQueueSize decreases,
+   * allowing backpressure management.
+   */
+  set ondequeue(callback?: DequeueCallback | undefined | null)
+  /** Configure the decoder */
+  configure(config: VideoDecoderConfig): void
+  /** Decode an encoded video chunk */
+  decode(chunk: EncodedVideoChunk): void
+  /**
+   * Flush the decoder
+   * Returns a Promise that resolves when flushing is complete
+   */
+  flush(): Promise<void>
+  /** Reset the decoder */
+  reset(): void
+  /** Close the decoder */
+  close(): void
+  /**
+   * Check if a configuration is supported
+   * Returns a Promise that resolves with support information
+   */
+  static isConfigSupported(config: VideoDecoderConfig): Promise<VideoDecoderSupport>
 }
 
 /**
@@ -189,55 +319,63 @@ export declare class VideoDecoder {
  *
  * Encodes VideoFrame objects into EncodedVideoChunk objects using FFmpeg.
  *
- * Note: This implementation uses a synchronous output queue model instead of
- * callbacks for simpler integration. Use `takeEncodedChunks()` to retrieve
- * encoded output after calling `encode()` or `flush()`.
+ * Per the WebCodecs spec, the constructor requires callbacks for output and error handling.
+ *
+ * Example:
+ * ```javascript
+ * const encoder = new VideoEncoder(
+ *   (chunk, metadata) => { console.log('encoded chunk', chunk); },
+ *   (e) => { console.error('error', e); }
+ * );
+ *
+ * encoder.configure({
+ *   codec: 'avc1.42001E',
+ *   width: 1920,
+ *   height: 1080,
+ *   bitrate: 5_000_000
+ * });
+ *
+ * encoder.encode(frame);
+ * await encoder.flush();
+ * ```
  */
 export declare class VideoEncoder {
-  /** Create a new VideoEncoder (queue-based mode) */
-  constructor()
   /**
-   * Create a VideoEncoder with callbacks (WebCodecs spec compliant mode)
+   * Create a new VideoEncoder with required callbacks (per WebCodecs spec)
    *
-   * In this mode, encoded chunks are delivered via the output callback
-   * instead of being queued for retrieval. Errors are reported via the
-   * error callback and the encoder transitions to the Closed state.
-   *
-   * Example:
-   * ```javascript
-   * const encoder = VideoEncoder.withCallbacks(
-   *   (chunk, metadata) => { /* handle output */ },
-   *   (error) => { /* handle error */ }
-   * );
-   * ```
+   * @param output - Callback invoked when an encoded chunk is available
+   * @param error - Callback invoked when an error occurs
    */
-  static withCallbacks(output: ((err: Error | null, arg0: EncodedVideoChunk, arg1: EncodedVideoChunkMetadata) => any), error: ((err: Error | null, arg: string) => any)): VideoEncoder
+  constructor(output: (result: [EncodedVideoChunkOutput, EncodedVideoChunkMetadata]) => void, error: (error: Error) => void)
   /** Get encoder state */
   get state(): CodecState
-  /** Get number of pending output chunks */
+  /** Get number of pending encode operations (per WebCodecs spec) */
   get encodeQueueSize(): number
+  /**
+   * Set the dequeue event handler (per WebCodecs spec)
+   *
+   * The dequeue event fires when encodeQueueSize decreases,
+   * allowing backpressure management.
+   */
+  set ondequeue(callback?: DequeueCallback | undefined | null)
   /** Configure the encoder */
   configure(config: VideoEncoderConfig): void
   /** Encode a frame */
   encode(frame: VideoFrame, options?: VideoEncoderEncodeOptions | undefined | null): void
-  /** Flush the encoder and return all remaining chunks */
-  flush(): void
   /**
-   * Take all encoded chunks from the output queue
-   *
-   * Returns an array of [chunk, metadata] pairs
+   * Flush the encoder
+   * Returns a Promise that resolves when flushing is complete
    */
-  takeEncodedChunks(): Array<EncodedVideoChunk>
-  /** Check if there are any pending encoded chunks */
-  hasOutput(): boolean
-  /** Take the next encoded chunk from the output queue (if any) */
-  takeNextChunk(): EncodedVideoChunk | null
+  flush(): Promise<void>
   /** Reset the encoder */
   reset(): void
   /** Close the encoder */
   close(): void
-  /** Check if a configuration is supported */
-  static isConfigSupported(config: VideoEncoderConfig): VideoEncoderSupport
+  /**
+   * Check if a configuration is supported
+   * Returns a Promise that resolves with support information
+   */
+  static isConfigSupported(config: VideoEncoderConfig): Promise<VideoEncoderSupport>
 }
 
 /**
@@ -258,6 +396,16 @@ export declare class VideoFrame {
   get displayWidth(): number
   /** Get the display height in pixels */
   get displayHeight(): number
+  /**
+   * Get the coded rect (the region containing valid pixel data)
+   * For now, this is the full coded dimensions starting at (0, 0)
+   */
+  get codedRect(): VideoFrameRect
+  /**
+   * Get the visible rect (the region of coded data that should be displayed)
+   * For now, this is the same as coded_rect (no cropping support yet)
+   */
+  get visibleRect(): VideoFrameRect
   /** Get the presentation timestamp in microseconds */
   get timestamp(): number
   /** Get the duration in microseconds */
@@ -266,8 +414,12 @@ export declare class VideoFrame {
   get colorSpace(): VideoColorSpace
   /** Calculate the allocation size needed for copyTo */
   allocationSize(options?: VideoFrameCopyToOptions | undefined | null): number
-  /** Copy frame data to a Uint8Array */
-  copyTo(destination: Uint8Array): void
+  /**
+   * Copy frame data to a Uint8Array
+   *
+   * Options can specify target format. The rect parameter is not yet implemented.
+   */
+  copyTo(destination: Uint8Array, options?: VideoFrameCopyToOptions | undefined | null): void
   /** Clone this VideoFrame */
   clone(): VideoFrame
   /** Close and release resources */
@@ -419,7 +571,7 @@ export interface AvcEncoderConfig {
   format?: string
 }
 
-/** Encoder state */
+/** Encoder state per WebCodecs spec */
 export declare const enum CodecState {
   /** Encoder not configured */
   Unconfigured = 'Unconfigured',
@@ -467,10 +619,27 @@ export interface EncodedVideoChunkInit {
   data: Buffer
 }
 
-/** Output callback metadata */
+/** Output callback metadata per WebCodecs spec */
 export interface EncodedVideoChunkMetadata {
   /** Decoder configuration for this chunk (only present for keyframes) */
   decoderConfig?: VideoDecoderConfigOutput
+}
+
+/**
+ * Serializable output for callbacks (used with ThreadsafeFunction)
+ *
+ * NAPI-RS class instances can't be passed through ThreadsafeFunction,
+ * so we use this plain object struct for callback output.
+ */
+export interface EncodedVideoChunkOutput {
+  /** Chunk type (key or delta) */
+  type: EncodedVideoChunkType
+  /** Timestamp in microseconds */
+  timestamp: number
+  /** Duration in microseconds (optional) */
+  duration?: number
+  /** Encoded data */
+  data: Buffer
 }
 
 /** Type of encoded video chunk */
@@ -512,6 +681,42 @@ export interface HevcEncoderConfig {
   preset?: string
   /** Tuning: "psnr", "ssim", "grain", "zerolatency", "fastdecode" */
   tune?: string
+}
+
+/** Image decode options */
+export interface ImageDecodeOptions {
+  /** Frame index to decode (for animated images) */
+  frameIndex?: number
+  /** Whether to only decode complete frames */
+  completeFramesOnly?: boolean
+}
+
+/** ImageDecoder init options */
+export interface ImageDecoderInit {
+  /** The image data (encoded bytes) */
+  data: Buffer
+  /** MIME type of the image (e.g., "image/png", "image/jpeg") */
+  mimeType: string
+  /** Color space conversion hint (optional) */
+  colorSpaceConversion?: string
+  /** Desired width (optional, for scaling) */
+  desiredWidth?: number
+  /** Desired height (optional, for scaling) */
+  desiredHeight?: number
+  /** Whether to prefer animation (for animated formats) */
+  preferAnimation?: boolean
+}
+
+/** Image track information */
+export interface ImageTrack {
+  /** Whether this track is animated */
+  animated: boolean
+  /** Number of frames in this track */
+  frameCount: number
+  /** Number of times the animation repeats (Infinity for infinite) */
+  repetitionCount: number
+  /** Whether this track is currently selected */
+  selected: boolean
 }
 
 /** Check if a specific hardware accelerator is available */
@@ -607,13 +812,13 @@ export interface VideoEncoderConfig {
   scalabilityMode?: string
 }
 
-/** Encode options */
+/** Encode options per WebCodecs spec */
 export interface VideoEncoderEncodeOptions {
   /** Force this frame to be a keyframe */
   keyFrame?: boolean
 }
 
-/** Result of isConfigSupported */
+/** Result of isConfigSupported per WebCodecs spec */
 export interface VideoEncoderSupport {
   /** Whether the configuration is supported */
   supported: boolean

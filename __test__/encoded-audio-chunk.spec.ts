@@ -2,6 +2,7 @@
  * EncodedAudioChunk API Conformance Tests
  *
  * Tests WebCodecs EncodedAudioChunk specification compliance.
+ * Per W3C spec, EncodedAudioChunk has no close() method - it's immutable encoded data.
  */
 
 import test from 'ava'
@@ -28,8 +29,6 @@ test('EncodedAudioChunk: constructor with key chunk', (t) => {
   t.is(chunk.timestamp, timestamp)
   t.is(chunk.duration, duration)
   t.is(chunk.byteLength, data.length)
-
-  
 })
 
 test('EncodedAudioChunk: constructor with delta chunk', (t) => {
@@ -45,8 +44,6 @@ test('EncodedAudioChunk: constructor with delta chunk', (t) => {
   t.is(chunk.type, EncodedAudioChunkType.Delta)
   t.is(chunk.timestamp, timestamp)
   t.is(chunk.byteLength, data.length)
-
-  
 })
 
 test('EncodedAudioChunk: constructor without duration', (t) => {
@@ -60,8 +57,6 @@ test('EncodedAudioChunk: constructor without duration', (t) => {
   })
 
   t.is(chunk.duration, null)
-
-  
 })
 
 // ============================================================================
@@ -77,7 +72,6 @@ test('EncodedAudioChunk: type property', (t) => {
     data,
   })
   t.is(keyChunk.type, EncodedAudioChunkType.Key)
-  keyChunk.close()
 
   const deltaChunk = new EncodedAudioChunk({
     type: EncodedAudioChunkType.Delta,
@@ -85,7 +79,6 @@ test('EncodedAudioChunk: type property', (t) => {
     data,
   })
   t.is(deltaChunk.type, EncodedAudioChunkType.Delta)
-  deltaChunk.close()
 })
 
 test('EncodedAudioChunk: timestamp property', (t) => {
@@ -98,7 +91,6 @@ test('EncodedAudioChunk: timestamp property', (t) => {
       data: Buffer.from([0x00]),
     })
     t.is(chunk.timestamp, ts, `Timestamp ${ts} not preserved`)
-    
   }
 })
 
@@ -113,7 +105,6 @@ test('EncodedAudioChunk: duration property', (t) => {
       data: Buffer.from([0x00]),
     })
     t.is(chunk.duration, dur, `Duration ${dur} not preserved`)
-    
   }
 })
 
@@ -128,7 +119,6 @@ test('EncodedAudioChunk: byteLength property', (t) => {
       data,
     })
     t.is(chunk.byteLength, size, `byteLength ${size} not preserved`)
-    
   }
 })
 
@@ -151,8 +141,6 @@ test('EncodedAudioChunk: copyTo() extracts chunk data', (t) => {
   for (let i = 0; i < originalData.length; i++) {
     t.is(extractedData[i], originalData[i], `Data mismatch at index ${i}`)
   }
-
-  
 })
 
 test('EncodedAudioChunk: copyTo() with larger buffer', (t) => {
@@ -172,8 +160,6 @@ test('EncodedAudioChunk: copyTo() with larger buffer', (t) => {
   for (let i = 0; i < originalData.length; i++) {
     t.is(extractedData[i], originalData[i], `Data mismatch at index ${i}`)
   }
-
-  
 })
 
 test('EncodedAudioChunk: can be created and accessed', (t) => {
@@ -201,8 +187,6 @@ test('EncodedAudioChunk: minimum data size (1 byte)', (t) => {
   })
 
   t.is(chunk.byteLength, 1)
-
-  
 })
 
 test('EncodedAudioChunk: large data size', (t) => {
@@ -216,8 +200,6 @@ test('EncodedAudioChunk: large data size', (t) => {
   })
 
   t.is(chunk.byteLength, size)
-
-  
 })
 
 test('EncodedAudioChunk: timestamp of 0 is valid', (t) => {
@@ -228,8 +210,6 @@ test('EncodedAudioChunk: timestamp of 0 is valid', (t) => {
   })
 
   t.is(chunk.timestamp, 0)
-
-  
 })
 
 test('EncodedAudioChunk: duration of 0 is valid', (t) => {
@@ -241,8 +221,6 @@ test('EncodedAudioChunk: duration of 0 is valid', (t) => {
   })
 
   t.is(chunk.duration, 0)
-
-  
 })
 
 // ============================================================================
@@ -272,8 +250,6 @@ test('EncodedAudioChunk: AAC-like data structure', (t) => {
 
   t.is(chunk.byteLength, data.length)
   t.is(chunk.type, EncodedAudioChunkType.Key)
-
-  
 })
 
 test('EncodedAudioChunk: Opus-like data structure', (t) => {
@@ -289,6 +265,4 @@ test('EncodedAudioChunk: Opus-like data structure', (t) => {
   })
 
   t.is(chunk.byteLength, data.length)
-
-  
 })

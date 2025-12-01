@@ -82,7 +82,7 @@ pub const AVERROR_EAGAIN: c_int = -35;
 pub const AVERROR_EAGAIN: c_int = -11;
 
 #[cfg(target_os = "windows")]
-pub const AVERROR_EAGAIN: c_int = -11;  // WSAEWOULDBLOCK maps to 11
+pub const AVERROR_EAGAIN: c_int = -11; // WSAEWOULDBLOCK maps to 11
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub const AVERROR_EAGAIN: c_int = -11;
@@ -101,7 +101,7 @@ pub const AVERROR_EINVAL: c_int = -22;
 
 /// Create FFmpeg error tag from 4 bytes
 const fn fferrtag(a: u8, b: u8, c: u8, d: u8) -> c_int {
-    -((a as c_int) | ((b as c_int) << 8) | ((c as c_int) << 16) | ((d as c_int) << 24))
+  -((a as c_int) | ((b as c_int) << 8) | ((c as c_int) << 16) | ((d as c_int) << 24))
 }
 
 // ============================================================================
@@ -111,77 +111,75 @@ const fn fferrtag(a: u8, b: u8, c: u8, d: u8) -> c_int {
 /// FFmpeg error with code and message
 #[derive(Clone)]
 pub struct FFmpegError {
-    /// Error code (negative)
-    pub code: c_int,
-    /// Human-readable message
-    pub message: String,
+  /// Error code (negative)
+  pub code: c_int,
+  /// Human-readable message
+  pub message: String,
 }
 
 impl FFmpegError {
-    /// Create error from FFmpeg error code
-    pub fn from_code(code: c_int) -> Self {
-        let mut buf = [0i8; 256];
-        unsafe {
-            super::avutil::av_strerror(code, buf.as_mut_ptr(), buf.len());
-            let message = CStr::from_ptr(buf.as_ptr())
-                .to_string_lossy()
-                .into_owned();
-            Self { code, message }
-        }
+  /// Create error from FFmpeg error code
+  pub fn from_code(code: c_int) -> Self {
+    let mut buf = [0i8; 256];
+    unsafe {
+      super::avutil::av_strerror(code, buf.as_mut_ptr(), buf.len());
+      let message = CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned();
+      Self { code, message }
     }
+  }
 
-    /// Create error with custom message
-    pub fn new(code: c_int, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: message.into(),
-        }
+  /// Create error with custom message
+  pub fn new(code: c_int, message: impl Into<String>) -> Self {
+    Self {
+      code,
+      message: message.into(),
     }
+  }
 
-    /// Check if this is EAGAIN (resource temporarily unavailable)
-    #[inline]
-    pub fn is_eagain(&self) -> bool {
-        self.code == AVERROR_EAGAIN
-    }
+  /// Check if this is EAGAIN (resource temporarily unavailable)
+  #[inline]
+  pub fn is_eagain(&self) -> bool {
+    self.code == AVERROR_EAGAIN
+  }
 
-    /// Check if this is EOF
-    #[inline]
-    pub fn is_eof(&self) -> bool {
-        self.code == AVERROR_EOF
-    }
+  /// Check if this is EOF
+  #[inline]
+  pub fn is_eof(&self) -> bool {
+    self.code == AVERROR_EOF
+  }
 
-    /// Check if this error indicates "would block" (EAGAIN or EOF)
-    #[inline]
-    pub fn would_block(&self) -> bool {
-        self.is_eagain() || self.is_eof()
-    }
+  /// Check if this error indicates "would block" (EAGAIN or EOF)
+  #[inline]
+  pub fn would_block(&self) -> bool {
+    self.is_eagain() || self.is_eof()
+  }
 
-    /// Check if this is an invalid argument error
-    #[inline]
-    pub fn is_invalid(&self) -> bool {
-        self.code == AVERROR_EINVAL
-    }
+  /// Check if this is an invalid argument error
+  #[inline]
+  pub fn is_invalid(&self) -> bool {
+    self.code == AVERROR_EINVAL
+  }
 
-    /// Check if this is an out of memory error
-    #[inline]
-    pub fn is_oom(&self) -> bool {
-        self.code == AVERROR_ENOMEM
-    }
+  /// Check if this is an out of memory error
+  #[inline]
+  pub fn is_oom(&self) -> bool {
+    self.code == AVERROR_ENOMEM
+  }
 }
 
 impl fmt::Debug for FFmpegError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FFmpegError")
-            .field("code", &self.code)
-            .field("message", &self.message)
-            .finish()
-    }
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("FFmpegError")
+      .field("code", &self.code)
+      .field("message", &self.message)
+      .finish()
+  }
 }
 
 impl fmt::Display for FFmpegError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "FFmpeg error {}: {}", self.code, self.message)
-    }
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "FFmpeg error {}: {}", self.code, self.message)
+  }
 }
 
 impl std::error::Error for FFmpegError {}
@@ -202,11 +200,11 @@ pub type FFmpegResult<T> = Result<T, FFmpegError>;
 /// Returns Ok with the value if >= 0, Err with FFmpegError if < 0
 #[inline]
 pub fn check_error(ret: c_int) -> FFmpegResult<c_int> {
-    if ret < 0 {
-        Err(FFmpegError::from_code(ret))
-    } else {
-        Ok(ret)
-    }
+  if ret < 0 {
+    Err(FFmpegError::from_code(ret))
+  } else {
+    Ok(ret)
+  }
 }
 
 /// Check FFmpeg return code, ignoring EAGAIN
@@ -214,13 +212,13 @@ pub fn check_error(ret: c_int) -> FFmpegResult<c_int> {
 /// Returns Ok(Some(value)) if >= 0, Ok(None) if EAGAIN, Err otherwise
 #[inline]
 pub fn check_error_except_eagain(ret: c_int) -> FFmpegResult<Option<c_int>> {
-    if ret >= 0 {
-        Ok(Some(ret))
-    } else if ret == AVERROR_EAGAIN {
-        Ok(None)
-    } else {
-        Err(FFmpegError::from_code(ret))
-    }
+  if ret >= 0 {
+    Ok(Some(ret))
+  } else if ret == AVERROR_EAGAIN {
+    Ok(None)
+  } else {
+    Err(FFmpegError::from_code(ret))
+  }
 }
 
 /// Check FFmpeg return code, ignoring EAGAIN and EOF
@@ -228,13 +226,13 @@ pub fn check_error_except_eagain(ret: c_int) -> FFmpegResult<Option<c_int>> {
 /// Returns Ok(Some(value)) if >= 0, Ok(None) if EAGAIN/EOF, Err otherwise
 #[inline]
 pub fn check_error_except_eagain_eof(ret: c_int) -> FFmpegResult<Option<c_int>> {
-    if ret >= 0 {
-        Ok(Some(ret))
-    } else if ret == AVERROR_EAGAIN || ret == AVERROR_EOF {
-        Ok(None)
-    } else {
-        Err(FFmpegError::from_code(ret))
-    }
+  if ret >= 0 {
+    Ok(Some(ret))
+  } else if ret == AVERROR_EAGAIN || ret == AVERROR_EOF {
+    Ok(None)
+  } else {
+    Err(FFmpegError::from_code(ret))
+  }
 }
 
 // ============================================================================
@@ -243,38 +241,36 @@ pub fn check_error_except_eagain_eof(ret: c_int) -> FFmpegResult<Option<c_int>> 
 
 /// Get error message for an FFmpeg error code
 pub fn get_error_message(code: c_int) -> String {
-    let mut buf = [0i8; 256];
-    unsafe {
-        super::avutil::av_strerror(code, buf.as_mut_ptr(), buf.len());
-        CStr::from_ptr(buf.as_ptr())
-            .to_string_lossy()
-            .into_owned()
-    }
+  let mut buf = [0i8; 256];
+  unsafe {
+    super::avutil::av_strerror(code, buf.as_mut_ptr(), buf.len());
+    CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()
+  }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+  use super::*;
 
-    #[test]
-    fn test_error_codes() {
-        assert!(AVERROR_EOF < 0);
-        assert!(AVERROR_EAGAIN < 0);
-        assert!(AVERROR_EINVAL < 0);
-    }
+  #[test]
+  fn test_error_codes() {
+    assert!(AVERROR_EOF < 0);
+    assert!(AVERROR_EAGAIN < 0);
+    assert!(AVERROR_EINVAL < 0);
+  }
 
-    #[test]
-    fn test_check_error() {
-        assert!(check_error(0).is_ok());
-        assert!(check_error(100).is_ok());
-        assert!(check_error(-1).is_err());
-        assert!(check_error(AVERROR_EAGAIN).is_err());
-    }
+  #[test]
+  fn test_check_error() {
+    assert!(check_error(0).is_ok());
+    assert!(check_error(100).is_ok());
+    assert!(check_error(-1).is_err());
+    assert!(check_error(AVERROR_EAGAIN).is_err());
+  }
 
-    #[test]
-    fn test_check_error_except_eagain() {
-        assert_eq!(check_error_except_eagain(0).unwrap(), Some(0));
-        assert_eq!(check_error_except_eagain(AVERROR_EAGAIN).unwrap(), None);
-        assert!(check_error_except_eagain(AVERROR_EINVAL).is_err());
-    }
+  #[test]
+  fn test_check_error_except_eagain() {
+    assert_eq!(check_error_except_eagain(0).unwrap(), Some(0));
+    assert_eq!(check_error_except_eagain(AVERROR_EAGAIN).unwrap(), None);
+    assert!(check_error_except_eagain(AVERROR_EINVAL).is_err());
+  }
 }

@@ -2,6 +2,7 @@
  * Hardware Acceleration API Tests
  *
  * Tests hardware accelerator detection and usage.
+ * Uses callback-based constructor per W3C WebCodecs spec.
  */
 
 import test from 'ava'
@@ -13,8 +14,30 @@ import {
   isHardwareAcceleratorAvailable,
   VideoEncoder,
 } from '../index.js'
-import { generateSolidColorI420Frame, TestColors } from './helpers/index.js'
+import {
+  generateSolidColorI420Frame,
+  TestColors,
+  type EncodedVideoChunkOutput,
+  type VideoEncoderOutput,
+} from './helpers/index.js'
 import { createEncoderConfig } from './helpers/codec-matrix.js'
+
+// Helper to create test encoder with callbacks
+function createTestEncoder() {
+  const chunks: EncodedVideoChunkOutput[] = []
+  const errors: Error[] = []
+
+  const encoder = new VideoEncoder(
+    (result: VideoEncoderOutput) => {
+      // VideoEncoder callback receives [chunk, metadata] tuple
+      const [chunk] = result
+      chunks.push(chunk)
+    },
+    (e) => errors.push(e),
+  )
+
+  return { encoder, chunks, errors }
+}
 
 // ============================================================================
 // getHardwareAccelerators() Tests
@@ -205,7 +228,7 @@ test('platform: preferred accelerator matches platform', (t) => {
 // Hardware Encoding Tests (conditional)
 // ============================================================================
 
-test('hardware encoding: H.264 with prefer-hardware', (t) => {
+test('hardware encoding: H.264 with prefer-hardware', async (t) => {
   const preferred = getPreferredHardwareAccelerator()
 
   if (preferred === null) {
@@ -213,7 +236,7 @@ test('hardware encoding: H.264 with prefer-hardware', (t) => {
     return
   }
 
-  const encoder = new VideoEncoder()
+  const { encoder, chunks } = createTestEncoder()
 
   const config = createEncoderConfig('h264', 320, 240, {
     hardwareAcceleration: 'prefer-hardware',
@@ -230,19 +253,16 @@ test('hardware encoding: H.264 with prefer-hardware', (t) => {
   })
 
   frame.close()
-  encoder.flush()
+  await encoder.flush()
 
   // Should produce output
-  t.true(encoder.hasOutput(), 'Hardware encoder should produce output')
-
-  const chunks = encoder.takeEncodedChunks()
-  t.true(chunks.length > 0)
+  t.true(chunks.length > 0, 'Hardware encoder should produce output')
 
   encoder.close()
 })
 
-test('hardware encoding: prefer-software still works', (t) => {
-  const encoder = new VideoEncoder()
+test('hardware encoding: prefer-software still works', async (t) => {
+  const { encoder, chunks } = createTestEncoder()
 
   const config = createEncoderConfig('h264', 320, 240, {
     hardwareAcceleration: 'prefer-software',
@@ -257,18 +277,15 @@ test('hardware encoding: prefer-software still works', (t) => {
   encoder.encode(frame, { keyFrame: true })
   frame.close()
 
-  encoder.flush()
+  await encoder.flush()
 
-  t.true(encoder.hasOutput())
-
-  const chunks = encoder.takeEncodedChunks()
   t.true(chunks.length > 0)
 
   encoder.close()
 })
 
-test('hardware encoding: no-preference fallback', (t) => {
-  const encoder = new VideoEncoder()
+test('hardware encoding: no-preference fallback', async (t) => {
+  const { encoder, chunks } = createTestEncoder()
 
   const config = createEncoderConfig('h264', 320, 240, {
     hardwareAcceleration: 'no-preference',
@@ -283,9 +300,9 @@ test('hardware encoding: no-preference fallback', (t) => {
   encoder.encode(frame, { keyFrame: true })
   frame.close()
 
-  encoder.flush()
+  await encoder.flush()
 
-  t.true(encoder.hasOutput())
+  t.true(chunks.length > 0)
 
   encoder.close()
 })

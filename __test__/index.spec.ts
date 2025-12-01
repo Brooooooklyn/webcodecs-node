@@ -29,7 +29,10 @@ import {
 
 test('exports VideoEncoder class', (t) => {
   t.is(typeof VideoEncoder, 'function')
-  const encoder = new VideoEncoder()
+  const encoder = new VideoEncoder(
+    () => {},
+    () => {},
+  )
   t.truthy(encoder)
   t.is(encoder.state, CodecState.Unconfigured)
   encoder.close()
@@ -37,7 +40,10 @@ test('exports VideoEncoder class', (t) => {
 
 test('exports VideoDecoder class', (t) => {
   t.is(typeof VideoDecoder, 'function')
-  const decoder = new VideoDecoder()
+  const decoder = new VideoDecoder(
+    () => {},
+    () => {},
+  )
   t.truthy(decoder)
   t.is(decoder.state, CodecState.Unconfigured)
   decoder.close()
@@ -52,21 +58,21 @@ test('exports EncodedVideoChunk class', (t) => {
 })
 
 test('exports CodecState enum', (t) => {
-  t.is(CodecState.Unconfigured, 'Unconfigured')
-  t.is(CodecState.Configured, 'Configured')
-  t.is(CodecState.Closed, 'Closed')
+  t.true(CodecState.Unconfigured === 'Unconfigured')
+  t.true(CodecState.Configured === 'Configured')
+  t.true(CodecState.Closed === 'Closed')
 })
 
 test('exports EncodedVideoChunkType enum', (t) => {
-  t.is(EncodedVideoChunkType.Key, 'Key')
-  t.is(EncodedVideoChunkType.Delta, 'Delta')
+  t.true(EncodedVideoChunkType.Key === 'Key')
+  t.true(EncodedVideoChunkType.Delta === 'Delta')
 })
 
 test('exports VideoPixelFormat enum', (t) => {
-  t.is(VideoPixelFormat.I420, 'I420')
-  t.is(VideoPixelFormat.NV12, 'NV12')
-  t.is(VideoPixelFormat.RGBA, 'RGBA')
-  t.is(VideoPixelFormat.BGRA, 'BGRA')
+  t.true(VideoPixelFormat.I420 === 'I420')
+  t.true(VideoPixelFormat.NV12 === 'NV12')
+  t.true(VideoPixelFormat.RGBA === 'RGBA')
+  t.true(VideoPixelFormat.BGRA === 'BGRA')
 })
 
 // ============================================================================

@@ -1,19 +1,37 @@
 import { Bench } from 'tinybench'
 
-import { plus100 } from '../index.js'
-
-function add(a: number) {
-  return a + 100
-}
+import { VideoEncoder, VideoFrame, VideoPixelFormat } from '../index.js'
 
 const bench = new Bench()
 
-bench.add('Native a + 100', () => {
-  plus100(10)
+// Create encoder for benchmarking
+function createTestEncoder() {
+  return new VideoEncoder(
+    () => {},
+    () => {},
+  )
+}
+
+bench.add('Create and configure VideoEncoder', () => {
+  const encoder = createTestEncoder()
+  encoder.configure({
+    codec: 'avc1.42001E',
+    width: 640,
+    height: 480,
+    bitrate: 1_000_000,
+  })
+  encoder.close()
 })
 
-bench.add('JavaScript a + 100', () => {
-  add(10)
+bench.add('Create VideoFrame (I420)', () => {
+  const buffer = Buffer.alloc(640 * 480 * 1.5)
+  const frame = new VideoFrame(buffer, {
+    format: VideoPixelFormat.I420,
+    codedWidth: 640,
+    codedHeight: 480,
+    timestamp: 0,
+  })
+  frame.close()
 })
 
 await bench.run()

@@ -2,24 +2,62 @@
  * Performance and Stress Tests
  *
  * Tests for memory management, throughput, and stability under load.
+ * Uses callback-based constructor per W3C WebCodecs spec.
  */
 
 import test from 'ava'
 
 import { VideoEncoder, VideoDecoder, VideoFrame, CodecState } from '../../index.js'
-import { generateSolidColorI420Frame, generateFrameSequence, TestColors, calculateI420Size } from '../helpers/index.js'
+import {
+  generateSolidColorI420Frame,
+  TestColors,
+  calculateI420Size,
+  reconstructVideoChunk,
+  type EncodedVideoChunkOutput,
+  type VideoEncoderOutput,
+} from '../helpers/index.js'
 import { createEncoderConfig, createDecoderConfig } from '../helpers/codec-matrix.js'
+
+// Helper to create test encoder with callbacks
+function createTestEncoder() {
+  const chunks: EncodedVideoChunkOutput[] = []
+  const errors: Error[] = []
+
+  const encoder = new VideoEncoder(
+    (result: VideoEncoderOutput) => {
+      // VideoEncoder callback receives [chunk, metadata] tuple
+      const [chunk] = result
+      chunks.push(chunk)
+    },
+    (e) => errors.push(e),
+  )
+
+  return { encoder, chunks, errors }
+}
+
+// Helper to create test decoder with callbacks
+function createTestDecoder() {
+  const frames: VideoFrame[] = []
+  const errors: Error[] = []
+
+  const decoder = new VideoDecoder(
+    (frame) => frames.push(frame),
+    (e) => errors.push(e),
+  )
+
+  return { decoder, frames, errors }
+}
 
 // ============================================================================
 // Frame Count Stress Tests
 // ============================================================================
 
-test('stress: encode 100 frames', (t) => {
+test('stress: encode 100 frames', async (t) => {
   const width = 320
   const height = 240
   const frameCount = 100
 
-  const encoder = new VideoEncoder()
+  const { encoder, chunks } = createTestEncoder()
   encoder.configure(createEncoderConfig('h264', width, height))
 
   // Encode frames
@@ -29,8 +67,7 @@ test('stress: encode 100 frames', (t) => {
     frame.close()
   }
 
-  encoder.flush()
-  const chunks = encoder.takeEncodedChunks()
+  await encoder.flush()
 
   t.true(chunks.length > 0, 'Should produce encoded chunks')
   t.log(`Encoded ${frameCount} frames into ${chunks.length} chunks`)
@@ -38,12 +75,12 @@ test('stress: encode 100 frames', (t) => {
   encoder.close()
 })
 
-test('stress: encode 500 frames', (t) => {
+test('stress: encode 500 frames', async (t) => {
   const width = 320
   const height = 240
   const frameCount = 500
 
-  const encoder = new VideoEncoder()
+  const { encoder, chunks } = createTestEncoder()
   encoder.configure(createEncoderConfig('h264', width, height))
 
   const startTime = Date.now()
@@ -54,8 +91,7 @@ test('stress: encode 500 frames', (t) => {
     frame.close()
   }
 
-  encoder.flush()
-  const chunks = encoder.takeEncodedChunks()
+  await encoder.flush()
 
   const elapsed = Date.now() - startTime
   const fps = (frameCount / elapsed) * 1000
@@ -66,13 +102,13 @@ test('stress: encode 500 frames', (t) => {
   encoder.close()
 })
 
-test('stress: decode 100 chunks', (t) => {
+test('stress: decode 100 chunks', async (t) => {
   const width = 320
   const height = 240
   const frameCount = 100
 
   // First encode
-  const encoder = new VideoEncoder()
+  const { encoder, chunks } = createTestEncoder()
   encoder.configure(createEncoderConfig('h264', width, height))
 
   for (let i = 0; i < frameCount; i++) {
@@ -81,22 +117,20 @@ test('stress: decode 100 chunks', (t) => {
     frame.close()
   }
 
-  encoder.flush()
-  const chunks = encoder.takeEncodedChunks()
+  await encoder.flush()
   encoder.close()
 
   t.true(chunks.length > 0)
 
   // Now decode
-  const decoder = new VideoDecoder()
+  const { decoder, frames } = createTestDecoder()
   decoder.configure(createDecoderConfig('h264', { codedWidth: width, codedHeight: height }))
 
   for (const chunk of chunks) {
-    decoder.decode(chunk)
+    decoder.decode(reconstructVideoChunk(chunk))
   }
 
-  decoder.flush()
-  const frames = decoder.takeDecodedFrames()
+  await decoder.flush()
 
   t.true(frames.length > 0, 'Should decode frames')
   t.log(`Decoded ${chunks.length} chunks into ${frames.length} frames`)
@@ -112,12 +146,12 @@ test('stress: decode 100 chunks', (t) => {
 // Resolution Stress Tests
 // ============================================================================
 
-test('stress: 720p encoding (1280x720)', (t) => {
+test('stress: 720p encoding (1280x720)', async (t) => {
   const width = 1280
   const height = 720
   const frameCount = 10
 
-  const encoder = new VideoEncoder()
+  const { encoder, chunks } = createTestEncoder()
   encoder.configure(createEncoderConfig('h264', width, height, { quality: 'medium' }))
 
   const startTime = Date.now()
@@ -128,8 +162,7 @@ test('stress: 720p encoding (1280x720)', (t) => {
     frame.close()
   }
 
-  encoder.flush()
-  const chunks = encoder.takeEncodedChunks()
+  await encoder.flush()
 
   const elapsed = Date.now() - startTime
 
@@ -139,12 +172,12 @@ test('stress: 720p encoding (1280x720)', (t) => {
   encoder.close()
 })
 
-test('stress: 1080p encoding (1920x1080)', (t) => {
+test('stress: 1080p encoding (1920x1080)', async (t) => {
   const width = 1920
   const height = 1080
   const frameCount = 5
 
-  const encoder = new VideoEncoder()
+  const { encoder, chunks } = createTestEncoder()
   encoder.configure(createEncoderConfig('h264', width, height, { quality: 'low' }))
 
   const startTime = Date.now()
@@ -155,8 +188,7 @@ test('stress: 1080p encoding (1920x1080)', (t) => {
     frame.close()
   }
 
-  encoder.flush()
-  const chunks = encoder.takeEncodedChunks()
+  await encoder.flush()
 
   const elapsed = Date.now() - startTime
 
@@ -170,45 +202,47 @@ test('stress: 1080p encoding (1920x1080)', (t) => {
 // Concurrent Encoder Stress Tests
 // ============================================================================
 
-test('stress: 4 concurrent encoders', (t) => {
+test('stress: 4 concurrent encoders', async (t) => {
   const width = 320
   const height = 240
   const frameCount = 20
 
-  const encoders = [
-    new VideoEncoder(),
-    new VideoEncoder(),
-    new VideoEncoder(),
-    new VideoEncoder(),
+  const encoderData = [
+    createTestEncoder(),
+    createTestEncoder(),
+    createTestEncoder(),
+    createTestEncoder(),
   ]
 
   // Configure all
-  for (const encoder of encoders) {
+  for (const { encoder } of encoderData) {
     encoder.configure(createEncoderConfig('h264', width, height))
   }
 
   // Encode frames on each
   for (let i = 0; i < frameCount; i++) {
-    for (let j = 0; j < encoders.length; j++) {
+    for (const { encoder } of encoderData) {
       const frame = generateSolidColorI420Frame(width, height, TestColors.yellow, i * 33333)
-      encoders[j].encode(frame, i === 0 ? { keyFrame: true } : undefined)
+      encoder.encode(frame, i === 0 ? { keyFrame: true } : undefined)
       frame.close()
     }
   }
 
   // Flush and get results
-  const allChunks = encoders.map((encoder) => {
-    encoder.flush()
-    return encoder.takeEncodedChunks()
-  })
+  const allChunks = await Promise.all(
+    encoderData.map(async ({ encoder, chunks }) => {
+      await encoder.flush()
+      return chunks
+    }),
+  )
 
   // Verify all produced output
-  for (let j = 0; j < encoders.length; j++) {
+  for (let j = 0; j < encoderData.length; j++) {
     t.true(allChunks[j].length > 0, `Encoder ${j} should produce chunks`)
   }
 
   // Close all
-  for (const encoder of encoders) {
+  for (const { encoder } of encoderData) {
     encoder.close()
   }
 
@@ -235,8 +269,8 @@ test('stress: frame creation and cleanup loop', (t) => {
   t.pass(`Created and closed ${iterations} frames without memory issues`)
 })
 
-test('stress: encoder reconfigure loop', (t) => {
-  const encoder = new VideoEncoder()
+test('stress: encoder reconfigure loop', async (t) => {
+  const { encoder, chunks } = createTestEncoder()
   const iterations = 20
 
   for (let i = 0; i < iterations; i++) {
@@ -251,8 +285,9 @@ test('stress: encoder reconfigure loop', (t) => {
     encoder.encode(frame, { keyFrame: true })
     frame.close()
 
-    encoder.flush()
-    encoder.takeEncodedChunks() // Clear queue
+    await encoder.flush()
+    // Chunks are collected via callback, clear the array for next iteration
+    chunks.length = 0
   }
 
   encoder.close()
@@ -260,7 +295,7 @@ test('stress: encoder reconfigure loop', (t) => {
 })
 
 test('stress: decoder reconfigure loop', (t) => {
-  const decoder = new VideoDecoder()
+  const { decoder } = createTestDecoder()
   const iterations = 20
 
   for (let i = 0; i < iterations; i++) {
@@ -277,12 +312,12 @@ test('stress: decoder reconfigure loop', (t) => {
 // Throughput Tests
 // ============================================================================
 
-test('throughput: H.264 320x240 FPS measurement', (t) => {
+test('throughput: H.264 320x240 FPS measurement', async (t) => {
   const width = 320
   const height = 240
   const frameCount = 100
 
-  const encoder = new VideoEncoder()
+  const { encoder } = createTestEncoder()
   encoder.configure(createEncoderConfig('h264', width, height))
 
   const startTime = Date.now()
@@ -293,8 +328,7 @@ test('throughput: H.264 320x240 FPS measurement', (t) => {
     frame.close()
   }
 
-  encoder.flush()
-  encoder.takeEncodedChunks()
+  await encoder.flush()
 
   const elapsed = Date.now() - startTime
   const fps = (frameCount / elapsed) * 1000
@@ -305,12 +339,12 @@ test('throughput: H.264 320x240 FPS measurement', (t) => {
   encoder.close()
 })
 
-test('throughput: H.264 640x480 FPS measurement', (t) => {
+test('throughput: H.264 640x480 FPS measurement', async (t) => {
   const width = 640
   const height = 480
   const frameCount = 50
 
-  const encoder = new VideoEncoder()
+  const { encoder } = createTestEncoder()
   encoder.configure(createEncoderConfig('h264', width, height))
 
   const startTime = Date.now()
@@ -321,8 +355,7 @@ test('throughput: H.264 640x480 FPS measurement', (t) => {
     frame.close()
   }
 
-  encoder.flush()
-  encoder.takeEncodedChunks()
+  await encoder.flush()
 
   const elapsed = Date.now() - startTime
   const fps = (frameCount / elapsed) * 1000
@@ -337,12 +370,12 @@ test('throughput: H.264 640x480 FPS measurement', (t) => {
 // Queue Size Tests
 // ============================================================================
 
-test('stress: encoder queue size under load', (t) => {
+test('stress: encoder queue size under load', async (t) => {
   const width = 320
   const height = 240
   const frameCount = 50
 
-  const encoder = new VideoEncoder()
+  const { encoder, chunks } = createTestEncoder()
   encoder.configure(createEncoderConfig('h264', width, height))
 
   let maxQueueSize = 0
@@ -355,8 +388,7 @@ test('stress: encoder queue size under load', (t) => {
     maxQueueSize = Math.max(maxQueueSize, encoder.encodeQueueSize)
   }
 
-  encoder.flush()
-  const chunks = encoder.takeEncodedChunks()
+  await encoder.flush()
 
   t.log(`Max encode queue size: ${maxQueueSize}`)
   t.true(chunks.length > 0, 'Should produce encoded chunks')
@@ -365,13 +397,13 @@ test('stress: encoder queue size under load', (t) => {
   encoder.close()
 })
 
-test('stress: decoder queue size under load', (t) => {
+test('stress: decoder queue size under load', async (t) => {
   const width = 320
   const height = 240
   const frameCount = 50
 
   // First encode
-  const encoder = new VideoEncoder()
+  const { encoder, chunks } = createTestEncoder()
   encoder.configure(createEncoderConfig('h264', width, height))
 
   for (let i = 0; i < frameCount; i++) {
@@ -380,29 +412,27 @@ test('stress: decoder queue size under load', (t) => {
     frame.close()
   }
 
-  encoder.flush()
-  const chunks = encoder.takeEncodedChunks()
+  await encoder.flush()
   encoder.close()
 
   t.true(chunks.length > 0, 'Should have encoded chunks')
 
   // Decode
-  const decoder = new VideoDecoder()
+  const { decoder, frames } = createTestDecoder()
   decoder.configure(createDecoderConfig('h264', { codedWidth: width, codedHeight: height }))
 
   let maxQueueSize = 0
 
   for (const chunk of chunks) {
-    decoder.decode(chunk)
+    decoder.decode(reconstructVideoChunk(chunk))
     maxQueueSize = Math.max(maxQueueSize, decoder.decodeQueueSize)
   }
 
-  decoder.flush()
+  await decoder.flush()
 
   t.log(`Max decode queue size: ${maxQueueSize}`)
   t.true(maxQueueSize >= 0, 'Queue size should be non-negative')
 
-  const frames = decoder.takeDecodedFrames()
   t.true(frames.length > 0, 'Should produce decoded frames')
 
   for (const frame of frames) {
@@ -416,21 +446,20 @@ test('stress: decoder queue size under load', (t) => {
 // Edge Case Stress Tests
 // ============================================================================
 
-test('stress: multiple encode-reconfigure cycles', (t) => {
+test('stress: multiple encode-reconfigure cycles', async (t) => {
   const width = 320
   const height = 240
   const cycles = 10
 
   for (let i = 0; i < cycles; i++) {
-    const encoder = new VideoEncoder()
+    const { encoder, chunks } = createTestEncoder()
     encoder.configure(createEncoderConfig('h264', width, height))
 
     const frame = generateSolidColorI420Frame(width, height, TestColors.yellow, i * 33333)
     encoder.encode(frame, { keyFrame: true })
     frame.close()
 
-    encoder.flush()
-    const chunks = encoder.takeEncodedChunks()
+    await encoder.flush()
     t.true(chunks.length > 0, `Cycle ${i} should produce output`)
 
     encoder.close()
@@ -439,12 +468,12 @@ test('stress: multiple encode-reconfigure cycles', (t) => {
   t.pass(`Completed ${cycles} encode cycles with fresh encoders`)
 })
 
-test('stress: rapid reconfigure cycles', (t) => {
+test('stress: rapid reconfigure cycles', async (t) => {
   const width = 320
   const height = 240
   const cycles = 20
 
-  const encoder = new VideoEncoder()
+  const { encoder, chunks } = createTestEncoder()
 
   for (let i = 0; i < cycles; i++) {
     encoder.configure(createEncoderConfig('h264', width, height))
@@ -453,8 +482,9 @@ test('stress: rapid reconfigure cycles', (t) => {
     encoder.encode(frame, { keyFrame: true })
     frame.close()
 
-    encoder.flush()
-    encoder.takeEncodedChunks()
+    await encoder.flush()
+    // Clear chunks for next iteration
+    chunks.length = 0
   }
 
   encoder.close()

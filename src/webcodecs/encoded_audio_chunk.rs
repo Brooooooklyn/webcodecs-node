@@ -147,17 +147,6 @@ impl EncodedAudioChunk {
     self.with_inner(|inner| Ok(inner.data.clone().into()))
   }
 
-  /// Close and release resources
-  #[napi]
-  pub fn close(&self) -> Result<()> {
-    let mut guard = self
-      .inner
-      .write()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-    *guard = None;
-    Ok(())
-  }
-
   // ========================================================================
   // Internal helpers
   // ========================================================================

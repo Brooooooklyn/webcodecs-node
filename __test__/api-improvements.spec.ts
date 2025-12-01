@@ -1,12 +1,37 @@
+/**
+ * API Improvements Tests
+ *
+ * Tests for bitrateMode, latencyMode, and other encoder configuration options.
+ * Uses callback-based constructor per W3C WebCodecs spec.
+ */
+
 import test from 'ava'
-import { VideoEncoder, VideoFrame, VideoPixelFormat } from '../index.js'
+import { VideoEncoder, VideoFrame, VideoPixelFormat, CodecState } from '../index.js'
+import { type EncodedVideoChunkOutput, type VideoEncoderOutput } from './helpers/index.js'
+
+// Helper to create test encoder with callbacks
+function createTestEncoder() {
+  const chunks: EncodedVideoChunkOutput[] = []
+  const errors: Error[] = []
+
+  const encoder = new VideoEncoder(
+    (result: VideoEncoderOutput) => {
+      // VideoEncoder callback receives [chunk, metadata] tuple
+      const [chunk] = result
+      chunks.push(chunk)
+    },
+    (e) => errors.push(e),
+  )
+
+  return { encoder, chunks, errors }
+}
 
 // ============================================================================
 // Phase 2: bitrateMode, latencyMode Tests
 // ============================================================================
 
 test('VideoEncoderConfig: accepts bitrateMode constant', (t) => {
-  const encoder = new VideoEncoder()
+  const { encoder } = createTestEncoder()
   encoder.configure({
     codec: 'avc1.42001E',
     width: 640,
@@ -14,12 +39,12 @@ test('VideoEncoderConfig: accepts bitrateMode constant', (t) => {
     bitrate: 1_000_000,
     bitrateMode: 'constant',
   })
-  t.is(encoder.state, 'Configured')
+  t.is(encoder.state, CodecState.Configured)
   encoder.close()
 })
 
 test('VideoEncoderConfig: accepts bitrateMode variable', (t) => {
-  const encoder = new VideoEncoder()
+  const { encoder } = createTestEncoder()
   encoder.configure({
     codec: 'avc1.42001E',
     width: 640,
@@ -27,12 +52,12 @@ test('VideoEncoderConfig: accepts bitrateMode variable', (t) => {
     bitrate: 1_000_000,
     bitrateMode: 'variable',
   })
-  t.is(encoder.state, 'Configured')
+  t.is(encoder.state, CodecState.Configured)
   encoder.close()
 })
 
 test('VideoEncoderConfig: accepts latencyMode quality', (t) => {
-  const encoder = new VideoEncoder()
+  const { encoder } = createTestEncoder()
   encoder.configure({
     codec: 'avc1.42001E',
     width: 640,
@@ -40,12 +65,12 @@ test('VideoEncoderConfig: accepts latencyMode quality', (t) => {
     bitrate: 1_000_000,
     latencyMode: 'quality',
   })
-  t.is(encoder.state, 'Configured')
+  t.is(encoder.state, CodecState.Configured)
   encoder.close()
 })
 
 test('VideoEncoderConfig: accepts latencyMode realtime', (t) => {
-  const encoder = new VideoEncoder()
+  const { encoder } = createTestEncoder()
   encoder.configure({
     codec: 'avc1.42001E',
     width: 640,
@@ -53,12 +78,12 @@ test('VideoEncoderConfig: accepts latencyMode realtime', (t) => {
     bitrate: 1_000_000,
     latencyMode: 'realtime',
   })
-  t.is(encoder.state, 'Configured')
+  t.is(encoder.state, CodecState.Configured)
   encoder.close()
 })
 
 test('VideoEncoderConfig: accepts scalabilityMode L1T1', (t) => {
-  const encoder = new VideoEncoder()
+  const { encoder } = createTestEncoder()
   encoder.configure({
     codec: 'avc1.42001E',
     width: 640,
@@ -66,12 +91,12 @@ test('VideoEncoderConfig: accepts scalabilityMode L1T1', (t) => {
     bitrate: 1_000_000,
     scalabilityMode: 'L1T1',
   })
-  t.is(encoder.state, 'Configured')
+  t.is(encoder.state, CodecState.Configured)
   encoder.close()
 })
 
-test('VideoEncoderConfig: combined bitrateMode and latencyMode', (t) => {
-  const encoder = new VideoEncoder()
+test('VideoEncoderConfig: combined bitrateMode and latencyMode', async (t) => {
+  const { encoder, chunks } = createTestEncoder()
   encoder.configure({
     codec: 'avc1.42001E',
     width: 640,
@@ -80,7 +105,7 @@ test('VideoEncoderConfig: combined bitrateMode and latencyMode', (t) => {
     bitrateMode: 'variable',
     latencyMode: 'realtime',
   })
-  t.is(encoder.state, 'Configured')
+  t.is(encoder.state, CodecState.Configured)
 
   // Create and encode a frame to verify encoder works
   // I420 buffer: Y (640*480) + U (320*240) + V (320*240) = 460800 bytes
@@ -91,18 +116,17 @@ test('VideoEncoderConfig: combined bitrateMode and latencyMode', (t) => {
     codedHeight: 480,
     timestamp: 0,
   })
-  encoder.encode(frame)
+  encoder.encode(frame, { keyFrame: true })
   frame.close()
 
-  encoder.flush()
-  const chunks = encoder.takeEncodedChunks()
+  await encoder.flush()
   t.true(chunks.length > 0, 'Should produce encoded output')
 
   encoder.close()
 })
 
-test('VideoEncoderConfig: queue mode works (no callbacks)', (t) => {
-  const encoder = new VideoEncoder()
+test('VideoEncoderConfig: callback mode with output', async (t) => {
+  const { encoder, chunks } = createTestEncoder()
 
   encoder.configure({
     codec: 'avc1.42001E',
@@ -122,15 +146,14 @@ test('VideoEncoderConfig: queue mode works (no callbacks)', (t) => {
       codedHeight: 240,
       timestamp: i * 33333,
     })
-    encoder.encode(frame)
+    encoder.encode(frame, i === 0 ? { keyFrame: true } : undefined)
     frame.close()
   }
 
-  encoder.flush()
+  await encoder.flush()
 
-  // In queue mode, chunks should be available via takeEncodedChunks
-  const chunks = encoder.takeEncodedChunks()
-  t.true(chunks.length > 0, 'Should have encoded chunks in queue')
+  // In callback mode, chunks are collected via the output callback
+  t.true(chunks.length > 0, 'Should have encoded chunks via callback')
 
   encoder.close()
 })

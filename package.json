@@ -53,6 +53,7 @@
     "lint": "oxlint",
     "prepublishOnly": "napi prepublish -t npm",
     "test": "ava",
+    "typecheck": "tsc --noEmit",
     "version": "napi version"
   },
   "devDependencies": {
@@ -110,5 +111,5 @@
     "singleQuote": true,
     "arrowParens": "always"
   },
-  "packageManager": "pnpm@10.22.0"
+  "packageManager": "pnpm@10.24.0"
 }
