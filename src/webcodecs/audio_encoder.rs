@@ -8,7 +8,9 @@ use crate::codec::{
   AudioSampleBuffer, CodecContext, Resampler,
 };
 use crate::ffi::{AVCodecID, AVSampleFormat};
-use crate::webcodecs::{AudioData, AudioEncoderConfig, AudioEncoderSupport, EncodedAudioChunk};
+use crate::webcodecs::{
+  AudioData, AudioEncoderConfig, AudioEncoderSupport, EncodedAudioChunk, EncodedAudioChunkOutput,
+};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{
   ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
@@ -18,12 +20,13 @@ use std::sync::{Arc, Mutex};
 
 use super::video_encoder::CodecState;
 
-/// Type alias for output callback (takes chunk and metadata)
+/// Type alias for output callback (takes chunk and metadata as separate args)
+/// Using FnArgs to spread tuple as separate callback arguments per WebCodecs spec
 /// Using CalleeHandled: false for direct callbacks without error-first convention
 type OutputCallback = ThreadsafeFunction<
-  (EncodedAudioChunk, EncodedAudioChunkMetadata),
+  FnArgs<(EncodedAudioChunkOutput, EncodedAudioChunkMetadata)>,
   UnknownReturnValue,
-  (EncodedAudioChunk, EncodedAudioChunkMetadata),
+  FnArgs<(EncodedAudioChunkOutput, EncodedAudioChunkMetadata)>,
   Status,
   false,
 >;
@@ -120,7 +123,7 @@ impl AudioEncoder {
   #[napi(constructor)]
   pub fn new(
     #[napi(
-      ts_arg_type = "(chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadata) => void"
+      ts_arg_type = "(chunk: EncodedAudioChunkOutput, metadata: EncodedAudioChunkMetadata) => void"
     )]
     output: OutputCallback,
     #[napi(ts_arg_type = "(error: Error) => void")] error: ErrorCallback,
@@ -557,11 +560,20 @@ impl AudioEncoder {
           }
         };
 
-        // Call output callback
-        // CalleeHandled: false means direct value, not Result
-        inner
-          .output_callback
-          .call((chunk, metadata), ThreadsafeFunctionCallMode::NonBlocking);
+        // Call output callback with serializable output
+        // FnArgs spreads tuple as separate callback arguments
+        match chunk.to_output() {
+          Ok(chunk_output) => {
+            inner.output_callback.call(
+              (chunk_output, metadata).into(),
+              ThreadsafeFunctionCallMode::NonBlocking,
+            );
+          }
+          Err(e) => {
+            Self::report_error(&mut inner, &format!("Failed to serialize chunk: {}", e));
+            return Ok(());
+          }
+        }
       }
     }
 
@@ -610,11 +622,13 @@ impl AudioEncoder {
             let metadata = EncodedAudioChunkMetadata {
               decoder_config: None,
             };
-            // Call output callback
-            // CalleeHandled: false means direct value, not Result
-            inner
-              .output_callback
-              .call((chunk, metadata), ThreadsafeFunctionCallMode::NonBlocking);
+            // Call output callback with serializable output
+            if let Ok(chunk_output) = chunk.to_output() {
+              inner.output_callback.call(
+                (chunk_output, metadata).into(),
+                ThreadsafeFunctionCallMode::NonBlocking,
+              );
+            }
           }
         }
       }
@@ -643,11 +657,13 @@ impl AudioEncoder {
       let metadata = EncodedAudioChunkMetadata {
         decoder_config: None,
       };
-      // Call output callback
-      // CalleeHandled: false means direct value, not Result
-      inner
-        .output_callback
-        .call((chunk, metadata), ThreadsafeFunctionCallMode::NonBlocking);
+      // Call output callback with serializable output
+      if let Ok(chunk_output) = chunk.to_output() {
+        inner.output_callback.call(
+          (chunk_output, metadata).into(),
+          ThreadsafeFunctionCallMode::NonBlocking,
+        );
+      }
     }
 
     Ok(())

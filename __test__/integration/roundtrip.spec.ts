@@ -17,7 +17,6 @@ import {
   extractI420Data,
   reconstructVideoChunk,
   type EncodedVideoChunkOutput,
-  type VideoEncoderOutput,
 } from '../helpers/index.js'
 import {
   compareBuffers,
@@ -33,9 +32,7 @@ function createTestEncoder() {
   const errors: Error[] = []
 
   const encoder = new VideoEncoder(
-    (result: VideoEncoderOutput) => {
-      // VideoEncoder callback receives [chunk, metadata] tuple
-      const [chunk] = result
+    (chunk, _metadata) => {
       chunks.push(chunk)
     },
     (e) => errors.push(e),

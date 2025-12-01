@@ -15,37 +15,17 @@ import {
   EncodedVideoChunkOutput as NativeEncodedVideoChunkOutput,
   EncodedVideoChunkMetadata as NativeEncodedVideoChunkMetadata,
   EncodedAudioChunkMetadata as NativeEncodedAudioChunkMetadata,
+  EncodedAudioChunkOutput as NativeEncodedAudioChunkOutput,
 } from '../../index.js'
 
 // Re-export types from the native module
 export type { EncodedVideoChunkOutput } from '../../index.js'
 export type { EncodedVideoChunkMetadata } from '../../index.js'
 export type { EncodedAudioChunkMetadata } from '../../index.js'
+export type { EncodedAudioChunkOutput } from '../../index.js'
 
-/**
- * Output type from AudioEncoder callback
- * (plain object, not class instance)
- *
- * AudioEncoder passes EncodedAudioChunk class instance directly,
- * not a plain object like VideoEncoder.
- */
-export interface EncodedAudioChunkOutput {
-  type: EncodedAudioChunk['type']
-  timestamp: number
-  duration?: number | null
-  data: Buffer
-  byteLength: number
-}
-
-/**
- * Tuple type returned from VideoEncoder output callback
- */
-export type VideoEncoderOutput = [NativeEncodedVideoChunkOutput, NativeEncodedVideoChunkMetadata]
-
-/**
- * Tuple type returned from AudioEncoder output callback
- */
-export type AudioEncoderOutput = [EncodedAudioChunkOutput, NativeEncodedAudioChunkMetadata]
+// Note: Both VideoEncoder and AudioEncoder callbacks now receive separate arguments
+// (chunk, metadata) per W3C WebCodecs spec. The old tuple types are no longer used.
 
 /**
  * Reconstruct an EncodedVideoChunk from callback data.
@@ -78,10 +58,11 @@ export function reconstructVideoChunk(chunk: NativeEncodedVideoChunkOutput): Enc
 /**
  * Reconstruct an EncodedAudioChunk from callback data.
  *
- * AudioEncoder now passes EncodedAudioChunk instances through
- * ThreadsafeFunction callbacks. This helper reconstructs a proper instance.
+ * AudioEncoder now passes EncodedAudioChunkOutput plain objects through
+ * ThreadsafeFunction callbacks (with FnArgs). This helper reconstructs
+ * a proper EncodedAudioChunk instance from that output.
  */
-export function reconstructAudioChunk(chunk: EncodedAudioChunkOutput): EncodedAudioChunk {
+export function reconstructAudioChunk(chunk: NativeEncodedAudioChunkOutput): EncodedAudioChunk {
   return new EncodedAudioChunk({
     type: chunk.type,
     timestamp: chunk.timestamp,

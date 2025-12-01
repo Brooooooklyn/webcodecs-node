@@ -182,11 +182,14 @@ impl EncodedVideoChunk {
   /// Convert to serializable output for callbacks
   pub fn to_output(&self) -> Result<EncodedVideoChunkOutput> {
     self.with_inner(|inner| {
+      let data = inner.data.clone();
+      let byte_length = data.len() as u32;
       Ok(EncodedVideoChunkOutput {
         chunk_type: inner.chunk_type,
         timestamp: inner.timestamp_us,
         duration: inner.duration_us,
-        data: Buffer::from(inner.data.clone()),
+        data: Buffer::from(data),
+        byte_length,
       })
     })
   }
@@ -207,6 +210,8 @@ pub struct EncodedVideoChunkOutput {
   pub duration: Option<i64>,
   /// Encoded data
   pub data: Buffer,
+  /// Byte length of the encoded data
+  pub byte_length: u32,
 }
 
 /// Decode configuration for AVC (H.264)

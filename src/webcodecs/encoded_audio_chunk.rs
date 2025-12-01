@@ -185,6 +185,38 @@ impl EncodedAudioChunk {
       )),
     }
   }
+
+  /// Convert to serializable output for callbacks
+  pub fn to_output(&self) -> Result<EncodedAudioChunkOutput> {
+    self.with_inner(|inner| {
+      Ok(EncodedAudioChunkOutput {
+        chunk_type: inner.chunk_type,
+        timestamp: inner.timestamp_us,
+        duration: inner.duration_us,
+        data: Buffer::from(inner.data.clone()),
+        byte_length: inner.data.len() as u32,
+      })
+    })
+  }
+}
+
+/// Serializable output for callbacks (used with ThreadsafeFunction)
+///
+/// NAPI-RS class instances can't be passed through ThreadsafeFunction,
+/// so we use this plain object struct for callback output.
+#[napi(object)]
+pub struct EncodedAudioChunkOutput {
+  /// Chunk type (key or delta)
+  #[napi(js_name = "type")]
+  pub chunk_type: EncodedAudioChunkType,
+  /// Timestamp in microseconds
+  pub timestamp: i64,
+  /// Duration in microseconds (optional)
+  pub duration: Option<i64>,
+  /// Encoded data
+  pub data: Buffer,
+  /// Byte length of the encoded data
+  pub byte_length: u32,
 }
 
 /// Audio encoder configuration (WebCodecs spec)

@@ -124,7 +124,7 @@ export declare class AudioEncoder {
    * @param output - Callback invoked when an encoded chunk is available
    * @param error - Callback invoked when an error occurs
    */
-  constructor(output: (chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadata) => void, error: (error: Error) => void)
+  constructor(output: (chunk: EncodedAudioChunkOutput, metadata: EncodedAudioChunkMetadata) => void, error: (error: Error) => void)
   /** Get encoder state */
   get state(): CodecState
   /** Get number of pending encode operations (per WebCodecs spec) */
@@ -346,7 +346,7 @@ export declare class VideoEncoder {
    * @param output - Callback invoked when an encoded chunk is available
    * @param error - Callback invoked when an error occurs
    */
-  constructor(output: (result: [EncodedVideoChunkOutput, EncodedVideoChunkMetadata]) => void, error: (error: Error) => void)
+  constructor(output: (chunk: EncodedVideoChunkOutput, metadata: EncodedVideoChunkMetadata) => void, error: (error: Error) => void)
   /** Get encoder state */
   get state(): CodecState
   /** Get number of pending encode operations (per WebCodecs spec) */
@@ -599,6 +599,25 @@ export interface EncodedAudioChunkMetadata {
   decoderConfig?: AudioDecoderConfigOutput
 }
 
+/**
+ * Serializable output for callbacks (used with ThreadsafeFunction)
+ *
+ * NAPI-RS class instances can't be passed through ThreadsafeFunction,
+ * so we use this plain object struct for callback output.
+ */
+export interface EncodedAudioChunkOutput {
+  /** Chunk type (key or delta) */
+  type: EncodedAudioChunkType
+  /** Timestamp in microseconds */
+  timestamp: number
+  /** Duration in microseconds (optional) */
+  duration?: number
+  /** Encoded data */
+  data: Buffer
+  /** Byte length of the encoded data */
+  byteLength: number
+}
+
 /** Type of encoded audio chunk */
 export declare const enum EncodedAudioChunkType {
   /** Key chunk - can be decoded independently */
@@ -640,6 +659,8 @@ export interface EncodedVideoChunkOutput {
   duration?: number
   /** Encoded data */
   data: Buffer
+  /** Byte length of the encoded data */
+  byteLength: number
 }
 
 /** Type of encoded video chunk */

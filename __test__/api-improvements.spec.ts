@@ -7,7 +7,7 @@
 
 import test from 'ava'
 import { VideoEncoder, VideoFrame, VideoPixelFormat, CodecState } from '../index.js'
-import { type EncodedVideoChunkOutput, type VideoEncoderOutput } from './helpers/index.js'
+import { type EncodedVideoChunkOutput } from './helpers/index.js'
 
 // Helper to create test encoder with callbacks
 function createTestEncoder() {
@@ -15,9 +15,7 @@ function createTestEncoder() {
   const errors: Error[] = []
 
   const encoder = new VideoEncoder(
-    (result: VideoEncoderOutput) => {
-      // VideoEncoder callback receives [chunk, metadata] tuple
-      const [chunk] = result
+    (chunk, _metadata) => {
       chunks.push(chunk)
     },
     (e) => errors.push(e),

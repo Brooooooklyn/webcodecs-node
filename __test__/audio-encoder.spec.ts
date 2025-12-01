@@ -7,16 +7,22 @@
 
 import test from 'ava'
 
-import { AudioEncoder, EncodedAudioChunk, AudioSampleFormat, CodecState, EncodedAudioChunkType } from '../index.js'
-import { generateSineTone, generateSilence } from './helpers/index.js'
+import {
+  AudioEncoder,
+  EncodedAudioChunk,
+  AudioSampleFormat,
+  CodecState,
+  EncodedAudioChunkType,
+} from '../index.js'
+import { generateSineTone, generateSilence, type EncodedAudioChunkOutput } from './helpers/index.js'
 
 // Helper to create encoder with callbacks that collect output
 function createTestEncoder() {
-  const chunks: EncodedAudioChunk[] = []
+  const chunks: EncodedAudioChunkOutput[] = []
   const errors: Error[] = []
 
   const encoder = new AudioEncoder(
-    (chunk) => {
+    (chunk, _metadata) => {
       chunks.push(chunk)
     },
     (e) => {

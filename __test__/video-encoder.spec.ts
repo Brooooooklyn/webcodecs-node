@@ -13,7 +13,6 @@ import {
   generateFrameSequence,
   TestColors,
   type EncodedVideoChunkOutput,
-  type VideoEncoderOutput,
 } from './helpers/index.js'
 import { createEncoderConfig } from './helpers/codec-matrix.js'
 
@@ -23,8 +22,7 @@ function createTestEncoder() {
   const errors: Error[] = []
 
   const encoder = new VideoEncoder(
-    (result: VideoEncoderOutput) => {
-      const [chunk] = result
+    (chunk, _metadata) => {
       chunks.push(chunk)
     },
     (e) => {

@@ -66,12 +66,12 @@ pub struct VideoEncoderSupport {
   pub config: VideoEncoderConfig,
 }
 
-/// Output callback type - tuple of (chunk, metadata) with CalleeHandled: false for direct callbacks
-/// Using CalleeHandled: false means the callback receives the value directly, not (err, value)
+/// Output callback type - uses FnArgs to spread tuple members as separate callback arguments
+/// This matches the WebCodecs spec: output(chunk, metadata) instead of output([chunk, metadata])
 type OutputCallback = ThreadsafeFunction<
-  (EncodedVideoChunkOutput, EncodedVideoChunkMetadata),
+  FnArgs<(EncodedVideoChunkOutput, EncodedVideoChunkMetadata)>,
   UnknownReturnValue,
-  (EncodedVideoChunkOutput, EncodedVideoChunkMetadata),
+  FnArgs<(EncodedVideoChunkOutput, EncodedVideoChunkMetadata)>,
   Status,
   false,
 >;
@@ -138,7 +138,7 @@ impl VideoEncoder {
   /// @param error - Callback invoked when an error occurs
   #[napi(constructor)]
   pub fn new(
-    #[napi(ts_arg_type = "(result: [EncodedVideoChunkOutput, EncodedVideoChunkMetadata]) => void")]
+    #[napi(ts_arg_type = "(chunk: EncodedVideoChunkOutput, metadata: EncodedVideoChunkMetadata) => void")]
     output: OutputCallback,
     #[napi(ts_arg_type = "(error: Error) => void")] error: ErrorCallback,
   ) -> Result<Self> {
@@ -484,11 +484,11 @@ impl VideoEncoder {
       };
 
       // Convert chunk to serializable output and call callback
-      // CalleeHandled: false means we pass value directly, not Result
+      // Use .into() to convert tuple to FnArgs for spreading as separate arguments
       match chunk.to_output() {
         Ok(chunk_output) => {
           inner.output_callback.call(
-            (chunk_output, metadata),
+            (chunk_output, metadata).into(),
             ThreadsafeFunctionCallMode::NonBlocking,
           );
         }
@@ -541,11 +541,11 @@ impl VideoEncoder {
       };
 
       // Convert chunk to serializable output and call callback
-      // CalleeHandled: false means we pass value directly, not Result
+      // Use .into() to convert tuple to FnArgs for spreading as separate arguments
       match chunk.to_output() {
         Ok(chunk_output) => {
           inner.output_callback.call(
-            (chunk_output, metadata),
+            (chunk_output, metadata).into(),
             ThreadsafeFunctionCallMode::NonBlocking,
           );
         }
