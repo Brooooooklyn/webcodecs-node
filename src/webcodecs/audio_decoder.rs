@@ -1,65 +1,57 @@
-//! VideoDecoder - WebCodecs API implementation
+//! AudioDecoder - WebCodecs API implementation
 //!
-//! Provides video decoding functionality using FFmpeg.
-//! See: https://developer.mozilla.org/en-US/docs/Web/API/VideoDecoder
+//! Provides audio decoding functionality using FFmpeg.
+//! See: https://developer.mozilla.org/en-US/docs/Web/API/AudioDecoder
 
-use crate::codec::{CodecContext, DecoderConfig, Frame, Packet};
-use crate::ffi::{AVCodecID, AVHWDeviceType};
-use crate::webcodecs::{CodecState, EncodedVideoChunk, VideoDecoderConfig, VideoFrame};
+use crate::codec::{AudioDecoderConfig as InternalAudioDecoderConfig, CodecContext, Frame, Packet};
+use crate::ffi::AVCodecID;
+use crate::webcodecs::{AudioData, AudioDecoderConfig, AudioDecoderSupport, EncodedAudioChunk};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use std::sync::{Arc, Mutex};
 
-/// Type alias for output callback (takes VideoFrame)
-type OutputCallback = ThreadsafeFunction<VideoFrame>;
+use super::video_encoder::CodecState;
+
+/// Type alias for output callback (takes AudioData)
+type OutputCallback = ThreadsafeFunction<AudioData>;
 
 /// Type alias for error callback (takes error message)
 type ErrorCallback = ThreadsafeFunction<String>;
 
-/// Result of isConfigSupported
-#[napi(object)]
-#[derive(Debug, Clone)]
-pub struct VideoDecoderSupport {
-    /// Whether the configuration is supported
-    pub supported: bool,
-    /// The configuration that was checked (codec only for simplicity)
-    pub codec: String,
-}
-
 /// Internal decoder state
-struct VideoDecoderInner {
+struct AudioDecoderInner {
     state: CodecState,
-    config: Option<DecoderConfig>,
+    config: Option<InternalAudioDecoderConfig>,
     context: Option<CodecContext>,
     codec_string: String,
     frame_count: u64,
     /// Queued output frames (for synchronous retrieval)
-    output_queue: Vec<VideoFrame>,
+    output_queue: Vec<AudioData>,
     /// Optional output callback (WebCodecs spec compliant mode)
     output_callback: Option<OutputCallback>,
     /// Optional error callback (WebCodecs spec compliant mode)
     error_callback: Option<ErrorCallback>,
 }
 
-/// VideoDecoder - WebCodecs-compliant video decoder
+/// AudioDecoder - WebCodecs-compliant audio decoder
 ///
-/// Decodes EncodedVideoChunk objects into VideoFrame objects using FFmpeg.
+/// Decodes EncodedAudioChunk objects into AudioData objects using FFmpeg.
 ///
 /// Note: This implementation uses a synchronous output queue model instead of
-/// callbacks for simpler integration. Use `takeDecodedFrames()` to retrieve
+/// callbacks for simpler integration. Use `takeDecodedAudio()` to retrieve
 /// decoded output after calling `decode()` or `flush()`.
 #[napi]
-pub struct VideoDecoder {
-    inner: Arc<Mutex<VideoDecoderInner>>,
+pub struct AudioDecoder {
+    inner: Arc<Mutex<AudioDecoderInner>>,
 }
 
 #[napi]
-impl VideoDecoder {
-    /// Create a new VideoDecoder (queue-based mode)
+impl AudioDecoder {
+    /// Create a new AudioDecoder (queue-based mode)
     #[napi(constructor)]
     pub fn new() -> Result<Self> {
-        let inner = VideoDecoderInner {
+        let inner = AudioDecoderInner {
             state: CodecState::Unconfigured,
             config: None,
             context: None,
@@ -75,25 +67,25 @@ impl VideoDecoder {
         })
     }
 
-    /// Create a VideoDecoder with callbacks (WebCodecs spec compliant mode)
+    /// Create an AudioDecoder with callbacks (WebCodecs spec compliant mode)
     ///
-    /// In this mode, decoded frames are delivered via the output callback
+    /// In this mode, decoded audio is delivered via the output callback
     /// instead of being queued for retrieval. Errors are reported via the
     /// error callback and the decoder transitions to the Closed state.
     ///
     /// Example:
     /// ```javascript
-    /// const decoder = VideoDecoder.withCallbacks(
-    ///   (frame) => { /* handle output */ },
+    /// const decoder = AudioDecoder.withCallbacks(
+    ///   (audio) => { /* handle output */ },
     ///   (error) => { /* handle error */ }
     /// );
     /// ```
     #[napi(factory)]
     pub fn with_callbacks(
-        output: ThreadsafeFunction<VideoFrame>,
+        output: ThreadsafeFunction<AudioData>,
         error: ThreadsafeFunction<String>,
     ) -> Result<Self> {
-        let inner = VideoDecoderInner {
+        let inner = AudioDecoderInner {
             state: CodecState::Unconfigured,
             config: None,
             context: None,
@@ -111,7 +103,7 @@ impl VideoDecoder {
 
     /// Report an error via callback (if in callback mode) and close the decoder
     /// Returns true if error was reported via callback, false if should return error
-    fn report_error(inner: &mut VideoDecoderInner, error_msg: &str) -> bool {
+    fn report_error(inner: &mut AudioDecoderInner, error_msg: &str) -> bool {
         if let Some(ref callback) = inner.error_callback {
             callback.call(Ok(error_msg.to_string()), ThreadsafeFunctionCallMode::NonBlocking);
             inner.state = CodecState::Closed;
@@ -130,7 +122,7 @@ impl VideoDecoder {
         Ok(inner.state)
     }
 
-    /// Get number of pending output frames
+    /// Get number of pending output audio data objects
     #[napi(getter)]
     pub fn decode_queue_size(&self) -> Result<u32> {
         let inner = self.inner.lock().map_err(|_| {
@@ -141,7 +133,7 @@ impl VideoDecoder {
 
     /// Configure the decoder
     #[napi]
-    pub fn configure(&self, config: VideoDecoderConfig) -> Result<()> {
+    pub fn configure(&self, config: AudioDecoderConfig) -> Result<()> {
         let mut inner = self.inner.lock().map_err(|_| {
             Error::new(Status::GenericFailure, "Lock poisoned")
         })?;
@@ -151,32 +143,38 @@ impl VideoDecoder {
         }
 
         // Parse codec string to determine codec ID
-        let codec_id = parse_codec_string(&config.codec)?;
+        let codec_id = parse_audio_codec_string(&config.codec)?;
 
-        // Determine hardware acceleration
-        let hw_type = config.hardware_acceleration.as_ref().and_then(|ha| {
-            parse_hw_acceleration(ha)
-        });
-
-        // Create decoder context with optional hardware acceleration
-        let mut context = CodecContext::new_decoder_with_hw(codec_id, hw_type).map_err(|e| {
-            Error::new(Status::GenericFailure, format!("Failed to create decoder: {}", e))
+        // Create decoder context
+        let mut context = CodecContext::new_decoder(codec_id).map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Failed to create decoder: {}", e),
+            )
         })?;
 
         // Configure decoder
-        let decoder_config = DecoderConfig {
+        let decoder_config = InternalAudioDecoderConfig {
             codec_id,
+            sample_rate: config.sample_rate.unwrap_or(0),
+            channels: config.number_of_channels.unwrap_or(0),
             thread_count: 0, // Auto
             extradata: config.description.as_ref().map(|d| d.to_vec()),
         };
 
-        context.configure_decoder(&decoder_config).map_err(|e| {
-            Error::new(Status::GenericFailure, format!("Failed to configure decoder: {}", e))
+        context.configure_audio_decoder(&decoder_config).map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("Failed to configure decoder: {}", e),
+            )
         })?;
 
         // Open the decoder
         context.open().map_err(|e| {
-            Error::new(Status::GenericFailure, format!("Failed to open decoder: {}", e))
+            Error::new(
+                Status::GenericFailure,
+                format!("Failed to open decoder: {}", e),
+            )
         })?;
 
         inner.context = Some(context);
@@ -189,9 +187,9 @@ impl VideoDecoder {
         Ok(())
     }
 
-    /// Decode an encoded video chunk
+    /// Decode an encoded audio chunk
     #[napi]
-    pub fn decode(&self, chunk: &EncodedVideoChunk) -> Result<()> {
+    pub fn decode(&self, chunk: &EncodedAudioChunk) -> Result<()> {
         let mut inner = self.inner.lock().map_err(|_| {
             Error::new(Status::GenericFailure, "Lock poisoned")
         })?;
@@ -215,20 +213,10 @@ impl VideoDecoder {
                 return Err(e);
             }
         };
-        let timestamp = match chunk.timestamp() {
+        let timestamp = match chunk.get_timestamp() {
             Ok(ts) => ts,
             Err(e) => {
                 let msg = format!("Failed to get timestamp: {}", e);
-                if Self::report_error(&mut inner, &msg) {
-                    return Ok(());
-                }
-                return Err(e);
-            }
-        };
-        let duration = match chunk.duration() {
-            Ok(dur) => dur,
-            Err(e) => {
-                let msg = format!("Failed to get duration: {}", e);
                 if Self::report_error(&mut inner, &msg) {
                     return Ok(());
                 }
@@ -248,8 +236,8 @@ impl VideoDecoder {
             }
         };
 
-        // Decode using the internal frame
-        let frames = match decode_chunk_data(context, &data, timestamp, duration) {
+        // Decode using the internal implementation
+        let frames = match decode_audio_chunk_data(context, &data, timestamp) {
             Ok(f) => f,
             Err(e) => {
                 let msg = format!("Decode failed: {}", e);
@@ -262,26 +250,23 @@ impl VideoDecoder {
 
         inner.frame_count += 1;
 
-        // Convert internal frames to VideoFrames and dispatch via callback or queue
+        // Convert internal frames to AudioData and dispatch via callback or queue
         for frame in frames {
-            let video_frame = VideoFrame::from_internal(
-                frame,
-                timestamp,
-                duration,
-            );
+            let pts = frame.pts();
+            let audio_data = AudioData::from_internal(frame, pts);
 
             // Dispatch output via callback or queue
             if let Some(ref callback) = inner.output_callback {
-                callback.call(Ok(video_frame), ThreadsafeFunctionCallMode::NonBlocking);
+                callback.call(Ok(audio_data), ThreadsafeFunctionCallMode::NonBlocking);
             } else {
-                inner.output_queue.push(video_frame);
+                inner.output_queue.push(audio_data);
             }
         }
 
         Ok(())
     }
 
-    /// Flush the decoder and return all remaining frames
+    /// Flush the decoder and return all remaining audio data
     /// Returns a Promise that resolves when flushing is complete
     #[napi]
     pub async fn flush(&self) -> Result<()> {
@@ -323,32 +308,31 @@ impl VideoDecoder {
         // Convert and dispatch remaining frames via callback or queue
         for frame in frames {
             let pts = frame.pts();
-            let duration = if frame.duration() > 0 { Some(frame.duration()) } else { None };
-            let video_frame = VideoFrame::from_internal(frame, pts, duration);
+            let audio_data = AudioData::from_internal(frame, pts);
 
             // Dispatch output via callback or queue
             if let Some(ref callback) = inner.output_callback {
-                callback.call(Ok(video_frame), ThreadsafeFunctionCallMode::NonBlocking);
+                callback.call(Ok(audio_data), ThreadsafeFunctionCallMode::NonBlocking);
             } else {
-                inner.output_queue.push(video_frame);
+                inner.output_queue.push(audio_data);
             }
         }
 
         Ok(())
     }
 
-    /// Take all decoded frames from the output queue
+    /// Take all decoded audio from the output queue
     #[napi]
-    pub fn take_decoded_frames(&self) -> Result<Vec<VideoFrame>> {
+    pub fn take_decoded_audio(&self) -> Result<Vec<AudioData>> {
         let mut inner = self.inner.lock().map_err(|_| {
             Error::new(Status::GenericFailure, "Lock poisoned")
         })?;
 
-        let frames: Vec<VideoFrame> = inner.output_queue.drain(..).collect();
-        Ok(frames)
+        let audio: Vec<AudioData> = inner.output_queue.drain(..).collect();
+        Ok(audio)
     }
 
-    /// Check if there are any pending decoded frames
+    /// Check if there are any pending decoded audio data
     #[napi]
     pub fn has_output(&self) -> Result<bool> {
         let inner = self.inner.lock().map_err(|_| {
@@ -357,9 +341,9 @@ impl VideoDecoder {
         Ok(!inner.output_queue.is_empty())
     }
 
-    /// Take the next decoded frame from the output queue (if any)
+    /// Take the next decoded audio data from the output queue (if any)
     #[napi]
-    pub fn take_next_frame(&self) -> Result<Option<VideoFrame>> {
+    pub fn take_next_audio(&self) -> Result<Option<AudioData>> {
         let mut inner = self.inner.lock().map_err(|_| {
             Error::new(Status::GenericFailure, "Lock poisoned")
         })?;
@@ -367,8 +351,8 @@ impl VideoDecoder {
         if inner.output_queue.is_empty() {
             Ok(None)
         } else {
-            let frame = inner.output_queue.remove(0);
-            Ok(Some(frame))
+            let audio = inner.output_queue.remove(0);
+            Ok(Some(audio))
         }
     }
 
@@ -413,14 +397,14 @@ impl VideoDecoder {
     /// Check if a configuration is supported
     /// Returns a Promise that resolves with support information
     #[napi]
-    pub async fn is_config_supported(config: VideoDecoderConfig) -> Result<VideoDecoderSupport> {
+    pub async fn is_config_supported(config: AudioDecoderConfig) -> Result<AudioDecoderSupport> {
         // Parse codec string
-        let codec_id = match parse_codec_string(&config.codec) {
+        let codec_id = match parse_audio_codec_string(&config.codec) {
             Ok(id) => id,
             Err(_) => {
-                return Ok(VideoDecoderSupport {
+                return Ok(AudioDecoderSupport {
                     supported: false,
-                    codec: config.codec,
+                    config,
                 });
             }
         };
@@ -428,80 +412,85 @@ impl VideoDecoder {
         // Try to create decoder
         let result = CodecContext::new_decoder(codec_id);
 
-        Ok(VideoDecoderSupport {
+        Ok(AudioDecoderSupport {
             supported: result.is_ok(),
-            codec: config.codec,
+            config,
         })
     }
 }
 
-/// Parse WebCodecs codec string to FFmpeg codec ID
-fn parse_codec_string(codec: &str) -> Result<AVCodecID> {
+/// Parse WebCodecs audio codec string to FFmpeg codec ID
+fn parse_audio_codec_string(codec: &str) -> Result<AVCodecID> {
     let codec_lower = codec.to_lowercase();
 
-    if codec_lower.starts_with("avc1") || codec_lower.starts_with("avc3") || codec_lower == "h264" {
-        Ok(AVCodecID::H264)
-    } else if codec_lower.starts_with("hev1") || codec_lower.starts_with("hvc1") || codec_lower == "h265" || codec_lower == "hevc" {
-        Ok(AVCodecID::Hevc)
-    } else if codec_lower == "vp8" {
-        Ok(AVCodecID::Vp8)
-    } else if codec_lower.starts_with("vp09") || codec_lower == "vp9" {
-        Ok(AVCodecID::Vp9)
-    } else if codec_lower.starts_with("av01") || codec_lower == "av1" {
-        Ok(AVCodecID::Av1)
-    } else {
-        Err(Error::new(
-            Status::GenericFailure,
-            format!("Unsupported codec: {}", codec),
-        ))
+    // AAC variants
+    if codec_lower.starts_with("mp4a.40") || codec_lower == "aac" {
+        return Ok(AVCodecID::Aac);
     }
+
+    // Opus
+    if codec_lower == "opus" {
+        return Ok(AVCodecID::Opus);
+    }
+
+    // MP3
+    if codec_lower == "mp3" || codec_lower == "mp4a.6b" {
+        return Ok(AVCodecID::Mp3);
+    }
+
+    // FLAC
+    if codec_lower == "flac" {
+        return Ok(AVCodecID::Flac);
+    }
+
+    // Vorbis
+    if codec_lower == "vorbis" {
+        return Ok(AVCodecID::Vorbis);
+    }
+
+    // PCM variants
+    if codec_lower == "pcm-s16" || codec_lower == "pcm_s16le" {
+        return Ok(AVCodecID::PcmS16le);
+    }
+    if codec_lower == "pcm-f32" || codec_lower == "pcm_f32le" {
+        return Ok(AVCodecID::PcmF32le);
+    }
+
+    // AC3/E-AC3
+    if codec_lower == "ac3" || codec_lower == "ac-3" {
+        return Ok(AVCodecID::Ac3);
+    }
+
+    // ALAC (Apple Lossless)
+    if codec_lower == "alac" {
+        return Ok(AVCodecID::Alac);
+    }
+
+    Err(Error::new(
+        Status::GenericFailure,
+        format!("Unsupported audio codec: {}", codec),
+    ))
 }
 
-/// Parse hardware acceleration preference string to device type
-fn parse_hw_acceleration(ha: &str) -> Option<AVHWDeviceType> {
-    match ha {
-        "prefer-hardware" | "require-hardware" => {
-            // Return platform-preferred hardware type
-            #[cfg(target_os = "macos")]
-            { Some(AVHWDeviceType::Videotoolbox) }
-            #[cfg(target_os = "linux")]
-            { Some(AVHWDeviceType::Vaapi) }
-            #[cfg(target_os = "windows")]
-            { Some(AVHWDeviceType::D3d11va) }
-            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-            { None }
-        }
-        _ => None,
-    }
-}
-
-/// Decode chunk data using FFmpeg
-fn decode_chunk_data(
+/// Decode audio chunk data using FFmpeg
+fn decode_audio_chunk_data(
     context: &mut CodecContext,
     data: &[u8],
     timestamp: i64,
-    duration: Option<i64>,
 ) -> Result<Vec<Frame>> {
     // Create a packet and fill it with data
     let mut packet = Packet::new().map_err(|e| {
-        Error::new(Status::GenericFailure, format!("Failed to create packet: {}", e))
+        Error::new(
+            Status::GenericFailure,
+            format!("Failed to create packet: {}", e),
+        )
     })?;
 
     // Set packet timestamps
     packet.set_pts(timestamp);
     packet.set_dts(timestamp);
-    if let Some(dur) = duration {
-        packet.set_duration(dur);
-    }
 
-    // We need to use FFmpeg's packet allocation to properly set the data
-    // For now, we'll use a workaround by sending raw data
-    // This requires proper av_packet_from_data or similar
-
-    // Simplified approach: use the packet directly
-    // Note: In production, this would need proper packet buffer management
-
-    // For this implementation, we'll use av_new_packet to allocate data
+    // Allocate packet data
     unsafe {
         use crate::ffi::avcodec::av_new_packet;
 

@@ -195,6 +195,7 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
         ("dav1d", false),    // AV1 decoder
         ("rav1e", false),    // AV1 encoder (Rust-based)
         ("SvtAv1Enc", false), // SVT-AV1 encoder
+        ("xvidcore", false), // Xvid MPEG-4
         // Image format libraries
         ("webp", false),     // WebP support
         ("webpmux", false),  // WebP muxer
@@ -207,10 +208,12 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
         ("opus", false),     // Opus audio codec
         ("vorbis", false),   // Vorbis audio
         ("vorbisenc", false), // Vorbis encoder
+        ("ogg", false),      // Ogg container (required by vorbis)
         ("theora", false),   // Theora video
         ("speex", false),    // Speex audio
         ("soxr", false),     // SoX resampler
         ("snappy", false),   // Snappy compression
+        ("zimg", false),     // Z image processing library
     ];
 
     let mut linked_x265 = false;
@@ -230,6 +233,13 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
             if *lib == "x265" {
                 linked_x265 = true;
             }
+        } else if find_dynamic_lib_path(lib, &codec_lib_paths).is_some() {
+            // Also try dynamic for optional libs that exist but aren't static
+            // This is needed for libs like soxr that FFmpeg may depend on
+            for search_path in &codec_lib_paths {
+                println!("cargo:rustc-link-search=native={}", search_path.display());
+            }
+            println!("cargo:rustc-link-lib={}", lib);
         }
     }
 
@@ -286,6 +296,29 @@ fn find_static_lib_path(name: &str, paths: &[PathBuf]) -> Option<PathBuf> {
         let full_path = path.join(&static_name);
         if full_path.exists() {
             return Some(full_path);
+        }
+    }
+    None
+}
+
+/// Find dynamic library path if it exists
+fn find_dynamic_lib_path(name: &str, paths: &[PathBuf]) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let extensions = ["dylib"];
+    #[cfg(target_os = "linux")]
+    let extensions = ["so"];
+    #[cfg(target_os = "windows")]
+    let extensions = ["dll"];
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let extensions: [&str; 0] = [];
+
+    for path in paths {
+        for ext in &extensions {
+            let dynamic_name = format!("lib{}.{}", name, ext);
+            let full_path = path.join(&dynamic_name);
+            if full_path.exists() {
+                return Some(full_path);
+            }
         }
     }
     None

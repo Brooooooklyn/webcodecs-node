@@ -16,11 +16,17 @@ pub mod webcodecs;
 
 // Re-export WebCodecs types at crate root
 pub use webcodecs::{
+    // Video types
     CodecState, EncodedVideoChunk, EncodedVideoChunkInit, EncodedVideoChunkMetadata,
     EncodedVideoChunkType, HardwareAccelerator, VideoColorSpace, VideoDecoder, VideoDecoderConfig,
     VideoDecoderConfigOutput, VideoDecoderSupport, VideoEncoder, VideoEncoderConfig,
     VideoEncoderEncodeOptions, VideoEncoderSupport, VideoFrame, VideoFrameCopyToOptions,
     VideoFrameInit, VideoFrameRect, VideoPixelFormat,
+    // Audio types
+    AudioData, AudioDataCopyToOptions, AudioDataInit, AudioDecoder, AudioDecoderConfig,
+    AudioDecoderConfigOutput, AudioDecoderSupport, AudioEncoder, AudioEncoderConfig,
+    AudioEncoderEncodeOptions, AudioEncoderSupport, AudioSampleFormat, EncodedAudioChunk,
+    EncodedAudioChunkInit, EncodedAudioChunkMetadata, EncodedAudioChunkType,
     // Hardware acceleration utilities
     get_available_hardware_accelerators, get_hardware_accelerators,
     get_preferred_hardware_accelerator, is_hardware_accelerator_available,

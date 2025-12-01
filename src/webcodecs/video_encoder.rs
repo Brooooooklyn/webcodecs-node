@@ -3,10 +3,11 @@
 //! Provides video encoding functionality using FFmpeg.
 //! See: https://developer.mozilla.org/en-US/docs/Web/API/VideoEncoder
 
-use crate::codec::{CodecContext, EncoderConfig, Scaler};
+use crate::codec::{BitrateMode, CodecContext, EncoderConfig, Scaler};
 use crate::ffi::{AVCodecID, AVHWDeviceType, AVPixelFormat};
 use crate::webcodecs::{EncodedVideoChunk, VideoEncoderConfig, VideoFrame};
 use napi::bindgen_prelude::*;
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use std::sync::{Arc, Mutex};
 
@@ -61,6 +62,12 @@ pub struct VideoEncoderSupport {
     pub config: VideoEncoderConfig,
 }
 
+/// Type alias for output callback (takes chunk and metadata)
+type OutputCallback = ThreadsafeFunction<(EncodedVideoChunk, EncodedVideoChunkMetadata)>;
+
+/// Type alias for error callback (takes error message)
+type ErrorCallback = ThreadsafeFunction<String>;
+
 /// Internal encoder state
 struct VideoEncoderInner {
     state: CodecState,
@@ -71,6 +78,10 @@ struct VideoEncoderInner {
     extradata_sent: bool,
     /// Queued output chunks (for synchronous retrieval)
     output_queue: Vec<(EncodedVideoChunk, EncodedVideoChunkMetadata)>,
+    /// Optional output callback (WebCodecs spec compliant mode)
+    output_callback: Option<OutputCallback>,
+    /// Optional error callback (WebCodecs spec compliant mode)
+    error_callback: Option<ErrorCallback>,
 }
 
 /// VideoEncoder - WebCodecs-compliant video encoder
@@ -87,7 +98,7 @@ pub struct VideoEncoder {
 
 #[napi]
 impl VideoEncoder {
-    /// Create a new VideoEncoder
+    /// Create a new VideoEncoder (queue-based mode)
     #[napi(constructor)]
     pub fn new() -> Result<Self> {
         let inner = VideoEncoderInner {
@@ -98,11 +109,60 @@ impl VideoEncoder {
             frame_count: 0,
             extradata_sent: false,
             output_queue: Vec::new(),
+            output_callback: None,
+            error_callback: None,
         };
 
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
         })
+    }
+
+    /// Create a VideoEncoder with callbacks (WebCodecs spec compliant mode)
+    ///
+    /// In this mode, encoded chunks are delivered via the output callback
+    /// instead of being queued for retrieval. Errors are reported via the
+    /// error callback and the encoder transitions to the Closed state.
+    ///
+    /// Example:
+    /// ```javascript
+    /// const encoder = VideoEncoder.withCallbacks(
+    ///   (chunk, metadata) => { /* handle output */ },
+    ///   (error) => { /* handle error */ }
+    /// );
+    /// ```
+    #[napi(factory)]
+    pub fn with_callbacks(
+        output: ThreadsafeFunction<(EncodedVideoChunk, EncodedVideoChunkMetadata)>,
+        error: ThreadsafeFunction<String>,
+    ) -> Result<Self> {
+        let inner = VideoEncoderInner {
+            state: CodecState::Unconfigured,
+            config: None,
+            context: None,
+            scaler: None,
+            frame_count: 0,
+            extradata_sent: false,
+            output_queue: Vec::new(),
+            output_callback: Some(output),
+            error_callback: Some(error),
+        };
+
+        Ok(Self {
+            inner: Arc::new(Mutex::new(inner)),
+        })
+    }
+
+    /// Report an error via callback (if in callback mode) and close the encoder
+    /// Returns true if error was reported via callback, false if should return error
+    fn report_error(inner: &mut VideoEncoderInner, error_msg: &str) -> bool {
+        if let Some(ref callback) = inner.error_callback {
+            callback.call(Ok(error_msg.to_string()), ThreadsafeFunctionCallMode::NonBlocking);
+            inner.state = CodecState::Closed;
+            true
+        } else {
+            false
+        }
     }
 
     /// Get encoder state
@@ -155,6 +215,30 @@ impl VideoEncoder {
             Error::new(Status::GenericFailure, format!("Failed to create encoder: {}", e))
         })?;
 
+        // Parse bitrate mode from config
+        let bitrate_mode = match config.bitrate_mode.as_deref() {
+            Some("constant") => BitrateMode::Constant,
+            Some("variable") => BitrateMode::Variable,
+            Some("quantizer") => BitrateMode::Quantizer,
+            _ => BitrateMode::Constant, // Default to CBR
+        };
+
+        // Parse latency mode: "realtime" = low latency, "quality" = default quality mode
+        let (gop_size, max_b_frames) = match config.latency_mode.as_deref() {
+            Some("realtime") => (10, 0), // Low latency: small GOP, no B-frames
+            _ => (60, 2),                // Quality mode: larger GOP with B-frames
+        };
+
+        // Parse scalability mode (e.g., "L1T1", "L1T2", "L1T3")
+        // Note: Temporal SVC support varies by codec and FFmpeg build
+        let _scalability = config
+            .scalability_mode
+            .as_ref()
+            .and_then(|mode| parse_scalability_mode(mode));
+        // TODO: Apply temporal layer settings when supported by the codec
+        // VP9: Use "ts-layering" option
+        // AV1: Use "temporal-layering" option
+
         // Configure encoder
         let encoder_config = EncoderConfig {
             width: config.width,
@@ -163,11 +247,15 @@ impl VideoEncoder {
             bitrate: config.bitrate.unwrap_or(5_000_000.0) as u64,
             framerate_num: config.framerate.unwrap_or(30.0) as u32,
             framerate_den: 1,
-            gop_size: 60, // 2 seconds at 30fps
-            max_b_frames: 2,
+            gop_size,
+            max_b_frames,
             thread_count: 0, // Auto
             profile: None,
             level: None,
+            bitrate_mode,
+            rc_max_rate: None, // Could be exposed via config later
+            rc_buffer_size: None,
+            crf: None, // Will use codec-specific defaults
         };
 
         context.configure_encoder(&encoder_config).map_err(|e| {
@@ -197,39 +285,60 @@ impl VideoEncoder {
         })?;
 
         if inner.state != CodecState::Configured {
-            return Err(Error::new(
-                Status::GenericFailure,
-                "Encoder not configured",
-            ));
+            let msg = "Encoder not configured";
+            if Self::report_error(&mut inner, msg) {
+                return Ok(());
+            }
+            return Err(Error::new(Status::GenericFailure, msg));
         }
 
         // Get config info first (clone to avoid borrow issues)
-        let (width, height, codec_string) = {
-            let config = inner.config.as_ref().ok_or_else(|| {
-                Error::new(Status::GenericFailure, "No encoder config")
-            })?;
-            (config.width, config.height, config.codec.clone())
+        let (width, height, codec_string) = match inner.config.as_ref() {
+            Some(config) => (config.width, config.height, config.codec.clone()),
+            None => {
+                let msg = "No encoder config";
+                if Self::report_error(&mut inner, msg) {
+                    return Ok(());
+                }
+                return Err(Error::new(Status::GenericFailure, msg));
+            }
         };
 
         // Get frame data from VideoFrame
-        let (internal_frame, needs_conversion) = frame.with_frame(|f| {
+        let (internal_frame, needs_conversion) = match frame.with_frame(|f| {
             let frame_format = f.format();
             let needs_conv = frame_format != AVPixelFormat::Yuv420p
                 || f.width() != width
                 || f.height() != height;
             (f.try_clone(), needs_conv)
-        })?;
+        }) {
+            Ok(result) => result,
+            Err(e) => {
+                let msg = format!("Failed to access frame: {}", e);
+                if Self::report_error(&mut inner, &msg) {
+                    return Ok(());
+                }
+                return Err(e);
+            }
+        };
 
-        let internal_frame = internal_frame.map_err(|e| {
-            Error::new(Status::GenericFailure, format!("Failed to clone frame: {}", e))
-        })?;
+        let internal_frame = match internal_frame {
+            Ok(f) => f,
+            Err(e) => {
+                let msg = format!("Failed to clone frame: {}", e);
+                if Self::report_error(&mut inner, &msg) {
+                    return Ok(());
+                }
+                return Err(Error::new(Status::GenericFailure, msg));
+            }
+        };
 
         // Convert frame if needed
         let mut frame_to_encode = if needs_conversion {
             // Create scaler if needed
             if inner.scaler.is_none() {
                 let src_format = internal_frame.format();
-                let scaler = Scaler::new(
+                match Scaler::new(
                     internal_frame.width(),
                     internal_frame.height(),
                     src_format,
@@ -237,22 +346,44 @@ impl VideoEncoder {
                     height,
                     AVPixelFormat::Yuv420p,
                     crate::codec::scaler::ScaleAlgorithm::Bilinear,
-                ).map_err(|e| {
-                    Error::new(Status::GenericFailure, format!("Failed to create scaler: {}", e))
-                })?;
-                inner.scaler = Some(scaler);
+                ) {
+                    Ok(scaler) => inner.scaler = Some(scaler),
+                    Err(e) => {
+                        let msg = format!("Failed to create scaler: {}", e);
+                        if Self::report_error(&mut inner, &msg) {
+                            return Ok(());
+                        }
+                        return Err(Error::new(Status::GenericFailure, msg));
+                    }
+                }
             }
 
             let scaler = inner.scaler.as_ref().unwrap();
-            scaler.scale_alloc(&internal_frame).map_err(|e| {
-                Error::new(Status::GenericFailure, format!("Failed to scale frame: {}", e))
-            })?
+            match scaler.scale_alloc(&internal_frame) {
+                Ok(scaled) => scaled,
+                Err(e) => {
+                    let msg = format!("Failed to scale frame: {}", e);
+                    if Self::report_error(&mut inner, &msg) {
+                        return Ok(());
+                    }
+                    return Err(Error::new(Status::GenericFailure, msg));
+                }
+            }
         } else {
             internal_frame
         };
 
         // Set frame PTS based on timestamp
-        let pts = frame.timestamp()?;
+        let pts = match frame.timestamp() {
+            Ok(ts) => ts,
+            Err(e) => {
+                let msg = format!("Failed to get frame timestamp: {}", e);
+                if Self::report_error(&mut inner, &msg) {
+                    return Ok(());
+                }
+                return Err(e);
+            }
+        };
         frame_to_encode.set_pts(pts);
 
         // Get extradata before encoding
@@ -264,17 +395,31 @@ impl VideoEncoder {
         };
 
         // Encode the frame
-        let context = inner.context.as_mut().ok_or_else(|| {
-            Error::new(Status::GenericFailure, "No encoder context")
-        })?;
+        let context = match inner.context.as_mut() {
+            Some(ctx) => ctx,
+            None => {
+                let msg = "No encoder context";
+                if Self::report_error(&mut inner, msg) {
+                    return Ok(());
+                }
+                return Err(Error::new(Status::GenericFailure, msg));
+            }
+        };
 
-        let packets = context.encode(Some(&frame_to_encode)).map_err(|e| {
-            Error::new(Status::GenericFailure, format!("Encode failed: {}", e))
-        })?;
+        let packets = match context.encode(Some(&frame_to_encode)) {
+            Ok(pkts) => pkts,
+            Err(e) => {
+                let msg = format!("Encode failed: {}", e);
+                if Self::report_error(&mut inner, &msg) {
+                    return Ok(());
+                }
+                return Err(Error::new(Status::GenericFailure, msg));
+            }
+        };
 
         inner.frame_count += 1;
 
-        // Process output packets and queue them
+        // Process output packets - either call callback or queue them
         for packet in packets {
             let chunk = EncodedVideoChunk::from_packet(&packet);
 
@@ -296,42 +441,69 @@ impl VideoEncoder {
                 }
             };
 
-            inner.output_queue.push((chunk, metadata));
+            // Dispatch output via callback or queue
+            if let Some(ref callback) = inner.output_callback {
+                callback.call(Ok((chunk, metadata)), ThreadsafeFunctionCallMode::NonBlocking);
+            } else {
+                inner.output_queue.push((chunk, metadata));
+            }
         }
 
         Ok(())
     }
 
     /// Flush the encoder and return all remaining chunks
+    /// Returns a Promise that resolves when flushing is complete
     #[napi]
-    pub fn flush(&self) -> Result<()> {
+    pub async fn flush(&self) -> Result<()> {
         let mut inner = self.inner.lock().map_err(|_| {
             Error::new(Status::GenericFailure, "Lock poisoned")
         })?;
 
         if inner.state != CodecState::Configured {
-            return Err(Error::new(
-                Status::GenericFailure,
-                "Encoder not configured",
-            ));
+            let msg = "Encoder not configured";
+            if Self::report_error(&mut inner, msg) {
+                return Ok(());
+            }
+            return Err(Error::new(Status::GenericFailure, msg));
         }
 
-        let context = inner.context.as_mut().ok_or_else(|| {
-            Error::new(Status::GenericFailure, "No encoder context")
-        })?;
+        let context = match inner.context.as_mut() {
+            Some(ctx) => ctx,
+            None => {
+                let msg = "No encoder context";
+                if Self::report_error(&mut inner, msg) {
+                    return Ok(());
+                }
+                return Err(Error::new(Status::GenericFailure, msg));
+            }
+        };
 
         // Flush encoder
-        let packets = context.flush_encoder().map_err(|e| {
-            Error::new(Status::GenericFailure, format!("Flush failed: {}", e))
-        })?;
+        let packets = match context.flush_encoder() {
+            Ok(pkts) => pkts,
+            Err(e) => {
+                let msg = format!("Flush failed: {}", e);
+                if Self::report_error(&mut inner, &msg) {
+                    return Ok(());
+                }
+                return Err(Error::new(Status::GenericFailure, msg));
+            }
+        };
 
-        // Process remaining packets
+        // Process remaining packets - either call callback or queue them
         for packet in packets {
             let chunk = EncodedVideoChunk::from_packet(&packet);
             let metadata = EncodedVideoChunkMetadata {
                 decoder_config: None,
             };
-            inner.output_queue.push((chunk, metadata));
+
+            // Dispatch output via callback or queue
+            if let Some(ref callback) = inner.output_callback {
+                callback.call(Ok((chunk, metadata)), ThreadsafeFunctionCallMode::NonBlocking);
+            } else {
+                inner.output_queue.push((chunk, metadata));
+            }
         }
 
         Ok(())
@@ -418,8 +590,9 @@ impl VideoEncoder {
     }
 
     /// Check if a configuration is supported
+    /// Returns a Promise that resolves with support information
     #[napi]
-    pub fn is_config_supported(config: VideoEncoderConfig) -> Result<VideoEncoderSupport> {
+    pub async fn is_config_supported(config: VideoEncoderConfig) -> Result<VideoEncoderSupport> {
         // Parse codec string
         let codec_id = match parse_codec_string(&config.codec) {
             Ok(id) => id,
@@ -464,4 +637,22 @@ fn parse_codec_string(codec: &str) -> Result<AVCodecID> {
             format!("Unsupported codec: {}", codec),
         ))
     }
+}
+
+/// Parse scalability mode string (e.g., "L1T1", "L1T2", "L1T3")
+/// Returns (spatial_layers, temporal_layers)
+fn parse_scalability_mode(mode: &str) -> Option<(u32, u32)> {
+    let mode_upper = mode.to_uppercase();
+
+    // Parse LxTy format (e.g., L1T1, L1T2, L1T3, L2T1, etc.)
+    if mode_upper.starts_with('L') && mode_upper.contains('T') {
+        let parts: Vec<&str> = mode_upper.split('T').collect();
+        if parts.len() == 2 {
+            let spatial = parts[0].trim_start_matches('L').parse::<u32>().ok()?;
+            let temporal = parts[1].chars().next()?.to_digit(10)?;
+            return Some((spatial, temporal));
+        }
+    }
+
+    None
 }

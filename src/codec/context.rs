@@ -5,24 +5,29 @@
 use crate::ffi::{
     self,
     accessors::{
-        ffctx_get_extradata, ffctx_get_extradata_size, ffctx_get_height, ffctx_get_pix_fmt,
-        ffctx_get_width, ffctx_set_bit_rate, ffctx_set_framerate, ffctx_set_gop_size,
-        ffctx_set_height, ffctx_set_hw_device_ctx, ffctx_set_level, ffctx_set_max_b_frames,
-        ffctx_set_pix_fmt, ffctx_set_profile, ffctx_set_thread_count, ffctx_set_time_base,
-        ffctx_set_width,
+        ffctx_get_extradata, ffctx_get_extradata_size, ffctx_get_frame_size, ffctx_get_height,
+        ffctx_get_pix_fmt, ffctx_get_sample_rate, ffctx_get_width, ffctx_set_bit_rate,
+        ffctx_set_channels, ffctx_set_framerate, ffctx_set_gop_size, ffctx_set_height,
+        ffctx_set_hw_device_ctx, ffctx_set_level, ffctx_set_max_b_frames, ffctx_set_pix_fmt,
+        ffctx_set_profile, ffctx_set_rc_buffer_size, ffctx_set_rc_max_rate, ffctx_set_sample_fmt,
+        ffctx_set_sample_rate, ffctx_set_thread_count, ffctx_set_time_base, ffctx_set_width,
     },
     avcodec::{
         avcodec_alloc_context3, avcodec_find_decoder, avcodec_find_encoder,
         avcodec_find_encoder_by_name, avcodec_flush_buffers, avcodec_free_context, avcodec_open2,
         avcodec_receive_frame, avcodec_receive_packet, avcodec_send_frame, avcodec_send_packet,
     },
+    avutil::{av_opt_set_int, opt_flag},
     error::{AVERROR_EAGAIN, AVERROR_EOF},
     AVCodec, AVCodecContext, AVCodecID, AVHWDeviceType, AVPixelFormat,
 };
 use std::ffi::CString;
 use std::ptr::NonNull;
 
-use super::{CodecError, CodecResult, DecoderConfig, EncoderConfig, Frame, HwDeviceContext, Packet};
+use super::{
+    AudioDecoderConfig, AudioEncoderConfig, BitrateMode, CodecError, CodecResult, DecoderConfig,
+    EncoderConfig, Frame, HwDeviceContext, Packet,
+};
 
 /// Type of codec (encoder or decoder)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,8 +170,59 @@ impl CodecContext {
             // Pixel format
             ffctx_set_pix_fmt(ctx, config.pixel_format.as_raw());
 
-            // Bitrate
-            ffctx_set_bit_rate(ctx, config.bitrate as i64);
+            // Rate control based on bitrate mode
+            match config.bitrate_mode {
+                BitrateMode::Constant => {
+                    // CBR: Set bitrate and optionally rc_max_rate equal to bitrate
+                    ffctx_set_bit_rate(ctx, config.bitrate as i64);
+                    let rc_max = config.rc_max_rate.unwrap_or(config.bitrate);
+                    ffctx_set_rc_max_rate(ctx, rc_max as i64);
+                    if let Some(buf_size) = config.rc_buffer_size {
+                        ffctx_set_rc_buffer_size(ctx, buf_size as i32);
+                    }
+                }
+                BitrateMode::Variable => {
+                    // VBR: Set bitrate with higher rc_max_rate
+                    ffctx_set_bit_rate(ctx, config.bitrate as i64);
+                    let rc_max = config.rc_max_rate.unwrap_or(config.bitrate * 2);
+                    ffctx_set_rc_max_rate(ctx, rc_max as i64);
+                    if let Some(buf_size) = config.rc_buffer_size {
+                        ffctx_set_rc_buffer_size(ctx, buf_size as i32);
+                    }
+                }
+                BitrateMode::Quantizer => {
+                    // CRF/CQ mode: Set bitrate to 0 and use CRF option
+                    ffctx_set_bit_rate(ctx, 0);
+                    let crf_value = config.crf.unwrap_or(23) as i64; // Default CRF 23
+
+                    // Set CRF via av_opt_set_int (works for x264, x265)
+                    let crf_key = CString::new("crf").expect("CString::new failed");
+                    av_opt_set_int(
+                        ctx as *mut std::ffi::c_void,
+                        crf_key.as_ptr(),
+                        crf_value,
+                        opt_flag::SEARCH_CHILDREN,
+                    );
+
+                    // Also try "cq" for VP9/AV1 (constrained quality)
+                    let cq_key = CString::new("cq").expect("CString::new failed");
+                    av_opt_set_int(
+                        ctx as *mut std::ffi::c_void,
+                        cq_key.as_ptr(),
+                        crf_value,
+                        opt_flag::SEARCH_CHILDREN,
+                    );
+
+                    // And "qp" as fallback for some codecs
+                    let qp_key = CString::new("qp").expect("CString::new failed");
+                    av_opt_set_int(
+                        ctx as *mut std::ffi::c_void,
+                        qp_key.as_ptr(),
+                        crf_value,
+                        opt_flag::SEARCH_CHILDREN,
+                    );
+                }
+            }
 
             // Time base (inverse of framerate for encoding)
             ffctx_set_time_base(ctx, config.framerate_den as i32, config.framerate_num as i32);
@@ -190,6 +246,67 @@ impl CodecContext {
             if let Some(level) = config.level {
                 ffctx_set_level(ctx, level);
             }
+        }
+
+        Ok(())
+    }
+
+    /// Configure the audio encoder with the given settings
+    pub fn configure_audio_encoder(&mut self, config: &AudioEncoderConfig) -> CodecResult<()> {
+        if self.codec_type != CodecType::Encoder {
+            return Err(CodecError::InvalidState("Not an encoder context".into()));
+        }
+
+        unsafe {
+            let ctx = self.ptr.as_ptr();
+
+            // Audio parameters
+            ffctx_set_sample_rate(ctx, config.sample_rate as i32);
+            ffctx_set_sample_fmt(ctx, config.sample_format.as_raw());
+            ffctx_set_channels(ctx, config.channels as i32);
+
+            // Bitrate
+            if config.bitrate > 0 {
+                ffctx_set_bit_rate(ctx, config.bitrate as i64);
+            }
+
+            // Threading
+            if config.thread_count > 0 {
+                ffctx_set_thread_count(ctx, config.thread_count as i32);
+            }
+
+            // Time base: 1/sample_rate for audio
+            ffctx_set_time_base(ctx, 1, config.sample_rate as i32);
+        }
+
+        Ok(())
+    }
+
+    /// Configure the audio decoder with the given settings
+    pub fn configure_audio_decoder(&mut self, config: &AudioDecoderConfig) -> CodecResult<()> {
+        if self.codec_type != CodecType::Decoder {
+            return Err(CodecError::InvalidState("Not a decoder context".into()));
+        }
+
+        unsafe {
+            let ctx = self.ptr.as_ptr();
+
+            // Set sample rate and channels if known
+            if config.sample_rate > 0 {
+                ffctx_set_sample_rate(ctx, config.sample_rate as i32);
+            }
+            if config.channels > 0 {
+                ffctx_set_channels(ctx, config.channels as i32);
+            }
+
+            // Threading
+            if config.thread_count > 0 {
+                ffctx_set_thread_count(ctx, config.thread_count as i32);
+            } else {
+                ffctx_set_thread_count(ctx, 0);
+            }
+
+            // TODO: Set extradata if provided
         }
 
         Ok(())
@@ -403,6 +520,16 @@ impl CodecContext {
         }
     }
 
+    /// Get configured sample rate (for audio)
+    pub fn sample_rate(&self) -> u32 {
+        unsafe { ffctx_get_sample_rate(self.as_ptr()) as u32 }
+    }
+
+    /// Get codec frame size (samples per frame for audio)
+    pub fn frame_size(&self) -> u32 {
+        unsafe { ffctx_get_frame_size(self.as_ptr()) as u32 }
+    }
+
     /// Get codec extradata (e.g., SPS/PPS for H.264)
     pub fn extradata(&self) -> Option<&[u8]> {
         unsafe {
@@ -499,5 +626,23 @@ fn hw_encoder_needs_device_context(hw_type: AVHWDeviceType) -> bool {
         AVHWDeviceType::D3d11va => true,
         // Other types - be conservative and try to set device
         _ => true,
+    }
+}
+
+/// Get software encoder name for an audio codec
+pub fn get_audio_encoder_name(codec_id: AVCodecID) -> Option<&'static str> {
+    match codec_id {
+        AVCodecID::Aac => Some("aac"), // Native FFmpeg AAC or libfdk_aac if available
+        AVCodecID::Opus => Some("libopus"),
+        AVCodecID::Mp3 => Some("libmp3lame"),
+        AVCodecID::Flac => Some("flac"),
+        AVCodecID::Vorbis => Some("libvorbis"),
+        AVCodecID::PcmS16le => None, // PCM doesn't need encoder
+        AVCodecID::PcmS16be => None,
+        AVCodecID::PcmF32le => None,
+        AVCodecID::PcmF32be => None,
+        AVCodecID::Ac3 => Some("ac3"),
+        AVCodecID::Alac => Some("alac"),
+        _ => None,
     }
 }

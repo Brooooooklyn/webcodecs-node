@@ -44,41 +44,111 @@ impl AVRational {
 // Codec IDs
 // ============================================================================
 
-/// Supported video codec IDs
+/// Supported codec IDs (video and audio)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AVCodecID {
     None = 0,
+    // Video codecs
+    Mjpeg = 7,    // Motion JPEG
     H264 = 27,
-    Hevc = 173, // H.265
+    Png = 61,     // PNG image
+    Gif = 97,     // GIF image
+    Bmp = 128,    // BMP image
     Vp8 = 139,
     Vp9 = 167,
+    Hevc = 173,   // H.265
+    Webp = 225,   // WebP image
     Av1 = 226,
+    // Audio codecs (starting at 0x10000 = 65536)
+    PcmS16le = 65536,      // PCM signed 16-bit little-endian
+    PcmS16be = 65537,      // PCM signed 16-bit big-endian
+    PcmU16le = 65538,      // PCM unsigned 16-bit little-endian
+    PcmU16be = 65539,      // PCM unsigned 16-bit big-endian
+    PcmS8 = 65540,         // PCM signed 8-bit
+    PcmU8 = 65541,         // PCM unsigned 8-bit
+    PcmF32le = 65557,      // PCM 32-bit float little-endian
+    PcmF32be = 65558,      // PCM 32-bit float big-endian
+    PcmF64le = 65559,      // PCM 64-bit double little-endian
+    PcmF64be = 65560,      // PCM 64-bit double big-endian
+    PcmS32le = 65544,      // PCM signed 32-bit little-endian
+    PcmS32be = 65545,      // PCM signed 32-bit big-endian
+    PcmS24le = 65566,      // PCM signed 24-bit little-endian
+    PcmS24be = 65567,      // PCM signed 24-bit big-endian
+    Mp2 = 86016,           // MPEG Audio Layer 2
+    Mp3 = 86017,           // MPEG Audio Layer 3
+    Aac = 86018,           // Advanced Audio Coding
+    Ac3 = 86019,           // Dolby AC-3
+    Vorbis = 86021,        // Vorbis
+    Flac = 86028,          // Free Lossless Audio Codec
+    Opus = 86076,          // Opus
+    Alac = 86032,          // Apple Lossless
 }
 
 impl AVCodecID {
     /// Convert WebCodecs codec string to AVCodecID
     pub fn from_webcodecs_codec(codec: &str) -> Option<Self> {
+        let codec_lower = codec.to_lowercase();
+
+        // Video codecs
         // H.264/AVC: avc1.PPCCLL or avc3.PPCCLL
-        if codec.starts_with("avc1") || codec.starts_with("avc3") {
+        if codec_lower.starts_with("avc1") || codec_lower.starts_with("avc3") {
             return Some(Self::H264);
         }
         // H.265/HEVC: hev1.P.T.Lxxx or hvc1.P.T.Lxxx
-        if codec.starts_with("hev1") || codec.starts_with("hvc1") {
+        if codec_lower.starts_with("hev1") || codec_lower.starts_with("hvc1") {
             return Some(Self::Hevc);
         }
         // VP8
-        if codec == "vp8" {
+        if codec_lower == "vp8" {
             return Some(Self::Vp8);
         }
         // VP9: vp09.PP.LL.DD or just "vp9"
-        if codec.starts_with("vp09") || codec == "vp9" {
+        if codec_lower.starts_with("vp09") || codec_lower == "vp9" {
             return Some(Self::Vp9);
         }
         // AV1: av01.P.LLT.DD or just "av1"
-        if codec.starts_with("av01") || codec == "av1" {
+        if codec_lower.starts_with("av01") || codec_lower == "av1" {
             return Some(Self::Av1);
         }
+
+        // Audio codecs
+        // AAC: mp4a.40.2 (AAC-LC), mp4a.40.5 (HE-AAC), mp4a.40.29 (HE-AACv2)
+        if codec_lower.starts_with("mp4a.40") || codec_lower == "aac" {
+            return Some(Self::Aac);
+        }
+        // Opus
+        if codec_lower == "opus" {
+            return Some(Self::Opus);
+        }
+        // MP3: mp4a.6b or "mp3"
+        if codec_lower == "mp3" || codec_lower == "mp4a.6b" {
+            return Some(Self::Mp3);
+        }
+        // FLAC
+        if codec_lower == "flac" {
+            return Some(Self::Flac);
+        }
+        // Vorbis
+        if codec_lower == "vorbis" {
+            return Some(Self::Vorbis);
+        }
+        // AC-3
+        if codec_lower == "ac-3" || codec_lower == "ac3" {
+            return Some(Self::Ac3);
+        }
+        // ALAC (Apple Lossless)
+        if codec_lower == "alac" {
+            return Some(Self::Alac);
+        }
+        // PCM formats
+        if codec_lower == "pcm-s16" || codec_lower == "pcm" {
+            return Some(Self::PcmS16le);
+        }
+        if codec_lower == "pcm-f32" {
+            return Some(Self::PcmF32le);
+        }
+
         None
     }
 
@@ -86,12 +156,47 @@ impl AVCodecID {
     pub fn to_webcodecs_codec(&self) -> &'static str {
         match self {
             Self::None => "",
+            // Video
             Self::H264 => "avc1.42001f", // Baseline profile, level 3.1
             Self::Hevc => "hev1.1.6.L93.B0", // Main profile
             Self::Vp8 => "vp8",
             Self::Vp9 => "vp09.00.10.08", // Profile 0, level 1.0, 8-bit
             Self::Av1 => "av01.0.01M.08", // Main profile, level 2.1, 8-bit
+            // Image (not standard WebCodecs but useful for ImageDecoder)
+            Self::Mjpeg => "mjpeg",
+            Self::Png => "png",
+            Self::Gif => "gif",
+            Self::Bmp => "bmp",
+            Self::Webp => "webp",
+            // Audio
+            Self::Aac => "mp4a.40.2",    // AAC-LC
+            Self::Opus => "opus",
+            Self::Mp3 => "mp3",
+            Self::Flac => "flac",
+            Self::Vorbis => "vorbis",
+            Self::Ac3 => "ac-3",
+            Self::Alac => "alac",
+            Self::Mp2 => "mp4a.69",      // MPEG Layer 2
+            Self::PcmS16le | Self::PcmS16be => "pcm-s16",
+            Self::PcmU16le | Self::PcmU16be => "pcm-u16",
+            Self::PcmS8 => "pcm-s8",
+            Self::PcmU8 => "pcm-u8",
+            Self::PcmF32le | Self::PcmF32be => "pcm-f32",
+            Self::PcmF64le | Self::PcmF64be => "pcm-f64",
+            Self::PcmS32le | Self::PcmS32be => "pcm-s32",
+            Self::PcmS24le | Self::PcmS24be => "pcm-s24",
         }
+    }
+
+    /// Check if this is an audio codec
+    pub fn is_audio(&self) -> bool {
+        (*self as c_int) >= 65536
+    }
+
+    /// Check if this is a video codec
+    pub fn is_video(&self) -> bool {
+        let raw = *self as c_int;
+        raw > 0 && raw < 65536
     }
 
     /// Get the raw FFmpeg codec ID value
@@ -180,6 +285,123 @@ impl AVPixelFormat {
     /// Whether this is a hardware pixel format
     pub fn is_hardware(&self) -> bool {
         matches!(self, Self::Videotoolbox | Self::Cuda | Self::Vaapi)
+    }
+}
+
+// ============================================================================
+// Audio Sample Formats
+// ============================================================================
+
+/// Audio sample formats (matches FFmpeg AVSampleFormat)
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AVSampleFormat {
+    None = -1,
+    /// unsigned 8-bit (interleaved)
+    U8 = 0,
+    /// signed 16-bit (interleaved)
+    S16 = 1,
+    /// signed 32-bit (interleaved)
+    S32 = 2,
+    /// float (interleaved)
+    Flt = 3,
+    /// double (interleaved)
+    Dbl = 4,
+    /// unsigned 8-bit (planar)
+    U8p = 5,
+    /// signed 16-bit (planar)
+    S16p = 6,
+    /// signed 32-bit (planar)
+    S32p = 7,
+    /// float (planar) - most common for encoders
+    Fltp = 8,
+    /// double (planar)
+    Dblp = 9,
+    /// signed 64-bit (interleaved)
+    S64 = 10,
+    /// signed 64-bit (planar)
+    S64p = 11,
+}
+
+impl AVSampleFormat {
+    /// Get the raw FFmpeg sample format value
+    pub fn as_raw(&self) -> c_int {
+        *self as c_int
+    }
+
+    /// Check if this format is planar (separate buffers per channel)
+    pub fn is_planar(&self) -> bool {
+        matches!(
+            self,
+            Self::U8p | Self::S16p | Self::S32p | Self::Fltp | Self::Dblp | Self::S64p
+        )
+    }
+
+    /// Get the interleaved version of this format (if planar)
+    pub fn to_interleaved(&self) -> Self {
+        match self {
+            Self::U8p => Self::U8,
+            Self::S16p => Self::S16,
+            Self::S32p => Self::S32,
+            Self::Fltp => Self::Flt,
+            Self::Dblp => Self::Dbl,
+            Self::S64p => Self::S64,
+            other => *other,
+        }
+    }
+
+    /// Get the planar version of this format (if interleaved)
+    pub fn to_planar(&self) -> Self {
+        match self {
+            Self::U8 => Self::U8p,
+            Self::S16 => Self::S16p,
+            Self::S32 => Self::S32p,
+            Self::Flt => Self::Fltp,
+            Self::Dbl => Self::Dblp,
+            Self::S64 => Self::S64p,
+            other => *other,
+        }
+    }
+
+    /// Get bytes per sample for this format
+    pub fn bytes_per_sample(&self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::U8 | Self::U8p => 1,
+            Self::S16 | Self::S16p => 2,
+            Self::S32 | Self::S32p | Self::Flt | Self::Fltp => 4,
+            Self::Dbl | Self::Dblp | Self::S64 | Self::S64p => 8,
+        }
+    }
+
+    /// Convert from WebCodecs AudioSampleFormat string
+    pub fn from_webcodecs_format(format: &str) -> Option<Self> {
+        match format {
+            "u8" => Some(Self::U8),
+            "s16" => Some(Self::S16),
+            "s32" => Some(Self::S32),
+            "f32" => Some(Self::Flt),
+            "u8-planar" => Some(Self::U8p),
+            "s16-planar" => Some(Self::S16p),
+            "s32-planar" => Some(Self::S32p),
+            "f32-planar" => Some(Self::Fltp),
+            _ => None,
+        }
+    }
+
+    /// Convert to WebCodecs AudioSampleFormat string
+    pub fn to_webcodecs_format(&self) -> Option<&'static str> {
+        match self {
+            Self::U8 => Some("u8"),
+            Self::S16 => Some("s16"),
+            Self::S32 => Some("s32"),
+            Self::Flt => Some("f32"),
+            Self::U8p => Some("u8-planar"),
+            Self::S16p => Some("s16-planar"),
+            Self::S32p => Some("s32-planar"),
+            Self::Fltp => Some("f32-planar"),
+            _ => None,
+        }
     }
 }
 
@@ -360,6 +582,26 @@ pub struct SwsContext {
     _marker: PhantomData<(*mut u8, std::marker::PhantomPinned)>,
 }
 
+/// Opaque SwrContext structure (software resampler context for audio)
+#[repr(C)]
+pub struct SwrContext {
+    _opaque: [u8; 0],
+    _marker: PhantomData<(*mut u8, std::marker::PhantomPinned)>,
+}
+
+/// AVChannelLayout structure (audio channel layout - FFmpeg 5.1+)
+///
+/// This is NOT opaque - FFmpeg documents that sizeof(AVChannelLayout) is part
+/// of the public ABI and may be allocated on stack. The struct is 24 bytes:
+/// - order: 4 bytes (enum AVChannelOrder)
+/// - nb_channels: 4 bytes (int)
+/// - u: 8 bytes (union of u64 mask or pointer to AVChannelCustom)
+/// - opaque: 8 bytes (void*)
+#[repr(C, align(8))]
+pub struct AVChannelLayout {
+    _data: [u8; 24],
+}
+
 /// Opaque AVDictionary structure (key-value options)
 #[repr(C)]
 pub struct AVDictionary {
@@ -390,4 +632,49 @@ pub mod pkt_flag {
     pub const DISCARD: c_int = 0x0004;
     pub const TRUSTED: c_int = 0x0008;
     pub const DISPOSABLE: c_int = 0x0010;
+}
+
+/// Legacy channel layout masks (for older FFmpeg versions)
+/// These are bitmasks used by FFmpeg < 5.1 for channel configuration
+pub mod channel_layout {
+    pub const AV_CH_FRONT_LEFT: u64 = 0x00000001;
+    pub const AV_CH_FRONT_RIGHT: u64 = 0x00000002;
+    pub const AV_CH_FRONT_CENTER: u64 = 0x00000004;
+    pub const AV_CH_LOW_FREQUENCY: u64 = 0x00000008;
+    pub const AV_CH_BACK_LEFT: u64 = 0x00000010;
+    pub const AV_CH_BACK_RIGHT: u64 = 0x00000020;
+    pub const AV_CH_BACK_CENTER: u64 = 0x00000100;
+    pub const AV_CH_SIDE_LEFT: u64 = 0x00000200;
+    pub const AV_CH_SIDE_RIGHT: u64 = 0x00000400;
+
+    // Common layouts
+    pub const AV_CH_LAYOUT_MONO: u64 = AV_CH_FRONT_CENTER;
+    pub const AV_CH_LAYOUT_STEREO: u64 = AV_CH_FRONT_LEFT | AV_CH_FRONT_RIGHT;
+    pub const AV_CH_LAYOUT_2_1: u64 = AV_CH_LAYOUT_STEREO | AV_CH_BACK_CENTER;
+    pub const AV_CH_LAYOUT_SURROUND: u64 = AV_CH_LAYOUT_STEREO | AV_CH_FRONT_CENTER;
+    pub const AV_CH_LAYOUT_4POINT0: u64 = AV_CH_LAYOUT_SURROUND | AV_CH_BACK_CENTER;
+    pub const AV_CH_LAYOUT_5POINT0: u64 =
+        AV_CH_LAYOUT_SURROUND | AV_CH_SIDE_LEFT | AV_CH_SIDE_RIGHT;
+    pub const AV_CH_LAYOUT_5POINT1: u64 = AV_CH_LAYOUT_5POINT0 | AV_CH_LOW_FREQUENCY;
+    pub const AV_CH_LAYOUT_7POINT1: u64 =
+        AV_CH_LAYOUT_5POINT1 | AV_CH_BACK_LEFT | AV_CH_BACK_RIGHT;
+
+    /// Get the number of channels for a given channel layout
+    pub fn count_channels(layout: u64) -> u32 {
+        layout.count_ones()
+    }
+
+    /// Get a default channel layout for the given number of channels
+    pub fn default_for_channels(channels: u32) -> u64 {
+        match channels {
+            1 => AV_CH_LAYOUT_MONO,
+            2 => AV_CH_LAYOUT_STEREO,
+            3 => AV_CH_LAYOUT_SURROUND,
+            4 => AV_CH_LAYOUT_4POINT0,
+            5 => AV_CH_LAYOUT_5POINT0,
+            6 => AV_CH_LAYOUT_5POINT1,
+            8 => AV_CH_LAYOUT_7POINT1,
+            _ => 0,
+        }
+    }
 }

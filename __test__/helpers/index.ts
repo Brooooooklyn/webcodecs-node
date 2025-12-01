@@ -7,3 +7,4 @@
 export * from './frame-generator.js'
 export * from './frame-comparator.js'
 export * from './codec-matrix.js'
+export * from './audio-generator.js'

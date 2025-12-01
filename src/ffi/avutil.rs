@@ -201,6 +201,47 @@ extern "C" {
 
     /// Get the current logging level
     pub fn av_log_get_level() -> c_int;
+
+    // ========================================================================
+    // Option Setting (av_opt_set family)
+    // ========================================================================
+
+    /// Set an option by string value
+    ///
+    /// # Safety
+    /// - `obj` must be a valid pointer to an AVClass-based object (e.g., AVCodecContext)
+    /// - `name` must be a valid null-terminated C string
+    /// - `val` must be a valid null-terminated C string
+    pub fn av_opt_set(
+        obj: *mut c_void,
+        name: *const c_char,
+        val: *const c_char,
+        search_flags: c_int,
+    ) -> c_int;
+
+    /// Set an option by integer value
+    ///
+    /// # Safety
+    /// - `obj` must be a valid pointer to an AVClass-based object
+    /// - `name` must be a valid null-terminated C string
+    pub fn av_opt_set_int(
+        obj: *mut c_void,
+        name: *const c_char,
+        val: i64,
+        search_flags: c_int,
+    ) -> c_int;
+
+    /// Set an option by double value
+    ///
+    /// # Safety
+    /// - `obj` must be a valid pointer to an AVClass-based object
+    /// - `name` must be a valid null-terminated C string
+    pub fn av_opt_set_double(
+        obj: *mut c_void,
+        name: *const c_char,
+        val: f64,
+        search_flags: c_int,
+    ) -> c_int;
 }
 
 // ============================================================================
@@ -259,4 +300,24 @@ pub mod rounding {
 /// Get the size in bytes needed for a video frame
 pub fn image_buffer_size(format: AVPixelFormat, width: i32, height: i32) -> i32 {
     unsafe { av_image_get_buffer_size(format.as_raw(), width, height, 1) }
+}
+
+// ============================================================================
+// Option Search Flags (for av_opt_set family)
+// ============================================================================
+
+pub mod opt_flag {
+    use std::os::raw::c_int;
+
+    /// Search in possible children of the object first
+    pub const SEARCH_CHILDREN: c_int = 1;
+
+    /// The obj passed is an AVClass, not a struct with AVClass* as first member
+    pub const SEARCH_FAKE_OBJ: c_int = 2;
+
+    /// Allow setting of values that otherwise would result in errors
+    pub const ALLOW_NULL: c_int = 4;
+
+    /// The option passed is a multi-component option
+    pub const MULTI_COMPONENT_RANGE: c_int = 4096;
 }

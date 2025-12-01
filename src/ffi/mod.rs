@@ -8,6 +8,7 @@ pub mod avcodec;
 pub mod avutil;
 pub mod error;
 pub mod hwaccel;
+pub mod swresample;
 pub mod swscale;
 pub mod types;
 

@@ -253,6 +253,34 @@ impl VideoFrame {
         self.with_inner(|inner| Ok(inner.display_height))
     }
 
+    /// Get the coded rect (the region containing valid pixel data)
+    /// For now, this is the full coded dimensions starting at (0, 0)
+    #[napi(getter)]
+    pub fn coded_rect(&self) -> Result<VideoFrameRect> {
+        self.with_inner(|inner| {
+            Ok(VideoFrameRect {
+                x: 0,
+                y: 0,
+                width: inner.frame.width(),
+                height: inner.frame.height(),
+            })
+        })
+    }
+
+    /// Get the visible rect (the region of coded data that should be displayed)
+    /// For now, this is the same as coded_rect (no cropping support yet)
+    #[napi(getter)]
+    pub fn visible_rect(&self) -> Result<VideoFrameRect> {
+        self.with_inner(|inner| {
+            Ok(VideoFrameRect {
+                x: 0,
+                y: 0,
+                width: inner.display_width,
+                height: inner.display_height,
+            })
+        })
+    }
+
     /// Get the presentation timestamp in microseconds
     #[napi(getter)]
     pub fn timestamp(&self) -> Result<i64> {
@@ -291,9 +319,23 @@ impl VideoFrame {
     }
 
     /// Copy frame data to a Uint8Array
+    ///
+    /// Options can specify target format and region (rect).
+    /// Note: rect parameter is not yet implemented - full frame is always copied.
     #[napi]
-    pub fn copy_to(&self, destination: Uint8Array) -> Result<()> {
+    pub fn copy_to(
+        &self,
+        destination: Uint8Array,
+        options: Option<VideoFrameCopyToOptions>,
+    ) -> Result<()> {
         self.with_inner_mut(|inner| {
+            // Note: options.rect is accepted but not yet implemented
+            // When rect is specified but not supported, we copy the full frame
+            if options.as_ref().and_then(|o| o.rect.as_ref()).is_some() {
+                // Log that rect is not yet implemented (silently proceed with full copy)
+                // In future, we could use FFmpeg's crop filter here
+            }
+
             let size = Self::calculate_buffer_size(
                 VideoPixelFormat::from_av_format(inner.frame.format())
                     .unwrap_or(VideoPixelFormat::I420),

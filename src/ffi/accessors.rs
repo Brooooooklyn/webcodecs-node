@@ -56,6 +56,26 @@ extern "C" {
     pub fn ffctx_get_extradata_size(ctx: *const AVCodecContext) -> c_int;
 
     // ========================================================================
+    // AVCodecContext Audio Setters
+    // ========================================================================
+
+    pub fn ffctx_set_sample_rate(ctx: *mut AVCodecContext, sample_rate: c_int);
+    pub fn ffctx_set_sample_fmt(ctx: *mut AVCodecContext, sample_fmt: c_int);
+    pub fn ffctx_set_channels(ctx: *mut AVCodecContext, channels: c_int);
+    pub fn ffctx_set_channel_layout(ctx: *mut AVCodecContext, channel_layout: u64);
+    pub fn ffctx_set_frame_size(ctx: *mut AVCodecContext, frame_size: c_int);
+
+    // ========================================================================
+    // AVCodecContext Audio Getters
+    // ========================================================================
+
+    pub fn ffctx_get_sample_rate(ctx: *const AVCodecContext) -> c_int;
+    pub fn ffctx_get_sample_fmt(ctx: *const AVCodecContext) -> c_int;
+    pub fn ffctx_get_channels(ctx: *const AVCodecContext) -> c_int;
+    pub fn ffctx_get_channel_layout(ctx: *const AVCodecContext) -> u64;
+    pub fn ffctx_get_frame_size(ctx: *const AVCodecContext) -> c_int;
+
+    // ========================================================================
     // AVFrame Setters
     // ========================================================================
 
@@ -95,12 +115,39 @@ extern "C" {
     pub fn ffframe_get_color_range(frame: *const AVFrame) -> c_int;
 
     // ========================================================================
+    // AVFrame Audio Setters
+    // ========================================================================
+
+    pub fn ffframe_set_nb_samples(frame: *mut AVFrame, nb_samples: c_int);
+    pub fn ffframe_set_sample_rate(frame: *mut AVFrame, sample_rate: c_int);
+    pub fn ffframe_set_channels(frame: *mut AVFrame, channels: c_int);
+    pub fn ffframe_set_channel_layout(frame: *mut AVFrame, channel_layout: u64);
+
+    // ========================================================================
+    // AVFrame Audio Getters
+    // ========================================================================
+
+    pub fn ffframe_get_nb_samples(frame: *const AVFrame) -> c_int;
+    pub fn ffframe_get_sample_rate(frame: *const AVFrame) -> c_int;
+    pub fn ffframe_get_channels(frame: *const AVFrame) -> c_int;
+    pub fn ffframe_get_channel_layout(frame: *const AVFrame) -> u64;
+
+    // ========================================================================
     // AVFrame Data Access
     // ========================================================================
 
     pub fn ffframe_data(frame: *mut AVFrame, plane: c_int) -> *mut u8;
     pub fn ffframe_data_const(frame: *const AVFrame, plane: c_int) -> *const u8;
     pub fn ffframe_linesize(frame: *const AVFrame, plane: c_int) -> c_int;
+
+    // ========================================================================
+    // AVFrame Audio Data Access (extended_data for planar audio)
+    // ========================================================================
+
+    pub fn ffframe_get_extended_data(frame: *mut AVFrame) -> *mut *mut u8;
+    pub fn ffframe_get_extended_data_const(frame: *const AVFrame) -> *const *const u8;
+    pub fn ffframe_extended_data_plane(frame: *mut AVFrame, plane: c_int) -> *mut u8;
+    pub fn ffframe_set_extended_data(frame: *mut AVFrame, extended_data: *mut *mut u8);
 
     // ========================================================================
     // AVPacket Getters
@@ -154,6 +201,35 @@ extern "C" {
         pix_fmt: c_int,
         width: c_int,
         height: c_int,
+        align: c_int,
+    ) -> c_int;
+
+    // ========================================================================
+    // Audio Utility Functions
+    // ========================================================================
+
+    /// Get bytes per sample for a given sample format
+    pub fn ff_get_bytes_per_sample(sample_fmt: c_int) -> c_int;
+
+    /// Check if sample format is planar
+    pub fn ff_sample_fmt_is_planar(sample_fmt: c_int) -> c_int;
+
+    /// Get buffer size required for audio samples
+    pub fn ff_get_audio_buffer_size(
+        channels: c_int,
+        nb_samples: c_int,
+        sample_fmt: c_int,
+        align: c_int,
+    ) -> c_int;
+
+    /// Fill audio data pointers and linesize for packed data
+    pub fn ff_samples_fill_arrays(
+        audio_data: *mut *mut u8,
+        linesize: *mut c_int,
+        buf: *const u8,
+        channels: c_int,
+        nb_samples: c_int,
+        sample_fmt: c_int,
         align: c_int,
     ) -> c_int;
 }

@@ -41,3 +41,5 @@ opt-level = 0
 default = []
 # Enable hardware acceleration (requires platform-specific FFmpeg build)
 hwaccel = []
+# Use FFmpeg 5.1+ APIs (AVChannelLayout instead of legacy channel layout)
+ffmpeg_5_1 = []

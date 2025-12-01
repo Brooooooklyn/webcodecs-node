@@ -12,10 +12,15 @@ use crate::ffi::{
         ffframe_set_color_range, ffframe_set_color_trc, ffframe_set_colorspace,
         ffframe_set_duration, ffframe_set_format, ffframe_set_height, ffframe_set_pts,
         ffframe_set_width,
+        // Audio accessors
+        ffframe_get_nb_samples, ffframe_get_sample_rate, ffframe_get_channels,
+        ffframe_get_channel_layout, ffframe_set_nb_samples, ffframe_set_sample_rate,
+        ffframe_set_channels, ffframe_set_channel_layout, ffframe_extended_data_plane,
+        ff_get_audio_buffer_size,
     },
     avutil::{av_frame_alloc, av_frame_clone, av_frame_free, av_frame_get_buffer, av_frame_unref},
     AVColorPrimaries, AVColorRange, AVColorSpace, AVColorTransferCharacteristic, AVFrame,
-    AVPixelFormat, AVPictureType,
+    AVPixelFormat, AVPictureType, AVSampleFormat,
 };
 use std::ptr::NonNull;
 
@@ -35,7 +40,7 @@ impl Frame {
             .ok_or(CodecError::AllocationFailed("AVFrame"))
     }
 
-    /// Allocate a frame with buffer for the given format and dimensions
+    /// Allocate a frame with buffer for the given video format and dimensions
     pub fn new_video(
         width: u32,
         height: u32,
@@ -46,6 +51,29 @@ impl Frame {
         unsafe {
             ffframe_set_width(frame.as_mut_ptr(), width as i32);
             ffframe_set_height(frame.as_mut_ptr(), height as i32);
+            ffframe_set_format(frame.as_mut_ptr(), format.as_raw());
+        }
+
+        // Allocate buffer with 32-byte alignment for SIMD
+        let ret = unsafe { av_frame_get_buffer(frame.as_mut_ptr(), 32) };
+        ffi::check_error(ret)?;
+
+        Ok(frame)
+    }
+
+    /// Allocate a frame with buffer for audio samples
+    pub fn new_audio(
+        nb_samples: u32,
+        channels: u32,
+        sample_rate: u32,
+        format: AVSampleFormat,
+    ) -> Result<Self, CodecError> {
+        let mut frame = Self::new()?;
+
+        unsafe {
+            ffframe_set_nb_samples(frame.as_mut_ptr(), nb_samples as i32);
+            ffframe_set_channels(frame.as_mut_ptr(), channels as i32);
+            ffframe_set_sample_rate(frame.as_mut_ptr(), sample_rate as i32);
             ffframe_set_format(frame.as_mut_ptr(), format.as_raw());
         }
 
@@ -251,6 +279,111 @@ impl Frame {
     }
 
     // ========================================================================
+    // Audio Properties
+    // ========================================================================
+
+    /// Get number of audio samples per channel
+    #[inline]
+    pub fn nb_samples(&self) -> u32 {
+        unsafe { ffframe_get_nb_samples(self.as_ptr()) as u32 }
+    }
+
+    /// Set number of audio samples per channel
+    #[inline]
+    pub fn set_nb_samples(&mut self, nb_samples: u32) {
+        unsafe { ffframe_set_nb_samples(self.as_mut_ptr(), nb_samples as i32) }
+    }
+
+    /// Get audio sample rate in Hz
+    #[inline]
+    pub fn sample_rate(&self) -> u32 {
+        unsafe { ffframe_get_sample_rate(self.as_ptr()) as u32 }
+    }
+
+    /// Set audio sample rate
+    #[inline]
+    pub fn set_sample_rate(&mut self, sample_rate: u32) {
+        unsafe { ffframe_set_sample_rate(self.as_mut_ptr(), sample_rate as i32) }
+    }
+
+    /// Get number of audio channels
+    #[inline]
+    pub fn channels(&self) -> u32 {
+        unsafe { ffframe_get_channels(self.as_ptr()) as u32 }
+    }
+
+    /// Set number of audio channels
+    #[inline]
+    pub fn set_channels(&mut self, channels: u32) {
+        unsafe { ffframe_set_channels(self.as_mut_ptr(), channels as i32) }
+    }
+
+    /// Get audio channel layout mask
+    #[inline]
+    pub fn channel_layout(&self) -> u64 {
+        unsafe { ffframe_get_channel_layout(self.as_ptr()) }
+    }
+
+    /// Set audio channel layout mask
+    #[inline]
+    pub fn set_channel_layout(&mut self, layout: u64) {
+        unsafe { ffframe_set_channel_layout(self.as_mut_ptr(), layout) }
+    }
+
+    /// Get audio sample format
+    pub fn sample_format(&self) -> AVSampleFormat {
+        let fmt = unsafe { ffframe_get_format(self.as_ptr()) };
+        match fmt {
+            0 => AVSampleFormat::U8,
+            1 => AVSampleFormat::S16,
+            2 => AVSampleFormat::S32,
+            3 => AVSampleFormat::Flt,
+            4 => AVSampleFormat::Dbl,
+            5 => AVSampleFormat::U8p,
+            6 => AVSampleFormat::S16p,
+            7 => AVSampleFormat::S32p,
+            8 => AVSampleFormat::Fltp,
+            9 => AVSampleFormat::Dblp,
+            10 => AVSampleFormat::S64,
+            11 => AVSampleFormat::S64p,
+            _ => AVSampleFormat::None,
+        }
+    }
+
+    /// Set audio sample format
+    pub fn set_sample_format(&mut self, format: AVSampleFormat) {
+        unsafe { ffframe_set_format(self.as_mut_ptr(), format.as_raw()) }
+    }
+
+    /// Check if this is an audio frame (has samples but no dimensions)
+    #[inline]
+    pub fn is_audio(&self) -> bool {
+        self.nb_samples() > 0 && self.width() == 0 && self.height() == 0
+    }
+
+    /// Check if this is a video frame (has dimensions)
+    #[inline]
+    pub fn is_video(&self) -> bool {
+        self.width() > 0 && self.height() > 0
+    }
+
+    /// Get the buffer size needed for audio data
+    pub fn audio_buffer_size(&self) -> usize {
+        if !self.is_audio() {
+            return 0;
+        }
+        let size = unsafe {
+            ff_get_audio_buffer_size(
+                self.channels() as i32,
+                self.nb_samples() as i32,
+                self.sample_format().as_raw(),
+                1, // alignment
+            )
+        };
+        size.max(0) as usize
+    }
+
+    // ========================================================================
     // Data Access
     // ========================================================================
 
@@ -387,6 +520,134 @@ impl Frame {
         }
 
         Ok(offset)
+    }
+
+    // ========================================================================
+    // Audio Data Access
+    // ========================================================================
+
+    /// Get pointer to audio channel data (for planar formats)
+    ///
+    /// For planar formats, each channel has its own buffer.
+    /// For interleaved formats, all data is in channel 0.
+    pub fn audio_data(&self, channel: usize) -> *const u8 {
+        unsafe { ffframe_extended_data_plane(self.ptr.as_ptr() as *mut _, channel as i32) as *const u8 }
+    }
+
+    /// Get mutable pointer to audio channel data
+    pub fn audio_data_mut(&mut self, channel: usize) -> *mut u8 {
+        unsafe { ffframe_extended_data_plane(self.as_mut_ptr(), channel as i32) }
+    }
+
+    /// Get audio channel data as a slice (for planar formats)
+    ///
+    /// Returns None if the channel doesn't exist or has no data
+    pub fn audio_channel_data(&self, channel: usize) -> Option<&[u8]> {
+        if !self.is_audio() {
+            return None;
+        }
+
+        let format = self.sample_format();
+        let channels = self.channels() as usize;
+        let nb_samples = self.nb_samples() as usize;
+
+        // For planar formats, each channel has separate data
+        // For interleaved formats, all data is in channel 0
+        if format.is_planar() {
+            if channel >= channels {
+                return None;
+            }
+        } else if channel != 0 {
+            return None;
+        }
+
+        let ptr = self.audio_data(channel);
+        if ptr.is_null() {
+            return None;
+        }
+
+        let bytes_per_sample = format.bytes_per_sample();
+        let size = if format.is_planar() {
+            nb_samples * bytes_per_sample
+        } else {
+            nb_samples * bytes_per_sample * channels
+        };
+
+        Some(unsafe { std::slice::from_raw_parts(ptr, size) })
+    }
+
+    /// Get mutable audio channel data as a slice
+    pub fn audio_channel_data_mut(&mut self, channel: usize) -> Option<&mut [u8]> {
+        if !self.is_audio() {
+            return None;
+        }
+
+        let format = self.sample_format();
+        let channels = self.channels() as usize;
+        let nb_samples = self.nb_samples() as usize;
+
+        if format.is_planar() {
+            if channel >= channels {
+                return None;
+            }
+        } else if channel != 0 {
+            return None;
+        }
+
+        let ptr = self.audio_data_mut(channel);
+        if ptr.is_null() {
+            return None;
+        }
+
+        let bytes_per_sample = format.bytes_per_sample();
+        let size = if format.is_planar() {
+            nb_samples * bytes_per_sample
+        } else {
+            nb_samples * bytes_per_sample * channels
+        };
+
+        Some(unsafe { std::slice::from_raw_parts_mut(ptr, size) })
+    }
+
+    /// Copy audio data to a contiguous interleaved buffer
+    ///
+    /// Converts planar data to interleaved format if necessary
+    pub fn copy_audio_to_buffer(&self, buffer: &mut [u8]) -> Result<usize, CodecError> {
+        if !self.is_audio() {
+            return Err(CodecError::InvalidConfig("Not an audio frame".into()));
+        }
+
+        let format = self.sample_format();
+        let channels = self.channels() as usize;
+        let nb_samples = self.nb_samples() as usize;
+        let bytes_per_sample = format.bytes_per_sample();
+        let total_size = nb_samples * channels * bytes_per_sample;
+
+        if buffer.len() < total_size {
+            return Err(CodecError::InvalidConfig("Buffer too small".into()));
+        }
+
+        if format.is_planar() {
+            // Convert planar to interleaved
+            for sample in 0..nb_samples {
+                for ch in 0..channels {
+                    let src_offset = sample * bytes_per_sample;
+                    let dst_offset = (sample * channels + ch) * bytes_per_sample;
+
+                    if let Some(ch_data) = self.audio_channel_data(ch) {
+                        buffer[dst_offset..dst_offset + bytes_per_sample]
+                            .copy_from_slice(&ch_data[src_offset..src_offset + bytes_per_sample]);
+                    }
+                }
+            }
+        } else {
+            // Already interleaved, just copy
+            if let Some(data) = self.audio_channel_data(0) {
+                buffer[..total_size].copy_from_slice(&data[..total_size]);
+            }
+        }
+
+        Ok(total_size)
     }
 
     // ========================================================================

@@ -10,6 +10,8 @@
 #include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/samplefmt.h>
 
 /* ============================================================================
  * AVCodecContext Setters
@@ -475,6 +477,238 @@ int ffhwframes_get_width(AVBufferRef* ref) {
 int ffhwframes_get_height(AVBufferRef* ref) {
     AVHWFramesContext* ctx = (AVHWFramesContext*)ref->data;
     return ctx->height;
+}
+
+/* ============================================================================
+ * Audio-specific AVCodecContext Setters
+ * ============================================================================ */
+
+void ffctx_set_sample_rate(AVCodecContext* ctx, int sample_rate) {
+    ctx->sample_rate = sample_rate;
+}
+
+void ffctx_set_sample_fmt(AVCodecContext* ctx, int sample_fmt) {
+    ctx->sample_fmt = sample_fmt;
+}
+
+void ffctx_set_channels(AVCodecContext* ctx, int channels) {
+#if LIBAVCODEC_VERSION_MAJOR >= 60
+    // FFmpeg 6.0+ uses ch_layout
+    av_channel_layout_default(&ctx->ch_layout, channels);
+#elif LIBAVCODEC_VERSION_MAJOR >= 59 && LIBAVCODEC_VERSION_MINOR >= 24
+    // FFmpeg 5.1+ - has both but channels is deprecated
+    av_channel_layout_default(&ctx->ch_layout, channels);
+#else
+    // Older FFmpeg
+    ctx->channels = channels;
+    ctx->channel_layout = av_get_default_channel_layout(channels);
+#endif
+}
+
+void ffctx_set_channel_layout(AVCodecContext* ctx, uint64_t channel_layout) {
+#if LIBAVCODEC_VERSION_MAJOR >= 60
+    // FFmpeg 6.0+ uses ch_layout
+    av_channel_layout_from_mask(&ctx->ch_layout, channel_layout);
+#elif LIBAVCODEC_VERSION_MAJOR >= 59 && LIBAVCODEC_VERSION_MINOR >= 24
+    // FFmpeg 5.1+
+    av_channel_layout_from_mask(&ctx->ch_layout, channel_layout);
+#else
+    // Older FFmpeg
+    ctx->channel_layout = channel_layout;
+    ctx->channels = av_get_channel_layout_nb_channels(channel_layout);
+#endif
+}
+
+void ffctx_set_frame_size(AVCodecContext* ctx, int frame_size) {
+    ctx->frame_size = frame_size;
+}
+
+/* ============================================================================
+ * Audio-specific AVCodecContext Getters
+ * ============================================================================ */
+
+int ffctx_get_sample_rate(const AVCodecContext* ctx) {
+    return ctx->sample_rate;
+}
+
+int ffctx_get_sample_fmt(const AVCodecContext* ctx) {
+    return ctx->sample_fmt;
+}
+
+int ffctx_get_channels(const AVCodecContext* ctx) {
+#if LIBAVCODEC_VERSION_MAJOR >= 60
+    return ctx->ch_layout.nb_channels;
+#elif LIBAVCODEC_VERSION_MAJOR >= 59 && LIBAVCODEC_VERSION_MINOR >= 24
+    return ctx->ch_layout.nb_channels;
+#else
+    return ctx->channels;
+#endif
+}
+
+uint64_t ffctx_get_channel_layout(const AVCodecContext* ctx) {
+#if LIBAVCODEC_VERSION_MAJOR >= 60
+    // FFmpeg 6.0+ - extract mask from ch_layout
+    if (ctx->ch_layout.order == AV_CHANNEL_ORDER_NATIVE) {
+        return ctx->ch_layout.u.mask;
+    }
+    // For other orders, construct a default layout and return its mask
+    AVChannelLayout default_layout = {0};
+    av_channel_layout_default(&default_layout, ctx->ch_layout.nb_channels);
+    uint64_t mask = default_layout.u.mask;
+    av_channel_layout_uninit(&default_layout);
+    return mask;
+#elif LIBAVCODEC_VERSION_MAJOR >= 59 && LIBAVCODEC_VERSION_MINOR >= 24
+    // FFmpeg 5.1+
+    if (ctx->ch_layout.order == AV_CHANNEL_ORDER_NATIVE) {
+        return ctx->ch_layout.u.mask;
+    }
+    AVChannelLayout default_layout = {0};
+    av_channel_layout_default(&default_layout, ctx->ch_layout.nb_channels);
+    uint64_t mask = default_layout.u.mask;
+    av_channel_layout_uninit(&default_layout);
+    return mask;
+#else
+    return ctx->channel_layout;
+#endif
+}
+
+int ffctx_get_frame_size(const AVCodecContext* ctx) {
+    return ctx->frame_size;
+}
+
+/* ============================================================================
+ * Audio-specific AVFrame Setters
+ * ============================================================================ */
+
+void ffframe_set_nb_samples(AVFrame* frame, int nb_samples) {
+    frame->nb_samples = nb_samples;
+}
+
+void ffframe_set_sample_rate(AVFrame* frame, int sample_rate) {
+    frame->sample_rate = sample_rate;
+}
+
+void ffframe_set_channels(AVFrame* frame, int channels) {
+#if LIBAVUTIL_VERSION_MAJOR >= 58
+    // FFmpeg 6.0+ uses ch_layout
+    av_channel_layout_default(&frame->ch_layout, channels);
+#elif LIBAVUTIL_VERSION_MAJOR >= 57 && LIBAVUTIL_VERSION_MINOR >= 24
+    // FFmpeg 5.1+
+    av_channel_layout_default(&frame->ch_layout, channels);
+#else
+    // Older FFmpeg
+    frame->channels = channels;
+    frame->channel_layout = av_get_default_channel_layout(channels);
+#endif
+}
+
+void ffframe_set_channel_layout(AVFrame* frame, uint64_t channel_layout) {
+#if LIBAVUTIL_VERSION_MAJOR >= 58
+    // FFmpeg 6.0+ uses ch_layout
+    av_channel_layout_from_mask(&frame->ch_layout, channel_layout);
+#elif LIBAVUTIL_VERSION_MAJOR >= 57 && LIBAVUTIL_VERSION_MINOR >= 24
+    // FFmpeg 5.1+
+    av_channel_layout_from_mask(&frame->ch_layout, channel_layout);
+#else
+    // Older FFmpeg
+    frame->channel_layout = channel_layout;
+    frame->channels = av_get_channel_layout_nb_channels(channel_layout);
+#endif
+}
+
+/* ============================================================================
+ * Audio-specific AVFrame Getters
+ * ============================================================================ */
+
+int ffframe_get_nb_samples(const AVFrame* frame) {
+    return frame->nb_samples;
+}
+
+int ffframe_get_sample_rate(const AVFrame* frame) {
+    return frame->sample_rate;
+}
+
+int ffframe_get_channels(const AVFrame* frame) {
+#if LIBAVUTIL_VERSION_MAJOR >= 58
+    return frame->ch_layout.nb_channels;
+#elif LIBAVUTIL_VERSION_MAJOR >= 57 && LIBAVUTIL_VERSION_MINOR >= 24
+    return frame->ch_layout.nb_channels;
+#else
+    return frame->channels;
+#endif
+}
+
+uint64_t ffframe_get_channel_layout(const AVFrame* frame) {
+#if LIBAVUTIL_VERSION_MAJOR >= 58
+    // FFmpeg 6.0+ - extract mask from ch_layout
+    if (frame->ch_layout.order == AV_CHANNEL_ORDER_NATIVE) {
+        return frame->ch_layout.u.mask;
+    }
+    // For other orders, construct a default layout and return its mask
+    AVChannelLayout default_layout = {0};
+    av_channel_layout_default(&default_layout, frame->ch_layout.nb_channels);
+    uint64_t mask = default_layout.u.mask;
+    av_channel_layout_uninit(&default_layout);
+    return mask;
+#elif LIBAVUTIL_VERSION_MAJOR >= 57 && LIBAVUTIL_VERSION_MINOR >= 24
+    // FFmpeg 5.1+
+    if (frame->ch_layout.order == AV_CHANNEL_ORDER_NATIVE) {
+        return frame->ch_layout.u.mask;
+    }
+    AVChannelLayout default_layout = {0};
+    av_channel_layout_default(&default_layout, frame->ch_layout.nb_channels);
+    uint64_t mask = default_layout.u.mask;
+    av_channel_layout_uninit(&default_layout);
+    return mask;
+#else
+    return frame->channel_layout;
+#endif
+}
+
+/* ============================================================================
+ * Audio Frame Data Access (extended_data for planar audio)
+ * ============================================================================ */
+
+uint8_t** ffframe_get_extended_data(AVFrame* frame) {
+    return frame->extended_data;
+}
+
+const uint8_t* const* ffframe_get_extended_data_const(const AVFrame* frame) {
+    return (const uint8_t* const*)frame->extended_data;
+}
+
+uint8_t* ffframe_extended_data_plane(AVFrame* frame, int plane) {
+    if (frame->extended_data == NULL) {
+        return NULL;
+    }
+    return frame->extended_data[plane];
+}
+
+void ffframe_set_extended_data(AVFrame* frame, uint8_t** extended_data) {
+    frame->extended_data = extended_data;
+}
+
+/* ============================================================================
+ * Audio Utility Functions
+ * ============================================================================ */
+
+int ff_get_bytes_per_sample(int sample_fmt) {
+    return av_get_bytes_per_sample(sample_fmt);
+}
+
+int ff_sample_fmt_is_planar(int sample_fmt) {
+    return av_sample_fmt_is_planar(sample_fmt);
+}
+
+int ff_get_audio_buffer_size(int channels, int nb_samples, int sample_fmt, int align) {
+    return av_samples_get_buffer_size(NULL, channels, nb_samples, sample_fmt, align);
+}
+
+int ff_samples_fill_arrays(uint8_t** audio_data, int* linesize,
+                           const uint8_t* buf, int channels,
+                           int nb_samples, int sample_fmt, int align) {
+    return av_samples_fill_arrays(audio_data, linesize, buf, channels,
+                                  nb_samples, sample_fmt, align);
 }
 
 /* ============================================================================

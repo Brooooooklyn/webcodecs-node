@@ -1,12 +1,12 @@
 {
-  "name": "@napi-rs/package-template-pnpm",
-  "version": "1.1.1",
-  "description": "Template project for writing node package with napi-rs",
+  "name": "@napi-rs/webcodec",
+  "version": "0.0.0",
+  "description": "WebCodecs API implementation for Node.js using FFmpeg",
   "main": "index.js",
   "types": "index.d.ts",
   "browser": "browser.js",
   "repository": {
-    "url": "git+ssh://git@github.com/napi-rs/package-template-pnpm.git",
+    "url": "git+ssh://git@github.com/Brooooooklyn/webcodec-node.git",
     "type": "git"
   },
   "license": "MIT",
@@ -24,22 +24,14 @@
     "browser.js"
   ],
   "napi": {
-    "binaryName": "package-template",
+    "binaryName": "webcodec",
     "targets": [
       "x86_64-apple-darwin",
       "aarch64-apple-darwin",
       "x86_64-unknown-linux-gnu",
       "x86_64-pc-windows-msvc",
-      "x86_64-unknown-linux-musl",
       "aarch64-unknown-linux-gnu",
-      "i686-pc-windows-msvc",
-      "armv7-unknown-linux-gnueabihf",
-      "aarch64-linux-android",
-      "x86_64-unknown-freebsd",
-      "aarch64-unknown-linux-musl",
-      "aarch64-pc-windows-msvc",
-      "armv7-linux-androideabi",
-      "wasm32-wasi-preview1-threads"
+      "aarch64-pc-windows-msvc"
     ]
   },
   "engines": {
@@ -71,6 +63,7 @@
     "@oxc-node/core": "^0.0.34",
     "@taplo/cli": "^0.7.0",
     "@tybys/wasm-util": "^0.10.0",
+    "@types/node": "^24.10.1",
     "ava": "^6.4.1",
     "chalk": "^5.6.2",
     "emnapi": "^1.5.0",

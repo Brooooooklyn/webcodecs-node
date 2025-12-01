@@ -3,19 +3,35 @@
 //! This module provides RAII wrappers around FFmpeg's C structures,
 //! ensuring proper resource cleanup and memory safety.
 
+pub mod audio_buffer;
 pub mod context;
 pub mod frame;
 pub mod hwdevice;
 pub mod packet;
+pub mod resampler;
 pub mod scaler;
 
+pub use audio_buffer::AudioSampleBuffer;
 pub use context::{CodecContext, CodecType};
 pub use frame::Frame;
 pub use hwdevice::HwDeviceContext;
 pub use packet::Packet;
+pub use resampler::Resampler;
 pub use scaler::Scaler;
 
-use crate::ffi::{AVCodecID, AVPixelFormat};
+use crate::ffi::{AVCodecID, AVPixelFormat, AVSampleFormat};
+
+/// Bitrate mode for video encoding
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BitrateMode {
+    /// Constant Bitrate - maintains target bitrate
+    #[default]
+    Constant,
+    /// Variable Bitrate - allows bitrate to fluctuate for better quality
+    Variable,
+    /// Quantizer mode - uses CRF/CQ for quality-based encoding
+    Quantizer,
+}
 
 /// Encoder configuration
 #[derive(Debug, Clone)]
@@ -42,6 +58,14 @@ pub struct EncoderConfig {
     pub profile: Option<i32>,
     /// Codec level (codec-specific)
     pub level: Option<i32>,
+    /// Bitrate mode (constant, variable, or quantizer)
+    pub bitrate_mode: BitrateMode,
+    /// Maximum bitrate for VBR mode (bits per second)
+    pub rc_max_rate: Option<u64>,
+    /// Rate control buffer size in bits
+    pub rc_buffer_size: Option<u32>,
+    /// CRF/CQ value for quantizer mode (0-51 for x264/x265, 0-63 for VP9/AV1)
+    pub crf: Option<u32>,
 }
 
 impl Default for EncoderConfig {
@@ -58,6 +82,10 @@ impl Default for EncoderConfig {
             thread_count: 0, // Auto
             profile: None,
             level: None,
+            bitrate_mode: BitrateMode::default(),
+            rc_max_rate: None,
+            rc_buffer_size: None,
+            crf: None,
         }
     }
 }
@@ -77,6 +105,60 @@ impl Default for DecoderConfig {
     fn default() -> Self {
         Self {
             codec_id: AVCodecID::H264,
+            thread_count: 0,
+            extradata: None,
+        }
+    }
+}
+
+/// Audio encoder configuration
+#[derive(Debug, Clone)]
+pub struct AudioEncoderConfig {
+    /// Sample rate in Hz
+    pub sample_rate: u32,
+    /// Number of channels
+    pub channels: u32,
+    /// Sample format
+    pub sample_format: AVSampleFormat,
+    /// Target bitrate in bits per second (0 for default)
+    pub bitrate: u64,
+    /// Number of threads (0 for auto)
+    pub thread_count: u32,
+}
+
+impl Default for AudioEncoderConfig {
+    fn default() -> Self {
+        Self {
+            sample_rate: 48000,
+            channels: 2,
+            sample_format: AVSampleFormat::Fltp,
+            bitrate: 128_000, // 128 kbps
+            thread_count: 0,
+        }
+    }
+}
+
+/// Audio decoder configuration
+#[derive(Debug, Clone)]
+pub struct AudioDecoderConfig {
+    /// Codec ID
+    pub codec_id: AVCodecID,
+    /// Sample rate (may be 0 if unknown)
+    pub sample_rate: u32,
+    /// Number of channels (may be 0 if unknown)
+    pub channels: u32,
+    /// Number of threads (0 for auto)
+    pub thread_count: u32,
+    /// Extra data (codec-specific)
+    pub extradata: Option<Vec<u8>>,
+}
+
+impl Default for AudioDecoderConfig {
+    fn default() -> Self {
+        Self {
+            codec_id: AVCodecID::Aac,
+            sample_rate: 0,
+            channels: 0,
             thread_count: 0,
             extradata: None,
         }
