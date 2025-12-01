@@ -97,6 +97,9 @@
     "extensions": {
       "ts": "module"
     },
+    "files": [
+      "__test__/**/*.spec.ts"
+    ],
     "timeout": "2m",
     "workerThreads": false,
     "environmentVariables": {

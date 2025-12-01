@@ -1,22 +1,43 @@
 [package]
-authors = ["LongYinan <lynweklm@gmail.com>"]
-edition = "2021"
-name = "napi-package-template"
+name = "webcodec-node"
 version = "0.1.0"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+edition = "2021"
+authors = ["LongYinan <lynweklm@gmail.com>"]
+description = "WebCodecs API implementation for Node.js using FFmpeg"
+license = "MIT"
+repository = "https://github.com/user/webcodec-node"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-napi = "3.0.0"
+# NAPI-RS bindings
+napi = { version = "3.0.0", features = ["async", "napi8"] }
 napi-derive = "3.0.0"
+
+# Async runtime
+tokio = { version = "1", features = ["sync", "rt-multi-thread"] }
+
+# Error handling
+thiserror = "2"
+
+# Concurrent data structures
+crossbeam = "0.8"
 
 [build-dependencies]
 napi-build = "2"
+cc = "1.0"
 
 [profile.release]
 lto = true
 codegen-units = 1
 strip = "symbols"
+
+[profile.dev]
+# Faster builds during development
+opt-level = 0
+
+[features]
+default = []
+# Enable hardware acceleration (requires platform-specific FFmpeg build)
+hwaccel = []

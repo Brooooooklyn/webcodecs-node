@@ -56,4 +56,14 @@ const {
   },
 })
 export default __napiModule.exports
-export const plus100 = __napiModule.exports.plus100
+export const EncodedVideoChunk = __napiModule.exports.EncodedVideoChunk
+export const VideoDecoder = __napiModule.exports.VideoDecoder
+export const VideoEncoder = __napiModule.exports.VideoEncoder
+export const VideoFrame = __napiModule.exports.VideoFrame
+export const CodecState = __napiModule.exports.CodecState
+export const EncodedVideoChunkType = __napiModule.exports.EncodedVideoChunkType
+export const getAvailableHardwareAccelerators = __napiModule.exports.getAvailableHardwareAccelerators
+export const getHardwareAccelerators = __napiModule.exports.getHardwareAccelerators
+export const getPreferredHardwareAccelerator = __napiModule.exports.getPreferredHardwareAccelerator
+export const isHardwareAcceleratorAvailable = __napiModule.exports.isHardwareAcceleratorAvailable
+export const VideoPixelFormat = __napiModule.exports.VideoPixelFormat

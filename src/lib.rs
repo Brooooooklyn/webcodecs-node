@@ -1,8 +1,27 @@
 #![deny(clippy::all)]
 
-use napi_derive::napi;
+//! WebCodecs API implementation for Node.js
+//!
+//! This crate provides a spec-compliant implementation of the WebCodecs API
+//! using FFmpeg for video encoding/decoding.
 
-#[napi]
-pub fn plus_100(input: u32) -> u32 {
-  input + 100
-}
+// FFmpeg C bindings (hand-written, no bindgen)
+pub mod ffi;
+
+// Safe codec wrappers (RAII)
+pub mod codec;
+
+// WebCodecs API surface (NAPI classes)
+pub mod webcodecs;
+
+// Re-export WebCodecs types at crate root
+pub use webcodecs::{
+    CodecState, EncodedVideoChunk, EncodedVideoChunkInit, EncodedVideoChunkMetadata,
+    EncodedVideoChunkType, HardwareAccelerator, VideoColorSpace, VideoDecoder, VideoDecoderConfig,
+    VideoDecoderConfigOutput, VideoDecoderSupport, VideoEncoder, VideoEncoderConfig,
+    VideoEncoderEncodeOptions, VideoEncoderSupport, VideoFrame, VideoFrameCopyToOptions,
+    VideoFrameInit, VideoFrameRect, VideoPixelFormat,
+    // Hardware acceleration utilities
+    get_available_hardware_accelerators, get_hardware_accelerators,
+    get_preferred_hardware_accelerator, is_hardware_accelerator_available,
+};

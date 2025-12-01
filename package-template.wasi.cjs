@@ -108,4 +108,14 @@ const { instance: __napiInstance, module: __wasiModule, napiModule: __napiModule
   },
 })
 module.exports = __napiModule.exports
-module.exports.plus100 = __napiModule.exports.plus100
+module.exports.EncodedVideoChunk = __napiModule.exports.EncodedVideoChunk
+module.exports.VideoDecoder = __napiModule.exports.VideoDecoder
+module.exports.VideoEncoder = __napiModule.exports.VideoEncoder
+module.exports.VideoFrame = __napiModule.exports.VideoFrame
+module.exports.CodecState = __napiModule.exports.CodecState
+module.exports.EncodedVideoChunkType = __napiModule.exports.EncodedVideoChunkType
+module.exports.getAvailableHardwareAccelerators = __napiModule.exports.getAvailableHardwareAccelerators
+module.exports.getHardwareAccelerators = __napiModule.exports.getHardwareAccelerators
+module.exports.getPreferredHardwareAccelerator = __napiModule.exports.getPreferredHardwareAccelerator
+module.exports.isHardwareAcceleratorAvailable = __napiModule.exports.isHardwareAcceleratorAvailable
+module.exports.VideoPixelFormat = __napiModule.exports.VideoPixelFormat
