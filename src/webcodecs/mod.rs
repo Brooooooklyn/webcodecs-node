@@ -29,6 +29,7 @@ pub use encoded_video_chunk::{
   EncodedVideoChunk, EncodedVideoChunkInit, EncodedVideoChunkType, VideoDecoderConfig,
   VideoEncoderConfig,
 };
+pub(crate) use encoded_video_chunk::EncodedVideoChunkInner;
 pub use hardware::{
   get_available_hardware_accelerators, get_hardware_accelerators,
   get_preferred_hardware_accelerator, is_hardware_accelerator_available, HardwareAccelerator,

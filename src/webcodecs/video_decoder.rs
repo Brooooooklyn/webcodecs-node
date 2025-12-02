@@ -5,13 +5,17 @@
 
 use crate::codec::{CodecContext, DecoderConfig, Frame, Packet};
 use crate::ffi::{AVCodecID, AVHWDeviceType};
-use crate::webcodecs::{CodecState, EncodedVideoChunk, VideoDecoderConfig, VideoFrame};
+use crate::webcodecs::{
+  CodecState, EncodedVideoChunk, EncodedVideoChunkInner, VideoDecoderConfig, VideoFrame,
+};
+use crossbeam::channel::{self, Receiver, Sender};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{
   ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
 };
 use napi_derive::napi;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread::JoinHandle;
 
 /// Type alias for output callback (takes VideoFrame)
 /// Using CalleeHandled: false for direct callbacks without error-first convention
@@ -24,6 +28,14 @@ type ErrorCallback = ThreadsafeFunction<String, UnknownReturnValue, String, Stat
 
 // Note: For ondequeue, we use FunctionRef instead of ThreadsafeFunction
 // to support both getter and setter per WebCodecs spec
+
+/// Commands sent to the worker thread
+enum WorkerCommand {
+  /// Decode a video chunk
+  Decode(Arc<RwLock<Option<EncodedVideoChunkInner>>>),
+  /// Flush the decoder and send result back via response channel
+  Flush(Sender<Result<()>>),
+}
 
 /// VideoDecoder init dictionary per WebCodecs spec
 pub struct VideoDecoderInit {
@@ -102,6 +114,22 @@ struct VideoDecoderInner {
 pub struct VideoDecoder {
   inner: Arc<Mutex<VideoDecoderInner>>,
   dequeue_callback: Option<FunctionRef<(), UnknownReturnValue>>,
+  /// Channel sender for worker commands
+  command_sender: Option<Sender<WorkerCommand>>,
+  /// Worker thread handle
+  worker_handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for VideoDecoder {
+  fn drop(&mut self) {
+    // Drop the sender first to signal the worker to stop
+    self.command_sender = None;
+
+    // Wait for the worker thread to finish processing remaining tasks
+    if let Some(handle) = self.worker_handle.take() {
+      let _ = handle.join();
+    }
+  }
 }
 
 #[napi]
@@ -126,10 +154,160 @@ impl VideoDecoder {
       dequeue_callback: None,
     };
 
+    let inner = Arc::new(Mutex::new(inner));
+
+    // Create channel for worker commands
+    let (sender, receiver) = channel::unbounded();
+
+    // Spawn worker thread
+    let worker_inner = inner.clone();
+    let worker_handle = std::thread::spawn(move || {
+      Self::worker_loop(worker_inner, receiver);
+    });
+
     Ok(Self {
-      inner: Arc::new(Mutex::new(inner)),
+      inner,
       dequeue_callback: None,
+      command_sender: Some(sender),
+      worker_handle: Some(worker_handle),
     })
+  }
+
+  /// Worker loop that processes commands from the channel
+  fn worker_loop(inner: Arc<Mutex<VideoDecoderInner>>, receiver: Receiver<WorkerCommand>) {
+    while let Ok(command) = receiver.recv() {
+      match command {
+        WorkerCommand::Decode(chunk) => {
+          Self::process_decode(&inner, chunk);
+        }
+        WorkerCommand::Flush(response_sender) => {
+          let result = Self::process_flush(&inner);
+          let _ = response_sender.send(result);
+        }
+      }
+    }
+  }
+
+  /// Process a decode command
+  fn process_decode(inner: &Arc<Mutex<VideoDecoderInner>>, chunk: Arc<RwLock<Option<EncodedVideoChunkInner>>>) {
+    let mut guard = match inner.lock() {
+      Ok(g) => g,
+      Err(_) => return, // Lock poisoned
+    };
+
+    // Check if decoder is still configured
+    if guard.state != CodecState::Configured {
+      guard.decode_queue_size = guard.decode_queue_size.saturating_sub(1);
+      let _ = Self::fire_dequeue_event(&guard);
+      Self::report_error(&mut guard, "Decoder not configured");
+      return;
+    }
+
+    // Get chunk data
+    let chunk_read_guard = chunk.read();
+    let encoded_chunk = match chunk_read_guard
+      .as_ref()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))
+      .and_then(|d| {
+        d.as_ref()
+          .ok_or_else(|| Error::new(Status::GenericFailure, "Chunk is closed"))
+      }) {
+      Ok(c) => c,
+      Err(e) => {
+        guard.decode_queue_size = guard.decode_queue_size.saturating_sub(1);
+        let _ = Self::fire_dequeue_event(&guard);
+        Self::report_error(&mut guard, &e.reason);
+        return;
+      }
+    };
+
+    let timestamp = encoded_chunk.timestamp_us;
+    let duration = encoded_chunk.duration_us;
+    let data = encoded_chunk.data.clone();
+
+    // Drop the chunk read guard before decoding
+    drop(chunk_read_guard);
+
+    // Get context
+    let context = match guard.context.as_mut() {
+      Some(ctx) => ctx,
+      None => {
+        guard.decode_queue_size = guard.decode_queue_size.saturating_sub(1);
+        let _ = Self::fire_dequeue_event(&guard);
+        Self::report_error(&mut guard, "No decoder context");
+        return;
+      }
+    };
+
+    // Decode
+    let frames = match decode_chunk_data(context, &data, timestamp, duration) {
+      Ok(f) => f,
+      Err(e) => {
+        guard.decode_queue_size = guard.decode_queue_size.saturating_sub(1);
+        let _ = Self::fire_dequeue_event(&guard);
+        Self::report_error(&mut guard, &format!("Decode failed: {}", e));
+        return;
+      }
+    };
+
+    guard.frame_count += 1;
+
+    // Decrement queue size and fire dequeue event
+    guard.decode_queue_size = guard.decode_queue_size.saturating_sub(1);
+    let _ = Self::fire_dequeue_event(&guard);
+
+    // Convert internal frames to VideoFrames and call output callback
+    for frame in frames {
+      let video_frame = VideoFrame::from_internal(frame, timestamp, duration);
+      guard
+        .output_callback
+        .call(video_frame, ThreadsafeFunctionCallMode::NonBlocking);
+    }
+  }
+
+  /// Process a flush command
+  fn process_flush(inner: &Arc<Mutex<VideoDecoderInner>>) -> Result<()> {
+    let mut guard = inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    if guard.state != CodecState::Configured {
+      Self::report_error(&mut guard, "Decoder not configured");
+      return Ok(());
+    }
+
+    let context = match guard.context.as_mut() {
+      Some(ctx) => ctx,
+      None => {
+        Self::report_error(&mut guard, "No decoder context");
+        return Ok(());
+      }
+    };
+
+    // Flush decoder
+    let frames = match context.flush_decoder() {
+      Ok(f) => f,
+      Err(e) => {
+        Self::report_error(&mut guard, &format!("Flush failed: {}", e));
+        return Ok(());
+      }
+    };
+
+    // Convert and call output callback for remaining frames
+    for frame in frames {
+      let pts = frame.pts();
+      let duration = if frame.duration() > 0 {
+        Some(frame.duration())
+      } else {
+        None
+      };
+      let video_frame = VideoFrame::from_internal(frame, pts, duration);
+      guard
+        .output_callback
+        .call(video_frame, ThreadsafeFunctionCallMode::NonBlocking);
+    }
+
+    Ok(())
   }
 
   /// Report an error via callback and close the decoder
@@ -280,84 +458,31 @@ impl VideoDecoder {
   /// Decode an encoded video chunk
   #[napi]
   pub fn decode(&self, chunk: &EncodedVideoChunk) -> Result<()> {
-    let mut inner = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    // Increment queue size first (under lock)
+    {
+      let mut inner = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    if inner.state != CodecState::Configured {
-      Self::report_error(&mut inner, "Decoder not configured");
-      return Ok(());
+      if inner.state != CodecState::Configured {
+        Self::report_error(&mut inner, "Decoder not configured");
+        return Ok(());
+      }
+
+      inner.decode_queue_size += 1;
     }
 
-    // Increment queue size (pending operation)
-    inner.decode_queue_size += 1;
-
-    // Get chunk data
-    let data = match chunk.get_data_vec() {
-      Ok(d) => d,
-      Err(e) => {
-        inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, &format!("Failed to get chunk data: {}", e));
-        return Ok(());
-      }
-    };
-    let timestamp = match chunk.timestamp() {
-      Ok(ts) => ts,
-      Err(e) => {
-        inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, &format!("Failed to get timestamp: {}", e));
-        return Ok(());
-      }
-    };
-    let duration = match chunk.duration() {
-      Ok(dur) => dur,
-      Err(e) => {
-        inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, &format!("Failed to get duration: {}", e));
-        return Ok(());
-      }
-    };
-
-    // Get context
-    let context = match inner.context.as_mut() {
-      Some(ctx) => ctx,
-      None => {
-        inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, "No decoder context");
-        return Ok(());
-      }
-    };
-
-    // Decode using the internal frame
-    let frames = match decode_chunk_data(context, &data, timestamp, duration) {
-      Ok(f) => f,
-      Err(e) => {
-        inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, &format!("Decode failed: {}", e));
-        return Ok(());
-      }
-    };
-
-    inner.frame_count += 1;
-
-    // Decrement queue size and fire dequeue event
-    inner.decode_queue_size -= 1;
-    Self::fire_dequeue_event(&inner)?;
-
-    // Convert internal frames to VideoFrames and call output callback
-    for frame in frames {
-      let video_frame = VideoFrame::from_internal(frame, timestamp, duration);
-
-      // Call output callback (CalleeHandled: false means direct value, not Result)
-      inner
-        .output_callback
-        .call(video_frame, ThreadsafeFunctionCallMode::NonBlocking);
+    // Send decode command to worker thread
+    if let Some(ref sender) = self.command_sender {
+      sender
+        .send(WorkerCommand::Decode(chunk.inner.clone()))
+        .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?;
+    } else {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "Decoder has been closed",
+      ));
     }
 
     Ok(())
@@ -367,64 +492,67 @@ impl VideoDecoder {
   /// Returns a Promise that resolves when flushing is complete
   #[napi]
   pub async fn flush(&self) -> Result<()> {
-    let mut inner = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    // Create a response channel
+    let (response_sender, response_receiver) = channel::bounded::<Result<()>>(1);
 
-    if inner.state != CodecState::Configured {
-      Self::report_error(&mut inner, "Decoder not configured");
-      return Ok(());
+    // Send flush command through the channel to ensure it's processed after all pending decodes
+    if let Some(ref sender) = self.command_sender {
+      sender
+        .send(WorkerCommand::Flush(response_sender))
+        .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?;
+    } else {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "Decoder has been closed",
+      ));
     }
 
-    let context = match inner.context.as_mut() {
-      Some(ctx) => ctx,
-      None => {
-        Self::report_error(&mut inner, "No decoder context");
-        return Ok(());
-      }
-    };
-
-    // Flush decoder
-    let frames = match context.flush_decoder() {
-      Ok(f) => f,
-      Err(e) => {
-        Self::report_error(&mut inner, &format!("Flush failed: {}", e));
-        return Ok(());
-      }
-    };
-
-    // Convert and call output callback for remaining frames
-    for frame in frames {
-      let pts = frame.pts();
-      let duration = if frame.duration() > 0 {
-        Some(frame.duration())
-      } else {
-        None
-      };
-      let video_frame = VideoFrame::from_internal(frame, pts, duration);
-
-      // Call output callback (CalleeHandled: false means direct value, not Result)
-      inner
-        .output_callback
-        .call(video_frame, ThreadsafeFunctionCallMode::NonBlocking);
-    }
-
-    Ok(())
+    // Wait for response in a blocking thread to not block the event loop
+    spawn_blocking(move || {
+      response_receiver
+        .recv()
+        .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?
+    })
+    .await
+    .map_err(|join_error| {
+      Error::new(
+        Status::GenericFailure,
+        format!("Flush failed: {}", join_error),
+      )
+    })
+    .flatten()
   }
 
   /// Reset the decoder
   #[napi]
-  pub fn reset(&self) -> Result<()> {
+  pub fn reset(&mut self) -> Result<()> {
+    // Check state first before touching the worker
+    {
+      let inner = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+      if inner.state == CodecState::Closed {
+        return Err(Error::new(
+          Status::GenericFailure,
+          "Decoder is closed",
+        ));
+      }
+    }
+
+    // Drop sender to signal worker to stop (must drop before join!)
+    drop(self.command_sender.take());
+
+    // Wait for worker to finish processing remaining commands
+    if let Some(handle) = self.worker_handle.take() {
+      let _ = handle.join();
+    }
+
     let mut inner = self
       .inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    if inner.state == CodecState::Closed {
-      Self::report_error(&mut inner, "Decoder is closed");
-      return Ok(());
-    }
 
     // Drain decoder before dropping to ensure libaom/AV1 threads finish
     if let Some(ctx) = inner.context.as_mut() {
@@ -440,12 +568,29 @@ impl VideoDecoder {
     inner.frame_count = 0;
     inner.decode_queue_size = 0;
 
+    // Create new channel and worker for future decode operations
+    let (sender, receiver) = channel::unbounded();
+    self.command_sender = Some(sender);
+    let worker_inner = self.inner.clone();
+    drop(inner); // Release lock before spawning thread
+    self.worker_handle = Some(std::thread::spawn(move || {
+      Self::worker_loop(worker_inner, receiver);
+    }));
+
     Ok(())
   }
 
   /// Close the decoder
   #[napi]
-  pub fn close(&self) -> Result<()> {
+  pub fn close(&mut self) -> Result<()> {
+    // Drop sender to stop accepting new commands
+    self.command_sender = None;
+
+    // Wait for worker to finish processing remaining tasks
+    if let Some(handle) = self.worker_handle.take() {
+      let _ = handle.join();
+    }
+
     let mut inner = self
       .inner
       .lock()

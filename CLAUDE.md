@@ -230,6 +230,55 @@ gifDecoder.close();
 - Integration tests for roundtrip, lifecycle, multi-codec, performance
 - Test fixtures in `__test__/fixtures/` for ImageDecoder (PNG, GIF)
 
+## VideoDecoder Threading Architecture
+
+VideoDecoder uses a **crossbeam channel-based worker thread pattern** for thread-safe decoding:
+
+### Architecture
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ VideoDecoder                                                     │
+├─────────────────────────────────────────────────────────────────┤
+│ inner: Arc<Mutex<VideoDecoderInner>>  ← shared state            │
+│ command_sender: Option<Sender<WorkerCommand>>                    │
+│ worker_handle: Option<JoinHandle<()>>                            │
+└─────────────────────────────────────────────────────────────────┘
+         │                                    ▲
+         │ WorkerCommand::Decode              │ output callback
+         │ WorkerCommand::Flush               │ (ThreadsafeFunction)
+         ▼                                    │
+┌─────────────────────────────────────────────────────────────────┐
+│ Worker Thread (worker_loop)                                      │
+├─────────────────────────────────────────────────────────────────┤
+│ - Receives commands via crossbeam::channel                       │
+│ - Processes decode/flush sequentially                            │
+│ - Holds mutex during FFmpeg decode                               │
+│ - Exits when channel disconnected (sender dropped)               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Key Components
+- **WorkerCommand enum**: `Decode(chunk)` and `Flush(response_sender)`
+- **EncodedVideoChunkInner**: Wrapped in `Arc<RwLock<Option<...>>>` for thread-safe sharing
+- **Response channel for flush**: Ensures flush waits for all pending decodes
+
+### Critical Implementation Details
+```rust
+// In reset(): MUST drop sender BEFORE joining worker thread
+drop(self.command_sender.take());  // Signal worker to stop
+if let Some(handle) = self.worker_handle.take() {
+    let _ = handle.join();  // Now safe to join - channel disconnected
+}
+```
+
+**Why?** If sender isn't dropped before join, channel stays connected and worker blocks on `recv()` forever → deadlock.
+
+### Thread Safety
+- `decode()`: Increments queue size under lock, then sends command (non-blocking)
+- `flush()`: Sends Flush command, waits for response via `spawn_blocking`
+- `process_decode()`: Holds mutex during entire FFmpeg decode (sequential processing)
+- AV1 special case: Drains decoder before context drop (libaom thread safety)
+
 ## Known Issues
 
 ### AV1 SIGSEGV

@@ -37,11 +37,11 @@ pub struct EncodedVideoChunkInit {
 }
 
 /// Internal state for EncodedVideoChunk
-struct EncodedVideoChunkInner {
-  data: Vec<u8>,
-  chunk_type: EncodedVideoChunkType,
-  timestamp_us: i64,
-  duration_us: Option<i64>,
+pub(crate) struct EncodedVideoChunkInner {
+  pub(crate) data: Vec<u8>,
+  pub(crate) chunk_type: EncodedVideoChunkType,
+  pub(crate) timestamp_us: i64,
+  pub(crate) duration_us: Option<i64>,
 }
 
 /// EncodedVideoChunk - represents encoded video data
@@ -49,7 +49,7 @@ struct EncodedVideoChunkInner {
 /// This is a WebCodecs-compliant EncodedVideoChunk implementation.
 #[napi]
 pub struct EncodedVideoChunk {
-  inner: Arc<RwLock<Option<EncodedVideoChunkInner>>>,
+  pub(crate) inner: Arc<RwLock<Option<EncodedVideoChunkInner>>>,
 }
 
 #[napi]
@@ -135,15 +135,6 @@ impl EncodedVideoChunk {
       unsafe { destination.as_mut() }.write_all(&inner.data)?;
       Ok(())
     })
-  }
-
-  // ========================================================================
-  // Internal helpers
-  // ========================================================================
-
-  /// Get data for decoder input
-  pub fn get_data_vec(&self) -> Result<Vec<u8>> {
-    self.with_inner(|inner| Ok(inner.data.clone()))
   }
 
   /// Check if this is a key frame
