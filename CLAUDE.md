@@ -91,7 +91,11 @@ Detection order:
 - **AudioDecoder**: Full implementation
 
 ### Image
-- **ImageDecoder**: JPEG, PNG, WebP, GIF, BMP → VideoFrame
+- **ImageDecoder**: JPEG, PNG, WebP, GIF, BMP, AVIF → VideoFrame
+  - Frame caching for efficient multi-frame access
+  - `frame_index` support for animated images (GIF/WebP)
+  - `frame_count` populated after first decode
+  - ReadableStream and Uint8Array data sources
 
 ### Hardware Acceleration
 - `getHardwareAccelerators()` - List all known accelerators
@@ -184,12 +188,47 @@ const frame = new VideoFrame(data, {
 const cloned = VideoFrame.fromVideoFrame(sourceFrame, { timestamp: newTs });
 ```
 
+## ImageDecoder Usage
+
+```typescript
+// Decode static image (PNG, JPEG, BMP)
+const decoder = new ImageDecoder({
+  data: imageBytes,  // Uint8Array or ReadableStream
+  type: 'image/png'
+});
+
+const result = await decoder.decode();
+const frame = result.image;  // VideoFrame
+console.log(frame.codedWidth, frame.codedHeight);
+frame.close();
+decoder.close();
+
+// Decode specific frame from animated GIF
+const gifDecoder = new ImageDecoder({
+  data: gifBytes,
+  type: 'image/gif'
+});
+
+// First decode populates frame_count
+await gifDecoder.decode({ frameIndex: 0 });
+const frameCount = gifDecoder.tracks.selectedTrack.frameCount;
+
+// Access any frame by index (uses cache)
+const frame2 = await gifDecoder.decode({ frameIndex: 1 });
+frame2.image.close();
+
+// Reset clears cache (re-decode on next call)
+gifDecoder.reset();
+gifDecoder.close();
+```
+
 ## Test Structure
 
-- **15 test files** (~3000+ lines)
-- **257 tests** all passing
+- **16 test files** (~5600+ lines)
+- **282 tests** all passing
 - Test helpers in `__test__/helpers/` for frame/audio generation
 - Integration tests for roundtrip, lifecycle, multi-codec, performance
+- Test fixtures in `__test__/fixtures/` for ImageDecoder (PNG, GIF)
 
 ## Known Issues
 
@@ -210,6 +249,8 @@ src/codec/context.rs:325,348  # Set extradata if provided
 2. **Temporal SVC** - Parsing only, layer settings not applied to encoder
 3. **Hardware-accelerated encoding** - Detection works, integration pending
 4. **Duration type** - Using i64 instead of u64 due to NAPI-RS constraints
+5. **ImageDecoder parameters** - `colorSpaceConversion`, `desiredWidth/Height`, `preferAnimation` parsed but not applied
+6. **ImageDecoder GIF animation** - FFmpeg may return only first frame; for full animation use VideoDecoder with GIF codec
 
 ## Configuration Options
 

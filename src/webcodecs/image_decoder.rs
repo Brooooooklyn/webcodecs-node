@@ -220,6 +220,8 @@ struct ImageDecoderInner {
   tracks: ImageTrackList,
   /// Whether decoder is closed
   closed: bool,
+  /// Cached decoded frames (for animated images, populated on first decode)
+  cached_frames: Option<Vec<crate::codec::Frame>>,
 }
 
 /// ImageDecoder - WebCodecs-compliant image decoder
@@ -280,6 +282,7 @@ impl ImageDecoder {
       complete: true, // Data is complete (collected from stream or buffer)
       tracks,
       closed: false,
+      cached_frames: None,
     };
 
     Ok(Self {
@@ -337,47 +340,62 @@ impl ImageDecoder {
       return Err(Error::new(Status::GenericFailure, "ImageDecoder is closed"));
     }
 
-    let _frame_index = options.as_ref().and_then(|o| o.frame_index).unwrap_or(0);
+    let frame_index = options.as_ref().and_then(|o| o.frame_index).unwrap_or(0) as usize;
 
-    // Create decoder context if not already created
-    if inner.context.is_none() {
-      let mut context = CodecContext::new_decoder(inner.codec_id).map_err(|e| {
-        Error::new(
-          Status::GenericFailure,
-          format!("Failed to create decoder: {}", e),
-        )
-      })?;
+    // Use cached frames if available, otherwise decode and cache
+    if inner.cached_frames.is_none() {
+      // Create decoder context if not already created
+      if inner.context.is_none() {
+        let mut context = CodecContext::new_decoder(inner.codec_id).map_err(|e| {
+          Error::new(
+            Status::GenericFailure,
+            format!("Failed to create decoder: {}", e),
+          )
+        })?;
 
-      let decoder_config = DecoderConfig {
-        codec_id: inner.codec_id,
-        thread_count: 0,
-        extradata: None,
-      };
+        let decoder_config = DecoderConfig {
+          codec_id: inner.codec_id,
+          thread_count: 0,
+          extradata: None,
+        };
 
-      context.configure_decoder(&decoder_config).map_err(|e| {
-        Error::new(
-          Status::GenericFailure,
-          format!("Failed to configure decoder: {}", e),
-        )
-      })?;
+        context.configure_decoder(&decoder_config).map_err(|e| {
+          Error::new(
+            Status::GenericFailure,
+            format!("Failed to configure decoder: {}", e),
+          )
+        })?;
 
-      context.open().map_err(|e| {
-        Error::new(
-          Status::GenericFailure,
-          format!("Failed to open decoder: {}", e),
-        )
-      })?;
+        context.open().map_err(|e| {
+          Error::new(
+            Status::GenericFailure,
+            format!("Failed to open decoder: {}", e),
+          )
+        })?;
 
-      inner.context = Some(context);
+        inner.context = Some(context);
+      }
+
+      // Clone data before mutable borrow
+      let data = inner.data.clone();
+
+      // Decode all frames from the image data
+      let context = inner.context.as_mut().unwrap();
+      let decoded_frames = decode_image_data(context, &data)?;
+
+      // Update frame_count in track info
+      if !decoded_frames.is_empty() {
+        inner.tracks.tracks[0].frame_count = decoded_frames.len() as u32;
+      }
+
+      // Cache the decoded frames
+      inner.cached_frames = Some(decoded_frames);
     }
 
-    // Clone data before mutable borrow
-    let data = inner.data.clone();
+    // Get reference to cached frames
+    let frames = inner.cached_frames.as_ref().unwrap();
 
-    // Decode the image data
-    let context = inner.context.as_mut().unwrap();
-    let frames = decode_image_data(context, &data)?;
-
+    // Validate frame_index
     if frames.is_empty() {
       return Err(Error::new(
         Status::GenericFailure,
@@ -385,8 +403,25 @@ impl ImageDecoder {
       ));
     }
 
-    // Take the first frame (or requested frame for animated images)
-    let frame = frames.into_iter().next().unwrap();
+    if frame_index >= frames.len() {
+      return Err(Error::new(
+        Status::InvalidArg,
+        format!(
+          "Frame index {} out of bounds (image has {} frames)",
+          frame_index,
+          frames.len()
+        ),
+      ));
+    }
+
+    // Clone the requested frame
+    let frame = frames[frame_index].try_clone().map_err(|e| {
+      Error::new(
+        Status::GenericFailure,
+        format!("Failed to clone frame: {}", e),
+      )
+    })?;
+
     let pts = frame.pts();
     let video_frame = VideoFrame::from_internal(frame, pts, None);
 
@@ -409,6 +444,13 @@ impl ImageDecoder {
     }
 
     inner.context = None;
+    inner.cached_frames = None;
+
+    // Reset frame_count for animated formats (will be re-detected on next decode)
+    if inner.tracks.tracks[0].animated {
+      inner.tracks.tracks[0].frame_count = 0;
+    }
+
     Ok(())
   }
 
@@ -421,6 +463,7 @@ impl ImageDecoder {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     inner.context = None;
+    inner.cached_frames = None;
     inner.closed = true;
     Ok(())
   }
