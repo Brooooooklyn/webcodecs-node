@@ -170,7 +170,7 @@ impl VideoColorSpace {
 
 /// DOMRectReadOnly - W3C WebCodecs spec compliant rect class
 /// Used for codedRect and visibleRect properties
-#[napi]
+#[napi(js_name = "DOMRectReadOnly")]
 #[derive(Debug, Clone)]
 pub struct DOMRectReadOnly {
   x: f64,
@@ -343,6 +343,10 @@ struct VideoFrameInner {
   display_width: u32,
   display_height: u32,
   color_space: VideoColorSpace,
+  /// Rotation in degrees (0, 90, 180, 270) per W3C WebCodecs spec
+  rotation: u16,
+  /// Whether frame is horizontally flipped per W3C WebCodecs spec
+  flip: bool,
   closed: bool,
 }
 
@@ -396,6 +400,8 @@ impl VideoFrame {
       display_width,
       display_height,
       color_space,
+      rotation: 0,
+      flip: false,
       closed: false,
     };
 
@@ -417,7 +423,7 @@ impl VideoFrame {
         .try_clone()
         .map_err(|e| Error::new(Status::GenericFailure, format!("Clone failed: {}", e)))?;
 
-      let init = init.unwrap_or_else(|| VideoFrameInit {
+      let init = init.unwrap_or(VideoFrameInit {
         timestamp: None,
         duration: None,
         alpha: None,
@@ -448,6 +454,8 @@ impl VideoFrame {
         display_width,
         display_height,
         color_space: source_inner.color_space.clone(),
+        rotation: source_inner.rotation,
+        flip: source_inner.flip,
         closed: false,
       };
 
@@ -469,6 +477,8 @@ impl VideoFrame {
       display_width: width,
       display_height: height,
       color_space: VideoColorSpace::default(),
+      rotation: 0,
+      flip: false,
       closed: false,
     };
 
@@ -516,31 +526,43 @@ impl VideoFrame {
   }
 
   /// Get the coded rect (the region containing valid pixel data)
-  /// Returns DOMRectReadOnly per W3C WebCodecs spec
+  /// Returns DOMRectReadOnly per W3C WebCodecs spec, null if closed
   #[napi(getter)]
-  pub fn coded_rect(&self) -> Result<DOMRectReadOnly> {
-    self.with_inner(|inner| {
-      Ok(DOMRectReadOnly {
+  pub fn coded_rect(&self) -> Result<Option<DOMRectReadOnly>> {
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    match guard.as_ref() {
+      Some(inner) if !inner.closed => Ok(Some(DOMRectReadOnly {
         x: 0.0,
         y: 0.0,
         width: inner.frame.width() as f64,
         height: inner.frame.height() as f64,
-      })
-    })
+      })),
+      _ => Ok(None),
+    }
   }
 
   /// Get the visible rect (the region of coded data that should be displayed)
-  /// Returns DOMRectReadOnly per W3C WebCodecs spec
+  /// Returns DOMRectReadOnly per W3C WebCodecs spec, null if closed
   #[napi(getter)]
-  pub fn visible_rect(&self) -> Result<DOMRectReadOnly> {
-    self.with_inner(|inner| {
-      Ok(DOMRectReadOnly {
+  pub fn visible_rect(&self) -> Result<Option<DOMRectReadOnly>> {
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    match guard.as_ref() {
+      Some(inner) if !inner.closed => Ok(Some(DOMRectReadOnly {
         x: 0.0,
         y: 0.0,
         width: inner.display_width as f64,
         height: inner.display_height as f64,
-      })
-    })
+      })),
+      _ => Ok(None),
+    }
   }
 
   /// Get the presentation timestamp in microseconds
@@ -561,6 +583,18 @@ impl VideoFrame {
     self.with_inner(|inner| Ok(inner.color_space.clone()))
   }
 
+  /// Get the rotation in degrees (0, 90, 180, 270) per W3C WebCodecs spec
+  #[napi(getter)]
+  pub fn rotation(&self) -> Result<u16> {
+    self.with_inner(|inner| Ok(inner.rotation))
+  }
+
+  /// Get whether the frame is horizontally flipped per W3C WebCodecs spec
+  #[napi(getter)]
+  pub fn flip(&self) -> Result<bool> {
+    self.with_inner(|inner| Ok(inner.flip))
+  }
+
   /// Get whether this VideoFrame has been closed (W3C WebCodecs spec)
   #[napi(getter)]
   pub fn closed(&self) -> Result<bool> {
@@ -569,7 +603,7 @@ impl VideoFrame {
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    Ok(guard.is_none() || guard.as_ref().map_or(true, |i| i.closed))
+    Ok(guard.is_none() || guard.as_ref().is_none_or(|i| i.closed))
   }
 
   /// Calculate the allocation size needed for copyTo
@@ -760,6 +794,8 @@ impl VideoFrame {
         display_width: inner.display_width,
         display_height: inner.display_height,
         color_space: inner.color_space.clone(),
+        rotation: inner.rotation,
+        flip: inner.flip,
         closed: false,
       };
 

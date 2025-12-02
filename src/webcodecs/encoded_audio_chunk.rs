@@ -215,6 +215,8 @@ pub struct EncodedAudioChunkOutput {
 }
 
 /// Audio encoder configuration (WebCodecs spec)
+/// Note: Per W3C spec, codec-specific options are not supported at this level.
+/// Codec behavior is controlled through the codec string itself.
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct AudioEncoderConfig {
@@ -226,16 +228,6 @@ pub struct AudioEncoderConfig {
   pub number_of_channels: u32,
   /// Target bitrate in bits per second
   pub bitrate: Option<f64>,
-  /// Opus-specific: complexity (0-10)
-  pub complexity: Option<u32>,
-  /// Opus-specific: application type ("voip", "audio", "lowdelay")
-  pub opus_application: Option<String>,
-  /// Opus-specific: signal type ("auto", "music", "voice")
-  pub opus_signal: Option<String>,
-  /// Opus-specific: frame duration preference in microseconds
-  pub opus_frame_duration: Option<u32>,
-  /// AAC-specific: format ("aac", "adts")
-  pub aac_format: Option<String>,
 }
 
 /// Audio decoder configuration (WebCodecs spec)

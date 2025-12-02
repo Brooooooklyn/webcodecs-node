@@ -132,7 +132,7 @@ impl EncodedVideoChunk {
         ));
       }
 
-      unsafe { destination.as_mut() }.write(&inner.data)?;
+      unsafe { destination.as_mut() }.write_all(&inner.data)?;
       Ok(())
     })
   }
@@ -170,88 +170,15 @@ impl EncodedVideoChunk {
       )),
     }
   }
-
-}
-
-/// Decode configuration for AVC (H.264)
-#[allow(dead_code)]
-#[napi(object)]
-pub struct AvcDecoderConfig {
-  /// AVC configuration record (avcC box content) - Uint8Array per W3C spec (BufferSource)
-  pub avc_c: Option<Uint8Array>,
-}
-
-/// Encode configuration for AVC (H.264)
-#[allow(dead_code)]
-#[napi(object)]
-#[derive(Debug, Clone)]
-pub struct AvcEncoderConfig {
-  /// AVC profile (e.g., "baseline", "main", "high")
-  pub profile: Option<String>,
-  /// AVC level (e.g., "3.0", "4.0", "5.1")
-  pub level: Option<String>,
-  /// Output format: "annexb" or "avc"
-  pub format: Option<String>,
-}
-
-/// Encode configuration for VP9
-#[napi(object)]
-#[derive(Debug, Clone)]
-pub struct Vp9EncoderConfig {
-  /// VP9 profile: 0 (8-bit 4:2:0), 1 (8-bit 4:2:2/4:4:4), 2 (10/12-bit 4:2:0), 3 (10/12-bit 4:2:2/4:4:4)
-  pub profile: Option<u8>,
-  /// Encoding speed preset (0 = best quality/slowest, 8 = fastest)
-  pub speed: Option<u32>,
-  /// Tile columns (log2 value: 0-6)
-  pub tile_columns: Option<u32>,
-  /// Tile rows (log2 value: 0-2)
-  pub tile_rows: Option<u32>,
-  /// Enable row-based multithreading
-  pub row_mt: Option<bool>,
-  /// Keyframe placement mode: "auto", "disabled"
-  pub keyframe_mode: Option<String>,
-}
-
-/// Encode configuration for AV1
-#[napi(object)]
-#[derive(Debug, Clone)]
-pub struct Av1EncoderConfig {
-  /// AV1 profile: 0 (Main), 1 (High), 2 (Professional)
-  pub profile: Option<u8>,
-  /// CPU usage preset (0 = slowest/best quality, 8 = fastest)
-  pub cpu_used: Option<u32>,
-  /// Tile columns (1, 2, 4, 8, 16, 32, 64)
-  pub tile_columns: Option<u32>,
-  /// Tile rows
-  pub tile_rows: Option<u32>,
-  /// CQ level for quantizer mode (0-63, lower = better quality)
-  pub cq_level: Option<u32>,
-  /// Enable screen content coding tools
-  pub screen_content: Option<bool>,
-}
-
-/// Encode configuration for HEVC (H.265)
-#[napi(object)]
-#[derive(Debug, Clone)]
-pub struct HevcEncoderConfig {
-  /// HEVC profile: "main", "main10", "main-still-picture", "rext"
-  pub profile: Option<String>,
-  /// Tier: "main" or "high"
-  pub tier: Option<String>,
-  /// Level (e.g., "4.0", "5.1", "6.2")
-  pub level: Option<String>,
-  /// Encoding preset: "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"
-  pub preset: Option<String>,
-  /// Tuning: "psnr", "ssim", "grain", "zerolatency", "fastdecode"
-  pub tune: Option<String>,
 }
 
 /// Video encoder configuration (WebCodecs spec)
-#[allow(dead_code)]
+/// Note: Codec-specific options are encoded in the codec string per W3C spec
+/// e.g., "avc1.42001E" encodes profile/level, "vp09.00.10.08" encodes profile/level/depth
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct VideoEncoderConfig {
-  /// Codec string (e.g., "avc1.42001E", "vp8", "vp09.00.10.08")
+  /// Codec string (e.g., "avc1.42001E", "vp8", "vp09.00.10.08", "av01.0.04M.08")
   pub codec: String,
   /// Coded width in pixels
   pub width: u32,
@@ -265,20 +192,12 @@ pub struct VideoEncoderConfig {
   pub bitrate: Option<f64>,
   /// Framerate
   pub framerate: Option<f64>,
-  /// Hardware acceleration preference
+  /// Hardware acceleration preference: "no-preference", "prefer-hardware", "prefer-software"
   pub hardware_acceleration: Option<String>,
   /// Latency mode: "quality" or "realtime"
   pub latency_mode: Option<String>,
   /// Bitrate mode: "constant", "variable", "quantizer"
   pub bitrate_mode: Option<String>,
-  /// AVC-specific configuration (H.264)
-  pub avc: Option<AvcEncoderConfig>,
-  /// VP9-specific configuration
-  pub vp9: Option<Vp9EncoderConfig>,
-  /// AV1-specific configuration
-  pub av1: Option<Av1EncoderConfig>,
-  /// HEVC-specific configuration (H.265)
-  pub hevc: Option<HevcEncoderConfig>,
   /// Alpha handling: "discard" or "keep"
   pub alpha: Option<String>,
   /// Scalability mode (SVC) - e.g., "L1T1", "L1T2", "L1T3"
@@ -286,7 +205,6 @@ pub struct VideoEncoderConfig {
 }
 
 /// Video decoder configuration (WebCodecs spec)
-#[allow(dead_code)]
 #[napi(object)]
 pub struct VideoDecoderConfig {
   /// Codec string (e.g., "avc1.42001E", "vp8", "vp09.00.10.08")

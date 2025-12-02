@@ -23,9 +23,8 @@ type OutputCallback = ThreadsafeFunction<AudioData, UnknownReturnValue, AudioDat
 /// Still using default CalleeHandled: true for error-first convention
 type ErrorCallback = ThreadsafeFunction<String>;
 
-/// Type alias for dequeue callback (no arguments)
-/// Using CalleeHandled: false for direct callbacks
-pub type DequeueCallback = ThreadsafeFunction<(), UnknownReturnValue, (), Status, false>;
+// Note: For ondequeue, we use FunctionRef instead of ThreadsafeFunction
+// to support both getter and setter per WebCodecs spec
 
 /// AudioDecoder init dictionary per WebCodecs spec
 pub struct AudioDecoderInit {
@@ -68,7 +67,7 @@ struct AudioDecoderInner {
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
   /// Optional dequeue event callback
-  dequeue_callback: Option<DequeueCallback>,
+  dequeue_callback: Option<FunctionRef<(), UnknownReturnValue>>,
 }
 
 /// AudioDecoder - WebCodecs-compliant audio decoder
@@ -135,11 +134,12 @@ impl AudioDecoder {
   }
 
   /// Fire dequeue event if callback is set
-  fn fire_dequeue_event(inner: &AudioDecoderInner) {
+  fn fire_dequeue_event(env: &Env, inner: &AudioDecoderInner) -> Result<()> {
     if let Some(ref callback) = inner.dequeue_callback {
-      // CalleeHandled: false means we pass value directly, not Result
-      callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+      let cb = callback.borrow_back(env)?;
+      cb.call(())?;
     }
+    Ok(())
   }
 
   /// Get decoder state
@@ -167,7 +167,7 @@ impl AudioDecoder {
   /// The dequeue event fires when decodeQueueSize decreases,
   /// allowing backpressure management.
   #[napi(setter)]
-  pub fn set_ondequeue(&self, callback: Option<DequeueCallback>) -> Result<()> {
+  pub fn set_ondequeue(&self, callback: Option<FunctionRef<(), UnknownReturnValue>>) -> Result<()> {
     let mut inner = self
       .inner
       .lock()
@@ -176,6 +176,24 @@ impl AudioDecoder {
     inner.dequeue_callback = callback;
 
     Ok(())
+  }
+
+  /// Get the dequeue event handler (per WebCodecs spec)
+  #[napi(getter)]
+  pub fn get_ondequeue<'env>(
+    &self,
+    env: &'env Env,
+  ) -> Result<Option<Function<'env, (), UnknownReturnValue>>> {
+    let inner = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    if let Some(ref callback) = inner.dequeue_callback {
+      let cb = callback.borrow_back(env)?;
+      Ok(Some(cb))
+    } else {
+      Ok(None)
+    }
   }
 
   /// Configure the decoder
@@ -241,7 +259,7 @@ impl AudioDecoder {
 
   /// Decode an encoded audio chunk
   #[napi]
-  pub fn decode(&self, chunk: &EncodedAudioChunk) -> Result<()> {
+  pub fn decode(&self, env: &Env, chunk: &EncodedAudioChunk) -> Result<()> {
     let mut inner = self
       .inner
       .lock()
@@ -260,7 +278,7 @@ impl AudioDecoder {
       Ok(d) => d,
       Err(e) => {
         inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, &format!("Failed to get chunk data: {}", e));
         return Ok(());
       }
@@ -269,7 +287,7 @@ impl AudioDecoder {
       Ok(ts) => ts,
       Err(e) => {
         inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, &format!("Failed to get timestamp: {}", e));
         return Ok(());
       }
@@ -280,7 +298,7 @@ impl AudioDecoder {
       Some(ctx) => ctx,
       None => {
         inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, "No decoder context");
         return Ok(());
       }
@@ -291,7 +309,7 @@ impl AudioDecoder {
       Ok(f) => f,
       Err(e) => {
         inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, &format!("Decode failed: {}", e));
         return Ok(());
       }
@@ -301,7 +319,7 @@ impl AudioDecoder {
 
     // Decrement queue size and fire dequeue event
     inner.decode_queue_size -= 1;
-    Self::fire_dequeue_event(&inner);
+    Self::fire_dequeue_event(env, &inner)?;
 
     // Convert internal frames to AudioData and call output callback
     for frame in frames {

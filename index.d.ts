@@ -82,7 +82,9 @@ export declare class AudioDecoder {
    * The dequeue event fires when decodeQueueSize decreases,
    * allowing backpressure management.
    */
-  set ondequeue(callback?: DequeueCallback | undefined | null)
+  set ondequeue(callback?: () => unknown | undefined | null)
+  /** Get the dequeue event handler (per WebCodecs spec) */
+  get ondequeue(): () => unknown | null
   /** Configure the decoder */
   configure(config: AudioDecoderConfig): void
   /** Decode an encoded audio chunk */
@@ -144,7 +146,9 @@ export declare class AudioEncoder {
    * The dequeue event fires when encodeQueueSize decreases,
    * allowing backpressure management.
    */
-  set ondequeue(callback?: DequeueCallback | undefined | null)
+  set ondequeue(callback?: () => unknown | undefined | null)
+  /** Get the dequeue event handler (per WebCodecs spec) */
+  get ondequeue(): () => unknown | null
   /** Configure the encoder */
   configure(config: AudioEncoderConfig): void
   /** Encode audio data */
@@ -169,7 +173,7 @@ export declare class AudioEncoder {
  * DOMRectReadOnly - W3C WebCodecs spec compliant rect class
  * Used for codedRect and visibleRect properties
  */
-export declare class DomRectReadOnly {
+export declare class DOMRectReadOnly {
   /** Create a new DOMRectReadOnly */
   constructor(x?: number | undefined | null, y?: number | undefined | null, width?: number | undefined | null, height?: number | undefined | null)
   /** X coordinate */
@@ -191,7 +195,6 @@ export declare class DomRectReadOnly {
   /** Convert to JSON */
   toJson(): DOMRectInit
 }
-export type DOMRectReadOnly = DomRectReadOnly
 
 /**
  * EncodedAudioChunk - represents encoded audio data
@@ -250,7 +253,10 @@ export declare class EncodedVideoChunk {
  * ```
  */
 export declare class ImageDecoder {
-  /** Create a new ImageDecoder */
+  /**
+   * Create a new ImageDecoder
+   * Supports both Uint8Array and ReadableStream as data source per W3C spec
+   */
   constructor(init: ImageDecoderInit)
   /** Whether the data is fully buffered */
   get complete(): boolean
@@ -348,7 +354,9 @@ export declare class VideoDecoder {
    * The dequeue event fires when decodeQueueSize decreases,
    * allowing backpressure management.
    */
-  set ondequeue(callback?: DequeueCallback | undefined | null)
+  set ondequeue(callback?: () => unknown | undefined | null)
+  /** Get the dequeue event handler (per WebCodecs spec) */
+  get ondequeue(): () => unknown | null
   /** Configure the decoder */
   configure(config: VideoDecoderConfig): void
   /** Decode an encoded video chunk */
@@ -411,7 +419,9 @@ export declare class VideoEncoder {
    * The dequeue event fires when encodeQueueSize decreases,
    * allowing backpressure management.
    */
-  set ondequeue(callback?: DequeueCallback | undefined | null)
+  set ondequeue(callback?: () => unknown | undefined | null)
+  /** Get the dequeue event handler (per WebCodecs spec) */
+  get ondequeue(): () => unknown | null
   /** Configure the encoder */
   configure(config: VideoEncoderConfig): void
   /** Encode a frame */
@@ -464,20 +474,24 @@ export declare class VideoFrame {
   get displayHeight(): number
   /**
    * Get the coded rect (the region containing valid pixel data)
-   * Returns DOMRectReadOnly per W3C WebCodecs spec
+   * Returns DOMRectReadOnly per W3C WebCodecs spec, null if closed
    */
-  get codedRect(): DomRectReadOnly
+  get codedRect(): DOMRectReadOnly | null
   /**
    * Get the visible rect (the region of coded data that should be displayed)
-   * Returns DOMRectReadOnly per W3C WebCodecs spec
+   * Returns DOMRectReadOnly per W3C WebCodecs spec, null if closed
    */
-  get visibleRect(): DomRectReadOnly
+  get visibleRect(): DOMRectReadOnly | null
   /** Get the presentation timestamp in microseconds */
   get timestamp(): number
   /** Get the duration in microseconds */
   get duration(): number | null
   /** Get the color space parameters */
   get colorSpace(): VideoColorSpace
+  /** Get the rotation in degrees (0, 90, 180, 270) per W3C WebCodecs spec */
+  get rotation(): number
+  /** Get whether the frame is horizontally flipped per W3C WebCodecs spec */
+  get flip(): boolean
   /** Get whether this VideoFrame has been closed (W3C WebCodecs spec) */
   get closed(): boolean
   /** Calculate the allocation size needed for copyTo */
@@ -558,7 +572,11 @@ export interface AudioDecoderSupport {
   config: AudioDecoderConfig
 }
 
-/** Audio encoder configuration (WebCodecs spec) */
+/**
+ * Audio encoder configuration (WebCodecs spec)
+ * Note: Per W3C spec, codec-specific options are not supported at this level.
+ * Codec behavior is controlled through the codec string itself.
+ */
 export interface AudioEncoderConfig {
   /** Codec string (e.g., "mp4a.40.2" for AAC-LC, "opus") */
   codec: string
@@ -568,16 +586,6 @@ export interface AudioEncoderConfig {
   numberOfChannels: number
   /** Target bitrate in bits per second */
   bitrate?: number
-  /** Opus-specific: complexity (0-10) */
-  complexity?: number
-  /** Opus-specific: application type ("voip", "audio", "lowdelay") */
-  opusApplication?: string
-  /** Opus-specific: signal type ("auto", "music", "voice") */
-  opusSignal?: string
-  /** Opus-specific: frame duration preference in microseconds */
-  opusFrameDuration?: number
-  /** AAC-specific: format ("aac", "adts") */
-  aacFormat?: string
 }
 
 /** Encode options for audio */
@@ -611,38 +619,6 @@ export type AudioSampleFormat = /** Unsigned 8-bit integer samples| interleaved 
 /** 32-bit float samples| planar */
 'f32-planar';
 
-/** Encode configuration for AV1 */
-export interface Av1EncoderConfig {
-  /** AV1 profile: 0 (Main), 1 (High), 2 (Professional) */
-  profile?: number
-  /** CPU usage preset (0 = slowest/best quality, 8 = fastest) */
-  cpuUsed?: number
-  /** Tile columns (1, 2, 4, 8, 16, 32, 64) */
-  tileColumns?: number
-  /** Tile rows */
-  tileRows?: number
-  /** CQ level for quantizer mode (0-63, lower = better quality) */
-  cqLevel?: number
-  /** Enable screen content coding tools */
-  screenContent?: boolean
-}
-
-/** Decode configuration for AVC (H.264) */
-export interface AvcDecoderConfig {
-  /** AVC configuration record (avcC box content) - Uint8Array per W3C spec (BufferSource) */
-  avcC?: Uint8Array
-}
-
-/** Encode configuration for AVC (H.264) */
-export interface AvcEncoderConfig {
-  /** AVC profile (e.g., "baseline", "main", "high") */
-  profile?: string
-  /** AVC level (e.g., "3.0", "4.0", "5.1") */
-  level?: string
-  /** Output format: "annexb" or "avc" */
-  format?: string
-}
-
 /** Encoder state per WebCodecs spec */
 export type CodecState = /** Encoder not configured */
 'unconfigured'|
@@ -650,13 +626,6 @@ export type CodecState = /** Encoder not configured */
 'configured'|
 /** Encoder closed */
 'closed';
-
-/**
- * Type alias for dequeue callback (no arguments)
- * Using CalleeHandled: false for direct callbacks
- */
-export type DequeueCallback =
-  (() => unknown)
 
 /** DOMRectInit for specifying regions */
 export interface DomRectInit {
@@ -758,42 +727,12 @@ export interface HardwareAccelerator {
   available: boolean
 }
 
-/** Encode configuration for HEVC (H.265) */
-export interface HevcEncoderConfig {
-  /** HEVC profile: "main", "main10", "main-still-picture", "rext" */
-  profile?: string
-  /** Tier: "main" or "high" */
-  tier?: string
-  /** Level (e.g., "4.0", "5.1", "6.2") */
-  level?: string
-  /** Encoding preset: "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo" */
-  preset?: string
-  /** Tuning: "psnr", "ssim", "grain", "zerolatency", "fastdecode" */
-  tune?: string
-}
-
 /** Image decode options */
 export interface ImageDecodeOptions {
   /** Frame index to decode (for animated images) */
   frameIndex?: number
   /** Whether to only decode complete frames */
   completeFramesOnly?: boolean
-}
-
-/** ImageDecoder init options */
-export interface ImageDecoderInit {
-  /** The image data (encoded bytes) - BufferSource per spec */
-  data: Uint8Array
-  /** MIME type of the image (e.g., "image/png", "image/jpeg") */
-  type: string
-  /** Color space conversion hint (optional) */
-  colorSpaceConversion?: string
-  /** Desired width (optional, for scaling) */
-  desiredWidth?: number
-  /** Desired height (optional, for scaling) */
-  desiredHeight?: number
-  /** Whether to prefer animation (for animated formats) */
-  preferAnimation?: boolean
 }
 
 /** Image track information */
@@ -873,9 +812,13 @@ export interface VideoDecoderSupport {
   config: VideoDecoderConfig
 }
 
-/** Video encoder configuration (WebCodecs spec) */
+/**
+ * Video encoder configuration (WebCodecs spec)
+ * Note: Codec-specific options are encoded in the codec string per W3C spec
+ * e.g., "avc1.42001E" encodes profile/level, "vp09.00.10.08" encodes profile/level/depth
+ */
 export interface VideoEncoderConfig {
-  /** Codec string (e.g., "avc1.42001E", "vp8", "vp09.00.10.08") */
+  /** Codec string (e.g., "avc1.42001E", "vp8", "vp09.00.10.08", "av01.0.04M.08") */
   codec: string
   /** Coded width in pixels */
   width: number
@@ -889,20 +832,12 @@ export interface VideoEncoderConfig {
   bitrate?: number
   /** Framerate */
   framerate?: number
-  /** Hardware acceleration preference */
+  /** Hardware acceleration preference: "no-preference", "prefer-hardware", "prefer-software" */
   hardwareAcceleration?: string
   /** Latency mode: "quality" or "realtime" */
   latencyMode?: string
   /** Bitrate mode: "constant", "variable", "quantizer" */
   bitrateMode?: string
-  /** AVC-specific configuration (H.264) */
-  avc?: AvcEncoderConfig
-  /** VP9-specific configuration */
-  vp9?: Vp9EncoderConfig
-  /** AV1-specific configuration */
-  av1?: Av1EncoderConfig
-  /** HEVC-specific configuration (H.265) */
-  hevc?: HevcEncoderConfig
   /** Alpha handling: "discard" or "keep" */
   alpha?: string
   /** Scalability mode (SVC) - e.g., "L1T1", "L1T2", "L1T3" */
@@ -1001,19 +936,3 @@ export type VideoPixelFormat = /** Planar YUV 4:2:0| 12bpp| (1 Cr & Cb sample pe
 'BGRA'|
 /** BGRX 32bpp (alpha ignored) */
 'BGRX';
-
-/** Encode configuration for VP9 */
-export interface Vp9EncoderConfig {
-  /** VP9 profile: 0 (8-bit 4:2:0), 1 (8-bit 4:2:2/4:4:4), 2 (10/12-bit 4:2:0), 3 (10/12-bit 4:2:2/4:4:4) */
-  profile?: number
-  /** Encoding speed preset (0 = best quality/slowest, 8 = fastest) */
-  speed?: number
-  /** Tile columns (log2 value: 0-6) */
-  tileColumns?: number
-  /** Tile rows (log2 value: 0-2) */
-  tileRows?: number
-  /** Enable row-based multithreading */
-  rowMt?: boolean
-  /** Keyframe placement mode: "auto", "disabled" */
-  keyframeMode?: string
-}

@@ -81,9 +81,8 @@ type OutputCallback = ThreadsafeFunction<
 /// Still using default CalleeHandled: true for error-first convention on error callback
 type ErrorCallback = ThreadsafeFunction<String>;
 
-/// Type alias for dequeue callback (no arguments)
-/// Using CalleeHandled: false for direct callbacks
-type DequeueCallback = ThreadsafeFunction<(), UnknownReturnValue, (), Status, false>;
+// Note: For ondequeue, we use FunctionRef instead of ThreadsafeFunction
+// to support both getter and setter per WebCodecs spec
 
 /// VideoEncoder init dictionary per WebCodecs spec
 pub struct VideoEncoderInit {
@@ -124,7 +123,7 @@ struct VideoEncoderInner {
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
   /// Optional dequeue event callback
-  dequeue_callback: Option<DequeueCallback>,
+  dequeue_callback: Option<FunctionRef<(), UnknownReturnValue>>,
 }
 
 /// VideoEncoder - WebCodecs-compliant video encoder
@@ -195,11 +194,12 @@ impl VideoEncoder {
   }
 
   /// Fire dequeue event if callback is set
-  fn fire_dequeue_event(inner: &VideoEncoderInner) {
+  fn fire_dequeue_event(env: &Env, inner: &VideoEncoderInner) -> Result<()> {
     if let Some(ref callback) = inner.dequeue_callback {
-      // CalleeHandled: false means we pass value directly, not Result
-      callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+      let cb = callback.borrow_back(env)?;
+      cb.call(())?;
     }
+    Ok(())
   }
 
   /// Get encoder state
@@ -227,7 +227,7 @@ impl VideoEncoder {
   /// The dequeue event fires when encodeQueueSize decreases,
   /// allowing backpressure management.
   #[napi(setter)]
-  pub fn set_ondequeue(&self, callback: Option<DequeueCallback>) -> Result<()> {
+  pub fn set_ondequeue(&self, callback: Option<FunctionRef<(), UnknownReturnValue>>) -> Result<()> {
     let mut inner = self
       .inner
       .lock()
@@ -236,6 +236,24 @@ impl VideoEncoder {
     inner.dequeue_callback = callback;
 
     Ok(())
+  }
+
+  /// Get the dequeue event handler (per WebCodecs spec)
+  #[napi(getter)]
+  pub fn get_ondequeue<'env>(
+    &self,
+    env: &'env Env,
+  ) -> Result<Option<Function<'env, (), UnknownReturnValue>>> {
+    let inner = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    if let Some(ref callback) = inner.dequeue_callback {
+      let cb = callback.borrow_back(env)?;
+      Ok(Some(cb))
+    } else {
+      Ok(None)
+    }
   }
 
   /// Configure the encoder
@@ -345,6 +363,7 @@ impl VideoEncoder {
   #[napi]
   pub fn encode(
     &self,
+    env: &Env,
     frame: &VideoFrame,
     _options: Option<VideoEncoderEncodeOptions>,
   ) -> Result<()> {
@@ -366,7 +385,7 @@ impl VideoEncoder {
       Some(config) => (config.width, config.height, config.codec.clone()),
       None => {
         inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, "No encoder config");
         return Ok(());
       }
@@ -382,7 +401,7 @@ impl VideoEncoder {
       Ok(result) => result,
       Err(e) => {
         inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, &format!("Failed to access frame: {}", e));
         return Ok(());
       }
@@ -392,7 +411,7 @@ impl VideoEncoder {
       Ok(f) => f,
       Err(e) => {
         inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, &format!("Failed to clone frame: {}", e));
         return Ok(());
       }
@@ -415,7 +434,7 @@ impl VideoEncoder {
           Ok(scaler) => inner.scaler = Some(scaler),
           Err(e) => {
             inner.encode_queue_size -= 1;
-            Self::fire_dequeue_event(&inner);
+            Self::fire_dequeue_event(env, &inner)?;
             Self::report_error(&mut inner, &format!("Failed to create scaler: {}", e));
             return Ok(());
           }
@@ -427,7 +446,7 @@ impl VideoEncoder {
         Ok(scaled) => scaled,
         Err(e) => {
           inner.encode_queue_size -= 1;
-          Self::fire_dequeue_event(&inner);
+          Self::fire_dequeue_event(env, &inner)?;
           Self::report_error(&mut inner, &format!("Failed to scale frame: {}", e));
           return Ok(());
         }
@@ -441,7 +460,7 @@ impl VideoEncoder {
       Ok(ts) => ts,
       Err(e) => {
         inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, &format!("Failed to get frame timestamp: {}", e));
         return Ok(());
       }
@@ -464,7 +483,7 @@ impl VideoEncoder {
       Some(ctx) => ctx,
       None => {
         inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, "No encoder context");
         return Ok(());
       }
@@ -474,7 +493,7 @@ impl VideoEncoder {
       Ok(pkts) => pkts,
       Err(e) => {
         inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, &format!("Encode failed: {}", e));
         return Ok(());
       }
@@ -484,7 +503,7 @@ impl VideoEncoder {
 
     // Decrement queue size and fire dequeue event
     inner.encode_queue_size -= 1;
-    Self::fire_dequeue_event(&inner);
+    Self::fire_dequeue_event(env, &inner)?;
 
     // Process output packets - call callback for each
     for packet in packets {
@@ -581,6 +600,12 @@ impl VideoEncoder {
       return Ok(());
     }
 
+    // Drain encoder before dropping to ensure libaom/AV1 threads finish
+    if let Some(ctx) = inner.context.as_mut() {
+      let _ = ctx.send_frame(None);
+      while ctx.receive_packet().ok().flatten().is_some() {}
+    }
+
     // Drop existing context
     inner.context = None;
     inner.scaler = None;
@@ -600,6 +625,15 @@ impl VideoEncoder {
       .inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    // Drain encoder before dropping to ensure libaom/AV1 threads finish
+    // This prevents SIGSEGV crashes during cleanup
+    if let Some(ctx) = inner.context.as_mut() {
+      // Send NULL frame to signal end of stream
+      let _ = ctx.send_frame(None);
+      // Drain all remaining packets
+      while ctx.receive_packet().ok().flatten().is_some() {}
+    }
 
     inner.context = None;
     inner.scaler = None;

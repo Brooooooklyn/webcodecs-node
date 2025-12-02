@@ -6,7 +6,7 @@
  */
 
 import test from 'ava'
-import { VideoEncoder, VideoFrame } from '../index.js'
+import { VideoEncoder, VideoFrame, VideoDecoder, AudioEncoder, AudioDecoder, AudioData } from '../index.js'
 import { type EncodedVideoChunk } from './helpers/index.js'
 
 // Helper to create test encoder with callbacks
@@ -154,4 +154,103 @@ test('VideoEncoderConfig: callback mode with output', async (t) => {
   t.true(chunks.length > 0, 'Should have encoded chunks via callback')
 
   encoder.close()
+})
+
+// ============================================================================
+// Phase 3: ondequeue getter tests (per WebCodecs spec)
+// ============================================================================
+
+test('VideoEncoder: ondequeue getter returns null when not set', (t) => {
+  const { encoder } = createTestEncoder()
+  t.is(encoder.ondequeue, null)
+  encoder.close()
+})
+
+test('VideoEncoder: ondequeue getter returns function after setter', (t) => {
+  const { encoder } = createTestEncoder()
+  const callback = () => {}
+  encoder.ondequeue = callback
+  t.is(typeof encoder.ondequeue, 'function')
+  encoder.close()
+})
+
+test('VideoEncoder: ondequeue getter returns same function that was set', (t) => {
+  const { encoder } = createTestEncoder()
+  const callback = () => {}
+  encoder.ondequeue = callback
+  t.is(encoder.ondequeue, callback)
+  encoder.close()
+})
+
+test('VideoEncoder: ondequeue can be set to null/undefined', (t) => {
+  const { encoder } = createTestEncoder()
+  const callback = () => {}
+  encoder.ondequeue = callback
+  t.is(encoder.ondequeue, callback)
+  encoder.ondequeue = undefined
+  t.is(encoder.ondequeue, null) // NAPI-RS returns null for Option::None
+  encoder.close()
+})
+
+test('VideoDecoder: ondequeue getter returns null when not set', (t) => {
+  const decoder = new VideoDecoder({
+    output: () => {},
+    error: () => {},
+  })
+  t.is(decoder.ondequeue, null)
+  decoder.close()
+})
+
+test('VideoDecoder: ondequeue getter returns function after setter', (t) => {
+  const decoder = new VideoDecoder({
+    output: () => {},
+    error: () => {},
+  })
+  const callback = () => {}
+  decoder.ondequeue = callback
+  t.is(typeof decoder.ondequeue, 'function')
+  t.is(decoder.ondequeue, callback)
+  decoder.close()
+})
+
+test('AudioEncoder: ondequeue getter returns null when not set', (t) => {
+  const encoder = new AudioEncoder({
+    output: () => {},
+    error: () => {},
+  })
+  t.is(encoder.ondequeue, null)
+  encoder.close()
+})
+
+test('AudioEncoder: ondequeue getter returns function after setter', (t) => {
+  const encoder = new AudioEncoder({
+    output: () => {},
+    error: () => {},
+  })
+  const callback = () => {}
+  encoder.ondequeue = callback
+  t.is(typeof encoder.ondequeue, 'function')
+  t.is(encoder.ondequeue, callback)
+  encoder.close()
+})
+
+test('AudioDecoder: ondequeue getter returns null when not set', (t) => {
+  const decoder = new AudioDecoder({
+    output: () => {},
+    error: () => {},
+  })
+  t.is(decoder.ondequeue, null)
+  decoder.close()
+})
+
+test('AudioDecoder: ondequeue getter returns function after setter', (t) => {
+  const decoder = new AudioDecoder({
+    output: () => {},
+    error: () => {},
+  })
+  const callback = () => {}
+  decoder.ondequeue = callback
+  t.is(typeof decoder.ondequeue, 'function')
+  t.is(decoder.ondequeue, callback)
+  decoder.close()
 })

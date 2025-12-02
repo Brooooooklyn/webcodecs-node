@@ -129,8 +129,22 @@ impl CodecContext {
   // Decoder Creation
   // ========================================================================
 
-  /// Create a new decoder context for the given codec ID
+  /// Create a new decoder context for the given codec ID.
+  /// For AV1, we prefer libdav1d over libaom because:
+  /// 1. libdav1d is more stable on darwin/aarch64 (Apple Silicon)
+  /// 2. libaom has known SIGSEGV issues during cleanup on some platforms
+  /// 3. libdav1d generally has better performance
   pub fn new_decoder(codec_id: AVCodecID) -> CodecResult<Self> {
+    // For AV1, try libdav1d first to avoid libaom stability issues
+    if codec_id == AVCodecID::Av1 {
+      let decoder_name = c"libdav1d";
+      let codec = unsafe { ffi::avcodec::avcodec_find_decoder_by_name(decoder_name.as_ptr()) };
+      if !codec.is_null() {
+        return Self::from_codec(codec, CodecType::Decoder);
+      }
+      // Fall back to default if libdav1d not available
+    }
+
     let codec = unsafe { avcodec_find_decoder(codec_id.as_raw()) };
     if codec.is_null() {
       return Err(CodecError::DecoderNotFound(codec_id));
@@ -563,6 +577,9 @@ impl CodecContext {
 impl Drop for CodecContext {
   fn drop(&mut self) {
     unsafe {
+      // avcodec_free_context handles both closing the codec and freeing the context.
+      // Do NOT call avcodec_close separately - it's deprecated and calling both
+      // can cause issues with some codecs (e.g., libaom-av1).
       let mut ptr = self.ptr.as_ptr();
       avcodec_free_context(&mut ptr);
     }
@@ -615,14 +632,19 @@ fn get_hw_encoder_name(codec_id: AVCodecID, hw_type: AVHWDeviceType) -> Option<&
   }
 }
 
-/// Get software encoder name for a codec
+/// Get software encoder name for a codec.
+/// For AV1, we prefer librav1e (rav1e) because:
+/// 1. It's more stable on darwin/aarch64 (Apple Silicon)
+/// 2. libaom-av1 has known SIGSEGV issues during cleanup on some platforms
+/// 3. SVT-AV1 also has reported segfault issues on macOS
 fn get_sw_encoder_name(codec_id: AVCodecID) -> Option<&'static str> {
   match codec_id {
     AVCodecID::H264 => Some("libx264"),
     AVCodecID::Hevc => Some("libx265"),
     AVCodecID::Vp8 => Some("libvpx"),
     AVCodecID::Vp9 => Some("libvpx-vp9"),
-    AVCodecID::Av1 => Some("libaom-av1"),
+    // Prefer librav1e over libaom-av1/libsvtav1 for stability on macOS
+    AVCodecID::Av1 => Some("librav1e"),
     _ => None,
   }
 }

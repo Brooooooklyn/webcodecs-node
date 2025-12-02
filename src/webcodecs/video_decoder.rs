@@ -21,9 +21,8 @@ type OutputCallback = ThreadsafeFunction<VideoFrame, UnknownReturnValue, VideoFr
 /// Still using default CalleeHandled: true for error-first convention
 type ErrorCallback = ThreadsafeFunction<String>;
 
-/// Type alias for dequeue callback (no arguments)
-/// Using CalleeHandled: false for direct callbacks
-type DequeueCallback = ThreadsafeFunction<(), UnknownReturnValue, (), Status, false>;
+// Note: For ondequeue, we use FunctionRef instead of ThreadsafeFunction
+// to support both getter and setter per WebCodecs spec
 
 /// VideoDecoder init dictionary per WebCodecs spec
 pub struct VideoDecoderInit {
@@ -72,7 +71,7 @@ struct VideoDecoderInner {
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
   /// Optional dequeue event callback
-  dequeue_callback: Option<DequeueCallback>,
+  dequeue_callback: Option<FunctionRef<(), UnknownReturnValue>>,
 }
 
 /// VideoDecoder - WebCodecs-compliant video decoder
@@ -137,11 +136,12 @@ impl VideoDecoder {
   }
 
   /// Fire dequeue event if callback is set
-  fn fire_dequeue_event(inner: &VideoDecoderInner) {
+  fn fire_dequeue_event(env: &Env, inner: &VideoDecoderInner) -> Result<()> {
     if let Some(ref callback) = inner.dequeue_callback {
-      // CalleeHandled: false means we pass value directly, not Result
-      callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+      let cb = callback.borrow_back(env)?;
+      cb.call(())?;
     }
+    Ok(())
   }
 
   /// Get decoder state
@@ -169,7 +169,7 @@ impl VideoDecoder {
   /// The dequeue event fires when decodeQueueSize decreases,
   /// allowing backpressure management.
   #[napi(setter)]
-  pub fn set_ondequeue(&self, callback: Option<DequeueCallback>) -> Result<()> {
+  pub fn set_ondequeue(&self, callback: Option<FunctionRef<(), UnknownReturnValue>>) -> Result<()> {
     let mut inner = self
       .inner
       .lock()
@@ -178,6 +178,24 @@ impl VideoDecoder {
     inner.dequeue_callback = callback;
 
     Ok(())
+  }
+
+  /// Get the dequeue event handler (per WebCodecs spec)
+  #[napi(getter)]
+  pub fn get_ondequeue<'env>(
+    &self,
+    env: &'env Env,
+  ) -> Result<Option<Function<'env, (), UnknownReturnValue>>> {
+    let inner = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    if let Some(ref callback) = inner.dequeue_callback {
+      let cb = callback.borrow_back(env)?;
+      Ok(Some(cb))
+    } else {
+      Ok(None)
+    }
   }
 
   /// Configure the decoder
@@ -247,7 +265,7 @@ impl VideoDecoder {
 
   /// Decode an encoded video chunk
   #[napi]
-  pub fn decode(&self, chunk: &EncodedVideoChunk) -> Result<()> {
+  pub fn decode(&self, env: &Env, chunk: &EncodedVideoChunk) -> Result<()> {
     let mut inner = self
       .inner
       .lock()
@@ -266,7 +284,7 @@ impl VideoDecoder {
       Ok(d) => d,
       Err(e) => {
         inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, &format!("Failed to get chunk data: {}", e));
         return Ok(());
       }
@@ -275,7 +293,7 @@ impl VideoDecoder {
       Ok(ts) => ts,
       Err(e) => {
         inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, &format!("Failed to get timestamp: {}", e));
         return Ok(());
       }
@@ -284,7 +302,7 @@ impl VideoDecoder {
       Ok(dur) => dur,
       Err(e) => {
         inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, &format!("Failed to get duration: {}", e));
         return Ok(());
       }
@@ -295,7 +313,7 @@ impl VideoDecoder {
       Some(ctx) => ctx,
       None => {
         inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, "No decoder context");
         return Ok(());
       }
@@ -306,7 +324,7 @@ impl VideoDecoder {
       Ok(f) => f,
       Err(e) => {
         inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, &format!("Decode failed: {}", e));
         return Ok(());
       }
@@ -316,7 +334,7 @@ impl VideoDecoder {
 
     // Decrement queue size and fire dequeue event
     inner.decode_queue_size -= 1;
-    Self::fire_dequeue_event(&inner);
+    Self::fire_dequeue_event(env, &inner)?;
 
     // Convert internal frames to VideoFrames and call output callback
     for frame in frames {
@@ -394,6 +412,12 @@ impl VideoDecoder {
       return Ok(());
     }
 
+    // Drain decoder before dropping to ensure libaom/AV1 threads finish
+    if let Some(ctx) = inner.context.as_mut() {
+      let _ = ctx.send_packet(None);
+      while ctx.receive_frame().ok().flatten().is_some() {}
+    }
+
     // Drop existing context
     inner.context = None;
     inner.config = None;
@@ -412,6 +436,12 @@ impl VideoDecoder {
       .inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    // Drain decoder before dropping to ensure libaom/AV1 threads finish
+    if let Some(ctx) = inner.context.as_mut() {
+      let _ = ctx.send_packet(None);
+      while ctx.receive_frame().ok().flatten().is_some() {}
+    }
 
     inner.context = None;
     inner.config = None;

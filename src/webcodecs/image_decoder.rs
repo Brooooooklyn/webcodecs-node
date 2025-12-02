@@ -1,22 +1,30 @@
 //! ImageDecoder - WebCodecs API implementation
 //!
 //! Provides image decoding functionality using FFmpeg.
-//! See: https://developer.mozilla.org/en-US/docs/Web/API/ImageDecoder
+//! See: <https://developer.mozilla.org/en-US/docs/Web/API/ImageDecoder>
 
 use crate::codec::{CodecContext, DecoderConfig, Packet};
 use crate::ffi::AVCodecID;
 use crate::webcodecs::VideoFrame;
 use napi::bindgen_prelude::*;
+use napi::tokio_stream::StreamExt;
 use napi_derive::napi;
 use std::sync::{Arc, Mutex};
 
+/// Data source for ImageDecoder - can be either a Uint8Array or ReadableStream
+pub enum ImageDecoderData {
+  /// Buffered data (Uint8Array)
+  Buffer(Vec<u8>),
+  /// Streaming data (ReadableStream) - data will be read incrementally
+  Stream(Vec<u8>), // Stores collected stream data
+}
+
 /// ImageDecoder init options
-#[napi(object)]
+/// Per W3C spec, `data` can be either a BufferSource or a ReadableStream
 pub struct ImageDecoderInit {
-  /// The image data (encoded bytes) - BufferSource per spec
-  pub data: Uint8Array,
+  /// The image data (encoded bytes or stream) - BufferSource | ReadableStream per spec
+  pub data: ImageDecoderData,
   /// MIME type of the image (e.g., "image/png", "image/jpeg")
-  #[napi(js_name = "type")]
   pub mime_type: String,
   /// Color space conversion hint (optional)
   pub color_space_conversion: Option<String>,
@@ -26,6 +34,95 @@ pub struct ImageDecoderInit {
   pub desired_height: Option<u32>,
   /// Whether to prefer animation (for animated formats)
   pub prefer_animation: Option<bool>,
+}
+
+impl FromNapiValue for ImageDecoderInit {
+  unsafe fn from_napi_value(
+    env: napi::sys::napi_env,
+    value: napi::sys::napi_value,
+  ) -> Result<Self> {
+    let obj = Object::from_napi_value(env, value)?;
+
+    // Get MIME type (required)
+    let mime_type: String = obj
+      .get_named_property("type")
+      .map_err(|_| Error::new(Status::InvalidArg, "Missing required 'type' property"))?;
+
+    // Get optional properties
+    let color_space_conversion: Option<String> = obj.get("colorSpaceConversion").ok().flatten();
+    let desired_width: Option<u32> = obj.get("desiredWidth").ok().flatten();
+    let desired_height: Option<u32> = obj.get("desiredHeight").ok().flatten();
+    let prefer_animation: Option<bool> = obj.get("preferAnimation").ok().flatten();
+
+    // Get data - try Uint8Array first, then ReadableStream
+    let data_napi_value: napi::sys::napi_value = {
+      let mut result = std::ptr::null_mut();
+      napi::check_status!(
+        napi::sys::napi_get_named_property(env, value, c"data".as_ptr().cast(), &mut result),
+        "Failed to get 'data' property"
+      )?;
+      result
+    };
+
+    // Check if it's a Uint8Array (Buffer)
+    let data = if let Ok(buffer) = Uint8Array::from_napi_value(env, data_napi_value) {
+      ImageDecoderData::Buffer(buffer.to_vec())
+    } else if let Ok(stream) = ReadableStream::<BufferSlice>::from_napi_value(env, data_napi_value)
+    {
+      // It's a ReadableStream - read all data from it
+      // Note: We need to collect the stream data synchronously during construction
+      // This is a limitation - we can't do async in FromNapiValue
+      // For true streaming support, we would need a different API design
+      let reader = stream.read().map_err(|e| {
+        Error::new(
+          Status::GenericFailure,
+          format!("Failed to get stream reader: {}", e),
+        )
+      })?;
+
+      // Collect stream data using a blocking approach
+      // This is not ideal but necessary for the current API design
+      let mut collected = Vec::new();
+      let rt = tokio::runtime::Handle::try_current().map_err(|_| {
+        Error::new(
+          Status::GenericFailure,
+          "ReadableStream requires async runtime",
+        )
+      })?;
+
+      rt.block_on(async {
+        let mut reader = reader;
+        while let Some(chunk) = reader.next().await {
+          match chunk {
+            Ok(data) => collected.extend_from_slice(data.as_ref()),
+            Err(e) => {
+              return Err(Error::new(
+                Status::GenericFailure,
+                format!("Stream read error: {}", e),
+              ))
+            }
+          }
+        }
+        Ok(())
+      })?;
+
+      ImageDecoderData::Stream(collected)
+    } else {
+      return Err(Error::new(
+        Status::InvalidArg,
+        "data must be a Uint8Array or ReadableStream",
+      ));
+    };
+
+    Ok(ImageDecoderInit {
+      data,
+      mime_type,
+      color_space_conversion,
+      desired_width,
+      desired_height,
+      prefer_animation,
+    })
+  }
 }
 
 /// Image decode options
@@ -117,7 +214,7 @@ struct ImageDecoderInner {
   codec_id: AVCodecID,
   /// Decoder context (created on first decode)
   context: Option<CodecContext>,
-  /// Whether data is fully buffered
+  /// Whether data is fully buffered (true for Buffer, becomes true for Stream when finished)
   complete: bool,
   /// Track list
   tracks: ImageTrackList,
@@ -147,6 +244,7 @@ pub struct ImageDecoder {
 #[napi]
 impl ImageDecoder {
   /// Create a new ImageDecoder
+  /// Supports both Uint8Array and ReadableStream as data source per W3C spec
   #[napi(constructor)]
   pub fn new(init: ImageDecoderInit) -> Result<Self> {
     // Parse MIME type to codec ID
@@ -168,12 +266,18 @@ impl ImageDecoder {
       selected_index: Some(0),
     };
 
+    // Extract data and determine source type
+    let data = match init.data {
+      ImageDecoderData::Buffer(buf) => buf,
+      ImageDecoderData::Stream(buf) => buf,
+    };
+
     let inner = ImageDecoderInner {
-      data: init.data.to_vec(),
+      data,
       mime_type: init.mime_type,
       codec_id,
       context: None,
-      complete: true, // Data is complete (we have Buffer, not stream)
+      complete: true, // Data is complete (collected from stream or buffer)
       tracks,
       closed: false,
     };

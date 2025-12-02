@@ -35,11 +35,6 @@ type OutputCallback = ThreadsafeFunction<
 /// Still using default CalleeHandled: true for error-first convention
 type ErrorCallback = ThreadsafeFunction<String>;
 
-#[napi]
-/// Type alias for dequeue callback (no arguments)
-/// Using CalleeHandled: false for direct callbacks
-pub type DequeueCallback = ThreadsafeFunction<(), UnknownReturnValue, (), Status, false>;
-
 /// AudioEncoder init dictionary per WebCodecs spec
 pub struct AudioEncoderInit {
   /// Output callback - called when encoded chunk is available
@@ -112,7 +107,7 @@ struct AudioEncoderInner {
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
   /// Optional dequeue event callback
-  dequeue_callback: Option<DequeueCallback>,
+  dequeue_callback: Option<FunctionRef<(), UnknownReturnValue>>,
 }
 
 /// AudioEncoder - WebCodecs-compliant audio encoder
@@ -184,11 +179,12 @@ impl AudioEncoder {
   }
 
   /// Fire dequeue event if callback is set
-  fn fire_dequeue_event(inner: &AudioEncoderInner) {
+  fn fire_dequeue_event(env: &Env, inner: &AudioEncoderInner) -> Result<()> {
     if let Some(ref callback) = inner.dequeue_callback {
-      // CalleeHandled: false means we pass value directly, not Result
-      callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+      let cb = callback.borrow_back(env)?;
+      cb.call(())?;
     }
+    Ok(())
   }
 
   /// Get encoder state
@@ -216,7 +212,7 @@ impl AudioEncoder {
   /// The dequeue event fires when encodeQueueSize decreases,
   /// allowing backpressure management.
   #[napi(setter)]
-  pub fn set_ondequeue(&self, callback: Option<DequeueCallback>) -> Result<()> {
+  pub fn set_ondequeue(&self, callback: Option<FunctionRef<(), UnknownReturnValue>>) -> Result<()> {
     let mut inner = self
       .inner
       .lock()
@@ -225,6 +221,24 @@ impl AudioEncoder {
     inner.dequeue_callback = callback;
 
     Ok(())
+  }
+
+  /// Get the dequeue event handler (per WebCodecs spec)
+  #[napi(getter)]
+  pub fn get_ondequeue<'env>(
+    &self,
+    env: &'env Env,
+  ) -> Result<Option<Function<'env, (), UnknownReturnValue>>> {
+    let inner = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    if let Some(ref callback) = inner.dequeue_callback {
+      let cb = callback.borrow_back(env)?;
+      Ok(Some(cb))
+    } else {
+      Ok(None)
+    }
   }
 
   /// Configure the encoder
@@ -318,7 +332,7 @@ impl AudioEncoder {
 
   /// Encode audio data
   #[napi]
-  pub fn encode(&self, data: &AudioData) -> Result<()> {
+  pub fn encode(&self, env: &Env, data: &AudioData) -> Result<()> {
     let mut inner = self
       .inner
       .lock()
@@ -341,7 +355,7 @@ impl AudioEncoder {
       ),
       None => {
         inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, "No encoder config");
         return Ok(());
       }
@@ -352,13 +366,13 @@ impl AudioEncoder {
       Ok(Some(fmt)) => fmt,
       Ok(None) => {
         inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, "AudioData has no format");
         return Ok(());
       }
       Err(e) => {
         inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, &format!("Failed to get format: {}", e));
         return Ok(());
       }
@@ -367,7 +381,7 @@ impl AudioEncoder {
       Ok(sr) => sr,
       Err(e) => {
         inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, &format!("Failed to get sample rate: {}", e));
         return Ok(());
       }
@@ -376,7 +390,7 @@ impl AudioEncoder {
       Ok(ch) => ch,
       Err(e) => {
         inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, &format!("Failed to get channels: {}", e));
         return Ok(());
       }
@@ -385,7 +399,7 @@ impl AudioEncoder {
       Ok(ts) => ts,
       Err(e) => {
         inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, &format!("Failed to get timestamp: {}", e));
         return Ok(());
       }
@@ -409,7 +423,7 @@ impl AudioEncoder {
         Ok(resampler) => inner.resampler = Some(resampler),
         Err(e) => {
           inner.encode_queue_size -= 1;
-          Self::fire_dequeue_event(&inner);
+          Self::fire_dequeue_event(env, &inner)?;
           Self::report_error(&mut inner, &format!("Failed to create resampler: {}", e));
           return Ok(());
         }
@@ -421,7 +435,7 @@ impl AudioEncoder {
       Ok(res) => res,
       Err(e) => {
         inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, &format!("Failed to get frame: {}", e));
         return Ok(());
       }
@@ -430,7 +444,7 @@ impl AudioEncoder {
       Ok(f) => f,
       Err(e) => {
         inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, &format!("Failed to clone frame: {}", e));
         return Ok(());
       }
@@ -442,7 +456,7 @@ impl AudioEncoder {
         Ok(f) => f,
         Err(e) => {
           inner.encode_queue_size -= 1;
-          Self::fire_dequeue_event(&inner);
+          Self::fire_dequeue_event(env, &inner)?;
           Self::report_error(&mut inner, &format!("Resampling failed: {}", e));
           return Ok(());
         }
@@ -457,7 +471,7 @@ impl AudioEncoder {
         Some(buf) => buf,
         None => {
           inner.encode_queue_size -= 1;
-          Self::fire_dequeue_event(&inner);
+          Self::fire_dequeue_event(env, &inner)?;
           Self::report_error(&mut inner, "No sample buffer");
           return Ok(());
         }
@@ -465,7 +479,7 @@ impl AudioEncoder {
 
       if let Err(e) = sample_buffer.add_frame(&frame_to_add) {
         inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner);
+        Self::fire_dequeue_event(env, &inner)?;
         Self::report_error(&mut inner, &format!("Failed to add samples: {}", e));
         return Ok(());
       }
@@ -492,7 +506,7 @@ impl AudioEncoder {
         ),
         None => {
           inner.encode_queue_size -= 1;
-          Self::fire_dequeue_event(&inner);
+          Self::fire_dequeue_event(env, &inner)?;
           Self::report_error(&mut inner, "No sample buffer");
           return Ok(());
         }
@@ -508,7 +522,7 @@ impl AudioEncoder {
           Some(buf) => buf,
           None => {
             inner.encode_queue_size -= 1;
-            Self::fire_dequeue_event(&inner);
+            Self::fire_dequeue_event(env, &inner)?;
             Self::report_error(&mut inner, "No sample buffer");
             return Ok(());
           }
@@ -517,13 +531,13 @@ impl AudioEncoder {
           Ok(Some(f)) => f,
           Ok(None) => {
             inner.encode_queue_size -= 1;
-            Self::fire_dequeue_event(&inner);
+            Self::fire_dequeue_event(env, &inner)?;
             Self::report_error(&mut inner, "No frame available");
             return Ok(());
           }
           Err(e) => {
             inner.encode_queue_size -= 1;
-            Self::fire_dequeue_event(&inner);
+            Self::fire_dequeue_event(env, &inner)?;
             Self::report_error(&mut inner, &format!("Failed to get frame: {}", e));
             return Ok(());
           }
@@ -543,7 +557,7 @@ impl AudioEncoder {
         Some(ctx) => ctx,
         None => {
           inner.encode_queue_size -= 1;
-          Self::fire_dequeue_event(&inner);
+          Self::fire_dequeue_event(env, &inner)?;
           Self::report_error(&mut inner, "No encoder context");
           return Ok(());
         }
@@ -553,7 +567,7 @@ impl AudioEncoder {
         Ok(pkts) => pkts,
         Err(e) => {
           inner.encode_queue_size -= 1;
-          Self::fire_dequeue_event(&inner);
+          Self::fire_dequeue_event(env, &inner)?;
           Self::report_error(&mut inner, &format!("Encode failed: {}", e));
           return Ok(());
         }
@@ -605,7 +619,7 @@ impl AudioEncoder {
 
     // Decrement queue size and fire dequeue event
     inner.encode_queue_size -= 1;
-    Self::fire_dequeue_event(&inner);
+    Self::fire_dequeue_event(env, &inner)?;
 
     Ok(())
   }

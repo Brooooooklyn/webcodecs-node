@@ -560,7 +560,6 @@ module.exports = nativeBinding
 module.exports.AudioData = nativeBinding.AudioData
 module.exports.AudioDecoder = nativeBinding.AudioDecoder
 module.exports.AudioEncoder = nativeBinding.AudioEncoder
-module.exports.DomRectReadOnly = nativeBinding.DomRectReadOnly
 module.exports.DOMRectReadOnly = nativeBinding.DOMRectReadOnly
 module.exports.EncodedAudioChunk = nativeBinding.EncodedAudioChunk
 module.exports.EncodedVideoChunk = nativeBinding.EncodedVideoChunk

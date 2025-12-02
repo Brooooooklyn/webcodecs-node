@@ -364,7 +364,7 @@ test('AudioDecoder: roundtrip with Opus', async (t) => {
     // For Opus, we may need extradata (OpusHead)
     try {
       decoder.decode(chunk)
-    } catch (_e) {
+    } catch {
       // May fail without proper Opus header, that's expected
     }
   }

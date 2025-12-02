@@ -12,7 +12,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # NAPI-RS bindings
-napi = { version = "3.0.0", features = ["async", "napi8"] }
+napi = { version = "3.0.0", features = ["async", "napi8", "web_stream"] }
 napi-derive = "3.0.0"
 
 # Async runtime
