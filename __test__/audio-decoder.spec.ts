@@ -433,7 +433,7 @@ test('AudioDecoder: ondequeue can be set', (t) => {
   })
 
   decoder.close()
-  t.pass()
+  t.is(dequeueCount, 0)
 })
 
 test('AudioDecoder: ondequeue can be set to null', (t) => {

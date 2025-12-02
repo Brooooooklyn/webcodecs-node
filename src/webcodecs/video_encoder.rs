@@ -75,11 +75,12 @@ type OutputCallback = ThreadsafeFunction<
   FnArgs<(EncodedVideoChunk, EncodedVideoChunkMetadata)>,
   Status,
   false,
+  true,
 >;
 
 /// Type alias for error callback (takes error string)
 /// Still using default CalleeHandled: true for error-first convention on error callback
-type ErrorCallback = ThreadsafeFunction<String>;
+type ErrorCallback = ThreadsafeFunction<String, UnknownReturnValue, String, Status, true, true>;
 
 // Note: For ondequeue, we use FunctionRef instead of ThreadsafeFunction
 // to support both getter and setter per WebCodecs spec
@@ -93,7 +94,10 @@ pub struct VideoEncoderInit {
 }
 
 impl FromNapiValue for VideoEncoderInit {
-  unsafe fn from_napi_value(env: napi::sys::napi_env, value: napi::sys::napi_value) -> Result<Self> {
+  unsafe fn from_napi_value(
+    env: napi::sys::napi_env,
+    value: napi::sys::napi_value,
+  ) -> Result<Self> {
     let obj = Object::from_napi_value(env, value)?;
 
     let output: OutputCallback = obj
@@ -122,8 +126,8 @@ struct VideoEncoderInner {
   output_callback: OutputCallback,
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
-  /// Optional dequeue event callback
-  dequeue_callback: Option<FunctionRef<(), UnknownReturnValue>>,
+  /// Optional dequeue event callback (ThreadsafeFunction for multi-thread support)
+  dequeue_callback: Option<ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, true>>,
 }
 
 /// VideoEncoder - WebCodecs-compliant video encoder
@@ -152,6 +156,7 @@ struct VideoEncoderInner {
 #[napi]
 pub struct VideoEncoder {
   inner: Arc<Mutex<VideoEncoderInner>>,
+  dequeue_callback: Option<FunctionRef<(), UnknownReturnValue>>,
 }
 
 #[napi]
@@ -181,6 +186,7 @@ impl VideoEncoder {
 
     Ok(Self {
       inner: Arc::new(Mutex::new(inner)),
+      dequeue_callback: None,
     })
   }
 
@@ -194,10 +200,9 @@ impl VideoEncoder {
   }
 
   /// Fire dequeue event if callback is set
-  fn fire_dequeue_event(env: &Env, inner: &VideoEncoderInner) -> Result<()> {
+  fn fire_dequeue_event(inner: &VideoEncoderInner) -> Result<()> {
     if let Some(ref callback) = inner.dequeue_callback {
-      let cb = callback.borrow_back(env)?;
-      cb.call(())?;
+      callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
     }
     Ok(())
   }
@@ -227,13 +232,26 @@ impl VideoEncoder {
   /// The dequeue event fires when encodeQueueSize decreases,
   /// allowing backpressure management.
   #[napi(setter)]
-  pub fn set_ondequeue(&self, callback: Option<FunctionRef<(), UnknownReturnValue>>) -> Result<()> {
-    let mut inner = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    inner.dequeue_callback = callback;
+  pub fn set_ondequeue(
+    &mut self,
+    env: &Env,
+    callback: Option<FunctionRef<(), UnknownReturnValue>>,
+  ) -> Result<()> {
+    if let Some(ref callback) = callback {
+      let mut inner = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+      inner.dequeue_callback = Some(
+        callback
+          .borrow_back(env)?
+          .build_threadsafe_function()
+          .callee_handled::<false>()
+          .weak::<true>()
+          .build()?,
+      );
+    }
+    self.dequeue_callback = callback;
 
     Ok(())
   }
@@ -244,11 +262,7 @@ impl VideoEncoder {
     &self,
     env: &'env Env,
   ) -> Result<Option<Function<'env, (), UnknownReturnValue>>> {
-    let inner = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-    if let Some(ref callback) = inner.dequeue_callback {
+    if let Some(ref callback) = self.dequeue_callback {
       let cb = callback.borrow_back(env)?;
       Ok(Some(cb))
     } else {
@@ -363,7 +377,6 @@ impl VideoEncoder {
   #[napi]
   pub fn encode(
     &self,
-    env: &Env,
     frame: &VideoFrame,
     _options: Option<VideoEncoderEncodeOptions>,
   ) -> Result<()> {
@@ -385,7 +398,7 @@ impl VideoEncoder {
       Some(config) => (config.width, config.height, config.codec.clone()),
       None => {
         inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(env, &inner)?;
+        Self::fire_dequeue_event(&inner)?;
         Self::report_error(&mut inner, "No encoder config");
         return Ok(());
       }
@@ -401,7 +414,7 @@ impl VideoEncoder {
       Ok(result) => result,
       Err(e) => {
         inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(env, &inner)?;
+        Self::fire_dequeue_event(&inner)?;
         Self::report_error(&mut inner, &format!("Failed to access frame: {}", e));
         return Ok(());
       }
@@ -411,7 +424,7 @@ impl VideoEncoder {
       Ok(f) => f,
       Err(e) => {
         inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(env, &inner)?;
+        Self::fire_dequeue_event(&inner)?;
         Self::report_error(&mut inner, &format!("Failed to clone frame: {}", e));
         return Ok(());
       }
@@ -434,7 +447,7 @@ impl VideoEncoder {
           Ok(scaler) => inner.scaler = Some(scaler),
           Err(e) => {
             inner.encode_queue_size -= 1;
-            Self::fire_dequeue_event(env, &inner)?;
+            Self::fire_dequeue_event(&inner)?;
             Self::report_error(&mut inner, &format!("Failed to create scaler: {}", e));
             return Ok(());
           }
@@ -446,7 +459,7 @@ impl VideoEncoder {
         Ok(scaled) => scaled,
         Err(e) => {
           inner.encode_queue_size -= 1;
-          Self::fire_dequeue_event(env, &inner)?;
+          Self::fire_dequeue_event(&inner)?;
           Self::report_error(&mut inner, &format!("Failed to scale frame: {}", e));
           return Ok(());
         }
@@ -460,7 +473,7 @@ impl VideoEncoder {
       Ok(ts) => ts,
       Err(e) => {
         inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(env, &inner)?;
+        Self::fire_dequeue_event(&inner)?;
         Self::report_error(&mut inner, &format!("Failed to get frame timestamp: {}", e));
         return Ok(());
       }
@@ -483,7 +496,7 @@ impl VideoEncoder {
       Some(ctx) => ctx,
       None => {
         inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(env, &inner)?;
+        Self::fire_dequeue_event(&inner)?;
         Self::report_error(&mut inner, "No encoder context");
         return Ok(());
       }
@@ -493,7 +506,7 @@ impl VideoEncoder {
       Ok(pkts) => pkts,
       Err(e) => {
         inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(env, &inner)?;
+        Self::fire_dequeue_event(&inner)?;
         Self::report_error(&mut inner, &format!("Encode failed: {}", e));
         return Ok(());
       }
@@ -503,7 +516,7 @@ impl VideoEncoder {
 
     // Decrement queue size and fire dequeue event
     inner.encode_queue_size -= 1;
-    Self::fire_dequeue_event(env, &inner)?;
+    Self::fire_dequeue_event(&inner)?;
 
     // Process output packets - call callback for each
     for packet in packets {

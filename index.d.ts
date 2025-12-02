@@ -82,9 +82,9 @@ export declare class AudioDecoder {
    * The dequeue event fires when decodeQueueSize decreases,
    * allowing backpressure management.
    */
-  set ondequeue(callback?: () => unknown | undefined | null)
+  set ondequeue(callback?: (() => unknown) | undefined | null)
   /** Get the dequeue event handler (per WebCodecs spec) */
-  get ondequeue(): () => unknown | null
+  get ondequeue(): (() => unknown) | null
   /** Configure the decoder */
   configure(config: AudioDecoderConfig): void
   /** Decode an encoded audio chunk */
@@ -146,9 +146,9 @@ export declare class AudioEncoder {
    * The dequeue event fires when encodeQueueSize decreases,
    * allowing backpressure management.
    */
-  set ondequeue(callback?: () => unknown | undefined | null)
+  set ondequeue(callback?: (() => unknown) | undefined | null)
   /** Get the dequeue event handler (per WebCodecs spec) */
-  get ondequeue(): () => unknown | null
+  get ondequeue(): (() => unknown) | null
   /** Configure the encoder */
   configure(config: AudioEncoderConfig): void
   /** Encode audio data */
@@ -354,9 +354,9 @@ export declare class VideoDecoder {
    * The dequeue event fires when decodeQueueSize decreases,
    * allowing backpressure management.
    */
-  set ondequeue(callback?: () => unknown | undefined | null)
+  set ondequeue(callback?: (() => unknown) | undefined | null)
   /** Get the dequeue event handler (per WebCodecs spec) */
-  get ondequeue(): () => unknown | null
+  get ondequeue(): (() => unknown) | null
   /** Configure the decoder */
   configure(config: VideoDecoderConfig): void
   /** Decode an encoded video chunk */
@@ -419,9 +419,9 @@ export declare class VideoEncoder {
    * The dequeue event fires when encodeQueueSize decreases,
    * allowing backpressure management.
    */
-  set ondequeue(callback?: () => unknown | undefined | null)
+  set ondequeue(callback?: (() => unknown) | undefined | null)
   /** Get the dequeue event handler (per WebCodecs spec) */
-  get ondequeue(): () => unknown | null
+  get ondequeue(): (() => unknown) | null
   /** Configure the encoder */
   configure(config: VideoEncoderConfig): void
   /** Encode a frame */

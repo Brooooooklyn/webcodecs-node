@@ -226,7 +226,8 @@ function writeSample(buffer: Buffer, offset: number, value: number, format: Audi
   switch (format) {
     case 'u8':
     case 'u8-planar':
-      buffer.writeUInt8(Math.round((value + 1) * 127.5), offset)
+      // Use 128 as center point for symmetric round-trip: 0 → 128 → 0
+      buffer.writeUInt8(Math.min(255, Math.max(0, Math.round(value * 127.5 + 128))), offset)
       break
     case 's16':
     case 's16-planar':
@@ -251,7 +252,8 @@ export function readSample(buffer: Buffer | Uint8Array, offset: number, format: 
   switch (format) {
     case 'u8':
     case 'u8-planar':
-      return buf.readUInt8(offset) / 127.5 - 1
+      // Inverse of write: (byte - 128) / 127.5 gives symmetric round-trip
+      return (buf.readUInt8(offset) - 128) / 127.5
     case 's16':
     case 's16-planar':
       return buf.readInt16LE(offset) / 32767

@@ -17,11 +17,12 @@ use super::video_encoder::CodecState;
 
 /// Type alias for output callback (takes AudioData)
 /// Using CalleeHandled: false for direct callbacks without error-first convention
-type OutputCallback = ThreadsafeFunction<AudioData, UnknownReturnValue, AudioData, Status, false>;
+type OutputCallback =
+  ThreadsafeFunction<AudioData, UnknownReturnValue, AudioData, Status, false, true>;
 
 /// Type alias for error callback (takes error message)
 /// Still using default CalleeHandled: true for error-first convention
-type ErrorCallback = ThreadsafeFunction<String>;
+type ErrorCallback = ThreadsafeFunction<String, UnknownReturnValue, String, Status, true, true>;
 
 // Note: For ondequeue, we use FunctionRef instead of ThreadsafeFunction
 // to support both getter and setter per WebCodecs spec
@@ -66,8 +67,8 @@ struct AudioDecoderInner {
   output_callback: OutputCallback,
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
-  /// Optional dequeue event callback
-  dequeue_callback: Option<FunctionRef<(), UnknownReturnValue>>,
+  /// Optional dequeue event callback (ThreadsafeFunction for multi-thread support)
+  dequeue_callback: Option<ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, true>>,
 }
 
 /// AudioDecoder - WebCodecs-compliant audio decoder
@@ -95,6 +96,7 @@ struct AudioDecoderInner {
 #[napi]
 pub struct AudioDecoder {
   inner: Arc<Mutex<AudioDecoderInner>>,
+  dequeue_callback: Option<FunctionRef<(), UnknownReturnValue>>,
 }
 
 #[napi]
@@ -121,6 +123,7 @@ impl AudioDecoder {
 
     Ok(Self {
       inner: Arc::new(Mutex::new(inner)),
+      dequeue_callback: None,
     })
   }
 
@@ -134,10 +137,9 @@ impl AudioDecoder {
   }
 
   /// Fire dequeue event if callback is set
-  fn fire_dequeue_event(env: &Env, inner: &AudioDecoderInner) -> Result<()> {
+  fn fire_dequeue_event(inner: &AudioDecoderInner) -> Result<()> {
     if let Some(ref callback) = inner.dequeue_callback {
-      let cb = callback.borrow_back(env)?;
-      cb.call(())?;
+      callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
     }
     Ok(())
   }
@@ -167,13 +169,26 @@ impl AudioDecoder {
   /// The dequeue event fires when decodeQueueSize decreases,
   /// allowing backpressure management.
   #[napi(setter)]
-  pub fn set_ondequeue(&self, callback: Option<FunctionRef<(), UnknownReturnValue>>) -> Result<()> {
-    let mut inner = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    inner.dequeue_callback = callback;
+  pub fn set_ondequeue(
+    &mut self,
+    env: &Env,
+    callback: Option<FunctionRef<(), UnknownReturnValue>>,
+  ) -> Result<()> {
+    if let Some(ref callback) = callback {
+      let mut inner = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+      inner.dequeue_callback = Some(
+        callback
+          .borrow_back(env)?
+          .build_threadsafe_function()
+          .callee_handled::<false>()
+          .weak::<true>()
+          .build()?,
+      );
+    }
+    self.dequeue_callback = callback;
 
     Ok(())
   }
@@ -184,11 +199,7 @@ impl AudioDecoder {
     &self,
     env: &'env Env,
   ) -> Result<Option<Function<'env, (), UnknownReturnValue>>> {
-    let inner = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-    if let Some(ref callback) = inner.dequeue_callback {
+    if let Some(ref callback) = self.dequeue_callback {
       let cb = callback.borrow_back(env)?;
       Ok(Some(cb))
     } else {
@@ -259,7 +270,7 @@ impl AudioDecoder {
 
   /// Decode an encoded audio chunk
   #[napi]
-  pub fn decode(&self, env: &Env, chunk: &EncodedAudioChunk) -> Result<()> {
+  pub fn decode(&self, chunk: &EncodedAudioChunk) -> Result<()> {
     let mut inner = self
       .inner
       .lock()
@@ -278,7 +289,7 @@ impl AudioDecoder {
       Ok(d) => d,
       Err(e) => {
         inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(env, &inner)?;
+        Self::fire_dequeue_event(&inner)?;
         Self::report_error(&mut inner, &format!("Failed to get chunk data: {}", e));
         return Ok(());
       }
@@ -287,7 +298,7 @@ impl AudioDecoder {
       Ok(ts) => ts,
       Err(e) => {
         inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(env, &inner)?;
+        Self::fire_dequeue_event(&inner)?;
         Self::report_error(&mut inner, &format!("Failed to get timestamp: {}", e));
         return Ok(());
       }
@@ -298,7 +309,7 @@ impl AudioDecoder {
       Some(ctx) => ctx,
       None => {
         inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(env, &inner)?;
+        Self::fire_dequeue_event(&inner)?;
         Self::report_error(&mut inner, "No decoder context");
         return Ok(());
       }
@@ -309,7 +320,7 @@ impl AudioDecoder {
       Ok(f) => f,
       Err(e) => {
         inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(env, &inner)?;
+        Self::fire_dequeue_event(&inner)?;
         Self::report_error(&mut inner, &format!("Decode failed: {}", e));
         return Ok(());
       }
@@ -319,7 +330,7 @@ impl AudioDecoder {
 
     // Decrement queue size and fire dequeue event
     inner.decode_queue_size -= 1;
-    Self::fire_dequeue_event(env, &inner)?;
+    Self::fire_dequeue_event(&inner)?;
 
     // Convert internal frames to AudioData and call output callback
     for frame in frames {

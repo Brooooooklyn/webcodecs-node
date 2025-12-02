@@ -15,11 +15,12 @@ use std::sync::{Arc, Mutex};
 
 /// Type alias for output callback (takes VideoFrame)
 /// Using CalleeHandled: false for direct callbacks without error-first convention
-type OutputCallback = ThreadsafeFunction<VideoFrame, UnknownReturnValue, VideoFrame, Status, false>;
+type OutputCallback =
+  ThreadsafeFunction<VideoFrame, UnknownReturnValue, VideoFrame, Status, false, true>;
 
 /// Type alias for error callback (takes error message)
 /// Still using default CalleeHandled: true for error-first convention
-type ErrorCallback = ThreadsafeFunction<String>;
+type ErrorCallback = ThreadsafeFunction<String, UnknownReturnValue, String, Status, true, true>;
 
 // Note: For ondequeue, we use FunctionRef instead of ThreadsafeFunction
 // to support both getter and setter per WebCodecs spec
@@ -33,7 +34,10 @@ pub struct VideoDecoderInit {
 }
 
 impl FromNapiValue for VideoDecoderInit {
-  unsafe fn from_napi_value(env: napi::sys::napi_env, value: napi::sys::napi_value) -> Result<Self> {
+  unsafe fn from_napi_value(
+    env: napi::sys::napi_env,
+    value: napi::sys::napi_value,
+  ) -> Result<Self> {
     let obj = Object::from_napi_value(env, value)?;
 
     let output: OutputCallback = obj
@@ -70,8 +74,8 @@ struct VideoDecoderInner {
   output_callback: OutputCallback,
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
-  /// Optional dequeue event callback
-  dequeue_callback: Option<FunctionRef<(), UnknownReturnValue>>,
+  /// Optional dequeue event callback (ThreadsafeFunction for multi-thread support)
+  dequeue_callback: Option<ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, true>>,
 }
 
 /// VideoDecoder - WebCodecs-compliant video decoder
@@ -97,6 +101,7 @@ struct VideoDecoderInner {
 #[napi]
 pub struct VideoDecoder {
   inner: Arc<Mutex<VideoDecoderInner>>,
+  dequeue_callback: Option<FunctionRef<(), UnknownReturnValue>>,
 }
 
 #[napi]
@@ -123,6 +128,7 @@ impl VideoDecoder {
 
     Ok(Self {
       inner: Arc::new(Mutex::new(inner)),
+      dequeue_callback: None,
     })
   }
 
@@ -136,10 +142,9 @@ impl VideoDecoder {
   }
 
   /// Fire dequeue event if callback is set
-  fn fire_dequeue_event(env: &Env, inner: &VideoDecoderInner) -> Result<()> {
+  fn fire_dequeue_event(inner: &VideoDecoderInner) -> Result<()> {
     if let Some(ref callback) = inner.dequeue_callback {
-      let cb = callback.borrow_back(env)?;
-      cb.call(())?;
+      callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
     }
     Ok(())
   }
@@ -169,13 +174,26 @@ impl VideoDecoder {
   /// The dequeue event fires when decodeQueueSize decreases,
   /// allowing backpressure management.
   #[napi(setter)]
-  pub fn set_ondequeue(&self, callback: Option<FunctionRef<(), UnknownReturnValue>>) -> Result<()> {
-    let mut inner = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    inner.dequeue_callback = callback;
+  pub fn set_ondequeue(
+    &mut self,
+    env: &Env,
+    callback: Option<FunctionRef<(), UnknownReturnValue>>,
+  ) -> Result<()> {
+    if let Some(ref callback) = callback {
+      let mut inner = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+      inner.dequeue_callback = Some(
+        callback
+          .borrow_back(env)?
+          .build_threadsafe_function()
+          .callee_handled::<false>()
+          .weak::<true>()
+          .build()?,
+      );
+    }
+    self.dequeue_callback = callback;
 
     Ok(())
   }
@@ -186,11 +204,7 @@ impl VideoDecoder {
     &self,
     env: &'env Env,
   ) -> Result<Option<Function<'env, (), UnknownReturnValue>>> {
-    let inner = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-    if let Some(ref callback) = inner.dequeue_callback {
+    if let Some(ref callback) = self.dequeue_callback {
       let cb = callback.borrow_back(env)?;
       Ok(Some(cb))
     } else {
@@ -265,7 +279,7 @@ impl VideoDecoder {
 
   /// Decode an encoded video chunk
   #[napi]
-  pub fn decode(&self, env: &Env, chunk: &EncodedVideoChunk) -> Result<()> {
+  pub fn decode(&self, chunk: &EncodedVideoChunk) -> Result<()> {
     let mut inner = self
       .inner
       .lock()
@@ -284,7 +298,7 @@ impl VideoDecoder {
       Ok(d) => d,
       Err(e) => {
         inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(env, &inner)?;
+        Self::fire_dequeue_event(&inner)?;
         Self::report_error(&mut inner, &format!("Failed to get chunk data: {}", e));
         return Ok(());
       }
@@ -293,7 +307,7 @@ impl VideoDecoder {
       Ok(ts) => ts,
       Err(e) => {
         inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(env, &inner)?;
+        Self::fire_dequeue_event(&inner)?;
         Self::report_error(&mut inner, &format!("Failed to get timestamp: {}", e));
         return Ok(());
       }
@@ -302,7 +316,7 @@ impl VideoDecoder {
       Ok(dur) => dur,
       Err(e) => {
         inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(env, &inner)?;
+        Self::fire_dequeue_event(&inner)?;
         Self::report_error(&mut inner, &format!("Failed to get duration: {}", e));
         return Ok(());
       }
@@ -313,7 +327,7 @@ impl VideoDecoder {
       Some(ctx) => ctx,
       None => {
         inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(env, &inner)?;
+        Self::fire_dequeue_event(&inner)?;
         Self::report_error(&mut inner, "No decoder context");
         return Ok(());
       }
@@ -324,7 +338,7 @@ impl VideoDecoder {
       Ok(f) => f,
       Err(e) => {
         inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(env, &inner)?;
+        Self::fire_dequeue_event(&inner)?;
         Self::report_error(&mut inner, &format!("Decode failed: {}", e));
         return Ok(());
       }
@@ -334,7 +348,7 @@ impl VideoDecoder {
 
     // Decrement queue size and fire dequeue event
     inner.decode_queue_size -= 1;
-    Self::fire_dequeue_event(env, &inner)?;
+    Self::fire_dequeue_event(&inner)?;
 
     // Convert internal frames to VideoFrames and call output callback
     for frame in frames {
