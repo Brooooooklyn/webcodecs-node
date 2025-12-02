@@ -4,7 +4,7 @@
  * Provides utilities for generating audio test data.
  */
 
-import { AudioData, AudioSampleFormat } from '../../index.js'
+import { AudioData, type AudioSampleFormat } from '../../index.js'
 
 // ============================================================================
 // Audio Test Constants
@@ -45,19 +45,20 @@ export function generateSilence(
   numberOfFrames: number,
   numberOfChannels: number,
   sampleRate: number,
-  format: AudioSampleFormat = AudioSampleFormat.F32,
+  format: AudioSampleFormat = 'f32',
   timestamp: number = 0
 ): AudioData {
   const bytesPerSample = getBytesPerSample(format)
   const dataSize = numberOfFrames * numberOfChannels * bytesPerSample
-  const buffer = Buffer.alloc(dataSize, 0)
+  const buffer = new Uint8Array(dataSize)
 
-  return new AudioData(buffer, {
+  return new AudioData({
     format,
     sampleRate,
     numberOfFrames,
     numberOfChannels,
     timestamp,
+    data: buffer,
   })
 }
 
@@ -69,7 +70,7 @@ export function generateSineTone(
   numberOfFrames: number,
   numberOfChannels: number,
   sampleRate: number,
-  format: AudioSampleFormat = AudioSampleFormat.F32,
+  format: AudioSampleFormat = 'f32',
   timestamp: number = 0,
   amplitude: number = 0.5
 ): AudioData {
@@ -87,12 +88,13 @@ export function generateSineTone(
     }
   }
 
-  return new AudioData(buffer, {
+  return new AudioData({
     format,
     sampleRate,
     numberOfFrames,
     numberOfChannels,
     timestamp,
+    data: new Uint8Array(buffer),
   })
 }
 
@@ -103,7 +105,7 @@ export function generateWhiteNoise(
   numberOfFrames: number,
   numberOfChannels: number,
   sampleRate: number,
-  format: AudioSampleFormat = AudioSampleFormat.F32,
+  format: AudioSampleFormat = 'f32',
   timestamp: number = 0,
   amplitude: number = 0.3
 ): AudioData {
@@ -119,12 +121,13 @@ export function generateWhiteNoise(
     }
   }
 
-  return new AudioData(buffer, {
+  return new AudioData({
     format,
     sampleRate,
     numberOfFrames,
     numberOfChannels,
     timestamp,
+    data: new Uint8Array(buffer),
   })
 }
 
@@ -137,7 +140,7 @@ export function generateChirp(
   numberOfFrames: number,
   numberOfChannels: number,
   sampleRate: number,
-  format: AudioSampleFormat = AudioSampleFormat.F32,
+  format: AudioSampleFormat = 'f32',
   timestamp: number = 0
 ): AudioData {
   const bytesPerSample = getBytesPerSample(format)
@@ -158,12 +161,13 @@ export function generateChirp(
     }
   }
 
-  return new AudioData(buffer, {
+  return new AudioData({
     format,
     sampleRate,
     numberOfFrames,
     numberOfChannels,
     timestamp,
+    data: new Uint8Array(buffer),
   })
 }
 
@@ -176,16 +180,16 @@ export function generateChirp(
  */
 export function getBytesPerSample(format: AudioSampleFormat): number {
   switch (format) {
-    case AudioSampleFormat.U8:
-    case AudioSampleFormat.U8Planar:
+    case 'u8':
+    case 'u8-planar':
       return 1
-    case AudioSampleFormat.S16:
-    case AudioSampleFormat.S16Planar:
+    case 's16':
+    case 's16-planar':
       return 2
-    case AudioSampleFormat.S32:
-    case AudioSampleFormat.S32Planar:
-    case AudioSampleFormat.F32:
-    case AudioSampleFormat.F32Planar:
+    case 's32':
+    case 's32-planar':
+    case 'f32':
+    case 'f32-planar':
       return 4
     default:
       throw new Error(`Unknown format: ${format}`)
@@ -197,10 +201,10 @@ export function getBytesPerSample(format: AudioSampleFormat): number {
  */
 export function isPlanarFormat(format: AudioSampleFormat): boolean {
   return [
-    AudioSampleFormat.U8Planar,
-    AudioSampleFormat.S16Planar,
-    AudioSampleFormat.S32Planar,
-    AudioSampleFormat.F32Planar,
+    'u8-planar',
+    's16-planar',
+    's32-planar',
+    'f32-planar',
   ].includes(format)
 }
 
@@ -220,20 +224,20 @@ export function calculateAudioSize(
  */
 function writeSample(buffer: Buffer, offset: number, value: number, format: AudioSampleFormat): void {
   switch (format) {
-    case AudioSampleFormat.U8:
-    case AudioSampleFormat.U8Planar:
+    case 'u8':
+    case 'u8-planar':
       buffer.writeUInt8(Math.round((value + 1) * 127.5), offset)
       break
-    case AudioSampleFormat.S16:
-    case AudioSampleFormat.S16Planar:
+    case 's16':
+    case 's16-planar':
       buffer.writeInt16LE(Math.round(value * 32767), offset)
       break
-    case AudioSampleFormat.S32:
-    case AudioSampleFormat.S32Planar:
+    case 's32':
+    case 's32-planar':
       buffer.writeInt32LE(Math.round(value * 2147483647), offset)
       break
-    case AudioSampleFormat.F32:
-    case AudioSampleFormat.F32Planar:
+    case 'f32':
+    case 'f32-planar':
       buffer.writeFloatLE(value, offset)
       break
   }
@@ -245,17 +249,17 @@ function writeSample(buffer: Buffer, offset: number, value: number, format: Audi
 export function readSample(buffer: Buffer | Uint8Array, offset: number, format: AudioSampleFormat): number {
   const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer)
   switch (format) {
-    case AudioSampleFormat.U8:
-    case AudioSampleFormat.U8Planar:
+    case 'u8':
+    case 'u8-planar':
       return buf.readUInt8(offset) / 127.5 - 1
-    case AudioSampleFormat.S16:
-    case AudioSampleFormat.S16Planar:
+    case 's16':
+    case 's16-planar':
       return buf.readInt16LE(offset) / 32767
-    case AudioSampleFormat.S32:
-    case AudioSampleFormat.S32Planar:
+    case 's32':
+    case 's32-planar':
       return buf.readInt32LE(offset) / 2147483647
-    case AudioSampleFormat.F32:
-    case AudioSampleFormat.F32Planar:
+    case 'f32':
+    case 'f32-planar':
       return buf.readFloatLE(offset)
     default:
       throw new Error(`Unknown format: ${format}`)

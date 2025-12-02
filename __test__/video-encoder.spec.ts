@@ -7,28 +7,28 @@
 
 import test from 'ava'
 
-import { VideoEncoder, CodecState, EncodedVideoChunkType } from '../index.js'
+import { VideoEncoder } from '../index.js'
 import {
   generateSolidColorI420Frame,
   generateFrameSequence,
   TestColors,
-  type EncodedVideoChunkOutput,
+  type EncodedVideoChunk,
 } from './helpers/index.js'
 import { createEncoderConfig } from './helpers/codec-matrix.js'
 
 // Helper to create encoder with callbacks that collect output
 function createTestEncoder() {
-  const chunks: EncodedVideoChunkOutput[] = []
+  const chunks: EncodedVideoChunk[] = []
   const errors: Error[] = []
 
-  const encoder = new VideoEncoder(
-    (chunk, _metadata) => {
+  const encoder = new VideoEncoder({
+    output: (chunk, _metadata) => {
       chunks.push(chunk)
     },
-    (e) => {
+    error: (e) => {
       errors.push(e)
     },
-  )
+  })
 
   return { encoder, chunks, errors }
 }
@@ -39,31 +39,31 @@ function createTestEncoder() {
 
 test('VideoEncoder: constructor creates unconfigured encoder', (t) => {
   const { encoder } = createTestEncoder()
-  t.is(encoder.state, CodecState.Unconfigured)
+  t.is(encoder.state, 'unconfigured')
   t.is(encoder.encodeQueueSize, 0)
   encoder.close()
 })
 
-test('VideoEncoder: constructor requires callbacks', (t) => {
-  // @ts-expect-error - Testing that missing callbacks throws
+test('VideoEncoder: constructor requires init dictionary', (t) => {
+  // @ts-expect-error - Testing that missing init throws
   t.throws(() => new VideoEncoder())
   // @ts-expect-error - Testing that missing error callback throws
-  t.throws(() => new VideoEncoder(() => {}))
+  t.throws(() => new VideoEncoder({ output: () => {} }))
 })
 
 test('VideoEncoder: state transitions correctly', (t) => {
   const { encoder } = createTestEncoder()
 
   // Initial state
-  t.is(encoder.state, CodecState.Unconfigured)
+  t.is(encoder.state, 'unconfigured')
 
   // Configure
   encoder.configure(createEncoderConfig('h264', 320, 240))
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
 
   // Close
   encoder.close()
-  t.is(encoder.state, CodecState.Closed)
+  t.is(encoder.state, 'closed')
 })
 
 test('VideoEncoder: close() is idempotent', (t) => {
@@ -71,11 +71,11 @@ test('VideoEncoder: close() is idempotent', (t) => {
   encoder.configure(createEncoderConfig('h264', 320, 240))
 
   encoder.close()
-  t.is(encoder.state, CodecState.Closed)
+  t.is(encoder.state, 'closed')
 
   // Second close should not throw
   t.notThrows(() => encoder.close())
-  t.is(encoder.state, CodecState.Closed)
+  t.is(encoder.state, 'closed')
 })
 
 // ============================================================================
@@ -89,7 +89,7 @@ test('VideoEncoder: configure() with H.264', (t) => {
     encoder.configure(createEncoderConfig('h264', 320, 240))
   })
 
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
   encoder.close()
 })
 
@@ -100,7 +100,7 @@ test('VideoEncoder: configure() with VP8', (t) => {
     encoder.configure(createEncoderConfig('vp8', 320, 240))
   })
 
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
   encoder.close()
 })
 
@@ -111,7 +111,7 @@ test('VideoEncoder: configure() with VP9', (t) => {
     encoder.configure(createEncoderConfig('vp9', 320, 240))
   })
 
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
   encoder.close()
 })
 
@@ -120,11 +120,11 @@ test('VideoEncoder: configure() can be called multiple times', (t) => {
 
   // First configuration
   encoder.configure(createEncoderConfig('h264', 320, 240))
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
 
   // Reconfigure with different settings
   encoder.configure(createEncoderConfig('h264', 640, 480))
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
 
   encoder.close()
 })
@@ -193,7 +193,7 @@ test('VideoEncoder: encode() with keyFrame option', async (t) => {
   t.true(chunks.length > 0)
 
   // First chunk should be a keyframe
-  t.is(chunks[0].type, EncodedVideoChunkType.Key)
+  t.is(chunks[0].type, 'key')
 
   encoder.close()
 })
@@ -277,7 +277,7 @@ test('VideoEncoder: reset() returns to unconfigured state', (t) => {
   encoder.reset()
 
   // Reset returns to unconfigured state
-  t.is(encoder.state, CodecState.Unconfigured)
+  t.is(encoder.state, 'unconfigured')
 
   encoder.close()
 })
@@ -295,11 +295,11 @@ test('VideoEncoder: reset() then reconfigure allows new encoding', async (t) => 
 
   // Reset (goes to unconfigured)
   encoder.reset()
-  t.is(encoder.state, CodecState.Unconfigured)
+  t.is(encoder.state, 'unconfigured')
 
   // Reconfigure
   encoder.configure(createEncoderConfig('h264', 320, 240))
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
 
   // Second encode should work
   const frame2 = generateSolidColorI420Frame(320, 240, TestColors.blue, 1000)
@@ -366,7 +366,7 @@ test('VideoEncoder: encode() on unconfigured encoder triggers error callback', (
   frame.close()
 
   // Give the error callback a chance to be called
-  t.is(encoder.state, CodecState.Closed, 'Encoder should be closed after error')
+  t.is(encoder.state, 'closed', 'Encoder should be closed after error')
 
   encoder.close()
 })

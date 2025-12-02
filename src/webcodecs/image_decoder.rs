@@ -13,9 +13,10 @@ use std::sync::{Arc, Mutex};
 /// ImageDecoder init options
 #[napi(object)]
 pub struct ImageDecoderInit {
-  /// The image data (encoded bytes)
-  pub data: Buffer,
+  /// The image data (encoded bytes) - BufferSource per spec
+  pub data: Uint8Array,
   /// MIME type of the image (e.g., "image/png", "image/jpeg")
+  #[napi(js_name = "type")]
   pub mime_type: String,
   /// Color space conversion hint (optional)
   pub color_space_conversion: Option<String>,
@@ -192,6 +193,14 @@ impl ImageDecoder {
     Ok(inner.complete)
   }
 
+  /// Promise that resolves when data is fully loaded (per WebCodecs spec)
+  /// Since we use buffered data, this resolves immediately
+  #[napi(getter)]
+  pub async fn completed(&self) -> Result<()> {
+    // For buffered data, we're always complete immediately
+    Ok(())
+  }
+
   /// Get the MIME type
   #[napi(getter, js_name = "type")]
   pub fn get_type(&self) -> Result<String> {
@@ -359,22 +368,13 @@ fn decode_image_data(context: &mut CodecContext, data: &[u8]) -> Result<Vec<crat
     )
   })?;
 
-  // Set packet data
-  unsafe {
-    use crate::ffi::avcodec::av_new_packet;
-
-    let ret = av_new_packet(packet.as_mut_ptr(), data.len() as i32);
-    if ret < 0 {
-      return Err(Error::new(
-        Status::GenericFailure,
-        format!("Failed to allocate packet data: {}", ret),
-      ));
-    }
-
-    // Copy data to packet
-    let pkt_data = packet.data() as *mut u8;
-    std::ptr::copy_nonoverlapping(data.as_ptr(), pkt_data, data.len());
-  }
+  // Allocate and copy data to packet using safe wrapper
+  packet.copy_data_from(data).map_err(|e| {
+    Error::new(
+      Status::GenericFailure,
+      format!("Failed to copy packet data: {}", e),
+    )
+  })?;
 
   // Decode
   let frames = context

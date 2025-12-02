@@ -7,27 +7,26 @@
 
 import test from 'ava'
 
-import { VideoEncoder, VideoDecoder, VideoFrame, CodecState } from '../../index.js'
+import { VideoEncoder, VideoDecoder, VideoFrame } from '../../index.js'
 import {
   generateSolidColorI420Frame,
   generateFrameSequence,
   TestColors,
-  reconstructVideoChunk,
-  type EncodedVideoChunkOutput,
+  type EncodedVideoChunk,
 } from '../helpers/index.js'
 import { createEncoderConfig, createDecoderConfig } from '../helpers/codec-matrix.js'
 
 // Helper to create test encoder with callbacks
 function createTestEncoder() {
-  const chunks: EncodedVideoChunkOutput[] = []
+  const chunks: EncodedVideoChunk[] = []
   const errors: Error[] = []
 
-  const encoder = new VideoEncoder(
-    (chunk, _metadata) => {
+  const encoder = new VideoEncoder({
+    output: (chunk, _metadata) => {
       chunks.push(chunk)
     },
-    (e) => errors.push(e),
-  )
+    error: (e) => errors.push(e),
+  })
 
   return { encoder, chunks, errors }
 }
@@ -37,10 +36,10 @@ function createTestDecoder() {
   const frames: VideoFrame[] = []
   const errors: Error[] = []
 
-  const decoder = new VideoDecoder(
-    (frame) => frames.push(frame),
-    (e) => errors.push(e),
-  )
+  const decoder = new VideoDecoder({
+    output: (frame) => frames.push(frame),
+    error: (e) => errors.push(e),
+  })
 
   return { decoder, frames, errors }
 }
@@ -53,54 +52,54 @@ test('lifecycle: encoder full state cycle', async (t) => {
   const { encoder } = createTestEncoder()
 
   // Unconfigured
-  t.is(encoder.state, CodecState.Unconfigured)
+  t.is(encoder.state, 'unconfigured')
 
   // Configure -> Configured
   encoder.configure(createEncoderConfig('h264', 320, 240))
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
 
   // Encode some frames
   const frame = generateSolidColorI420Frame(320, 240, TestColors.red, 0)
   encoder.encode(frame, { keyFrame: true })
   frame.close()
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
 
   await encoder.flush()
 
   // Reset -> Unconfigured (implementation clears state)
   encoder.reset()
-  t.is(encoder.state, CodecState.Unconfigured)
+  t.is(encoder.state, 'unconfigured')
 
   // Reconfigure -> Configured
   encoder.configure(createEncoderConfig('h264', 640, 480))
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
 
   // Close -> Closed
   encoder.close()
-  t.is(encoder.state, CodecState.Closed)
+  t.is(encoder.state, 'closed')
 })
 
 test('lifecycle: decoder full state cycle', (t) => {
   const { decoder } = createTestDecoder()
 
   // Unconfigured
-  t.is(decoder.state, CodecState.Unconfigured)
+  t.is(decoder.state, 'unconfigured')
 
   // Configure -> Configured
   decoder.configure(createDecoderConfig('h264'))
-  t.is(decoder.state, CodecState.Configured)
+  t.is(decoder.state, 'configured')
 
   // Reset -> Unconfigured (implementation clears state)
   decoder.reset()
-  t.is(decoder.state, CodecState.Unconfigured)
+  t.is(decoder.state, 'unconfigured')
 
   // Reconfigure -> Configured
   decoder.configure(createDecoderConfig('vp8'))
-  t.is(decoder.state, CodecState.Configured)
+  t.is(decoder.state, 'configured')
 
   // Close -> Closed
   decoder.close()
-  t.is(decoder.state, CodecState.Closed)
+  t.is(decoder.state, 'closed')
 })
 
 // ============================================================================
@@ -125,7 +124,7 @@ test('lifecycle: encoder close releases resources', async (t) => {
 
   // Close should not throw
   t.notThrows(() => encoder.close())
-  t.is(encoder.state, CodecState.Closed)
+  t.is(encoder.state, 'closed')
 })
 
 test('lifecycle: decoder close releases resources', async (t) => {
@@ -142,7 +141,7 @@ test('lifecycle: decoder close releases resources', async (t) => {
   const { decoder, frames: decodedFrames } = createTestDecoder()
   decoder.configure(createDecoderConfig('h264', { codedWidth: 320, codedHeight: 240 }))
   for (const chunk of chunks) {
-    decoder.decode(reconstructVideoChunk(chunk))
+    decoder.decode(chunk)
   }
 
   await decoder.flush()
@@ -154,7 +153,7 @@ test('lifecycle: decoder close releases resources', async (t) => {
 
   // Close should not throw
   t.notThrows(() => decoder.close())
-  t.is(decoder.state, CodecState.Closed)
+  t.is(decoder.state, 'closed')
 })
 
 test('lifecycle: frame close releases resources', (t) => {
@@ -175,7 +174,7 @@ test('lifecycle: frame close releases resources', (t) => {
 // Clone Independence Tests
 // ============================================================================
 
-test('lifecycle: clone is independent of original', (t) => {
+test('lifecycle: clone is independent of original', async (t) => {
   const original = generateSolidColorI420Frame(320, 240, TestColors.yellow, 1000, 33333)
 
   // Clone
@@ -199,7 +198,7 @@ test('lifecycle: clone is independent of original', (t) => {
   t.true(size > 0)
 
   const buffer = new Uint8Array(size)
-  t.notThrows(() => cloned.copyTo(buffer))
+  await t.notThrowsAsync(async () => cloned.copyTo(buffer))
 
   // Cleanup
   cloned.close()
@@ -238,7 +237,7 @@ test('lifecycle: encoder close is idempotent', (t) => {
   t.notThrows(() => encoder.close())
   t.notThrows(() => encoder.close())
 
-  t.is(encoder.state, CodecState.Closed)
+  t.is(encoder.state, 'closed')
 })
 
 test('lifecycle: decoder close is idempotent', (t) => {
@@ -250,7 +249,7 @@ test('lifecycle: decoder close is idempotent', (t) => {
   t.notThrows(() => decoder.close())
   t.notThrows(() => decoder.close())
 
-  t.is(decoder.state, CodecState.Closed)
+  t.is(decoder.state, 'closed')
 })
 
 test('lifecycle: frame close is idempotent', (t) => {
@@ -298,7 +297,7 @@ test('lifecycle: decoder operations fail after close', async (t) => {
 
   // decode() on closed decoder triggers error callback
   if (chunks.length > 0) {
-    decoder.decode(reconstructVideoChunk(chunks[0]))
+    decoder.decode(chunks[0])
   }
 
   // Test passes if no crash - error callback will be invoked asynchronously
@@ -319,18 +318,18 @@ test('lifecycle: multiple encoder instances', (t) => {
   encoder3.configure(createEncoderConfig('vp8', 320, 240))
 
   // All should be configured
-  t.is(encoder1.state, CodecState.Configured)
-  t.is(encoder2.state, CodecState.Configured)
-  t.is(encoder3.state, CodecState.Configured)
+  t.is(encoder1.state, 'configured')
+  t.is(encoder2.state, 'configured')
+  t.is(encoder3.state, 'configured')
 
   // Close in different order
   encoder2.close()
   encoder1.close()
   encoder3.close()
 
-  t.is(encoder1.state, CodecState.Closed)
-  t.is(encoder2.state, CodecState.Closed)
-  t.is(encoder3.state, CodecState.Closed)
+  t.is(encoder1.state, 'closed')
+  t.is(encoder2.state, 'closed')
+  t.is(encoder3.state, 'closed')
 })
 
 test('lifecycle: multiple decoder instances', (t) => {
@@ -343,16 +342,16 @@ test('lifecycle: multiple decoder instances', (t) => {
   decoder3.configure(createDecoderConfig('vp9'))
 
   // All should be configured
-  t.is(decoder1.state, CodecState.Configured)
-  t.is(decoder2.state, CodecState.Configured)
-  t.is(decoder3.state, CodecState.Configured)
+  t.is(decoder1.state, 'configured')
+  t.is(decoder2.state, 'configured')
+  t.is(decoder3.state, 'configured')
 
   // Close all
   decoder1.close()
   decoder2.close()
   decoder3.close()
 
-  t.is(decoder1.state, CodecState.Closed)
-  t.is(decoder2.state, CodecState.Closed)
-  t.is(decoder3.state, CodecState.Closed)
+  t.is(decoder1.state, 'closed')
+  t.is(decoder2.state, 'closed')
+  t.is(decoder3.state, 'closed')
 })

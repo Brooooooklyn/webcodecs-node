@@ -6,7 +6,7 @@
 
 import test from 'ava'
 
-import { EncodedVideoChunk, EncodedVideoChunkType } from '../index.js'
+import { EncodedVideoChunk } from '../index.js'
 
 // ============================================================================
 // Constructor Tests
@@ -18,13 +18,13 @@ test('EncodedVideoChunk: constructor with key frame', (t) => {
   const duration = 33333
 
   const chunk = new EncodedVideoChunk({
-    type: EncodedVideoChunkType.Key,
+    type: 'key',
     timestamp,
     duration,
     data,
   })
 
-  t.is(chunk.type, EncodedVideoChunkType.Key)
+  t.is(chunk.type, 'key')
   t.is(chunk.timestamp, timestamp)
   t.is(chunk.duration, duration)
   t.is(chunk.byteLength, data.length)
@@ -35,12 +35,12 @@ test('EncodedVideoChunk: constructor with delta frame', (t) => {
   const timestamp = 2000
 
   const chunk = new EncodedVideoChunk({
-    type: EncodedVideoChunkType.Delta,
+    type: 'delta',
     timestamp,
     data,
   })
 
-  t.is(chunk.type, EncodedVideoChunkType.Delta)
+  t.is(chunk.type, 'delta')
   t.is(chunk.timestamp, timestamp)
   t.is(chunk.byteLength, data.length)
 })
@@ -48,7 +48,7 @@ test('EncodedVideoChunk: constructor with delta frame', (t) => {
 test('EncodedVideoChunk: constructor without duration', (t) => {
   const data = Buffer.from([0x00])
   const chunk = new EncodedVideoChunk({
-    type: EncodedVideoChunkType.Key,
+    type: 'key',
     timestamp: 0,
     data,
   })
@@ -62,18 +62,18 @@ test('EncodedVideoChunk: constructor without duration', (t) => {
 
 test('EncodedVideoChunk: type property returns correct ChunkType', (t) => {
   const keyChunk = new EncodedVideoChunk({
-    type: EncodedVideoChunkType.Key,
+    type: 'key',
     timestamp: 0,
     data: Buffer.from([0x00]),
   })
-  t.is(keyChunk.type, EncodedVideoChunkType.Key)
+  t.is(keyChunk.type, 'key')
 
   const deltaChunk = new EncodedVideoChunk({
-    type: EncodedVideoChunkType.Delta,
+    type: 'delta',
     timestamp: 0,
     data: Buffer.from([0x00]),
   })
-  t.is(deltaChunk.type, EncodedVideoChunkType.Delta)
+  t.is(deltaChunk.type, 'delta')
 })
 
 test('EncodedVideoChunk: timestamp property', (t) => {
@@ -81,7 +81,7 @@ test('EncodedVideoChunk: timestamp property', (t) => {
 
   for (const ts of timestamps) {
     const chunk = new EncodedVideoChunk({
-      type: EncodedVideoChunkType.Key,
+      type: 'key',
       timestamp: ts,
       data: Buffer.from([0x00]),
     })
@@ -92,7 +92,7 @@ test('EncodedVideoChunk: timestamp property', (t) => {
 test('EncodedVideoChunk: duration property (optional)', (t) => {
   // Without duration
   const chunk1 = new EncodedVideoChunk({
-    type: EncodedVideoChunkType.Key,
+    type: 'key',
     timestamp: 0,
     data: Buffer.from([0x00]),
   })
@@ -100,7 +100,7 @@ test('EncodedVideoChunk: duration property (optional)', (t) => {
 
   // With duration
   const chunk2 = new EncodedVideoChunk({
-    type: EncodedVideoChunkType.Key,
+    type: 'key',
     timestamp: 0,
     duration: 33333,
     data: Buffer.from([0x00]),
@@ -119,7 +119,7 @@ test('EncodedVideoChunk: byteLength property', (t) => {
   for (const { size } of testCases) {
     const data = Buffer.alloc(size)
     const chunk = new EncodedVideoChunk({
-      type: EncodedVideoChunkType.Key,
+      type: 'key',
       timestamp: 0,
       data,
     })
@@ -134,7 +134,7 @@ test('EncodedVideoChunk: byteLength property', (t) => {
 test('EncodedVideoChunk: copyTo() extracts data', (t) => {
   const sourceData = Buffer.from([0x01, 0x02, 0x03, 0x04, 0x05])
   const chunk = new EncodedVideoChunk({
-    type: EncodedVideoChunkType.Key,
+    type: 'key',
     timestamp: 0,
     data: sourceData,
   })
@@ -150,7 +150,7 @@ test('EncodedVideoChunk: copyTo() extracts data', (t) => {
 test('EncodedVideoChunk: copyTo() with larger destination buffer', (t) => {
   const sourceData = Buffer.from([0x0A, 0x0B, 0x0C])
   const chunk = new EncodedVideoChunk({
-    type: EncodedVideoChunkType.Key,
+    type: 'key',
     timestamp: 0,
     data: sourceData,
   })
@@ -167,16 +167,16 @@ test('EncodedVideoChunk: copyTo() with larger destination buffer', (t) => {
   t.is(destination[2], 0x0C)
 })
 
-test('EncodedVideoChunk: getData() returns Buffer (extension)', (t) => {
-  const sourceData = Buffer.from([0xDE, 0xAD, 0xBE, 0xEF])
+test('EncodedVideoChunk: copyTo() extracts data from Uint8Array source', (t) => {
+  const sourceData = new Uint8Array([0xDE, 0xAD, 0xBE, 0xEF])
   const chunk = new EncodedVideoChunk({
-    type: EncodedVideoChunkType.Key,
+    type: 'key',
     timestamp: 0,
     data: sourceData,
   })
 
-  const data = chunk.getData()
-  t.true(Buffer.isBuffer(data))
+  const data = new Uint8Array(chunk.byteLength)
+  chunk.copyTo(data)
   t.is(data.length, sourceData.length)
 
   for (let i = 0; i < sourceData.length; i++) {
@@ -191,7 +191,7 @@ test('EncodedVideoChunk: getData() returns Buffer (extension)', (t) => {
 test('EncodedVideoChunk: empty data buffer', (t) => {
   const data = Buffer.alloc(0)
   const chunk = new EncodedVideoChunk({
-    type: EncodedVideoChunkType.Key,
+    type: 'key',
     timestamp: 0,
     data,
   })
@@ -201,7 +201,7 @@ test('EncodedVideoChunk: empty data buffer', (t) => {
 
 test('EncodedVideoChunk: timestamp of 0 is valid', (t) => {
   const chunk = new EncodedVideoChunk({
-    type: EncodedVideoChunkType.Key,
+    type: 'key',
     timestamp: 0,
     data: Buffer.from([0x00]),
   })
@@ -211,27 +211,28 @@ test('EncodedVideoChunk: timestamp of 0 is valid', (t) => {
 test('EncodedVideoChunk: large data buffer', (t) => {
   // 1MB of data
   const size = 1024 * 1024
-  const data = Buffer.alloc(size)
+  const data = new Uint8Array(size)
   data.fill(0x42)
 
   const chunk = new EncodedVideoChunk({
-    type: EncodedVideoChunkType.Key,
+    type: 'key',
     timestamp: 0,
     data,
   })
 
   t.is(chunk.byteLength, size)
 
-  const extracted = chunk.getData()
+  const extracted = new Uint8Array(chunk.byteLength)
+  chunk.copyTo(extracted)
   t.is(extracted.length, size)
   t.is(extracted[0], 0x42)
   t.is(extracted[size - 1], 0x42)
 })
 
 test('EncodedVideoChunk: data immutability', (t) => {
-  const originalData = Buffer.from([0x01, 0x02, 0x03])
+  const originalData = new Uint8Array([0x01, 0x02, 0x03])
   const chunk = new EncodedVideoChunk({
-    type: EncodedVideoChunkType.Key,
+    type: 'key',
     timestamp: 0,
     data: originalData,
   })
@@ -240,24 +241,26 @@ test('EncodedVideoChunk: data immutability', (t) => {
   originalData[0] = 0xFF
 
   // Chunk data should be independent
-  const extractedData = chunk.getData()
+  const extractedData = new Uint8Array(chunk.byteLength)
+  chunk.copyTo(extractedData)
   t.is(extractedData[0], 0x01, 'Chunk data should be independent of original buffer')
 })
 
 test('EncodedVideoChunk: binary data preservation', (t) => {
   // Test all byte values 0-255
-  const allBytes = Buffer.alloc(256)
+  const allBytes = new Uint8Array(256)
   for (let i = 0; i < 256; i++) {
     allBytes[i] = i
   }
 
   const chunk = new EncodedVideoChunk({
-    type: EncodedVideoChunkType.Key,
+    type: 'key',
     timestamp: 0,
     data: allBytes,
   })
 
-  const extracted = chunk.getData()
+  const extracted = new Uint8Array(chunk.byteLength)
+  chunk.copyTo(extracted)
   for (let i = 0; i < 256; i++) {
     t.is(extracted[i], i, `Byte ${i} not preserved`)
   }

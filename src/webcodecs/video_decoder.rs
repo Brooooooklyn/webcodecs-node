@@ -25,14 +25,37 @@ type ErrorCallback = ThreadsafeFunction<String>;
 /// Using CalleeHandled: false for direct callbacks
 type DequeueCallback = ThreadsafeFunction<(), UnknownReturnValue, (), Status, false>;
 
-/// Result of isConfigSupported
+/// VideoDecoder init dictionary per WebCodecs spec
+pub struct VideoDecoderInit {
+  /// Output callback - called when decoded frame is available
+  pub output: OutputCallback,
+  /// Error callback - called when an error occurs
+  pub error: ErrorCallback,
+}
+
+impl FromNapiValue for VideoDecoderInit {
+  unsafe fn from_napi_value(env: napi::sys::napi_env, value: napi::sys::napi_value) -> Result<Self> {
+    let obj = Object::from_napi_value(env, value)?;
+
+    let output: OutputCallback = obj
+      .get_named_property("output")
+      .map_err(|_| Error::new(Status::InvalidArg, "Missing required 'output' callback"))?;
+
+    let error: ErrorCallback = obj
+      .get_named_property("error")
+      .map_err(|_| Error::new(Status::InvalidArg, "Missing required 'error' callback"))?;
+
+    Ok(VideoDecoderInit { output, error })
+  }
+}
+
+/// Result of isConfigSupported per WebCodecs spec
 #[napi(object)]
-#[derive(Debug, Clone)]
 pub struct VideoDecoderSupport {
   /// Whether the configuration is supported
   pub supported: bool,
-  /// The configuration that was checked (codec only for simplicity)
-  pub codec: String,
+  /// The configuration that was checked
+  pub config: VideoDecoderConfig,
 }
 
 /// Internal decoder state
@@ -56,14 +79,14 @@ struct VideoDecoderInner {
 ///
 /// Decodes EncodedVideoChunk objects into VideoFrame objects using FFmpeg.
 ///
-/// Per the WebCodecs spec, the constructor requires callbacks for output and error handling.
+/// Per the WebCodecs spec, the constructor takes an init dictionary with callbacks.
 ///
 /// Example:
 /// ```javascript
-/// const decoder = new VideoDecoder(
-///   (frame) => { console.log('decoded frame', frame); },
-///   (e) => { console.error('error', e); }
-/// );
+/// const decoder = new VideoDecoder({
+///   output: (frame) => { console.log('decoded frame', frame); },
+///   error: (e) => { console.error('error', e); }
+/// });
 ///
 /// decoder.configure({
 ///   codec: 'avc1.42001E'
@@ -79,14 +102,13 @@ pub struct VideoDecoder {
 
 #[napi]
 impl VideoDecoder {
-  /// Create a new VideoDecoder with required callbacks (per WebCodecs spec)
+  /// Create a new VideoDecoder with init dictionary (per WebCodecs spec)
   ///
-  /// @param output - Callback invoked when a decoded frame is available
-  /// @param error - Callback invoked when an error occurs
+  /// @param init - Init dictionary containing output and error callbacks
   #[napi(constructor)]
   pub fn new(
-    #[napi(ts_arg_type = "(frame: VideoFrame) => void")] output: OutputCallback,
-    #[napi(ts_arg_type = "(error: Error) => void")] error: ErrorCallback,
+    #[napi(ts_arg_type = "{ output: (frame: VideoFrame) => void, error: (error: Error) => void }")]
+    init: VideoDecoderInit,
   ) -> Result<Self> {
     let inner = VideoDecoderInner {
       state: CodecState::Unconfigured,
@@ -95,8 +117,8 @@ impl VideoDecoder {
       codec_string: String::new(),
       frame_count: 0,
       decode_queue_size: 0,
-      output_callback: output,
-      error_callback: error,
+      output_callback: init.output,
+      error_callback: init.error,
       dequeue_callback: None,
     };
 
@@ -410,7 +432,7 @@ impl VideoDecoder {
       Err(_) => {
         return Ok(VideoDecoderSupport {
           supported: false,
-          codec: config.codec,
+          config,
         });
       }
     };
@@ -420,7 +442,7 @@ impl VideoDecoder {
 
     Ok(VideoDecoderSupport {
       supported: result.is_ok(),
-      codec: config.codec,
+      config,
     })
   }
 }
@@ -499,22 +521,13 @@ fn decode_chunk_data(
     packet.set_duration(dur);
   }
 
-  // Allocate and copy data to packet
-  unsafe {
-    use crate::ffi::avcodec::av_new_packet;
-
-    let ret = av_new_packet(packet.as_mut_ptr(), data.len() as i32);
-    if ret < 0 {
-      return Err(Error::new(
-        Status::GenericFailure,
-        format!("Failed to allocate packet data: {}", ret),
-      ));
-    }
-
-    // Copy data to packet
-    let pkt_data = packet.data() as *mut u8;
-    std::ptr::copy_nonoverlapping(data.as_ptr(), pkt_data, data.len());
-  }
+  // Allocate and copy data to packet using safe wrapper
+  packet.copy_data_from(data).map_err(|e| {
+    Error::new(
+      Status::GenericFailure,
+      format!("Failed to copy packet data: {}", e),
+    )
+  })?;
 
   // Decode
   let frames = context

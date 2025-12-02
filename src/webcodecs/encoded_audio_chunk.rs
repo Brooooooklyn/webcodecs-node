@@ -6,6 +6,7 @@
 use crate::codec::Packet;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use std::io::Write;
 use std::sync::{Arc, RwLock};
 
 /// Type of encoded audio chunk
@@ -13,8 +14,10 @@ use std::sync::{Arc, RwLock};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncodedAudioChunkType {
   /// Key chunk - can be decoded independently
+  #[napi(value = "key")]
   Key,
   /// Delta chunk - depends on previous chunks
+  #[napi(value = "delta")]
   Delta,
 }
 
@@ -27,9 +30,10 @@ pub struct EncodedAudioChunkInit {
   /// Timestamp in microseconds
   pub timestamp: i64,
   /// Duration in microseconds (optional)
+  /// Note: W3C spec uses unsigned long long, but JS number can represent up to 2^53 safely
   pub duration: Option<i64>,
-  /// Encoded data
-  pub data: Buffer,
+  /// Encoded data (BufferSource per spec)
+  pub data: Uint8Array,
 }
 
 /// Internal state for EncodedAudioChunk
@@ -119,7 +123,7 @@ impl EncodedAudioChunk {
 
   /// Copy the encoded data to a Uint8Array
   #[napi]
-  pub fn copy_to(&self, destination: Uint8Array) -> Result<()> {
+  pub fn copy_to(&self, mut destination: Uint8Array) -> Result<()> {
     self.with_inner(|inner| {
       if destination.len() < inner.data.len() {
         return Err(Error::new(
@@ -132,19 +136,10 @@ impl EncodedAudioChunk {
         ));
       }
 
-      // Use unsafe to get mutable access
-      let dest_ptr = destination.as_ref().as_ptr() as *mut u8;
-      unsafe {
-        std::ptr::copy_nonoverlapping(inner.data.as_ptr(), dest_ptr, inner.data.len());
-      }
+      // Use std::io::Write for safe buffer access
+      unsafe { destination.as_mut() }.write_all(&inner.data)?;
       Ok(())
     })
-  }
-
-  /// Get the raw data as a Uint8Array (extension, not in spec)
-  #[napi(getter)]
-  pub fn get_data(&self) -> Result<Uint8Array> {
-    self.with_inner(|inner| Ok(inner.data.clone().into()))
   }
 
   // ========================================================================
@@ -193,7 +188,7 @@ impl EncodedAudioChunk {
         chunk_type: inner.chunk_type,
         timestamp: inner.timestamp_us,
         duration: inner.duration_us,
-        data: Buffer::from(inner.data.clone()),
+        data: Uint8Array::from(inner.data.clone()),
         byte_length: inner.data.len() as u32,
       })
     })
@@ -213,8 +208,8 @@ pub struct EncodedAudioChunkOutput {
   pub timestamp: i64,
   /// Duration in microseconds (optional)
   pub duration: Option<i64>,
-  /// Encoded data
-  pub data: Buffer,
+  /// Encoded data (Uint8Array per spec)
+  pub data: Uint8Array,
   /// Byte length of the encoded data
   pub byte_length: u32,
 }
@@ -225,10 +220,10 @@ pub struct EncodedAudioChunkOutput {
 pub struct AudioEncoderConfig {
   /// Codec string (e.g., "mp4a.40.2" for AAC-LC, "opus")
   pub codec: String,
-  /// Sample rate in Hz
-  pub sample_rate: Option<u32>,
-  /// Number of channels
-  pub number_of_channels: Option<u32>,
+  /// Sample rate in Hz (required per spec)
+  pub sample_rate: u32,
+  /// Number of channels (required per spec)
+  pub number_of_channels: u32,
   /// Target bitrate in bits per second
   pub bitrate: Option<f64>,
   /// Opus-specific: complexity (0-10)
@@ -248,12 +243,12 @@ pub struct AudioEncoderConfig {
 pub struct AudioDecoderConfig {
   /// Codec string (e.g., "mp4a.40.2" for AAC-LC, "opus")
   pub codec: String,
-  /// Sample rate in Hz (optional, may be in description)
-  pub sample_rate: Option<u32>,
-  /// Number of channels (optional, may be in description)
-  pub number_of_channels: Option<u32>,
-  /// Codec-specific description data (e.g., AudioSpecificConfig for AAC)
-  pub description: Option<Buffer>,
+  /// Sample rate in Hz (required per spec)
+  pub sample_rate: u32,
+  /// Number of channels (required per spec)
+  pub number_of_channels: u32,
+  /// Codec-specific description data (e.g., AudioSpecificConfig for AAC) - BufferSource per spec
+  pub description: Option<Uint8Array>,
 }
 
 /// Audio encoder support information

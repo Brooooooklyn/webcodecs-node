@@ -7,7 +7,7 @@
 
 import test from 'ava'
 
-import { EncodedAudioChunk, EncodedAudioChunkType } from '../index.js'
+import { EncodedAudioChunk } from '../index.js'
 
 // ============================================================================
 // Constructor Tests
@@ -19,13 +19,13 @@ test('EncodedAudioChunk: constructor with key chunk', (t) => {
   const duration = 20000
 
   const chunk = new EncodedAudioChunk({
-    type: EncodedAudioChunkType.Key,
+    type: 'key',
     timestamp,
     duration,
     data,
   })
 
-  t.is(chunk.type, EncodedAudioChunkType.Key)
+  t.is(chunk.type, 'key')
   t.is(chunk.timestamp, timestamp)
   t.is(chunk.duration, duration)
   t.is(chunk.byteLength, data.length)
@@ -36,12 +36,12 @@ test('EncodedAudioChunk: constructor with delta chunk', (t) => {
   const timestamp = 2000
 
   const chunk = new EncodedAudioChunk({
-    type: EncodedAudioChunkType.Delta,
+    type: 'delta',
     timestamp,
     data,
   })
 
-  t.is(chunk.type, EncodedAudioChunkType.Delta)
+  t.is(chunk.type, 'delta')
   t.is(chunk.timestamp, timestamp)
   t.is(chunk.byteLength, data.length)
 })
@@ -51,7 +51,7 @@ test('EncodedAudioChunk: constructor without duration', (t) => {
   const timestamp = 0
 
   const chunk = new EncodedAudioChunk({
-    type: EncodedAudioChunkType.Key,
+    type: 'key',
     timestamp,
     data,
   })
@@ -67,18 +67,18 @@ test('EncodedAudioChunk: type property', (t) => {
   const data = Buffer.from([0x00])
 
   const keyChunk = new EncodedAudioChunk({
-    type: EncodedAudioChunkType.Key,
+    type: 'key',
     timestamp: 0,
     data,
   })
-  t.is(keyChunk.type, EncodedAudioChunkType.Key)
+  t.is(keyChunk.type, 'key')
 
   const deltaChunk = new EncodedAudioChunk({
-    type: EncodedAudioChunkType.Delta,
+    type: 'delta',
     timestamp: 0,
     data,
   })
-  t.is(deltaChunk.type, EncodedAudioChunkType.Delta)
+  t.is(deltaChunk.type, 'delta')
 })
 
 test('EncodedAudioChunk: timestamp property', (t) => {
@@ -86,7 +86,7 @@ test('EncodedAudioChunk: timestamp property', (t) => {
 
   for (const ts of timestamps) {
     const chunk = new EncodedAudioChunk({
-      type: EncodedAudioChunkType.Key,
+      type: 'key',
       timestamp: ts,
       data: Buffer.from([0x00]),
     })
@@ -99,7 +99,7 @@ test('EncodedAudioChunk: duration property', (t) => {
 
   for (const dur of durations) {
     const chunk = new EncodedAudioChunk({
-      type: EncodedAudioChunkType.Key,
+      type: 'key',
       timestamp: 0,
       duration: dur,
       data: Buffer.from([0x00]),
@@ -114,7 +114,7 @@ test('EncodedAudioChunk: byteLength property', (t) => {
   for (const size of sizes) {
     const data = Buffer.alloc(size, 0x42)
     const chunk = new EncodedAudioChunk({
-      type: EncodedAudioChunkType.Key,
+      type: 'key',
       timestamp: 0,
       data,
     })
@@ -130,7 +130,7 @@ test('EncodedAudioChunk: copyTo() extracts chunk data', (t) => {
   const originalData = Buffer.from([0x01, 0x02, 0x03, 0x04, 0x05])
 
   const chunk = new EncodedAudioChunk({
-    type: EncodedAudioChunkType.Key,
+    type: 'key',
     timestamp: 0,
     data: originalData,
   })
@@ -147,7 +147,7 @@ test('EncodedAudioChunk: copyTo() with larger buffer', (t) => {
   const originalData = Buffer.from([0xAA, 0xBB, 0xCC])
 
   const chunk = new EncodedAudioChunk({
-    type: EncodedAudioChunkType.Key,
+    type: 'key',
     timestamp: 0,
     data: originalData,
   })
@@ -164,13 +164,13 @@ test('EncodedAudioChunk: copyTo() with larger buffer', (t) => {
 
 test('EncodedAudioChunk: can be created and accessed', (t) => {
   const chunk = new EncodedAudioChunk({
-    type: EncodedAudioChunkType.Key,
+    type: 'key',
     timestamp: 0,
     data: Buffer.from([0x00]),
   })
 
   // Should be able to access properties
-  t.is(chunk.type, EncodedAudioChunkType.Key)
+  t.is(chunk.type, 'key')
   t.is(chunk.timestamp, 0)
   t.is(chunk.byteLength, 1)
 })
@@ -181,7 +181,7 @@ test('EncodedAudioChunk: can be created and accessed', (t) => {
 
 test('EncodedAudioChunk: minimum data size (1 byte)', (t) => {
   const chunk = new EncodedAudioChunk({
-    type: EncodedAudioChunkType.Key,
+    type: 'key',
     timestamp: 0,
     data: Buffer.from([0x00]),
   })
@@ -194,7 +194,7 @@ test('EncodedAudioChunk: large data size', (t) => {
   const data = Buffer.alloc(size, 0x55)
 
   const chunk = new EncodedAudioChunk({
-    type: EncodedAudioChunkType.Key,
+    type: 'key',
     timestamp: 0,
     data,
   })
@@ -204,7 +204,7 @@ test('EncodedAudioChunk: large data size', (t) => {
 
 test('EncodedAudioChunk: timestamp of 0 is valid', (t) => {
   const chunk = new EncodedAudioChunk({
-    type: EncodedAudioChunkType.Key,
+    type: 'key',
     timestamp: 0,
     data: Buffer.from([0x00]),
   })
@@ -214,7 +214,7 @@ test('EncodedAudioChunk: timestamp of 0 is valid', (t) => {
 
 test('EncodedAudioChunk: duration of 0 is valid', (t) => {
   const chunk = new EncodedAudioChunk({
-    type: EncodedAudioChunkType.Key,
+    type: 'key',
     timestamp: 0,
     duration: 0,
     data: Buffer.from([0x00]),
@@ -242,14 +242,14 @@ test('EncodedAudioChunk: AAC-like data structure', (t) => {
   const data = Buffer.concat([fakeAdtsHeader, frameData])
 
   const chunk = new EncodedAudioChunk({
-    type: EncodedAudioChunkType.Key,
+    type: 'key',
     timestamp: 0,
     duration: 21333, // ~1024 samples at 48kHz
     data,
   })
 
   t.is(chunk.byteLength, data.length)
-  t.is(chunk.type, EncodedAudioChunkType.Key)
+  t.is(chunk.type, 'key')
 })
 
 test('EncodedAudioChunk: Opus-like data structure', (t) => {
@@ -258,7 +258,7 @@ test('EncodedAudioChunk: Opus-like data structure', (t) => {
   const data = Buffer.concat([Buffer.from([tocByte]), Buffer.alloc(50)])
 
   const chunk = new EncodedAudioChunk({
-    type: EncodedAudioChunkType.Key,
+    type: 'key',
     timestamp: 0,
     duration: 20000, // 20ms Opus frame
     data,

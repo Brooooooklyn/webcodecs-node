@@ -13,8 +13,7 @@ import {
   generateGradientI420Frame,
   TestColors,
   extractI420Data,
-  reconstructVideoChunk,
-  type EncodedVideoChunkOutput,
+  type EncodedVideoChunk,
 } from '../helpers/index.js'
 import { compareBuffers, formatPSNR, PSNRThresholds } from '../helpers/frame-comparator.js'
 import {
@@ -27,15 +26,15 @@ import {
 
 // Helper to create test encoder with callbacks
 function createTestEncoder() {
-  const chunks: EncodedVideoChunkOutput[] = []
+  const chunks: EncodedVideoChunk[] = []
   const errors: Error[] = []
 
-  const encoder = new VideoEncoder(
-    (chunk, _metadata) => {
+  const encoder = new VideoEncoder({
+    output: (chunk, _metadata) => {
       chunks.push(chunk)
     },
-    (e) => errors.push(e),
-  )
+    error: (e) => errors.push(e),
+  })
 
   return { encoder, chunks, errors }
 }
@@ -45,10 +44,10 @@ function createTestDecoder() {
   const frames: VideoFrame[] = []
   const errors: Error[] = []
 
-  const decoder = new VideoDecoder(
-    (frame) => frames.push(frame),
-    (e) => errors.push(e),
-  )
+  const decoder = new VideoDecoder({
+    output: (frame) => frames.push(frame),
+    error: (e) => errors.push(e),
+  })
 
   return { decoder, frames, errors }
 }
@@ -86,7 +85,7 @@ test('codec: H.264 encode-decode roundtrip', async (t) => {
   const height = 240
 
   const original = generateSolidColorI420Frame(width, height, TestColors.red, 0)
-  const originalData = extractI420Data(original)
+  const originalData = await extractI420Data(original)
 
   // Encode
   const { encoder, chunks } = createTestEncoder()
@@ -103,13 +102,13 @@ test('codec: H.264 encode-decode roundtrip', async (t) => {
   decoder.configure(createDecoderConfig('h264', { codedWidth: width, codedHeight: height }))
 
   for (const chunk of chunks) {
-    decoder.decode(reconstructVideoChunk(chunk))
+    decoder.decode(chunk)
   }
   await decoder.flush()
 
   t.true(frames.length > 0, 'H.264 should decode frames')
 
-  const comparison = compareBuffers(originalData, extractI420Data(frames[0]))
+  const comparison = compareBuffers(originalData, await extractI420Data(frames[0]))
   t.log(`H.264 PSNR: ${formatPSNR(comparison.psnr)}`)
   t.true(comparison.acceptable)
 
@@ -136,7 +135,7 @@ test('codec: VP8 encode-decode roundtrip', async (t) => {
   }
 
   const original = generateGradientI420Frame(width, height, 0)
-  const originalData = extractI420Data(original)
+  const originalData = await extractI420Data(original)
 
   // Encode
   const { encoder, chunks } = createTestEncoder()
@@ -153,13 +152,13 @@ test('codec: VP8 encode-decode roundtrip', async (t) => {
   decoder.configure(createDecoderConfig('vp8', { codedWidth: width, codedHeight: height }))
 
   for (const chunk of chunks) {
-    decoder.decode(reconstructVideoChunk(chunk))
+    decoder.decode(chunk)
   }
   await decoder.flush()
 
   t.true(frames.length > 0, 'VP8 should decode frames')
 
-  const comparison = compareBuffers(originalData, extractI420Data(frames[0]))
+  const comparison = compareBuffers(originalData, await extractI420Data(frames[0]))
   t.log(`VP8 PSNR: ${formatPSNR(comparison.psnr)}`)
   t.true(comparison.acceptable)
 
@@ -186,7 +185,7 @@ test('codec: VP9 encode-decode roundtrip', async (t) => {
   }
 
   const original = generateSolidColorI420Frame(width, height, TestColors.green, 0)
-  const originalData = extractI420Data(original)
+  const originalData = await extractI420Data(original)
 
   // Encode
   const { encoder, chunks } = createTestEncoder()
@@ -203,13 +202,13 @@ test('codec: VP9 encode-decode roundtrip', async (t) => {
   decoder.configure(createDecoderConfig('vp9', { codedWidth: width, codedHeight: height }))
 
   for (const chunk of chunks) {
-    decoder.decode(reconstructVideoChunk(chunk))
+    decoder.decode(chunk)
   }
   await decoder.flush()
 
   t.true(frames.length > 0, 'VP9 should decode frames')
 
-  const comparison = compareBuffers(originalData, extractI420Data(frames[0]))
+  const comparison = compareBuffers(originalData, await extractI420Data(frames[0]))
   t.log(`VP9 PSNR: ${formatPSNR(comparison.psnr)}`)
   t.true(comparison.acceptable)
 
@@ -236,7 +235,7 @@ test('codec: H.265 encode-decode roundtrip', async (t) => {
   }
 
   const original = generateSolidColorI420Frame(width, height, TestColors.blue, 0)
-  const originalData = extractI420Data(original)
+  const originalData = await extractI420Data(original)
 
   // Encode
   const { encoder, chunks } = createTestEncoder()
@@ -253,13 +252,13 @@ test('codec: H.265 encode-decode roundtrip', async (t) => {
   decoder.configure(createDecoderConfig('h265', { codedWidth: width, codedHeight: height }))
 
   for (const chunk of chunks) {
-    decoder.decode(reconstructVideoChunk(chunk))
+    decoder.decode(chunk)
   }
   await decoder.flush()
 
   t.true(frames.length > 0, 'H.265 should decode frames')
 
-  const comparison = compareBuffers(originalData, extractI420Data(frames[0]))
+  const comparison = compareBuffers(originalData, await extractI420Data(frames[0]))
   t.log(`H.265 PSNR: ${formatPSNR(comparison.psnr)}`)
   t.true(comparison.acceptable)
 
@@ -286,7 +285,7 @@ test('codec: AV1 encode-decode roundtrip', async (t) => {
   }
 
   const original = generateSolidColorI420Frame(width, height, TestColors.yellow, 0)
-  const originalData = extractI420Data(original)
+  const originalData = await extractI420Data(original)
 
   // Encode
   const { encoder, chunks } = createTestEncoder()
@@ -308,7 +307,7 @@ test('codec: AV1 encode-decode roundtrip', async (t) => {
     decoder.configure(createDecoderConfig('av1', { codedWidth: width, codedHeight: height }))
 
     for (const chunk of chunks) {
-      decoder.decode(reconstructVideoChunk(chunk))
+      decoder.decode(chunk)
     }
     await decoder.flush()
 
@@ -320,7 +319,7 @@ test('codec: AV1 encode-decode roundtrip', async (t) => {
       return
     }
 
-    const comparison = compareBuffers(originalData, extractI420Data(frames[0]))
+    const comparison = compareBuffers(originalData, await extractI420Data(frames[0]))
     t.log(`AV1 PSNR: ${formatPSNR(comparison.psnr)}`)
     t.true(comparison.acceptable)
 
@@ -350,7 +349,7 @@ const resolutions = [
 for (const res of resolutions) {
   test(`codec matrix: H.264 @ ${res.name} (${res.width}x${res.height})`, async (t) => {
     const original = generateSolidColorI420Frame(res.width, res.height, TestColors.white, 0)
-    const originalData = extractI420Data(original)
+    const originalData = await extractI420Data(original)
 
     // Encode
     const { encoder, chunks } = createTestEncoder()
@@ -367,7 +366,7 @@ for (const res of resolutions) {
     decoder.configure(createDecoderConfig('h264', { codedWidth: res.width, codedHeight: res.height }))
 
     for (const chunk of chunks) {
-      decoder.decode(reconstructVideoChunk(chunk))
+      decoder.decode(chunk)
     }
     await decoder.flush()
 
@@ -378,7 +377,7 @@ for (const res of resolutions) {
     t.is(frames[0].codedHeight, res.height)
 
     // Verify quality
-    const comparison = compareBuffers(originalData, extractI420Data(frames[0]))
+    const comparison = compareBuffers(originalData, await extractI420Data(frames[0]))
     t.true(comparison.acceptable, `Quality at ${res.name}`)
 
     for (const frame of frames) {
@@ -396,7 +395,7 @@ test('codec comparison: quality across codecs', async (t) => {
   const width = 320
   const height = 240
   const original = generateGradientI420Frame(width, height, 0)
-  const originalData = extractI420Data(original)
+  const originalData = await extractI420Data(original)
 
   const codecs: CodecType[] = ['h264', 'vp8', 'vp9']
   const results: { codec: string; psnr: number }[] = []
@@ -426,7 +425,7 @@ test('codec comparison: quality across codecs', async (t) => {
     decoder.configure(createDecoderConfig(codec, { codedWidth: width, codedHeight: height }))
 
     for (const chunk of chunks) {
-      decoder.decode(reconstructVideoChunk(chunk))
+      decoder.decode(chunk)
     }
     await decoder.flush()
 
@@ -435,7 +434,7 @@ test('codec comparison: quality across codecs', async (t) => {
       continue
     }
 
-    const comparison = compareBuffers(originalData, extractI420Data(frames[0]))
+    const comparison = compareBuffers(originalData, await extractI420Data(frames[0]))
     results.push({ codec, psnr: comparison.psnr })
 
     for (const f of frames) {

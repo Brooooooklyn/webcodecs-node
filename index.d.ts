@@ -6,8 +6,11 @@
  * This is a WebCodecs-compliant AudioData implementation backed by FFmpeg.
  */
 export declare class AudioData {
-  /** Create a new AudioData from raw sample data */
-  constructor(data: Uint8Array, init: AudioDataInit)
+  /**
+   * Create a new AudioData (W3C WebCodecs spec)
+   * Per spec, the constructor takes a single init object containing all parameters including data
+   */
+  constructor(init: AudioDataInit)
   /** Get sample format */
   get format(): AudioSampleFormat | null
   /** Get sample rate in Hz */
@@ -20,10 +23,18 @@ export declare class AudioData {
   get duration(): number
   /** Get timestamp in microseconds */
   get timestamp(): number
-  /** Get the buffer size required for allocationSize */
-  allocationSize(options?: AudioDataCopyToOptions | undefined | null): number
-  /** Copy audio data to a buffer */
-  copyTo(destination: Uint8Array, options?: AudioDataCopyToOptions | undefined | null): void
+  /** Get whether this AudioData has been closed (W3C WebCodecs spec) */
+  get closed(): boolean
+  /**
+   * Get the buffer size required for copyTo (W3C WebCodecs spec)
+   * Note: options is REQUIRED per spec
+   */
+  allocationSize(options: AudioDataCopyToOptions): number
+  /**
+   * Copy audio data to a buffer (W3C WebCodecs spec)
+   * Note: Per spec, this is SYNCHRONOUS and returns undefined
+   */
+  copyTo(destination: Uint8Array, options: AudioDataCopyToOptions): void
   /** Create a copy of this AudioData */
   clone(): AudioData
   /** Close and release resources */
@@ -35,14 +46,14 @@ export declare class AudioData {
  *
  * Decodes EncodedAudioChunk objects into AudioData objects using FFmpeg.
  *
- * Per the WebCodecs spec, the constructor requires callbacks for output and error handling.
+ * Per the WebCodecs spec, the constructor takes an init dictionary with callbacks.
  *
  * Example:
  * ```javascript
- * const decoder = new AudioDecoder(
- *   (data) => { console.log('decoded audio', data); },
- *   (e) => { console.error('error', e); }
- * );
+ * const decoder = new AudioDecoder({
+ *   output: (data) => { console.log('decoded audio', data); },
+ *   error: (e) => { console.error('error', e); }
+ * });
  *
  * decoder.configure({
  *   codec: 'opus',
@@ -56,12 +67,11 @@ export declare class AudioData {
  */
 export declare class AudioDecoder {
   /**
-   * Create a new AudioDecoder with required callbacks (per WebCodecs spec)
+   * Create a new AudioDecoder with init dictionary (per WebCodecs spec)
    *
-   * @param output - Callback invoked when decoded audio is available
-   * @param error - Callback invoked when an error occurs
+   * @param init - Init dictionary containing output and error callbacks
    */
-  constructor(output: (data: AudioData) => void, error: (error: Error) => void)
+  constructor(init: { output: (data: AudioData) => void, error: (error: Error) => void })
   /** Get decoder state */
   get state(): CodecState
   /** Get number of pending decode operations (per WebCodecs spec) */
@@ -98,14 +108,14 @@ export declare class AudioDecoder {
  *
  * Encodes AudioData objects into EncodedAudioChunk objects using FFmpeg.
  *
- * Per the WebCodecs spec, the constructor requires callbacks for output and error handling.
+ * Per the WebCodecs spec, the constructor takes an init dictionary with callbacks.
  *
  * Example:
  * ```javascript
- * const encoder = new AudioEncoder(
- *   (chunk, metadata) => { console.log('encoded chunk', chunk); },
- *   (e) => { console.error('error', e); }
- * );
+ * const encoder = new AudioEncoder({
+ *   output: (chunk, metadata) => { console.log('encoded chunk', chunk); },
+ *   error: (e) => { console.error('error', e); }
+ * });
  *
  * encoder.configure({
  *   codec: 'opus',
@@ -119,12 +129,11 @@ export declare class AudioDecoder {
  */
 export declare class AudioEncoder {
   /**
-   * Create a new AudioEncoder with required callbacks (per WebCodecs spec)
+   * Create a new AudioEncoder with init dictionary (per WebCodecs spec)
    *
-   * @param output - Callback invoked when an encoded chunk is available
-   * @param error - Callback invoked when an error occurs
+   * @param init - Init dictionary containing output and error callbacks
    */
-  constructor(output: (chunk: EncodedAudioChunkOutput, metadata: EncodedAudioChunkMetadata) => void, error: (error: Error) => void)
+  constructor(init: { output: (chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadata) => void, error: (error: Error) => void })
   /** Get encoder state */
   get state(): CodecState
   /** Get number of pending encode operations (per WebCodecs spec) */
@@ -157,6 +166,34 @@ export declare class AudioEncoder {
 }
 
 /**
+ * DOMRectReadOnly - W3C WebCodecs spec compliant rect class
+ * Used for codedRect and visibleRect properties
+ */
+export declare class DomRectReadOnly {
+  /** Create a new DOMRectReadOnly */
+  constructor(x?: number | undefined | null, y?: number | undefined | null, width?: number | undefined | null, height?: number | undefined | null)
+  /** X coordinate */
+  get x(): number
+  /** Y coordinate */
+  get y(): number
+  /** Width */
+  get width(): number
+  /** Height */
+  get height(): number
+  /** Top edge (same as y) */
+  get top(): number
+  /** Right edge (x + width) */
+  get right(): number
+  /** Bottom edge (y + height) */
+  get bottom(): number
+  /** Left edge (same as x) */
+  get left(): number
+  /** Convert to JSON */
+  toJson(): DOMRectInit
+}
+export type DOMRectReadOnly = DomRectReadOnly
+
+/**
  * EncodedAudioChunk - represents encoded audio data
  *
  * This is a WebCodecs-compliant EncodedAudioChunk implementation.
@@ -174,8 +211,6 @@ export declare class EncodedAudioChunk {
   get byteLength(): number
   /** Copy the encoded data to a Uint8Array */
   copyTo(destination: Uint8Array): void
-  /** Get the raw data as a Uint8Array (extension, not in spec) */
-  get data(): Uint8Array
 }
 
 /**
@@ -196,8 +231,6 @@ export declare class EncodedVideoChunk {
   get byteLength(): number
   /** Copy the encoded data to a Uint8Array */
   copyTo(destination: Uint8Array): void
-  /** Get the raw data as a Buffer (extension, not in spec) */
-  getData(): Buffer
 }
 
 /**
@@ -221,6 +254,11 @@ export declare class ImageDecoder {
   constructor(init: ImageDecoderInit)
   /** Whether the data is fully buffered */
   get complete(): boolean
+  /**
+   * Promise that resolves when data is fully loaded (per WebCodecs spec)
+   * Since we use buffered data, this resolves immediately
+   */
+  get completed(): Promise<void>
   /** Get the MIME type */
   get type(): string
   /** Get the track list */
@@ -253,19 +291,37 @@ export declare class ImageTrackList {
   get selectedIndex(): number | null
 }
 
+/** Video color space parameters (WebCodecs spec) - as a class per spec */
+export declare class VideoColorSpace {
+  /** Create a new VideoColorSpace */
+  constructor(init?: VideoColorSpaceInit | undefined | null)
+  /** Get color primaries */
+  get primaries(): string | null
+  /** Get transfer characteristics */
+  get transfer(): string | null
+  /** Get matrix coefficients */
+  get matrix(): string | null
+  /** Get full range flag */
+  get fullRange(): boolean | null
+  /** Convert to JSON-compatible object */
+  toJson(): VideoColorSpaceInit
+  /** Clone this VideoColorSpace (W3C WebCodecs spec) */
+  clone(): VideoColorSpace
+}
+
 /**
  * VideoDecoder - WebCodecs-compliant video decoder
  *
  * Decodes EncodedVideoChunk objects into VideoFrame objects using FFmpeg.
  *
- * Per the WebCodecs spec, the constructor requires callbacks for output and error handling.
+ * Per the WebCodecs spec, the constructor takes an init dictionary with callbacks.
  *
  * Example:
  * ```javascript
- * const decoder = new VideoDecoder(
- *   (frame) => { console.log('decoded frame', frame); },
- *   (e) => { console.error('error', e); }
- * );
+ * const decoder = new VideoDecoder({
+ *   output: (frame) => { console.log('decoded frame', frame); },
+ *   error: (e) => { console.error('error', e); }
+ * });
  *
  * decoder.configure({
  *   codec: 'avc1.42001E'
@@ -277,12 +333,11 @@ export declare class ImageTrackList {
  */
 export declare class VideoDecoder {
   /**
-   * Create a new VideoDecoder with required callbacks (per WebCodecs spec)
+   * Create a new VideoDecoder with init dictionary (per WebCodecs spec)
    *
-   * @param output - Callback invoked when a decoded frame is available
-   * @param error - Callback invoked when an error occurs
+   * @param init - Init dictionary containing output and error callbacks
    */
-  constructor(output: (frame: VideoFrame) => void, error: (error: Error) => void)
+  constructor(init: { output: (frame: VideoFrame) => void, error: (error: Error) => void })
   /** Get decoder state */
   get state(): CodecState
   /** Get number of pending decode operations (per WebCodecs spec) */
@@ -319,14 +374,14 @@ export declare class VideoDecoder {
  *
  * Encodes VideoFrame objects into EncodedVideoChunk objects using FFmpeg.
  *
- * Per the WebCodecs spec, the constructor requires callbacks for output and error handling.
+ * Per the WebCodecs spec, the constructor takes an init dictionary with callbacks.
  *
  * Example:
  * ```javascript
- * const encoder = new VideoEncoder(
- *   (chunk, metadata) => { console.log('encoded chunk', chunk); },
- *   (e) => { console.error('error', e); }
- * );
+ * const encoder = new VideoEncoder({
+ *   output: (chunk, metadata) => { console.log('encoded chunk', chunk); },
+ *   error: (e) => { console.error('error', e); }
+ * });
  *
  * encoder.configure({
  *   codec: 'avc1.42001E',
@@ -341,12 +396,11 @@ export declare class VideoDecoder {
  */
 export declare class VideoEncoder {
   /**
-   * Create a new VideoEncoder with required callbacks (per WebCodecs spec)
+   * Create a new VideoEncoder with init dictionary (per WebCodecs spec)
    *
-   * @param output - Callback invoked when an encoded chunk is available
-   * @param error - Callback invoked when an error occurs
+   * @param init - Init dictionary containing output and error callbacks
    */
-  constructor(output: (chunk: EncodedVideoChunkOutput, metadata: EncodedVideoChunkMetadata) => void, error: (error: Error) => void)
+  constructor(init: { output: (chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadata) => void, error: (error: Error) => void })
   /** Get encoder state */
   get state(): CodecState
   /** Get number of pending encode operations (per WebCodecs spec) */
@@ -384,8 +438,20 @@ export declare class VideoEncoder {
  * This is a WebCodecs-compliant VideoFrame implementation backed by FFmpeg.
  */
 export declare class VideoFrame {
-  /** Create a new VideoFrame from raw data */
-  constructor(data: Buffer, init: VideoFrameInit)
+  /**
+   * Create a new VideoFrame from raw buffer data (BufferSource per spec)
+   *
+   * This is the VideoFrameBufferInit constructor form.
+   * Use `fromVideoFrame()` to create from another VideoFrame.
+   */
+  constructor(data: Uint8Array, init: VideoFrameBufferInit)
+  /**
+   * Create a new VideoFrame from another VideoFrame (image source constructor per spec)
+   *
+   * This clones the source VideoFrame and applies any overrides from init.
+   * Per W3C spec, this is equivalent to `new VideoFrame(videoFrame, init)`.
+   */
+  static fromVideoFrame(source: VideoFrame, init?: VideoFrameInit | undefined | null): VideoFrame
   /** Get the pixel format */
   get format(): VideoPixelFormat | null
   /** Get the coded width in pixels */
@@ -398,28 +464,31 @@ export declare class VideoFrame {
   get displayHeight(): number
   /**
    * Get the coded rect (the region containing valid pixel data)
-   * For now, this is the full coded dimensions starting at (0, 0)
+   * Returns DOMRectReadOnly per W3C WebCodecs spec
    */
-  get codedRect(): VideoFrameRect
+  get codedRect(): DomRectReadOnly
   /**
    * Get the visible rect (the region of coded data that should be displayed)
-   * For now, this is the same as coded_rect (no cropping support yet)
+   * Returns DOMRectReadOnly per W3C WebCodecs spec
    */
-  get visibleRect(): VideoFrameRect
+  get visibleRect(): DomRectReadOnly
   /** Get the presentation timestamp in microseconds */
   get timestamp(): number
   /** Get the duration in microseconds */
   get duration(): number | null
   /** Get the color space parameters */
   get colorSpace(): VideoColorSpace
+  /** Get whether this VideoFrame has been closed (W3C WebCodecs spec) */
+  get closed(): boolean
   /** Calculate the allocation size needed for copyTo */
   allocationSize(options?: VideoFrameCopyToOptions | undefined | null): number
   /**
    * Copy frame data to a Uint8Array
    *
+   * Returns a Promise that resolves with an array of PlaneLayout objects.
    * Options can specify target format. The rect parameter is not yet implemented.
    */
-  copyTo(destination: Uint8Array, options?: VideoFrameCopyToOptions | undefined | null): void
+  copyTo(destination: Uint8Array, options?: VideoFrameCopyToOptions | undefined | null): Promise<Array<PlaneLayout>>
   /** Clone this VideoFrame */
   clone(): VideoFrame
   /** Close and release resources */
@@ -438,30 +507,35 @@ export interface AudioDataCopyToOptions {
   format?: AudioSampleFormat
 }
 
-/** Options for creating an AudioData */
+/**
+ * Options for creating an AudioData (W3C WebCodecs spec)
+ * Note: Per spec, data is included in the init object
+ */
 export interface AudioDataInit {
-  /** Sample format */
+  /** Sample format (required) */
   format: AudioSampleFormat
-  /** Sample rate in Hz */
+  /** Sample rate in Hz (required) */
   sampleRate: number
-  /** Number of frames (samples per channel) */
+  /** Number of frames (samples per channel) (required) */
   numberOfFrames: number
-  /** Number of channels */
+  /** Number of channels (required) */
   numberOfChannels: number
-  /** Timestamp in microseconds */
+  /** Timestamp in microseconds (required) */
   timestamp: number
+  /** Raw audio sample data (required) - BufferSource per spec */
+  data: Uint8Array
 }
 
 /** Audio decoder configuration (WebCodecs spec) */
 export interface AudioDecoderConfig {
   /** Codec string (e.g., "mp4a.40.2" for AAC-LC, "opus") */
   codec: string
-  /** Sample rate in Hz (optional, may be in description) */
-  sampleRate?: number
-  /** Number of channels (optional, may be in description) */
-  numberOfChannels?: number
-  /** Codec-specific description data (e.g., AudioSpecificConfig for AAC) */
-  description?: Buffer
+  /** Sample rate in Hz (required per spec) */
+  sampleRate: number
+  /** Number of channels (required per spec) */
+  numberOfChannels: number
+  /** Codec-specific description data (e.g., AudioSpecificConfig for AAC) - BufferSource per spec */
+  description?: Uint8Array
 }
 
 /** Decoder configuration output (for passing to decoder) */
@@ -472,8 +546,8 @@ export interface AudioDecoderConfigOutput {
   sampleRate?: number
   /** Number of channels */
   numberOfChannels?: number
-  /** Codec description (e.g., AudioSpecificConfig for AAC) */
-  description?: Buffer
+  /** Codec description (e.g., AudioSpecificConfig for AAC) - Uint8Array per spec */
+  description?: Uint8Array
 }
 
 /** Audio decoder support information */
@@ -488,10 +562,10 @@ export interface AudioDecoderSupport {
 export interface AudioEncoderConfig {
   /** Codec string (e.g., "mp4a.40.2" for AAC-LC, "opus") */
   codec: string
-  /** Sample rate in Hz */
-  sampleRate?: number
-  /** Number of channels */
-  numberOfChannels?: number
+  /** Sample rate in Hz (required per spec) */
+  sampleRate: number
+  /** Number of channels (required per spec) */
+  numberOfChannels: number
   /** Target bitrate in bits per second */
   bitrate?: number
   /** Opus-specific: complexity (0-10) */
@@ -520,24 +594,22 @@ export interface AudioEncoderSupport {
 }
 
 /** Audio sample format (WebCodecs spec) */
-export declare const enum AudioSampleFormat {
-  /** Unsigned 8-bit integer samples, interleaved */
-  U8 = 'U8',
-  /** Signed 16-bit integer samples, interleaved */
-  S16 = 'S16',
-  /** Signed 32-bit integer samples, interleaved */
-  S32 = 'S32',
-  /** 32-bit float samples, interleaved */
-  F32 = 'F32',
-  /** Unsigned 8-bit integer samples, planar */
-  U8Planar = 'U8Planar',
-  /** Signed 16-bit integer samples, planar */
-  S16Planar = 'S16Planar',
-  /** Signed 32-bit integer samples, planar */
-  S32Planar = 'S32Planar',
-  /** 32-bit float samples, planar */
-  F32Planar = 'F32Planar'
-}
+export type AudioSampleFormat = /** Unsigned 8-bit integer samples| interleaved */
+'u8'|
+/** Signed 16-bit integer samples| interleaved */
+'s16'|
+/** Signed 32-bit integer samples| interleaved */
+'s32'|
+/** 32-bit float samples| interleaved */
+'f32'|
+/** Unsigned 8-bit integer samples| planar */
+'u8-planar'|
+/** Signed 16-bit integer samples| planar */
+'s16-planar'|
+/** Signed 32-bit integer samples| planar */
+'s32-planar'|
+/** 32-bit float samples| planar */
+'f32-planar';
 
 /** Encode configuration for AV1 */
 export interface Av1EncoderConfig {
@@ -557,8 +629,8 @@ export interface Av1EncoderConfig {
 
 /** Decode configuration for AVC (H.264) */
 export interface AvcDecoderConfig {
-  /** AVC configuration record (avcC box content) */
-  avcC?: Buffer
+  /** AVC configuration record (avcC box content) - Uint8Array per W3C spec (BufferSource) */
+  avcC?: Uint8Array
 }
 
 /** Encode configuration for AVC (H.264) */
@@ -572,13 +644,26 @@ export interface AvcEncoderConfig {
 }
 
 /** Encoder state per WebCodecs spec */
-export declare const enum CodecState {
-  /** Encoder not configured */
-  Unconfigured = 'Unconfigured',
-  /** Encoder configured and ready */
-  Configured = 'Configured',
-  /** Encoder closed */
-  Closed = 'Closed'
+export type CodecState = /** Encoder not configured */
+'unconfigured'|
+/** Encoder configured and ready */
+'configured'|
+/** Encoder closed */
+'closed';
+
+/**
+ * Type alias for dequeue callback (no arguments)
+ * Using CalleeHandled: false for direct callbacks
+ */
+export type DequeueCallback =
+  (() => unknown)
+
+/** DOMRectInit for specifying regions */
+export interface DomRectInit {
+  x?: number
+  y?: number
+  width?: number
+  height?: number
 }
 
 /** Options for creating an EncodedAudioChunk */
@@ -587,10 +672,13 @@ export interface EncodedAudioChunkInit {
   type: EncodedAudioChunkType
   /** Timestamp in microseconds */
   timestamp: number
-  /** Duration in microseconds (optional) */
+  /**
+   * Duration in microseconds (optional)
+   * Note: W3C spec uses unsigned long long, but JS number can represent up to 2^53 safely
+   */
   duration?: number
-  /** Encoded data */
-  data: Buffer
+  /** Encoded data (BufferSource per spec) */
+  data: Uint8Array
 }
 
 /** Output callback metadata for audio */
@@ -612,19 +700,17 @@ export interface EncodedAudioChunkOutput {
   timestamp: number
   /** Duration in microseconds (optional) */
   duration?: number
-  /** Encoded data */
-  data: Buffer
+  /** Encoded data (Uint8Array per spec) */
+  data: Uint8Array
   /** Byte length of the encoded data */
   byteLength: number
 }
 
 /** Type of encoded audio chunk */
-export declare const enum EncodedAudioChunkType {
-  /** Key chunk - can be decoded independently */
-  Key = 'Key',
-  /** Delta chunk - depends on previous chunks */
-  Delta = 'Delta'
-}
+export type EncodedAudioChunkType = /** Key chunk - can be decoded independently */
+'key'|
+/** Delta chunk - depends on previous chunks */
+'delta';
 
 /** Options for creating an EncodedVideoChunk */
 export interface EncodedVideoChunkInit {
@@ -632,10 +718,13 @@ export interface EncodedVideoChunkInit {
   type: EncodedVideoChunkType
   /** Timestamp in microseconds */
   timestamp: number
-  /** Duration in microseconds (optional) */
+  /**
+   * Duration in microseconds (optional)
+   * Note: W3C spec uses unsigned long long, but JS number can represent up to 2^53 safely
+   */
   duration?: number
-  /** Encoded data */
-  data: Buffer
+  /** Encoded data (BufferSource per spec) */
+  data: Uint8Array
 }
 
 /** Output callback metadata per WebCodecs spec */
@@ -644,32 +733,11 @@ export interface EncodedVideoChunkMetadata {
   decoderConfig?: VideoDecoderConfigOutput
 }
 
-/**
- * Serializable output for callbacks (used with ThreadsafeFunction)
- *
- * NAPI-RS class instances can't be passed through ThreadsafeFunction,
- * so we use this plain object struct for callback output.
- */
-export interface EncodedVideoChunkOutput {
-  /** Chunk type (key or delta) */
-  type: EncodedVideoChunkType
-  /** Timestamp in microseconds */
-  timestamp: number
-  /** Duration in microseconds (optional) */
-  duration?: number
-  /** Encoded data */
-  data: Buffer
-  /** Byte length of the encoded data */
-  byteLength: number
-}
-
 /** Type of encoded video chunk */
-export declare const enum EncodedVideoChunkType {
-  /** Keyframe - can be decoded independently */
-  Key = 'Key',
-  /** Delta frame - depends on previous frames */
-  Delta = 'Delta'
-}
+export type EncodedVideoChunkType = /** Keyframe - can be decoded independently */
+'key'|
+/** Delta frame - depends on previous frames */
+'delta';
 
 /** Get available hardware accelerators (only those that can be used) */
 export declare function getAvailableHardwareAccelerators(): Array<string>
@@ -714,10 +782,10 @@ export interface ImageDecodeOptions {
 
 /** ImageDecoder init options */
 export interface ImageDecoderInit {
-  /** The image data (encoded bytes) */
-  data: Buffer
+  /** The image data (encoded bytes) - BufferSource per spec */
+  data: Uint8Array
   /** MIME type of the image (e.g., "image/png", "image/jpeg") */
-  mimeType: string
+  type: string
   /** Color space conversion hint (optional) */
   colorSpaceConversion?: string
   /** Desired width (optional, for scaling) */
@@ -743,8 +811,16 @@ export interface ImageTrack {
 /** Check if a specific hardware accelerator is available */
 export declare function isHardwareAcceleratorAvailable(name: string): boolean
 
-/** Video color space parameters (WebCodecs spec) */
-export interface VideoColorSpace {
+/** Layout information for a single plane per WebCodecs spec */
+export interface PlaneLayout {
+  /** Byte offset from the start of the buffer to the start of the plane */
+  offset: number
+  /** Number of bytes per row (stride) */
+  stride: number
+}
+
+/** VideoColorSpaceInit for constructing VideoColorSpace */
+export interface VideoColorSpaceInit {
   /** Color primaries (e.g., "bt709", "bt2020") */
   primaries?: string
   /** Transfer function (e.g., "bt709", "srgb", "pq", "hlg") */
@@ -767,14 +843,14 @@ export interface VideoDecoderConfig {
   displayAspectWidth?: number
   /** Display aspect height */
   displayAspectHeight?: number
-  /** Color space parameters */
-  colorSpace?: VideoColorSpace
+  /** Color space parameters (uses init object for compatibility) */
+  colorSpace?: VideoColorSpaceInit
   /** Hardware acceleration preference */
   hardwareAcceleration?: string
   /** Optimization preference: "prefer-accuracy" or "prefer-speed" */
   optimizeForLatency?: boolean
-  /** Codec-specific description data (e.g., avcC for H.264) */
-  description?: Buffer
+  /** Codec-specific description data (e.g., avcC for H.264) - BufferSource per spec */
+  description?: Uint8Array
 }
 
 /** Decoder configuration output (for passing to decoder) */
@@ -785,16 +861,16 @@ export interface VideoDecoderConfigOutput {
   codedWidth?: number
   /** Coded height */
   codedHeight?: number
-  /** Codec description (e.g., avcC for H.264) */
-  description?: Buffer
+  /** Codec description (e.g., avcC for H.264) - Uint8Array per spec */
+  description?: Uint8Array
 }
 
-/** Result of isConfigSupported */
+/** Result of isConfigSupported per WebCodecs spec */
 export interface VideoDecoderSupport {
   /** Whether the configuration is supported */
   supported: boolean
-  /** The configuration that was checked (codec only for simplicity) */
-  codec: string
+  /** The configuration that was checked */
+  config: VideoDecoderConfig
 }
 
 /** Video encoder configuration (WebCodecs spec) */
@@ -847,16 +923,8 @@ export interface VideoEncoderSupport {
   config: VideoEncoderConfig
 }
 
-/** Options for copyTo operation */
-export interface VideoFrameCopyToOptions {
-  /** Target pixel format (for format conversion) */
-  format?: VideoPixelFormat
-  /** Region to copy (not yet implemented) */
-  rect?: VideoFrameRect
-}
-
-/** Options for creating a VideoFrame */
-export interface VideoFrameInit {
+/** Options for creating a VideoFrame from buffer data (VideoFrameBufferInit per spec) */
+export interface VideoFrameBufferInit {
   /** Pixel format */
   format: VideoPixelFormat
   /** Coded width in pixels */
@@ -865,14 +933,43 @@ export interface VideoFrameInit {
   codedHeight: number
   /** Timestamp in microseconds */
   timestamp: number
-  /** Duration in microseconds (optional) */
+  /**
+   * Duration in microseconds (optional)
+   * Note: W3C spec uses unsigned long long, but JS number can represent up to 2^53 safely
+   */
   duration?: number
   /** Display width (defaults to coded_width) */
   displayWidth?: number
   /** Display height (defaults to coded_height) */
   displayHeight?: number
-  /** Color space parameters */
-  colorSpace?: VideoColorSpace
+  /** Color space parameters (uses init object) */
+  colorSpace?: VideoColorSpaceInit
+}
+
+/** Options for copyTo operation */
+export interface VideoFrameCopyToOptions {
+  /** Target pixel format (for format conversion) */
+  format?: VideoPixelFormat
+  /** Region to copy (not yet implemented) */
+  rect?: DOMRectInit
+  /** Layout for output planes */
+  layout?: Array<PlaneLayout>
+}
+
+/** Options for creating a VideoFrame from an image source (VideoFrameInit per spec) */
+export interface VideoFrameInit {
+  /** Timestamp in microseconds (required per spec when creating from VideoFrame) */
+  timestamp?: number
+  /** Duration in microseconds (optional) */
+  duration?: number
+  /** Alpha handling: "keep" (default) or "discard" */
+  alpha?: string
+  /** Visible rect (optional) */
+  visibleRect?: DOMRectInit
+  /** Display width (optional) */
+  displayWidth?: number
+  /** Display height (optional) */
+  displayHeight?: number
 }
 
 /** Rectangle for specifying a region */
@@ -884,26 +981,26 @@ export interface VideoFrameRect {
 }
 
 /** Video pixel format (WebCodecs spec) */
-export declare const enum VideoPixelFormat {
-  /** Planar YUV 4:2:0, 12bpp, (1 Cr & Cb sample per 2x2 Y samples) */
-  I420 = 'I420',
-  /** Planar YUV 4:2:0, 12bpp, with alpha plane */
-  I420A = 'I420A',
-  /** Planar YUV 4:2:2, 16bpp */
-  I422 = 'I422',
-  /** Planar YUV 4:4:4, 24bpp */
-  I444 = 'I444',
-  /** Semi-planar YUV 4:2:0, 12bpp (Y plane + interleaved UV) */
-  NV12 = 'NV12',
-  /** RGBA 32bpp */
-  RGBA = 'RGBA',
-  /** RGBX 32bpp (alpha ignored) */
-  RGBX = 'RGBX',
-  /** BGRA 32bpp */
-  BGRA = 'BGRA',
-  /** BGRX 32bpp (alpha ignored) */
-  BGRX = 'BGRX'
-}
+export type VideoPixelFormat = /** Planar YUV 4:2:0| 12bpp| (1 Cr & Cb sample per 2x2 Y samples) */
+'I420'|
+/** Planar YUV 4:2:0| 12bpp| with alpha plane */
+'I420A'|
+/** Planar YUV 4:2:2| 16bpp */
+'I422'|
+/** Planar YUV 4:4:4| 24bpp */
+'I444'|
+/** Semi-planar YUV 4:2:0| 12bpp (Y plane + interleaved UV) */
+'NV12'|
+/** Semi-planar YUV 4:2:0| 12bpp (Y plane + interleaved VU) - per W3C WebCodecs spec */
+'NV21'|
+/** RGBA 32bpp */
+'RGBA'|
+/** RGBX 32bpp (alpha ignored) */
+'RGBX'|
+/** BGRA 32bpp */
+'BGRA'|
+/** BGRX 32bpp (alpha ignored) */
+'BGRX';
 
 /** Encode configuration for VP9 */
 export interface Vp9EncoderConfig {

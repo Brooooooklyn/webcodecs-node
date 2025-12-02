@@ -17,7 +17,7 @@ use crate::ffi::{
     avcodec_find_encoder_by_name, avcodec_flush_buffers, avcodec_free_context, avcodec_open2,
     avcodec_receive_frame, avcodec_receive_packet, avcodec_send_frame, avcodec_send_packet,
   },
-  avutil::{av_opt_set_int, opt_flag},
+  avutil::{av_opt_set, av_opt_set_int, opt_flag},
   error::{AVERROR_EAGAIN, AVERROR_EOF},
   AVCodec, AVCodecContext, AVCodecID, AVHWDeviceType, AVPixelFormat,
 };
@@ -254,6 +254,14 @@ impl CodecContext {
       if let Some(level) = config.level {
         ffctx_set_level(ctx, level);
       }
+
+      // Suppress x265 verbose logging via x265-params
+      av_opt_set(
+        ctx as *mut std::ffi::c_void,
+        c"x265-params".as_ptr(),
+        c"log-level=error".as_ptr(),
+        opt_flag::SEARCH_CHILDREN,
+      );
     }
 
     Ok(())

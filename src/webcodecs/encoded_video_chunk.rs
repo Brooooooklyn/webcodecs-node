@@ -6,6 +6,7 @@
 use crate::codec::Packet;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use std::io::Write;
 use std::sync::{Arc, RwLock};
 
 /// Type of encoded video chunk
@@ -13,8 +14,10 @@ use std::sync::{Arc, RwLock};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncodedVideoChunkType {
   /// Keyframe - can be decoded independently
+  #[napi(value = "key")]
   Key,
   /// Delta frame - depends on previous frames
+  #[napi(value = "delta")]
   Delta,
 }
 
@@ -27,9 +30,10 @@ pub struct EncodedVideoChunkInit {
   /// Timestamp in microseconds
   pub timestamp: i64,
   /// Duration in microseconds (optional)
+  /// Note: W3C spec uses unsigned long long, but JS number can represent up to 2^53 safely
   pub duration: Option<i64>,
-  /// Encoded data
-  pub data: Buffer,
+  /// Encoded data (BufferSource per spec)
+  pub data: Uint8Array,
 }
 
 /// Internal state for EncodedVideoChunk
@@ -115,7 +119,7 @@ impl EncodedVideoChunk {
 
   /// Copy the encoded data to a Uint8Array
   #[napi]
-  pub fn copy_to(&self, destination: Uint8Array) -> Result<()> {
+  pub fn copy_to(&self, mut destination: Uint8Array) -> Result<()> {
     self.with_inner(|inner| {
       if destination.len() < inner.data.len() {
         return Err(Error::new(
@@ -128,21 +132,9 @@ impl EncodedVideoChunk {
         ));
       }
 
-      // Uint8Array is already mutable
-      let dest_slice = destination.as_ref();
-      // We need to use unsafe here to get mutable access
-      let dest_ptr = dest_slice.as_ptr() as *mut u8;
-      unsafe {
-        std::ptr::copy_nonoverlapping(inner.data.as_ptr(), dest_ptr, inner.data.len());
-      }
+      unsafe { destination.as_mut() }.write(&inner.data)?;
       Ok(())
     })
-  }
-
-  /// Get the raw data as a Buffer (extension, not in spec)
-  #[napi]
-  pub fn get_data(&self) -> Result<Buffer> {
-    self.with_inner(|inner| Ok(Buffer::from(inner.data.clone())))
   }
 
   // ========================================================================
@@ -179,47 +171,14 @@ impl EncodedVideoChunk {
     }
   }
 
-  /// Convert to serializable output for callbacks
-  pub fn to_output(&self) -> Result<EncodedVideoChunkOutput> {
-    self.with_inner(|inner| {
-      let data = inner.data.clone();
-      let byte_length = data.len() as u32;
-      Ok(EncodedVideoChunkOutput {
-        chunk_type: inner.chunk_type,
-        timestamp: inner.timestamp_us,
-        duration: inner.duration_us,
-        data: Buffer::from(data),
-        byte_length,
-      })
-    })
-  }
-}
-
-/// Serializable output for callbacks (used with ThreadsafeFunction)
-///
-/// NAPI-RS class instances can't be passed through ThreadsafeFunction,
-/// so we use this plain object struct for callback output.
-#[napi(object)]
-pub struct EncodedVideoChunkOutput {
-  /// Chunk type (key or delta)
-  #[napi(js_name = "type")]
-  pub chunk_type: EncodedVideoChunkType,
-  /// Timestamp in microseconds
-  pub timestamp: i64,
-  /// Duration in microseconds (optional)
-  pub duration: Option<i64>,
-  /// Encoded data
-  pub data: Buffer,
-  /// Byte length of the encoded data
-  pub byte_length: u32,
 }
 
 /// Decode configuration for AVC (H.264)
 #[allow(dead_code)]
 #[napi(object)]
 pub struct AvcDecoderConfig {
-  /// AVC configuration record (avcC box content)
-  pub avc_c: Option<Buffer>,
+  /// AVC configuration record (avcC box content) - Uint8Array per W3C spec (BufferSource)
+  pub avc_c: Option<Uint8Array>,
 }
 
 /// Encode configuration for AVC (H.264)
@@ -340,12 +299,12 @@ pub struct VideoDecoderConfig {
   pub display_aspect_width: Option<u32>,
   /// Display aspect height
   pub display_aspect_height: Option<u32>,
-  /// Color space parameters
-  pub color_space: Option<crate::webcodecs::video_frame::VideoColorSpace>,
+  /// Color space parameters (uses init object for compatibility)
+  pub color_space: Option<crate::webcodecs::video_frame::VideoColorSpaceInit>,
   /// Hardware acceleration preference
   pub hardware_acceleration: Option<String>,
   /// Optimization preference: "prefer-accuracy" or "prefer-speed"
   pub optimize_for_latency: Option<bool>,
-  /// Codec-specific description data (e.g., avcC for H.264)
-  pub description: Option<Buffer>,
+  /// Codec-specific description data (e.g., avcC for H.264) - BufferSource per spec
+  pub description: Option<Uint8Array>,
 }

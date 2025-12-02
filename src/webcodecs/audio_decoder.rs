@@ -25,7 +25,34 @@ type ErrorCallback = ThreadsafeFunction<String>;
 
 /// Type alias for dequeue callback (no arguments)
 /// Using CalleeHandled: false for direct callbacks
-type DequeueCallback = ThreadsafeFunction<(), UnknownReturnValue, (), Status, false>;
+pub type DequeueCallback = ThreadsafeFunction<(), UnknownReturnValue, (), Status, false>;
+
+/// AudioDecoder init dictionary per WebCodecs spec
+pub struct AudioDecoderInit {
+  /// Output callback - called when decoded audio is available
+  pub output: OutputCallback,
+  /// Error callback - called when an error occurs
+  pub error: ErrorCallback,
+}
+
+impl FromNapiValue for AudioDecoderInit {
+  unsafe fn from_napi_value(
+    env: napi::sys::napi_env,
+    value: napi::sys::napi_value,
+  ) -> Result<Self> {
+    let obj = Object::from_napi_value(env, value)?;
+
+    let output: OutputCallback = obj
+      .get_named_property("output")
+      .map_err(|_| Error::new(Status::InvalidArg, "Missing required 'output' callback"))?;
+
+    let error: ErrorCallback = obj
+      .get_named_property("error")
+      .map_err(|_| Error::new(Status::InvalidArg, "Missing required 'error' callback"))?;
+
+    Ok(AudioDecoderInit { output, error })
+  }
+}
 
 /// Internal decoder state
 struct AudioDecoderInner {
@@ -48,14 +75,14 @@ struct AudioDecoderInner {
 ///
 /// Decodes EncodedAudioChunk objects into AudioData objects using FFmpeg.
 ///
-/// Per the WebCodecs spec, the constructor requires callbacks for output and error handling.
+/// Per the WebCodecs spec, the constructor takes an init dictionary with callbacks.
 ///
 /// Example:
 /// ```javascript
-/// const decoder = new AudioDecoder(
-///   (data) => { console.log('decoded audio', data); },
-///   (e) => { console.error('error', e); }
-/// );
+/// const decoder = new AudioDecoder({
+///   output: (data) => { console.log('decoded audio', data); },
+///   error: (e) => { console.error('error', e); }
+/// });
 ///
 /// decoder.configure({
 ///   codec: 'opus',
@@ -73,14 +100,13 @@ pub struct AudioDecoder {
 
 #[napi]
 impl AudioDecoder {
-  /// Create a new AudioDecoder with required callbacks (per WebCodecs spec)
+  /// Create a new AudioDecoder with init dictionary (per WebCodecs spec)
   ///
-  /// @param output - Callback invoked when decoded audio is available
-  /// @param error - Callback invoked when an error occurs
+  /// @param init - Init dictionary containing output and error callbacks
   #[napi(constructor)]
   pub fn new(
-    #[napi(ts_arg_type = "(data: AudioData) => void")] output: OutputCallback,
-    #[napi(ts_arg_type = "(error: Error) => void")] error: ErrorCallback,
+    #[napi(ts_arg_type = "{ output: (data: AudioData) => void, error: (error: Error) => void }")]
+    init: AudioDecoderInit,
   ) -> Result<Self> {
     let inner = AudioDecoderInner {
       state: CodecState::Unconfigured,
@@ -89,8 +115,8 @@ impl AudioDecoder {
       codec_string: String::new(),
       frame_count: 0,
       decode_queue_size: 0,
-      output_callback: output,
-      error_callback: error,
+      output_callback: init.output,
+      error_callback: init.error,
       dequeue_callback: None,
     };
 
@@ -186,8 +212,8 @@ impl AudioDecoder {
     // Configure decoder
     let decoder_config = InternalAudioDecoderConfig {
       codec_id,
-      sample_rate: config.sample_rate.unwrap_or(0),
-      channels: config.number_of_channels.unwrap_or(0),
+      sample_rate: config.sample_rate,
+      channels: config.number_of_channels,
       thread_count: 0, // Auto
       extradata: config.description.as_ref().map(|d| d.to_vec()),
     };
@@ -473,22 +499,13 @@ fn decode_audio_chunk_data(
   packet.set_pts(timestamp);
   packet.set_dts(timestamp);
 
-  // Allocate packet data
-  unsafe {
-    use crate::ffi::avcodec::av_new_packet;
-
-    let ret = av_new_packet(packet.as_mut_ptr(), data.len() as i32);
-    if ret < 0 {
-      return Err(Error::new(
-        Status::GenericFailure,
-        format!("Failed to allocate packet data: {}", ret),
-      ));
-    }
-
-    // Copy data to packet
-    let pkt_data = packet.data() as *mut u8;
-    std::ptr::copy_nonoverlapping(data.as_ptr(), pkt_data, data.len());
-  }
+  // Allocate and copy data to packet using safe wrapper
+  packet.copy_data_from(data).map_err(|e| {
+    Error::new(
+      Status::GenericFailure,
+      format!("Failed to copy packet data: {}", e),
+    )
+  })?;
 
   // Decode
   let frames = context

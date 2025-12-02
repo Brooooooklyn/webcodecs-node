@@ -7,28 +7,22 @@
 
 import test from 'ava'
 
-import {
-  AudioEncoder,
-  EncodedAudioChunk,
-  AudioSampleFormat,
-  CodecState,
-  EncodedAudioChunkType,
-} from '../index.js'
-import { generateSineTone, generateSilence, type EncodedAudioChunkOutput } from './helpers/index.js'
+import { AudioEncoder } from '../index.js'
+import { generateSineTone, generateSilence, type EncodedAudioChunk } from './helpers/index.js'
 
 // Helper to create encoder with callbacks that collect output
 function createTestEncoder() {
-  const chunks: EncodedAudioChunkOutput[] = []
+  const chunks: EncodedAudioChunk[] = []
   const errors: Error[] = []
 
-  const encoder = new AudioEncoder(
-    (chunk, _metadata) => {
+  const encoder = new AudioEncoder({
+    output: (chunk, _metadata) => {
       chunks.push(chunk)
     },
-    (e) => {
+    error: (e) => {
       errors.push(e)
     },
-  )
+  })
 
   return { encoder, chunks, errors }
 }
@@ -40,17 +34,17 @@ function createTestEncoder() {
 test('AudioEncoder: constructor creates unconfigured encoder', (t) => {
   const { encoder } = createTestEncoder()
 
-  t.is(encoder.state, CodecState.Unconfigured)
+  t.is(encoder.state, 'unconfigured')
   t.is(encoder.encodeQueueSize, 0)
 
   encoder.close()
 })
 
-test('AudioEncoder: constructor requires callbacks', (t) => {
-  // @ts-expect-error - Testing that missing callbacks throws
+test('AudioEncoder: constructor requires init dictionary', (t) => {
+  // @ts-expect-error - Testing that missing init throws
   t.throws(() => new AudioEncoder())
   // @ts-expect-error - Testing that missing error callback throws
-  t.throws(() => new AudioEncoder(() => {}))
+  t.throws(() => new AudioEncoder({ output: () => {} }))
 })
 
 // ============================================================================
@@ -67,7 +61,7 @@ test('AudioEncoder: configure() with AAC codec', (t) => {
     bitrate: 128000,
   })
 
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
 
   encoder.close()
 })
@@ -82,7 +76,7 @@ test('AudioEncoder: configure() with Opus codec', (t) => {
     bitrate: 64000,
   })
 
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
 
   encoder.close()
 })
@@ -97,7 +91,7 @@ test('AudioEncoder: configure() with MP3 codec', (t) => {
     bitrate: 192000,
   })
 
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
 
   encoder.close()
 })
@@ -111,7 +105,7 @@ test('AudioEncoder: configure() with FLAC codec', (t) => {
     numberOfChannels: 2,
   })
 
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
 
   encoder.close()
 })
@@ -126,7 +120,7 @@ test('AudioEncoder: configure() with mono audio', (t) => {
     bitrate: 32000,
   })
 
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
 
   encoder.close()
 })
@@ -141,7 +135,7 @@ test('AudioEncoder: configure() with invalid codec triggers error callback', (t)
   })
 
   // Error callback transitions to closed
-  t.is(encoder.state, CodecState.Closed)
+  t.is(encoder.state, 'closed')
 
   encoder.close()
 })
@@ -161,7 +155,7 @@ test('AudioEncoder: encode() single frame', async (t) => {
   })
 
   // Generate 20ms of audio (960 samples at 48kHz)
-  const audio = generateSineTone(440, 960, 2, 48000, AudioSampleFormat.F32, 0)
+  const audio = generateSineTone(440, 960, 2, 48000, 'f32', 0)
 
   encoder.encode(audio)
   audio.close()
@@ -173,7 +167,7 @@ test('AudioEncoder: encode() single frame', async (t) => {
   t.true(chunks.length >= 0, 'Encoder should produce chunks or buffer them')
 
   for (const chunk of chunks) {
-    t.is(chunk.type, EncodedAudioChunkType.Key)
+    t.is(chunk.type, 'key')
     t.true(chunk.byteLength > 0)
   }
 
@@ -193,7 +187,7 @@ test('AudioEncoder: encode() multiple frames', async (t) => {
   // Encode 10 frames of 20ms each
   for (let i = 0; i < 10; i++) {
     const timestamp = i * 20000 // 20ms per frame in microseconds
-    const audio = generateSineTone(440, 960, 2, 48000, AudioSampleFormat.F32, timestamp)
+    const audio = generateSineTone(440, 960, 2, 48000, 'f32', timestamp)
     encoder.encode(audio)
     audio.close()
   }
@@ -216,13 +210,13 @@ test('AudioEncoder: encode() with AAC', async (t) => {
   })
 
   // AAC typically needs 1024 samples per frame
-  const audio = generateSineTone(440, 1024, 2, 48000, AudioSampleFormat.F32, 0)
+  const audio = generateSineTone(440, 1024, 2, 48000, 'f32', 0)
   encoder.encode(audio)
   audio.close()
 
   // Need to encode more frames to get output (AAC buffers)
   for (let i = 1; i < 5; i++) {
-    const frame = generateSineTone(440, 1024, 2, 48000, AudioSampleFormat.F32, i * 21333)
+    const frame = generateSineTone(440, 1024, 2, 48000, 'f32', i * 21333)
     encoder.encode(frame)
     frame.close()
   }
@@ -242,12 +236,12 @@ test('AudioEncoder: encode() with AAC', async (t) => {
 test('AudioEncoder: encode() on unconfigured triggers error callback', (t) => {
   const { encoder } = createTestEncoder()
 
-  const audio = generateSilence(960, 2, 48000, AudioSampleFormat.F32, 0)
+  const audio = generateSilence(960, 2, 48000, 'f32', 0)
 
   // encode() on unconfigured encoder should trigger error callback
   encoder.encode(audio)
 
-  t.is(encoder.state, CodecState.Closed, 'Encoder should be closed after error')
+  t.is(encoder.state, 'closed', 'Encoder should be closed after error')
 
   audio.close()
   encoder.close()
@@ -264,7 +258,7 @@ test('AudioEncoder: encode() on closed triggers error callback', (t) => {
 
   encoder.close()
 
-  const audio = generateSilence(960, 2, 48000, AudioSampleFormat.F32, 0)
+  const audio = generateSilence(960, 2, 48000, 'f32', 0)
 
   // encode() on closed encoder should trigger error callback
   encoder.encode(audio)
@@ -284,11 +278,11 @@ test('AudioEncoder: reset() returns to unconfigured state', (t) => {
     numberOfChannels: 2,
   })
 
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
 
   encoder.reset()
 
-  t.is(encoder.state, CodecState.Unconfigured)
+  t.is(encoder.state, 'unconfigured')
 
   encoder.close()
 })
@@ -312,7 +306,7 @@ test('AudioEncoder: can reconfigure after reset', (t) => {
     bitrate: 192000,
   })
 
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
 
   encoder.close()
 })
@@ -344,7 +338,7 @@ test('AudioEncoder: flush() returns a Promise', async (t) => {
     bitrate: 64000,
   })
 
-  const audio = generateSineTone(440, 960, 2, 48000, AudioSampleFormat.F32, 0)
+  const audio = generateSineTone(440, 960, 2, 48000, 'f32', 0)
   encoder.encode(audio)
   audio.close()
 
@@ -405,13 +399,13 @@ test('AudioEncoder: encode with 44.1kHz sample rate', async (t) => {
   })
 
   // Generate audio at 44.1kHz
-  const audio = generateSineTone(440, 1152, 2, 44100, AudioSampleFormat.F32, 0) // MP3 frame size
+  const audio = generateSineTone(440, 1152, 2, 44100, 'f32', 0) // MP3 frame size
   encoder.encode(audio)
   audio.close()
 
   // Encode more to get output
   for (let i = 1; i < 10; i++) {
-    const frame = generateSineTone(440, 1152, 2, 44100, AudioSampleFormat.F32, i * 26122) // ~1152/44100 seconds
+    const frame = generateSineTone(440, 1152, 2, 44100, 'f32', i * 26122) // ~1152/44100 seconds
     encoder.encode(frame)
     frame.close()
   }
@@ -441,7 +435,7 @@ test('AudioEncoder: ondequeue fires when queue decreases', async (t) => {
     bitrate: 64000,
   })
 
-  const audio = generateSineTone(440, 960, 2, 48000, AudioSampleFormat.F32, 0)
+  const audio = generateSineTone(440, 960, 2, 48000, 'f32', 0)
   encoder.encode(audio)
   audio.close()
 

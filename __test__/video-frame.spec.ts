@@ -6,7 +6,7 @@
 
 import test from 'ava'
 
-import { VideoFrame, VideoPixelFormat } from '../index.js'
+import { VideoFrame } from '../index.js'
 import {
   generateSolidColorI420Frame,
   generateSolidColorRGBAFrame,
@@ -28,7 +28,7 @@ test('VideoFrame: constructor with I420 data', (t) => {
 
   const frame = generateSolidColorI420Frame(width, height, TestColors.red, timestamp)
 
-  t.is(frame.format, VideoPixelFormat.I420)
+  t.is(frame.format, 'I420')
   t.is(frame.codedWidth, width)
   t.is(frame.codedHeight, height)
   t.is(frame.displayWidth, width)
@@ -45,7 +45,7 @@ test('VideoFrame: constructor with RGBA data', (t) => {
 
   const frame = generateSolidColorRGBAFrame(width, height, TestColors.blue, timestamp)
 
-  t.is(frame.format, VideoPixelFormat.RGBA)
+  t.is(frame.format, 'RGBA')
   t.is(frame.codedWidth, width)
   t.is(frame.codedHeight, height)
   t.is(frame.timestamp, timestamp)
@@ -74,10 +74,10 @@ test('VideoFrame: constructor with displayWidth/displayHeight', (t) => {
   const displayHeight = 480
 
   const size = calculateI420Size(width, height)
-  const buffer = Buffer.alloc(size)
+  const buffer = new Uint8Array(size)
 
   const frame = new VideoFrame(buffer, {
-    format: VideoPixelFormat.I420,
+    format: 'I420',
     codedWidth: width,
     codedHeight: height,
     timestamp: 0,
@@ -99,11 +99,11 @@ test('VideoFrame: constructor with displayWidth/displayHeight', (t) => {
 
 test('VideoFrame: format property returns correct pixel format', (t) => {
   const i420Frame = generateSolidColorI420Frame(128, 96, TestColors.white, 0)
-  t.is(i420Frame.format, VideoPixelFormat.I420)
+  t.is(i420Frame.format, 'I420')
   i420Frame.close()
 
   const rgbaFrame = generateSolidColorRGBAFrame(128, 96, TestColors.white, 0)
-  t.is(rgbaFrame.format, VideoPixelFormat.RGBA)
+  t.is(rgbaFrame.format, 'RGBA')
   rgbaFrame.close()
 })
 
@@ -183,7 +183,7 @@ test('VideoFrame: allocationSize() returns correct size for RGBA', (t) => {
   }
 })
 
-test('VideoFrame: copyTo() extracts frame data', (t) => {
+test('VideoFrame: copyTo() extracts frame data', async (t) => {
   const width = 128
   const height = 96
   const frame = generateSolidColorI420Frame(width, height, TestColors.green, 0)
@@ -191,7 +191,7 @@ test('VideoFrame: copyTo() extracts frame data', (t) => {
   const size = frame.allocationSize()
   const buffer = new Uint8Array(size)
 
-  frame.copyTo(buffer)
+  await frame.copyTo(buffer)
 
   // Buffer should be filled (not all zeros for a colored frame)
   let hasNonZero = false
@@ -206,13 +206,13 @@ test('VideoFrame: copyTo() extracts frame data', (t) => {
   frame.close()
 })
 
-test('VideoFrame: copyTo() preserves data round-trip', (t) => {
+test('VideoFrame: copyTo() preserves data round-trip', async (t) => {
   const width = 128
   const height = 96
 
   // Create source data
   const sourceSize = calculateI420Size(width, height)
-  const sourceData = Buffer.alloc(sourceSize)
+  const sourceData = new Uint8Array(sourceSize)
 
   // Fill with a pattern
   for (let i = 0; i < sourceSize; i++) {
@@ -220,7 +220,7 @@ test('VideoFrame: copyTo() preserves data round-trip', (t) => {
   }
 
   const frame = new VideoFrame(sourceData, {
-    format: VideoPixelFormat.I420,
+    format: 'I420',
     codedWidth: width,
     codedHeight: height,
     timestamp: 0,
@@ -228,7 +228,7 @@ test('VideoFrame: copyTo() preserves data round-trip', (t) => {
 
   // Extract and compare
   const extractedData = new Uint8Array(sourceSize)
-  frame.copyTo(extractedData)
+  await frame.copyTo(extractedData)
 
   for (let i = 0; i < sourceSize; i++) {
     t.is(extractedData[i], sourceData[i], `Data mismatch at index ${i}`)
@@ -237,7 +237,7 @@ test('VideoFrame: copyTo() preserves data round-trip', (t) => {
   frame.close()
 })
 
-test('VideoFrame: clone() creates independent copy', (t) => {
+test('VideoFrame: clone() creates independent copy', async (t) => {
   const frame = generateSolidColorI420Frame(128, 96, TestColors.yellow, 12345, 33333)
 
   const cloned = frame.clone()
@@ -258,7 +258,7 @@ test('VideoFrame: clone() creates independent copy', (t) => {
 
   const size = cloned.allocationSize()
   const buffer = new Uint8Array(size)
-  t.notThrows(() => cloned.copyTo(buffer))
+  await t.notThrowsAsync(async () => cloned.copyTo(buffer))
 
   cloned.close()
 })
@@ -281,10 +281,10 @@ test('VideoFrame: minimum dimensions (2x2 for I420)', (t) => {
   const width = 2
   const height = 2
   const size = calculateI420Size(width, height) // 6 bytes
-  const buffer = Buffer.alloc(size)
+  const buffer = new Uint8Array(size)
 
   const frame = new VideoFrame(buffer, {
-    format: VideoPixelFormat.I420,
+    format: 'I420',
     codedWidth: width,
     codedHeight: height,
     timestamp: 0,
@@ -310,12 +310,12 @@ test('VideoFrame: large timestamp values', (t) => {
   frame.close()
 })
 
-test('VideoFrame: gradient pattern creates varied data', (t) => {
+test('VideoFrame: gradient pattern creates varied data', async (t) => {
   const frame = generateGradientI420Frame(320, 240, 0)
 
   const size = frame.allocationSize()
   const buffer = new Uint8Array(size)
-  frame.copyTo(buffer)
+  await frame.copyTo(buffer)
 
   // Check that Y values vary (gradient)
   const uniqueValues = new Set<number>()

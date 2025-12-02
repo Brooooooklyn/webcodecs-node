@@ -23,6 +23,8 @@ pub enum VideoPixelFormat {
   I444,
   /// Semi-planar YUV 4:2:0, 12bpp (Y plane + interleaved UV)
   NV12,
+  /// Semi-planar YUV 4:2:0, 12bpp (Y plane + interleaved VU) - per W3C WebCodecs spec
+  NV21,
   /// RGBA 32bpp
   RGBA,
   /// RGBX 32bpp (alpha ignored)
@@ -42,6 +44,7 @@ impl VideoPixelFormat {
       AVPixelFormat::Yuv422p => Some(VideoPixelFormat::I422),
       AVPixelFormat::Yuv444p => Some(VideoPixelFormat::I444),
       AVPixelFormat::Nv12 => Some(VideoPixelFormat::NV12),
+      AVPixelFormat::Nv21 => Some(VideoPixelFormat::NV21),
       AVPixelFormat::Rgba => Some(VideoPixelFormat::RGBA),
       AVPixelFormat::Bgra => Some(VideoPixelFormat::BGRA),
       _ => None,
@@ -56,6 +59,7 @@ impl VideoPixelFormat {
       VideoPixelFormat::I422 => AVPixelFormat::Yuv422p,
       VideoPixelFormat::I444 => AVPixelFormat::Yuv444p,
       VideoPixelFormat::NV12 => AVPixelFormat::Nv12,
+      VideoPixelFormat::NV21 => AVPixelFormat::Nv21,
       VideoPixelFormat::RGBA => AVPixelFormat::Rgba,
       VideoPixelFormat::RGBX => AVPixelFormat::Rgba, // Treat as RGBA
       VideoPixelFormat::BGRA => AVPixelFormat::Bgra,
@@ -68,7 +72,7 @@ impl VideoPixelFormat {
     match self {
       VideoPixelFormat::I420 | VideoPixelFormat::I420A => 1,
       VideoPixelFormat::I422 | VideoPixelFormat::I444 => 1,
-      VideoPixelFormat::NV12 => 1,
+      VideoPixelFormat::NV12 | VideoPixelFormat::NV21 => 1,
       VideoPixelFormat::RGBA
       | VideoPixelFormat::RGBX
       | VideoPixelFormat::BGRA
@@ -77,10 +81,10 @@ impl VideoPixelFormat {
   }
 }
 
-/// Video color space parameters (WebCodecs spec)
+/// VideoColorSpaceInit for constructing VideoColorSpace
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
-pub struct VideoColorSpace {
+pub struct VideoColorSpaceInit {
   /// Color primaries (e.g., "bt709", "bt2020")
   pub primaries: Option<String>,
   /// Transfer function (e.g., "bt709", "srgb", "pq", "hlg")
@@ -91,10 +95,167 @@ pub struct VideoColorSpace {
   pub full_range: Option<bool>,
 }
 
-/// Options for creating a VideoFrame
+/// Video color space parameters (WebCodecs spec) - as a class per spec
+#[napi]
+#[derive(Debug, Clone, Default)]
+pub struct VideoColorSpace {
+  primaries: Option<String>,
+  transfer: Option<String>,
+  matrix: Option<String>,
+  full_range: Option<bool>,
+}
+
+#[napi]
+impl VideoColorSpace {
+  /// Create a new VideoColorSpace
+  #[napi(constructor)]
+  pub fn new(init: Option<VideoColorSpaceInit>) -> Self {
+    match init {
+      Some(init) => VideoColorSpace {
+        primaries: init.primaries,
+        transfer: init.transfer,
+        matrix: init.matrix,
+        full_range: init.full_range,
+      },
+      None => VideoColorSpace::default(),
+    }
+  }
+
+  /// Get color primaries
+  #[napi(getter)]
+  pub fn primaries(&self) -> Option<String> {
+    self.primaries.clone()
+  }
+
+  /// Get transfer characteristics
+  #[napi(getter)]
+  pub fn transfer(&self) -> Option<String> {
+    self.transfer.clone()
+  }
+
+  /// Get matrix coefficients
+  #[napi(getter)]
+  pub fn matrix(&self) -> Option<String> {
+    self.matrix.clone()
+  }
+
+  /// Get full range flag
+  #[napi(getter)]
+  pub fn full_range(&self) -> Option<bool> {
+    self.full_range
+  }
+
+  /// Convert to JSON-compatible object
+  #[napi]
+  pub fn to_json(&self) -> VideoColorSpaceInit {
+    VideoColorSpaceInit {
+      primaries: self.primaries.clone(),
+      transfer: self.transfer.clone(),
+      matrix: self.matrix.clone(),
+      full_range: self.full_range,
+    }
+  }
+
+  /// Clone this VideoColorSpace (W3C WebCodecs spec)
+  #[napi(js_name = "clone")]
+  pub fn clone_color_space(&self) -> VideoColorSpace {
+    VideoColorSpace {
+      primaries: self.primaries.clone(),
+      transfer: self.transfer.clone(),
+      matrix: self.matrix.clone(),
+      full_range: self.full_range,
+    }
+  }
+}
+
+/// DOMRectReadOnly - W3C WebCodecs spec compliant rect class
+/// Used for codedRect and visibleRect properties
+#[napi]
+#[derive(Debug, Clone)]
+pub struct DOMRectReadOnly {
+  x: f64,
+  y: f64,
+  width: f64,
+  height: f64,
+}
+
+#[napi]
+impl DOMRectReadOnly {
+  /// Create a new DOMRectReadOnly
+  #[napi(constructor)]
+  pub fn new(x: Option<f64>, y: Option<f64>, width: Option<f64>, height: Option<f64>) -> Self {
+    DOMRectReadOnly {
+      x: x.unwrap_or(0.0),
+      y: y.unwrap_or(0.0),
+      width: width.unwrap_or(0.0),
+      height: height.unwrap_or(0.0),
+    }
+  }
+
+  /// X coordinate
+  #[napi(getter)]
+  pub fn x(&self) -> f64 {
+    self.x
+  }
+
+  /// Y coordinate
+  #[napi(getter)]
+  pub fn y(&self) -> f64 {
+    self.y
+  }
+
+  /// Width
+  #[napi(getter)]
+  pub fn width(&self) -> f64 {
+    self.width
+  }
+
+  /// Height
+  #[napi(getter)]
+  pub fn height(&self) -> f64 {
+    self.height
+  }
+
+  /// Top edge (same as y)
+  #[napi(getter)]
+  pub fn top(&self) -> f64 {
+    self.y
+  }
+
+  /// Right edge (x + width)
+  #[napi(getter)]
+  pub fn right(&self) -> f64 {
+    self.x + self.width
+  }
+
+  /// Bottom edge (y + height)
+  #[napi(getter)]
+  pub fn bottom(&self) -> f64 {
+    self.y + self.height
+  }
+
+  /// Left edge (same as x)
+  #[napi(getter)]
+  pub fn left(&self) -> f64 {
+    self.x
+  }
+
+  /// Convert to JSON
+  #[napi]
+  pub fn to_json(&self) -> DOMRectInit {
+    DOMRectInit {
+      x: Some(self.x),
+      y: Some(self.y),
+      width: Some(self.width),
+      height: Some(self.height),
+    }
+  }
+}
+
+/// Options for creating a VideoFrame from buffer data (VideoFrameBufferInit per spec)
 #[napi(object)]
 #[derive(Debug, Clone)]
-pub struct VideoFrameInit {
+pub struct VideoFrameBufferInit {
   /// Pixel format
   pub format: VideoPixelFormat,
   /// Coded width in pixels
@@ -104,13 +265,32 @@ pub struct VideoFrameInit {
   /// Timestamp in microseconds
   pub timestamp: i64,
   /// Duration in microseconds (optional)
+  /// Note: W3C spec uses unsigned long long, but JS number can represent up to 2^53 safely
   pub duration: Option<i64>,
   /// Display width (defaults to coded_width)
   pub display_width: Option<u32>,
   /// Display height (defaults to coded_height)
   pub display_height: Option<u32>,
-  /// Color space parameters
-  pub color_space: Option<VideoColorSpace>,
+  /// Color space parameters (uses init object)
+  pub color_space: Option<VideoColorSpaceInit>,
+}
+
+/// Options for creating a VideoFrame from an image source (VideoFrameInit per spec)
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct VideoFrameInit {
+  /// Timestamp in microseconds (required per spec when creating from VideoFrame)
+  pub timestamp: Option<i64>,
+  /// Duration in microseconds (optional)
+  pub duration: Option<i64>,
+  /// Alpha handling: "keep" (default) or "discard"
+  pub alpha: Option<String>,
+  /// Visible rect (optional)
+  pub visible_rect: Option<DOMRectInit>,
+  /// Display width (optional)
+  pub display_width: Option<u32>,
+  /// Display height (optional)
+  pub display_height: Option<u32>,
 }
 
 /// Options for copyTo operation
@@ -120,7 +300,29 @@ pub struct VideoFrameCopyToOptions {
   /// Target pixel format (for format conversion)
   pub format: Option<VideoPixelFormat>,
   /// Region to copy (not yet implemented)
-  pub rect: Option<VideoFrameRect>,
+  pub rect: Option<DOMRectInit>,
+  /// Layout for output planes
+  pub layout: Option<Vec<PlaneLayout>>,
+}
+
+/// DOMRectInit for specifying regions
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct DOMRectInit {
+  pub x: Option<f64>,
+  pub y: Option<f64>,
+  pub width: Option<f64>,
+  pub height: Option<f64>,
+}
+
+/// Layout information for a single plane per WebCodecs spec
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct PlaneLayout {
+  /// Byte offset from the start of the buffer to the start of the plane
+  pub offset: u32,
+  /// Number of bytes per row (stride)
+  pub stride: u32,
 }
 
 /// Rectangle for specifying a region
@@ -154,9 +356,12 @@ pub struct VideoFrame {
 
 #[napi]
 impl VideoFrame {
-  /// Create a new VideoFrame from raw data
+  /// Create a new VideoFrame from raw buffer data (BufferSource per spec)
+  ///
+  /// This is the VideoFrameBufferInit constructor form.
+  /// Use `fromVideoFrame()` to create from another VideoFrame.
   #[napi(constructor)]
-  pub fn new(data: Buffer, init: VideoFrameInit) -> Result<Self> {
+  pub fn new(data: Uint8Array, init: VideoFrameBufferInit) -> Result<Self> {
     let format = init.format.to_av_format();
     let width = init.coded_width;
     let height = init.coded_height;
@@ -182,18 +387,73 @@ impl VideoFrame {
     let display_width = init.display_width.unwrap_or(width);
     let display_height = init.display_height.unwrap_or(height);
 
+    let color_space = VideoColorSpace::new(init.color_space);
+
     let inner = VideoFrameInner {
       frame,
       timestamp_us: init.timestamp,
       duration_us: init.duration,
       display_width,
       display_height,
-      color_space: init.color_space.unwrap_or_default(),
+      color_space,
       closed: false,
     };
 
     Ok(Self {
       inner: Arc::new(Mutex::new(Some(inner))),
+    })
+  }
+
+  /// Create a new VideoFrame from another VideoFrame (image source constructor per spec)
+  ///
+  /// This clones the source VideoFrame and applies any overrides from init.
+  /// Per W3C spec, this is equivalent to `new VideoFrame(videoFrame, init)`.
+  #[napi(factory)]
+  pub fn from_video_frame(source: &VideoFrame, init: Option<VideoFrameInit>) -> Result<Self> {
+    source.with_inner(|source_inner| {
+      // Clone the underlying frame data
+      let cloned_frame = source_inner
+        .frame
+        .try_clone()
+        .map_err(|e| Error::new(Status::GenericFailure, format!("Clone failed: {}", e)))?;
+
+      let init = init.unwrap_or_else(|| VideoFrameInit {
+        timestamp: None,
+        duration: None,
+        alpha: None,
+        visible_rect: None,
+        display_width: None,
+        display_height: None,
+      });
+
+      // Apply overrides from init
+      let timestamp_us = init.timestamp.unwrap_or(source_inner.timestamp_us);
+      let duration_us = init.duration.or(source_inner.duration_us);
+      let display_width = init.display_width.unwrap_or(source_inner.display_width);
+      let display_height = init.display_height.unwrap_or(source_inner.display_height);
+
+      // Note: alpha handling and visible_rect cropping are not yet implemented
+      // visible_rect would require sub-region copying which is complex
+      if init.visible_rect.is_some() {
+        return Err(Error::new(
+          Status::GenericFailure,
+          "VideoFrame visibleRect parameter is not yet implemented",
+        ));
+      }
+
+      let new_inner = VideoFrameInner {
+        frame: cloned_frame,
+        timestamp_us,
+        duration_us,
+        display_width,
+        display_height,
+        color_space: source_inner.color_space.clone(),
+        closed: false,
+      };
+
+      Ok(VideoFrame {
+        inner: Arc::new(Mutex::new(Some(new_inner))),
+      })
     })
   }
 
@@ -256,29 +516,29 @@ impl VideoFrame {
   }
 
   /// Get the coded rect (the region containing valid pixel data)
-  /// For now, this is the full coded dimensions starting at (0, 0)
+  /// Returns DOMRectReadOnly per W3C WebCodecs spec
   #[napi(getter)]
-  pub fn coded_rect(&self) -> Result<VideoFrameRect> {
+  pub fn coded_rect(&self) -> Result<DOMRectReadOnly> {
     self.with_inner(|inner| {
-      Ok(VideoFrameRect {
-        x: 0,
-        y: 0,
-        width: inner.frame.width(),
-        height: inner.frame.height(),
+      Ok(DOMRectReadOnly {
+        x: 0.0,
+        y: 0.0,
+        width: inner.frame.width() as f64,
+        height: inner.frame.height() as f64,
       })
     })
   }
 
   /// Get the visible rect (the region of coded data that should be displayed)
-  /// For now, this is the same as coded_rect (no cropping support yet)
+  /// Returns DOMRectReadOnly per W3C WebCodecs spec
   #[napi(getter)]
-  pub fn visible_rect(&self) -> Result<VideoFrameRect> {
+  pub fn visible_rect(&self) -> Result<DOMRectReadOnly> {
     self.with_inner(|inner| {
-      Ok(VideoFrameRect {
-        x: 0,
-        y: 0,
-        width: inner.display_width,
-        height: inner.display_height,
+      Ok(DOMRectReadOnly {
+        x: 0.0,
+        y: 0.0,
+        width: inner.display_width as f64,
+        height: inner.display_height as f64,
       })
     })
   }
@@ -301,6 +561,17 @@ impl VideoFrame {
     self.with_inner(|inner| Ok(inner.color_space.clone()))
   }
 
+  /// Get whether this VideoFrame has been closed (W3C WebCodecs spec)
+  #[napi(getter)]
+  pub fn closed(&self) -> Result<bool> {
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    Ok(guard.is_none() || guard.as_ref().map_or(true, |i| i.closed))
+  }
+
   /// Calculate the allocation size needed for copyTo
   #[napi]
   pub fn allocation_size(&self, options: Option<VideoFrameCopyToOptions>) -> Result<u32> {
@@ -318,13 +589,14 @@ impl VideoFrame {
 
   /// Copy frame data to a Uint8Array
   ///
+  /// Returns a Promise that resolves with an array of PlaneLayout objects.
   /// Options can specify target format. The rect parameter is not yet implemented.
   #[napi]
-  pub fn copy_to(
+  pub async fn copy_to(
     &self,
-    destination: Uint8Array,
+    mut destination: Uint8Array,
     options: Option<VideoFrameCopyToOptions>,
-  ) -> Result<()> {
+  ) -> Result<Vec<PlaneLayout>> {
     self.with_inner_mut(|inner| {
       // Throw error if rect is specified since it's not implemented
       if options.as_ref().and_then(|o| o.rect.as_ref()).is_some() {
@@ -334,11 +606,12 @@ impl VideoFrame {
         ));
       }
 
-      let size = Self::calculate_buffer_size(
-        VideoPixelFormat::from_av_format(inner.frame.format()).unwrap_or(VideoPixelFormat::I420),
-        inner.frame.width(),
-        inner.frame.height(),
-      ) as usize;
+      let format =
+        VideoPixelFormat::from_av_format(inner.frame.format()).unwrap_or(VideoPixelFormat::I420);
+      let width = inner.frame.width();
+      let height = inner.frame.height();
+
+      let size = Self::calculate_buffer_size(format, width, height) as usize;
 
       if destination.len() < size {
         return Err(Error::new(
@@ -351,18 +624,124 @@ impl VideoFrame {
         ));
       }
 
-      // Get mutable access to the destination buffer
-      let dest_slice = destination.as_ref();
-      let dest_ptr = dest_slice.as_ptr() as *mut u8;
-      let dest_buffer = unsafe { std::slice::from_raw_parts_mut(dest_ptr, destination.len()) };
+      // Get mutable access to the destination buffer safely
+      let dest_buffer = unsafe { destination.as_mut() };
 
       inner
         .frame
         .copy_to_buffer(dest_buffer)
         .map_err(|e| Error::new(Status::GenericFailure, format!("Copy failed: {}", e)))?;
 
-      Ok(())
+      // Calculate and return plane layouts
+      let layouts = Self::get_plane_layouts(format, width, height);
+      Ok(layouts)
     })
+  }
+
+  /// Calculate plane layouts for a given format
+  fn get_plane_layouts(format: VideoPixelFormat, width: u32, height: u32) -> Vec<PlaneLayout> {
+    match format {
+      VideoPixelFormat::I420 => {
+        let y_size = width * height;
+        let uv_stride = width / 2;
+        let uv_size = uv_stride * (height / 2);
+        vec![
+          PlaneLayout {
+            offset: 0,
+            stride: width,
+          },
+          PlaneLayout {
+            offset: y_size,
+            stride: uv_stride,
+          },
+          PlaneLayout {
+            offset: y_size + uv_size,
+            stride: uv_stride,
+          },
+        ]
+      }
+      VideoPixelFormat::I420A => {
+        let y_size = width * height;
+        let uv_stride = width / 2;
+        let uv_size = uv_stride * (height / 2);
+        vec![
+          PlaneLayout {
+            offset: 0,
+            stride: width,
+          },
+          PlaneLayout {
+            offset: y_size,
+            stride: uv_stride,
+          },
+          PlaneLayout {
+            offset: y_size + uv_size,
+            stride: uv_stride,
+          },
+          PlaneLayout {
+            offset: y_size + uv_size * 2,
+            stride: width,
+          },
+        ]
+      }
+      VideoPixelFormat::I422 => {
+        let y_size = width * height;
+        let uv_stride = width / 2;
+        let uv_size = uv_stride * height;
+        vec![
+          PlaneLayout {
+            offset: 0,
+            stride: width,
+          },
+          PlaneLayout {
+            offset: y_size,
+            stride: uv_stride,
+          },
+          PlaneLayout {
+            offset: y_size + uv_size,
+            stride: uv_stride,
+          },
+        ]
+      }
+      VideoPixelFormat::I444 => {
+        let plane_size = width * height;
+        vec![
+          PlaneLayout {
+            offset: 0,
+            stride: width,
+          },
+          PlaneLayout {
+            offset: plane_size,
+            stride: width,
+          },
+          PlaneLayout {
+            offset: plane_size * 2,
+            stride: width,
+          },
+        ]
+      }
+      VideoPixelFormat::NV12 | VideoPixelFormat::NV21 => {
+        let y_size = width * height;
+        vec![
+          PlaneLayout {
+            offset: 0,
+            stride: width,
+          },
+          PlaneLayout {
+            offset: y_size,
+            stride: width,
+          },
+        ]
+      }
+      VideoPixelFormat::RGBA
+      | VideoPixelFormat::RGBX
+      | VideoPixelFormat::BGRA
+      | VideoPixelFormat::BGRX => {
+        vec![PlaneLayout {
+          offset: 0,
+          stride: width * 4,
+        }]
+      }
+    }
   }
 
   /// Clone this VideoFrame
@@ -476,8 +855,8 @@ impl VideoFrame {
         // Y + U + V (4:4:4)
         w * h * 3
       }
-      VideoPixelFormat::NV12 => {
-        // Y plane + interleaved UV plane
+      VideoPixelFormat::NV12 | VideoPixelFormat::NV21 => {
+        // Y plane + interleaved UV/VU plane
         w * h + w * (h / 2)
       }
       VideoPixelFormat::RGBA
@@ -576,7 +955,9 @@ impl VideoFrame {
           }
         }
       }
-      VideoPixelFormat::NV12 => {
+      VideoPixelFormat::NV12 | VideoPixelFormat::NV21 => {
+        // NV12: Y plane + interleaved UV
+        // NV21: Y plane + interleaved VU (same layout, just U/V swapped)
         let y_size = (width * height) as usize;
         let uv_height = (height / 2) as usize;
 
@@ -593,11 +974,11 @@ impl VideoFrame {
           }
         }
 
-        // Copy UV plane (interleaved)
+        // Copy UV/VU plane (interleaved)
         {
           let uv_plane = frame
             .plane_data_mut(1)
-            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get UV plane"))?;
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get UV/VU plane"))?;
           for row in 0..uv_height {
             let src_start = y_size + row * width as usize;
             let dst_start = row * linesize1;

@@ -7,7 +7,7 @@
 
 import test from 'ava'
 
-import { VideoEncoder, VideoDecoder, VideoFrame, EncodedVideoChunkType } from '../../index.js'
+import { VideoEncoder, VideoDecoder, VideoFrame } from '../../index.js'
 import {
   generateSolidColorI420Frame,
   generateGradientI420Frame,
@@ -15,8 +15,7 @@ import {
   generateColorBarsI420Frame,
   TestColors,
   extractI420Data,
-  reconstructVideoChunk,
-  type EncodedVideoChunkOutput,
+  type EncodedVideoChunk,
 } from '../helpers/index.js'
 import {
   compareBuffers,
@@ -28,15 +27,15 @@ import { createEncoderConfig, createDecoderConfig } from '../helpers/codec-matri
 
 // Helper to create test encoder with callbacks
 function createTestEncoder() {
-  const chunks: EncodedVideoChunkOutput[] = []
+  const chunks: EncodedVideoChunk[] = []
   const errors: Error[] = []
 
-  const encoder = new VideoEncoder(
-    (chunk, _metadata) => {
+  const encoder = new VideoEncoder({
+    output: (chunk, _metadata) => {
       chunks.push(chunk)
     },
-    (e) => errors.push(e),
-  )
+    error: (e) => errors.push(e),
+  })
 
   return { encoder, chunks, errors }
 }
@@ -46,10 +45,10 @@ function createTestDecoder() {
   const frames: VideoFrame[] = []
   const errors: Error[] = []
 
-  const decoder = new VideoDecoder(
-    (frame) => frames.push(frame),
-    (e) => errors.push(e),
-  )
+  const decoder = new VideoDecoder({
+    output: (frame) => frames.push(frame),
+    error: (e) => errors.push(e),
+  })
 
   return { decoder, frames, errors }
 }
@@ -65,7 +64,7 @@ test('roundtrip: H.264 single frame encode-decode', async (t) => {
 
   // Create original frame
   const originalFrame = generateSolidColorI420Frame(width, height, TestColors.red, timestamp)
-  const originalData = extractI420Data(originalFrame)
+  const originalData = await extractI420Data(originalFrame)
 
   // Encode
   const { encoder, chunks } = createTestEncoder()
@@ -82,14 +81,14 @@ test('roundtrip: H.264 single frame encode-decode', async (t) => {
   decoder.configure(createDecoderConfig('h264', { codedWidth: width, codedHeight: height }))
 
   for (const chunk of chunks) {
-    decoder.decode(reconstructVideoChunk(chunk))
+    decoder.decode(chunk)
   }
   await decoder.flush()
 
   t.true(decodedFrames.length > 0, 'Should produce decoded frames')
 
   // Compare
-  const decodedData = extractI420Data(decodedFrames[0])
+  const decodedData = await extractI420Data(decodedFrames[0])
   const comparison = compareBuffers(originalData, decodedData)
 
   t.log(`PSNR: ${formatPSNR(comparison.psnr)} (${getQualityDescription(comparison.psnr)})`)
@@ -109,7 +108,7 @@ test('roundtrip: H.264 multiple frames', async (t) => {
 
   // Create original frames
   const originalFrames = generateFrameSequence(width, height, frameCount)
-  const originalDataList = originalFrames.map(extractI420Data)
+  const originalDataList = await Promise.all(originalFrames.map((f) => extractI420Data(f)))
 
   // Encode
   const { encoder, chunks } = createTestEncoder()
@@ -134,7 +133,7 @@ test('roundtrip: H.264 multiple frames', async (t) => {
   decoder.configure(createDecoderConfig('h264', { codedWidth: width, codedHeight: height }))
 
   for (const chunk of chunks) {
-    decoder.decode(reconstructVideoChunk(chunk))
+    decoder.decode(chunk)
   }
   await decoder.flush()
 
@@ -143,7 +142,7 @@ test('roundtrip: H.264 multiple frames', async (t) => {
   // Compare each frame (note: might have different count due to codec behavior)
   const framesToCompare = Math.min(originalDataList.length, decodedFrames.length)
   for (let i = 0; i < framesToCompare; i++) {
-    const decodedData = extractI420Data(decodedFrames[i])
+    const decodedData = await extractI420Data(decodedFrames[i])
     const comparison = compareBuffers(originalDataList[i], decodedData)
 
     t.true(comparison.acceptable, `Frame ${i}: PSNR ${formatPSNR(comparison.psnr)} should be acceptable`)
@@ -230,11 +229,11 @@ test('roundtrip: keyframe generation', async (t) => {
   encoder.close()
 
   // First chunk must be a keyframe
-  t.is(chunks[0].type, EncodedVideoChunkType.Key, 'First chunk should be keyframe')
+  t.is(chunks[0].type, 'key', 'First chunk should be keyframe')
 
   // Count keyframes - note: codec may not honor all keyFrame requests
   // depending on GOP settings and B-frame configuration
-  const keyframes = chunks.filter((c) => c.type === EncodedVideoChunkType.Key)
+  const keyframes = chunks.filter((c) => c.type === 'key')
   t.true(keyframes.length >= 1, 'Should have at least 1 keyframe')
   t.log(`Generated ${keyframes.length} keyframes from ${chunks.length} chunks`)
 })
@@ -248,7 +247,7 @@ test('roundtrip: gradient pattern quality', async (t) => {
   const height = 240
 
   const originalFrame = generateGradientI420Frame(width, height, 0)
-  const originalData = extractI420Data(originalFrame)
+  const originalData = await extractI420Data(originalFrame)
 
   // Encode
   const { encoder, chunks } = createTestEncoder()
@@ -263,14 +262,14 @@ test('roundtrip: gradient pattern quality', async (t) => {
   decoder.configure(createDecoderConfig('h264', { codedWidth: width, codedHeight: height }))
 
   for (const chunk of chunks) {
-    decoder.decode(reconstructVideoChunk(chunk))
+    decoder.decode(chunk)
   }
   await decoder.flush()
 
   t.true(decodedFrames.length > 0)
 
   // Compare
-  const decodedData = extractI420Data(decodedFrames[0])
+  const decodedData = await extractI420Data(decodedFrames[0])
   const comparison = compareBuffers(originalData, decodedData)
 
   t.log(`Gradient PSNR: ${formatPSNR(comparison.psnr)}`)
@@ -287,7 +286,7 @@ test('roundtrip: color bars pattern quality', async (t) => {
   const height = 240
 
   const originalFrame = generateColorBarsI420Frame(width, height, 0)
-  const originalData = extractI420Data(originalFrame)
+  const originalData = await extractI420Data(originalFrame)
 
   // Encode
   const { encoder, chunks } = createTestEncoder()
@@ -302,14 +301,14 @@ test('roundtrip: color bars pattern quality', async (t) => {
   decoder.configure(createDecoderConfig('h264', { codedWidth: width, codedHeight: height }))
 
   for (const chunk of chunks) {
-    decoder.decode(reconstructVideoChunk(chunk))
+    decoder.decode(chunk)
   }
   await decoder.flush()
 
   t.true(decodedFrames.length > 0)
 
   // Compare
-  const decodedData = extractI420Data(decodedFrames[0])
+  const decodedData = await extractI420Data(decodedFrames[0])
   const comparison = compareBuffers(originalData, decodedData)
 
   t.log(`Color bars PSNR: ${formatPSNR(comparison.psnr)}`)
@@ -334,7 +333,7 @@ test('roundtrip: various resolutions', async (t) => {
 
   for (const { width, height } of resolutions) {
     const originalFrame = generateSolidColorI420Frame(width, height, TestColors.cyan, 0)
-    const originalData = extractI420Data(originalFrame)
+    const originalData = await extractI420Data(originalFrame)
 
     // Encode
     const { encoder, chunks } = createTestEncoder()
@@ -349,7 +348,7 @@ test('roundtrip: various resolutions', async (t) => {
     decoder.configure(createDecoderConfig('h264', { codedWidth: width, codedHeight: height }))
 
     for (const chunk of chunks) {
-      decoder.decode(reconstructVideoChunk(chunk))
+      decoder.decode(chunk)
     }
     await decoder.flush()
 
@@ -361,7 +360,7 @@ test('roundtrip: various resolutions', async (t) => {
     t.is(decodedFrame.codedHeight, height, `Height should match at ${width}x${height}`)
 
     // Verify quality
-    const decodedData = extractI420Data(decodedFrame)
+    const decodedData = await extractI420Data(decodedFrame)
     const comparison = compareBuffers(originalData, decodedData)
     t.true(comparison.acceptable, `Quality should be acceptable at ${width}x${height}`)
 
@@ -382,7 +381,7 @@ test('roundtrip: re-encoding (double roundtrip)', async (t) => {
 
   // First pass
   const original = generateSolidColorI420Frame(width, height, TestColors.magenta, 0)
-  const originalData = extractI420Data(original)
+  const originalData = await extractI420Data(original)
 
   const { encoder: encoder1, chunks: chunks1 } = createTestEncoder()
   encoder1.configure(createEncoderConfig('h264', width, height))
@@ -394,7 +393,7 @@ test('roundtrip: re-encoding (double roundtrip)', async (t) => {
   const { decoder: decoder1, frames: pass1Frames } = createTestDecoder()
   decoder1.configure(createDecoderConfig('h264', { codedWidth: width, codedHeight: height }))
   for (const chunk of chunks1) {
-    decoder1.decode(reconstructVideoChunk(chunk))
+    decoder1.decode(chunk)
   }
   await decoder1.flush()
 
@@ -416,14 +415,14 @@ test('roundtrip: re-encoding (double roundtrip)', async (t) => {
   const { decoder: decoder2, frames: pass2Frames } = createTestDecoder()
   decoder2.configure(createDecoderConfig('h264', { codedWidth: width, codedHeight: height }))
   for (const chunk of chunks2) {
-    decoder2.decode(reconstructVideoChunk(chunk))
+    decoder2.decode(chunk)
   }
   await decoder2.flush()
 
   t.true(pass2Frames.length > 0)
 
   // Compare final output to original
-  const finalData = extractI420Data(pass2Frames[0])
+  const finalData = await extractI420Data(pass2Frames[0])
   const comparison = compareBuffers(originalData, finalData)
 
   t.log(`Double roundtrip PSNR: ${formatPSNR(comparison.psnr)}`)

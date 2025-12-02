@@ -5,9 +5,7 @@
 
 use crate::codec::{BitrateMode, CodecContext, EncoderConfig, Scaler};
 use crate::ffi::{AVCodecID, AVHWDeviceType, AVPixelFormat};
-use crate::webcodecs::{
-  EncodedVideoChunk, EncodedVideoChunkOutput, VideoEncoderConfig, VideoFrame,
-};
+use crate::webcodecs::{EncodedVideoChunk, VideoEncoderConfig, VideoFrame};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{
   ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
@@ -21,10 +19,13 @@ use std::sync::{Arc, Mutex};
 pub enum CodecState {
   /// Encoder not configured
   #[default]
+  #[napi(value = "unconfigured")]
   Unconfigured,
   /// Encoder configured and ready
+  #[napi(value = "configured")]
   Configured,
   /// Encoder closed
+  #[napi(value = "closed")]
   Closed,
 }
 
@@ -44,8 +45,8 @@ pub struct VideoDecoderConfigOutput {
   pub coded_width: Option<u32>,
   /// Coded height
   pub coded_height: Option<u32>,
-  /// Codec description (e.g., avcC for H.264)
-  pub description: Option<Buffer>,
+  /// Codec description (e.g., avcC for H.264) - Uint8Array per spec
+  pub description: Option<Uint8Array>,
 }
 
 /// Encode options per WebCodecs spec
@@ -69,9 +70,9 @@ pub struct VideoEncoderSupport {
 /// Output callback type - uses FnArgs to spread tuple members as separate callback arguments
 /// This matches the WebCodecs spec: output(chunk, metadata) instead of output([chunk, metadata])
 type OutputCallback = ThreadsafeFunction<
-  FnArgs<(EncodedVideoChunkOutput, EncodedVideoChunkMetadata)>,
+  FnArgs<(EncodedVideoChunk, EncodedVideoChunkMetadata)>,
   UnknownReturnValue,
-  FnArgs<(EncodedVideoChunkOutput, EncodedVideoChunkMetadata)>,
+  FnArgs<(EncodedVideoChunk, EncodedVideoChunkMetadata)>,
   Status,
   false,
 >;
@@ -83,6 +84,30 @@ type ErrorCallback = ThreadsafeFunction<String>;
 /// Type alias for dequeue callback (no arguments)
 /// Using CalleeHandled: false for direct callbacks
 type DequeueCallback = ThreadsafeFunction<(), UnknownReturnValue, (), Status, false>;
+
+/// VideoEncoder init dictionary per WebCodecs spec
+pub struct VideoEncoderInit {
+  /// Output callback - called when encoded chunk is available
+  pub output: OutputCallback,
+  /// Error callback - called when an error occurs
+  pub error: ErrorCallback,
+}
+
+impl FromNapiValue for VideoEncoderInit {
+  unsafe fn from_napi_value(env: napi::sys::napi_env, value: napi::sys::napi_value) -> Result<Self> {
+    let obj = Object::from_napi_value(env, value)?;
+
+    let output: OutputCallback = obj
+      .get_named_property("output")
+      .map_err(|_| Error::new(Status::InvalidArg, "Missing required 'output' callback"))?;
+
+    let error: ErrorCallback = obj
+      .get_named_property("error")
+      .map_err(|_| Error::new(Status::InvalidArg, "Missing required 'error' callback"))?;
+
+    Ok(VideoEncoderInit { output, error })
+  }
+}
 
 /// Internal encoder state
 struct VideoEncoderInner {
@@ -106,14 +131,14 @@ struct VideoEncoderInner {
 ///
 /// Encodes VideoFrame objects into EncodedVideoChunk objects using FFmpeg.
 ///
-/// Per the WebCodecs spec, the constructor requires callbacks for output and error handling.
+/// Per the WebCodecs spec, the constructor takes an init dictionary with callbacks.
 ///
 /// Example:
 /// ```javascript
-/// const encoder = new VideoEncoder(
-///   (chunk, metadata) => { console.log('encoded chunk', chunk); },
-///   (e) => { console.error('error', e); }
-/// );
+/// const encoder = new VideoEncoder({
+///   output: (chunk, metadata) => { console.log('encoded chunk', chunk); },
+///   error: (e) => { console.error('error', e); }
+/// });
 ///
 /// encoder.configure({
 ///   codec: 'avc1.42001E',
@@ -132,15 +157,15 @@ pub struct VideoEncoder {
 
 #[napi]
 impl VideoEncoder {
-  /// Create a new VideoEncoder with required callbacks (per WebCodecs spec)
+  /// Create a new VideoEncoder with init dictionary (per WebCodecs spec)
   ///
-  /// @param output - Callback invoked when an encoded chunk is available
-  /// @param error - Callback invoked when an error occurs
+  /// @param init - Init dictionary containing output and error callbacks
   #[napi(constructor)]
   pub fn new(
-    #[napi(ts_arg_type = "(chunk: EncodedVideoChunkOutput, metadata: EncodedVideoChunkMetadata) => void")]
-    output: OutputCallback,
-    #[napi(ts_arg_type = "(error: Error) => void")] error: ErrorCallback,
+    #[napi(
+      ts_arg_type = "{ output: (chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadata) => void, error: (error: Error) => void }"
+    )]
+    init: VideoEncoderInit,
   ) -> Result<Self> {
     let inner = VideoEncoderInner {
       state: CodecState::Unconfigured,
@@ -150,8 +175,8 @@ impl VideoEncoder {
       frame_count: 0,
       extradata_sent: false,
       encode_queue_size: 0,
-      output_callback: output,
-      error_callback: error,
+      output_callback: init.output,
+      error_callback: init.error,
       dequeue_callback: None,
     };
 
@@ -474,7 +499,7 @@ impl VideoEncoder {
             codec: codec_string.clone(),
             coded_width: Some(width),
             coded_height: Some(height),
-            description: extradata.clone().map(Buffer::from),
+            description: extradata.clone().map(Uint8Array::from),
           }),
         }
       } else {
@@ -483,20 +508,12 @@ impl VideoEncoder {
         }
       };
 
-      // Convert chunk to serializable output and call callback
+      // Call callback with EncodedVideoChunk directly (per W3C WebCodecs spec)
       // Use .into() to convert tuple to FnArgs for spreading as separate arguments
-      match chunk.to_output() {
-        Ok(chunk_output) => {
-          inner.output_callback.call(
-            (chunk_output, metadata).into(),
-            ThreadsafeFunctionCallMode::NonBlocking,
-          );
-        }
-        Err(e) => {
-          Self::report_error(&mut inner, &format!("Failed to serialize chunk: {}", e));
-          return Ok(());
-        }
-      }
+      inner.output_callback.call(
+        (chunk, metadata).into(),
+        ThreadsafeFunctionCallMode::NonBlocking,
+      );
     }
 
     Ok(())
@@ -540,20 +557,12 @@ impl VideoEncoder {
         decoder_config: None,
       };
 
-      // Convert chunk to serializable output and call callback
+      // Call callback with EncodedVideoChunk directly (per W3C WebCodecs spec)
       // Use .into() to convert tuple to FnArgs for spreading as separate arguments
-      match chunk.to_output() {
-        Ok(chunk_output) => {
-          inner.output_callback.call(
-            (chunk_output, metadata).into(),
-            ThreadsafeFunctionCallMode::NonBlocking,
-          );
-        }
-        Err(e) => {
-          Self::report_error(&mut inner, &format!("Failed to serialize chunk: {}", e));
-          return Ok(());
-        }
-      }
+      inner.output_callback.call(
+        (chunk, metadata).into(),
+        ThreadsafeFunctionCallMode::NonBlocking,
+      );
     }
 
     Ok(())

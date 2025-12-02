@@ -8,7 +8,7 @@ use crate::ffi::{
     ffpkt_data, ffpkt_dts, ffpkt_duration, ffpkt_flags, ffpkt_pts, ffpkt_set_dts,
     ffpkt_set_duration, ffpkt_set_flags, ffpkt_set_pts, ffpkt_size,
   },
-  avcodec::{av_packet_alloc, av_packet_free, av_packet_ref, av_packet_unref},
+  avcodec::{av_new_packet, av_packet_alloc, av_packet_free, av_packet_ref, av_packet_unref},
   pkt_flag, AVPacket,
 };
 use std::ptr::NonNull;
@@ -177,6 +177,32 @@ impl Packet {
   /// Copy packet data to a new Vec
   pub fn to_vec(&self) -> Vec<u8> {
     self.as_slice().to_vec()
+  }
+
+  /// Allocate packet buffer and copy data from a slice
+  ///
+  /// This is a safe wrapper around av_new_packet + memcpy that handles
+  /// allocation and copying in one operation.
+  pub fn copy_data_from(&mut self, data: &[u8]) -> Result<(), CodecError> {
+    // First, unref any existing data
+    self.unref();
+
+    // Allocate new buffer
+    let ret = unsafe { av_new_packet(self.as_mut_ptr(), data.len() as i32) };
+    ffi::check_error(ret)?;
+
+    // Get mutable access to the packet's data buffer and copy
+    let pkt_data = unsafe { ffpkt_data(self.as_ptr()) as *mut u8 };
+    if !pkt_data.is_null() {
+      // SAFETY: av_new_packet allocated exactly data.len() bytes,
+      // and we're copying exactly that many bytes from a valid slice.
+      // The packet's data pointer is valid after successful av_new_packet.
+      unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr(), pkt_data, data.len());
+      }
+    }
+
+    Ok(())
   }
 }
 

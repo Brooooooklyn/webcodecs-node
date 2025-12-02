@@ -5,7 +5,7 @@
  * for encoding/decoding validation.
  */
 
-import { VideoFrame, VideoPixelFormat, type VideoFrameInit } from '../../index.js'
+import { VideoFrame, type VideoFrameBufferInit } from '../../index.js'
 
 /** RGB color representation */
 export interface RGBColor {
@@ -92,15 +92,15 @@ export function generateSolidColorI420Frame(
   // V plane
   buffer.fill(yuv.v, ySize + uSize, ySize + uSize * 2)
 
-  const init: VideoFrameInit = {
-    format: VideoPixelFormat.I420,
+  const init: VideoFrameBufferInit = {
+    format: 'I420',
     codedWidth: width,
     codedHeight: height,
     timestamp,
     duration,
   }
 
-  return new VideoFrame(buffer, init)
+  return new VideoFrame(new Uint8Array(buffer), init)
 }
 
 /**
@@ -125,15 +125,15 @@ export function generateSolidColorRGBAFrame(
     buffer[offset + 3] = alpha
   }
 
-  const init: VideoFrameInit = {
-    format: VideoPixelFormat.RGBA,
+  const init: VideoFrameBufferInit = {
+    format: 'RGBA',
     codedWidth: width,
     codedHeight: height,
     timestamp,
     duration,
   }
 
-  return new VideoFrame(buffer, init)
+  return new VideoFrame(new Uint8Array(buffer), init)
 }
 
 /**
@@ -158,15 +158,15 @@ export function generateGradientI420Frame(width: number, height: number, timesta
   const uvSize = (width / 2) * (height / 2)
   buffer.fill(128, ySize, ySize + uvSize * 2)
 
-  const init: VideoFrameInit = {
-    format: VideoPixelFormat.I420,
+  const init: VideoFrameBufferInit = {
+    format: 'I420',
     codedWidth: width,
     codedHeight: height,
     timestamp,
     duration,
   }
 
-  return new VideoFrame(buffer, init)
+  return new VideoFrame(new Uint8Array(buffer), init)
 }
 
 /**
@@ -199,15 +199,15 @@ export function generateCheckerboardI420Frame(
   const uvSize = (width / 2) * (height / 2)
   buffer.fill(128, ySize, ySize + uvSize * 2)
 
-  const init: VideoFrameInit = {
-    format: VideoPixelFormat.I420,
+  const init: VideoFrameBufferInit = {
+    format: 'I420',
     codedWidth: width,
     codedHeight: height,
     timestamp,
     duration,
   }
 
-  return new VideoFrame(buffer, init)
+  return new VideoFrame(new Uint8Array(buffer), init)
 }
 
 /**
@@ -263,15 +263,15 @@ export function generateColorBarsI420Frame(width: number, height: number, timest
     }
   }
 
-  const init: VideoFrameInit = {
-    format: VideoPixelFormat.I420,
+  const init: VideoFrameBufferInit = {
+    format: 'I420',
     codedWidth: width,
     codedHeight: height,
     timestamp,
     duration,
   }
 
-  return new VideoFrame(buffer, init)
+  return new VideoFrame(new Uint8Array(buffer), init)
 }
 
 /**
@@ -318,11 +318,13 @@ export function generateFrameSequence(
 
 /**
  * Extract raw I420 data from a VideoFrame
+ *
+ * Note: VideoFrame.copyTo() is async per W3C spec, so this function is async.
  */
-export function extractI420Data(frame: VideoFrame): Uint8Array {
+export async function extractI420Data(frame: VideoFrame): Promise<Uint8Array> {
   const size = frame.allocationSize()
   const buffer = new Uint8Array(size)
-  frame.copyTo(buffer)
+  await frame.copyTo(buffer)
   return buffer
 }
 

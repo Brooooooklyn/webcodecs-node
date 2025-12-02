@@ -14,6 +14,17 @@ pub mod codec;
 // WebCodecs API surface (NAPI classes)
 pub mod webcodecs;
 
+use napi_derive::module_init;
+
+/// Module initialization - called when the native module is loaded
+#[module_init]
+fn init() {
+  // Suppress verbose FFmpeg logging (only show errors)
+  unsafe {
+    ffi::avutil::av_log_set_level(ffi::avutil::log_level::ERROR);
+  }
+}
+
 // Re-export WebCodecs types at crate root
 pub use webcodecs::{
   // Hardware acceleration utilities

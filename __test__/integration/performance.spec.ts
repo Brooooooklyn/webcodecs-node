@@ -7,27 +7,26 @@
 
 import test from 'ava'
 
-import { VideoEncoder, VideoDecoder, VideoFrame, CodecState } from '../../index.js'
+import { VideoEncoder, VideoDecoder, VideoFrame } from '../../index.js'
 import {
   generateSolidColorI420Frame,
   TestColors,
   calculateI420Size,
-  reconstructVideoChunk,
-  type EncodedVideoChunkOutput,
+  type EncodedVideoChunk,
 } from '../helpers/index.js'
 import { createEncoderConfig, createDecoderConfig } from '../helpers/codec-matrix.js'
 
 // Helper to create test encoder with callbacks
 function createTestEncoder() {
-  const chunks: EncodedVideoChunkOutput[] = []
+  const chunks: EncodedVideoChunk[] = []
   const errors: Error[] = []
 
-  const encoder = new VideoEncoder(
-    (chunk, _metadata) => {
+  const encoder = new VideoEncoder({
+    output: (chunk, _metadata) => {
       chunks.push(chunk)
     },
-    (e) => errors.push(e),
-  )
+    error: (e) => errors.push(e),
+  })
 
   return { encoder, chunks, errors }
 }
@@ -37,10 +36,10 @@ function createTestDecoder() {
   const frames: VideoFrame[] = []
   const errors: Error[] = []
 
-  const decoder = new VideoDecoder(
-    (frame) => frames.push(frame),
-    (e) => errors.push(e),
-  )
+  const decoder = new VideoDecoder({
+    output: (frame) => frames.push(frame),
+    error: (e) => errors.push(e),
+  })
 
   return { decoder, frames, errors }
 }
@@ -124,7 +123,7 @@ test('stress: decode 100 chunks', async (t) => {
   decoder.configure(createDecoderConfig('h264', { codedWidth: width, codedHeight: height }))
 
   for (const chunk of chunks) {
-    decoder.decode(reconstructVideoChunk(chunk))
+    decoder.decode(chunk)
   }
 
   await decoder.flush()
@@ -275,7 +274,7 @@ test('stress: encoder reconfigure loop', async (t) => {
     const height = 240 + (i % 3) * 48
 
     encoder.configure(createEncoderConfig('h264', width, height))
-    t.is(encoder.state, CodecState.Configured)
+    t.is(encoder.state, 'configured')
 
     // Encode one frame
     const frame = generateSolidColorI420Frame(width, height, TestColors.black, 0)
@@ -297,7 +296,7 @@ test('stress: decoder reconfigure loop', (t) => {
 
   for (let i = 0; i < iterations; i++) {
     decoder.configure(createDecoderConfig('h264'))
-    t.is(decoder.state, CodecState.Configured)
+    t.is(decoder.state, 'configured')
     decoder.reset()
   }
 
@@ -421,7 +420,7 @@ test('stress: decoder queue size under load', async (t) => {
   let maxQueueSize = 0
 
   for (const chunk of chunks) {
-    decoder.decode(reconstructVideoChunk(chunk))
+    decoder.decode(chunk)
     maxQueueSize = Math.max(maxQueueSize, decoder.decodeQueueSize)
   }
 
@@ -492,7 +491,7 @@ test('stress: rapid reconfigure cycles', async (t) => {
 // Large Data Tests
 // ============================================================================
 
-test('stress: large frame data handling', (t) => {
+test('stress: large frame data handling', async (t) => {
   // 4K frame would be very slow, use 1080p
   const width = 1920
   const height = 1080
@@ -505,7 +504,7 @@ test('stress: large frame data handling', (t) => {
   t.is(frame.codedHeight, height)
 
   const buffer = new Uint8Array(frame.allocationSize())
-  frame.copyTo(buffer)
+  await frame.copyTo(buffer)
 
   t.is(buffer.length, frameSize)
 

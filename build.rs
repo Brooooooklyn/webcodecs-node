@@ -243,6 +243,10 @@ fn get_codec_library_paths(target_os: &str) -> Vec<PathBuf> {
     _ => {}
   }
 
+  if let Ok(brew_prefix) = env::var("HOMEBREW_PREFIX") {
+    paths.push(PathBuf::from(brew_prefix).join("lib"));
+  }
+
   // Add FFmpeg lib dir if set
   if let Ok(ffmpeg_dir) = env::var("FFMPEG_DIR") {
     paths.push(PathBuf::from(ffmpeg_dir).join("lib"));

@@ -7,15 +7,7 @@
 
 import test from 'ava'
 
-import {
-  AudioDecoder,
-  AudioEncoder,
-  AudioData,
-  AudioSampleFormat,
-  CodecState,
-  EncodedAudioChunk,
-  EncodedAudioChunkType,
-} from '../index.js'
+import { AudioDecoder, AudioEncoder, AudioData, EncodedAudioChunk } from '../index.js'
 import { generateSineTone } from './helpers/index.js'
 
 // Helper to create test encoder with callbacks
@@ -23,12 +15,12 @@ function createTestEncoder() {
   const chunks: EncodedAudioChunk[] = []
   const errors: Error[] = []
 
-  const encoder = new AudioEncoder(
-    (chunk) => {
+  const encoder = new AudioEncoder({
+    output: (chunk) => {
       chunks.push(chunk)
     },
-    (e) => errors.push(e),
-  )
+    error: (e) => errors.push(e),
+  })
 
   return { encoder, chunks, errors }
 }
@@ -38,10 +30,10 @@ function createTestDecoder() {
   const audioOutputs: AudioData[] = []
   const errors: Error[] = []
 
-  const decoder = new AudioDecoder(
-    (data) => audioOutputs.push(data),
-    (e) => errors.push(e),
-  )
+  const decoder = new AudioDecoder({
+    output: (data) => audioOutputs.push(data),
+    error: (e) => errors.push(e),
+  })
 
   return { decoder, audioOutputs, errors }
 }
@@ -53,17 +45,17 @@ function createTestDecoder() {
 test('AudioDecoder: constructor creates unconfigured decoder', (t) => {
   const { decoder } = createTestDecoder()
 
-  t.is(decoder.state, CodecState.Unconfigured)
+  t.is(decoder.state, 'unconfigured')
   t.is(decoder.decodeQueueSize, 0)
 
   decoder.close()
 })
 
-test('AudioDecoder: constructor requires callbacks', (t) => {
-  // @ts-expect-error - Testing that missing callbacks throws
+test('AudioDecoder: constructor requires init dictionary', (t) => {
+  // @ts-expect-error - Testing that missing init throws
   t.throws(() => new AudioDecoder())
   // @ts-expect-error - Testing that missing error callback throws
-  t.throws(() => new AudioDecoder(() => {}))
+  t.throws(() => new AudioDecoder({ output: () => {} }))
 })
 
 // ============================================================================
@@ -79,7 +71,7 @@ test('AudioDecoder: configure() with AAC codec', (t) => {
     numberOfChannels: 2,
   })
 
-  t.is(decoder.state, CodecState.Configured)
+  t.is(decoder.state, 'configured')
 
   decoder.close()
 })
@@ -93,7 +85,7 @@ test('AudioDecoder: configure() with Opus codec', (t) => {
     numberOfChannels: 2,
   })
 
-  t.is(decoder.state, CodecState.Configured)
+  t.is(decoder.state, 'configured')
 
   decoder.close()
 })
@@ -107,7 +99,7 @@ test('AudioDecoder: configure() with MP3 codec', (t) => {
     numberOfChannels: 2,
   })
 
-  t.is(decoder.state, CodecState.Configured)
+  t.is(decoder.state, 'configured')
 
   decoder.close()
 })
@@ -121,7 +113,7 @@ test('AudioDecoder: configure() with FLAC codec', (t) => {
     numberOfChannels: 2,
   })
 
-  t.is(decoder.state, CodecState.Configured)
+  t.is(decoder.state, 'configured')
 
   decoder.close()
 })
@@ -135,7 +127,7 @@ test('AudioDecoder: configure() with mono audio', (t) => {
     numberOfChannels: 1,
   })
 
-  t.is(decoder.state, CodecState.Configured)
+  t.is(decoder.state, 'configured')
 
   decoder.close()
 })
@@ -150,7 +142,7 @@ test('AudioDecoder: configure() with invalid codec triggers error callback', (t)
   })
 
   // Error callback transitions to closed
-  t.is(decoder.state, CodecState.Closed)
+  t.is(decoder.state, 'closed')
 
   decoder.close()
 })
@@ -163,7 +155,7 @@ test('AudioDecoder: decode() on unconfigured triggers error callback', (t) => {
   const { decoder } = createTestDecoder()
 
   const chunk = new EncodedAudioChunk({
-    type: EncodedAudioChunkType.Key,
+    type: 'key',
     timestamp: 0,
     data: Buffer.from([0x00, 0x01, 0x02]),
   })
@@ -171,7 +163,7 @@ test('AudioDecoder: decode() on unconfigured triggers error callback', (t) => {
   // decode() on unconfigured decoder should trigger error callback
   decoder.decode(chunk)
 
-  t.is(decoder.state, CodecState.Closed, 'Decoder should be closed after error')
+  t.is(decoder.state, 'closed', 'Decoder should be closed after error')
 
   decoder.close()
 })
@@ -188,7 +180,7 @@ test('AudioDecoder: decode() on closed triggers error callback', (t) => {
   decoder.close()
 
   const chunk = new EncodedAudioChunk({
-    type: EncodedAudioChunkType.Key,
+    type: 'key',
     timestamp: 0,
     data: Buffer.from([0x00, 0x01, 0x02]),
   })
@@ -209,11 +201,11 @@ test('AudioDecoder: reset() returns to unconfigured state', (t) => {
     numberOfChannels: 2,
   })
 
-  t.is(decoder.state, CodecState.Configured)
+  t.is(decoder.state, 'configured')
 
   decoder.reset()
 
-  t.is(decoder.state, CodecState.Unconfigured)
+  t.is(decoder.state, 'unconfigured')
 
   decoder.close()
 })
@@ -236,7 +228,7 @@ test('AudioDecoder: can reconfigure after reset', (t) => {
     numberOfChannels: 2,
   })
 
-  t.is(decoder.state, CodecState.Configured)
+  t.is(decoder.state, 'configured')
 
   decoder.close()
 })
@@ -345,7 +337,7 @@ test('AudioDecoder: roundtrip with Opus', async (t) => {
 
   // Generate and encode multiple frames
   for (let i = 0; i < 10; i++) {
-    const audio = generateSineTone(440, 960, 2, 48000, AudioSampleFormat.F32, i * 20000)
+    const audio = generateSineTone(440, 960, 2, 48000, 'f32', i * 20000)
     encoder.encode(audio)
     audio.close()
   }

@@ -14,20 +14,28 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioSampleFormat {
   /// Unsigned 8-bit integer samples, interleaved
+  #[napi(value = "u8")]
   U8,
   /// Signed 16-bit integer samples, interleaved
+  #[napi(value = "s16")]
   S16,
   /// Signed 32-bit integer samples, interleaved
+  #[napi(value = "s32")]
   S32,
   /// 32-bit float samples, interleaved
+  #[napi(value = "f32")]
   F32,
   /// Unsigned 8-bit integer samples, planar
+  #[napi(value = "u8-planar")]
   U8Planar,
   /// Signed 16-bit integer samples, planar
+  #[napi(value = "s16-planar")]
   S16Planar,
   /// Signed 32-bit integer samples, planar
+  #[napi(value = "s32-planar")]
   S32Planar,
   /// 32-bit float samples, planar
+  #[napi(value = "f32-planar")]
   F32Planar,
 }
 
@@ -85,20 +93,22 @@ impl AudioSampleFormat {
   }
 }
 
-/// Options for creating an AudioData
+/// Options for creating an AudioData (W3C WebCodecs spec)
+/// Note: Per spec, data is included in the init object
 #[napi(object)]
-#[derive(Debug, Clone)]
 pub struct AudioDataInit {
-  /// Sample format
+  /// Sample format (required)
   pub format: AudioSampleFormat,
-  /// Sample rate in Hz
+  /// Sample rate in Hz (required)
   pub sample_rate: u32,
-  /// Number of frames (samples per channel)
+  /// Number of frames (samples per channel) (required)
   pub number_of_frames: u32,
-  /// Number of channels
+  /// Number of channels (required)
   pub number_of_channels: u32,
-  /// Timestamp in microseconds
+  /// Timestamp in microseconds (required)
   pub timestamp: i64,
+  /// Raw audio sample data (required) - BufferSource per spec
+  pub data: Uint8Array,
 }
 
 /// Options for copyTo operation
@@ -133,10 +143,12 @@ pub struct AudioData {
 
 #[napi]
 impl AudioData {
-  /// Create a new AudioData from raw sample data
+  /// Create a new AudioData (W3C WebCodecs spec)
+  /// Per spec, the constructor takes a single init object containing all parameters including data
   #[napi(constructor)]
-  pub fn new(data: &[u8], init: AudioDataInit) -> Result<Self> {
+  pub fn new(init: AudioDataInit) -> Result<Self> {
     let av_format = init.format.to_av_format();
+    let data = init.data.as_ref();
 
     // Create internal frame
     let mut frame = Frame::new_audio(
@@ -331,13 +343,25 @@ impl AudioData {
     }
   }
 
+  /// Get whether this AudioData has been closed (W3C WebCodecs spec)
+  #[napi(getter)]
+  pub fn closed(&self) -> Result<bool> {
+    let inner = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    Ok(inner.is_none())
+  }
+
   // ========================================================================
   // Methods (WebCodecs spec)
   // ========================================================================
 
-  /// Get the buffer size required for allocationSize
+  /// Get the buffer size required for copyTo (W3C WebCodecs spec)
+  /// Note: options is REQUIRED per spec
   #[napi]
-  pub fn allocation_size(&self, options: Option<AudioDataCopyToOptions>) -> Result<u32> {
+  pub fn allocation_size(&self, options: AudioDataCopyToOptions) -> Result<u32> {
     let inner = self
       .inner
       .lock()
@@ -347,14 +371,10 @@ impl AudioData {
       .as_ref()
       .ok_or_else(|| Error::new(Status::GenericFailure, "AudioData is closed"))?;
 
-    let format = options
-      .as_ref()
-      .and_then(|o| o.format)
-      .unwrap_or(inner.format);
-    let frame_offset = options.as_ref().and_then(|o| o.frame_offset).unwrap_or(0);
+    let format = options.format.unwrap_or(inner.format);
+    let frame_offset = options.frame_offset.unwrap_or(0);
     let num_frames = options
-      .as_ref()
-      .and_then(|o| o.frame_count)
+      .frame_count
       .unwrap_or(inner.frame.nb_samples() - frame_offset);
 
     let bytes_per_sample = format.bytes_per_sample() as u32;
@@ -368,13 +388,10 @@ impl AudioData {
     }
   }
 
-  /// Copy audio data to a buffer
+  /// Copy audio data to a buffer (W3C WebCodecs spec)
+  /// Note: Per spec, this is SYNCHRONOUS and returns undefined
   #[napi]
-  pub fn copy_to(
-    &self,
-    destination: Uint8Array,
-    options: Option<AudioDataCopyToOptions>,
-  ) -> Result<()> {
+  pub fn copy_to(&self, mut destination: Uint8Array, options: AudioDataCopyToOptions) -> Result<()> {
     let inner = self
       .inner
       .lock()
@@ -384,25 +401,18 @@ impl AudioData {
       .as_ref()
       .ok_or_else(|| Error::new(Status::GenericFailure, "AudioData is closed"))?;
 
-    let format = options
-      .as_ref()
-      .and_then(|o| o.format)
-      .unwrap_or(inner.format);
-    let plane_index = options
-      .as_ref()
-      .map(|o| o.plane_index as usize)
-      .unwrap_or(0);
-    let frame_offset = options.as_ref().and_then(|o| o.frame_offset).unwrap_or(0) as usize;
+    let format = options.format.unwrap_or(inner.format);
+    let plane_index = options.plane_index as usize;
+    let frame_offset = options.frame_offset.unwrap_or(0) as usize;
     let num_frames = options
-      .as_ref()
-      .and_then(|o| o.frame_count)
+      .frame_count
       .unwrap_or(inner.frame.nb_samples() - frame_offset as u32) as usize;
 
     let bytes_per_sample = format.bytes_per_sample();
     let channels = inner.frame.channels() as usize;
 
-    // Get mutable access to the destination buffer
-    let dest_ptr = destination.as_ref().as_ptr() as *mut u8;
+    // Get mutable access to the destination buffer safely
+    let dest_slice = unsafe { destination.as_mut() };
 
     if format.is_planar() {
       // Copy single plane
@@ -411,7 +421,7 @@ impl AudioData {
       }
 
       let copy_size = num_frames * bytes_per_sample;
-      if destination.len() < copy_size {
+      if dest_slice.len() < copy_size {
         return Err(Error::new(
           Status::InvalidArg,
           "Destination buffer too small",
@@ -423,9 +433,7 @@ impl AudioData {
         // Source is planar too
         if let Some(src) = inner.frame.audio_channel_data(plane_index) {
           let src_offset = frame_offset * bytes_per_sample;
-          unsafe {
-            std::ptr::copy_nonoverlapping(src[src_offset..].as_ptr(), dest_ptr, copy_size);
-          }
+          dest_slice[..copy_size].copy_from_slice(&src[src_offset..src_offset + copy_size]);
         }
       } else {
         // Source is interleaved, need to extract one channel
@@ -433,20 +441,15 @@ impl AudioData {
           for i in 0..num_frames {
             let src_offset = ((frame_offset + i) * channels + plane_index) * bytes_per_sample;
             let dst_offset = i * bytes_per_sample;
-            unsafe {
-              std::ptr::copy_nonoverlapping(
-                src[src_offset..].as_ptr(),
-                dest_ptr.add(dst_offset),
-                bytes_per_sample,
-              );
-            }
+            dest_slice[dst_offset..dst_offset + bytes_per_sample]
+              .copy_from_slice(&src[src_offset..src_offset + bytes_per_sample]);
           }
         }
       }
     } else {
       // Interleaved output
       let copy_size = num_frames * channels * bytes_per_sample;
-      if destination.len() < copy_size {
+      if dest_slice.len() < copy_size {
         return Err(Error::new(
           Status::InvalidArg,
           "Destination buffer too small",
@@ -460,13 +463,8 @@ impl AudioData {
             if let Some(src) = inner.frame.audio_channel_data(ch) {
               let src_offset = (frame_offset + i) * bytes_per_sample;
               let dst_offset = (i * channels + ch) * bytes_per_sample;
-              unsafe {
-                std::ptr::copy_nonoverlapping(
-                  src[src_offset..].as_ptr(),
-                  dest_ptr.add(dst_offset),
-                  bytes_per_sample,
-                );
-              }
+              dest_slice[dst_offset..dst_offset + bytes_per_sample]
+                .copy_from_slice(&src[src_offset..src_offset + bytes_per_sample]);
             }
           }
         }
@@ -474,9 +472,7 @@ impl AudioData {
         // Both interleaved
         if let Some(src) = inner.frame.audio_channel_data(0) {
           let src_offset = frame_offset * channels * bytes_per_sample;
-          unsafe {
-            std::ptr::copy_nonoverlapping(src[src_offset..].as_ptr(), dest_ptr, copy_size);
-          }
+          dest_slice[..copy_size].copy_from_slice(&src[src_offset..src_offset + copy_size]);
         }
       }
     }

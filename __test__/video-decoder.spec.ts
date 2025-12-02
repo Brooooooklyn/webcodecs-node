@@ -7,31 +7,21 @@
 
 import test from 'ava'
 
-import {
-  VideoEncoder,
-  VideoDecoder,
-  VideoFrame,
-  EncodedVideoChunk,
-  CodecState,
-} from '../index.js'
-import {
-  generateFrameSequence,
-  reconstructVideoChunk,
-  type EncodedVideoChunkOutput,
-} from './helpers/index.js'
+import { VideoEncoder, VideoDecoder, VideoFrame, EncodedVideoChunk } from '../index.js'
+import { generateFrameSequence } from './helpers/index.js'
 import { createEncoderConfig, createDecoderConfig } from './helpers/codec-matrix.js'
 
 // Helper to create test encoder with callbacks
 function createTestEncoder() {
-  const chunks: EncodedVideoChunkOutput[] = []
+  const chunks: EncodedVideoChunk[] = []
   const errors: Error[] = []
 
-  const encoder = new VideoEncoder(
-    (chunk, _metadata) => {
+  const encoder = new VideoEncoder({
+    output: (chunk, _metadata) => {
       chunks.push(chunk)
     },
-    (e) => errors.push(e),
-  )
+    error: (e) => errors.push(e),
+  })
 
   return { encoder, chunks, errors }
 }
@@ -41,10 +31,10 @@ function createTestDecoder() {
   const frames: VideoFrame[] = []
   const errors: Error[] = []
 
-  const decoder = new VideoDecoder(
-    (frame) => frames.push(frame),
-    (e) => errors.push(e),
-  )
+  const decoder = new VideoDecoder({
+    output: (frame) => frames.push(frame),
+    error: (e) => errors.push(e),
+  })
 
   return { decoder, frames, errors }
 }
@@ -75,8 +65,8 @@ async function createEncodedH264Chunks(
   await encoder.flush()
   encoder.close()
 
-  // Reconstruct chunks to preserve class identity for decoder.decode()
-  return chunks.map(reconstructVideoChunk)
+  // Chunks are now class instances directly from the callback
+  return chunks
 }
 
 // ============================================================================
@@ -85,31 +75,31 @@ async function createEncodedH264Chunks(
 
 test('VideoDecoder: constructor creates unconfigured decoder', (t) => {
   const { decoder } = createTestDecoder()
-  t.is(decoder.state, CodecState.Unconfigured)
+  t.is(decoder.state, 'unconfigured')
   t.is(decoder.decodeQueueSize, 0)
   decoder.close()
 })
 
-test('VideoDecoder: constructor requires callbacks', (t) => {
-  // @ts-expect-error - Testing that missing callbacks throws
+test('VideoDecoder: constructor requires init dictionary', (t) => {
+  // @ts-expect-error - Testing that missing init throws
   t.throws(() => new VideoDecoder())
   // @ts-expect-error - Testing that missing error callback throws
-  t.throws(() => new VideoDecoder(() => {}))
+  t.throws(() => new VideoDecoder({ output: () => {} }))
 })
 
 test('VideoDecoder: state transitions correctly', (t) => {
   const { decoder } = createTestDecoder()
 
   // Initial state
-  t.is(decoder.state, CodecState.Unconfigured)
+  t.is(decoder.state, 'unconfigured')
 
   // Configure
   decoder.configure(createDecoderConfig('h264', { codedWidth: 320, codedHeight: 240 }))
-  t.is(decoder.state, CodecState.Configured)
+  t.is(decoder.state, 'configured')
 
   // Close
   decoder.close()
-  t.is(decoder.state, CodecState.Closed)
+  t.is(decoder.state, 'closed')
 })
 
 test('VideoDecoder: close() is idempotent', (t) => {
@@ -117,11 +107,11 @@ test('VideoDecoder: close() is idempotent', (t) => {
   decoder.configure(createDecoderConfig('h264'))
 
   decoder.close()
-  t.is(decoder.state, CodecState.Closed)
+  t.is(decoder.state, 'closed')
 
   // Second close should not throw
   t.notThrows(() => decoder.close())
-  t.is(decoder.state, CodecState.Closed)
+  t.is(decoder.state, 'closed')
 })
 
 // ============================================================================
@@ -135,7 +125,7 @@ test('VideoDecoder: configure() with H.264', (t) => {
     decoder.configure(createDecoderConfig('h264'))
   })
 
-  t.is(decoder.state, CodecState.Configured)
+  t.is(decoder.state, 'configured')
   decoder.close()
 })
 
@@ -146,7 +136,7 @@ test('VideoDecoder: configure() with VP8', (t) => {
     decoder.configure(createDecoderConfig('vp8'))
   })
 
-  t.is(decoder.state, CodecState.Configured)
+  t.is(decoder.state, 'configured')
   decoder.close()
 })
 
@@ -157,7 +147,7 @@ test('VideoDecoder: configure() with VP9', (t) => {
     decoder.configure(createDecoderConfig('vp9'))
   })
 
-  t.is(decoder.state, CodecState.Configured)
+  t.is(decoder.state, 'configured')
   decoder.close()
 })
 
@@ -166,11 +156,11 @@ test('VideoDecoder: configure() can be called multiple times', (t) => {
 
   // First configuration
   decoder.configure(createDecoderConfig('h264'))
-  t.is(decoder.state, CodecState.Configured)
+  t.is(decoder.state, 'configured')
 
   // Reconfigure
   decoder.configure(createDecoderConfig('vp8'))
-  t.is(decoder.state, CodecState.Configured)
+  t.is(decoder.state, 'configured')
 
   decoder.close()
 })
@@ -312,7 +302,7 @@ test('VideoDecoder: reset() returns to unconfigured state', async (t) => {
   decoder.reset()
 
   // Reset returns to unconfigured state
-  t.is(decoder.state, CodecState.Unconfigured)
+  t.is(decoder.state, 'unconfigured')
 
   decoder.close()
 })
@@ -333,11 +323,11 @@ test('VideoDecoder: reset() then reconfigure allows new decoding', async (t) => 
 
   // Reset (goes to unconfigured)
   decoder.reset()
-  t.is(decoder.state, CodecState.Unconfigured)
+  t.is(decoder.state, 'unconfigured')
 
   // Reconfigure
   decoder.configure(createDecoderConfig('h264', { codedWidth: 320, codedHeight: 240 }))
-  t.is(decoder.state, CodecState.Configured)
+  t.is(decoder.state, 'configured')
 
   // Second decode should work (with fresh keyframe)
   t.notThrows(() => {
@@ -363,7 +353,7 @@ test('VideoDecoder: isConfigSupported() for H.264', async (t) => {
   const result = await VideoDecoder.isConfigSupported(config)
 
   t.is(typeof result.supported, 'boolean')
-  t.is(typeof result.codec, 'string')
+  t.is(typeof result.config.codec, 'string')
 })
 
 test('VideoDecoder: isConfigSupported() for VP8', async (t) => {
@@ -400,7 +390,7 @@ test('VideoDecoder: decode() on unconfigured decoder triggers error callback', a
   // decode() on unconfigured decoder should trigger error callback
   decoder.decode(chunks[0])
 
-  t.is(decoder.state, CodecState.Closed, 'Decoder should be closed after error')
+  t.is(decoder.state, 'closed', 'Decoder should be closed after error')
 
   decoder.close()
 })

@@ -6,20 +6,20 @@
  */
 
 import test from 'ava'
-import { VideoEncoder, VideoFrame, VideoPixelFormat, CodecState } from '../index.js'
-import { type EncodedVideoChunkOutput } from './helpers/index.js'
+import { VideoEncoder, VideoFrame } from '../index.js'
+import { type EncodedVideoChunk } from './helpers/index.js'
 
 // Helper to create test encoder with callbacks
 function createTestEncoder() {
-  const chunks: EncodedVideoChunkOutput[] = []
+  const chunks: EncodedVideoChunk[] = []
   const errors: Error[] = []
 
-  const encoder = new VideoEncoder(
-    (chunk, _metadata) => {
+  const encoder = new VideoEncoder({
+    output: (chunk, _metadata) => {
       chunks.push(chunk)
     },
-    (e) => errors.push(e),
-  )
+    error: (e) => errors.push(e),
+  })
 
   return { encoder, chunks, errors }
 }
@@ -37,7 +37,7 @@ test('VideoEncoderConfig: accepts bitrateMode constant', (t) => {
     bitrate: 1_000_000,
     bitrateMode: 'constant',
   })
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
   encoder.close()
 })
 
@@ -50,7 +50,7 @@ test('VideoEncoderConfig: accepts bitrateMode variable', (t) => {
     bitrate: 1_000_000,
     bitrateMode: 'variable',
   })
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
   encoder.close()
 })
 
@@ -63,7 +63,7 @@ test('VideoEncoderConfig: accepts latencyMode quality', (t) => {
     bitrate: 1_000_000,
     latencyMode: 'quality',
   })
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
   encoder.close()
 })
 
@@ -76,7 +76,7 @@ test('VideoEncoderConfig: accepts latencyMode realtime', (t) => {
     bitrate: 1_000_000,
     latencyMode: 'realtime',
   })
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
   encoder.close()
 })
 
@@ -89,7 +89,7 @@ test('VideoEncoderConfig: accepts scalabilityMode L1T1', (t) => {
     bitrate: 1_000_000,
     scalabilityMode: 'L1T1',
   })
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
   encoder.close()
 })
 
@@ -103,13 +103,13 @@ test('VideoEncoderConfig: combined bitrateMode and latencyMode', async (t) => {
     bitrateMode: 'variable',
     latencyMode: 'realtime',
   })
-  t.is(encoder.state, CodecState.Configured)
+  t.is(encoder.state, 'configured')
 
   // Create and encode a frame to verify encoder works
   // I420 buffer: Y (640*480) + U (320*240) + V (320*240) = 460800 bytes
   const frameData = Buffer.alloc(640 * 480 + 320 * 240 * 2)
   const frame = new VideoFrame(frameData, {
-    format: VideoPixelFormat.I420,
+    format: 'I420',
     codedWidth: 640,
     codedHeight: 480,
     timestamp: 0,
@@ -139,7 +139,7 @@ test('VideoEncoderConfig: callback mode with output', async (t) => {
   const frameData = Buffer.alloc(320 * 240 + 160 * 120 * 2)
   for (let i = 0; i < 10; i++) {
     const frame = new VideoFrame(frameData, {
-      format: VideoPixelFormat.I420,
+      format: 'I420',
       codedWidth: 320,
       codedHeight: 240,
       timestamp: i * 33333,

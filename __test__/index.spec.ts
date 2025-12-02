@@ -12,10 +12,6 @@ import {
   VideoDecoder,
   VideoFrame,
   EncodedVideoChunk,
-  // Enums
-  CodecState,
-  EncodedVideoChunkType,
-  VideoPixelFormat,
   // Hardware functions
   getHardwareAccelerators,
   getAvailableHardwareAccelerators,
@@ -29,23 +25,23 @@ import {
 
 test('exports VideoEncoder class', (t) => {
   t.is(typeof VideoEncoder, 'function')
-  const encoder = new VideoEncoder(
-    () => {},
-    () => {},
-  )
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: () => {},
+  })
   t.truthy(encoder)
-  t.is(encoder.state, CodecState.Unconfigured)
+  t.is(encoder.state, 'unconfigured')
   encoder.close()
 })
 
 test('exports VideoDecoder class', (t) => {
   t.is(typeof VideoDecoder, 'function')
-  const decoder = new VideoDecoder(
-    () => {},
-    () => {},
-  )
+  const decoder = new VideoDecoder({
+    output: () => {},
+    error: () => {},
+  })
   t.truthy(decoder)
-  t.is(decoder.state, CodecState.Unconfigured)
+  t.is(decoder.state, 'unconfigured')
   decoder.close()
 })
 
@@ -57,22 +53,31 @@ test('exports EncodedVideoChunk class', (t) => {
   t.is(typeof EncodedVideoChunk, 'function')
 })
 
-test('exports CodecState enum', (t) => {
-  t.true(CodecState.Unconfigured === 'Unconfigured')
-  t.true(CodecState.Configured === 'Configured')
-  t.true(CodecState.Closed === 'Closed')
+test('CodecState uses string literals', (t) => {
+  const encoder = new VideoEncoder({ output: () => {}, error: () => {} })
+  t.is(encoder.state, 'unconfigured')
+  encoder.close()
+  t.is(encoder.state, 'closed')
 })
 
-test('exports EncodedVideoChunkType enum', (t) => {
-  t.true(EncodedVideoChunkType.Key === 'Key')
-  t.true(EncodedVideoChunkType.Delta === 'Delta')
+test('EncodedVideoChunkType uses string literals', (t) => {
+  const chunk = new EncodedVideoChunk({
+    type: 'key',
+    timestamp: 0,
+    data: new Uint8Array([0x00]),
+  })
+  t.is(chunk.type, 'key')
 })
 
-test('exports VideoPixelFormat enum', (t) => {
-  t.true(VideoPixelFormat.I420 === 'I420')
-  t.true(VideoPixelFormat.NV12 === 'NV12')
-  t.true(VideoPixelFormat.RGBA === 'RGBA')
-  t.true(VideoPixelFormat.BGRA === 'BGRA')
+test('VideoPixelFormat uses string literals', (t) => {
+  const frame = new VideoFrame(new Uint8Array(4 * 4 * 4), {
+    format: 'RGBA',
+    codedWidth: 4,
+    codedHeight: 4,
+    timestamp: 0,
+  })
+  t.is(frame.format, 'RGBA')
+  frame.close()
 })
 
 // ============================================================================

@@ -9,6 +9,7 @@ mod audio_encoder;
 pub mod codec_string;
 mod encoded_audio_chunk;
 mod encoded_video_chunk;
+pub mod error;
 mod hardware;
 mod image_decoder;
 mod video_decoder;
@@ -25,8 +26,8 @@ pub use encoded_audio_chunk::{
   EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkOutput, EncodedAudioChunkType,
 };
 pub use encoded_video_chunk::{
-  EncodedVideoChunk, EncodedVideoChunkInit, EncodedVideoChunkOutput, EncodedVideoChunkType,
-  VideoDecoderConfig, VideoEncoderConfig,
+  EncodedVideoChunk, EncodedVideoChunkInit, EncodedVideoChunkType, VideoDecoderConfig,
+  VideoEncoderConfig,
 };
 pub use hardware::{
   get_available_hardware_accelerators, get_hardware_accelerators,
@@ -41,6 +42,6 @@ pub use video_encoder::{
   VideoEncoderEncodeOptions, VideoEncoderSupport,
 };
 pub use video_frame::{
-  VideoColorSpace, VideoFrame, VideoFrameCopyToOptions, VideoFrameInit, VideoFrameRect,
-  VideoPixelFormat,
+  DOMRectReadOnly, VideoColorSpace, VideoFrame, VideoFrameBufferInit, VideoFrameCopyToOptions,
+  VideoFrameInit, VideoFrameRect, VideoPixelFormat,
 };

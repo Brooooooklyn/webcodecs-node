@@ -35,9 +35,37 @@ type OutputCallback = ThreadsafeFunction<
 /// Still using default CalleeHandled: true for error-first convention
 type ErrorCallback = ThreadsafeFunction<String>;
 
+#[napi]
 /// Type alias for dequeue callback (no arguments)
 /// Using CalleeHandled: false for direct callbacks
-type DequeueCallback = ThreadsafeFunction<(), UnknownReturnValue, (), Status, false>;
+pub type DequeueCallback = ThreadsafeFunction<(), UnknownReturnValue, (), Status, false>;
+
+/// AudioEncoder init dictionary per WebCodecs spec
+pub struct AudioEncoderInit {
+  /// Output callback - called when encoded chunk is available
+  pub output: OutputCallback,
+  /// Error callback - called when an error occurs
+  pub error: ErrorCallback,
+}
+
+impl FromNapiValue for AudioEncoderInit {
+  unsafe fn from_napi_value(
+    env: napi::sys::napi_env,
+    value: napi::sys::napi_value,
+  ) -> Result<Self> {
+    let obj = Object::from_napi_value(env, value)?;
+
+    let output: OutputCallback = obj
+      .get_named_property("output")
+      .map_err(|_| Error::new(Status::InvalidArg, "Missing required 'output' callback"))?;
+
+    let error: ErrorCallback = obj
+      .get_named_property("error")
+      .map_err(|_| Error::new(Status::InvalidArg, "Missing required 'error' callback"))?;
+
+    Ok(AudioEncoderInit { output, error })
+  }
+}
 
 /// Output callback metadata for audio
 #[napi(object)]
@@ -55,8 +83,8 @@ pub struct AudioDecoderConfigOutput {
   pub sample_rate: Option<u32>,
   /// Number of channels
   pub number_of_channels: Option<u32>,
-  /// Codec description (e.g., AudioSpecificConfig for AAC)
-  pub description: Option<Buffer>,
+  /// Codec description (e.g., AudioSpecificConfig for AAC) - Uint8Array per spec
+  pub description: Option<Uint8Array>,
 }
 
 /// Encode options for audio
@@ -91,14 +119,14 @@ struct AudioEncoderInner {
 ///
 /// Encodes AudioData objects into EncodedAudioChunk objects using FFmpeg.
 ///
-/// Per the WebCodecs spec, the constructor requires callbacks for output and error handling.
+/// Per the WebCodecs spec, the constructor takes an init dictionary with callbacks.
 ///
 /// Example:
 /// ```javascript
-/// const encoder = new AudioEncoder(
-///   (chunk, metadata) => { console.log('encoded chunk', chunk); },
-///   (e) => { console.error('error', e); }
-/// );
+/// const encoder = new AudioEncoder({
+///   output: (chunk, metadata) => { console.log('encoded chunk', chunk); },
+///   error: (e) => { console.error('error', e); }
+/// });
 ///
 /// encoder.configure({
 ///   codec: 'opus',
@@ -116,17 +144,15 @@ pub struct AudioEncoder {
 
 #[napi]
 impl AudioEncoder {
-  /// Create a new AudioEncoder with required callbacks (per WebCodecs spec)
+  /// Create a new AudioEncoder with init dictionary (per WebCodecs spec)
   ///
-  /// @param output - Callback invoked when an encoded chunk is available
-  /// @param error - Callback invoked when an error occurs
+  /// @param init - Init dictionary containing output and error callbacks
   #[napi(constructor)]
   pub fn new(
     #[napi(
-      ts_arg_type = "(chunk: EncodedAudioChunkOutput, metadata: EncodedAudioChunkMetadata) => void"
+      ts_arg_type = "{ output: (chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadata) => void, error: (error: Error) => void }"
     )]
-    output: OutputCallback,
-    #[napi(ts_arg_type = "(error: Error) => void")] error: ErrorCallback,
+    init: AudioEncoderInit,
   ) -> Result<Self> {
     let inner = AudioEncoderInner {
       state: CodecState::Unconfigured,
@@ -138,8 +164,8 @@ impl AudioEncoder {
       extradata_sent: false,
       target_format: AVSampleFormat::Fltp,
       encode_queue_size: 0,
-      output_callback: output,
-      error_callback: error,
+      output_callback: init.output,
+      error_callback: init.error,
       dequeue_callback: None,
     };
 
@@ -243,8 +269,8 @@ impl AudioEncoder {
     let target_format = get_encoder_sample_format(codec_id);
 
     // Configure encoder
-    let sample_rate = config.sample_rate.unwrap_or(48000);
-    let channels = config.number_of_channels.unwrap_or(2);
+    let sample_rate = config.sample_rate;
+    let channels = config.number_of_channels;
 
     let encoder_config = InternalAudioEncoderConfig {
       sample_rate,
@@ -309,8 +335,8 @@ impl AudioEncoder {
     // Get config info
     let (target_sample_rate, target_channels, codec_string) = match inner.config.as_ref() {
       Some(config) => (
-        config.sample_rate.unwrap_or(48000),
-        config.number_of_channels.unwrap_or(2),
+        config.sample_rate,
+        config.number_of_channels,
         config.codec.clone(),
       ),
       None => {
@@ -551,7 +577,7 @@ impl AudioEncoder {
               codec: codec_string.clone(),
               sample_rate: Some(target_sample_rate),
               number_of_channels: Some(target_channels),
-              description: extradata.clone().map(Buffer::from),
+              description: extradata.clone().map(Uint8Array::from),
             }),
           }
         } else {

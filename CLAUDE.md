@@ -16,7 +16,7 @@ src/
 │   ├── types.rs       # AVCodecID, AVPixelFormat, AVRational, etc.
 │   ├── accessors.rs/c # Thin C library for FFmpeg struct field access
 │   ├── avcodec.rs     # Video codec functions
-│   ├── avutil.rs      # Utility functions
+│   ├── avutil.rs      # Utility functions (logging, options)
 │   ├── swscale.rs     # Video scaling/format conversion
 │   ├── swresample.rs  # Audio resampling
 │   └── hwaccel.rs     # Hardware acceleration
@@ -38,8 +38,9 @@ src/
 │   ├── encoded_video_chunk.rs
 │   ├── encoded_audio_chunk.rs
 │   ├── image_decoder.rs    # ImageDecoder class
-│   └── codec_string.rs     # Codec string parsing
-└── lib.rs         # Crate root, re-exports
+│   ├── codec_string.rs     # Codec string parsing
+│   └── error.rs            # DOMException-style errors
+└── lib.rs         # Crate root, module init, re-exports
 
 __test__/          # Test suite (ava)
 ├── helpers/       # Test utilities (frame/audio generators, codec matrix)
@@ -76,14 +77,16 @@ Detection order:
 ## Implemented WebCodecs API
 
 ### Video
-- **VideoFrame**: All pixel formats (I420, I420A, I422, I444, NV12, RGBA, RGBX, BGRA, BGRX)
-- **EncodedVideoChunk**: Key/Delta types
+- **VideoFrame**: All pixel formats (I420, I420A, I422, I444, NV12, NV21, RGBA, RGBX, BGRA, BGRX)
+- **EncodedVideoChunk**: Key/Delta types with copyTo()
 - **VideoEncoder**: Callback-based API, bitrateMode, latencyMode, scalabilityMode
 - **VideoDecoder**: Full implementation with callback API
+- **VideoColorSpace**: Class with constructor and clone() method
+- **DOMRectReadOnly**: For codedRect/visibleRect properties
 
 ### Audio
-- **AudioData**: All sample formats (U8, S16, S32, F32, planar variants)
-- **EncodedAudioChunk**: Key/Delta types
+- **AudioData**: All sample formats (u8, s16, s32, f32, planar variants)
+- **EncodedAudioChunk**: Key/Delta types with copyTo()
 - **AudioEncoder**: Callback-based API, AAC/Opus/MP3/FLAC support
 - **AudioDecoder**: Full implementation
 
@@ -97,7 +100,7 @@ Detection order:
 - `isHardwareAcceleratorAvailable(name)` - Check specific
 
 ### Supported Codecs
-- **Video**: H.264 (avc1), H.265 (hev1/hvc1), VP8, VP9 (vp09), AV1 (av01), ProRes
+- **Video**: H.264 (avc1), H.265 (hev1/hvc1), VP8, VP9 (vp09), AV1 (av01)
 - **Audio**: AAC (mp4a.40.2), Opus, MP3, FLAC, Vorbis, ALAC, PCM variants
 
 ## Key Files
@@ -108,61 +111,105 @@ Detection order:
 | `src/webcodecs/video_decoder.rs` | VideoDecoder implementation |
 | `src/webcodecs/audio_encoder.rs` | AudioEncoder with callback API |
 | `src/webcodecs/audio_decoder.rs` | AudioDecoder implementation |
+| `src/webcodecs/video_frame.rs` | VideoFrame with fromVideoFrame() factory |
+| `src/webcodecs/audio_data.rs` | AudioData with sync copyTo() |
+| `src/webcodecs/error.rs` | DOMException-style error helpers |
 | `src/webcodecs/codec_string.rs` | Codec string parser (avc1, vp09, av01, hev1) |
 | `src/codec/context.rs` | FFmpeg encoder/decoder context wrapper |
+| `src/lib.rs` | Module init with FFmpeg log suppression |
 | `build.rs` | FFmpeg detection and static linking |
-| `index.d.ts` | TypeScript type definitions (~900 lines) |
+| `index.d.ts` | TypeScript type definitions (~1000 lines) |
 
-## Callback API Pattern
+## Callback API Pattern (W3C Compliant)
 
-All encoders/decoders use W3C-compliant callback-based constructors:
+All encoders/decoders use W3C-compliant init dictionary constructors:
 
 ```typescript
-// VideoEncoder callback receives tuple: [EncodedVideoChunkOutput, metadata]
-const encoder = new VideoEncoder(
-  (result: [EncodedVideoChunkOutput, EncodedVideoChunkMetadata]) => {
-    const [chunk, metadata] = result;
-    // chunk has: type, timestamp, duration, data
+// VideoEncoder - init dictionary with output and error callbacks
+const encoder = new VideoEncoder({
+  output: (chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadata) => {
+    // chunk is actual EncodedVideoChunk instance
   },
-  (error: Error) => { /* error callback */ }
-);
+  error: (error: Error) => { /* error callback */ }
+});
 
-// AudioEncoder callback receives tuple: (EncodedAudioChunk, metadata)
-const audioEncoder = new AudioEncoder(
-  (chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadata) => {
-    // Note: callback signature differs from VideoEncoder
+// AudioEncoder - same pattern
+const audioEncoder = new AudioEncoder({
+  output: (chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadata) => {
+    // chunk is actual EncodedAudioChunk instance
   },
-  (error: Error) => { /* error callback */ }
-);
+  error: (error: Error) => { /* error callback */ }
+});
+
+// VideoDecoder
+const decoder = new VideoDecoder({
+  output: (frame: VideoFrame) => { /* handle decoded frame */ },
+  error: (error: Error) => { /* error callback */ }
+});
+
+// AudioDecoder
+const audioDecoder = new AudioDecoder({
+  output: (data: AudioData) => { /* handle decoded audio */ },
+  error: (error: Error) => { /* error callback */ }
+});
+```
+
+## AudioData Constructor (W3C Compliant)
+
+Data is INSIDE the init object per spec:
+
+```typescript
+const audioData = new AudioData({
+  data: new Uint8Array(samples),  // data inside init
+  format: 'f32-planar',
+  sampleRate: 48000,
+  numberOfFrames: 1024,
+  numberOfChannels: 2,
+  timestamp: 0
+});
+```
+
+## VideoFrame Constructors
+
+```typescript
+// Buffer-based constructor
+const frame = new VideoFrame(data, {
+  format: 'I420',
+  codedWidth: 1920,
+  codedHeight: 1080,
+  timestamp: 0
+});
+
+// Clone from existing frame (factory method)
+const cloned = VideoFrame.fromVideoFrame(sourceFrame, { timestamp: newTs });
 ```
 
 ## Test Structure
 
 - **15 test files** (~3000+ lines)
+- **257 tests** all passing
 - Test helpers in `__test__/helpers/` for frame/audio generation
 - Integration tests for roundtrip, lifecycle, multi-codec, performance
 
 ## Known Issues
 
-### Test Failure: `AudioEncoder: encode() single frame`
-**Location:** `__test__/audio-encoder.spec.ts:170`
-**Issue:** Test callback handler doesn't properly destructure the tuple result
-**Expected:** `chunk.type === 'Key'`
-**Actual:** `chunk.type === undefined`
-**Root cause:** AudioEncoder callback passes `(chunk, metadata)` but test treats first arg as chunk directly
+### AV1 SIGSEGV
+**Location:** `__test__/integration/multi-codec.spec.ts`
+**Issue:** Segmentation fault during AV1 encoder/decoder cleanup
+**Status:** Native crash in libaom, not affecting other codecs
 
 ### Pending TODOs
 
 ```
-src/codec/context.rs:317,340  # Set extradata if provided
+src/codec/context.rs:325,348  # Set extradata if provided
 ```
 
 ## Known Limitations
 
-1. **VideoFrame.copyTo() with rect** - rect parameter not implemented
+1. **VideoFrame.visibleRect cropping** - Parameter not implemented, returns error
 2. **Temporal SVC** - Parsing only, layer settings not applied to encoder
 3. **Hardware-accelerated encoding** - Detection works, integration pending
-4. **Codec extradata** - Not fully implemented in encoder context setup
+4. **Duration type** - Using i64 instead of u64 due to NAPI-RS constraints
 
 ## Configuration Options
 
@@ -185,12 +232,12 @@ src/codec/context.rs:317,340  # Set extradata if provided
 ```typescript
 {
   codec: string,           // "opus", "mp4a.40.2", "mp3", "flac"
-  sampleRate?: number,
-  numberOfChannels?: number,
+  sampleRate: number,      // REQUIRED
+  numberOfChannels: number, // REQUIRED
   bitrate?: number,
-  // Opus-specific options
+  // Opus-specific options (non-standard extensions)
   complexity?: number,
-  opus_application?: "voip" | "audio" | "lowdelay",
+  opusApplication?: "voip" | "audio" | "lowdelay",
 }
 ```
 
@@ -200,7 +247,13 @@ src/codec/context.rs:317,340  # Set extradata if provided
 - Linux (x86_64, aarch64)
 - Windows (x86_64, aarch64)
 
-## Feature Flags
+## Spec Compliance Notes
 
-- `hwaccel` - Hardware acceleration support
-- `ffmpeg_5_1` - FFmpeg 5.1+ API (AVChannelLayout)
+| Feature | Spec | Implementation |
+|---------|------|----------------|
+| VideoFrame.copyTo() | Promise<PlaneLayout[]> | ✅ Async |
+| AudioData.copyTo() | void (sync) | ✅ Sync |
+| AudioData.allocationSize() | options required | ✅ Required |
+| Encoder callbacks | (chunk, metadata?) | ✅ Spread args |
+| AudioData constructor | data in init | ✅ Inside init |
+| Enum casing | lowercase | ✅ "key", "unconfigured" |
