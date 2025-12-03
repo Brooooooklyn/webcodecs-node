@@ -75,8 +75,8 @@ pub struct EncodedAudioChunkMetadata {
 pub struct AudioDecoderConfigOutput {
   /// Codec string
   pub codec: String,
-  /// Sample rate
-  pub sample_rate: Option<u32>,
+  /// Sample rate - W3C spec uses float
+  pub sample_rate: Option<f64>,
   /// Number of channels
   pub number_of_channels: Option<u32>,
   /// Codec description (e.g., AudioSpecificConfig for AAC) - Uint8Array per spec
@@ -375,7 +375,7 @@ impl AudioEncoder {
             .config
             .as_ref()
             .map(|c| (c.sample_rate, c.number_of_channels))
-            .unwrap_or((48000, 2));
+            .unwrap_or((48000.0, 2));
 
           EncodedAudioChunkMetadata {
             decoder_config: Some(AudioDecoderConfigOutput {
@@ -600,8 +600,8 @@ impl AudioEncoder {
     // Determine target sample format based on codec
     let target_format = get_encoder_sample_format(codec_id);
 
-    // Configure encoder
-    let sample_rate = config.sample_rate;
+    // Configure encoder (cast f64 sample_rate to u32 for FFmpeg)
+    let sample_rate = config.sample_rate as u32;
     let channels = config.number_of_channels;
 
     let encoder_config = InternalAudioEncoderConfig {
@@ -706,8 +706,10 @@ impl AudioEncoder {
         }
       };
 
-      // Check if we need resampling
-      let needs_resampling = src_sample_rate != target_sample_rate
+      // Check if we need resampling (compare as u32 for FFmpeg)
+      let src_sample_rate_u32 = src_sample_rate as u32;
+      let target_sample_rate_u32 = target_sample_rate as u32;
+      let needs_resampling = src_sample_rate_u32 != target_sample_rate_u32
         || src_channels != target_channels
         || src_format.to_av_format() != inner.target_format;
 
@@ -715,10 +717,10 @@ impl AudioEncoder {
       if needs_resampling && inner.resampler.is_none() {
         match Resampler::new(
           src_channels,
-          src_sample_rate,
+          src_sample_rate_u32,
           src_format.to_av_format(),
           target_channels,
-          target_sample_rate,
+          target_sample_rate_u32,
           inner.target_format,
         ) {
           Ok(resampler) => inner.resampler = Some(resampler),

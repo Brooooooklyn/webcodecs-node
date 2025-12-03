@@ -34,11 +34,23 @@ pub enum CodecState {
   Closed,
 }
 
+/// SVC (Scalable Video Coding) output metadata (W3C WebCodecs spec)
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct SvcOutputMetadata {
+  /// Temporal layer ID for this frame
+  pub temporal_layer_id: Option<u32>,
+}
+
 /// Output callback metadata per WebCodecs spec
 #[napi(object)]
 pub struct EncodedVideoChunkMetadata {
   /// Decoder configuration for this chunk (only present for keyframes)
   pub decoder_config: Option<VideoDecoderConfigOutput>,
+  /// SVC metadata (temporal layer info)
+  pub svc: Option<SvcOutputMetadata>,
+  /// Alpha channel side data (when alpha option is "keep")
+  pub alpha_side_data: Option<Uint8Array>,
 }
 
 /// Decoder configuration output (for passing to decoder)
@@ -54,12 +66,56 @@ pub struct VideoDecoderConfigOutput {
   pub description: Option<Uint8Array>,
 }
 
+// ============================================================================
+// Codec-Specific Encode Options (W3C WebCodecs Codec Registry)
+// ============================================================================
+
+/// AVC (H.264) encode options (W3C WebCodecs AVC Registration)
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct VideoEncoderEncodeOptionsForAvc {
+  /// Per-frame quantizer (0-51, lower = higher quality)
+  pub quantizer: Option<u16>,
+}
+
+/// HEVC (H.265) encode options (W3C WebCodecs HEVC Registration)
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct VideoEncoderEncodeOptionsForHevc {
+  /// Per-frame quantizer (0-51, lower = higher quality)
+  pub quantizer: Option<u16>,
+}
+
+/// VP9 encode options (W3C WebCodecs VP9 Registration)
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct VideoEncoderEncodeOptionsForVp9 {
+  /// Per-frame quantizer (0-63, lower = higher quality)
+  pub quantizer: Option<u16>,
+}
+
+/// AV1 encode options (W3C WebCodecs AV1 Registration)
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct VideoEncoderEncodeOptionsForAv1 {
+  /// Per-frame quantizer (0-63, lower = higher quality)
+  pub quantizer: Option<u16>,
+}
+
 /// Encode options per WebCodecs spec
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
 pub struct VideoEncoderEncodeOptions {
   /// Force this frame to be a keyframe
   pub key_frame: Option<bool>,
+  /// AVC (H.264) codec-specific options
+  pub avc: Option<VideoEncoderEncodeOptionsForAvc>,
+  /// HEVC (H.265) codec-specific options
+  pub hevc: Option<VideoEncoderEncodeOptionsForHevc>,
+  /// VP9 codec-specific options
+  pub vp9: Option<VideoEncoderEncodeOptionsForVp9>,
+  /// AV1 codec-specific options
+  pub av1: Option<VideoEncoderEncodeOptionsForAv1>,
 }
 
 /// Result of isConfigSupported per WebCodecs spec
@@ -385,10 +441,14 @@ impl VideoEncoder {
             coded_height: Some(height),
             description: extradata.clone().map(Uint8Array::from),
           }),
+          svc: None,
+          alpha_side_data: None,
         }
       } else {
         EncodedVideoChunkMetadata {
           decoder_config: None,
+          svc: None,
+          alpha_side_data: None,
         }
       };
 
@@ -433,6 +493,8 @@ impl VideoEncoder {
       let chunk = EncodedVideoChunk::from_packet(&packet);
       let metadata = EncodedVideoChunkMetadata {
         decoder_config: None,
+        svc: None,
+        alpha_side_data: None,
       };
 
       guard.output_callback.call(

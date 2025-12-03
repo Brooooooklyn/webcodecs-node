@@ -390,10 +390,10 @@ impl AudioDecoder {
       }
     };
 
-    // Configure decoder
+    // Configure decoder (cast f64 sample_rate to u32 for FFmpeg)
     let decoder_config = InternalAudioDecoderConfig {
       codec_id,
-      sample_rate: config.sample_rate,
+      sample_rate: config.sample_rate as u32,
       channels: config.number_of_channels,
       thread_count: 0, // Auto
       extradata: config.description.as_ref().map(|d| d.to_vec()),

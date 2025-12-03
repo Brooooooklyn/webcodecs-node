@@ -67,14 +67,15 @@ pub enum VideoEncoderBitrateMode {
 }
 
 /// Alpha channel handling option (W3C WebCodecs spec)
+/// Default is "discard" per spec
 #[napi(string_enum)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AlphaOption {
   /// Keep alpha channel if present
-  #[default]
   #[napi(value = "keep")]
   Keep,
-  /// Discard alpha channel
+  /// Discard alpha channel (default per W3C spec)
+  #[default]
   #[napi(value = "discard")]
   Discard,
 }
@@ -224,6 +225,52 @@ impl EncodedVideoChunk {
   }
 }
 
+// ============================================================================
+// Codec-Specific Encoder Configurations (W3C WebCodecs Codec Registry)
+// ============================================================================
+
+/// AVC (H.264) bitstream format (W3C WebCodecs AVC Registration)
+#[napi(string_enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AvcBitstreamFormat {
+  /// AVC format with parameter sets in description (ISO 14496-15)
+  #[default]
+  #[napi(value = "avc")]
+  Avc,
+  /// Annex B format with parameter sets in bitstream
+  #[napi(value = "annexb")]
+  Annexb,
+}
+
+/// AVC (H.264) encoder configuration (W3C WebCodecs AVC Registration)
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct AvcEncoderConfig {
+  /// Bitstream format (default: "avc")
+  pub format: Option<AvcBitstreamFormat>,
+}
+
+/// HEVC (H.265) bitstream format (W3C WebCodecs HEVC Registration)
+#[napi(string_enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HevcBitstreamFormat {
+  /// HEVC format with parameter sets in description (ISO 14496-15)
+  #[default]
+  #[napi(value = "hevc")]
+  Hevc,
+  /// Annex B format with parameter sets in bitstream
+  #[napi(value = "annexb")]
+  Annexb,
+}
+
+/// HEVC (H.265) encoder configuration (W3C WebCodecs HEVC Registration)
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct HevcEncoderConfig {
+  /// Bitstream format (default: "hevc")
+  pub format: Option<HevcBitstreamFormat>,
+}
+
 /// Video encoder configuration (WebCodecs spec)
 /// Note: Codec-specific options are encoded in the codec string per W3C spec
 /// e.g., "avc1.42001E" encodes profile/level, "vp09.00.10.08" encodes profile/level/depth
@@ -256,6 +303,10 @@ pub struct VideoEncoderConfig {
   pub scalability_mode: Option<String>,
   /// Content hint for encoder optimization
   pub content_hint: Option<String>,
+  /// AVC (H.264) codec-specific configuration
+  pub avc: Option<AvcEncoderConfig>,
+  /// HEVC (H.265) codec-specific configuration
+  pub hevc: Option<HevcEncoderConfig>,
 }
 
 /// Video decoder configuration (WebCodecs spec)

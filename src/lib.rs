@@ -56,7 +56,9 @@ pub use webcodecs::{
   EncodedVideoChunkMetadata,
   EncodedVideoChunkType,
   HardwareAccelerator,
+  VideoColorPrimaries,
   VideoColorSpace,
+  VideoColorSpaceInit,
   VideoDecoder,
   VideoDecoderConfig,
   VideoDecoderConfigOutput,
@@ -69,5 +71,7 @@ pub use webcodecs::{
   VideoFrameCopyToOptions,
   VideoFrameInit,
   VideoFrameRect,
+  VideoMatrixCoefficients,
   VideoPixelFormat,
+  VideoTransferCharacteristics,
 };

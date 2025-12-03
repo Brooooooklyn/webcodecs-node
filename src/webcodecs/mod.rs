@@ -22,14 +22,16 @@ pub use audio_encoder::{
   AudioDecoderConfigOutput, AudioEncoder, AudioEncoderEncodeOptions, EncodedAudioChunkMetadata,
 };
 pub use encoded_audio_chunk::{
-  AudioDecoderConfig, AudioDecoderSupport, AudioEncoderConfig, AudioEncoderSupport, BitrateMode,
-  EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkType,
+  AacBitstreamFormat, AacEncoderConfig, AudioDecoderConfig, AudioDecoderSupport,
+  AudioEncoderConfig, AudioEncoderSupport, BitrateMode, EncodedAudioChunk, EncodedAudioChunkInit,
+  EncodedAudioChunkType, FlacEncoderConfig, OpusApplication, OpusBitstreamFormat,
+  OpusEncoderConfig, OpusSignal,
 };
 pub(crate) use encoded_video_chunk::EncodedVideoChunkInner;
 pub use encoded_video_chunk::{
-  AlphaOption, EncodedVideoChunk, EncodedVideoChunkInit, EncodedVideoChunkType,
-  HardwareAcceleration, LatencyMode, VideoDecoderConfig, VideoEncoderBitrateMode,
-  VideoEncoderConfig,
+  AlphaOption, AvcBitstreamFormat, AvcEncoderConfig, EncodedVideoChunk, EncodedVideoChunkInit,
+  EncodedVideoChunkType, HardwareAcceleration, HevcBitstreamFormat, HevcEncoderConfig, LatencyMode,
+  VideoDecoderConfig, VideoEncoderBitrateMode, VideoEncoderConfig,
 };
 pub use hardware::{
   get_available_hardware_accelerators, get_hardware_accelerators,
@@ -40,10 +42,12 @@ pub use image_decoder::{
 };
 pub use video_decoder::{VideoDecoder, VideoDecoderSupport};
 pub use video_encoder::{
-  CodecState, EncodedVideoChunkMetadata, VideoDecoderConfigOutput, VideoEncoder,
-  VideoEncoderEncodeOptions, VideoEncoderSupport,
+  CodecState, EncodedVideoChunkMetadata, SvcOutputMetadata, VideoDecoderConfigOutput, VideoEncoder,
+  VideoEncoderEncodeOptions, VideoEncoderEncodeOptionsForAv1, VideoEncoderEncodeOptionsForAvc,
+  VideoEncoderEncodeOptionsForHevc, VideoEncoderEncodeOptionsForVp9, VideoEncoderSupport,
 };
 pub use video_frame::{
-  DOMRectReadOnly, VideoColorSpace, VideoFrame, VideoFrameBufferInit, VideoFrameCopyToOptions,
-  VideoFrameInit, VideoFrameMetadata, VideoFrameRect, VideoPixelFormat,
+  DOMRectReadOnly, VideoColorPrimaries, VideoColorSpace, VideoColorSpaceInit, VideoFrame,
+  VideoFrameBufferInit, VideoFrameCopyToOptions, VideoFrameInit, VideoFrameMetadata,
+  VideoFrameRect, VideoMatrixCoefficients, VideoPixelFormat, VideoTransferCharacteristics,
 };

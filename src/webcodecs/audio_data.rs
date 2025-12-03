@@ -100,8 +100,8 @@ impl AudioSampleFormat {
 pub struct AudioDataInit {
   /// Sample format (required)
   pub format: AudioSampleFormat,
-  /// Sample rate in Hz (required)
-  pub sample_rate: u32,
+  /// Sample rate in Hz (required) - W3C spec uses float
+  pub sample_rate: f64,
   /// Number of frames (samples per channel) (required)
   pub number_of_frames: u32,
   /// Number of channels (required)
@@ -153,12 +153,14 @@ impl AudioData {
   pub fn new(init: AudioDataInit) -> Result<Self> {
     let av_format = init.format.to_av_format();
     let data = init.data.as_ref();
+    // Convert sample_rate from f64 to u32 for FFmpeg (internally uses integer)
+    let sample_rate_u32 = init.sample_rate as u32;
 
     // Create internal frame
     let mut frame = Frame::new_audio(
       init.number_of_frames,
       init.number_of_channels,
-      init.sample_rate,
+      sample_rate_u32,
       av_format,
     )
     .map_err(|e| {
@@ -269,16 +271,16 @@ impl AudioData {
     Ok(inner.as_ref().map(|i| i.format))
   }
 
-  /// Get sample rate in Hz
+  /// Get sample rate in Hz (W3C spec uses float)
   #[napi(getter)]
-  pub fn sample_rate(&self) -> Result<u32> {
+  pub fn sample_rate(&self) -> Result<f64> {
     let inner = self
       .inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match &*inner {
-      Some(i) => Ok(i.frame.sample_rate()),
+      Some(i) => Ok(i.frame.sample_rate() as f64),
       None => Err(invalid_state_error("AudioData is closed")),
     }
   }

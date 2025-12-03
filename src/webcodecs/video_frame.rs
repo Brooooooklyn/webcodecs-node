@@ -158,16 +158,82 @@ impl VideoPixelFormat {
   }
 }
 
+/// Video color primaries (W3C WebCodecs spec)
+#[napi(string_enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoColorPrimaries {
+  /// BT.709 / sRGB primaries
+  #[napi(value = "bt709")]
+  Bt709,
+  /// BT.470 BG (PAL)
+  #[napi(value = "bt470bg")]
+  Bt470bg,
+  /// SMPTE 170M (NTSC)
+  #[napi(value = "smpte170m")]
+  Smpte170m,
+  /// BT.2020 (UHD)
+  #[napi(value = "bt2020")]
+  Bt2020,
+  /// SMPTE 432 (DCI-P3)
+  #[napi(value = "smpte432")]
+  Smpte432,
+}
+
+/// Video transfer characteristics (W3C WebCodecs spec)
+#[napi(string_enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoTransferCharacteristics {
+  /// BT.709 transfer
+  #[napi(value = "bt709")]
+  Bt709,
+  /// SMPTE 170M transfer
+  #[napi(value = "smpte170m")]
+  Smpte170m,
+  /// IEC 61966-2-1 (sRGB)
+  #[napi(value = "iec61966-2-1")]
+  Iec6196621,
+  /// Linear transfer
+  #[napi(value = "linear")]
+  Linear,
+  /// Perceptual Quantizer (HDR)
+  #[napi(value = "pq")]
+  Pq,
+  /// Hybrid Log-Gamma (HDR)
+  #[napi(value = "hlg")]
+  Hlg,
+}
+
+/// Video matrix coefficients (W3C WebCodecs spec)
+#[napi(string_enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoMatrixCoefficients {
+  /// RGB (identity matrix)
+  #[napi(value = "rgb")]
+  Rgb,
+  /// BT.709
+  #[napi(value = "bt709")]
+  Bt709,
+  /// BT.470 BG
+  #[napi(value = "bt470bg")]
+  Bt470bg,
+  /// SMPTE 170M
+  #[napi(value = "smpte170m")]
+  Smpte170m,
+  /// BT.2020 non-constant luminance
+  #[napi(value = "bt2020-ncl")]
+  Bt2020Ncl,
+}
+
 /// VideoColorSpaceInit for constructing VideoColorSpace
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
 pub struct VideoColorSpaceInit {
-  /// Color primaries (e.g., "bt709", "bt2020")
-  pub primaries: Option<String>,
-  /// Transfer function (e.g., "bt709", "srgb", "pq", "hlg")
-  pub transfer: Option<String>,
-  /// Matrix coefficients (e.g., "bt709", "bt2020-ncl")
-  pub matrix: Option<String>,
+  /// Color primaries
+  pub primaries: Option<VideoColorPrimaries>,
+  /// Transfer characteristics
+  pub transfer: Option<VideoTransferCharacteristics>,
+  /// Matrix coefficients
+  pub matrix: Option<VideoMatrixCoefficients>,
   /// Full range flag
   pub full_range: Option<bool>,
 }
@@ -176,9 +242,9 @@ pub struct VideoColorSpaceInit {
 #[napi]
 #[derive(Debug, Clone, Default)]
 pub struct VideoColorSpace {
-  primaries: Option<String>,
-  transfer: Option<String>,
-  matrix: Option<String>,
+  primaries: Option<VideoColorPrimaries>,
+  transfer: Option<VideoTransferCharacteristics>,
+  matrix: Option<VideoMatrixCoefficients>,
   full_range: Option<bool>,
 }
 
@@ -200,20 +266,20 @@ impl VideoColorSpace {
 
   /// Get color primaries
   #[napi(getter)]
-  pub fn primaries(&self) -> Option<String> {
-    self.primaries.clone()
+  pub fn primaries(&self) -> Option<VideoColorPrimaries> {
+    self.primaries
   }
 
   /// Get transfer characteristics
   #[napi(getter)]
-  pub fn transfer(&self) -> Option<String> {
-    self.transfer.clone()
+  pub fn transfer(&self) -> Option<VideoTransferCharacteristics> {
+    self.transfer
   }
 
   /// Get matrix coefficients
   #[napi(getter)]
-  pub fn matrix(&self) -> Option<String> {
-    self.matrix.clone()
+  pub fn matrix(&self) -> Option<VideoMatrixCoefficients> {
+    self.matrix
   }
 
   /// Get full range flag
@@ -226,9 +292,9 @@ impl VideoColorSpace {
   #[napi(js_name = "toJSON")]
   pub fn to_json(&self) -> VideoColorSpaceInit {
     VideoColorSpaceInit {
-      primaries: self.primaries.clone(),
-      transfer: self.transfer.clone(),
-      matrix: self.matrix.clone(),
+      primaries: self.primaries,
+      transfer: self.transfer,
+      matrix: self.matrix,
       full_range: self.full_range,
     }
   }

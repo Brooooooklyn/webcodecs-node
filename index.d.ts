@@ -13,7 +13,7 @@ export declare class AudioData {
   constructor(init: AudioDataInit)
   /** Get sample format */
   get format(): AudioSampleFormat | null
-  /** Get sample rate in Hz */
+  /** Get sample rate in Hz (W3C spec uses float) */
   get sampleRate(): number
   /** Get number of frames (samples per channel) */
   get numberOfFrames(): number
@@ -332,11 +332,11 @@ export declare class VideoColorSpace {
   /** Create a new VideoColorSpace */
   constructor(init?: VideoColorSpaceInit | undefined | null)
   /** Get color primaries */
-  get primaries(): string | null
+  get primaries(): VideoColorPrimaries | null
   /** Get transfer characteristics */
-  get transfer(): string | null
+  get transfer(): VideoTransferCharacteristics | null
   /** Get matrix coefficients */
-  get matrix(): string | null
+  get matrix(): VideoMatrixCoefficients | null
   /** Get full range flag */
   get fullRange(): boolean | null
   /** Convert to JSON-compatible object (W3C spec uses toJSON) */
@@ -544,10 +544,25 @@ export declare class VideoFrame {
   close(): void
 }
 
-/** Alpha channel handling option (W3C WebCodecs spec) */
+/** AAC bitstream format (W3C WebCodecs AAC Registration) */
+export type AacBitstreamFormat = /** Raw AAC frames - metadata in description */
+'aac'|
+/** ADTS frames - metadata in each frame */
+'adts';
+
+/** AAC encoder configuration (W3C WebCodecs AAC Registration) */
+export interface AacEncoderConfig {
+  /** Bitstream format (default: "aac") */
+  format?: AacBitstreamFormat
+}
+
+/**
+ * Alpha channel handling option (W3C WebCodecs spec)
+ * Default is "discard" per spec
+ */
 export type AlphaOption = /** Keep alpha channel if present */
 'keep'|
-/** Discard alpha channel */
+/** Discard alpha channel (default per W3C spec) */
 'discard';
 
 /** Options for copyTo operation */
@@ -569,7 +584,7 @@ export interface AudioDataCopyToOptions {
 export interface AudioDataInit {
   /** Sample format (required) */
   format: AudioSampleFormat
-  /** Sample rate in Hz (required) */
+  /** Sample rate in Hz (required) - W3C spec uses float */
   sampleRate: number
   /** Number of frames (samples per channel) (required) */
   numberOfFrames: number
@@ -587,7 +602,7 @@ export interface AudioDataInit {
 export interface AudioDecoderConfig {
   /** Codec string (e.g., "mp4a.40.2" for AAC-LC, "opus") */
   codec: string
-  /** Sample rate in Hz (required per spec) */
+  /** Sample rate in Hz (required per spec) - W3C spec uses float */
   sampleRate: number
   /** Number of channels (required per spec) */
   numberOfChannels: number
@@ -599,7 +614,7 @@ export interface AudioDecoderConfig {
 export interface AudioDecoderConfigOutput {
   /** Codec string */
   codec: string
-  /** Sample rate */
+  /** Sample rate - W3C spec uses float */
   sampleRate?: number
   /** Number of channels */
   numberOfChannels?: number
@@ -615,15 +630,11 @@ export interface AudioDecoderSupport {
   config: AudioDecoderConfig
 }
 
-/**
- * Audio encoder configuration (WebCodecs spec)
- * Note: Per W3C spec, codec-specific options are not supported at this level.
- * Codec behavior is controlled through the codec string itself.
- */
+/** Audio encoder configuration (WebCodecs spec) */
 export interface AudioEncoderConfig {
   /** Codec string (e.g., "mp4a.40.2" for AAC-LC, "opus") */
   codec: string
-  /** Sample rate in Hz (required per spec) */
+  /** Sample rate in Hz (required per spec) - W3C spec uses float */
   sampleRate: number
   /** Number of channels (required per spec) */
   numberOfChannels: number
@@ -631,6 +642,12 @@ export interface AudioEncoderConfig {
   bitrate?: number
   /** Bitrate mode (W3C spec enum) */
   bitrateMode?: BitrateMode
+  /** Opus codec-specific configuration */
+  opus?: OpusEncoderConfig
+  /** AAC codec-specific configuration */
+  aac?: AacEncoderConfig
+  /** FLAC codec-specific configuration */
+  flac?: FlacEncoderConfig
 }
 
 /** Encode options for audio */
@@ -664,6 +681,18 @@ export type AudioSampleFormat = /** Unsigned 8-bit integer samples| interleaved 
 /** 32-bit float samples| planar */
 'f32-planar';
 
+/** AVC (H.264) bitstream format (W3C WebCodecs AVC Registration) */
+export type AvcBitstreamFormat = /** AVC format with parameter sets in description (ISO 14496-15) */
+'avc'|
+/** Annex B format with parameter sets in bitstream */
+'annexb';
+
+/** AVC (H.264) encoder configuration (W3C WebCodecs AVC Registration) */
+export interface AvcEncoderConfig {
+  /** Bitstream format (default: "avc") */
+  format?: AvcBitstreamFormat
+}
+
 /** Bitrate mode for audio encoding (W3C WebCodecs spec) */
 export type BitrateMode = /** Variable bitrate (default) */
 'variable'|
@@ -680,9 +709,9 @@ export type CodecState = /** Encoder not configured */
 
 /** ColorSpaceConversion for ImageDecoder (W3C WebCodecs spec) */
 export type ColorSpaceConversion = /** Apply default color space conversion (spec default) */
-'Default'|
+'default'|
 /** No color space conversion */
-'None';
+'none';
 
 /** DOMRectInit for specifying regions */
 export interface DOMRectInit {
@@ -742,6 +771,10 @@ export interface EncodedVideoChunkInit {
 export interface EncodedVideoChunkMetadata {
   /** Decoder configuration for this chunk (only present for keyframes) */
   decoderConfig?: VideoDecoderConfigOutput
+  /** SVC metadata (temporal layer info) */
+  svc?: SvcOutputMetadata
+  /** Alpha channel side data (when alpha option is "keep") */
+  alphaSideData?: Uint8Array
 }
 
 /** Type of encoded video chunk */
@@ -749,6 +782,14 @@ export type EncodedVideoChunkType = /** Keyframe - can be decoded independently 
 'key'|
 /** Delta frame - depends on previous frames */
 'delta';
+
+/** FLAC encoder configuration (W3C WebCodecs FLAC Registration) */
+export interface FlacEncoderConfig {
+  /** Block size (0 = auto, default: 0) */
+  blockSize?: number
+  /** Compression level 0-8 (default: 5) */
+  compressLevel?: number
+}
 
 /** Get available hardware accelerators (only those that can be used) */
 export declare function getAvailableHardwareAccelerators(): Array<string>
@@ -777,6 +818,18 @@ export interface HardwareAccelerator {
   available: boolean
 }
 
+/** HEVC (H.265) bitstream format (W3C WebCodecs HEVC Registration) */
+export type HevcBitstreamFormat = /** HEVC format with parameter sets in description (ISO 14496-15) */
+'hevc'|
+/** Annex B format with parameter sets in bitstream */
+'annexb';
+
+/** HEVC (H.265) encoder configuration (W3C WebCodecs HEVC Registration) */
+export interface HevcEncoderConfig {
+  /** Bitstream format (default: "hevc") */
+  format?: HevcBitstreamFormat
+}
+
 /** Image decode options */
 export interface ImageDecodeOptions {
   /** Frame index to decode (for animated images) */
@@ -794,6 +847,51 @@ export type LatencyMode = /** Optimize for quality (default) */
 /** Optimize for low latency */
 'realtime';
 
+/** Opus application mode (W3C WebCodecs Opus Registration) */
+export type OpusApplication = /** Optimize for VoIP (speech intelligibility) */
+'voip'|
+/** Optimize for audio fidelity (default) */
+'audio'|
+/** Minimize coding delay */
+'lowdelay';
+
+/** Opus bitstream format (W3C WebCodecs Opus Registration) */
+export type OpusBitstreamFormat = /** Opus packets (RFC 6716) - no metadata needed for decoding */
+'opus'|
+/** Ogg encapsulation (RFC 7845) - metadata in description */
+'ogg';
+
+/** Opus encoder configuration (W3C WebCodecs Opus Registration) */
+export interface OpusEncoderConfig {
+  /** Bitstream format (default: "opus") */
+  format?: OpusBitstreamFormat
+  /** Signal type hint (default: "auto") */
+  signal?: OpusSignal
+  /** Application mode (default: "audio") */
+  application?: OpusApplication
+  /**
+   * Frame duration in microseconds (default: 20000)
+   * Note: W3C spec uses unsigned long long, but NAPI-RS uses f64 for JS compatibility
+   */
+  frameDuration?: number
+  /** Encoder complexity 0-10 (default: 5 mobile, 9 desktop) */
+  complexity?: number
+  /** Expected packet loss percentage 0-100 (default: 0) */
+  packetlossperc?: number
+  /** Enable in-band FEC (default: false) */
+  useinbandfec?: boolean
+  /** Enable DTX (default: false) */
+  usedtx?: boolean
+}
+
+/** Opus signal type hint (W3C WebCodecs Opus Registration) */
+export type OpusSignal = /** Auto-detect signal type */
+'auto'|
+/** Music signal */
+'music'|
+/** Voice/speech signal */
+'voice';
+
 /** Layout information for a single plane per WebCodecs spec */
 export interface PlaneLayout {
   /** Byte offset from the start of the buffer to the start of the plane */
@@ -802,14 +900,32 @@ export interface PlaneLayout {
   stride: number
 }
 
+/** SVC (Scalable Video Coding) output metadata (W3C WebCodecs spec) */
+export interface SvcOutputMetadata {
+  /** Temporal layer ID for this frame */
+  temporalLayerId?: number
+}
+
+/** Video color primaries (W3C WebCodecs spec) */
+export type VideoColorPrimaries = /** BT.709 / sRGB primaries */
+'bt709'|
+/** BT.470 BG (PAL) */
+'bt470bg'|
+/** SMPTE 170M (NTSC) */
+'smpte170m'|
+/** BT.2020 (UHD) */
+'bt2020'|
+/** SMPTE 432 (DCI-P3) */
+'smpte432';
+
 /** VideoColorSpaceInit for constructing VideoColorSpace */
 export interface VideoColorSpaceInit {
-  /** Color primaries (e.g., "bt709", "bt2020") */
-  primaries?: string
-  /** Transfer function (e.g., "bt709", "srgb", "pq", "hlg") */
-  transfer?: string
-  /** Matrix coefficients (e.g., "bt709", "bt2020-ncl") */
-  matrix?: string
+  /** Color primaries */
+  primaries?: VideoColorPrimaries
+  /** Transfer characteristics */
+  transfer?: VideoTransferCharacteristics
+  /** Matrix coefficients */
+  matrix?: VideoMatrixCoefficients
   /** Full range flag */
   fullRange?: boolean
 }
@@ -896,12 +1012,48 @@ export interface VideoEncoderConfig {
   scalabilityMode?: string
   /** Content hint for encoder optimization */
   contentHint?: string
+  /** AVC (H.264) codec-specific configuration */
+  avc?: AvcEncoderConfig
+  /** HEVC (H.265) codec-specific configuration */
+  hevc?: HevcEncoderConfig
 }
 
 /** Encode options per WebCodecs spec */
 export interface VideoEncoderEncodeOptions {
   /** Force this frame to be a keyframe */
   keyFrame?: boolean
+  /** AVC (H.264) codec-specific options */
+  avc?: VideoEncoderEncodeOptionsForAvc
+  /** HEVC (H.265) codec-specific options */
+  hevc?: VideoEncoderEncodeOptionsForHevc
+  /** VP9 codec-specific options */
+  vp9?: VideoEncoderEncodeOptionsForVp9
+  /** AV1 codec-specific options */
+  av1?: VideoEncoderEncodeOptionsForAv1
+}
+
+/** AV1 encode options (W3C WebCodecs AV1 Registration) */
+export interface VideoEncoderEncodeOptionsForAv1 {
+  /** Per-frame quantizer (0-63, lower = higher quality) */
+  quantizer?: number
+}
+
+/** AVC (H.264) encode options (W3C WebCodecs AVC Registration) */
+export interface VideoEncoderEncodeOptionsForAvc {
+  /** Per-frame quantizer (0-51, lower = higher quality) */
+  quantizer?: number
+}
+
+/** HEVC (H.265) encode options (W3C WebCodecs HEVC Registration) */
+export interface VideoEncoderEncodeOptionsForHevc {
+  /** Per-frame quantizer (0-51, lower = higher quality) */
+  quantizer?: number
+}
+
+/** VP9 encode options (W3C WebCodecs VP9 Registration) */
+export interface VideoEncoderEncodeOptionsForVp9 {
+  /** Per-frame quantizer (0-63, lower = higher quality) */
+  quantizer?: number
 }
 
 /** Result of isConfigSupported per WebCodecs spec */
@@ -995,6 +1147,18 @@ export interface VideoFrameRect {
   height: number
 }
 
+/** Video matrix coefficients (W3C WebCodecs spec) */
+export type VideoMatrixCoefficients = /** RGB (identity matrix) */
+'rgb'|
+/** BT.709 */
+'bt709'|
+/** BT.470 BG */
+'bt470bg'|
+/** SMPTE 170M */
+'smpte170m'|
+/** BT.2020 non-constant luminance */
+'bt2020-ncl';
+
 /** Video pixel format (WebCodecs spec) */
 export type VideoPixelFormat = /** Planar YUV 4:2:0| 12bpp| (1 Cr & Cb sample per 2x2 Y samples) */
 'I420'|
@@ -1038,3 +1202,17 @@ export type VideoPixelFormat = /** Planar YUV 4:2:0| 12bpp| (1 Cr & Cb sample pe
 'BGRA'|
 /** BGRX 32bpp (alpha ignored) */
 'BGRX';
+
+/** Video transfer characteristics (W3C WebCodecs spec) */
+export type VideoTransferCharacteristics = /** BT.709 transfer */
+'bt709'|
+/** SMPTE 170M transfer */
+'smpte170m'|
+/** IEC 61966-2-1 (sRGB) */
+'iec61966-2-1'|
+/** Linear transfer */
+'linear'|
+/** Perceptual Quantizer (HDR) */
+'pq'|
+/** Hybrid Log-Gamma (HDR) */
+'hlg';

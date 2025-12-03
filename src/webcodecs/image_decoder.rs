@@ -25,8 +25,10 @@ const READY_PROMISE: &str = "[[ready]]";
 pub enum ColorSpaceConversion {
   /// Apply default color space conversion (spec default)
   #[default]
+  #[napi(value = "default")]
   Default,
   /// No color space conversion
+  #[napi(value = "none")]
   None,
 }
 

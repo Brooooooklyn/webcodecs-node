@@ -198,22 +198,129 @@ impl EncodedAudioChunk {
   }
 }
 
+// ============================================================================
+// Codec-Specific Audio Encoder Configurations (W3C WebCodecs Codec Registry)
+// ============================================================================
+
+/// Opus bitstream format (W3C WebCodecs Opus Registration)
+#[napi(string_enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpusBitstreamFormat {
+  /// Opus packets (RFC 6716) - no metadata needed for decoding
+  #[default]
+  #[napi(value = "opus")]
+  Opus,
+  /// Ogg encapsulation (RFC 7845) - metadata in description
+  #[napi(value = "ogg")]
+  Ogg,
+}
+
+/// Opus signal type hint (W3C WebCodecs Opus Registration)
+#[napi(string_enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpusSignal {
+  /// Auto-detect signal type
+  #[default]
+  #[napi(value = "auto")]
+  Auto,
+  /// Music signal
+  #[napi(value = "music")]
+  Music,
+  /// Voice/speech signal
+  #[napi(value = "voice")]
+  Voice,
+}
+
+/// Opus application mode (W3C WebCodecs Opus Registration)
+#[napi(string_enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpusApplication {
+  /// Optimize for VoIP (speech intelligibility)
+  #[napi(value = "voip")]
+  Voip,
+  /// Optimize for audio fidelity (default)
+  #[default]
+  #[napi(value = "audio")]
+  Audio,
+  /// Minimize coding delay
+  #[napi(value = "lowdelay")]
+  Lowdelay,
+}
+
+/// Opus encoder configuration (W3C WebCodecs Opus Registration)
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct OpusEncoderConfig {
+  /// Bitstream format (default: "opus")
+  pub format: Option<OpusBitstreamFormat>,
+  /// Signal type hint (default: "auto")
+  pub signal: Option<OpusSignal>,
+  /// Application mode (default: "audio")
+  pub application: Option<OpusApplication>,
+  /// Frame duration in microseconds (default: 20000)
+  /// Note: W3C spec uses unsigned long long, but NAPI-RS uses f64 for JS compatibility
+  pub frame_duration: Option<f64>,
+  /// Encoder complexity 0-10 (default: 5 mobile, 9 desktop)
+  pub complexity: Option<u32>,
+  /// Expected packet loss percentage 0-100 (default: 0)
+  pub packetlossperc: Option<u32>,
+  /// Enable in-band FEC (default: false)
+  pub useinbandfec: Option<bool>,
+  /// Enable DTX (default: false)
+  pub usedtx: Option<bool>,
+}
+
+/// AAC bitstream format (W3C WebCodecs AAC Registration)
+#[napi(string_enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AacBitstreamFormat {
+  /// Raw AAC frames - metadata in description
+  #[default]
+  #[napi(value = "aac")]
+  Aac,
+  /// ADTS frames - metadata in each frame
+  #[napi(value = "adts")]
+  Adts,
+}
+
+/// AAC encoder configuration (W3C WebCodecs AAC Registration)
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct AacEncoderConfig {
+  /// Bitstream format (default: "aac")
+  pub format: Option<AacBitstreamFormat>,
+}
+
+/// FLAC encoder configuration (W3C WebCodecs FLAC Registration)
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct FlacEncoderConfig {
+  /// Block size (0 = auto, default: 0)
+  pub block_size: Option<u32>,
+  /// Compression level 0-8 (default: 5)
+  pub compress_level: Option<u32>,
+}
+
 /// Audio encoder configuration (WebCodecs spec)
-/// Note: Per W3C spec, codec-specific options are not supported at this level.
-/// Codec behavior is controlled through the codec string itself.
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct AudioEncoderConfig {
   /// Codec string (e.g., "mp4a.40.2" for AAC-LC, "opus")
   pub codec: String,
-  /// Sample rate in Hz (required per spec)
-  pub sample_rate: u32,
+  /// Sample rate in Hz (required per spec) - W3C spec uses float
+  pub sample_rate: f64,
   /// Number of channels (required per spec)
   pub number_of_channels: u32,
   /// Target bitrate in bits per second
   pub bitrate: Option<f64>,
   /// Bitrate mode (W3C spec enum)
   pub bitrate_mode: Option<BitrateMode>,
+  /// Opus codec-specific configuration
+  pub opus: Option<OpusEncoderConfig>,
+  /// AAC codec-specific configuration
+  pub aac: Option<AacEncoderConfig>,
+  /// FLAC codec-specific configuration
+  pub flac: Option<FlacEncoderConfig>,
 }
 
 /// Audio decoder configuration (WebCodecs spec)
@@ -221,8 +328,8 @@ pub struct AudioEncoderConfig {
 pub struct AudioDecoderConfig {
   /// Codec string (e.g., "mp4a.40.2" for AAC-LC, "opus")
   pub codec: String,
-  /// Sample rate in Hz (required per spec)
-  pub sample_rate: u32,
+  /// Sample rate in Hz (required per spec) - W3C spec uses float
+  pub sample_rate: f64,
   /// Number of channels (required per spec)
   pub number_of_channels: u32,
   /// Codec-specific description data (e.g., AudioSpecificConfig for AAC) - BufferSource per spec
