@@ -263,3 +263,33 @@ test('ImageDecoder completed getter resolves immediately for buffered data', asy
 
   decoder.close()
 })
+
+test('ImageDecoder tracks.ready resolves after metadata is parsed', async (t) => {
+  const data = readFileSync(join(__dirname, 'fixtures/animated.gif'))
+  const decoder = new ImageDecoder({ data, type: 'image/gif' })
+
+  // Wait for tracks.ready (metadata parsing)
+  await decoder.tracks.ready
+
+  // After ready, frameCount should be populated for animated GIF
+  const track = decoder.tracks.selectedTrack!
+  t.true(track.animated)
+  t.true(track.frameCount > 0, `Expected frameCount > 0 after ready, got ${track.frameCount}`)
+
+  decoder.close()
+})
+
+test('ImageDecoder tracks.ready resolves for static images', async (t) => {
+  const data = readFileSync(join(__dirname, 'fixtures/test.png'))
+  const decoder = new ImageDecoder({ data, type: 'image/png' })
+
+  // Wait for tracks.ready
+  await decoder.tracks.ready
+
+  // Static images should have frameCount = 1
+  const track = decoder.tracks.selectedTrack!
+  t.false(track.animated)
+  t.is(track.frameCount, 1)
+
+  decoder.close()
+})

@@ -262,16 +262,19 @@ export declare class ImageDecoder {
   get complete(): boolean
   /**
    * Promise that resolves when data is fully loaded (per WebCodecs spec)
-   * Since we use buffered data, this resolves immediately
+   * Returns a new promise chained from the stored promise (allows multiple accesses)
    */
-  get completed(): Promise<void>
+  get completed(): Promise<undefined>
   /** Get the MIME type */
   get type(): string
   /** Get the track list */
   get tracks(): ImageTrackList
   /** Decode the image (or a specific frame) */
-  decode(options?: ImageDecodeOptions | undefined | null): Promise<ImageDecodeResult>
-  /** Reset the decoder */
+  decode(this: this, options?: ImageDecodeOptions | undefined | null): Promise<ImageDecodeResult>
+  /**
+   * Reset the decoder
+   * Clears cached frames - next decode() will re-decode from stored data
+   */
   reset(): void
   /** Close the decoder */
   close(): void
@@ -318,10 +321,7 @@ export declare class ImageTrackList {
   get selectedTrack(): ImageTrack | null
   /** Get the selected track index (W3C spec: returns -1 if no track selected) */
   get selectedIndex(): number
-  /**
-   * Promise that resolves when track metadata is available (W3C spec)
-   * Since we use buffered data, this resolves immediately
-   */
+  /** Promise that resolves when track metadata is available (W3C spec) */
   get ready(): Promise<void>
   /** Get track at specified index (W3C spec) */
   item(index: number): ImageTrack | null

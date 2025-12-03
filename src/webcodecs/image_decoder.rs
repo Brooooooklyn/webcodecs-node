@@ -7,10 +7,17 @@ use crate::codec::{CodecContext, DecoderConfig, Packet};
 use crate::ffi::AVCodecID;
 use crate::webcodecs::error::invalid_state_error;
 use crate::webcodecs::VideoFrame;
+use futures::stream::{StreamExt, TryStreamExt};
 use napi::bindgen_prelude::*;
-use napi::tokio_stream::StreamExt;
+use napi::tokio::sync::Notify;
 use napi_derive::napi;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+  atomic::{AtomicBool, Ordering},
+  Arc, Mutex,
+};
+
+const COMPLETED_PROMISE: &str = "[[completed]]";
+const READY_PROMISE: &str = "[[ready]]";
 
 /// ColorSpaceConversion for ImageDecoder (W3C WebCodecs spec)
 #[napi(string_enum)]
@@ -23,19 +30,21 @@ pub enum ColorSpaceConversion {
   None,
 }
 
-/// Data source for ImageDecoder - can be either a Uint8Array or ReadableStream
+/// Data source for ImageDecoder - stores the encoded image data
 pub enum ImageDecoderData {
-  /// Buffered data (Uint8Array)
-  Buffer(Vec<u8>),
-  /// Streaming data (ReadableStream) - data will be read incrementally
-  Stream(Vec<u8>), // Stores collected stream data
+  /// Buffered data (Uint8Array from constructor)
+  Buffer(Uint8Array),
+  /// Collected stream data (Vec<u8> after stream is fully read)
+  Vec(Vec<u8>),
+  /// Empty (data has been consumed or not yet available)
+  Empty,
 }
 
 /// ImageDecoder init options
 /// Per W3C spec, `data` can be either a BufferSource or a ReadableStream
-pub struct ImageDecoderInit {
+pub struct ImageDecoderInit<'env> {
   /// The image data (encoded bytes or stream) - BufferSource | ReadableStream per spec
-  pub data: ImageDecoderData,
+  pub data: Unknown<'env>,
   /// MIME type of the image (e.g., "image/png", "image/jpeg")
   pub mime_type: String,
   /// Color space conversion hint (optional)
@@ -48,7 +57,7 @@ pub struct ImageDecoderInit {
   pub prefer_animation: Option<bool>,
 }
 
-impl FromNapiValue for ImageDecoderInit {
+impl<'env> FromNapiValue for ImageDecoderInit<'env> {
   unsafe fn from_napi_value(
     env: napi::sys::napi_env,
     value: napi::sys::napi_value,
@@ -76,55 +85,7 @@ impl FromNapiValue for ImageDecoderInit {
       result
     };
 
-    // Check if it's a Uint8Array (Buffer)
-    let data = if let Ok(buffer) = Uint8Array::from_napi_value(env, data_napi_value) {
-      ImageDecoderData::Buffer(buffer.to_vec())
-    } else if let Ok(stream) = ReadableStream::<BufferSlice>::from_napi_value(env, data_napi_value)
-    {
-      // It's a ReadableStream - read all data from it
-      // Note: We need to collect the stream data synchronously during construction
-      // This is a limitation - we can't do async in FromNapiValue
-      // For true streaming support, we would need a different API design
-      let reader = stream.read().map_err(|e| {
-        Error::new(
-          Status::GenericFailure,
-          format!("Failed to get stream reader: {}", e),
-        )
-      })?;
-
-      // Collect stream data using a blocking approach
-      // This is not ideal but necessary for the current API design
-      let mut collected = Vec::new();
-      let rt = tokio::runtime::Handle::try_current().map_err(|_| {
-        Error::new(
-          Status::GenericFailure,
-          "ReadableStream requires async runtime",
-        )
-      })?;
-
-      rt.block_on(async {
-        let mut reader = reader;
-        while let Some(chunk) = reader.next().await {
-          match chunk {
-            Ok(data) => collected.extend_from_slice(data.as_ref()),
-            Err(e) => {
-              return Err(Error::new(
-                Status::GenericFailure,
-                format!("Stream read error: {}", e),
-              ))
-            }
-          }
-        }
-        Ok(())
-      })?;
-
-      ImageDecoderData::Stream(collected)
-    } else {
-      return Err(Error::new(
-        Status::InvalidArg,
-        "data must be a Uint8Array or ReadableStream",
-      ));
-    };
+    let data = unsafe { Unknown::from_raw_unchecked(env, data_napi_value) };
 
     Ok(ImageDecoderInit {
       data,
@@ -286,12 +247,18 @@ impl ImageTrack {
 #[napi]
 pub struct ImageTrackList {
   inner: Arc<Mutex<ImageTrackListInner>>,
+  /// Whether track metadata is ready (established)
+  ready: Arc<AtomicBool>,
+  /// Notifier for when ready becomes true
+  ready_notify: Arc<Notify>,
 }
 
 impl Clone for ImageTrackList {
   fn clone(&self) -> Self {
     ImageTrackList {
       inner: self.inner.clone(),
+      ready: self.ready.clone(),
+      ready_notify: self.ready_notify.clone(),
     }
   }
 }
@@ -336,9 +303,14 @@ impl ImageTrackList {
   }
 
   /// Promise that resolves when track metadata is available (W3C spec)
-  /// Since we use buffered data, this resolves immediately
   #[napi(getter)]
   pub async fn ready(&self) -> Result<()> {
+    // Fast path: already ready
+    if self.ready.load(Ordering::Acquire) {
+      return Ok(());
+    }
+    // Wait for notification
+    self.ready_notify.notified().await;
     Ok(())
   }
 
@@ -364,7 +336,7 @@ impl ImageTrackList {
 /// Internal decoder state
 struct ImageDecoderInner {
   /// Original encoded data
-  data: Vec<u8>,
+  data: ImageDecoderData,
   /// MIME type
   mime_type: String,
   /// Codec ID for decoding
@@ -372,7 +344,7 @@ struct ImageDecoderInner {
   /// Decoder context (created on first decode)
   context: Option<CodecContext>,
   /// Whether data is fully buffered (true for Buffer, becomes true for Stream when finished)
-  complete: bool,
+  complete: Arc<AtomicBool>,
   /// Track list
   tracks: ImageTrackList,
   /// Whether decoder is closed
@@ -405,7 +377,7 @@ impl ImageDecoder {
   /// Create a new ImageDecoder
   /// Supports both Uint8Array and ReadableStream as data source per W3C spec
   #[napi(constructor)]
-  pub fn new(init: ImageDecoderInit) -> Result<Self> {
+  pub fn new<'env>(env: &'env Env, mut this: This, init: ImageDecoderInit<'env>) -> Result<Self> {
     // Parse MIME type to codec ID
     let codec_id = parse_mime_type(&init.mime_type)?;
 
@@ -414,6 +386,11 @@ impl ImageDecoder {
 
     // For static images, there's one frame; for animated, we'll detect later
     let frame_count = if animated { 0 } else { 1 };
+
+    // Create async signaling primitives
+    let complete = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(AtomicBool::new(false));
+    let ready_notify = Arc::new(Notify::new());
 
     let track_list_inner = Arc::new(Mutex::new(ImageTrackListInner {
       tracks: vec![ImageTrackData {
@@ -426,28 +403,117 @@ impl ImageDecoder {
 
     let tracks = ImageTrackList {
       inner: track_list_inner,
+      ready: ready.clone(),
+      ready_notify: ready_notify.clone(),
     };
 
-    // Extract data and determine source type
-    let data = match init.data {
-      ImageDecoderData::Buffer(buf) => buf,
-      ImageDecoderData::Stream(buf) => buf,
-    };
-
-    let inner = ImageDecoderInner {
-      data,
-      mime_type: init.mime_type,
+    // Create inner state first so we can share it with async tasks
+    let inner = Arc::new(Mutex::new(ImageDecoderInner {
+      data: ImageDecoderData::Empty,
+      mime_type: init.mime_type.clone(),
       codec_id,
       context: None,
-      complete: true, // Data is complete (collected from stream or buffer)
-      tracks,
+      complete: complete.clone(),
+      tracks: tracks.clone(),
       closed: false,
       cached_frames: None,
-    };
+    }));
 
-    Ok(Self {
-      inner: Arc::new(Mutex::new(inner)),
-    })
+    if let Ok(buf) = unsafe { init.data.cast::<Uint8Array>() } {
+      // Buffer data: store immediately and mark complete
+      {
+        let mut inner_guard = inner
+          .lock()
+          .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+        inner_guard.data = ImageDecoderData::Buffer(buf);
+      }
+      complete.store(true, Ordering::Release);
+
+      // For buffer data: completed resolves immediately (data is already available)
+      let completed_promise = env.spawn_future(async { Ok(()) })?;
+
+      // Spawn pre-parse task for ready promise
+      let inner_clone = inner.clone();
+      let ready_promise = env.spawn_future(async move {
+        let result = spawn_blocking(move || pre_parse_and_cache_frames(&inner_clone)).await;
+
+        match result {
+          Ok(Ok(())) | Ok(Err(_)) | Err(_) => {
+            // Always signal ready, even on error (per W3C spec behavior)
+          }
+        }
+
+        Ok(())
+      })?;
+
+      // Store both promises as non-enumerable properties
+      this.define_properties(&[
+        Property::new()
+          .with_utf8_name(COMPLETED_PROMISE)?
+          .with_value(&completed_promise)
+          .with_property_attributes(PropertyAttributes::default()),
+        Property::new()
+          .with_utf8_name(READY_PROMISE)?
+          .with_value(&ready_promise)
+          .with_property_attributes(PropertyAttributes::default()),
+      ])?;
+    } else if let Ok(stream) = unsafe { init.data.cast::<ReadableStream<Uint8Array>>() } {
+      // Stream data: start collecting asynchronously
+      let reader = stream.read()?;
+      let inner_clone = inner.clone();
+
+      // For stream data: combined promise that does collection + pre-parse
+      // Both completed and ready resolve when this completes (Option A: simpler)
+      let combined_promise = env.spawn_future(async move {
+        // Collect all stream data
+        let stream_data = reader.map(|s| s.map(|c| c.to_vec())).try_concat().await;
+
+        match stream_data {
+          Ok(collected_data) => {
+            // Store collected data in inner
+            {
+              if let Ok(mut inner_guard) = inner_clone.lock() {
+                inner_guard.data = ImageDecoderData::Vec(collected_data);
+                inner_guard.complete.store(true, Ordering::Release);
+              }
+            }
+
+            // Pre-parse metadata and cache frames
+            let result = spawn_blocking(move || pre_parse_and_cache_frames(&inner_clone)).await;
+
+            match result {
+              Ok(Ok(())) | Ok(Err(_)) | Err(_) => {
+                // Always signal ready (done in pre_parse_and_cache_frames)
+              }
+            }
+          }
+          Err(_) => {
+            // Stream error - signal ready_notify to unblock waiters
+            if let Ok(inner_guard) = inner_clone.lock() {
+              inner_guard.tracks.ready_notify.notify_waiters();
+            }
+          }
+        }
+
+        Ok(())
+      })?;
+
+      // Store the combined promise for both completed and ready
+      this.define_properties(&[
+        Property::new()
+          .with_utf8_name(COMPLETED_PROMISE)?
+          .with_value(&combined_promise)
+          .with_property_attributes(PropertyAttributes::default()),
+        Property::new()
+          .with_utf8_name(READY_PROMISE)?
+          .with_value(&combined_promise)
+          .with_property_attributes(PropertyAttributes::default()),
+      ])?;
+    } else {
+      return Err(Error::new(Status::InvalidArg, "Invalid data type"));
+    }
+
+    Ok(Self { inner })
   }
 
   /// Whether the data is fully buffered
@@ -457,15 +523,27 @@ impl ImageDecoder {
       .inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-    Ok(inner.complete)
+    Ok(inner.complete.load(Ordering::Relaxed))
   }
 
   /// Promise that resolves when data is fully loaded (per WebCodecs spec)
-  /// Since we use buffered data, this resolves immediately
+  /// Returns a new promise chained from the stored promise (allows multiple accesses)
   #[napi(getter)]
-  pub async fn completed(&self) -> Result<()> {
-    // For buffered data, we're always complete immediately
-    Ok(())
+  pub fn completed(&self, this: This) -> Result<PromiseRaw<'_, ()>> {
+    // Check if closed
+    {
+      let inner = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+      if inner.closed {
+        return Err(invalid_state_error("ImageDecoder is closed"));
+      }
+    }
+
+    // Get stored promise from this and chain a new promise for this access
+    let promise: PromiseRaw<()> = this.get_named_property(COMPLETED_PROMISE)?;
+    promise.then(|_| Ok(()))
   }
 
   /// Get the MIME type
@@ -490,112 +568,161 @@ impl ImageDecoder {
 
   /// Decode the image (or a specific frame)
   #[napi]
-  pub async fn decode(&self, options: Option<ImageDecodeOptions>) -> Result<ImageDecodeResult> {
-    let mut inner = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+  pub fn decode<'env>(
+    &self,
+    env: &'env Env,
+    this: This,
+    options: Option<ImageDecodeOptions>,
+  ) -> Result<PromiseRaw<'env, ImageDecodeResult>> {
+    // Get ready promise synchronously (before entering async context)
+    let ready_promise: Promise<()> = {
+      let promise_raw: PromiseRaw<()> = this.get_named_property(READY_PROMISE)?;
+      promise_raw.into_sendable_promise()?
+    };
 
-    if inner.closed {
-      return Err(invalid_state_error("ImageDecoder is closed"));
-    }
+    let inner = self.inner.clone();
 
-    let frame_index = options.as_ref().and_then(|o| o.frame_index).unwrap_or(0) as usize;
-
-    // Use cached frames if available, otherwise decode and cache
-    if inner.cached_frames.is_none() {
-      // Create decoder context if not already created
-      if inner.context.is_none() {
-        let mut context = CodecContext::new_decoder(inner.codec_id).map_err(|e| {
-          Error::new(
-            Status::GenericFailure,
-            format!("Failed to create decoder: {}", e),
-          )
-        })?;
-
-        let decoder_config = DecoderConfig {
-          codec_id: inner.codec_id,
-          thread_count: 0,
-          extradata: None,
-        };
-
-        context.configure_decoder(&decoder_config).map_err(|e| {
-          Error::new(
-            Status::GenericFailure,
-            format!("Failed to configure decoder: {}", e),
-          )
-        })?;
-
-        context.open().map_err(|e| {
-          Error::new(
-            Status::GenericFailure,
-            format!("Failed to open decoder: {}", e),
-          )
-        })?;
-
-        inner.context = Some(context);
-      }
-
-      // Clone data before mutable borrow
-      let data = inner.data.clone();
-
-      // Decode all frames from the image data
-      let context = inner.context.as_mut().unwrap();
-      let decoded_frames = decode_image_data(context, &data)?;
-
-      // Update frame_count in track info
-      if !decoded_frames.is_empty() {
-        if let Ok(mut track_inner) = inner.tracks.inner.lock() {
-          if let Some(track) = track_inner.tracks.get_mut(0) {
-            track.frame_count = decoded_frames.len() as u32;
-          }
+    // Spawn async task that first waits for ready, then decodes
+    env.spawn_future(async move {
+      // Check if closed before waiting
+      {
+        let inner_guard = inner
+          .lock()
+          .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+        if inner_guard.closed {
+          return Err(invalid_state_error("ImageDecoder is closed"));
         }
       }
 
-      // Cache the decoded frames
-      inner.cached_frames = Some(decoded_frames);
-    }
+      // Wait for ready promise (ensures initial pre-parsing is complete)
+      ready_promise.await?;
 
-    // Get reference to cached frames
-    let frames = inner.cached_frames.as_ref().unwrap();
+      // Now do the actual decode in a blocking task
+      spawn_blocking(move || {
+        let mut inner = inner
+          .lock()
+          .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    // Validate frame_index
-    if frames.is_empty() {
-      return Err(Error::new(
-        Status::GenericFailure,
-        "No frames decoded from image",
-      ));
-    }
+        if inner.closed {
+          return Err(invalid_state_error("ImageDecoder is closed"));
+        }
 
-    if frame_index >= frames.len() {
-      return Err(Error::new(
-        Status::InvalidArg,
-        format!(
-          "Frame index {} out of bounds (image has {} frames)",
-          frame_index,
-          frames.len()
-        ),
-      ));
-    }
+        let frame_index = options.as_ref().and_then(|o| o.frame_index).unwrap_or(0) as usize;
 
-    // Clone the requested frame
-    let frame = frames[frame_index].try_clone().map_err(|e| {
-      Error::new(
-        Status::GenericFailure,
-        format!("Failed to clone frame: {}", e),
-      )
-    })?;
+        // If frames were cleared (e.g., by reset), re-decode them
+        if inner.cached_frames.is_none() {
+          // Get the data bytes
+          let data_bytes: Vec<u8> = match &inner.data {
+            ImageDecoderData::Buffer(buf) => buf.as_ref().to_vec(),
+            ImageDecoderData::Vec(vec) => vec.clone(),
+            ImageDecoderData::Empty => {
+              return Err(Error::new(Status::GenericFailure, "No data available"));
+            }
+          };
 
-    let pts = frame.pts();
-    let video_frame = VideoFrame::from_internal(frame, pts, None);
+          // Create decoder context if needed
+          if inner.context.is_none() {
+            let mut context = CodecContext::new_decoder(inner.codec_id).map_err(|e| {
+              Error::new(
+                Status::GenericFailure,
+                format!("Failed to create decoder: {}", e),
+              )
+            })?;
 
-    Ok(ImageDecodeResult {
-      image: video_frame,
-      complete: true,
+            let decoder_config = DecoderConfig {
+              codec_id: inner.codec_id,
+              thread_count: 0,
+              extradata: None,
+            };
+
+            context.configure_decoder(&decoder_config).map_err(|e| {
+              Error::new(
+                Status::GenericFailure,
+                format!("Failed to configure decoder: {}", e),
+              )
+            })?;
+
+            context.open().map_err(|e| {
+              Error::new(
+                Status::GenericFailure,
+                format!("Failed to open decoder: {}", e),
+              )
+            })?;
+
+            inner.context = Some(context);
+          }
+
+          // Decode all frames
+          let context = inner.context.as_mut().unwrap();
+          let frames = decode_image_data(context, &data_bytes)?;
+
+          // Update frame_count
+          if !frames.is_empty() {
+            if let Ok(mut track_inner) = inner.tracks.inner.lock() {
+              if let Some(track) = track_inner.tracks.get_mut(0) {
+                track.frame_count = frames.len() as u32;
+              }
+            }
+          }
+
+          inner.cached_frames = Some(frames);
+        }
+
+        // Get reference to cached frames
+        let frames = inner.cached_frames.as_ref().ok_or_else(|| {
+          Error::new(
+            Status::GenericFailure,
+            "No frames available - decoding may have failed",
+          )
+        })?;
+
+        // Validate frame_index
+        if frames.is_empty() {
+          return Err(Error::new(
+            Status::GenericFailure,
+            "No frames decoded from image",
+          ));
+        }
+
+        if frame_index >= frames.len() {
+          return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+              "Frame index {} out of bounds (image has {} frames)",
+              frame_index,
+              frames.len()
+            ),
+          ));
+        }
+
+        // Clone the requested frame
+        let frame = frames[frame_index].try_clone().map_err(|e| {
+          Error::new(
+            Status::GenericFailure,
+            format!("Failed to clone frame: {}", e),
+          )
+        })?;
+
+        let pts = frame.pts();
+        let video_frame = VideoFrame::from_internal(frame, pts, None);
+
+        Ok(ImageDecodeResult {
+          image: video_frame,
+          complete: true,
+        })
+      })
+      .await
+      .map_err(|join_error| {
+        Error::new(
+          Status::GenericFailure,
+          format!("Decode task failed: {}", join_error),
+        )
+      })?
     })
   }
 
   /// Reset the decoder
+  /// Clears cached frames - next decode() will re-decode from stored data
   #[napi]
   pub fn reset(&self) -> Result<()> {
     let mut inner = self
@@ -633,6 +760,10 @@ impl ImageDecoder {
     inner.context = None;
     inner.cached_frames = None;
     inner.closed = true;
+
+    // Wake any waiters so they can check closed state
+    inner.tracks.ready_notify.notify_waiters();
+
     Ok(())
   }
 
@@ -651,6 +782,92 @@ impl ImageDecoder {
   pub async fn is_type_supported(mime_type: String) -> bool {
     parse_mime_type(&mime_type).is_ok()
   }
+}
+
+/// Pre-parse image and cache decoded frames
+fn pre_parse_and_cache_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
+  let mut inner_guard = inner
+    .lock()
+    .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+  // Check if already closed
+  if inner_guard.closed {
+    inner_guard.tracks.ready.store(true, Ordering::Release);
+    inner_guard.tracks.ready_notify.notify_waiters();
+    return Err(invalid_state_error("ImageDecoder is closed"));
+  }
+
+  // Get the data bytes
+  let data_bytes: Vec<u8> = match &inner_guard.data {
+    ImageDecoderData::Buffer(buf) => buf.as_ref().to_vec(),
+    ImageDecoderData::Vec(vec) => vec.clone(),
+    ImageDecoderData::Empty => {
+      inner_guard.tracks.ready.store(true, Ordering::Release);
+      inner_guard.tracks.ready_notify.notify_waiters();
+      return Err(Error::new(Status::GenericFailure, "No data available"));
+    }
+  };
+
+  let codec_id = inner_guard.codec_id;
+
+  // Create decoder context
+  let mut context = CodecContext::new_decoder(codec_id).map_err(|e| {
+    inner_guard.tracks.ready.store(true, Ordering::Release);
+    inner_guard.tracks.ready_notify.notify_waiters();
+    Error::new(
+      Status::GenericFailure,
+      format!("Failed to create decoder: {}", e),
+    )
+  })?;
+
+  let decoder_config = DecoderConfig {
+    codec_id,
+    thread_count: 0,
+    extradata: None,
+  };
+
+  context.configure_decoder(&decoder_config).map_err(|e| {
+    inner_guard.tracks.ready.store(true, Ordering::Release);
+    inner_guard.tracks.ready_notify.notify_waiters();
+    Error::new(
+      Status::GenericFailure,
+      format!("Failed to configure decoder: {}", e),
+    )
+  })?;
+
+  context.open().map_err(|e| {
+    inner_guard.tracks.ready.store(true, Ordering::Release);
+    inner_guard.tracks.ready_notify.notify_waiters();
+    Error::new(
+      Status::GenericFailure,
+      format!("Failed to open decoder: {}", e),
+    )
+  })?;
+
+  // Decode all frames
+  let frames = decode_image_data(&mut context, &data_bytes).inspect_err(|_e| {
+    inner_guard.tracks.ready.store(true, Ordering::Release);
+    inner_guard.tracks.ready_notify.notify_waiters();
+  })?;
+
+  // Update frame_count in track info
+  if !frames.is_empty() {
+    if let Ok(mut track_inner) = inner_guard.tracks.inner.lock() {
+      if let Some(track) = track_inner.tracks.get_mut(0) {
+        track.frame_count = frames.len() as u32;
+      }
+    }
+  }
+
+  // Cache the decoded frames
+  inner_guard.cached_frames = Some(frames);
+  inner_guard.context = Some(context);
+
+  // Signal ready
+  inner_guard.tracks.ready.store(true, Ordering::Release);
+  inner_guard.tracks.ready_notify.notify_waiters();
+
+  Ok(())
 }
 
 /// Parse MIME type to FFmpeg codec ID

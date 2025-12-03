@@ -15,6 +15,8 @@ crate-type = ["cdylib"]
 napi = { version = "3.0.0", features = ["async", "napi8", "web_stream"] }
 napi-derive = "3.0.0"
 
+futures = "0.3"
+
 # Async runtime
 tokio = { version = "1", features = ["sync", "rt-multi-thread"] }
 
