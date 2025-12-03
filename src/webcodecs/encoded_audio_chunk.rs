@@ -21,6 +21,19 @@ pub enum EncodedAudioChunkType {
   Delta,
 }
 
+/// Bitrate mode for audio encoding (W3C WebCodecs spec)
+#[napi(string_enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BitrateMode {
+  /// Variable bitrate (default)
+  #[default]
+  #[napi(value = "variable")]
+  Variable,
+  /// Constant bitrate
+  #[napi(value = "constant")]
+  Constant,
+}
+
 /// Options for creating an EncodedAudioChunk
 #[napi(object)]
 pub struct EncodedAudioChunkInit {
@@ -34,6 +47,9 @@ pub struct EncodedAudioChunkInit {
   pub duration: Option<i64>,
   /// Encoded data (BufferSource per spec)
   pub data: Uint8Array,
+  /// ArrayBuffers to transfer (W3C spec - ignored in Node.js, we always copy)
+  #[napi(ts_type = "ArrayBuffer[]")]
+  pub transfer: Option<Vec<Uint8Array>>,
 }
 
 /// Internal state for EncodedAudioChunk
@@ -180,7 +196,6 @@ impl EncodedAudioChunk {
       )),
     }
   }
-
 }
 
 /// Audio encoder configuration (WebCodecs spec)
@@ -197,6 +212,8 @@ pub struct AudioEncoderConfig {
   pub number_of_channels: u32,
   /// Target bitrate in bits per second
   pub bitrate: Option<f64>,
+  /// Bitrate mode (W3C spec enum)
+  pub bitrate_mode: Option<BitrateMode>,
 }
 
 /// Audio decoder configuration (WebCodecs spec)

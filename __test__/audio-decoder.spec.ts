@@ -157,7 +157,7 @@ test('AudioDecoder: decode() on unconfigured triggers error callback', (t) => {
   const chunk = new EncodedAudioChunk({
     type: 'key',
     timestamp: 0,
-    data: Buffer.from([0x00, 0x01, 0x02]),
+    data: new Uint8Array([0x00, 0x01, 0x02]),
   })
 
   // decode() on unconfigured decoder should trigger error callback
@@ -182,7 +182,7 @@ test('AudioDecoder: decode() on closed triggers error callback', (t) => {
   const chunk = new EncodedAudioChunk({
     type: 'key',
     timestamp: 0,
-    data: Buffer.from([0x00, 0x01, 0x02]),
+    data: new Uint8Array([0x00, 0x01, 0x02]),
   })
 
   // decode() on closed decoder should trigger error callback

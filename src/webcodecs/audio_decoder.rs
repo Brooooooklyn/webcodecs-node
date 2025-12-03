@@ -32,10 +32,7 @@ type ErrorCallback = ThreadsafeFunction<String, UnknownReturnValue, String, Stat
 /// Commands sent to the worker thread
 enum DecoderCommand {
   /// Decode an audio chunk
-  Decode {
-    data: Vec<u8>,
-    timestamp: i64,
-  },
+  Decode { data: Vec<u8>, timestamp: i64 },
   /// Flush the decoder and send result back via response channel
   Flush(Sender<Result<()>>),
 }
@@ -521,10 +518,7 @@ impl AudioDecoder {
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
       if inner.state == CodecState::Closed {
-        return Err(Error::new(
-          Status::GenericFailure,
-          "Decoder is closed",
-        ));
+        return Err(Error::new(Status::GenericFailure, "Decoder is closed"));
       }
     }
 

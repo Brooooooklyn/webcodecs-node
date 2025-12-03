@@ -110,6 +110,9 @@ pub struct AudioDataInit {
   pub timestamp: i64,
   /// Raw audio sample data (required) - BufferSource per spec
   pub data: Uint8Array,
+  /// ArrayBuffers to transfer (W3C spec - ignored in Node.js, we always copy)
+  #[napi(ts_type = "ArrayBuffer[]")]
+  pub transfer: Option<Vec<Uint8Array>>,
 }
 
 /// Options for copyTo operation
@@ -392,7 +395,11 @@ impl AudioData {
   /// Copy audio data to a buffer (W3C WebCodecs spec)
   /// Note: Per spec, this is SYNCHRONOUS and returns undefined
   #[napi]
-  pub fn copy_to(&self, mut destination: Uint8Array, options: AudioDataCopyToOptions) -> Result<()> {
+  pub fn copy_to(
+    &self,
+    mut destination: Uint8Array,
+    options: AudioDataCopyToOptions,
+  ) -> Result<()> {
     let inner = self
       .inner
       .lock()

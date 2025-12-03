@@ -154,7 +154,11 @@ test('AudioData: allocationSize() returns correct size', (t) => {
   for (const { frames, channels, format } of testCases) {
     const audio = generateSilence(frames, channels, 48000, format, 0)
     const expectedSize = calculateAudioSize(frames, channels, format)
-    t.is(audio.allocationSize({ planeIndex: 0 }), expectedSize, `allocationSize mismatch for ${frames}x${channels} ${format}`)
+    t.is(
+      audio.allocationSize({ planeIndex: 0 }),
+      expectedSize,
+      `allocationSize mismatch for ${frames}x${channels} ${format}`,
+    )
     audio.close()
   }
 })
@@ -182,11 +186,12 @@ test('AudioData: copyTo() preserves data round-trip', (t) => {
 
   // Create source data with a pattern
   const sourceSize = numberOfFrames * numberOfChannels * bytesPerSample
-  const sourceData = Buffer.alloc(sourceSize)
+  const sourceData = new Uint8Array(sourceSize)
+  const view = new DataView(sourceData.buffer)
 
   for (let i = 0; i < numberOfFrames * numberOfChannels; i++) {
     const value = Math.sin((i / (numberOfFrames * numberOfChannels)) * Math.PI * 2)
-    sourceData.writeFloatLE(value, i * bytesPerSample)
+    view.setFloat32(i * bytesPerSample, value, true) // little-endian
   }
 
   const audio = new AudioData({
@@ -195,7 +200,7 @@ test('AudioData: copyTo() preserves data round-trip', (t) => {
     numberOfFrames,
     numberOfChannels,
     timestamp: 0,
-    data: new Uint8Array(sourceData),
+    data: sourceData,
   })
 
   // Extract and compare

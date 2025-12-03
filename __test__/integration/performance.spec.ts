@@ -8,12 +8,7 @@
 import test from 'ava'
 
 import { VideoEncoder, VideoDecoder, VideoFrame } from '../../index.js'
-import {
-  generateSolidColorI420Frame,
-  TestColors,
-  calculateI420Size,
-  type EncodedVideoChunk,
-} from '../helpers/index.js'
+import { generateSolidColorI420Frame, TestColors, calculateI420Size, type EncodedVideoChunk } from '../helpers/index.js'
 import { createEncoderConfig, createDecoderConfig } from '../helpers/codec-matrix.js'
 
 // Helper to create test encoder with callbacks
@@ -203,12 +198,7 @@ test('stress: 4 concurrent encoders', async (t) => {
   const height = 240
   const frameCount = 20
 
-  const encoderData = [
-    createTestEncoder(),
-    createTestEncoder(),
-    createTestEncoder(),
-    createTestEncoder(),
-  ]
+  const encoderData = [createTestEncoder(), createTestEncoder(), createTestEncoder(), createTestEncoder()]
 
   // Configure all
   for (const { encoder } of encoderData) {

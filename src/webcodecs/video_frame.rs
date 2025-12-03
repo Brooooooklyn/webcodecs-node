@@ -14,18 +14,49 @@ use std::sync::{Arc, Mutex};
 #[napi(string_enum)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoPixelFormat {
+  // 8-bit YUV formats
   /// Planar YUV 4:2:0, 12bpp, (1 Cr & Cb sample per 2x2 Y samples)
   I420,
   /// Planar YUV 4:2:0, 12bpp, with alpha plane
   I420A,
   /// Planar YUV 4:2:2, 16bpp
   I422,
+  /// Planar YUV 4:2:2, 16bpp, with alpha plane
+  I422A,
   /// Planar YUV 4:4:4, 24bpp
   I444,
+  /// Planar YUV 4:4:4, 24bpp, with alpha plane
+  I444A,
+
+  // 10-bit YUV formats
+  /// Planar YUV 4:2:0, 10-bit
+  I420P10,
+  /// Planar YUV 4:2:0, 10-bit, with alpha plane
+  I420AP10,
+  /// Planar YUV 4:2:2, 10-bit
+  I422P10,
+  /// Planar YUV 4:2:2, 10-bit, with alpha plane
+  I422AP10,
+  /// Planar YUV 4:4:4, 10-bit
+  I444P10,
+  /// Planar YUV 4:4:4, 10-bit, with alpha plane
+  I444AP10,
+
+  // 12-bit YUV formats
+  /// Planar YUV 4:2:0, 12-bit
+  I420P12,
+  /// Planar YUV 4:2:2, 12-bit
+  I422P12,
+  /// Planar YUV 4:4:4, 12-bit
+  I444P12,
+
+  // Semi-planar formats
   /// Semi-planar YUV 4:2:0, 12bpp (Y plane + interleaved UV)
   NV12,
   /// Semi-planar YUV 4:2:0, 12bpp (Y plane + interleaved VU) - per W3C WebCodecs spec
   NV21,
+
+  // RGB formats
   /// RGBA 32bpp
   RGBA,
   /// RGBX 32bpp (alpha ignored)
@@ -40,14 +71,28 @@ impl VideoPixelFormat {
   /// Convert from FFmpeg pixel format
   pub fn from_av_format(format: AVPixelFormat) -> Option<Self> {
     match format {
+      // 8-bit formats
       AVPixelFormat::Yuv420p => Some(VideoPixelFormat::I420),
       AVPixelFormat::Yuva420p => Some(VideoPixelFormat::I420A),
       AVPixelFormat::Yuv422p => Some(VideoPixelFormat::I422),
+      AVPixelFormat::Yuva422p => Some(VideoPixelFormat::I422A),
       AVPixelFormat::Yuv444p => Some(VideoPixelFormat::I444),
+      AVPixelFormat::Yuva444p => Some(VideoPixelFormat::I444A),
       AVPixelFormat::Nv12 => Some(VideoPixelFormat::NV12),
       AVPixelFormat::Nv21 => Some(VideoPixelFormat::NV21),
       AVPixelFormat::Rgba => Some(VideoPixelFormat::RGBA),
       AVPixelFormat::Bgra => Some(VideoPixelFormat::BGRA),
+      // 10-bit formats
+      AVPixelFormat::Yuv420p10le => Some(VideoPixelFormat::I420P10),
+      AVPixelFormat::Yuv422p10le => Some(VideoPixelFormat::I422P10),
+      AVPixelFormat::Yuv444p10le => Some(VideoPixelFormat::I444P10),
+      AVPixelFormat::Yuva420p10le => Some(VideoPixelFormat::I420AP10),
+      AVPixelFormat::Yuva422p10le => Some(VideoPixelFormat::I422AP10),
+      AVPixelFormat::Yuva444p10le => Some(VideoPixelFormat::I444AP10),
+      // 12-bit formats
+      AVPixelFormat::Yuv420p12le => Some(VideoPixelFormat::I420P12),
+      AVPixelFormat::Yuv422p12le => Some(VideoPixelFormat::I422P12),
+      AVPixelFormat::Yuv444p12le => Some(VideoPixelFormat::I444P12),
       _ => None,
     }
   }
@@ -55,25 +100,56 @@ impl VideoPixelFormat {
   /// Convert to FFmpeg pixel format
   pub fn to_av_format(&self) -> AVPixelFormat {
     match self {
+      // 8-bit formats
       VideoPixelFormat::I420 => AVPixelFormat::Yuv420p,
       VideoPixelFormat::I420A => AVPixelFormat::Yuva420p,
       VideoPixelFormat::I422 => AVPixelFormat::Yuv422p,
+      VideoPixelFormat::I422A => AVPixelFormat::Yuva422p,
       VideoPixelFormat::I444 => AVPixelFormat::Yuv444p,
+      VideoPixelFormat::I444A => AVPixelFormat::Yuva444p,
       VideoPixelFormat::NV12 => AVPixelFormat::Nv12,
       VideoPixelFormat::NV21 => AVPixelFormat::Nv21,
       VideoPixelFormat::RGBA => AVPixelFormat::Rgba,
       VideoPixelFormat::RGBX => AVPixelFormat::Rgba, // Treat as RGBA
       VideoPixelFormat::BGRA => AVPixelFormat::Bgra,
       VideoPixelFormat::BGRX => AVPixelFormat::Bgra, // Treat as BGRA
+      // 10-bit formats
+      VideoPixelFormat::I420P10 => AVPixelFormat::Yuv420p10le,
+      VideoPixelFormat::I420AP10 => AVPixelFormat::Yuva420p10le,
+      VideoPixelFormat::I422P10 => AVPixelFormat::Yuv422p10le,
+      VideoPixelFormat::I422AP10 => AVPixelFormat::Yuva422p10le,
+      VideoPixelFormat::I444P10 => AVPixelFormat::Yuv444p10le,
+      VideoPixelFormat::I444AP10 => AVPixelFormat::Yuva444p10le,
+      // 12-bit formats
+      VideoPixelFormat::I420P12 => AVPixelFormat::Yuv420p12le,
+      VideoPixelFormat::I422P12 => AVPixelFormat::Yuv422p12le,
+      VideoPixelFormat::I444P12 => AVPixelFormat::Yuv444p12le,
     }
   }
 
-  /// Get bytes per pixel for packed formats, 1 for planar
+  /// Get bytes per sample for this format (1 for 8-bit, 2 for 10/12-bit)
   pub fn bytes_per_sample(&self) -> usize {
     match self {
-      VideoPixelFormat::I420 | VideoPixelFormat::I420A => 1,
-      VideoPixelFormat::I422 | VideoPixelFormat::I444 => 1,
-      VideoPixelFormat::NV12 | VideoPixelFormat::NV21 => 1,
+      // 8-bit formats
+      VideoPixelFormat::I420
+      | VideoPixelFormat::I420A
+      | VideoPixelFormat::I422
+      | VideoPixelFormat::I422A
+      | VideoPixelFormat::I444
+      | VideoPixelFormat::I444A
+      | VideoPixelFormat::NV12
+      | VideoPixelFormat::NV21 => 1,
+      // 10/12-bit formats use 2 bytes per sample
+      VideoPixelFormat::I420P10
+      | VideoPixelFormat::I420AP10
+      | VideoPixelFormat::I422P10
+      | VideoPixelFormat::I422AP10
+      | VideoPixelFormat::I444P10
+      | VideoPixelFormat::I444AP10
+      | VideoPixelFormat::I420P12
+      | VideoPixelFormat::I422P12
+      | VideoPixelFormat::I444P12 => 2,
+      // RGBA formats: 4 bytes per pixel
       VideoPixelFormat::RGBA
       | VideoPixelFormat::RGBX
       | VideoPixelFormat::BGRA
@@ -242,32 +318,49 @@ impl DOMRectReadOnly {
   }
 }
 
+/// VideoFrameMetadata - metadata associated with a VideoFrame (W3C spec)
+/// Members defined in VideoFrame Metadata Registry - currently empty per spec
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct VideoFrameMetadata {}
+
 /// Options for creating a VideoFrame from buffer data (VideoFrameBufferInit per spec)
 #[napi(object)]
-#[derive(Debug, Clone)]
 pub struct VideoFrameBufferInit {
-  /// Pixel format
+  /// Pixel format (required)
   pub format: VideoPixelFormat,
-  /// Coded width in pixels
+  /// Coded width in pixels (required)
   pub coded_width: u32,
-  /// Coded height in pixels
+  /// Coded height in pixels (required)
   pub coded_height: u32,
-  /// Timestamp in microseconds
+  /// Timestamp in microseconds (required)
   pub timestamp: i64,
   /// Duration in microseconds (optional)
   /// Note: W3C spec uses unsigned long long, but JS number can represent up to 2^53 safely
   pub duration: Option<i64>,
-  /// Display width (defaults to coded_width)
+  /// Layout for input planes (optional, default is tightly-packed)
+  pub layout: Option<Vec<PlaneLayout>>,
+  /// Visible rect within coded size (optional, default is full coded size at 0,0)
+  pub visible_rect: Option<DOMRectInit>,
+  /// Rotation in degrees clockwise (0, 90, 180, 270) - default 0
+  pub rotation: Option<f64>,
+  /// Horizontal flip - default false
+  pub flip: Option<bool>,
+  /// Display width (defaults to visible width or coded_width)
   pub display_width: Option<u32>,
-  /// Display height (defaults to coded_height)
+  /// Display height (defaults to visible height or coded_height)
   pub display_height: Option<u32>,
   /// Color space parameters (uses init object)
   pub color_space: Option<VideoColorSpaceInit>,
+  /// Metadata associated with the frame
+  pub metadata: Option<VideoFrameMetadata>,
+  /// ArrayBuffers to transfer (W3C spec - ignored in Node.js, we always copy)
+  #[napi(ts_type = "ArrayBuffer[]")]
+  pub transfer: Option<Vec<Uint8Array>>,
 }
 
 /// Options for creating a VideoFrame from an image source (VideoFrameInit per spec)
 #[napi(object)]
-#[derive(Debug, Clone)]
 pub struct VideoFrameInit {
   /// Timestamp in microseconds (required per spec when creating from VideoFrame)
   pub timestamp: Option<i64>,
@@ -277,10 +370,16 @@ pub struct VideoFrameInit {
   pub alpha: Option<String>,
   /// Visible rect (optional)
   pub visible_rect: Option<DOMRectInit>,
+  /// Rotation in degrees clockwise (0, 90, 180, 270) - default 0
+  pub rotation: Option<f64>,
+  /// Horizontal flip - default false
+  pub flip: Option<bool>,
   /// Display width (optional)
   pub display_width: Option<u32>,
   /// Display height (optional)
   pub display_height: Option<u32>,
+  /// Metadata associated with the frame
+  pub metadata: Option<VideoFrameMetadata>,
 }
 
 /// Options for copyTo operation
@@ -296,7 +395,7 @@ pub struct VideoFrameCopyToOptions {
 }
 
 /// DOMRectInit for specifying regions
-#[napi(object)]
+#[napi(object, js_name = "DOMRectInit")]
 #[derive(Debug, Clone)]
 pub struct DOMRectInit {
   pub x: Option<f64>,
@@ -332,6 +431,10 @@ struct VideoFrameInner {
   duration_us: Option<i64>,
   display_width: u32,
   display_height: u32,
+  /// Rotation in degrees clockwise (0, 90, 180, 270)
+  rotation: f64,
+  /// Horizontal flip
+  flip: bool,
   color_space: VideoColorSpace,
   closed: bool,
 }
@@ -342,6 +445,16 @@ struct VideoFrameInner {
 #[napi]
 pub struct VideoFrame {
   inner: Arc<Mutex<Option<VideoFrameInner>>>,
+}
+
+/// Parse rotation value per W3C spec algorithm
+/// Rounds to nearest 90 degrees, normalizes to 0-359 range
+fn parse_rotation(rotation: f64) -> f64 {
+  // Round to nearest multiple of 90, ties towards positive infinity
+  let aligned = (rotation / 90.0).round() * 90.0;
+  // Normalize to 0-359 range
+  let full_turns = (aligned / 360.0).floor() * 360.0;
+  aligned - full_turns
 }
 
 #[napi]
@@ -374,8 +487,25 @@ impl VideoFrame {
       frame.set_duration(duration);
     }
 
-    let display_width = init.display_width.unwrap_or(width);
-    let display_height = init.display_height.unwrap_or(height);
+    // Parse rotation and flip per W3C spec
+    let rotation = parse_rotation(init.rotation.unwrap_or(0.0));
+    let flip = init.flip.unwrap_or(false);
+
+    // Display dimensions default to visible/coded dimensions, swapped if rotation is 90/270
+    let display_width = init.display_width.unwrap_or({
+      if rotation == 90.0 || rotation == 270.0 {
+        height
+      } else {
+        width
+      }
+    });
+    let display_height = init.display_height.unwrap_or({
+      if rotation == 90.0 || rotation == 270.0 {
+        width
+      } else {
+        height
+      }
+    });
 
     let color_space = VideoColorSpace::new(init.color_space);
 
@@ -385,6 +515,8 @@ impl VideoFrame {
       duration_us: init.duration,
       display_width,
       display_height,
+      rotation,
+      flip,
       color_space,
       closed: false,
     };
@@ -412,15 +544,16 @@ impl VideoFrame {
         duration: None,
         alpha: None,
         visible_rect: None,
+        rotation: None,
+        flip: None,
         display_width: None,
         display_height: None,
+        metadata: None,
       });
 
       // Apply overrides from init
       let timestamp_us = init.timestamp.unwrap_or(source_inner.timestamp_us);
       let duration_us = init.duration.or(source_inner.duration_us);
-      let display_width = init.display_width.unwrap_or(source_inner.display_width);
-      let display_height = init.display_height.unwrap_or(source_inner.display_height);
 
       // Note: alpha handling and visible_rect cropping are not yet implemented
       // visible_rect would require sub-region copying which is complex
@@ -431,12 +564,32 @@ impl VideoFrame {
         ));
       }
 
+      // Handle rotation per W3C spec "Add Rotations" algorithm
+      let init_rotation = parse_rotation(init.rotation.unwrap_or(0.0));
+      let base_rotation = source_inner.rotation;
+      let base_flip = source_inner.flip;
+      let init_flip = init.flip.unwrap_or(false);
+
+      // Per spec: if baseFlip is false, combined = base + init; else combined = base - init
+      let combined_rotation = if !base_flip {
+        parse_rotation(base_rotation + init_rotation)
+      } else {
+        parse_rotation(base_rotation - init_rotation)
+      };
+      // Per spec: flip is XOR of base and init flip
+      let combined_flip = base_flip != init_flip;
+
+      let display_width = init.display_width.unwrap_or(source_inner.display_width);
+      let display_height = init.display_height.unwrap_or(source_inner.display_height);
+
       let new_inner = VideoFrameInner {
         frame: cloned_frame,
         timestamp_us,
         duration_us,
         display_width,
         display_height,
+        rotation: combined_rotation,
+        flip: combined_flip,
         color_space: source_inner.color_space.clone(),
         closed: false,
       };
@@ -447,7 +600,7 @@ impl VideoFrame {
     })
   }
 
-  /// Create a VideoFrame from an internal Frame (for encoder output)
+  /// Create a VideoFrame from an internal Frame (for decoder output)
   pub fn from_internal(frame: Frame, timestamp_us: i64, duration_us: Option<i64>) -> Self {
     let width = frame.width();
     let height = frame.height();
@@ -458,6 +611,44 @@ impl VideoFrame {
       duration_us,
       display_width: width,
       display_height: height,
+      rotation: 0.0,
+      flip: false,
+      color_space: VideoColorSpace::default(),
+      closed: false,
+    };
+
+    Self {
+      inner: Arc::new(Mutex::new(Some(inner))),
+    }
+  }
+
+  /// Create a VideoFrame from an internal Frame with rotation/flip (for decoder output)
+  pub fn from_internal_with_orientation(
+    frame: Frame,
+    timestamp_us: i64,
+    duration_us: Option<i64>,
+    rotation: f64,
+    flip: bool,
+  ) -> Self {
+    let width = frame.width();
+    let height = frame.height();
+    let parsed_rotation = parse_rotation(rotation);
+
+    // Display dimensions may be swapped based on rotation
+    let (display_width, display_height) = if parsed_rotation == 90.0 || parsed_rotation == 270.0 {
+      (height, width)
+    } else {
+      (width, height)
+    };
+
+    let inner = VideoFrameInner {
+      frame,
+      timestamp_us,
+      duration_us,
+      display_width,
+      display_height,
+      rotation: parsed_rotation,
+      flip,
       color_space: VideoColorSpace::default(),
       closed: false,
     };
@@ -576,6 +767,25 @@ impl VideoFrame {
     Ok(guard.is_none() || guard.as_ref().is_none_or(|i| i.closed))
   }
 
+  /// Get the rotation in degrees clockwise (0, 90, 180, 270) - W3C WebCodecs spec
+  #[napi(getter)]
+  pub fn rotation(&self) -> Result<f64> {
+    self.with_inner(|inner| Ok(inner.rotation))
+  }
+
+  /// Get whether horizontal flip is applied - W3C WebCodecs spec
+  #[napi(getter)]
+  pub fn flip(&self) -> Result<bool> {
+    self.with_inner(|inner| Ok(inner.flip))
+  }
+
+  /// Get the metadata associated with this VideoFrame - W3C WebCodecs spec
+  /// Currently returns an empty metadata object as members are defined in the registry
+  #[napi]
+  pub fn metadata(&self) -> Result<VideoFrameMetadata> {
+    self.with_inner(|_inner| Ok(VideoFrameMetadata {}))
+  }
+
   /// Calculate the allocation size needed for copyTo
   #[napi]
   pub fn allocation_size(&self, options: Option<VideoFrameCopyToOptions>) -> Result<u32> {
@@ -618,9 +828,7 @@ impl VideoFrame {
 
       let inner = match guard.as_ref() {
         Some(inner) if !inner.closed => inner,
-        _ => {
-          return Err(invalid_state_error("VideoFrame is closed"))
-        }
+        _ => return Err(invalid_state_error("VideoFrame is closed")),
       };
 
       let format =
@@ -654,9 +862,7 @@ impl VideoFrame {
 
       let inner = match guard.as_ref() {
         Some(inner) if !inner.closed => inner,
-        _ => {
-          return Err(invalid_state_error("VideoFrame is closed"))
-        }
+        _ => return Err(invalid_state_error("VideoFrame is closed")),
       };
 
       // Allocate temporary buffer and copy frame data
@@ -682,15 +888,19 @@ impl VideoFrame {
 
   /// Calculate plane layouts for a given format
   fn get_plane_layouts(format: VideoPixelFormat, width: u32, height: u32) -> Vec<PlaneLayout> {
+    let bps = format.bytes_per_sample() as u32; // bytes per sample (1 for 8-bit, 2 for 10/12-bit)
+
     match format {
-      VideoPixelFormat::I420 => {
-        let y_size = width * height;
-        let uv_stride = width / 2;
+      // 4:2:0 formats (Y, U, V planes)
+      VideoPixelFormat::I420 | VideoPixelFormat::I420P10 | VideoPixelFormat::I420P12 => {
+        let y_stride = width * bps;
+        let y_size = y_stride * height;
+        let uv_stride = (width / 2) * bps;
         let uv_size = uv_stride * (height / 2);
         vec![
           PlaneLayout {
             offset: 0,
-            stride: width,
+            stride: y_stride,
           },
           PlaneLayout {
             offset: y_size,
@@ -702,14 +912,16 @@ impl VideoFrame {
           },
         ]
       }
-      VideoPixelFormat::I420A => {
-        let y_size = width * height;
-        let uv_stride = width / 2;
+      // 4:2:0 with alpha (Y, U, V, A planes)
+      VideoPixelFormat::I420A | VideoPixelFormat::I420AP10 => {
+        let y_stride = width * bps;
+        let y_size = y_stride * height;
+        let uv_stride = (width / 2) * bps;
         let uv_size = uv_stride * (height / 2);
         vec![
           PlaneLayout {
             offset: 0,
-            stride: width,
+            stride: y_stride,
           },
           PlaneLayout {
             offset: y_size,
@@ -721,18 +933,20 @@ impl VideoFrame {
           },
           PlaneLayout {
             offset: y_size + uv_size * 2,
-            stride: width,
+            stride: y_stride,
           },
         ]
       }
-      VideoPixelFormat::I422 => {
-        let y_size = width * height;
-        let uv_stride = width / 2;
+      // 4:2:2 formats (Y, U, V planes)
+      VideoPixelFormat::I422 | VideoPixelFormat::I422P10 | VideoPixelFormat::I422P12 => {
+        let y_stride = width * bps;
+        let y_size = y_stride * height;
+        let uv_stride = (width / 2) * bps;
         let uv_size = uv_stride * height;
         vec![
           PlaneLayout {
             offset: 0,
-            stride: width,
+            stride: y_stride,
           },
           PlaneLayout {
             offset: y_size,
@@ -744,23 +958,74 @@ impl VideoFrame {
           },
         ]
       }
-      VideoPixelFormat::I444 => {
-        let plane_size = width * height;
+      // 4:2:2 with alpha (Y, U, V, A planes)
+      VideoPixelFormat::I422A | VideoPixelFormat::I422AP10 => {
+        let y_stride = width * bps;
+        let y_size = y_stride * height;
+        let uv_stride = (width / 2) * bps;
+        let uv_size = uv_stride * height;
         vec![
           PlaneLayout {
             offset: 0,
-            stride: width,
+            stride: y_stride,
           },
           PlaneLayout {
-            offset: plane_size,
-            stride: width,
+            offset: y_size,
+            stride: uv_stride,
           },
           PlaneLayout {
-            offset: plane_size * 2,
-            stride: width,
+            offset: y_size + uv_size,
+            stride: uv_stride,
+          },
+          PlaneLayout {
+            offset: y_size + uv_size * 2,
+            stride: y_stride,
           },
         ]
       }
+      // 4:4:4 formats (Y, U, V planes)
+      VideoPixelFormat::I444 | VideoPixelFormat::I444P10 | VideoPixelFormat::I444P12 => {
+        let plane_stride = width * bps;
+        let plane_size = plane_stride * height;
+        vec![
+          PlaneLayout {
+            offset: 0,
+            stride: plane_stride,
+          },
+          PlaneLayout {
+            offset: plane_size,
+            stride: plane_stride,
+          },
+          PlaneLayout {
+            offset: plane_size * 2,
+            stride: plane_stride,
+          },
+        ]
+      }
+      // 4:4:4 with alpha (Y, U, V, A planes)
+      VideoPixelFormat::I444A | VideoPixelFormat::I444AP10 => {
+        let plane_stride = width * bps;
+        let plane_size = plane_stride * height;
+        vec![
+          PlaneLayout {
+            offset: 0,
+            stride: plane_stride,
+          },
+          PlaneLayout {
+            offset: plane_size,
+            stride: plane_stride,
+          },
+          PlaneLayout {
+            offset: plane_size * 2,
+            stride: plane_stride,
+          },
+          PlaneLayout {
+            offset: plane_size * 3,
+            stride: plane_stride,
+          },
+        ]
+      }
+      // Semi-planar formats (Y plane + interleaved UV/VU)
       VideoPixelFormat::NV12 | VideoPixelFormat::NV21 => {
         let y_size = width * height;
         vec![
@@ -774,6 +1039,7 @@ impl VideoFrame {
           },
         ]
       }
+      // RGBA formats (single packed plane)
       VideoPixelFormat::RGBA
       | VideoPixelFormat::RGBX
       | VideoPixelFormat::BGRA
@@ -801,6 +1067,8 @@ impl VideoFrame {
         duration_us: inner.duration_us,
         display_width: inner.display_width,
         display_height: inner.display_height,
+        rotation: inner.rotation,
+        flip: inner.flip,
         color_space: inner.color_space.clone(),
         closed: false,
       };
@@ -858,35 +1126,36 @@ impl VideoFrame {
   fn calculate_buffer_size(format: VideoPixelFormat, width: u32, height: u32) -> u32 {
     let w = width;
     let h = height;
+    let bps = format.bytes_per_sample() as u32; // bytes per sample (1 for 8-bit, 2 for 10/12-bit)
 
     match format {
-      VideoPixelFormat::I420 => {
-        // Y plane + U plane + V plane (4:2:0)
-        w * h + (w / 2) * (h / 2) * 2
+      // 4:2:0 formats (Y plane + U plane + V plane)
+      VideoPixelFormat::I420 | VideoPixelFormat::I420P10 | VideoPixelFormat::I420P12 => {
+        (w * h + (w / 2) * (h / 2) * 2) * bps
       }
-      VideoPixelFormat::I420A => {
-        // Y + U + V + A (4:2:0 with alpha)
-        w * h * 2 + (w / 2) * (h / 2) * 2
+      // 4:2:0 with alpha (Y + U + V + A)
+      VideoPixelFormat::I420A | VideoPixelFormat::I420AP10 => {
+        (w * h * 2 + (w / 2) * (h / 2) * 2) * bps
       }
-      VideoPixelFormat::I422 => {
-        // Y plane + U plane + V plane (4:2:2)
-        w * h + (w / 2) * h * 2
+      // 4:2:2 formats (Y + U + V)
+      VideoPixelFormat::I422 | VideoPixelFormat::I422P10 | VideoPixelFormat::I422P12 => {
+        (w * h + (w / 2) * h * 2) * bps
       }
-      VideoPixelFormat::I444 => {
-        // Y + U + V (4:4:4)
-        w * h * 3
+      // 4:2:2 with alpha (Y + U + V + A)
+      VideoPixelFormat::I422A | VideoPixelFormat::I422AP10 => (w * h * 2 + (w / 2) * h * 2) * bps,
+      // 4:4:4 formats (Y + U + V)
+      VideoPixelFormat::I444 | VideoPixelFormat::I444P10 | VideoPixelFormat::I444P12 => {
+        w * h * 3 * bps
       }
-      VideoPixelFormat::NV12 | VideoPixelFormat::NV21 => {
-        // Y plane + interleaved UV/VU plane
-        w * h + w * (h / 2)
-      }
+      // 4:4:4 with alpha (Y + U + V + A)
+      VideoPixelFormat::I444A | VideoPixelFormat::I444AP10 => w * h * 4 * bps,
+      // Semi-planar (Y + interleaved UV/VU)
+      VideoPixelFormat::NV12 | VideoPixelFormat::NV21 => w * h + w * (h / 2),
+      // RGBA formats (4 bytes per pixel)
       VideoPixelFormat::RGBA
       | VideoPixelFormat::RGBX
       | VideoPixelFormat::BGRA
-      | VideoPixelFormat::BGRX => {
-        // 4 bytes per pixel
-        w * h * 4
-      }
+      | VideoPixelFormat::BGRX => w * h * 4,
     }
   }
 

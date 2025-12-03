@@ -6,7 +6,7 @@
  */
 
 import test from 'ava'
-import { VideoEncoder, VideoFrame, VideoDecoder, AudioEncoder, AudioDecoder, AudioData } from '../index.js'
+import { VideoEncoder, VideoFrame, VideoDecoder, AudioEncoder, AudioDecoder } from '../index.js'
 import { type EncodedVideoChunk } from './helpers/index.js'
 
 // Helper to create test encoder with callbacks
@@ -107,7 +107,7 @@ test('VideoEncoderConfig: combined bitrateMode and latencyMode', async (t) => {
 
   // Create and encode a frame to verify encoder works
   // I420 buffer: Y (640*480) + U (320*240) + V (320*240) = 460800 bytes
-  const frameData = Buffer.alloc(640 * 480 + 320 * 240 * 2)
+  const frameData = new Uint8Array(640 * 480 + 320 * 240 * 2)
   const frame = new VideoFrame(frameData, {
     format: 'I420',
     codedWidth: 640,
@@ -136,7 +136,7 @@ test('VideoEncoderConfig: callback mode with output', async (t) => {
 
   // Create and encode some frames
   // I420 buffer: Y (320*240) + U (160*120) + V (160*120) = 115200 bytes
-  const frameData = Buffer.alloc(320 * 240 + 160 * 120 * 2)
+  const frameData = new Uint8Array(320 * 240 + 160 * 120 * 2)
   for (let i = 0; i < 10; i++) {
     const frame = new VideoFrame(frameData, {
       format: 'I420',

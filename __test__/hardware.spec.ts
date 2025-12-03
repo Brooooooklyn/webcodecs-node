@@ -14,11 +14,7 @@ import {
   isHardwareAcceleratorAvailable,
   VideoEncoder,
 } from '../index.js'
-import {
-  generateSolidColorI420Frame,
-  TestColors,
-  type EncodedVideoChunk,
-} from './helpers/index.js'
+import { generateSolidColorI420Frame, TestColors, type EncodedVideoChunk } from './helpers/index.js'
 import { createEncoderConfig } from './helpers/codec-matrix.js'
 
 // Helper to create test encoder with callbacks
@@ -105,9 +101,15 @@ test('getAvailableHardwareAccelerators: matches available flag', (t) => {
 
   for (const accel of all) {
     if (accel.available) {
-      t.true(availableSet.has(accel.name), `${accel.name} marked available but not in getAvailableHardwareAccelerators()`)
+      t.true(
+        availableSet.has(accel.name),
+        `${accel.name} marked available but not in getAvailableHardwareAccelerators()`,
+      )
     } else {
-      t.false(availableSet.has(accel.name), `${accel.name} marked unavailable but in getAvailableHardwareAccelerators()`)
+      t.false(
+        availableSet.has(accel.name),
+        `${accel.name} marked unavailable but in getAvailableHardwareAccelerators()`,
+      )
     }
   }
 })
@@ -214,7 +216,10 @@ test('platform: preferred accelerator matches platform', (t) => {
       break
     case 'win32':
       // Windows could prefer d3d11va, cuda, or qsv
-      t.true(['d3d11va', 'cuda', 'qsv'].includes(preferred), `Windows should prefer d3d11va, cuda, or qsv, got ${preferred}`)
+      t.true(
+        ['d3d11va', 'cuda', 'qsv'].includes(preferred),
+        `Windows should prefer d3d11va, cuda, or qsv, got ${preferred}`,
+      )
       break
     default:
       t.pass(`Unknown platform: ${process.platform}`)

@@ -77,7 +77,7 @@ export function generateSolidColorI420Frame(
 ): VideoFrame {
   const yuv = rgbToYuv(color)
   const bufferSize = calculateI420Size(width, height)
-  const buffer = Buffer.alloc(bufferSize)
+  const buffer = new Uint8Array(bufferSize)
 
   // Y plane
   const ySize = width * height
@@ -100,7 +100,7 @@ export function generateSolidColorI420Frame(
     duration,
   }
 
-  return new VideoFrame(new Uint8Array(buffer), init)
+  return new VideoFrame(buffer, init)
 }
 
 /**
@@ -115,7 +115,7 @@ export function generateSolidColorRGBAFrame(
   duration?: number,
 ): VideoFrame {
   const bufferSize = calculateRGBASize(width, height)
-  const buffer = Buffer.alloc(bufferSize)
+  const buffer = new Uint8Array(bufferSize)
 
   for (let i = 0; i < width * height; i++) {
     const offset = i * 4
@@ -133,7 +133,7 @@ export function generateSolidColorRGBAFrame(
     duration,
   }
 
-  return new VideoFrame(new Uint8Array(buffer), init)
+  return new VideoFrame(buffer, init)
 }
 
 /**
@@ -141,9 +141,14 @@ export function generateSolidColorRGBAFrame(
  *
  * Creates a gradient from black to white horizontally, useful for visual testing.
  */
-export function generateGradientI420Frame(width: number, height: number, timestamp: number, duration?: number): VideoFrame {
+export function generateGradientI420Frame(
+  width: number,
+  height: number,
+  timestamp: number,
+  duration?: number,
+): VideoFrame {
   const bufferSize = calculateI420Size(width, height)
-  const buffer = Buffer.alloc(bufferSize)
+  const buffer = new Uint8Array(bufferSize)
 
   // Y plane - gradient from 16 (black) to 235 (white) in video range
   for (let y = 0; y < height; y++) {
@@ -166,7 +171,7 @@ export function generateGradientI420Frame(width: number, height: number, timesta
     duration,
   }
 
-  return new VideoFrame(new Uint8Array(buffer), init)
+  return new VideoFrame(buffer, init)
 }
 
 /**
@@ -182,7 +187,7 @@ export function generateCheckerboardI420Frame(
   duration?: number,
 ): VideoFrame {
   const bufferSize = calculateI420Size(width, height)
-  const buffer = Buffer.alloc(bufferSize)
+  const buffer = new Uint8Array(bufferSize)
 
   // Y plane - checkerboard pattern
   for (let y = 0; y < height; y++) {
@@ -207,7 +212,7 @@ export function generateCheckerboardI420Frame(
     duration,
   }
 
-  return new VideoFrame(new Uint8Array(buffer), init)
+  return new VideoFrame(buffer, init)
 }
 
 /**
@@ -215,7 +220,12 @@ export function generateCheckerboardI420Frame(
  *
  * Creates vertical color bars useful for codec color fidelity testing.
  */
-export function generateColorBarsI420Frame(width: number, height: number, timestamp: number, duration?: number): VideoFrame {
+export function generateColorBarsI420Frame(
+  width: number,
+  height: number,
+  timestamp: number,
+  duration?: number,
+): VideoFrame {
   const colors = [
     TestColors.white,
     TestColors.yellow,
@@ -228,7 +238,7 @@ export function generateColorBarsI420Frame(width: number, height: number, timest
   ]
 
   const bufferSize = calculateI420Size(width, height)
-  const buffer = Buffer.alloc(bufferSize)
+  const buffer = new Uint8Array(bufferSize)
 
   const barWidth = Math.floor(width / colors.length)
   const ySize = width * height
@@ -271,7 +281,7 @@ export function generateColorBarsI420Frame(width: number, height: number, timest
     duration,
   }
 
-  return new VideoFrame(new Uint8Array(buffer), init)
+  return new VideoFrame(buffer, init)
 }
 
 /**

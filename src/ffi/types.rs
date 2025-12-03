@@ -214,11 +214,13 @@ impl AVCodecID {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AVPixelFormat {
   None = -1,
-  // Planar YUV formats
+  // Planar YUV formats (8-bit)
   Yuv420p = 0,   // I420
   Yuv422p = 4,   // I422
   Yuv444p = 5,   // I444
   Yuva420p = 33, // I420A (with alpha)
+  Yuva422p = 39, // I422A (with alpha)
+  Yuva444p = 40, // I444A (with alpha)
   // Semi-planar formats
   Nv12 = 23,
   Nv21 = 24,
@@ -229,8 +231,18 @@ pub enum AVPixelFormat {
   Rgba = 26,
   Abgr = 27,
   Bgra = 28,
-  // 10-bit formats
-  Yuv420p10le = 64,
+  // 10-bit YUV formats
+  Yuv420p10le = 64, // I420P10
+  Yuv422p10le = 65, // I422P10
+  Yuv444p10le = 68, // I444P10
+  // 12-bit YUV formats
+  Yuv420p12le = 74, // I420P12
+  Yuv422p12le = 75, // I422P12
+  Yuv444p12le = 78, // I444P12
+  // 10-bit YUV with alpha formats
+  Yuva420p10le = 82, // I420AP10
+  Yuva422p10le = 83, // I422AP10
+  Yuva444p10le = 84, // I444AP10
   // Hardware formats
   Videotoolbox = 162,
   Cuda = 119,
@@ -241,13 +253,28 @@ impl AVPixelFormat {
   /// Convert from WebCodecs VideoPixelFormat string
   pub fn from_webcodecs_format(format: &str) -> Option<Self> {
     match format {
+      // 8-bit formats
       "I420" => Some(Self::Yuv420p),
       "I420A" => Some(Self::Yuva420p),
       "I422" => Some(Self::Yuv422p),
+      "I422A" => Some(Self::Yuva422p),
       "I444" => Some(Self::Yuv444p),
+      "I444A" => Some(Self::Yuva444p),
       "NV12" => Some(Self::Nv12),
+      "NV21" => Some(Self::Nv21),
       "RGBA" | "RGBX" => Some(Self::Rgba),
       "BGRA" | "BGRX" => Some(Self::Bgra),
+      // 10-bit formats
+      "I420P10" => Some(Self::Yuv420p10le),
+      "I422P10" => Some(Self::Yuv422p10le),
+      "I444P10" => Some(Self::Yuv444p10le),
+      "I420AP10" => Some(Self::Yuva420p10le),
+      "I422AP10" => Some(Self::Yuva422p10le),
+      "I444AP10" => Some(Self::Yuva444p10le),
+      // 12-bit formats
+      "I420P12" => Some(Self::Yuv420p12le),
+      "I422P12" => Some(Self::Yuv422p12le),
+      "I444P12" => Some(Self::Yuv444p12le),
       _ => None,
     }
   }
@@ -255,13 +282,28 @@ impl AVPixelFormat {
   /// Convert to WebCodecs VideoPixelFormat string
   pub fn to_webcodecs_format(&self) -> Option<&'static str> {
     match self {
+      // 8-bit formats
       Self::Yuv420p => Some("I420"),
       Self::Yuva420p => Some("I420A"),
       Self::Yuv422p => Some("I422"),
+      Self::Yuva422p => Some("I422A"),
       Self::Yuv444p => Some("I444"),
+      Self::Yuva444p => Some("I444A"),
       Self::Nv12 => Some("NV12"),
+      Self::Nv21 => Some("NV21"),
       Self::Rgba => Some("RGBA"),
       Self::Bgra => Some("BGRA"),
+      // 10-bit formats
+      Self::Yuv420p10le => Some("I420P10"),
+      Self::Yuv422p10le => Some("I422P10"),
+      Self::Yuv444p10le => Some("I444P10"),
+      Self::Yuva420p10le => Some("I420AP10"),
+      Self::Yuva422p10le => Some("I422AP10"),
+      Self::Yuva444p10le => Some("I444AP10"),
+      // 12-bit formats
+      Self::Yuv420p12le => Some("I420P12"),
+      Self::Yuv422p12le => Some("I422P12"),
+      Self::Yuv444p12le => Some("I444P12"),
       _ => None,
     }
   }
@@ -274,9 +316,16 @@ impl AVPixelFormat {
   /// Number of planes for this pixel format
   pub fn num_planes(&self) -> usize {
     match self {
+      // 3-plane formats (Y, U, V)
       Self::Yuv420p | Self::Yuv422p | Self::Yuv444p => 3,
-      Self::Yuva420p => 4,
+      Self::Yuv420p10le | Self::Yuv422p10le | Self::Yuv444p10le => 3,
+      Self::Yuv420p12le | Self::Yuv422p12le | Self::Yuv444p12le => 3,
+      // 4-plane formats (Y, U, V, A)
+      Self::Yuva420p | Self::Yuva422p | Self::Yuva444p => 4,
+      Self::Yuva420p10le | Self::Yuva422p10le | Self::Yuva444p10le => 4,
+      // 2-plane formats (Y, UV interleaved)
       Self::Nv12 | Self::Nv21 => 2,
+      // 1-plane packed formats
       Self::Rgb24 | Self::Bgr24 | Self::Rgba | Self::Bgra | Self::Argb | Self::Abgr => 1,
       _ => 0,
     }

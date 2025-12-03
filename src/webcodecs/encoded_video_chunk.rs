@@ -21,6 +21,64 @@ pub enum EncodedVideoChunkType {
   Delta,
 }
 
+/// Hardware acceleration preference (W3C WebCodecs spec)
+#[napi(string_enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HardwareAcceleration {
+  /// No preference - may use hardware or software
+  #[default]
+  #[napi(value = "no-preference")]
+  NoPreference,
+  /// Prefer hardware acceleration
+  #[napi(value = "prefer-hardware")]
+  PreferHardware,
+  /// Prefer software implementation
+  #[napi(value = "prefer-software")]
+  PreferSoftware,
+}
+
+/// Latency mode for video encoding (W3C WebCodecs spec)
+#[napi(string_enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LatencyMode {
+  /// Optimize for quality (default)
+  #[default]
+  #[napi(value = "quality")]
+  Quality,
+  /// Optimize for low latency
+  #[napi(value = "realtime")]
+  Realtime,
+}
+
+/// Bitrate mode for video encoding (W3C WebCodecs spec)
+#[napi(string_enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoEncoderBitrateMode {
+  /// Variable bitrate (default)
+  #[default]
+  #[napi(value = "variable")]
+  Variable,
+  /// Constant bitrate
+  #[napi(value = "constant")]
+  Constant,
+  /// Use quantizer parameter from codec-specific options
+  #[napi(value = "quantizer")]
+  Quantizer,
+}
+
+/// Alpha channel handling option (W3C WebCodecs spec)
+#[napi(string_enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AlphaOption {
+  /// Keep alpha channel if present
+  #[default]
+  #[napi(value = "keep")]
+  Keep,
+  /// Discard alpha channel
+  #[napi(value = "discard")]
+  Discard,
+}
+
 /// Options for creating an EncodedVideoChunk
 #[napi(object)]
 pub struct EncodedVideoChunkInit {
@@ -34,6 +92,9 @@ pub struct EncodedVideoChunkInit {
   pub duration: Option<i64>,
   /// Encoded data (BufferSource per spec)
   pub data: Uint8Array,
+  /// ArrayBuffers to transfer (W3C spec - ignored in Node.js, we always copy)
+  #[napi(ts_type = "ArrayBuffer[]")]
+  pub transfer: Option<Vec<Uint8Array>>,
 }
 
 /// Internal state for EncodedVideoChunk
@@ -171,9 +232,9 @@ impl EncodedVideoChunk {
 pub struct VideoEncoderConfig {
   /// Codec string (e.g., "avc1.42001E", "vp8", "vp09.00.10.08", "av01.0.04M.08")
   pub codec: String,
-  /// Coded width in pixels
+  /// Coded width in pixels (required)
   pub width: u32,
-  /// Coded height in pixels
+  /// Coded height in pixels (required)
   pub height: u32,
   /// Display width (optional, defaults to width)
   pub display_width: Option<u32>,
@@ -181,18 +242,20 @@ pub struct VideoEncoderConfig {
   pub display_height: Option<u32>,
   /// Target bitrate in bits per second
   pub bitrate: Option<f64>,
-  /// Framerate
+  /// Framerate (frames per second)
   pub framerate: Option<f64>,
-  /// Hardware acceleration preference: "no-preference", "prefer-hardware", "prefer-software"
-  pub hardware_acceleration: Option<String>,
-  /// Latency mode: "quality" or "realtime"
-  pub latency_mode: Option<String>,
-  /// Bitrate mode: "constant", "variable", "quantizer"
-  pub bitrate_mode: Option<String>,
-  /// Alpha handling: "discard" or "keep"
-  pub alpha: Option<String>,
+  /// Hardware acceleration preference (W3C spec enum)
+  pub hardware_acceleration: Option<HardwareAcceleration>,
+  /// Latency mode (W3C spec enum)
+  pub latency_mode: Option<LatencyMode>,
+  /// Bitrate mode (W3C spec enum)
+  pub bitrate_mode: Option<VideoEncoderBitrateMode>,
+  /// Alpha handling (W3C spec enum)
+  pub alpha: Option<AlphaOption>,
   /// Scalability mode (SVC) - e.g., "L1T1", "L1T2", "L1T3"
   pub scalability_mode: Option<String>,
+  /// Content hint for encoder optimization
+  pub content_hint: Option<String>,
 }
 
 /// Video decoder configuration (WebCodecs spec)
@@ -210,9 +273,9 @@ pub struct VideoDecoderConfig {
   pub display_aspect_height: Option<u32>,
   /// Color space parameters (uses init object for compatibility)
   pub color_space: Option<crate::webcodecs::video_frame::VideoColorSpaceInit>,
-  /// Hardware acceleration preference
-  pub hardware_acceleration: Option<String>,
-  /// Optimization preference: "prefer-accuracy" or "prefer-speed"
+  /// Hardware acceleration preference (W3C spec enum)
+  pub hardware_acceleration: Option<HardwareAcceleration>,
+  /// Optimize for latency (W3C spec)
   pub optimize_for_latency: Option<bool>,
   /// Codec-specific description data (e.g., avcC for H.264) - BufferSource per spec
   pub description: Option<Uint8Array>,

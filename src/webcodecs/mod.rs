@@ -22,14 +22,15 @@ pub use audio_encoder::{
   AudioDecoderConfigOutput, AudioEncoder, AudioEncoderEncodeOptions, EncodedAudioChunkMetadata,
 };
 pub use encoded_audio_chunk::{
-  AudioDecoderConfig, AudioDecoderSupport, AudioEncoderConfig, AudioEncoderSupport,
+  AudioDecoderConfig, AudioDecoderSupport, AudioEncoderConfig, AudioEncoderSupport, BitrateMode,
   EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkType,
 };
+pub(crate) use encoded_video_chunk::EncodedVideoChunkInner;
 pub use encoded_video_chunk::{
-  EncodedVideoChunk, EncodedVideoChunkInit, EncodedVideoChunkType, VideoDecoderConfig,
+  AlphaOption, EncodedVideoChunk, EncodedVideoChunkInit, EncodedVideoChunkType,
+  HardwareAcceleration, LatencyMode, VideoDecoderConfig, VideoEncoderBitrateMode,
   VideoEncoderConfig,
 };
-pub(crate) use encoded_video_chunk::EncodedVideoChunkInner;
 pub use hardware::{
   get_available_hardware_accelerators, get_hardware_accelerators,
   get_preferred_hardware_accelerator, is_hardware_accelerator_available, HardwareAccelerator,
@@ -44,5 +45,5 @@ pub use video_encoder::{
 };
 pub use video_frame::{
   DOMRectReadOnly, VideoColorSpace, VideoFrame, VideoFrameBufferInit, VideoFrameCopyToOptions,
-  VideoFrameInit, VideoFrameRect, VideoPixelFormat,
+  VideoFrameInit, VideoFrameMetadata, VideoFrameRect, VideoPixelFormat,
 };

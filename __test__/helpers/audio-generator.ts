@@ -46,7 +46,7 @@ export function generateSilence(
   numberOfChannels: number,
   sampleRate: number,
   format: AudioSampleFormat = 'f32',
-  timestamp: number = 0
+  timestamp: number = 0,
 ): AudioData {
   const bytesPerSample = getBytesPerSample(format)
   const dataSize = numberOfFrames * numberOfChannels * bytesPerSample
@@ -72,11 +72,12 @@ export function generateSineTone(
   sampleRate: number,
   format: AudioSampleFormat = 'f32',
   timestamp: number = 0,
-  amplitude: number = 0.5
+  amplitude: number = 0.5,
 ): AudioData {
   const bytesPerSample = getBytesPerSample(format)
   const dataSize = numberOfFrames * numberOfChannels * bytesPerSample
-  const buffer = Buffer.alloc(dataSize)
+  const buffer = new Uint8Array(dataSize)
+  const view = new DataView(buffer.buffer)
 
   for (let frame = 0; frame < numberOfFrames; frame++) {
     const t = frame / sampleRate
@@ -84,7 +85,7 @@ export function generateSineTone(
 
     for (let ch = 0; ch < numberOfChannels; ch++) {
       const offset = (frame * numberOfChannels + ch) * bytesPerSample
-      writeSample(buffer, offset, value, format)
+      writeSample(view, offset, value, format)
     }
   }
 
@@ -94,7 +95,7 @@ export function generateSineTone(
     numberOfFrames,
     numberOfChannels,
     timestamp,
-    data: new Uint8Array(buffer),
+    data: buffer,
   })
 }
 
@@ -107,17 +108,18 @@ export function generateWhiteNoise(
   sampleRate: number,
   format: AudioSampleFormat = 'f32',
   timestamp: number = 0,
-  amplitude: number = 0.3
+  amplitude: number = 0.3,
 ): AudioData {
   const bytesPerSample = getBytesPerSample(format)
   const dataSize = numberOfFrames * numberOfChannels * bytesPerSample
-  const buffer = Buffer.alloc(dataSize)
+  const buffer = new Uint8Array(dataSize)
+  const view = new DataView(buffer.buffer)
 
   for (let frame = 0; frame < numberOfFrames; frame++) {
     for (let ch = 0; ch < numberOfChannels; ch++) {
       const offset = (frame * numberOfChannels + ch) * bytesPerSample
       const value = (Math.random() * 2 - 1) * amplitude
-      writeSample(buffer, offset, value, format)
+      writeSample(view, offset, value, format)
     }
   }
 
@@ -127,7 +129,7 @@ export function generateWhiteNoise(
     numberOfFrames,
     numberOfChannels,
     timestamp,
-    data: new Uint8Array(buffer),
+    data: buffer,
   })
 }
 
@@ -141,11 +143,12 @@ export function generateChirp(
   numberOfChannels: number,
   sampleRate: number,
   format: AudioSampleFormat = 'f32',
-  timestamp: number = 0
+  timestamp: number = 0,
 ): AudioData {
   const bytesPerSample = getBytesPerSample(format)
   const dataSize = numberOfFrames * numberOfChannels * bytesPerSample
-  const buffer = Buffer.alloc(dataSize)
+  const buffer = new Uint8Array(dataSize)
+  const view = new DataView(buffer.buffer)
 
   const duration = numberOfFrames / sampleRate
   const k = (endFreq - startFreq) / duration
@@ -157,7 +160,7 @@ export function generateChirp(
 
     for (let ch = 0; ch < numberOfChannels; ch++) {
       const offset = (frame * numberOfChannels + ch) * bytesPerSample
-      writeSample(buffer, offset, value, format)
+      writeSample(view, offset, value, format)
     }
   }
 
@@ -167,7 +170,7 @@ export function generateChirp(
     numberOfFrames,
     numberOfChannels,
     timestamp,
-    data: new Uint8Array(buffer),
+    data: buffer,
   })
 }
 
@@ -200,12 +203,7 @@ export function getBytesPerSample(format: AudioSampleFormat): number {
  * Check if a format is planar
  */
 export function isPlanarFormat(format: AudioSampleFormat): boolean {
-  return [
-    'u8-planar',
-    's16-planar',
-    's32-planar',
-    'f32-planar',
-  ].includes(format)
+  return ['u8-planar', 's16-planar', 's32-planar', 'f32-planar'].includes(format)
 }
 
 /**
@@ -214,55 +212,55 @@ export function isPlanarFormat(format: AudioSampleFormat): boolean {
 export function calculateAudioSize(
   numberOfFrames: number,
   numberOfChannels: number,
-  format: AudioSampleFormat
+  format: AudioSampleFormat,
 ): number {
   return numberOfFrames * numberOfChannels * getBytesPerSample(format)
 }
 
 /**
- * Write a sample value to a buffer
+ * Write a sample value to a DataView
  */
-function writeSample(buffer: Buffer, offset: number, value: number, format: AudioSampleFormat): void {
+function writeSample(view: DataView, offset: number, value: number, format: AudioSampleFormat): void {
   switch (format) {
     case 'u8':
     case 'u8-planar':
       // Use 128 as center point for symmetric round-trip: 0 → 128 → 0
-      buffer.writeUInt8(Math.min(255, Math.max(0, Math.round(value * 127.5 + 128))), offset)
+      view.setUint8(offset, Math.min(255, Math.max(0, Math.round(value * 127.5 + 128))))
       break
     case 's16':
     case 's16-planar':
-      buffer.writeInt16LE(Math.round(value * 32767), offset)
+      view.setInt16(offset, Math.round(value * 32767), true) // little-endian
       break
     case 's32':
     case 's32-planar':
-      buffer.writeInt32LE(Math.round(value * 2147483647), offset)
+      view.setInt32(offset, Math.round(value * 2147483647), true)
       break
     case 'f32':
     case 'f32-planar':
-      buffer.writeFloatLE(value, offset)
+      view.setFloat32(offset, value, true)
       break
   }
 }
 
 /**
- * Read a sample value from a buffer
+ * Read a sample value from a Uint8Array
  */
-export function readSample(buffer: Buffer | Uint8Array, offset: number, format: AudioSampleFormat): number {
-  const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer)
+export function readSample(buffer: Uint8Array, offset: number, format: AudioSampleFormat): number {
+  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength)
   switch (format) {
     case 'u8':
     case 'u8-planar':
       // Inverse of write: (byte - 128) / 127.5 gives symmetric round-trip
-      return (buf.readUInt8(offset) - 128) / 127.5
+      return (view.getUint8(offset) - 128) / 127.5
     case 's16':
     case 's16-planar':
-      return buf.readInt16LE(offset) / 32767
+      return view.getInt16(offset, true) / 32767
     case 's32':
     case 's32-planar':
-      return buf.readInt32LE(offset) / 2147483647
+      return view.getInt32(offset, true) / 2147483647
     case 'f32':
     case 'f32-planar':
-      return buf.readFloatLE(offset)
+      return view.getFloat32(offset, true)
     default:
       throw new Error(`Unknown format: ${format}`)
   }

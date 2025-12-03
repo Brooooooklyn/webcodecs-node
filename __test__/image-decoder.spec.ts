@@ -10,7 +10,7 @@ import { readFileSync } from 'fs'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 
-import { ImageDecoder, VideoFrame } from '../index.js'
+import { ImageDecoder } from '../index.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 

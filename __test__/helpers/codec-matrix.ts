@@ -113,11 +113,7 @@ const BitrateTable: Record<string, Record<QualityPreset, number>> = {
 /**
  * Get recommended bitrate for a resolution and quality level
  */
-export function getRecommendedBitrate(
-  width: number,
-  height: number,
-  quality: QualityPreset = 'medium',
-): number {
+export function getRecommendedBitrate(width: number, height: number, quality: QualityPreset = 'medium'): number {
   const pixels = width * height
 
   // Find closest resolution preset

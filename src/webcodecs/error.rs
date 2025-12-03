@@ -52,7 +52,10 @@ impl DOMExceptionName {
 /// return Err(dom_exception(DOMExceptionName::NotSupportedError, "Codec not supported"));
 /// ```
 pub fn dom_exception(name: DOMExceptionName, message: &str) -> Error {
-  Error::new(Status::GenericFailure, format!("{}: {}", name.as_str(), message))
+  Error::new(
+    Status::GenericFailure,
+    format!("{}: {}", name.as_str(), message),
+  )
 }
 
 /// Helper to create NotSupportedError for unsupported codecs/configs

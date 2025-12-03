@@ -12,6 +12,17 @@ use napi::tokio_stream::StreamExt;
 use napi_derive::napi;
 use std::sync::{Arc, Mutex};
 
+/// ColorSpaceConversion for ImageDecoder (W3C WebCodecs spec)
+#[napi(string_enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorSpaceConversion {
+  /// Apply default color space conversion (spec default)
+  #[default]
+  Default,
+  /// No color space conversion
+  None,
+}
+
 /// Data source for ImageDecoder - can be either a Uint8Array or ReadableStream
 pub enum ImageDecoderData {
   /// Buffered data (Uint8Array)
@@ -137,6 +148,8 @@ pub struct ImageDecodeOptions {
 }
 
 /// Image decode result
+/// Note: W3C spec defines this as a dictionary, but NAPI-RS doesn't support
+/// class instances in objects, so we use a class with the same properties.
 #[napi]
 pub struct ImageDecodeResult {
   /// The decoded image as a VideoFrame
@@ -196,7 +209,13 @@ impl ImageTrack {
       .track_list_inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-    Ok(inner.tracks.get(self.index).map(|t| t.animated).unwrap_or(false))
+    Ok(
+      inner
+        .tracks
+        .get(self.index)
+        .map(|t| t.animated)
+        .unwrap_or(false),
+    )
   }
 
   /// Number of frames in this track
@@ -206,7 +225,13 @@ impl ImageTrack {
       .track_list_inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-    Ok(inner.tracks.get(self.index).map(|t| t.frame_count).unwrap_or(0))
+    Ok(
+      inner
+        .tracks
+        .get(self.index)
+        .map(|t| t.frame_count)
+        .unwrap_or(0),
+    )
   }
 
   /// Number of times the animation repeats (Infinity for infinite)
@@ -216,7 +241,13 @@ impl ImageTrack {
       .track_list_inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-    Ok(inner.tracks.get(self.index).map(|t| t.repetition_count).unwrap_or(0.0))
+    Ok(
+      inner
+        .tracks
+        .get(self.index)
+        .map(|t| t.repetition_count)
+        .unwrap_or(0.0),
+    )
   }
 
   /// Whether this track is currently selected (W3C spec - writable)

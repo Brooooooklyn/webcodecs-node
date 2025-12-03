@@ -6,7 +6,8 @@
 use crate::codec::{CodecContext, DecoderConfig, Frame, Packet};
 use crate::ffi::{AVCodecID, AVHWDeviceType};
 use crate::webcodecs::{
-  CodecState, EncodedVideoChunk, EncodedVideoChunkInner, VideoDecoderConfig, VideoFrame,
+  CodecState, EncodedVideoChunk, EncodedVideoChunkInner, HardwareAcceleration, VideoDecoderConfig,
+  VideoFrame,
 };
 use crossbeam::channel::{self, Receiver, Sender};
 use napi::bindgen_prelude::*;
@@ -190,7 +191,10 @@ impl VideoDecoder {
   }
 
   /// Process a decode command
-  fn process_decode(inner: &Arc<Mutex<VideoDecoderInner>>, chunk: Arc<RwLock<Option<EncodedVideoChunkInner>>>) {
+  fn process_decode(
+    inner: &Arc<Mutex<VideoDecoderInner>>,
+    chunk: Arc<RwLock<Option<EncodedVideoChunkInner>>>,
+  ) {
     let mut guard = match inner.lock() {
       Ok(g) => g,
       Err(_) => return, // Lock poisoned
@@ -417,7 +421,7 @@ impl VideoDecoder {
     let hw_type = config
       .hardware_acceleration
       .as_ref()
-      .and_then(|ha| parse_hw_acceleration(ha));
+      .and_then(parse_hw_acceleration);
 
     // Create decoder context with optional hardware acceleration
     let mut context = match CodecContext::new_decoder_with_hw(codec_id, hw_type) {
@@ -535,10 +539,7 @@ impl VideoDecoder {
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
       if inner.state == CodecState::Closed {
-        return Err(Error::new(
-          Status::GenericFailure,
-          "Decoder is closed",
-        ));
+        return Err(Error::new(Status::GenericFailure, "Decoder is closed"));
       }
     }
 
@@ -663,10 +664,10 @@ fn parse_codec_string(codec: &str) -> Result<AVCodecID> {
   }
 }
 
-/// Parse hardware acceleration preference string to device type
-fn parse_hw_acceleration(ha: &str) -> Option<AVHWDeviceType> {
+/// Parse hardware acceleration preference to device type
+fn parse_hw_acceleration(ha: &HardwareAcceleration) -> Option<AVHWDeviceType> {
   match ha {
-    "prefer-hardware" | "require-hardware" => {
+    HardwareAcceleration::PreferHardware => {
       // Return platform-preferred hardware type
       #[cfg(target_os = "macos")]
       {

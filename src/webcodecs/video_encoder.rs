@@ -3,9 +3,12 @@
 //! Provides video encoding functionality using FFmpeg.
 //! See: https://w3c.github.io/webcodecs/#videoencoder-interface
 
-use crate::codec::{BitrateMode, CodecContext, EncoderConfig, Frame, Scaler};
+use crate::codec::{BitrateMode as CodecBitrateMode, CodecContext, EncoderConfig, Frame, Scaler};
 use crate::ffi::{AVCodecID, AVHWDeviceType, AVPixelFormat};
-use crate::webcodecs::{EncodedVideoChunk, VideoEncoderConfig, VideoFrame};
+use crate::webcodecs::{
+  EncodedVideoChunk, HardwareAcceleration, LatencyMode, VideoEncoderBitrateMode,
+  VideoEncoderConfig, VideoFrame,
+};
 use crossbeam::channel::{self, Receiver, Sender};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{
@@ -238,7 +241,11 @@ impl VideoEncoder {
   fn worker_loop(inner: Arc<Mutex<VideoEncoderInner>>, receiver: Receiver<EncoderCommand>) {
     while let Ok(command) = receiver.recv() {
       match command {
-        EncoderCommand::Encode { frame, timestamp, options } => {
+        EncoderCommand::Encode {
+          frame,
+          timestamp,
+          options,
+        } => {
           Self::process_encode(&inner, frame, timestamp, options);
         }
         EncoderCommand::Flush(response_sender) => {
@@ -543,8 +550,8 @@ impl VideoEncoder {
     let hw_type = config
       .hardware_acceleration
       .as_ref()
-      .and_then(|ha| match ha.as_str() {
-        "prefer-hardware" | "require-hardware" => {
+      .and_then(|ha| match ha {
+        HardwareAcceleration::PreferHardware => {
           #[cfg(target_os = "macos")]
           {
             Some(AVHWDeviceType::Videotoolbox)
@@ -566,18 +573,18 @@ impl VideoEncoder {
       }
     };
 
-    // Parse bitrate mode from config
-    let bitrate_mode = match config.bitrate_mode.as_deref() {
-      Some("constant") => BitrateMode::Constant,
-      Some("variable") => BitrateMode::Variable,
-      Some("quantizer") => BitrateMode::Quantizer,
-      _ => BitrateMode::Constant, // Default to CBR
+    // Convert WebCodecs bitrate mode to internal codec bitrate mode
+    let bitrate_mode = match config.bitrate_mode {
+      Some(VideoEncoderBitrateMode::Constant) => CodecBitrateMode::Constant,
+      Some(VideoEncoderBitrateMode::Variable) => CodecBitrateMode::Variable,
+      Some(VideoEncoderBitrateMode::Quantizer) => CodecBitrateMode::Quantizer,
+      None => CodecBitrateMode::Constant, // Default to CBR
     };
 
     // Parse latency mode: "realtime" = low latency, "quality" = default quality mode
-    let (gop_size, max_b_frames) = match config.latency_mode.as_deref() {
-      Some("realtime") => (10, 0), // Low latency: small GOP, no B-frames
-      _ => (60, 2),                // Quality mode: larger GOP with B-frames
+    let (gop_size, max_b_frames) = match config.latency_mode {
+      Some(LatencyMode::Realtime) => (10, 0), // Low latency: small GOP, no B-frames
+      _ => (60, 2),                           // Quality mode: larger GOP with B-frames
     };
 
     // Configure encoder
@@ -732,10 +739,7 @@ impl VideoEncoder {
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
       if inner.state == CodecState::Closed {
-        return Err(Error::new(
-          Status::GenericFailure,
-          "Encoder is closed",
-        ));
+        return Err(Error::new(Status::GenericFailure, "Encoder is closed"));
       }
     }
 

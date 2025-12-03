@@ -281,7 +281,11 @@ export declare class ImageDecoder {
   static isTypeSupported(mimeType: string): Promise<boolean>
 }
 
-/** Image decode result */
+/**
+ * Image decode result
+ * Note: W3C spec defines this as a dictionary, but NAPI-RS doesn't support
+ * class instances in objects, so we use a class with the same properties.
+ */
 export declare class ImageDecodeResult {
   /** Get the decoded image */
   get image(): VideoFrame
@@ -516,6 +520,15 @@ export declare class VideoFrame {
   get colorSpace(): VideoColorSpace
   /** Get whether this VideoFrame has been closed (W3C WebCodecs spec) */
   get closed(): boolean
+  /** Get the rotation in degrees clockwise (0, 90, 180, 270) - W3C WebCodecs spec */
+  get rotation(): number
+  /** Get whether horizontal flip is applied - W3C WebCodecs spec */
+  get flip(): boolean
+  /**
+   * Get the metadata associated with this VideoFrame - W3C WebCodecs spec
+   * Currently returns an empty metadata object as members are defined in the registry
+   */
+  metadata(): VideoFrameMetadata
   /** Calculate the allocation size needed for copyTo */
   allocationSize(options?: VideoFrameCopyToOptions | undefined | null): number
   /**
@@ -530,6 +543,12 @@ export declare class VideoFrame {
   /** Close and release resources */
   close(): void
 }
+
+/** Alpha channel handling option (W3C WebCodecs spec) */
+export type AlphaOption = /** Keep alpha channel if present */
+'keep'|
+/** Discard alpha channel */
+'discard';
 
 /** Options for copyTo operation */
 export interface AudioDataCopyToOptions {
@@ -560,6 +579,8 @@ export interface AudioDataInit {
   timestamp: number
   /** Raw audio sample data (required) - BufferSource per spec */
   data: Uint8Array
+  /** ArrayBuffers to transfer (W3C spec - ignored in Node.js, we always copy) */
+  transfer?: ArrayBuffer[]
 }
 
 /** Audio decoder configuration (WebCodecs spec) */
@@ -608,6 +629,8 @@ export interface AudioEncoderConfig {
   numberOfChannels: number
   /** Target bitrate in bits per second */
   bitrate?: number
+  /** Bitrate mode (W3C spec enum) */
+  bitrateMode?: BitrateMode
 }
 
 /** Encode options for audio */
@@ -641,6 +664,12 @@ export type AudioSampleFormat = /** Unsigned 8-bit integer samples| interleaved 
 /** 32-bit float samples| planar */
 'f32-planar';
 
+/** Bitrate mode for audio encoding (W3C WebCodecs spec) */
+export type BitrateMode = /** Variable bitrate (default) */
+'variable'|
+/** Constant bitrate */
+'constant';
+
 /** Encoder state per WebCodecs spec */
 export type CodecState = /** Encoder not configured */
 'unconfigured'|
@@ -649,8 +678,14 @@ export type CodecState = /** Encoder not configured */
 /** Encoder closed */
 'closed';
 
+/** ColorSpaceConversion for ImageDecoder (W3C WebCodecs spec) */
+export type ColorSpaceConversion = /** Apply default color space conversion (spec default) */
+'Default'|
+/** No color space conversion */
+'None';
+
 /** DOMRectInit for specifying regions */
-export interface DomRectInit {
+export interface DOMRectInit {
   x?: number
   y?: number
   width?: number
@@ -670,6 +705,8 @@ export interface EncodedAudioChunkInit {
   duration?: number
   /** Encoded data (BufferSource per spec) */
   data: Uint8Array
+  /** ArrayBuffers to transfer (W3C spec - ignored in Node.js, we always copy) */
+  transfer?: ArrayBuffer[]
 }
 
 /** Output callback metadata for audio */
@@ -697,6 +734,8 @@ export interface EncodedVideoChunkInit {
   duration?: number
   /** Encoded data (BufferSource per spec) */
   data: Uint8Array
+  /** ArrayBuffers to transfer (W3C spec - ignored in Node.js, we always copy) */
+  transfer?: ArrayBuffer[]
 }
 
 /** Output callback metadata per WebCodecs spec */
@@ -720,6 +759,14 @@ export declare function getHardwareAccelerators(): Array<HardwareAccelerator>
 /** Get the preferred hardware accelerator for the current platform */
 export declare function getPreferredHardwareAccelerator(): string | null
 
+/** Hardware acceleration preference (W3C WebCodecs spec) */
+export type HardwareAcceleration = /** No preference - may use hardware or software */
+'no-preference'|
+/** Prefer hardware acceleration */
+'prefer-hardware'|
+/** Prefer software implementation */
+'prefer-software';
+
 /** Hardware accelerator information */
 export interface HardwareAccelerator {
   /** Internal name (e.g., "videotoolbox", "cuda", "vaapi") */
@@ -740,6 +787,12 @@ export interface ImageDecodeOptions {
 
 /** Check if a specific hardware accelerator is available */
 export declare function isHardwareAcceleratorAvailable(name: string): boolean
+
+/** Latency mode for video encoding (W3C WebCodecs spec) */
+export type LatencyMode = /** Optimize for quality (default) */
+'quality'|
+/** Optimize for low latency */
+'realtime';
 
 /** Layout information for a single plane per WebCodecs spec */
 export interface PlaneLayout {
@@ -775,9 +828,9 @@ export interface VideoDecoderConfig {
   displayAspectHeight?: number
   /** Color space parameters (uses init object for compatibility) */
   colorSpace?: VideoColorSpaceInit
-  /** Hardware acceleration preference */
-  hardwareAcceleration?: string
-  /** Optimization preference: "prefer-accuracy" or "prefer-speed" */
+  /** Hardware acceleration preference (W3C spec enum) */
+  hardwareAcceleration?: HardwareAcceleration
+  /** Optimize for latency (W3C spec) */
   optimizeForLatency?: boolean
   /** Codec-specific description data (e.g., avcC for H.264) - BufferSource per spec */
   description?: Uint8Array
@@ -803,6 +856,14 @@ export interface VideoDecoderSupport {
   config: VideoDecoderConfig
 }
 
+/** Bitrate mode for video encoding (W3C WebCodecs spec) */
+export type VideoEncoderBitrateMode = /** Variable bitrate (default) */
+'variable'|
+/** Constant bitrate */
+'constant'|
+/** Use quantizer parameter from codec-specific options */
+'quantizer';
+
 /**
  * Video encoder configuration (WebCodecs spec)
  * Note: Codec-specific options are encoded in the codec string per W3C spec
@@ -811,9 +872,9 @@ export interface VideoDecoderSupport {
 export interface VideoEncoderConfig {
   /** Codec string (e.g., "avc1.42001E", "vp8", "vp09.00.10.08", "av01.0.04M.08") */
   codec: string
-  /** Coded width in pixels */
+  /** Coded width in pixels (required) */
   width: number
-  /** Coded height in pixels */
+  /** Coded height in pixels (required) */
   height: number
   /** Display width (optional, defaults to width) */
   displayWidth?: number
@@ -821,18 +882,20 @@ export interface VideoEncoderConfig {
   displayHeight?: number
   /** Target bitrate in bits per second */
   bitrate?: number
-  /** Framerate */
+  /** Framerate (frames per second) */
   framerate?: number
-  /** Hardware acceleration preference: "no-preference", "prefer-hardware", "prefer-software" */
-  hardwareAcceleration?: string
-  /** Latency mode: "quality" or "realtime" */
-  latencyMode?: string
-  /** Bitrate mode: "constant", "variable", "quantizer" */
-  bitrateMode?: string
-  /** Alpha handling: "discard" or "keep" */
-  alpha?: string
+  /** Hardware acceleration preference (W3C spec enum) */
+  hardwareAcceleration?: HardwareAcceleration
+  /** Latency mode (W3C spec enum) */
+  latencyMode?: LatencyMode
+  /** Bitrate mode (W3C spec enum) */
+  bitrateMode?: VideoEncoderBitrateMode
+  /** Alpha handling (W3C spec enum) */
+  alpha?: AlphaOption
   /** Scalability mode (SVC) - e.g., "L1T1", "L1T2", "L1T3" */
   scalabilityMode?: string
+  /** Content hint for encoder optimization */
+  contentHint?: string
 }
 
 /** Encode options per WebCodecs spec */
@@ -851,25 +914,37 @@ export interface VideoEncoderSupport {
 
 /** Options for creating a VideoFrame from buffer data (VideoFrameBufferInit per spec) */
 export interface VideoFrameBufferInit {
-  /** Pixel format */
+  /** Pixel format (required) */
   format: VideoPixelFormat
-  /** Coded width in pixels */
+  /** Coded width in pixels (required) */
   codedWidth: number
-  /** Coded height in pixels */
+  /** Coded height in pixels (required) */
   codedHeight: number
-  /** Timestamp in microseconds */
+  /** Timestamp in microseconds (required) */
   timestamp: number
   /**
    * Duration in microseconds (optional)
    * Note: W3C spec uses unsigned long long, but JS number can represent up to 2^53 safely
    */
   duration?: number
-  /** Display width (defaults to coded_width) */
+  /** Layout for input planes (optional, default is tightly-packed) */
+  layout?: Array<PlaneLayout>
+  /** Visible rect within coded size (optional, default is full coded size at 0,0) */
+  visibleRect?: DOMRectInit
+  /** Rotation in degrees clockwise (0, 90, 180, 270) - default 0 */
+  rotation?: number
+  /** Horizontal flip - default false */
+  flip?: boolean
+  /** Display width (defaults to visible width or coded_width) */
   displayWidth?: number
-  /** Display height (defaults to coded_height) */
+  /** Display height (defaults to visible height or coded_height) */
   displayHeight?: number
   /** Color space parameters (uses init object) */
   colorSpace?: VideoColorSpaceInit
+  /** Metadata associated with the frame */
+  metadata?: VideoFrameMetadata
+  /** ArrayBuffers to transfer (W3C spec - ignored in Node.js, we always copy) */
+  transfer?: ArrayBuffer[]
 }
 
 /** Options for copyTo operation */
@@ -892,10 +967,24 @@ export interface VideoFrameInit {
   alpha?: string
   /** Visible rect (optional) */
   visibleRect?: DOMRectInit
+  /** Rotation in degrees clockwise (0, 90, 180, 270) - default 0 */
+  rotation?: number
+  /** Horizontal flip - default false */
+  flip?: boolean
   /** Display width (optional) */
   displayWidth?: number
   /** Display height (optional) */
   displayHeight?: number
+  /** Metadata associated with the frame */
+  metadata?: VideoFrameMetadata
+}
+
+/**
+ * VideoFrameMetadata - metadata associated with a VideoFrame (W3C spec)
+ * Members defined in VideoFrame Metadata Registry - currently empty per spec
+ */
+export interface VideoFrameMetadata {
+
 }
 
 /** Rectangle for specifying a region */
@@ -913,8 +1002,30 @@ export type VideoPixelFormat = /** Planar YUV 4:2:0| 12bpp| (1 Cr & Cb sample pe
 'I420A'|
 /** Planar YUV 4:2:2| 16bpp */
 'I422'|
+/** Planar YUV 4:2:2| 16bpp| with alpha plane */
+'I422A'|
 /** Planar YUV 4:4:4| 24bpp */
 'I444'|
+/** Planar YUV 4:4:4| 24bpp| with alpha plane */
+'I444A'|
+/** Planar YUV 4:2:0| 10-bit */
+'I420P10'|
+/** Planar YUV 4:2:0| 10-bit| with alpha plane */
+'I420AP10'|
+/** Planar YUV 4:2:2| 10-bit */
+'I422P10'|
+/** Planar YUV 4:2:2| 10-bit| with alpha plane */
+'I422AP10'|
+/** Planar YUV 4:4:4| 10-bit */
+'I444P10'|
+/** Planar YUV 4:4:4| 10-bit| with alpha plane */
+'I444AP10'|
+/** Planar YUV 4:2:0| 12-bit */
+'I420P12'|
+/** Planar YUV 4:2:2| 12-bit */
+'I422P12'|
+/** Planar YUV 4:4:4| 12-bit */
+'I444P12'|
 /** Semi-planar YUV 4:2:0| 12bpp (Y plane + interleaved UV) */
 'NV12'|
 /** Semi-planar YUV 4:2:0| 12bpp (Y plane + interleaved VU) - per W3C WebCodecs spec */

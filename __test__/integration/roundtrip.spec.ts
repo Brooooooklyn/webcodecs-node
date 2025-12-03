@@ -17,12 +17,7 @@ import {
   extractI420Data,
   type EncodedVideoChunk,
 } from '../helpers/index.js'
-import {
-  compareBuffers,
-  PSNRThresholds,
-  formatPSNR,
-  getQualityDescription,
-} from '../helpers/frame-comparator.js'
+import { compareBuffers, PSNRThresholds, formatPSNR, getQualityDescription } from '../helpers/frame-comparator.js'
 import { createEncoderConfig, createDecoderConfig } from '../helpers/codec-matrix.js'
 
 // Helper to create test encoder with callbacks
@@ -165,9 +160,7 @@ test('roundtrip: timestamp preservation in chunks', async (t) => {
   const timestamps = [0, 33333, 66666, 100000]
 
   // Create frames with specific timestamps
-  const frames = timestamps.map((ts) =>
-    generateSolidColorI420Frame(width, height, TestColors.blue, ts),
-  )
+  const frames = timestamps.map((ts) => generateSolidColorI420Frame(width, height, TestColors.blue, ts))
 
   // Encode
   const { encoder, chunks } = createTestEncoder()
