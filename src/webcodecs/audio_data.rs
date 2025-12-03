@@ -5,6 +5,7 @@
 
 use crate::codec::Frame;
 use crate::ffi::AVSampleFormat;
+use crate::webcodecs::error::invalid_state_error;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::sync::{Arc, Mutex};
@@ -275,7 +276,7 @@ impl AudioData {
 
     match &*inner {
       Some(i) => Ok(i.frame.sample_rate()),
-      None => Err(Error::new(Status::GenericFailure, "AudioData is closed")),
+      None => Err(invalid_state_error("AudioData is closed")),
     }
   }
 
@@ -289,7 +290,7 @@ impl AudioData {
 
     match &*inner {
       Some(i) => Ok(i.frame.nb_samples()),
-      None => Err(Error::new(Status::GenericFailure, "AudioData is closed")),
+      None => Err(invalid_state_error("AudioData is closed")),
     }
   }
 
@@ -303,7 +304,7 @@ impl AudioData {
 
     match &*inner {
       Some(i) => Ok(i.frame.channels()),
-      None => Err(Error::new(Status::GenericFailure, "AudioData is closed")),
+      None => Err(invalid_state_error("AudioData is closed")),
     }
   }
 
@@ -325,7 +326,7 @@ impl AudioData {
           Ok(0)
         }
       }
-      None => Err(Error::new(Status::GenericFailure, "AudioData is closed")),
+      None => Err(invalid_state_error("AudioData is closed")),
     }
   }
 
@@ -339,7 +340,7 @@ impl AudioData {
 
     match &*inner {
       Some(i) => Ok(i.timestamp_us),
-      None => Err(Error::new(Status::GenericFailure, "AudioData is closed")),
+      None => Err(invalid_state_error("AudioData is closed")),
     }
   }
 
@@ -369,7 +370,7 @@ impl AudioData {
 
     let inner = inner
       .as_ref()
-      .ok_or_else(|| Error::new(Status::GenericFailure, "AudioData is closed"))?;
+      .ok_or_else(|| invalid_state_error("AudioData is closed"))?;
 
     let format = options.format.unwrap_or(inner.format);
     let frame_offset = options.frame_offset.unwrap_or(0);
@@ -399,7 +400,7 @@ impl AudioData {
 
     let inner = inner
       .as_ref()
-      .ok_or_else(|| Error::new(Status::GenericFailure, "AudioData is closed"))?;
+      .ok_or_else(|| invalid_state_error("AudioData is closed"))?;
 
     let format = options.format.unwrap_or(inner.format);
     let plane_index = options.plane_index as usize;
@@ -490,7 +491,7 @@ impl AudioData {
 
     let inner = inner
       .as_ref()
-      .ok_or_else(|| Error::new(Status::GenericFailure, "AudioData is closed"))?;
+      .ok_or_else(|| invalid_state_error("AudioData is closed"))?;
 
     let cloned_frame = inner.frame.try_clone().map_err(|e| {
       Error::new(
@@ -537,8 +538,8 @@ impl AudioData {
 
     match &*inner {
       Some(i) if !i.closed => Ok(f(&i.frame)),
-      Some(_) => Err(Error::new(Status::GenericFailure, "AudioData is closed")),
-      None => Err(Error::new(Status::GenericFailure, "AudioData is closed")),
+      Some(_) => Err(invalid_state_error("AudioData is closed")),
+      None => Err(invalid_state_error("AudioData is closed")),
     }
   }
 
@@ -551,7 +552,7 @@ impl AudioData {
 
     let inner = inner
       .as_ref()
-      .ok_or_else(|| Error::new(Status::GenericFailure, "AudioData is closed"))?;
+      .ok_or_else(|| invalid_state_error("AudioData is closed"))?;
 
     let num_frames = inner.frame.nb_samples() as usize;
     let channels = inner.frame.channels() as usize;

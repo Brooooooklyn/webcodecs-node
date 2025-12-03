@@ -118,13 +118,14 @@ pub struct AudioDecoder {
 
 impl Drop for AudioDecoder {
   fn drop(&mut self) {
-    // Drop the sender first to signal the worker to stop
+    // Drop the sender to signal the worker to stop.
+    // The worker will see the channel disconnect and exit its loop.
     self.command_sender = None;
 
-    // Wait for the worker thread to finish processing remaining tasks
-    if let Some(handle) = self.worker_handle.take() {
-      let _ = handle.join();
-    }
+    // Don't join the worker thread here - it would block the JS thread during GC.
+    // Instead, let the thread become detached and finish on its own.
+    // Safety: The Arc<Mutex<AudioDecoderInner>> ensures the inner state (including
+    // callbacks and FFmpeg context) stays alive until the worker exits.
   }
 }
 

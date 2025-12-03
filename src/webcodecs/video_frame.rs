@@ -5,6 +5,7 @@
 
 use crate::codec::Frame;
 use crate::ffi::AVPixelFormat;
+use crate::webcodecs::error::invalid_state_error;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::sync::{Arc, Mutex};
@@ -145,21 +146,10 @@ impl VideoColorSpace {
     self.full_range
   }
 
-  /// Convert to JSON-compatible object
-  #[napi]
+  /// Convert to JSON-compatible object (W3C spec uses toJSON)
+  #[napi(js_name = "toJSON")]
   pub fn to_json(&self) -> VideoColorSpaceInit {
     VideoColorSpaceInit {
-      primaries: self.primaries.clone(),
-      transfer: self.transfer.clone(),
-      matrix: self.matrix.clone(),
-      full_range: self.full_range,
-    }
-  }
-
-  /// Clone this VideoColorSpace (W3C WebCodecs spec)
-  #[napi(js_name = "clone")]
-  pub fn clone_color_space(&self) -> VideoColorSpace {
-    VideoColorSpace {
       primaries: self.primaries.clone(),
       transfer: self.transfer.clone(),
       matrix: self.matrix.clone(),
@@ -240,8 +230,8 @@ impl DOMRectReadOnly {
     self.x
   }
 
-  /// Convert to JSON
-  #[napi]
+  /// Convert to JSON (W3C spec uses toJSON)
+  #[napi(js_name = "toJSON")]
   pub fn to_json(&self) -> DOMRectInit {
     DOMRectInit {
       x: Some(self.x),
@@ -343,10 +333,6 @@ struct VideoFrameInner {
   display_width: u32,
   display_height: u32,
   color_space: VideoColorSpace,
-  /// Rotation in degrees (0, 90, 180, 270) per W3C WebCodecs spec
-  rotation: u16,
-  /// Whether frame is horizontally flipped per W3C WebCodecs spec
-  flip: bool,
   closed: bool,
 }
 
@@ -400,8 +386,6 @@ impl VideoFrame {
       display_width,
       display_height,
       color_space,
-      rotation: 0,
-      flip: false,
       closed: false,
     };
 
@@ -454,8 +438,6 @@ impl VideoFrame {
         display_width,
         display_height,
         color_space: source_inner.color_space.clone(),
-        rotation: source_inner.rotation,
-        flip: source_inner.flip,
         closed: false,
       };
 
@@ -477,8 +459,6 @@ impl VideoFrame {
       display_width: width,
       display_height: height,
       color_space: VideoColorSpace::default(),
-      rotation: 0,
-      flip: false,
       closed: false,
     };
 
@@ -526,42 +506,44 @@ impl VideoFrame {
   }
 
   /// Get the coded rect (the region containing valid pixel data)
-  /// Returns DOMRectReadOnly per W3C WebCodecs spec, null if closed
+  /// Returns DOMRectReadOnly per W3C WebCodecs spec
+  /// Throws InvalidStateError if the VideoFrame is closed
   #[napi(getter)]
-  pub fn coded_rect(&self) -> Result<Option<DOMRectReadOnly>> {
+  pub fn coded_rect(&self) -> Result<DOMRectReadOnly> {
     let guard = self
       .inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) if !inner.closed => Ok(Some(DOMRectReadOnly {
+      Some(inner) if !inner.closed => Ok(DOMRectReadOnly {
         x: 0.0,
         y: 0.0,
         width: inner.frame.width() as f64,
         height: inner.frame.height() as f64,
-      })),
-      _ => Ok(None),
+      }),
+      _ => Err(invalid_state_error("VideoFrame is closed")),
     }
   }
 
   /// Get the visible rect (the region of coded data that should be displayed)
-  /// Returns DOMRectReadOnly per W3C WebCodecs spec, null if closed
+  /// Returns DOMRectReadOnly per W3C WebCodecs spec
+  /// Throws InvalidStateError if the VideoFrame is closed
   #[napi(getter)]
-  pub fn visible_rect(&self) -> Result<Option<DOMRectReadOnly>> {
+  pub fn visible_rect(&self) -> Result<DOMRectReadOnly> {
     let guard = self
       .inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) if !inner.closed => Ok(Some(DOMRectReadOnly {
+      Some(inner) if !inner.closed => Ok(DOMRectReadOnly {
         x: 0.0,
         y: 0.0,
         width: inner.display_width as f64,
         height: inner.display_height as f64,
-      })),
-      _ => Ok(None),
+      }),
+      _ => Err(invalid_state_error("VideoFrame is closed")),
     }
   }
 
@@ -581,18 +563,6 @@ impl VideoFrame {
   #[napi(getter)]
   pub fn color_space(&self) -> Result<VideoColorSpace> {
     self.with_inner(|inner| Ok(inner.color_space.clone()))
-  }
-
-  /// Get the rotation in degrees (0, 90, 180, 270) per W3C WebCodecs spec
-  #[napi(getter)]
-  pub fn rotation(&self) -> Result<u16> {
-    self.with_inner(|inner| Ok(inner.rotation))
-  }
-
-  /// Get whether the frame is horizontally flipped per W3C WebCodecs spec
-  #[napi(getter)]
-  pub fn flip(&self) -> Result<bool> {
-    self.with_inner(|inner| Ok(inner.flip))
   }
 
   /// Get whether this VideoFrame has been closed (W3C WebCodecs spec)
@@ -649,10 +619,7 @@ impl VideoFrame {
       let inner = match guard.as_ref() {
         Some(inner) if !inner.closed => inner,
         _ => {
-          return Err(Error::new(
-            Status::GenericFailure,
-            "VideoFrame is closed or invalid",
-          ))
+          return Err(invalid_state_error("VideoFrame is closed"))
         }
       };
 
@@ -688,10 +655,7 @@ impl VideoFrame {
       let inner = match guard.as_ref() {
         Some(inner) if !inner.closed => inner,
         _ => {
-          return Err(Error::new(
-            Status::GenericFailure,
-            "VideoFrame is closed or invalid",
-          ))
+          return Err(invalid_state_error("VideoFrame is closed"))
         }
       };
 
@@ -838,8 +802,6 @@ impl VideoFrame {
         display_width: inner.display_width,
         display_height: inner.display_height,
         color_space: inner.color_space.clone(),
-        rotation: inner.rotation,
-        flip: inner.flip,
         closed: false,
       };
 
@@ -889,10 +851,7 @@ impl VideoFrame {
 
     match guard.as_ref() {
       Some(inner) if !inner.closed => f(inner),
-      _ => Err(Error::new(
-        Status::GenericFailure,
-        "VideoFrame is closed or invalid",
-      )),
+      _ => Err(invalid_state_error("VideoFrame is closed")),
     }
   }
 

@@ -5,6 +5,7 @@
 
 use crate::codec::{CodecContext, DecoderConfig, Packet};
 use crate::ffi::AVCodecID;
+use crate::webcodecs::error::invalid_state_error;
 use crate::webcodecs::VideoFrame;
 use napi::bindgen_prelude::*;
 use napi::tokio_stream::StreamExt;
@@ -159,48 +160,173 @@ impl ImageDecodeResult {
   }
 }
 
-/// Image track information
-#[napi(object)]
+/// Internal track data (shared between ImageTrack instances)
 #[derive(Debug, Clone)]
-pub struct ImageTrack {
+struct ImageTrackData {
   /// Whether this track is animated
-  pub animated: bool,
+  animated: bool,
   /// Number of frames in this track
-  pub frame_count: u32,
+  frame_count: u32,
   /// Number of times the animation repeats (Infinity for infinite)
-  pub repetition_count: f64,
-  /// Whether this track is currently selected
-  pub selected: bool,
+  repetition_count: f64,
 }
 
-/// Image track list
-#[napi]
-#[derive(Debug, Clone)]
-pub struct ImageTrackList {
-  tracks: Vec<ImageTrack>,
+/// Internal state for ImageTrackList (shared with ImageTrack instances)
+#[derive(Debug)]
+struct ImageTrackListInner {
+  tracks: Vec<ImageTrackData>,
   selected_index: Option<usize>,
+}
+
+/// Image track information (W3C spec - class with writable selected property)
+#[napi]
+pub struct ImageTrack {
+  /// Reference to the parent track list's inner state
+  track_list_inner: Arc<Mutex<ImageTrackListInner>>,
+  /// Index of this track in the parent list
+  index: usize,
+}
+
+#[napi]
+impl ImageTrack {
+  /// Whether this track is animated
+  #[napi(getter)]
+  pub fn animated(&self) -> Result<bool> {
+    let inner = self
+      .track_list_inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    Ok(inner.tracks.get(self.index).map(|t| t.animated).unwrap_or(false))
+  }
+
+  /// Number of frames in this track
+  #[napi(getter)]
+  pub fn frame_count(&self) -> Result<u32> {
+    let inner = self
+      .track_list_inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    Ok(inner.tracks.get(self.index).map(|t| t.frame_count).unwrap_or(0))
+  }
+
+  /// Number of times the animation repeats (Infinity for infinite)
+  #[napi(getter)]
+  pub fn repetition_count(&self) -> Result<f64> {
+    let inner = self
+      .track_list_inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    Ok(inner.tracks.get(self.index).map(|t| t.repetition_count).unwrap_or(0.0))
+  }
+
+  /// Whether this track is currently selected (W3C spec - writable)
+  #[napi(getter)]
+  pub fn selected(&self) -> Result<bool> {
+    let inner = self
+      .track_list_inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    Ok(inner.selected_index == Some(self.index))
+  }
+
+  /// Set whether this track is selected (W3C spec - writable)
+  /// Setting to true deselects all other tracks
+  #[napi(setter)]
+  pub fn set_selected(&self, value: bool) -> Result<()> {
+    let mut inner = self
+      .track_list_inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    if value {
+      // Select this track (deselects others implicitly)
+      inner.selected_index = Some(self.index);
+    } else {
+      // Only deselect if this track is currently selected
+      if inner.selected_index == Some(self.index) {
+        inner.selected_index = None;
+      }
+    }
+    Ok(())
+  }
+}
+
+/// Image track list (W3C spec)
+#[napi]
+pub struct ImageTrackList {
+  inner: Arc<Mutex<ImageTrackListInner>>,
+}
+
+impl Clone for ImageTrackList {
+  fn clone(&self) -> Self {
+    ImageTrackList {
+      inner: self.inner.clone(),
+    }
+  }
 }
 
 #[napi]
 impl ImageTrackList {
   /// Get the number of tracks
   #[napi(getter)]
-  pub fn length(&self) -> u32 {
-    self.tracks.len() as u32
+  pub fn length(&self) -> Result<u32> {
+    let inner = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    Ok(inner.tracks.len() as u32)
   }
 
   /// Get the currently selected track (if any)
   #[napi(getter)]
-  pub fn selected_track(&self) -> Option<ImageTrack> {
-    self
-      .selected_index
-      .and_then(|i| self.tracks.get(i).cloned())
+  pub fn selected_track(&self) -> Result<Option<ImageTrack>> {
+    let inner = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    match inner.selected_index {
+      Some(idx) if idx < inner.tracks.len() => Ok(Some(ImageTrack {
+        track_list_inner: self.inner.clone(),
+        index: idx,
+      })),
+      _ => Ok(None),
+    }
   }
 
-  /// Get the selected track index
+  /// Get the selected track index (W3C spec: returns -1 if no track selected)
   #[napi(getter)]
-  pub fn selected_index(&self) -> Option<u32> {
-    self.selected_index.map(|i| i as u32)
+  pub fn selected_index(&self) -> Result<i32> {
+    let inner = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    Ok(inner.selected_index.map(|i| i as i32).unwrap_or(-1))
+  }
+
+  /// Promise that resolves when track metadata is available (W3C spec)
+  /// Since we use buffered data, this resolves immediately
+  #[napi(getter)]
+  pub async fn ready(&self) -> Result<()> {
+    Ok(())
+  }
+
+  /// Get track at specified index (W3C spec)
+  #[napi]
+  pub fn item(&self, index: u32) -> Result<Option<ImageTrack>> {
+    let inner = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    if (index as usize) < inner.tracks.len() {
+      Ok(Some(ImageTrack {
+        track_list_inner: self.inner.clone(),
+        index: index as usize,
+      }))
+    } else {
+      Ok(None)
+    }
   }
 }
 
@@ -258,14 +384,17 @@ impl ImageDecoder {
     // For static images, there's one frame; for animated, we'll detect later
     let frame_count = if animated { 0 } else { 1 };
 
-    let tracks = ImageTrackList {
-      tracks: vec![ImageTrack {
+    let track_list_inner = Arc::new(Mutex::new(ImageTrackListInner {
+      tracks: vec![ImageTrackData {
         animated,
         frame_count,
         repetition_count: if animated { f64::INFINITY } else { 0.0 },
-        selected: true,
       }],
       selected_index: Some(0),
+    }));
+
+    let tracks = ImageTrackList {
+      inner: track_list_inner,
     };
 
     // Extract data and determine source type
@@ -337,7 +466,7 @@ impl ImageDecoder {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     if inner.closed {
-      return Err(Error::new(Status::GenericFailure, "ImageDecoder is closed"));
+      return Err(invalid_state_error("ImageDecoder is closed"));
     }
 
     let frame_index = options.as_ref().and_then(|o| o.frame_index).unwrap_or(0) as usize;
@@ -385,7 +514,11 @@ impl ImageDecoder {
 
       // Update frame_count in track info
       if !decoded_frames.is_empty() {
-        inner.tracks.tracks[0].frame_count = decoded_frames.len() as u32;
+        if let Ok(mut track_inner) = inner.tracks.inner.lock() {
+          if let Some(track) = track_inner.tracks.get_mut(0) {
+            track.frame_count = decoded_frames.len() as u32;
+          }
+        }
       }
 
       // Cache the decoded frames
@@ -440,15 +573,19 @@ impl ImageDecoder {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     if inner.closed {
-      return Err(Error::new(Status::GenericFailure, "ImageDecoder is closed"));
+      return Err(invalid_state_error("ImageDecoder is closed"));
     }
 
     inner.context = None;
     inner.cached_frames = None;
 
     // Reset frame_count for animated formats (will be re-detected on next decode)
-    if inner.tracks.tracks[0].animated {
-      inner.tracks.tracks[0].frame_count = 0;
+    if let Ok(mut track_inner) = inner.tracks.inner.lock() {
+      if let Some(track) = track_inner.tracks.get_mut(0) {
+        if track.animated {
+          track.frame_count = 0;
+        }
+      }
     }
 
     Ok(())
@@ -466,6 +603,16 @@ impl ImageDecoder {
     inner.cached_frames = None;
     inner.closed = true;
     Ok(())
+  }
+
+  /// Whether this ImageDecoder has been closed (W3C WebCodecs spec)
+  #[napi(getter)]
+  pub fn closed(&self) -> Result<bool> {
+    let inner = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    Ok(inner.closed)
   }
 
   /// Check if a MIME type is supported

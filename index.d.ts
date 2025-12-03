@@ -192,8 +192,8 @@ export declare class DOMRectReadOnly {
   get bottom(): number
   /** Left edge (same as x) */
   get left(): number
-  /** Convert to JSON */
-  toJson(): DOMRectInit
+  /** Convert to JSON (W3C spec uses toJSON) */
+  toJSON(): DOMRectInit
 }
 
 /**
@@ -275,6 +275,8 @@ export declare class ImageDecoder {
   reset(): void
   /** Close the decoder */
   close(): void
+  /** Whether this ImageDecoder has been closed (W3C WebCodecs spec) */
+  get closed(): boolean
   /** Check if a MIME type is supported */
   static isTypeSupported(mimeType: string): Promise<boolean>
 }
@@ -287,14 +289,38 @@ export declare class ImageDecodeResult {
   get complete(): boolean
 }
 
-/** Image track list */
+/** Image track information (W3C spec - class with writable selected property) */
+export declare class ImageTrack {
+  /** Whether this track is animated */
+  get animated(): boolean
+  /** Number of frames in this track */
+  get frameCount(): number
+  /** Number of times the animation repeats (Infinity for infinite) */
+  get repetitionCount(): number
+  /** Whether this track is currently selected (W3C spec - writable) */
+  get selected(): boolean
+  /**
+   * Set whether this track is selected (W3C spec - writable)
+   * Setting to true deselects all other tracks
+   */
+  set selected(value: boolean)
+}
+
+/** Image track list (W3C spec) */
 export declare class ImageTrackList {
   /** Get the number of tracks */
   get length(): number
   /** Get the currently selected track (if any) */
   get selectedTrack(): ImageTrack | null
-  /** Get the selected track index */
-  get selectedIndex(): number | null
+  /** Get the selected track index (W3C spec: returns -1 if no track selected) */
+  get selectedIndex(): number
+  /**
+   * Promise that resolves when track metadata is available (W3C spec)
+   * Since we use buffered data, this resolves immediately
+   */
+  get ready(): Promise<void>
+  /** Get track at specified index (W3C spec) */
+  item(index: number): ImageTrack | null
 }
 
 /** Video color space parameters (WebCodecs spec) - as a class per spec */
@@ -309,10 +335,8 @@ export declare class VideoColorSpace {
   get matrix(): string | null
   /** Get full range flag */
   get fullRange(): boolean | null
-  /** Convert to JSON-compatible object */
-  toJson(): VideoColorSpaceInit
-  /** Clone this VideoColorSpace (W3C WebCodecs spec) */
-  clone(): VideoColorSpace
+  /** Convert to JSON-compatible object (W3C spec uses toJSON) */
+  toJSON(): VideoColorSpaceInit
 }
 
 /**
@@ -474,24 +498,22 @@ export declare class VideoFrame {
   get displayHeight(): number
   /**
    * Get the coded rect (the region containing valid pixel data)
-   * Returns DOMRectReadOnly per W3C WebCodecs spec, null if closed
+   * Returns DOMRectReadOnly per W3C WebCodecs spec
+   * Throws InvalidStateError if the VideoFrame is closed
    */
-  get codedRect(): DOMRectReadOnly | null
+  get codedRect(): DOMRectReadOnly
   /**
    * Get the visible rect (the region of coded data that should be displayed)
-   * Returns DOMRectReadOnly per W3C WebCodecs spec, null if closed
+   * Returns DOMRectReadOnly per W3C WebCodecs spec
+   * Throws InvalidStateError if the VideoFrame is closed
    */
-  get visibleRect(): DOMRectReadOnly | null
+  get visibleRect(): DOMRectReadOnly
   /** Get the presentation timestamp in microseconds */
   get timestamp(): number
   /** Get the duration in microseconds */
   get duration(): number | null
   /** Get the color space parameters */
   get colorSpace(): VideoColorSpace
-  /** Get the rotation in degrees (0, 90, 180, 270) per W3C WebCodecs spec */
-  get rotation(): number
-  /** Get whether the frame is horizontally flipped per W3C WebCodecs spec */
-  get flip(): boolean
   /** Get whether this VideoFrame has been closed (W3C WebCodecs spec) */
   get closed(): boolean
   /** Calculate the allocation size needed for copyTo */
@@ -656,25 +678,6 @@ export interface EncodedAudioChunkMetadata {
   decoderConfig?: AudioDecoderConfigOutput
 }
 
-/**
- * Serializable output for callbacks (used with ThreadsafeFunction)
- *
- * NAPI-RS class instances can't be passed through ThreadsafeFunction,
- * so we use this plain object struct for callback output.
- */
-export interface EncodedAudioChunkOutput {
-  /** Chunk type (key or delta) */
-  type: EncodedAudioChunkType
-  /** Timestamp in microseconds */
-  timestamp: number
-  /** Duration in microseconds (optional) */
-  duration?: number
-  /** Encoded data (Uint8Array per spec) */
-  data: Uint8Array
-  /** Byte length of the encoded data */
-  byteLength: number
-}
-
 /** Type of encoded audio chunk */
 export type EncodedAudioChunkType = /** Key chunk - can be decoded independently */
 'key'|
@@ -733,18 +736,6 @@ export interface ImageDecodeOptions {
   frameIndex?: number
   /** Whether to only decode complete frames */
   completeFramesOnly?: boolean
-}
-
-/** Image track information */
-export interface ImageTrack {
-  /** Whether this track is animated */
-  animated: boolean
-  /** Number of frames in this track */
-  frameCount: number
-  /** Number of times the animation repeats (Infinity for infinite) */
-  repetitionCount: number
-  /** Whether this track is currently selected */
-  selected: boolean
 }
 
 /** Check if a specific hardware accelerator is available */

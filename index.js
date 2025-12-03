@@ -565,6 +565,7 @@ module.exports.EncodedAudioChunk = nativeBinding.EncodedAudioChunk
 module.exports.EncodedVideoChunk = nativeBinding.EncodedVideoChunk
 module.exports.ImageDecoder = nativeBinding.ImageDecoder
 module.exports.ImageDecodeResult = nativeBinding.ImageDecodeResult
+module.exports.ImageTrack = nativeBinding.ImageTrack
 module.exports.ImageTrackList = nativeBinding.ImageTrackList
 module.exports.VideoColorSpace = nativeBinding.VideoColorSpace
 module.exports.VideoDecoder = nativeBinding.VideoDecoder

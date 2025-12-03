@@ -23,7 +23,7 @@ pub use audio_encoder::{
 };
 pub use encoded_audio_chunk::{
   AudioDecoderConfig, AudioDecoderSupport, AudioEncoderConfig, AudioEncoderSupport,
-  EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkOutput, EncodedAudioChunkType,
+  EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkType,
 };
 pub use encoded_video_chunk::{
   EncodedVideoChunk, EncodedVideoChunkInit, EncodedVideoChunkType, VideoDecoderConfig,

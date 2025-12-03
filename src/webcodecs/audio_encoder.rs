@@ -8,9 +8,7 @@ use crate::codec::{
   AudioSampleBuffer, CodecContext, Frame, Resampler,
 };
 use crate::ffi::{AVCodecID, AVSampleFormat};
-use crate::webcodecs::{
-  AudioData, AudioEncoderConfig, AudioEncoderSupport, EncodedAudioChunk, EncodedAudioChunkOutput,
-};
+use crate::webcodecs::{AudioData, AudioEncoderConfig, AudioEncoderSupport, EncodedAudioChunk};
 use crossbeam::channel::{self, Receiver, Sender};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{
@@ -26,9 +24,9 @@ use super::video_encoder::CodecState;
 /// Using FnArgs to spread tuple as separate callback arguments per WebCodecs spec
 /// Using CalleeHandled: false for direct callbacks without error-first convention
 type OutputCallback = ThreadsafeFunction<
-  FnArgs<(EncodedAudioChunkOutput, EncodedAudioChunkMetadata)>,
+  FnArgs<(EncodedAudioChunk, EncodedAudioChunkMetadata)>,
   UnknownReturnValue,
-  FnArgs<(EncodedAudioChunkOutput, EncodedAudioChunkMetadata)>,
+  FnArgs<(EncodedAudioChunk, EncodedAudioChunkMetadata)>,
   Status,
   false,
   true,
@@ -95,10 +93,7 @@ pub struct AudioEncoderEncodeOptions {
 /// Commands sent to the worker thread
 enum EncoderCommand {
   /// Encode an audio frame
-  Encode {
-    frame: Frame,
-    timestamp: i64,
-  },
+  Encode { frame: Frame, timestamp: i64 },
   /// Flush the encoder and send result back via response channel
   Flush(Sender<Result<()>>),
 }
@@ -158,13 +153,14 @@ pub struct AudioEncoder {
 
 impl Drop for AudioEncoder {
   fn drop(&mut self) {
-    // Drop the sender first to signal the worker to stop
+    // Drop the sender to signal the worker to stop.
+    // The worker will see the channel disconnect and exit its loop.
     self.command_sender = None;
 
-    // Wait for the worker thread to finish processing remaining tasks
-    if let Some(handle) = self.worker_handle.take() {
-      let _ = handle.join();
-    }
+    // Don't join the worker thread here - it would block the JS thread during GC.
+    // Instead, let the thread become detached and finish on its own.
+    // Safety: The Arc<Mutex<AudioEncoderInner>> ensures the inner state (including
+    // callbacks and FFmpeg context) stays alive until the worker exits.
   }
 }
 
@@ -395,19 +391,10 @@ impl AudioEncoder {
           }
         };
 
-        // Call output callback with serializable output
-        match chunk.to_output() {
-          Ok(chunk_output) => {
-            guard.output_callback.call(
-              (chunk_output, metadata).into(),
-              ThreadsafeFunctionCallMode::NonBlocking,
-            );
-          }
-          Err(e) => {
-            Self::report_error(&mut guard, &format!("Failed to serialize chunk: {}", e));
-            return;
-          }
-        }
+        guard.output_callback.call(
+          (chunk, metadata).into(),
+          ThreadsafeFunctionCallMode::NonBlocking,
+        );
       }
     }
 
@@ -451,12 +438,10 @@ impl AudioEncoder {
             let metadata = EncodedAudioChunkMetadata {
               decoder_config: None,
             };
-            if let Ok(chunk_output) = chunk.to_output() {
-              guard.output_callback.call(
-                (chunk_output, metadata).into(),
-                ThreadsafeFunctionCallMode::NonBlocking,
-              );
-            }
+            guard.output_callback.call(
+              (chunk, metadata).into(),
+              ThreadsafeFunctionCallMode::NonBlocking,
+            );
           }
         }
       }
@@ -485,12 +470,10 @@ impl AudioEncoder {
       let metadata = EncodedAudioChunkMetadata {
         decoder_config: None,
       };
-      if let Ok(chunk_output) = chunk.to_output() {
-        guard.output_callback.call(
-          (chunk_output, metadata).into(),
-          ThreadsafeFunctionCallMode::NonBlocking,
-        );
-      }
+      guard.output_callback.call(
+        (chunk, metadata).into(),
+        ThreadsafeFunctionCallMode::NonBlocking,
+      );
     }
 
     Ok(())
@@ -842,10 +825,7 @@ impl AudioEncoder {
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
       if inner.state == CodecState::Closed {
-        return Err(Error::new(
-          Status::GenericFailure,
-          "Encoder is closed",
-        ));
+        return Err(Error::new(Status::GenericFailure, "Encoder is closed"));
       }
     }
 
