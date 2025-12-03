@@ -6,12 +6,14 @@
 use crate::codec::{AudioDecoderConfig as InternalAudioDecoderConfig, CodecContext, Frame, Packet};
 use crate::ffi::AVCodecID;
 use crate::webcodecs::{AudioData, AudioDecoderConfig, AudioDecoderSupport, EncodedAudioChunk};
+use crossbeam::channel::{self, Receiver, Sender};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{
   ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
 };
 use napi_derive::napi;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use super::video_encoder::CodecState;
 
@@ -26,6 +28,17 @@ type ErrorCallback = ThreadsafeFunction<String, UnknownReturnValue, String, Stat
 
 // Note: For ondequeue, we use FunctionRef instead of ThreadsafeFunction
 // to support both getter and setter per WebCodecs spec
+
+/// Commands sent to the worker thread
+enum DecoderCommand {
+  /// Decode an audio chunk
+  Decode {
+    data: Vec<u8>,
+    timestamp: i64,
+  },
+  /// Flush the decoder and send result back via response channel
+  Flush(Sender<Result<()>>),
+}
 
 /// AudioDecoder init dictionary per WebCodecs spec
 pub struct AudioDecoderInit {
@@ -97,6 +110,22 @@ struct AudioDecoderInner {
 pub struct AudioDecoder {
   inner: Arc<Mutex<AudioDecoderInner>>,
   dequeue_callback: Option<FunctionRef<(), UnknownReturnValue>>,
+  /// Channel sender for worker commands
+  command_sender: Option<Sender<DecoderCommand>>,
+  /// Worker thread handle
+  worker_handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for AudioDecoder {
+  fn drop(&mut self) {
+    // Drop the sender first to signal the worker to stop
+    self.command_sender = None;
+
+    // Wait for the worker thread to finish processing remaining tasks
+    if let Some(handle) = self.worker_handle.take() {
+      let _ = handle.join();
+    }
+  }
 }
 
 #[napi]
@@ -121,10 +150,135 @@ impl AudioDecoder {
       dequeue_callback: None,
     };
 
+    let inner = Arc::new(Mutex::new(inner));
+
+    // Create channel for worker commands
+    let (sender, receiver) = channel::unbounded();
+
+    // Spawn worker thread
+    let worker_inner = inner.clone();
+    let worker_handle = std::thread::spawn(move || {
+      Self::worker_loop(worker_inner, receiver);
+    });
+
     Ok(Self {
-      inner: Arc::new(Mutex::new(inner)),
+      inner,
       dequeue_callback: None,
+      command_sender: Some(sender),
+      worker_handle: Some(worker_handle),
     })
+  }
+
+  /// Worker loop that processes commands from the channel
+  fn worker_loop(inner: Arc<Mutex<AudioDecoderInner>>, receiver: Receiver<DecoderCommand>) {
+    while let Ok(command) = receiver.recv() {
+      match command {
+        DecoderCommand::Decode { data, timestamp } => {
+          Self::process_decode(&inner, data, timestamp);
+        }
+        DecoderCommand::Flush(response_sender) => {
+          let result = Self::process_flush(&inner);
+          let _ = response_sender.send(result);
+        }
+      }
+    }
+  }
+
+  /// Process a decode command on the worker thread
+  fn process_decode(inner: &Arc<Mutex<AudioDecoderInner>>, data: Vec<u8>, timestamp: i64) {
+    let mut guard = match inner.lock() {
+      Ok(g) => g,
+      Err(_) => return, // Lock poisoned
+    };
+
+    // Check if decoder is still configured
+    if guard.state != CodecState::Configured {
+      guard.decode_queue_size = guard.decode_queue_size.saturating_sub(1);
+      let _ = Self::fire_dequeue_event(&guard);
+      Self::report_error(&mut guard, "Decoder not configured");
+      return;
+    }
+
+    // Get context
+    let context = match guard.context.as_mut() {
+      Some(ctx) => ctx,
+      None => {
+        guard.decode_queue_size = guard.decode_queue_size.saturating_sub(1);
+        let _ = Self::fire_dequeue_event(&guard);
+        Self::report_error(&mut guard, "No decoder context");
+        return;
+      }
+    };
+
+    // Decode using the internal implementation
+    let frames = match decode_audio_chunk_data(context, &data, timestamp) {
+      Ok(f) => f,
+      Err(e) => {
+        guard.decode_queue_size = guard.decode_queue_size.saturating_sub(1);
+        let _ = Self::fire_dequeue_event(&guard);
+        Self::report_error(&mut guard, &format!("Decode failed: {}", e));
+        return;
+      }
+    };
+
+    guard.frame_count += 1;
+
+    // Decrement queue size and fire dequeue event
+    guard.decode_queue_size = guard.decode_queue_size.saturating_sub(1);
+    let _ = Self::fire_dequeue_event(&guard);
+
+    // Convert internal frames to AudioData and call output callback
+    for frame in frames {
+      let pts = frame.pts();
+      let audio_data = AudioData::from_internal(frame, pts);
+
+      // Call output callback (CalleeHandled: false means direct value, not Result)
+      guard
+        .output_callback
+        .call(audio_data, ThreadsafeFunctionCallMode::NonBlocking);
+    }
+  }
+
+  /// Process a flush command on the worker thread
+  fn process_flush(inner: &Arc<Mutex<AudioDecoderInner>>) -> Result<()> {
+    let mut guard = inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    if guard.state != CodecState::Configured {
+      Self::report_error(&mut guard, "Decoder not configured");
+      return Ok(());
+    }
+
+    let context = match guard.context.as_mut() {
+      Some(ctx) => ctx,
+      None => {
+        Self::report_error(&mut guard, "No decoder context");
+        return Ok(());
+      }
+    };
+
+    // Flush decoder
+    let frames = match context.flush_decoder() {
+      Ok(f) => f,
+      Err(e) => {
+        Self::report_error(&mut guard, &format!("Flush failed: {}", e));
+        return Ok(());
+      }
+    };
+
+    // Convert and call output callback for remaining frames
+    for frame in frames {
+      let pts = frame.pts();
+      let audio_data = AudioData::from_internal(frame, pts);
+
+      // Call output callback (CalleeHandled: false means direct value, not Result)
+      guard
+        .output_callback
+        .call(audio_data, ThreadsafeFunctionCallMode::NonBlocking);
+    }
+
+    Ok(())
   }
 
   /// Report an error via callback and close the decoder
@@ -271,76 +425,50 @@ impl AudioDecoder {
   /// Decode an encoded audio chunk
   #[napi]
   pub fn decode(&self, chunk: &EncodedAudioChunk) -> Result<()> {
-    let mut inner = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    // Extract data and timestamp on main thread (brief lock)
+    let (data, timestamp) = {
+      let mut inner = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    if inner.state != CodecState::Configured {
-      Self::report_error(&mut inner, "Decoder not configured");
-      return Ok(());
-    }
-
-    // Increment queue size (pending operation)
-    inner.decode_queue_size += 1;
-
-    // Get chunk data
-    let data = match chunk.get_data_vec() {
-      Ok(d) => d,
-      Err(e) => {
-        inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, &format!("Failed to get chunk data: {}", e));
+      if inner.state != CodecState::Configured {
+        Self::report_error(&mut inner, "Decoder not configured");
         return Ok(());
       }
-    };
-    let timestamp = match chunk.get_timestamp() {
-      Ok(ts) => ts,
-      Err(e) => {
-        inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, &format!("Failed to get timestamp: {}", e));
-        return Ok(());
-      }
-    };
 
-    // Get context
-    let context = match inner.context.as_mut() {
-      Some(ctx) => ctx,
-      None => {
-        inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, "No decoder context");
-        return Ok(());
-      }
-    };
+      // Get chunk data
+      let data = match chunk.get_data_vec() {
+        Ok(d) => d,
+        Err(e) => {
+          Self::report_error(&mut inner, &format!("Failed to get chunk data: {}", e));
+          return Ok(());
+        }
+      };
+      let timestamp = match chunk.get_timestamp() {
+        Ok(ts) => ts,
+        Err(e) => {
+          Self::report_error(&mut inner, &format!("Failed to get timestamp: {}", e));
+          return Ok(());
+        }
+      };
 
-    // Decode using the internal implementation
-    let frames = match decode_audio_chunk_data(context, &data, timestamp) {
-      Ok(f) => f,
-      Err(e) => {
-        inner.decode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, &format!("Decode failed: {}", e));
-        return Ok(());
-      }
+      // Increment queue size (pending operation)
+      inner.decode_queue_size += 1;
+
+      (data, timestamp)
     };
 
-    inner.frame_count += 1;
-
-    // Decrement queue size and fire dequeue event
-    inner.decode_queue_size -= 1;
-    Self::fire_dequeue_event(&inner)?;
-
-    // Convert internal frames to AudioData and call output callback
-    for frame in frames {
-      let pts = frame.pts();
-      let audio_data = AudioData::from_internal(frame, pts);
-
-      // Call output callback (CalleeHandled: false means direct value, not Result)
-      inner
-        .output_callback
-        .call(audio_data, ThreadsafeFunctionCallMode::NonBlocking);
+    // Send decode command to worker thread
+    if let Some(ref sender) = self.command_sender {
+      sender
+        .send(DecoderCommand::Decode { data, timestamp })
+        .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?;
+    } else {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "Decoder has been closed",
+      ));
     }
 
     Ok(())
@@ -350,59 +478,67 @@ impl AudioDecoder {
   /// Returns a Promise that resolves when flushing is complete
   #[napi]
   pub async fn flush(&self) -> Result<()> {
-    let mut inner = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    // Create a response channel
+    let (response_sender, response_receiver) = channel::bounded::<Result<()>>(1);
 
-    if inner.state != CodecState::Configured {
-      Self::report_error(&mut inner, "Decoder not configured");
-      return Ok(());
+    // Send flush command through the channel to ensure it's processed after all pending decodes
+    if let Some(ref sender) = self.command_sender {
+      sender
+        .send(DecoderCommand::Flush(response_sender))
+        .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?;
+    } else {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "Decoder has been closed",
+      ));
     }
 
-    let context = match inner.context.as_mut() {
-      Some(ctx) => ctx,
-      None => {
-        Self::report_error(&mut inner, "No decoder context");
-        return Ok(());
-      }
-    };
-
-    // Flush decoder
-    let frames = match context.flush_decoder() {
-      Ok(f) => f,
-      Err(e) => {
-        Self::report_error(&mut inner, &format!("Flush failed: {}", e));
-        return Ok(());
-      }
-    };
-
-    // Convert and call output callback for remaining frames
-    for frame in frames {
-      let pts = frame.pts();
-      let audio_data = AudioData::from_internal(frame, pts);
-
-      // Call output callback (CalleeHandled: false means direct value, not Result)
-      inner
-        .output_callback
-        .call(audio_data, ThreadsafeFunctionCallMode::NonBlocking);
-    }
-
-    Ok(())
+    // Wait for response in a blocking thread to not block the event loop
+    spawn_blocking(move || {
+      response_receiver
+        .recv()
+        .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?
+    })
+    .await
+    .map_err(|join_error| {
+      Error::new(
+        Status::GenericFailure,
+        format!("Flush failed: {}", join_error),
+      )
+    })
+    .flatten()
   }
 
   /// Reset the decoder
   #[napi]
-  pub fn reset(&self) -> Result<()> {
+  pub fn reset(&mut self) -> Result<()> {
+    // Check state first before touching the worker
+    {
+      let inner = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+      if inner.state == CodecState::Closed {
+        return Err(Error::new(
+          Status::GenericFailure,
+          "Decoder is closed",
+        ));
+      }
+    }
+
+    // Drop sender to signal worker to stop (must drop before join!)
+    drop(self.command_sender.take());
+
+    // Wait for worker to finish processing remaining commands
+    if let Some(handle) = self.worker_handle.take() {
+      let _ = handle.join();
+    }
+
     let mut inner = self
       .inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    if inner.state == CodecState::Closed {
-      Self::report_error(&mut inner, "Decoder is closed");
-      return Ok(());
-    }
 
     // Drop existing context
     inner.context = None;
@@ -412,12 +548,29 @@ impl AudioDecoder {
     inner.frame_count = 0;
     inner.decode_queue_size = 0;
 
+    // Create new channel and worker for future decode operations
+    let (sender, receiver) = channel::unbounded();
+    self.command_sender = Some(sender);
+    let worker_inner = self.inner.clone();
+    drop(inner); // Release lock before spawning thread
+    self.worker_handle = Some(std::thread::spawn(move || {
+      Self::worker_loop(worker_inner, receiver);
+    }));
+
     Ok(())
   }
 
   /// Close the decoder
   #[napi]
-  pub fn close(&self) -> Result<()> {
+  pub fn close(&mut self) -> Result<()> {
+    // Drop sender to stop accepting new commands
+    self.command_sender = None;
+
+    // Wait for worker to finish processing remaining tasks
+    if let Some(handle) = self.worker_handle.take() {
+      let _ = handle.join();
+    }
+
     let mut inner = self
       .inner
       .lock()

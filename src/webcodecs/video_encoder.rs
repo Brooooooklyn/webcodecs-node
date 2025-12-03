@@ -3,15 +3,17 @@
 //! Provides video encoding functionality using FFmpeg.
 //! See: https://w3c.github.io/webcodecs/#videoencoder-interface
 
-use crate::codec::{BitrateMode, CodecContext, EncoderConfig, Scaler};
+use crate::codec::{BitrateMode, CodecContext, EncoderConfig, Frame, Scaler};
 use crate::ffi::{AVCodecID, AVHWDeviceType, AVPixelFormat};
 use crate::webcodecs::{EncodedVideoChunk, VideoEncoderConfig, VideoFrame};
+use crossbeam::channel::{self, Receiver, Sender};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{
   ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
 };
 use napi_derive::napi;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 /// Encoder state per WebCodecs spec
 #[napi(string_enum)]
@@ -85,6 +87,18 @@ type ErrorCallback = ThreadsafeFunction<String, UnknownReturnValue, String, Stat
 // Note: For ondequeue, we use FunctionRef instead of ThreadsafeFunction
 // to support both getter and setter per WebCodecs spec
 
+/// Commands sent to the worker thread
+enum EncoderCommand {
+  /// Encode a video frame
+  Encode {
+    frame: Frame,
+    timestamp: i64,
+    options: Option<VideoEncoderEncodeOptions>,
+  },
+  /// Flush the encoder and send result back via response channel
+  Flush(Sender<Result<()>>),
+}
+
 /// VideoEncoder init dictionary per WebCodecs spec
 pub struct VideoEncoderInit {
   /// Output callback - called when encoded chunk is available
@@ -157,6 +171,22 @@ struct VideoEncoderInner {
 pub struct VideoEncoder {
   inner: Arc<Mutex<VideoEncoderInner>>,
   dequeue_callback: Option<FunctionRef<(), UnknownReturnValue>>,
+  /// Channel sender for worker commands
+  command_sender: Option<Sender<EncoderCommand>>,
+  /// Worker thread handle
+  worker_handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for VideoEncoder {
+  fn drop(&mut self) {
+    // Drop the sender first to signal the worker to stop
+    self.command_sender = None;
+
+    // Wait for the worker thread to finish processing remaining tasks
+    if let Some(handle) = self.worker_handle.take() {
+      let _ = handle.join();
+    }
+  }
 }
 
 #[napi]
@@ -184,10 +214,226 @@ impl VideoEncoder {
       dequeue_callback: None,
     };
 
+    let inner = Arc::new(Mutex::new(inner));
+
+    // Create channel for worker commands
+    let (sender, receiver) = channel::unbounded();
+
+    // Spawn worker thread
+    let worker_inner = inner.clone();
+    let worker_handle = std::thread::spawn(move || {
+      Self::worker_loop(worker_inner, receiver);
+    });
+
     Ok(Self {
-      inner: Arc::new(Mutex::new(inner)),
+      inner,
       dequeue_callback: None,
+      command_sender: Some(sender),
+      worker_handle: Some(worker_handle),
     })
+  }
+
+  /// Worker loop that processes commands from the channel
+  fn worker_loop(inner: Arc<Mutex<VideoEncoderInner>>, receiver: Receiver<EncoderCommand>) {
+    while let Ok(command) = receiver.recv() {
+      match command {
+        EncoderCommand::Encode { frame, timestamp, options } => {
+          Self::process_encode(&inner, frame, timestamp, options);
+        }
+        EncoderCommand::Flush(response_sender) => {
+          let result = Self::process_flush(&inner);
+          let _ = response_sender.send(result);
+        }
+      }
+    }
+  }
+
+  /// Process an encode command on the worker thread
+  fn process_encode(
+    inner: &Arc<Mutex<VideoEncoderInner>>,
+    frame: Frame,
+    timestamp: i64,
+    _options: Option<VideoEncoderEncodeOptions>,
+  ) {
+    let mut guard = match inner.lock() {
+      Ok(g) => g,
+      Err(_) => return, // Lock poisoned
+    };
+
+    // Check if encoder is still configured
+    if guard.state != CodecState::Configured {
+      guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+      let _ = Self::fire_dequeue_event(&guard);
+      Self::report_error(&mut guard, "Encoder not configured");
+      return;
+    }
+
+    // Get config info
+    let (width, height, codec_string) = match guard.config.as_ref() {
+      Some(config) => (config.width, config.height, config.codec.clone()),
+      None => {
+        guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+        let _ = Self::fire_dequeue_event(&guard);
+        Self::report_error(&mut guard, "No encoder config");
+        return;
+      }
+    };
+
+    // Check if frame needs conversion
+    let frame_format = frame.format();
+    let needs_conversion =
+      frame_format != AVPixelFormat::Yuv420p || frame.width() != width || frame.height() != height;
+
+    // Convert frame if needed
+    let mut frame_to_encode = if needs_conversion {
+      // Create scaler if needed
+      if guard.scaler.is_none() {
+        match Scaler::new(
+          frame.width(),
+          frame.height(),
+          frame_format,
+          width,
+          height,
+          AVPixelFormat::Yuv420p,
+          crate::codec::scaler::ScaleAlgorithm::Bilinear,
+        ) {
+          Ok(scaler) => guard.scaler = Some(scaler),
+          Err(e) => {
+            guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+            let _ = Self::fire_dequeue_event(&guard);
+            Self::report_error(&mut guard, &format!("Failed to create scaler: {}", e));
+            return;
+          }
+        }
+      }
+
+      let scaler = guard.scaler.as_ref().unwrap();
+      match scaler.scale_alloc(&frame) {
+        Ok(scaled) => scaled,
+        Err(e) => {
+          guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+          let _ = Self::fire_dequeue_event(&guard);
+          Self::report_error(&mut guard, &format!("Failed to scale frame: {}", e));
+          return;
+        }
+      }
+    } else {
+      frame
+    };
+
+    // Set frame PTS
+    frame_to_encode.set_pts(timestamp);
+
+    // Get extradata before encoding
+    let extradata_sent = guard.extradata_sent;
+    let extradata = if !extradata_sent {
+      guard
+        .context
+        .as_ref()
+        .and_then(|ctx| ctx.extradata().map(|d| d.to_vec()))
+    } else {
+      None
+    };
+
+    // Encode the frame
+    let context = match guard.context.as_mut() {
+      Some(ctx) => ctx,
+      None => {
+        guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+        let _ = Self::fire_dequeue_event(&guard);
+        Self::report_error(&mut guard, "No encoder context");
+        return;
+      }
+    };
+
+    let packets = match context.encode(Some(&frame_to_encode)) {
+      Ok(pkts) => pkts,
+      Err(e) => {
+        guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+        let _ = Self::fire_dequeue_event(&guard);
+        Self::report_error(&mut guard, &format!("Encode failed: {}", e));
+        return;
+      }
+    };
+
+    guard.frame_count += 1;
+
+    // Decrement queue size and fire dequeue event
+    guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+    let _ = Self::fire_dequeue_event(&guard);
+
+    // Process output packets - call callback for each
+    for packet in packets {
+      let chunk = EncodedVideoChunk::from_packet(&packet);
+
+      // Create metadata
+      let metadata = if !guard.extradata_sent && packet.is_key() {
+        guard.extradata_sent = true;
+
+        EncodedVideoChunkMetadata {
+          decoder_config: Some(VideoDecoderConfigOutput {
+            codec: codec_string.clone(),
+            coded_width: Some(width),
+            coded_height: Some(height),
+            description: extradata.clone().map(Uint8Array::from),
+          }),
+        }
+      } else {
+        EncodedVideoChunkMetadata {
+          decoder_config: None,
+        }
+      };
+
+      // Call callback with EncodedVideoChunk directly (per W3C WebCodecs spec)
+      guard.output_callback.call(
+        (chunk, metadata).into(),
+        ThreadsafeFunctionCallMode::NonBlocking,
+      );
+    }
+  }
+
+  /// Process a flush command on the worker thread
+  fn process_flush(inner: &Arc<Mutex<VideoEncoderInner>>) -> Result<()> {
+    let mut guard = inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    if guard.state != CodecState::Configured {
+      Self::report_error(&mut guard, "Encoder not configured");
+      return Ok(());
+    }
+
+    let context = match guard.context.as_mut() {
+      Some(ctx) => ctx,
+      None => {
+        Self::report_error(&mut guard, "No encoder context");
+        return Ok(());
+      }
+    };
+
+    // Flush encoder
+    let packets = match context.flush_encoder() {
+      Ok(pkts) => pkts,
+      Err(e) => {
+        Self::report_error(&mut guard, &format!("Flush failed: {}", e));
+        return Ok(());
+      }
+    };
+
+    // Process remaining packets - call callback for each
+    for packet in packets {
+      let chunk = EncodedVideoChunk::from_packet(&packet);
+      let metadata = EncodedVideoChunkMetadata {
+        decoder_config: None,
+      };
+
+      guard.output_callback.call(
+        (chunk, metadata).into(),
+        ThreadsafeFunctionCallMode::NonBlocking,
+      );
+    }
+
+    Ok(())
   }
 
   /// Report an error via callback and close the encoder
@@ -378,174 +624,62 @@ impl VideoEncoder {
   pub fn encode(
     &self,
     frame: &VideoFrame,
-    _options: Option<VideoEncoderEncodeOptions>,
+    options: Option<VideoEncoderEncodeOptions>,
   ) -> Result<()> {
-    let mut inner = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    // Clone frame and get timestamp on main thread (brief lock)
+    let (internal_frame, timestamp) = {
+      let mut inner = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    if inner.state != CodecState::Configured {
-      Self::report_error(&mut inner, "Encoder not configured");
-      return Ok(());
-    }
-
-    // Increment queue size (pending operation)
-    inner.encode_queue_size += 1;
-
-    // Get config info first (clone to avoid borrow issues)
-    let (width, height, codec_string) = match inner.config.as_ref() {
-      Some(config) => (config.width, config.height, config.codec.clone()),
-      None => {
-        inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, "No encoder config");
+      if inner.state != CodecState::Configured {
+        Self::report_error(&mut inner, "Encoder not configured");
         return Ok(());
       }
-    };
 
-    // Get frame data from VideoFrame
-    let (internal_frame, needs_conversion) = match frame.with_frame(|f| {
-      let frame_format = f.format();
-      let needs_conv =
-        frame_format != AVPixelFormat::Yuv420p || f.width() != width || f.height() != height;
-      (f.try_clone(), needs_conv)
-    }) {
-      Ok(result) => result,
-      Err(e) => {
-        inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, &format!("Failed to access frame: {}", e));
-        return Ok(());
-      }
-    };
-
-    let internal_frame = match internal_frame {
-      Ok(f) => f,
-      Err(e) => {
-        inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, &format!("Failed to clone frame: {}", e));
-        return Ok(());
-      }
-    };
-
-    // Convert frame if needed
-    let mut frame_to_encode = if needs_conversion {
-      // Create scaler if needed
-      if inner.scaler.is_none() {
-        let src_format = internal_frame.format();
-        match Scaler::new(
-          internal_frame.width(),
-          internal_frame.height(),
-          src_format,
-          width,
-          height,
-          AVPixelFormat::Yuv420p,
-          crate::codec::scaler::ScaleAlgorithm::Bilinear,
-        ) {
-          Ok(scaler) => inner.scaler = Some(scaler),
-          Err(e) => {
-            inner.encode_queue_size -= 1;
-            Self::fire_dequeue_event(&inner)?;
-            Self::report_error(&mut inner, &format!("Failed to create scaler: {}", e));
-            return Ok(());
-          }
-        }
-      }
-
-      let scaler = inner.scaler.as_ref().unwrap();
-      match scaler.scale_alloc(&internal_frame) {
-        Ok(scaled) => scaled,
-        Err(e) => {
-          inner.encode_queue_size -= 1;
-          Self::fire_dequeue_event(&inner)?;
-          Self::report_error(&mut inner, &format!("Failed to scale frame: {}", e));
+      // Clone frame data from VideoFrame
+      let internal_frame = match frame.with_frame(|f| f.try_clone()) {
+        Ok(Ok(f)) => f,
+        Ok(Err(e)) => {
+          Self::report_error(&mut inner, &format!("Failed to clone frame: {}", e));
           return Ok(());
         }
-      }
-    } else {
-      internal_frame
-    };
-
-    // Set frame PTS based on timestamp
-    let pts = match frame.timestamp() {
-      Ok(ts) => ts,
-      Err(e) => {
-        inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, &format!("Failed to get frame timestamp: {}", e));
-        return Ok(());
-      }
-    };
-    frame_to_encode.set_pts(pts);
-
-    // Get extradata before encoding
-    let extradata_sent = inner.extradata_sent;
-    let extradata = if !extradata_sent {
-      inner
-        .context
-        .as_ref()
-        .and_then(|ctx| ctx.extradata().map(|d| d.to_vec()))
-    } else {
-      None
-    };
-
-    // Encode the frame
-    let context = match inner.context.as_mut() {
-      Some(ctx) => ctx,
-      None => {
-        inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, "No encoder context");
-        return Ok(());
-      }
-    };
-
-    let packets = match context.encode(Some(&frame_to_encode)) {
-      Ok(pkts) => pkts,
-      Err(e) => {
-        inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, &format!("Encode failed: {}", e));
-        return Ok(());
-      }
-    };
-
-    inner.frame_count += 1;
-
-    // Decrement queue size and fire dequeue event
-    inner.encode_queue_size -= 1;
-    Self::fire_dequeue_event(&inner)?;
-
-    // Process output packets - call callback for each
-    for packet in packets {
-      let chunk = EncodedVideoChunk::from_packet(&packet);
-
-      // Create metadata
-      let metadata = if !inner.extradata_sent && packet.is_key() {
-        inner.extradata_sent = true;
-
-        EncodedVideoChunkMetadata {
-          decoder_config: Some(VideoDecoderConfigOutput {
-            codec: codec_string.clone(),
-            coded_width: Some(width),
-            coded_height: Some(height),
-            description: extradata.clone().map(Uint8Array::from),
-          }),
-        }
-      } else {
-        EncodedVideoChunkMetadata {
-          decoder_config: None,
+        Err(e) => {
+          Self::report_error(&mut inner, &format!("Failed to access frame: {}", e));
+          return Ok(());
         }
       };
 
-      // Call callback with EncodedVideoChunk directly (per W3C WebCodecs spec)
-      // Use .into() to convert tuple to FnArgs for spreading as separate arguments
-      inner.output_callback.call(
-        (chunk, metadata).into(),
-        ThreadsafeFunctionCallMode::NonBlocking,
-      );
+      // Get timestamp
+      let timestamp = match frame.timestamp() {
+        Ok(ts) => ts,
+        Err(e) => {
+          Self::report_error(&mut inner, &format!("Failed to get frame timestamp: {}", e));
+          return Ok(());
+        }
+      };
+
+      // Increment queue size (pending operation)
+      inner.encode_queue_size += 1;
+
+      (internal_frame, timestamp)
+    };
+
+    // Send encode command to worker thread
+    if let Some(ref sender) = self.command_sender {
+      sender
+        .send(EncoderCommand::Encode {
+          frame: internal_frame,
+          timestamp,
+          options,
+        })
+        .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?;
+    } else {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "Encoder has been closed",
+      ));
     }
 
     Ok(())
@@ -555,63 +689,67 @@ impl VideoEncoder {
   /// Returns a Promise that resolves when flushing is complete
   #[napi]
   pub async fn flush(&self) -> Result<()> {
-    let mut inner = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    // Create a response channel
+    let (response_sender, response_receiver) = channel::bounded::<Result<()>>(1);
 
-    if inner.state != CodecState::Configured {
-      Self::report_error(&mut inner, "Encoder not configured");
-      return Ok(());
+    // Send flush command through the channel to ensure it's processed after all pending encodes
+    if let Some(ref sender) = self.command_sender {
+      sender
+        .send(EncoderCommand::Flush(response_sender))
+        .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?;
+    } else {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "Encoder has been closed",
+      ));
     }
 
-    let context = match inner.context.as_mut() {
-      Some(ctx) => ctx,
-      None => {
-        Self::report_error(&mut inner, "No encoder context");
-        return Ok(());
-      }
-    };
-
-    // Flush encoder
-    let packets = match context.flush_encoder() {
-      Ok(pkts) => pkts,
-      Err(e) => {
-        Self::report_error(&mut inner, &format!("Flush failed: {}", e));
-        return Ok(());
-      }
-    };
-
-    // Process remaining packets - call callback for each
-    for packet in packets {
-      let chunk = EncodedVideoChunk::from_packet(&packet);
-      let metadata = EncodedVideoChunkMetadata {
-        decoder_config: None,
-      };
-
-      // Call callback with EncodedVideoChunk directly (per W3C WebCodecs spec)
-      // Use .into() to convert tuple to FnArgs for spreading as separate arguments
-      inner.output_callback.call(
-        (chunk, metadata).into(),
-        ThreadsafeFunctionCallMode::NonBlocking,
-      );
-    }
-
-    Ok(())
+    // Wait for response in a blocking thread to not block the event loop
+    spawn_blocking(move || {
+      response_receiver
+        .recv()
+        .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?
+    })
+    .await
+    .map_err(|join_error| {
+      Error::new(
+        Status::GenericFailure,
+        format!("Flush failed: {}", join_error),
+      )
+    })
+    .flatten()
   }
 
   /// Reset the encoder
   #[napi]
-  pub fn reset(&self) -> Result<()> {
+  pub fn reset(&mut self) -> Result<()> {
+    // Check state first before touching the worker
+    {
+      let inner = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+      if inner.state == CodecState::Closed {
+        return Err(Error::new(
+          Status::GenericFailure,
+          "Encoder is closed",
+        ));
+      }
+    }
+
+    // Drop sender to signal worker to stop (must drop before join!)
+    drop(self.command_sender.take());
+
+    // Wait for worker to finish processing remaining commands
+    if let Some(handle) = self.worker_handle.take() {
+      let _ = handle.join();
+    }
+
     let mut inner = self
       .inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    if inner.state == CodecState::Closed {
-      Self::report_error(&mut inner, "Encoder is closed");
-      return Ok(());
-    }
 
     // Drain encoder before dropping to ensure libaom/AV1 threads finish
     if let Some(ctx) = inner.context.as_mut() {
@@ -628,12 +766,29 @@ impl VideoEncoder {
     inner.extradata_sent = false;
     inner.encode_queue_size = 0;
 
+    // Create new channel and worker for future encode operations
+    let (sender, receiver) = channel::unbounded();
+    self.command_sender = Some(sender);
+    let worker_inner = self.inner.clone();
+    drop(inner); // Release lock before spawning thread
+    self.worker_handle = Some(std::thread::spawn(move || {
+      Self::worker_loop(worker_inner, receiver);
+    }));
+
     Ok(())
   }
 
   /// Close the encoder
   #[napi]
-  pub fn close(&self) -> Result<()> {
+  pub fn close(&mut self) -> Result<()> {
+    // Drop sender to stop accepting new commands
+    self.command_sender = None;
+
+    // Wait for worker to finish processing remaining tasks
+    if let Some(handle) = self.worker_handle.take() {
+      let _ = handle.join();
+    }
+
     let mut inner = self
       .inner
       .lock()

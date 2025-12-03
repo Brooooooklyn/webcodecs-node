@@ -631,45 +631,89 @@ impl VideoFrame {
     mut destination: Uint8Array,
     options: Option<VideoFrameCopyToOptions>,
   ) -> Result<Vec<PlaneLayout>> {
-    self.with_inner_mut(|inner| {
-      // Throw error if rect is specified since it's not implemented
-      if options.as_ref().and_then(|o| o.rect.as_ref()).is_some() {
-        return Err(Error::new(
-          Status::GenericFailure,
-          "VideoFrame.copyTo rect parameter is not yet implemented",
-        ));
-      }
+    // Throw error if rect is specified since it's not implemented
+    if options.as_ref().and_then(|o| o.rect.as_ref()).is_some() {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "VideoFrame.copyTo rect parameter is not yet implemented",
+      ));
+    }
+
+    // Get format, size info and validate destination buffer (brief lock)
+    let (format, width, height, size) = {
+      let guard = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+      let inner = match guard.as_ref() {
+        Some(inner) if !inner.closed => inner,
+        _ => {
+          return Err(Error::new(
+            Status::GenericFailure,
+            "VideoFrame is closed or invalid",
+          ))
+        }
+      };
 
       let format =
         VideoPixelFormat::from_av_format(inner.frame.format()).unwrap_or(VideoPixelFormat::I420);
       let width = inner.frame.width();
       let height = inner.frame.height();
-
       let size = Self::calculate_buffer_size(format, width, height) as usize;
 
-      if destination.len() < size {
-        return Err(Error::new(
-          Status::GenericFailure,
-          format!(
-            "Buffer too small: need {} bytes, got {}",
-            size,
-            destination.len()
-          ),
-        ));
-      }
+      (format, width, height, size)
+    };
 
-      // Get mutable access to the destination buffer safely
-      let dest_buffer = unsafe { destination.as_mut() };
+    if destination.len() < size {
+      return Err(Error::new(
+        Status::GenericFailure,
+        format!(
+          "Buffer too small: need {} bytes, got {}",
+          size,
+          destination.len()
+        ),
+      ));
+    }
 
+    // Clone inner Arc for the blocking thread
+    let inner_clone = self.inner.clone();
+
+    // Perform the copy in a blocking thread to not block the event loop
+    let copied_data = spawn_blocking(move || -> Result<Vec<u8>> {
+      let guard = inner_clone
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+      let inner = match guard.as_ref() {
+        Some(inner) if !inner.closed => inner,
+        _ => {
+          return Err(Error::new(
+            Status::GenericFailure,
+            "VideoFrame is closed or invalid",
+          ))
+        }
+      };
+
+      // Allocate temporary buffer and copy frame data
+      let mut temp_buffer = vec![0u8; size];
       inner
         .frame
-        .copy_to_buffer(dest_buffer)
+        .copy_to_buffer(&mut temp_buffer)
         .map_err(|e| Error::new(Status::GenericFailure, format!("Copy failed: {}", e)))?;
 
-      // Calculate and return plane layouts
-      let layouts = Self::get_plane_layouts(format, width, height);
-      Ok(layouts)
+      Ok(temp_buffer)
     })
+    .await
+    .map_err(|e| Error::new(Status::GenericFailure, format!("Copy task failed: {}", e)))??;
+
+    // Copy from temp buffer to destination (this is fast since destination is already allocated)
+    let dest_buffer = unsafe { destination.as_mut() };
+    dest_buffer[..size].copy_from_slice(&copied_data);
+
+    // Calculate and return plane layouts
+    let layouts = Self::get_plane_layouts(format, width, height);
+    Ok(layouts)
   }
 
   /// Calculate plane layouts for a given format
@@ -844,24 +888,6 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) if !inner.closed => f(inner),
-      _ => Err(Error::new(
-        Status::GenericFailure,
-        "VideoFrame is closed or invalid",
-      )),
-    }
-  }
-
-  fn with_inner_mut<F, R>(&self, f: F) -> Result<R>
-  where
-    F: FnOnce(&mut VideoFrameInner) -> Result<R>,
-  {
-    let mut guard = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    match guard.as_mut() {
       Some(inner) if !inner.closed => f(inner),
       _ => Err(Error::new(
         Status::GenericFailure,

@@ -5,18 +5,20 @@
 
 use crate::codec::{
   context::get_audio_encoder_name, AudioEncoderConfig as InternalAudioEncoderConfig,
-  AudioSampleBuffer, CodecContext, Resampler,
+  AudioSampleBuffer, CodecContext, Frame, Resampler,
 };
 use crate::ffi::{AVCodecID, AVSampleFormat};
 use crate::webcodecs::{
   AudioData, AudioEncoderConfig, AudioEncoderSupport, EncodedAudioChunk, EncodedAudioChunkOutput,
 };
+use crossbeam::channel::{self, Receiver, Sender};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{
   ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
 };
 use napi_derive::napi;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use super::video_encoder::CodecState;
 
@@ -90,6 +92,17 @@ pub struct AudioEncoderEncodeOptions {
   // Currently no options defined in WebCodecs spec for audio
 }
 
+/// Commands sent to the worker thread
+enum EncoderCommand {
+  /// Encode an audio frame
+  Encode {
+    frame: Frame,
+    timestamp: i64,
+  },
+  /// Flush the encoder and send result back via response channel
+  Flush(Sender<Result<()>>),
+}
+
 /// Internal encoder state
 struct AudioEncoderInner {
   state: CodecState,
@@ -137,6 +150,22 @@ struct AudioEncoderInner {
 pub struct AudioEncoder {
   inner: Arc<Mutex<AudioEncoderInner>>,
   dequeue_callback: Option<FunctionRef<(), UnknownReturnValue>>,
+  /// Channel sender for worker commands
+  command_sender: Option<Sender<EncoderCommand>>,
+  /// Worker thread handle
+  worker_handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for AudioEncoder {
+  fn drop(&mut self) {
+    // Drop the sender first to signal the worker to stop
+    self.command_sender = None;
+
+    // Wait for the worker thread to finish processing remaining tasks
+    if let Some(handle) = self.worker_handle.take() {
+      let _ = handle.join();
+    }
+  }
 }
 
 #[napi]
@@ -166,10 +195,305 @@ impl AudioEncoder {
       dequeue_callback: None,
     };
 
+    let inner = Arc::new(Mutex::new(inner));
+
+    // Create channel for worker commands
+    let (sender, receiver) = channel::unbounded();
+
+    // Spawn worker thread
+    let worker_inner = inner.clone();
+    let worker_handle = std::thread::spawn(move || {
+      Self::worker_loop(worker_inner, receiver);
+    });
+
     Ok(Self {
-      inner: Arc::new(Mutex::new(inner)),
+      inner,
       dequeue_callback: None,
+      command_sender: Some(sender),
+      worker_handle: Some(worker_handle),
     })
+  }
+
+  /// Worker loop that processes commands from the channel
+  fn worker_loop(inner: Arc<Mutex<AudioEncoderInner>>, receiver: Receiver<EncoderCommand>) {
+    while let Ok(command) = receiver.recv() {
+      match command {
+        EncoderCommand::Encode { frame, timestamp } => {
+          Self::process_encode(&inner, frame, timestamp);
+        }
+        EncoderCommand::Flush(response_sender) => {
+          let result = Self::process_flush(&inner);
+          let _ = response_sender.send(result);
+        }
+      }
+    }
+  }
+
+  /// Process an encode command on the worker thread
+  fn process_encode(inner: &Arc<Mutex<AudioEncoderInner>>, frame: Frame, timestamp: i64) {
+    let mut guard = match inner.lock() {
+      Ok(g) => g,
+      Err(_) => return, // Lock poisoned
+    };
+
+    // Check if encoder is still configured
+    if guard.state != CodecState::Configured {
+      guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+      let _ = Self::fire_dequeue_event(&guard);
+      Self::report_error(&mut guard, "Encoder not configured");
+      return;
+    }
+
+    // Get config info
+    let codec_string = match guard.config.as_ref() {
+      Some(config) => config.codec.clone(),
+      None => {
+        guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+        let _ = Self::fire_dequeue_event(&guard);
+        Self::report_error(&mut guard, "No encoder config");
+        return;
+      }
+    };
+
+    // Add frame to sample buffer
+    {
+      let sample_buffer = match guard.sample_buffer.as_mut() {
+        Some(buf) => buf,
+        None => {
+          guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+          let _ = Self::fire_dequeue_event(&guard);
+          Self::report_error(&mut guard, "No sample buffer");
+          return;
+        }
+      };
+
+      if let Err(e) = sample_buffer.add_frame(&frame) {
+        guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+        let _ = Self::fire_dequeue_event(&guard);
+        Self::report_error(&mut guard, &format!("Failed to add samples: {}", e));
+        return;
+      }
+    }
+
+    // Get extradata before encoding first frame
+    let extradata = if !guard.extradata_sent {
+      guard
+        .context
+        .as_ref()
+        .and_then(|ctx| ctx.extradata().map(|d| d.to_vec()))
+    } else {
+      None
+    };
+
+    // Process complete frames
+    loop {
+      // Check if we have a full frame and get buffer info
+      let (has_frame, frame_size, sample_rate) = match guard.sample_buffer.as_ref() {
+        Some(buf) => (
+          buf.has_full_frame(),
+          buf.frame_size() as i64,
+          buf.sample_rate() as i64,
+        ),
+        None => {
+          guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+          let _ = Self::fire_dequeue_event(&guard);
+          Self::report_error(&mut guard, "No sample buffer");
+          return;
+        }
+      };
+
+      if !has_frame {
+        break;
+      }
+
+      // Take frame from buffer
+      let mut frame_to_encode = {
+        let sample_buffer = match guard.sample_buffer.as_mut() {
+          Some(buf) => buf,
+          None => {
+            guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+            let _ = Self::fire_dequeue_event(&guard);
+            Self::report_error(&mut guard, "No sample buffer");
+            return;
+          }
+        };
+        match sample_buffer.take_frame() {
+          Ok(Some(f)) => f,
+          Ok(None) => {
+            guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+            let _ = Self::fire_dequeue_event(&guard);
+            Self::report_error(&mut guard, "No frame available");
+            return;
+          }
+          Err(e) => {
+            guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+            let _ = Self::fire_dequeue_event(&guard);
+            Self::report_error(&mut guard, &format!("Failed to get frame: {}", e));
+            return;
+          }
+        }
+      };
+
+      // Set timestamp (approximate based on frame count)
+      let frame_timestamp = if guard.frame_count == 0 {
+        timestamp
+      } else {
+        timestamp + (guard.frame_count as i64 * frame_size * 1_000_000) / sample_rate
+      };
+      frame_to_encode.set_pts(frame_timestamp);
+
+      // Encode the frame
+      let context = match guard.context.as_mut() {
+        Some(ctx) => ctx,
+        None => {
+          guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+          let _ = Self::fire_dequeue_event(&guard);
+          Self::report_error(&mut guard, "No encoder context");
+          return;
+        }
+      };
+
+      let packets = match context.encode(Some(&frame_to_encode)) {
+        Ok(pkts) => pkts,
+        Err(e) => {
+          guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+          let _ = Self::fire_dequeue_event(&guard);
+          Self::report_error(&mut guard, &format!("Encode failed: {}", e));
+          return;
+        }
+      };
+
+      guard.frame_count += 1;
+
+      // Calculate duration per frame in microseconds
+      let duration_us = (frame_size * 1_000_000) / sample_rate;
+
+      // Process output packets - call callback for each
+      for packet in packets {
+        let chunk = EncodedAudioChunk::from_packet(&packet, Some(duration_us));
+
+        // Create metadata
+        let metadata = if !guard.extradata_sent {
+          guard.extradata_sent = true;
+          let (target_sample_rate, target_channels) = guard
+            .config
+            .as_ref()
+            .map(|c| (c.sample_rate, c.number_of_channels))
+            .unwrap_or((48000, 2));
+
+          EncodedAudioChunkMetadata {
+            decoder_config: Some(AudioDecoderConfigOutput {
+              codec: codec_string.clone(),
+              sample_rate: Some(target_sample_rate),
+              number_of_channels: Some(target_channels),
+              description: extradata.clone().map(Uint8Array::from),
+            }),
+          }
+        } else {
+          EncodedAudioChunkMetadata {
+            decoder_config: None,
+          }
+        };
+
+        // Call output callback with serializable output
+        match chunk.to_output() {
+          Ok(chunk_output) => {
+            guard.output_callback.call(
+              (chunk_output, metadata).into(),
+              ThreadsafeFunctionCallMode::NonBlocking,
+            );
+          }
+          Err(e) => {
+            Self::report_error(&mut guard, &format!("Failed to serialize chunk: {}", e));
+            return;
+          }
+        }
+      }
+    }
+
+    // Decrement queue size and fire dequeue event
+    guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+    let _ = Self::fire_dequeue_event(&guard);
+  }
+
+  /// Process a flush command on the worker thread
+  fn process_flush(inner: &Arc<Mutex<AudioEncoderInner>>) -> Result<()> {
+    let mut guard = inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    if guard.state != CodecState::Configured {
+      Self::report_error(&mut guard, "Encoder not configured");
+      return Ok(());
+    }
+
+    // Flush any remaining samples in buffer
+    if let Some(ref mut sample_buffer) = guard.sample_buffer {
+      if let Ok(Some(mut frame)) = sample_buffer.flush() {
+        // Set timestamp
+        let frame_size = sample_buffer.frame_size() as i64;
+        let sample_rate = sample_buffer.sample_rate() as i64;
+        let frame_timestamp = (guard.frame_count as i64 * frame_size * 1_000_000) / sample_rate;
+        frame.set_pts(frame_timestamp);
+
+        let context = match guard.context.as_mut() {
+          Some(ctx) => ctx,
+          None => {
+            Self::report_error(&mut guard, "No encoder context");
+            return Ok(());
+          }
+        };
+
+        if let Ok(packets) = context.encode(Some(&frame)) {
+          let duration_us = (frame.nb_samples() as i64 * 1_000_000) / sample_rate;
+          for packet in packets {
+            let chunk = EncodedAudioChunk::from_packet(&packet, Some(duration_us));
+            let metadata = EncodedAudioChunkMetadata {
+              decoder_config: None,
+            };
+            if let Ok(chunk_output) = chunk.to_output() {
+              guard.output_callback.call(
+                (chunk_output, metadata).into(),
+                ThreadsafeFunctionCallMode::NonBlocking,
+              );
+            }
+          }
+        }
+      }
+    }
+
+    // Flush encoder
+    let context = match guard.context.as_mut() {
+      Some(ctx) => ctx,
+      None => {
+        Self::report_error(&mut guard, "No encoder context");
+        return Ok(());
+      }
+    };
+
+    let packets = match context.flush_encoder() {
+      Ok(pkts) => pkts,
+      Err(e) => {
+        Self::report_error(&mut guard, &format!("Flush failed: {}", e));
+        return Ok(());
+      }
+    };
+
+    // Process remaining packets - call callback for each
+    for packet in packets {
+      let chunk = EncodedAudioChunk::from_packet(&packet, None);
+      let metadata = EncodedAudioChunkMetadata {
+        decoder_config: None,
+      };
+      if let Ok(chunk_output) = chunk.to_output() {
+        guard.output_callback.call(
+          (chunk_output, metadata).into(),
+          ThreadsafeFunctionCallMode::NonBlocking,
+        );
+      }
+    }
+
+    Ok(())
   }
 
   /// Report an error via callback and close the encoder
@@ -344,293 +668,130 @@ impl AudioEncoder {
   /// Encode audio data
   #[napi]
   pub fn encode(&self, data: &AudioData) -> Result<()> {
-    let mut inner = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    // Clone frame, resample if needed, and get timestamp on main thread
+    let (frame_to_send, timestamp) = {
+      let mut inner = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    if inner.state != CodecState::Configured {
-      Self::report_error(&mut inner, "Encoder not configured");
-      return Ok(());
-    }
-
-    // Increment queue size (pending operation)
-    inner.encode_queue_size += 1;
-
-    // Get config info
-    let (target_sample_rate, target_channels, codec_string) = match inner.config.as_ref() {
-      Some(config) => (
-        config.sample_rate,
-        config.number_of_channels,
-        config.codec.clone(),
-      ),
-      None => {
-        inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, "No encoder config");
+      if inner.state != CodecState::Configured {
+        Self::report_error(&mut inner, "Encoder not configured");
         return Ok(());
       }
-    };
 
-    // Get audio data properties
-    let src_format = match data.format() {
-      Ok(Some(fmt)) => fmt,
-      Ok(None) => {
-        inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, "AudioData has no format");
-        return Ok(());
-      }
-      Err(e) => {
-        inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, &format!("Failed to get format: {}", e));
-        return Ok(());
-      }
-    };
-    let src_sample_rate = match data.sample_rate() {
-      Ok(sr) => sr,
-      Err(e) => {
-        inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, &format!("Failed to get sample rate: {}", e));
-        return Ok(());
-      }
-    };
-    let src_channels = match data.number_of_channels() {
-      Ok(ch) => ch,
-      Err(e) => {
-        inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, &format!("Failed to get channels: {}", e));
-        return Ok(());
-      }
-    };
-    let timestamp = match data.timestamp() {
-      Ok(ts) => ts,
-      Err(e) => {
-        inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, &format!("Failed to get timestamp: {}", e));
-        return Ok(());
-      }
-    };
-
-    // Check if we need resampling
-    let needs_resampling = src_sample_rate != target_sample_rate
-      || src_channels != target_channels
-      || src_format.to_av_format() != inner.target_format;
-
-    // Create resampler if needed and not already created
-    if needs_resampling && inner.resampler.is_none() {
-      match Resampler::new(
-        src_channels,
-        src_sample_rate,
-        src_format.to_av_format(),
-        target_channels,
-        target_sample_rate,
-        inner.target_format,
-      ) {
-        Ok(resampler) => inner.resampler = Some(resampler),
-        Err(e) => {
-          inner.encode_queue_size -= 1;
-          Self::fire_dequeue_event(&inner)?;
-          Self::report_error(&mut inner, &format!("Failed to create resampler: {}", e));
-          return Ok(());
-        }
-      }
-    }
-
-    // Get frame from AudioData
-    let frame_result = match data.with_frame(|f| f.try_clone()) {
-      Ok(res) => res,
-      Err(e) => {
-        inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, &format!("Failed to get frame: {}", e));
-        return Ok(());
-      }
-    };
-    let frame = match frame_result {
-      Ok(f) => f,
-      Err(e) => {
-        inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, &format!("Failed to clone frame: {}", e));
-        return Ok(());
-      }
-    };
-
-    // Resample if needed
-    let frame_to_add = if let Some(ref mut resampler) = inner.resampler {
-      match resampler.convert_alloc(&frame) {
-        Ok(f) => f,
-        Err(e) => {
-          inner.encode_queue_size -= 1;
-          Self::fire_dequeue_event(&inner)?;
-          Self::report_error(&mut inner, &format!("Resampling failed: {}", e));
-          return Ok(());
-        }
-      }
-    } else {
-      frame
-    };
-
-    // Add frame to sample buffer
-    {
-      let sample_buffer = match inner.sample_buffer.as_mut() {
-        Some(buf) => buf,
+      // Get config info
+      let (target_sample_rate, target_channels) = match inner.config.as_ref() {
+        Some(config) => (config.sample_rate, config.number_of_channels),
         None => {
-          inner.encode_queue_size -= 1;
-          Self::fire_dequeue_event(&inner)?;
-          Self::report_error(&mut inner, "No sample buffer");
+          Self::report_error(&mut inner, "No encoder config");
           return Ok(());
         }
       };
 
-      if let Err(e) = sample_buffer.add_frame(&frame_to_add) {
-        inner.encode_queue_size -= 1;
-        Self::fire_dequeue_event(&inner)?;
-        Self::report_error(&mut inner, &format!("Failed to add samples: {}", e));
-        return Ok(());
-      }
-    }
-
-    // Get extradata before encoding first frame
-    let extradata = if !inner.extradata_sent {
-      inner
-        .context
-        .as_ref()
-        .and_then(|ctx| ctx.extradata().map(|d| d.to_vec()))
-    } else {
-      None
-    };
-
-    // Process complete frames
-    loop {
-      // Check if we have a full frame and get buffer info
-      let (has_frame, frame_size, sample_rate) = match inner.sample_buffer.as_ref() {
-        Some(buf) => (
-          buf.has_full_frame(),
-          buf.frame_size() as i64,
-          buf.sample_rate() as i64,
-        ),
-        None => {
-          inner.encode_queue_size -= 1;
-          Self::fire_dequeue_event(&inner)?;
-          Self::report_error(&mut inner, "No sample buffer");
+      // Get audio data properties
+      let src_format = match data.format() {
+        Ok(Some(fmt)) => fmt,
+        Ok(None) => {
+          Self::report_error(&mut inner, "AudioData has no format");
+          return Ok(());
+        }
+        Err(e) => {
+          Self::report_error(&mut inner, &format!("Failed to get format: {}", e));
+          return Ok(());
+        }
+      };
+      let src_sample_rate = match data.sample_rate() {
+        Ok(sr) => sr,
+        Err(e) => {
+          Self::report_error(&mut inner, &format!("Failed to get sample rate: {}", e));
+          return Ok(());
+        }
+      };
+      let src_channels = match data.number_of_channels() {
+        Ok(ch) => ch,
+        Err(e) => {
+          Self::report_error(&mut inner, &format!("Failed to get channels: {}", e));
+          return Ok(());
+        }
+      };
+      let timestamp = match data.timestamp() {
+        Ok(ts) => ts,
+        Err(e) => {
+          Self::report_error(&mut inner, &format!("Failed to get timestamp: {}", e));
           return Ok(());
         }
       };
 
-      if !has_frame {
-        break;
-      }
+      // Check if we need resampling
+      let needs_resampling = src_sample_rate != target_sample_rate
+        || src_channels != target_channels
+        || src_format.to_av_format() != inner.target_format;
 
-      // Take frame from buffer
-      let mut frame_to_encode = {
-        let sample_buffer = match inner.sample_buffer.as_mut() {
-          Some(buf) => buf,
-          None => {
-            inner.encode_queue_size -= 1;
-            Self::fire_dequeue_event(&inner)?;
-            Self::report_error(&mut inner, "No sample buffer");
-            return Ok(());
-          }
-        };
-        match sample_buffer.take_frame() {
-          Ok(Some(f)) => f,
-          Ok(None) => {
-            inner.encode_queue_size -= 1;
-            Self::fire_dequeue_event(&inner)?;
-            Self::report_error(&mut inner, "No frame available");
-            return Ok(());
-          }
+      // Create resampler if needed and not already created
+      if needs_resampling && inner.resampler.is_none() {
+        match Resampler::new(
+          src_channels,
+          src_sample_rate,
+          src_format.to_av_format(),
+          target_channels,
+          target_sample_rate,
+          inner.target_format,
+        ) {
+          Ok(resampler) => inner.resampler = Some(resampler),
           Err(e) => {
-            inner.encode_queue_size -= 1;
-            Self::fire_dequeue_event(&inner)?;
-            Self::report_error(&mut inner, &format!("Failed to get frame: {}", e));
+            Self::report_error(&mut inner, &format!("Failed to create resampler: {}", e));
             return Ok(());
           }
         }
+      }
+
+      // Get frame from AudioData
+      let frame = match data.with_frame(|f| f.try_clone()) {
+        Ok(Ok(f)) => f,
+        Ok(Err(e)) => {
+          Self::report_error(&mut inner, &format!("Failed to clone frame: {}", e));
+          return Ok(());
+        }
+        Err(e) => {
+          Self::report_error(&mut inner, &format!("Failed to get frame: {}", e));
+          return Ok(());
+        }
       };
 
-      // Set timestamp (approximate based on frame count)
-      let frame_timestamp = if inner.frame_count == 0 {
-        timestamp
+      // Resample if needed
+      let frame_to_send = if let Some(ref mut resampler) = inner.resampler {
+        match resampler.convert_alloc(&frame) {
+          Ok(f) => f,
+          Err(e) => {
+            Self::report_error(&mut inner, &format!("Resampling failed: {}", e));
+            return Ok(());
+          }
+        }
       } else {
-        timestamp + (inner.frame_count as i64 * frame_size * 1_000_000) / sample_rate
-      };
-      frame_to_encode.set_pts(frame_timestamp);
-
-      // Encode the frame
-      let context = match inner.context.as_mut() {
-        Some(ctx) => ctx,
-        None => {
-          inner.encode_queue_size -= 1;
-          Self::fire_dequeue_event(&inner)?;
-          Self::report_error(&mut inner, "No encoder context");
-          return Ok(());
-        }
+        frame
       };
 
-      let packets = match context.encode(Some(&frame_to_encode)) {
-        Ok(pkts) => pkts,
-        Err(e) => {
-          inner.encode_queue_size -= 1;
-          Self::fire_dequeue_event(&inner)?;
-          Self::report_error(&mut inner, &format!("Encode failed: {}", e));
-          return Ok(());
-        }
-      };
+      // Increment queue size (pending operation)
+      inner.encode_queue_size += 1;
 
-      inner.frame_count += 1;
+      (frame_to_send, timestamp)
+    };
 
-      // Calculate duration per frame in microseconds
-      let duration_us = (frame_size * 1_000_000) / sample_rate;
-
-      // Process output packets - call callback for each
-      for packet in packets {
-        let chunk = EncodedAudioChunk::from_packet(&packet, Some(duration_us));
-
-        // Create metadata
-        let metadata = if !inner.extradata_sent {
-          inner.extradata_sent = true;
-
-          EncodedAudioChunkMetadata {
-            decoder_config: Some(AudioDecoderConfigOutput {
-              codec: codec_string.clone(),
-              sample_rate: Some(target_sample_rate),
-              number_of_channels: Some(target_channels),
-              description: extradata.clone().map(Uint8Array::from),
-            }),
-          }
-        } else {
-          EncodedAudioChunkMetadata {
-            decoder_config: None,
-          }
-        };
-
-        // Call output callback with serializable output
-        // FnArgs spreads tuple as separate callback arguments
-        match chunk.to_output() {
-          Ok(chunk_output) => {
-            inner.output_callback.call(
-              (chunk_output, metadata).into(),
-              ThreadsafeFunctionCallMode::NonBlocking,
-            );
-          }
-          Err(e) => {
-            Self::report_error(&mut inner, &format!("Failed to serialize chunk: {}", e));
-            return Ok(());
-          }
-        }
-      }
+    // Send encode command to worker thread
+    if let Some(ref sender) = self.command_sender {
+      sender
+        .send(EncoderCommand::Encode {
+          frame: frame_to_send,
+          timestamp,
+        })
+        .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?;
+    } else {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "Encoder has been closed",
+      ));
     }
-
-    // Decrement queue size and fire dequeue event
-    inner.encode_queue_size -= 1;
-    Self::fire_dequeue_event(&inner)?;
 
     Ok(())
   }
@@ -639,99 +800,67 @@ impl AudioEncoder {
   /// Returns a Promise that resolves when flushing is complete
   #[napi]
   pub async fn flush(&self) -> Result<()> {
-    let mut inner = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    // Create a response channel
+    let (response_sender, response_receiver) = channel::bounded::<Result<()>>(1);
 
-    if inner.state != CodecState::Configured {
-      Self::report_error(&mut inner, "Encoder not configured");
-      return Ok(());
+    // Send flush command through the channel to ensure it's processed after all pending encodes
+    if let Some(ref sender) = self.command_sender {
+      sender
+        .send(EncoderCommand::Flush(response_sender))
+        .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?;
+    } else {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "Encoder has been closed",
+      ));
     }
 
-    // Flush any remaining samples in buffer
-    if let Some(ref mut sample_buffer) = inner.sample_buffer {
-      if let Ok(Some(mut frame)) = sample_buffer.flush() {
-        // Set timestamp
-        let frame_size = sample_buffer.frame_size() as i64;
-        let sample_rate = sample_buffer.sample_rate() as i64;
-        let frame_timestamp = (inner.frame_count as i64 * frame_size * 1_000_000) / sample_rate;
-        frame.set_pts(frame_timestamp);
-
-        let context = match inner.context.as_mut() {
-          Some(ctx) => ctx,
-          None => {
-            Self::report_error(&mut inner, "No encoder context");
-            return Ok(());
-          }
-        };
-
-        if let Ok(packets) = context.encode(Some(&frame)) {
-          let duration_us = (frame.nb_samples() as i64 * 1_000_000) / sample_rate;
-          for packet in packets {
-            let chunk = EncodedAudioChunk::from_packet(&packet, Some(duration_us));
-            let metadata = EncodedAudioChunkMetadata {
-              decoder_config: None,
-            };
-            // Call output callback with serializable output
-            if let Ok(chunk_output) = chunk.to_output() {
-              inner.output_callback.call(
-                (chunk_output, metadata).into(),
-                ThreadsafeFunctionCallMode::NonBlocking,
-              );
-            }
-          }
-        }
-      }
-    }
-
-    // Flush encoder
-    let context = match inner.context.as_mut() {
-      Some(ctx) => ctx,
-      None => {
-        Self::report_error(&mut inner, "No encoder context");
-        return Ok(());
-      }
-    };
-
-    let packets = match context.flush_encoder() {
-      Ok(pkts) => pkts,
-      Err(e) => {
-        Self::report_error(&mut inner, &format!("Flush failed: {}", e));
-        return Ok(());
-      }
-    };
-
-    // Process remaining packets - call callback for each
-    for packet in packets {
-      let chunk = EncodedAudioChunk::from_packet(&packet, None);
-      let metadata = EncodedAudioChunkMetadata {
-        decoder_config: None,
-      };
-      // Call output callback with serializable output
-      if let Ok(chunk_output) = chunk.to_output() {
-        inner.output_callback.call(
-          (chunk_output, metadata).into(),
-          ThreadsafeFunctionCallMode::NonBlocking,
-        );
-      }
-    }
-
-    Ok(())
+    // Wait for response in a blocking thread to not block the event loop
+    spawn_blocking(move || {
+      response_receiver
+        .recv()
+        .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?
+    })
+    .await
+    .map_err(|join_error| {
+      Error::new(
+        Status::GenericFailure,
+        format!("Flush failed: {}", join_error),
+      )
+    })
+    .flatten()
   }
 
   /// Reset the encoder
   #[napi]
-  pub fn reset(&self) -> Result<()> {
+  pub fn reset(&mut self) -> Result<()> {
+    // Check state first before touching the worker
+    {
+      let inner = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+      if inner.state == CodecState::Closed {
+        return Err(Error::new(
+          Status::GenericFailure,
+          "Encoder is closed",
+        ));
+      }
+    }
+
+    // Drop sender to signal worker to stop (must drop before join!)
+    drop(self.command_sender.take());
+
+    // Wait for worker to finish processing remaining commands
+    if let Some(handle) = self.worker_handle.take() {
+      let _ = handle.join();
+    }
+
     let mut inner = self
       .inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    if inner.state == CodecState::Closed {
-      Self::report_error(&mut inner, "Encoder is closed");
-      return Ok(());
-    }
 
     // Drop existing context
     inner.context = None;
@@ -743,12 +872,29 @@ impl AudioEncoder {
     inner.extradata_sent = false;
     inner.encode_queue_size = 0;
 
+    // Create new channel and worker for future encode operations
+    let (sender, receiver) = channel::unbounded();
+    self.command_sender = Some(sender);
+    let worker_inner = self.inner.clone();
+    drop(inner); // Release lock before spawning thread
+    self.worker_handle = Some(std::thread::spawn(move || {
+      Self::worker_loop(worker_inner, receiver);
+    }));
+
     Ok(())
   }
 
   /// Close the encoder
   #[napi]
-  pub fn close(&self) -> Result<()> {
+  pub fn close(&mut self) -> Result<()> {
+    // Drop sender to stop accepting new commands
+    self.command_sender = None;
+
+    // Wait for worker to finish processing remaining tasks
+    if let Some(handle) = self.worker_handle.take() {
+      let _ = handle.join();
+    }
+
     let mut inner = self
       .inner
       .lock()

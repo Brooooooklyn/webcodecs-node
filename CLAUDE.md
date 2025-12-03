@@ -230,37 +230,40 @@ gifDecoder.close();
 - Integration tests for roundtrip, lifecycle, multi-codec, performance
 - Test fixtures in `__test__/fixtures/` for ImageDecoder (PNG, GIF)
 
-## VideoDecoder Threading Architecture
+## Encoder/Decoder Threading Architecture
 
-VideoDecoder uses a **crossbeam channel-based worker thread pattern** for thread-safe decoding:
+All encoders and decoders use a **crossbeam channel-based worker thread pattern** for non-blocking FFmpeg operations:
+
+### Components Using Worker Thread Pattern
+| Component | Worker Commands | Notes |
+|-----------|-----------------|-------|
+| VideoDecoder | Decode, Flush | EncodedVideoChunkInner uses Arc<RwLock<...>> |
+| VideoEncoder | Encode, Flush | Frame cloned on main thread, encoded on worker |
+| AudioEncoder | Encode, Flush | Resampling on main thread, encoding on worker |
+| AudioDecoder | Decode, Flush | Data extracted on main thread, decoded on worker |
 
 ### Architecture
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│ VideoDecoder                                                     │
+│ Encoder/Decoder                                                  │
 ├─────────────────────────────────────────────────────────────────┤
-│ inner: Arc<Mutex<VideoDecoderInner>>  ← shared state            │
-│ command_sender: Option<Sender<WorkerCommand>>                    │
+│ inner: Arc<Mutex<Inner>>              ← shared state            │
+│ command_sender: Option<Sender<Command>>                          │
 │ worker_handle: Option<JoinHandle<()>>                            │
 └─────────────────────────────────────────────────────────────────┘
          │                                    ▲
-         │ WorkerCommand::Decode              │ output callback
-         │ WorkerCommand::Flush               │ (ThreadsafeFunction)
+         │ Command::Encode/Decode             │ output callback
+         │ Command::Flush                     │ (ThreadsafeFunction)
          ▼                                    │
 ┌─────────────────────────────────────────────────────────────────┐
 │ Worker Thread (worker_loop)                                      │
 ├─────────────────────────────────────────────────────────────────┤
 │ - Receives commands via crossbeam::channel                       │
-│ - Processes decode/flush sequentially                            │
-│ - Holds mutex during FFmpeg decode                               │
+│ - Processes encode/decode/flush sequentially                     │
+│ - Holds mutex during FFmpeg operations                           │
 │ - Exits when channel disconnected (sender dropped)               │
 └─────────────────────────────────────────────────────────────────┘
 ```
-
-### Key Components
-- **WorkerCommand enum**: `Decode(chunk)` and `Flush(response_sender)`
-- **EncodedVideoChunkInner**: Wrapped in `Arc<RwLock<Option<...>>>` for thread-safe sharing
-- **Response channel for flush**: Ensures flush waits for all pending decodes
 
 ### Critical Implementation Details
 ```rust
@@ -274,10 +277,13 @@ if let Some(handle) = self.worker_handle.take() {
 **Why?** If sender isn't dropped before join, channel stays connected and worker blocks on `recv()` forever → deadlock.
 
 ### Thread Safety
-- `decode()`: Increments queue size under lock, then sends command (non-blocking)
-- `flush()`: Sends Flush command, waits for response via `spawn_blocking`
-- `process_decode()`: Holds mutex during entire FFmpeg decode (sequential processing)
-- AV1 special case: Drains decoder before context drop (libaom thread safety)
+- `encode()/decode()`: Increments queue size under lock, sends command (non-blocking)
+- `flush()`: Sends Flush command with response channel, waits via `spawn_blocking`
+- Worker: Holds mutex during FFmpeg operations, uses `saturating_sub` for queue decrement
+- AV1 special case: Drains encoder/decoder before context drop (libaom thread safety)
+
+### VideoFrame.copyTo
+Uses `spawn_blocking` to offload frame data copy to a blocking thread, preventing main thread blocking for large frames (4K+).
 
 ## Known Issues
 
@@ -300,6 +306,7 @@ src/codec/context.rs:325,348  # Set extradata if provided
 4. **Duration type** - Using i64 instead of u64 due to NAPI-RS constraints
 5. **ImageDecoder parameters** - `colorSpaceConversion`, `desiredWidth/Height`, `preferAnimation` parsed but not applied
 6. **ImageDecoder GIF animation** - FFmpeg may return only first frame; for full animation use VideoDecoder with GIF codec
+7. **ImageDecoder ReadableStream blocking** - Constructor uses `rt.block_on()` for ReadableStream data collection, which blocks the Node.js event loop during initialization. **Workaround:** Use Uint8Array data source instead of ReadableStream for large images. Location: `src/webcodecs/image_decoder.rs` lines 86-107
 
 ## Configuration Options
 
