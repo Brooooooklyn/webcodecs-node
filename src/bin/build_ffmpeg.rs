@@ -623,8 +623,18 @@ Cflags: -I${{includedir}}{}
     cmd.env("CXX", self.get_cxx());
     cmd.env("AR", self.get_ar());
     cmd.env("RANLIB", self.get_ranlib());
-    cmd.env("AS", self.get_as());
-    cmd.env("CCAS", self.get_as());
+
+    // Only set AS/CCAS for ARM targets where .S files use the C compiler
+    // For x86, don't override AS so build systems can find nasm
+    let is_arm = self
+      .target
+      .as_ref()
+      .map(|t| t.contains("arm") || t.contains("aarch64"))
+      .unwrap_or(false);
+    if is_arm || self.use_system_cc {
+      cmd.env("AS", self.get_as());
+      cmd.env("CCAS", self.get_as());
+    }
 
     self.run_command_visible(&mut cmd)
   }
@@ -663,8 +673,18 @@ Cflags: -I${{includedir}}{}
     cmd.env("CXX", self.get_cxx());
     cmd.env("AR", self.get_ar());
     cmd.env("RANLIB", self.get_ranlib());
-    cmd.env("AS", self.get_as());
-    cmd.env("CCAS", self.get_as());
+
+    // Only set AS/CCAS for ARM targets where .S files use the C compiler
+    // For x86, don't override AS so build systems can find nasm
+    let is_arm = self
+      .target
+      .as_ref()
+      .map(|t| t.contains("arm") || t.contains("aarch64"))
+      .unwrap_or(false);
+    if is_arm || self.use_system_cc {
+      cmd.env("AS", self.get_as());
+      cmd.env("CCAS", self.get_as());
+    }
 
     self.run_command_visible(&mut cmd)
   }
