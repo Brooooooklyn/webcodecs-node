@@ -1354,11 +1354,21 @@ Cflags: -I${{includedir}}
       }
     }
 
-    // Cross-compilation: zig handles toolchain via CC/CXX, just need arch/os for FFmpeg config
+    // Cross-compilation: pass compiler paths explicitly via --cc=, --cxx=, etc.
+    // FFmpeg's configure ignores CC/CXX env vars for library tests, so we must use args
     if let Some(cross) = self.cross_config() {
       args.push(format!("--arch={}", cross.ffmpeg_arch()));
       args.push(format!("--target-os={}", cross.ffmpeg_os()));
       args.push("--enable-cross-compile".to_string());
+      args.push(format!("--cc={}", self.get_cc()));
+      args.push(format!("--cxx={}", self.get_cxx()));
+      args.push(format!("--ar={}", self.get_ar()));
+      args.push(format!("--ranlib={}", self.get_ranlib()));
+      // Use CC as assembler for ARM .S files
+      let is_arm = cross.arch.contains("arm") || cross.arch.contains("aarch64");
+      if is_arm {
+        args.push(format!("--as={}", self.get_cc()));
+      }
     }
 
     let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
