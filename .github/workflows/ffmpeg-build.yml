@@ -212,6 +212,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
 
     steps:
       - name: Download all artifacts
@@ -225,6 +227,11 @@ jobs:
           find artifacts -name '*.tar.gz' -exec mv {} release/ \;
           find artifacts -name '*.zip' -exec mv {} release/ \;
           ls -la release/
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'release/*'
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -252,6 +259,11 @@ jobs:
             ### Windows (MSVC)
             - x86_64-pc-windows-msvc
             - aarch64-pc-windows-msvc
+
+            ## Verification
+
+            All artifacts are signed with [GitHub Artifact Attestations](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds).
+            Verify with: `gh attestation verify <artifact> --repo ${{ github.repository }}`
           files: |
             release/*.tar.gz
             release/*.zip
