@@ -4,9 +4,12 @@
 //! 1. NAPI-RS setup
 //! 2. Compiling the C accessor library via `cc`
 //! 3. Static linking of FFmpeg libraries
+//! 4. Downloading pre-built FFmpeg from GitHub Releases (Linux only)
 
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn main() {
   // NAPI-RS build setup
@@ -29,19 +32,22 @@ fn main() {
   println!("cargo:rerun-if-changed=src/ffi/accessors.c");
   println!("cargo:rerun-if-changed=build.rs");
   println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
+  println!("cargo:rerun-if-env-changed=FFMPEG_GITHUB_REPO");
+  println!("cargo:rerun-if-env-changed=FFMPEG_RELEASE_TAG");
+  println!("cargo:rerun-if-env-changed=FFMPEG_SKIP_DOWNLOAD");
 }
 
 /// Get FFmpeg installation directory
 fn get_ffmpeg_dir(target_os: &str, target_arch: &str) -> PathBuf {
-  // Check for custom FFMPEG_DIR environment variable
+  // 1. Check for custom FFMPEG_DIR environment variable
   if let Ok(dir) = env::var("FFMPEG_DIR") {
     return PathBuf::from(dir);
   }
 
-  // Check for pkg-config on Unix systems
+  // 2. Check for pkg-config on Unix systems
   #[cfg(unix)]
   {
-    if let Ok(output) = std::process::Command::new("pkg-config")
+    if let Ok(output) = Command::new("pkg-config")
       .args(["--variable=prefix", "libavcodec"])
       .output()
     {
@@ -55,7 +61,7 @@ fn get_ffmpeg_dir(target_os: &str, target_arch: &str) -> PathBuf {
     }
   }
 
-  // Try common installation paths
+  // 3. Try common installation paths
   let common_paths = match target_os {
     "macos" => vec![
       "/opt/homebrew", // Apple Silicon Homebrew
@@ -74,7 +80,7 @@ fn get_ffmpeg_dir(target_os: &str, target_arch: &str) -> PathBuf {
     }
   }
 
-  // Try bundled FFmpeg in project directory
+  // 4. Try bundled FFmpeg in project directory
   let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
   let platform = match (target_os, target_arch) {
     ("macos", "aarch64") => "darwin-arm64",
@@ -90,11 +96,170 @@ fn get_ffmpeg_dir(target_os: &str, target_arch: &str) -> PathBuf {
     return bundled;
   }
 
-  // Fallback: assume FFmpeg is in system paths
-  println!(
-    "cargo:warning=FFmpeg not found. Set FFMPEG_DIR environment variable or install FFmpeg."
+  // 5. Try downloading from GitHub Releases (Linux only)
+  let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+  if let Some(downloaded) = download_ffmpeg_from_release(target_os, target_arch, &target_env) {
+    return downloaded;
+  }
+
+  // 6. FAIL - no fallback to building from source
+  let repo =
+    env::var("FFMPEG_GITHUB_REPO").unwrap_or_else(|_| "anthropics/webcodec-node".to_string());
+  panic!(
+    "FFmpeg not found for target {}-{}.\n\
+     \n\
+     Options:\n\
+     1. Set FFMPEG_DIR environment variable to point to FFmpeg installation\n\
+     2. Install FFmpeg via package manager (e.g., brew install ffmpeg)\n\
+     3. Create a GitHub Release with pre-built FFmpeg:\n\
+        - Run the 'Build FFmpeg Static' workflow in GitHub Actions\n\
+        - Or download from: https://github.com/{}/releases\n\
+     \n\
+     For CI: Ensure the ffmpeg-build.yml workflow has been run to create a release.",
+    target_os,
+    target_arch,
+    repo
   );
-  PathBuf::from("/usr/local")
+}
+
+/// Download FFmpeg from GitHub Releases (Linux only)
+fn download_ffmpeg_from_release(
+  target_os: &str,
+  target_arch: &str,
+  target_env: &str,
+) -> Option<PathBuf> {
+  // Skip if FFMPEG_SKIP_DOWNLOAD is set
+  if env::var("FFMPEG_SKIP_DOWNLOAD").unwrap_or_default() == "1" {
+    return None;
+  }
+
+  // Only download for Linux targets
+  if target_os != "linux" {
+    return None;
+  }
+
+  // Map to Rust target triple
+  let target = match (target_arch, target_env) {
+    ("x86_64", "gnu") => "x86_64-unknown-linux-gnu",
+    ("x86_64", "musl") => "x86_64-unknown-linux-musl",
+    ("aarch64", "gnu") => "aarch64-unknown-linux-gnu",
+    ("aarch64", "musl") => "aarch64-unknown-linux-musl",
+    ("arm", "gnueabihf") => "armv7-unknown-linux-gnueabihf",
+    _ => return None,
+  };
+
+  let repo =
+    env::var("FFMPEG_GITHUB_REPO").unwrap_or_else(|_| "anthropics/webcodec-node".to_string());
+
+  // Determine release tag
+  let release_tag = match env::var("FFMPEG_RELEASE_TAG") {
+    Ok(tag) => tag,
+    Err(_) => find_latest_ffmpeg_release(&repo)?,
+  };
+
+  let download_url = format!(
+    "https://github.com/{}/releases/download/{}/ffmpeg-{}.tar.gz",
+    repo, release_tag, target
+  );
+
+  // Download to OUT_DIR
+  let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+  let ffmpeg_dir = out_dir.join("ffmpeg");
+  let tarball_path = out_dir.join(format!("ffmpeg-{}.tar.gz", target));
+
+  // Skip if already extracted
+  if ffmpeg_dir.join("lib").join("libavcodec.a").exists() {
+    println!(
+      "cargo:warning=Using cached FFmpeg at {}",
+      ffmpeg_dir.display()
+    );
+    return Some(ffmpeg_dir);
+  }
+
+  println!("cargo:warning=Downloading FFmpeg from {}", download_url);
+
+  // Download using curl (available on all CI runners)
+  let status = Command::new("curl")
+    .args(["-L", "-f", "-o"])
+    .arg(&tarball_path)
+    .arg(&download_url)
+    .status();
+
+  match status {
+    Ok(s) if s.success() => {}
+    _ => {
+      println!(
+        "cargo:warning=Failed to download FFmpeg from {}",
+        download_url
+      );
+      return None;
+    }
+  }
+
+  // Create extraction directory
+  if let Err(e) = fs::create_dir_all(&ffmpeg_dir) {
+    println!("cargo:warning=Failed to create directory: {}", e);
+    return None;
+  }
+
+  // Extract tarball
+  let status = Command::new("tar")
+    .arg("xzf")
+    .arg(&tarball_path)
+    .arg("-C")
+    .arg(&ffmpeg_dir)
+    .status();
+
+  match status {
+    Ok(s) if s.success() => {
+      // Clean up tarball
+      let _ = fs::remove_file(&tarball_path);
+      println!(
+        "cargo:warning=FFmpeg extracted to {}",
+        ffmpeg_dir.display()
+      );
+      Some(ffmpeg_dir)
+    }
+    _ => {
+      println!("cargo:warning=Failed to extract FFmpeg tarball");
+      None
+    }
+  }
+}
+
+/// Find the latest ffmpeg-* release tag from GitHub
+fn find_latest_ffmpeg_release(repo: &str) -> Option<String> {
+  // Use GitHub API to list releases
+  let api_url = format!("https://api.github.com/repos/{}/releases", repo);
+
+  let output = Command::new("curl")
+    .args(["-s", "-f", "-H", "Accept: application/vnd.github+json"])
+    .arg(&api_url)
+    .output()
+    .ok()?;
+
+  if !output.status.success() {
+    return None;
+  }
+
+  let body = String::from_utf8_lossy(&output.stdout);
+
+  // Simple JSON parsing - find first "tag_name": "ffmpeg-*"
+  // This is a minimal parser to avoid adding dependencies
+  for line in body.lines() {
+    if let Some(pos) = line.find("\"tag_name\"") {
+      let rest = &line[pos..];
+      if let Some(start) = rest.find("ffmpeg-") {
+        let tag_str = &rest[start..];
+        if let Some(end) = tag_str.find('"') {
+          let tag = &tag_str[..end];
+          return Some(tag.to_string());
+        }
+      }
+    }
+  }
+
+  None
 }
 
 /// Compile the C accessor library

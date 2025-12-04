@@ -1,12 +1,10 @@
 name: CI
 env:
   DEBUG: napi:*
-  APP_NAME: package-template
+  APP_NAME: webcodec
   MACOSX_DEPLOYMENT_TARGET: '10.13'
   CARGO_INCREMENTAL: '1'
-permissions:
-  contents: write
-  id-token: write
+permissions: {}
 'on':
   push:
     branches:
@@ -59,45 +57,46 @@ jobs:
       fail-fast: false
       matrix:
         settings:
+          # macOS - use homebrew FFmpeg
           - host: macos-latest
             target: x86_64-apple-darwin
             build: pnpm build --target x86_64-apple-darwin
-          - host: windows-latest
-            build: pnpm build --target x86_64-pc-windows-msvc
-            target: x86_64-pc-windows-msvc
-          - host: windows-latest
-            build: pnpm build --target i686-pc-windows-msvc
-            target: i686-pc-windows-msvc
-          - host: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            build: pnpm build --target x86_64-unknown-linux-gnu --use-napi-cross
-          - host: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            build: pnpm build --target x86_64-unknown-linux-musl -x
+            build_ffmpeg: false
           - host: macos-latest
             target: aarch64-apple-darwin
             build: pnpm build --target aarch64-apple-darwin
-          - host: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            build: pnpm build --target aarch64-unknown-linux-gnu --use-napi-cross
-          - host: ubuntu-latest
-            target: armv7-unknown-linux-gnueabihf
-            build: pnpm build --target armv7-unknown-linux-gnueabihf --use-napi-cross
-          - host: ubuntu-latest
-            target: aarch64-linux-android
-            build: pnpm build --target aarch64-linux-android
-          - host: ubuntu-latest
-            target: armv7-linux-androideabi
-            build: pnpm build --target armv7-linux-androideabi
-          - host: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            build: pnpm build --target aarch64-unknown-linux-musl -x
+            build_ffmpeg: false
+          # Windows - use prebuilt FFmpeg
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            build: pnpm build --target x86_64-pc-windows-msvc
+            build_ffmpeg: false
           - host: windows-latest
             target: aarch64-pc-windows-msvc
             build: pnpm build --target aarch64-pc-windows-msvc
+            build_ffmpeg: false
+          # Linux glibc - download pre-built FFmpeg from release
           - host: ubuntu-latest
-            target: wasm32-wasip1-threads
-            build: pnpm build --target wasm32-wasip1-threads
+            target: x86_64-unknown-linux-gnu
+            build: pnpm build --target x86_64-unknown-linux-gnu --use-napi-cross
+            download_ffmpeg: true
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            build: pnpm build --target aarch64-unknown-linux-gnu --use-napi-cross
+            download_ffmpeg: true
+          - host: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            build: pnpm build --target armv7-unknown-linux-gnueabihf --use-napi-cross
+            download_ffmpeg: true
+          # Linux musl - download pre-built FFmpeg from release
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            build: pnpm build --target x86_64-unknown-linux-musl -x
+            download_ffmpeg: true
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            build: pnpm build --target aarch64-unknown-linux-musl -x
+            download_ffmpeg: true
     name: stable - ${{ matrix.settings.target }} - node@20
     runs-on: ${{ matrix.settings.host }}
     steps:
@@ -139,6 +138,35 @@ jobs:
       - name: Setup toolchain
         run: ${{ matrix.settings.setup }}
         if: ${{ matrix.settings.setup }}
+        shell: bash
+      - name: Download FFmpeg from release
+        if: ${{ matrix.settings.download_ffmpeg }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Find latest ffmpeg-* release
+          RELEASE_TAG=$(gh release list --repo ${{ github.repository }} \
+            --exclude-drafts --exclude-pre-releases \
+            --json tagName --jq '.[].tagName | select(startswith("ffmpeg-"))' \
+            | head -n1)
+
+          if [ -z "$RELEASE_TAG" ]; then
+            echo "ERROR: No FFmpeg release found!"
+            echo "Run the 'Build FFmpeg Static' workflow first to create a release."
+            exit 1
+          fi
+
+          echo "Using FFmpeg release: $RELEASE_TAG"
+
+          mkdir -p ./ffmpeg-build
+          gh release download "$RELEASE_TAG" \
+            --repo ${{ github.repository }} \
+            --pattern "ffmpeg-${{ matrix.settings.target }}.tar.gz"
+
+          tar -xzf "ffmpeg-${{ matrix.settings.target }}.tar.gz" -C ./ffmpeg-build
+          rm "ffmpeg-${{ matrix.settings.target }}.tar.gz"
+
+          echo "FFMPEG_DIR=$(pwd)/ffmpeg-build" >> $GITHUB_ENV
         shell: bash
       - name: Install dependencies
         run: pnpm install
@@ -186,7 +214,7 @@ jobs:
           environment_variables: 'DEBUG RUSTUP_IO_THREADS'
           shell: bash
           run: |
-            sudo pkg install -y -f curl node libnghttp2 npm
+            sudo pkg install -y -f curl node libnghttp2 npm cmake nasm yasm autoconf automake libtool git pkgconf libva libdrm
             sudo npm install -g corepack
             curl https://sh.rustup.rs -sSf --output rustup.sh
             sh rustup.sh -y --profile minimal --default-toolchain beta
@@ -203,6 +231,10 @@ jobs:
             whoami
             env
             freebsd-version
+            # Build FFmpeg from source
+            cargo build --release --bin build-ffmpeg
+            ./target/release/build-ffmpeg --output ./ffmpeg-build --verbose
+            export FFMPEG_DIR=$(pwd)/ffmpeg-build
             pnpm install
             pnpm build
             rm -rf node_modules
@@ -357,6 +389,9 @@ jobs:
   publish:
     name: Publish
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
     needs:
       - lint
       - build-freebsd
@@ -387,18 +422,16 @@ jobs:
         shell: bash
       - name: Publish
         run: |
+          npm install -g npm
           npm config set provenance true
           if git log -1 --pretty=%B | grep "^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$";
           then
-            echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
             npm publish --access public
           elif git log -1 --pretty=%B | grep "^v\?[0-9]\+\.[0-9]\+\.[0-9]\+";
           then
-            echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
             npm publish --tag next --access public
           else
             echo "Not a release, skipping publish"
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

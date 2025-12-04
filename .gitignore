@@ -194,3 +194,5 @@ Temporary Items
 # iCloud generated files
 *.icloud
 specs/
+ffmpeg-src/
+ffmpeg-build/

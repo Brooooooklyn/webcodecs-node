@@ -1,0 +1,106 @@
+name: Build FFmpeg Static
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_version:
+        description: 'FFmpeg version tag (e.g., n8.0.1)'
+        required: true
+        default: 'n8.0.1'
+
+env:
+  FFMPEG_VERSION: ${{ github.event.inputs.ffmpeg_version }}
+
+jobs:
+  build-ffmpeg:
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake git nasm yasm pkg-config \
+            autoconf automake libtool curl
+
+      - name: Build FFmpeg
+        run: |
+          cargo build --release --bin build-ffmpeg
+          ./target/release/build-ffmpeg \
+            --target ${{ matrix.target }} \
+            --output ./ffmpeg-${{ matrix.target }} \
+            --verbose
+
+      - name: Create tarball
+        run: |
+          tar -czvf ffmpeg-${{ matrix.target }}.tar.gz \
+            -C ./ffmpeg-${{ matrix.target }} .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-${{ matrix.target }}
+          path: ffmpeg-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  create-release:
+    needs: build-ffmpeg
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          find artifacts -name '*.tar.gz' -exec mv {} release/ \;
+          ls -la release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ffmpeg-${{ env.FFMPEG_VERSION }}
+          name: FFmpeg ${{ env.FFMPEG_VERSION }} Static Builds
+          body: |
+            Pre-built FFmpeg ${{ env.FFMPEG_VERSION }} static libraries.
+
+            ## Included Libraries
+            - FFmpeg: avcodec, avutil, swscale, swresample
+            - Video: x264, x265, libvpx, libaom
+            - Audio: opus, mp3lame
+            - Image: libwebp
+
+            ## Targets
+            - x86_64-unknown-linux-gnu
+            - aarch64-unknown-linux-gnu
+            - armv7-unknown-linux-gnueabihf
+            - x86_64-unknown-linux-musl
+            - aarch64-unknown-linux-musl
+          files: release/*.tar.gz
+          draft: false
+          prerelease: false
