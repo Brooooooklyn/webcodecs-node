@@ -276,6 +276,89 @@ exec zig c++ {} $args
     result
   }
 
+  /// Ensure a .pc file exists in pkgconfig directory
+  /// If not found, try to copy from build dir or generate manually
+  fn ensure_pc_file(
+    &self,
+    name: &str,
+    build_dir: &Path,
+    version: &str,
+    description: &str,
+    extra_cflags: &str,
+    extra_libs: &str,
+  ) -> io::Result<()> {
+    let pkgconfig_dir = self.prefix.join("lib").join("pkgconfig");
+    fs::create_dir_all(&pkgconfig_dir)?;
+
+    let pc_filename = format!("{}.pc", name);
+    let dest_pc = pkgconfig_dir.join(&pc_filename);
+    let prefix_str = self.prefix.to_string_lossy().to_string();
+
+    // If already exists with correct prefix, we're done
+    if dest_pc.exists() {
+      let content = fs::read_to_string(&dest_pc)?;
+      if content.contains(&format!("prefix={}", prefix_str)) {
+        self.log(&format!("{} already exists with correct prefix", pc_filename));
+        return Ok(());
+      }
+      // Fix prefix if needed
+      let fixed = self.fix_pc_file_prefix(&content, &prefix_str);
+      fs::write(&dest_pc, fixed)?;
+      self.log(&format!("Fixed prefix in {}", pc_filename));
+      return Ok(());
+    }
+
+    // Try to find .pc in common build locations
+    let possible_sources = [
+      build_dir.join(&pc_filename),
+      build_dir.join("lib").join("pkgconfig").join(&pc_filename),
+      build_dir.join("pkgconfig").join(&pc_filename),
+    ];
+
+    for src in &possible_sources {
+      if src.exists() {
+        let content = fs::read_to_string(src)?;
+        let fixed = self.fix_pc_file_prefix(&content, &prefix_str);
+        fs::write(&dest_pc, fixed)?;
+        self.log(&format!("Copied and fixed {} from {:?}", pc_filename, src));
+        return Ok(());
+      }
+    }
+
+    // Generate manually if not found
+    let pc_content = format!(
+      r#"prefix={}
+exec_prefix=${{prefix}}
+libdir=${{exec_prefix}}/lib
+includedir=${{prefix}}/include
+
+Name: {}
+Description: {}
+Version: {}
+Libs: -L${{libdir}} -l{}{}
+Cflags: -I${{includedir}}{}
+"#,
+      prefix_str,
+      name,
+      description,
+      version,
+      name,
+      if extra_libs.is_empty() {
+        String::new()
+      } else {
+        format!(" {}", extra_libs)
+      },
+      if extra_cflags.is_empty() {
+        String::new()
+      } else {
+        format!(" {}", extra_cflags)
+      },
+    );
+    fs::write(&dest_pc, pc_content)?;
+    self.log(&format!("Generated {} manually", pc_filename));
+    Ok(())
+  }
+
   /// Get the zig target triple for the current target
   fn zig_target(&self) -> Option<String> {
     self.target.as_ref().map(|t| {
@@ -501,6 +584,9 @@ exec zig c++ {} $args
     cmd.env("CXX", self.get_cxx());
     cmd.env("AR", self.get_ar());
     cmd.env("RANLIB", self.get_ranlib());
+    // Use CC as assembler too (zig cc handles .S files)
+    cmd.env("AS", self.get_cc());
+    cmd.env("CCAS", self.get_cc());
 
     self.run_command_visible(&mut cmd)
   }
@@ -539,6 +625,9 @@ exec zig c++ {} $args
     cmd.env("CXX", self.get_cxx());
     cmd.env("AR", self.get_ar());
     cmd.env("RANLIB", self.get_ranlib());
+    // Use CC as assembler too (zig cc handles .S files)
+    cmd.env("AS", self.get_cc());
+    cmd.env("CCAS", self.get_cc());
 
     self.run_command_visible(&mut cmd)
   }
@@ -685,13 +774,16 @@ Cflags: -I${{includedir}}
     if let Some(cross) = self.cross_config() {
       let vpx_target = match cross.arch.as_str() {
         "aarch64" => "arm64-linux-gcc",
-        "armv7" | "arm" => "armv7-linux-gcc",
+        // armv7 uses generic-gnu to avoid -march=armv7-a ASFLAGS issues with zig
+        // This uses C implementations instead of ARM assembly, but works reliably
+        "armv7" | "arm" => "generic-gnu",
         "x86_64" => "x86_64-linux-gcc",
         _ => "generic-gnu",
       };
       args.push(format!("--target={}", vpx_target));
 
       // ARM SIMD optimizations - zig wrapper transforms -march flags to -mcpu=generic+feature
+      // Note: armv7 uses generic-gnu target so NEON is not available via assembly
       match cross.arch.as_str() {
         "aarch64" => {
           args.push("--enable-neon".to_string());
@@ -699,9 +791,6 @@ Cflags: -I${{includedir}}
           args.push("--enable-neon-i8mm".to_string());
           args.push("--enable-sve".to_string());
           args.push("--enable-sve2".to_string());
-        }
-        "armv7" | "arm" => {
-          args.push("--enable-neon".to_string());
         }
         _ => {}
       }
@@ -762,6 +851,16 @@ Cflags: -I${{includedir}}
     self.run_cmake_build(&build_dir)?;
     self.run_cmake_install(&build_dir)?;
 
+    // Ensure aom.pc exists
+    self.ensure_pc_file(
+      "aom",
+      &build_dir,
+      AOM_BRANCH.trim_start_matches('v'),
+      "AV1 codec library",
+      "",
+      "-lm -lpthread",
+    )?;
+
     self.info("libaom built successfully");
     Ok(())
   }
@@ -789,51 +888,15 @@ Cflags: -I${{includedir}}
     self.run_cmake_build(&build_dir)?;
     self.run_cmake_install(&build_dir)?;
 
-    // Ensure opus.pc is installed with correct prefix
-    // CMake may generate it in the build directory
-    let pkgconfig_dir = self.prefix.join("lib").join("pkgconfig");
-    fs::create_dir_all(&pkgconfig_dir)?;
-
-    // Check if opus.pc exists in pkgconfig dir, if not try to copy from build
-    let dest_pc = pkgconfig_dir.join("opus.pc");
-    if !dest_pc.exists() {
-      // Try common locations for the generated .pc file
-      let possible_sources = [
-        build_dir.join("opus.pc"),
-        build_dir.join("lib").join("pkgconfig").join("opus.pc"),
-        source.join("opus.pc.in"), // Template file
-      ];
-
-      for src in &possible_sources {
-        if src.exists() && src.extension().map(|e| e == "pc").unwrap_or(false) {
-          let content = fs::read_to_string(src)?;
-          let fixed = self.fix_pc_file_prefix(&content, &prefix_str);
-          fs::write(&dest_pc, fixed)?;
-          self.log(&format!("Copied and fixed opus.pc to pkgconfig"));
-          break;
-        }
-      }
-
-      // If still not found, generate a basic opus.pc
-      if !dest_pc.exists() {
-        let opus_pc = format!(
-          r#"prefix={}
-exec_prefix=${{prefix}}
-libdir=${{exec_prefix}}/lib
-includedir=${{prefix}}/include
-
-Name: opus
-Description: Opus audio codec
-Version: 1.5.2
-Libs: -L${{libdir}} -lopus
-Cflags: -I${{includedir}} -I${{includedir}}/opus
-"#,
-          prefix_str
-        );
-        fs::write(&dest_pc, opus_pc)?;
-        self.log("Generated opus.pc manually");
-      }
-    }
+    // Ensure opus.pc exists
+    self.ensure_pc_file(
+      "opus",
+      &build_dir,
+      OPUS_BRANCH.trim_start_matches('v'),
+      "Opus audio codec",
+      "-I${includedir}/opus",
+      "-lm",
+    )?;
 
     self.info("opus built successfully");
     Ok(())
