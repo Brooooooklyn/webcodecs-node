@@ -112,6 +112,9 @@ jobs:
           # Use gcc as AS for .S files (needs preprocessing, raw 'as' can't handle -S flag)
           export AS=arm-linux-gnueabihf-gcc
           export STRIP=arm-linux-gnueabihf-strip
+          # Enable NEON for armv7 hard-float
+          export CFLAGS="-march=armv7-a -mfpu=neon -mfloat-abi=hard"
+          export CXXFLAGS="-march=armv7-a -mfpu=neon -mfloat-abi=hard"
           SKIP_FFMPEG_BUILD=1 cargo build --release --bin build-ffmpeg
           ./target/release/build-ffmpeg \
             --target armv7-unknown-linux-gnueabihf \

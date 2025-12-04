@@ -624,6 +624,14 @@ Cflags: -I${{includedir}}{}
     cmd.env("AR", self.get_ar());
     cmd.env("RANLIB", self.get_ranlib());
 
+    // Pass through CFLAGS/CXXFLAGS from environment
+    if let Ok(cflags) = env::var("CFLAGS") {
+      cmd.env("CFLAGS", &cflags);
+    }
+    if let Ok(cxxflags) = env::var("CXXFLAGS") {
+      cmd.env("CXXFLAGS", &cxxflags);
+    }
+
     // Only set AS/CCAS for ARM targets where .S files use the C compiler
     // For x86, don't override AS so build systems can find nasm
     let is_arm = self
@@ -664,9 +672,17 @@ Cflags: -I${{includedir}}{}
     cmd
       .arg("-G")
       .arg("Unix Makefiles")
-      .args(args)
-      .arg(&source_dir_abs)
-      .current_dir(build_dir);
+      .args(args);
+
+    // Pass CFLAGS/CXXFLAGS to cmake if set in environment
+    if let Ok(cflags) = env::var("CFLAGS") {
+      cmd.arg(format!("-DCMAKE_C_FLAGS={}", cflags));
+    }
+    if let Ok(cxxflags) = env::var("CXXFLAGS") {
+      cmd.arg(format!("-DCMAKE_CXX_FLAGS={}", cxxflags));
+    }
+
+    cmd.arg(&source_dir_abs).current_dir(build_dir);
 
     // Set compiler via environment variables
     cmd.env("CC", self.get_cc());
