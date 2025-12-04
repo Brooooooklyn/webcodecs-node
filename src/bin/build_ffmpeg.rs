@@ -282,13 +282,22 @@ exec zig c++ {} $args
       // Convert Rust target to zig target
       // e.g., "aarch64-unknown-linux-gnu" -> "aarch64-linux-gnu.2.17"
       // e.g., "x86_64-unknown-linux-musl" -> "x86_64-linux-musl"
+      // e.g., "armv7-unknown-linux-gnueabihf" -> "arm-linux-gnueabihf.2.17"
       let parts: Vec<&str> = t.split('-').collect();
+
+      // Convert architecture name to zig format
+      // Zig uses "arm" instead of "armv7" for 32-bit ARM
+      let arch = match parts[0] {
+        "armv7" => "arm",
+        other => other,
+      };
+
       let zig_target = if parts.len() >= 4 {
         // arch-vendor-os-env -> arch-os-env
-        format!("{}-{}-{}", parts[0], parts[2], parts[3])
+        format!("{}-{}-{}", arch, parts[2], parts[3])
       } else if parts.len() == 3 {
         // arch-os-env -> arch-os-env
-        t.clone()
+        format!("{}-{}-{}", arch, parts[1], parts[2])
       } else {
         t.clone()
       };
