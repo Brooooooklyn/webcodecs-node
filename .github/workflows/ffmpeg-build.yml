@@ -109,7 +109,8 @@ jobs:
           export CXX=arm-linux-gnueabihf-g++
           export AR=arm-linux-gnueabihf-ar
           export RANLIB=arm-linux-gnueabihf-ranlib
-          export AS=arm-linux-gnueabihf-as
+          # Use gcc as AS for .S files (needs preprocessing, raw 'as' can't handle -S flag)
+          export AS=arm-linux-gnueabihf-gcc
           export STRIP=arm-linux-gnueabihf-strip
           SKIP_FFMPEG_BUILD=1 cargo build --release --bin build-ffmpeg
           ./target/release/build-ffmpeg \
