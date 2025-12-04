@@ -1017,6 +1017,53 @@ Cflags: -I${{includedir}}
       "-lm -lpthread",
     )?;
 
+    // Debug: print aom.pc content and test pkg-config
+    let aom_pc = self.prefix.join("lib").join("pkgconfig").join("aom.pc");
+    if aom_pc.exists() {
+      self.info(&format!("=== DEBUG: {} ===", aom_pc.display()));
+      if let Ok(content) = fs::read_to_string(&aom_pc) {
+        for line in content.lines() {
+          self.info(&format!("  {}", line));
+        }
+      }
+      // Test pkg-config
+      let pkg_config_path = self.prefix.join("lib").join("pkgconfig");
+      let output = Command::new("pkg-config")
+        .args(["--exists", "--print-errors", "aom"])
+        .env("PKG_CONFIG_PATH", &pkg_config_path)
+        .env("PKG_CONFIG_LIBDIR", &pkg_config_path)
+        .env("PKG_CONFIG_ALLOW_CROSS", "1")
+        .output();
+      match output {
+        Ok(o) => {
+          self.info(&format!(
+            "pkg-config --exists aom: exit={}, stderr={}",
+            o.status,
+            String::from_utf8_lossy(&o.stderr).trim()
+          ));
+        }
+        Err(e) => self.info(&format!("pkg-config failed to run: {}", e)),
+      }
+      let output = Command::new("pkg-config")
+        .args(["--modversion", "aom"])
+        .env("PKG_CONFIG_PATH", &pkg_config_path)
+        .env("PKG_CONFIG_LIBDIR", &pkg_config_path)
+        .env("PKG_CONFIG_ALLOW_CROSS", "1")
+        .output();
+      match output {
+        Ok(o) => {
+          self.info(&format!(
+            "pkg-config --modversion aom: exit={}, stdout={}, stderr={}",
+            o.status,
+            String::from_utf8_lossy(&o.stdout).trim(),
+            String::from_utf8_lossy(&o.stderr).trim()
+          ));
+        }
+        Err(e) => self.info(&format!("pkg-config --modversion failed: {}", e)),
+      }
+      self.info("=== END DEBUG ===");
+    }
+
     self.info("libaom built successfully");
     Ok(())
   }
