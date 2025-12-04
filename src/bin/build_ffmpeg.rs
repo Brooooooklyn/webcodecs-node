@@ -1362,7 +1362,22 @@ Cflags: -I${{includedir}}
     }
 
     let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    self.run_configure(&source, &args_refs)?;
+    if let Err(e) = self.run_configure(&source, &args_refs) {
+      // Print config.log for debugging
+      let config_log = source.join("ffbuild").join("config.log");
+      if config_log.exists() {
+        self.info("=== FFmpeg configure failed, printing config.log (last 200 lines) ===");
+        if let Ok(content) = fs::read_to_string(&config_log) {
+          let lines: Vec<&str> = content.lines().collect();
+          let start = if lines.len() > 200 { lines.len() - 200 } else { 0 };
+          for line in &lines[start..] {
+            self.info(line);
+          }
+        }
+        self.info("=== END config.log ===");
+      }
+      return Err(e);
+    }
     self.run_make(&source)?;
     self.run_make_install(&source)?;
 
