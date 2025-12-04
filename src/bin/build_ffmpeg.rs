@@ -156,10 +156,23 @@ impl BuildContext {
     let cc_content = format!(
       r#"#!/bin/sh
 # Zig CC wrapper - transforms arch flags to zig-compatible format
+# Also filters out -target/--target flags that cmake/configure might add
 args=""
 cpu_features=""
+skip_next=0
 for arg in "$@"; do
+  if [ "$skip_next" = "1" ]; then
+    skip_next=0
+    continue
+  fi
   case "$arg" in
+    -target|--target)
+      # Skip this flag and the next argument (cmake/configure sometimes adds these)
+      skip_next=1
+      ;;
+    -target=*|--target=*)
+      # Skip combined target flag
+      ;;
     -march=*|-mcpu=*|-mtune=*)
       # Extract features from flags like -march=armv8.2-a+dotprod+i8mm+crc
       case "$arg" in
@@ -207,10 +220,23 @@ exec zig cc {} $args
     let cxx_content = format!(
       r#"#!/bin/sh
 # Zig C++ wrapper - transforms arch flags to zig-compatible format
+# Also filters out -target/--target flags that cmake/configure might add
 args=""
 cpu_features=""
+skip_next=0
 for arg in "$@"; do
+  if [ "$skip_next" = "1" ]; then
+    skip_next=0
+    continue
+  fi
   case "$arg" in
+    -target|--target)
+      # Skip this flag and the next argument (cmake/configure sometimes adds these)
+      skip_next=1
+      ;;
+    -target=*|--target=*)
+      # Skip combined target flag
+      ;;
     -march=*|-mcpu=*|-mtune=*)
       # Extract features from flags like -march=armv8.2-a+dotprod+i8mm+crc
       case "$arg" in
@@ -371,9 +397,10 @@ Cflags: -I${{includedir}}{}
   fn zig_target(&self) -> Option<String> {
     self.target.as_ref().map(|t| {
       // Convert Rust target to zig target
-      // e.g., "aarch64-unknown-linux-gnu" -> "aarch64-linux-gnu.2.17"
+      // e.g., "aarch64-unknown-linux-gnu" -> "aarch64-linux-gnu.2.17.0"
       // e.g., "x86_64-unknown-linux-musl" -> "x86_64-linux-musl"
-      // e.g., "armv7-unknown-linux-gnueabihf" -> "arm-linux-gnueabihf.2.17"
+      // e.g., "armv7-unknown-linux-gnueabihf" -> "arm-linux-gnueabihf.2.17.0"
+      // Key: Remove "unknown" vendor, keep dot before glibc version
       let parts: Vec<&str> = t.split('-').collect();
 
       // Convert architecture name to zig format
@@ -384,7 +411,7 @@ Cflags: -I${{includedir}}{}
       };
 
       let zig_target = if parts.len() >= 4 {
-        // arch-vendor-os-env -> arch-os-env
+        // arch-vendor-os-env -> arch-os-env (remove vendor like "unknown")
         format!("{}-{}-{}", arch, parts[2], parts[3])
       } else if parts.len() == 3 {
         // arch-os-env -> arch-os-env
@@ -393,9 +420,10 @@ Cflags: -I${{includedir}}{}
         t.clone()
       };
 
-      // For gnu targets, specify glibc 2.17 for compatibility with older distros
+      // For gnu targets, specify glibc 2.17.0 for compatibility with older distros
+      // Format: "aarch64-linux-gnu.2.17.0" (dot before version, full 3-part version)
       if zig_target.ends_with("-gnu") || zig_target.ends_with("-gnueabihf") {
-        format!("{}.2.17", zig_target)
+        format!("{}.2.17.0", zig_target)
       } else {
         zig_target
       }
@@ -481,6 +509,22 @@ Cflags: -I${{includedir}}{}
 
     // When using zig, use CC as assembler (zig cc handles .S files)
     self.get_cc()
+  }
+
+  /// Get STRIP command
+  fn get_strip(&self) -> String {
+    // If using system CC, check environment variable first
+    if self.use_system_cc {
+      return env::var("STRIP").unwrap_or_else(|_| "strip".to_string());
+    }
+
+    // For zig cross-compilation, use no-op to avoid "unable to recognise format" warnings
+    // zig doesn't have a strip command, and host strip can't handle cross-compiled objects
+    if self.target.is_some() && self.use_zig {
+      "true".to_string() // no-op command
+    } else {
+      "strip".to_string()
+    }
   }
 
   /// Get cross-compilation config if cross-compiling
@@ -644,6 +688,10 @@ Cflags: -I${{includedir}}{}
       cmd.env("CCAS", self.get_as());
     }
 
+    // Set STRIP to no-op for zig cross-compilation to avoid "unable to recognise format" warnings
+    // Stripping static libraries is unnecessary; final strip happens on the Rust binary
+    cmd.env("STRIP", self.get_strip());
+
     self.run_command_visible(&mut cmd)
   }
 
@@ -701,6 +749,10 @@ Cflags: -I${{includedir}}{}
       cmd.env("AS", self.get_as());
       cmd.env("CCAS", self.get_as());
     }
+
+    // Set STRIP to no-op for zig cross-compilation to avoid "unable to recognise format" warnings
+    // Stripping static libraries is unnecessary; final strip happens on the Rust binary
+    cmd.env("STRIP", self.get_strip());
 
     self.run_command_visible(&mut cmd)
   }
