@@ -689,11 +689,14 @@ Cflags: -I${{includedir}}{}
       .join(":");
     cmd.env("PKG_CONFIG_PATH", &full_pkg_path);
 
-    // For cross-compilation, set PKG_CONFIG_LIBDIR to only search our prefix
-    // Note: Don't set PKG_CONFIG_SYSROOT_DIR because our .pc files already have
-    // absolute paths, and sysroot would cause doubled paths
+    // For cross-compilation, configure pkg-config properly
     if self.target.is_some() {
+      // PKG_CONFIG_LIBDIR: only search our prefix (not system paths)
       cmd.env("PKG_CONFIG_LIBDIR", &full_pkg_path);
+      // PKG_CONFIG_ALLOW_CROSS: allow pkg-config to work during cross-compilation
+      // Without this, pkgconf (default on Ubuntu) silently refuses to return
+      // results when it detects cross-compilation from path patterns
+      cmd.env("PKG_CONFIG_ALLOW_CROSS", "1");
     }
 
     // Set compiler environment variables
