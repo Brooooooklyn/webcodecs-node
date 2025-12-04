@@ -888,7 +888,7 @@ Name: x265
 Description: H.265/HEVC video encoder
 Version: {}
 Libs: -L${{libdir}} -lx265
-Libs.private: -lstdc++ -lm -lpthread
+Libs.private: -lstdc++ -lm -lpthread -ldl
 Cflags: -I${{includedir}}
 "#,
       prefix_str,
@@ -1388,6 +1388,21 @@ Cflags: -I${{includedir}}
       }
       return Err(e);
     }
+
+    // For zig builds: patch config.h to disable sysctl (zig's sysroot lacks sys/sysctl.h)
+    // Only needed for zig cross-compilation, not native GCC builds
+    if self.use_zig && !self.use_system_cc {
+      let config_h = source.join("config.h");
+      if config_h.exists() {
+        self.info("Patching config.h to disable sysctl for zig build...");
+        let content = fs::read_to_string(&config_h)?;
+        let patched = content
+          .replace("#define HAVE_SYSCTL 1", "#define HAVE_SYSCTL 0")
+          .replace("#define HAVE_SYS_SYSCTL_H 1", "#define HAVE_SYS_SYSCTL_H 0");
+        fs::write(&config_h, patched)?;
+      }
+    }
+
     self.run_make(&source)?;
     self.run_make_install(&source)?;
 
