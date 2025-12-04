@@ -15,6 +15,14 @@ fn main() {
   // NAPI-RS build setup
   napi_build::setup();
 
+  // Skip FFmpeg operations when building standalone binaries (e.g., build-ffmpeg)
+  // This is needed because the build-ffmpeg binary doesn't need FFmpeg to compile,
+  // and FFmpeg might not exist yet (we're building the tool that creates it!)
+  if env::var("SKIP_FFMPEG_BUILD").unwrap_or_default() == "1" {
+    println!("cargo:warning=Skipping FFmpeg build steps (SKIP_FFMPEG_BUILD=1)");
+    return;
+  }
+
   // Get target information
   let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
   let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
@@ -35,6 +43,7 @@ fn main() {
   println!("cargo:rerun-if-env-changed=FFMPEG_GITHUB_REPO");
   println!("cargo:rerun-if-env-changed=FFMPEG_RELEASE_TAG");
   println!("cargo:rerun-if-env-changed=FFMPEG_SKIP_DOWNLOAD");
+  println!("cargo:rerun-if-env-changed=SKIP_FFMPEG_BUILD");
 }
 
 /// Get FFmpeg installation directory
