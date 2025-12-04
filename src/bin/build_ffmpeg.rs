@@ -1176,30 +1176,38 @@ Cflags: -I${{includedir}}
       .unwrap_or(cfg!(target_os = "linux"));
 
     if is_linux {
-      // VAAPI - Intel/AMD hardware acceleration
-      if self.check_vaapi_available() {
-        self.info("Enabling VAAPI hardware acceleration...");
-        args.push("--enable-vaapi".to_string());
-      } else {
-        self.info("VAAPI not available, skipping");
-      }
-
-      // NVENC/NVDEC - NVIDIA hardware acceleration
-      // Install nv-codec-headers first (header-only, no runtime deps)
-      if !self.skip_deps {
-        self.install_nv_codec_headers()?;
-      }
-      self.info("Enabling NVENC/NVDEC hardware acceleration...");
-      args.push("--enable-ffnvcodec".to_string());
-      args.push("--enable-nvenc".to_string());
-      args.push("--enable-nvdec".to_string());
-
-      // V4L2 M2M - ARM/embedded hardware acceleration
+      // Check architecture for hardware acceleration support
+      let is_armv7 = self
+        .target
+        .as_ref()
+        .map(|t| t.starts_with("armv7") || t.starts_with("arm-"))
+        .unwrap_or(false);
       let is_arm = self
         .target
         .as_ref()
         .map(|t| t.contains("arm") || t.contains("aarch64"))
         .unwrap_or(false);
+
+      // VAAPI - Intel/AMD hardware acceleration (not for ARM)
+      if !is_arm && self.check_vaapi_available() {
+        self.info("Enabling VAAPI hardware acceleration...");
+        args.push("--enable-vaapi".to_string());
+      }
+
+      // NVENC/NVDEC - NVIDIA hardware acceleration (x86_64 and aarch64 only, not armv7)
+      if !is_armv7 {
+        if !self.skip_deps {
+          self.install_nv_codec_headers()?;
+        }
+        self.info("Enabling NVENC/NVDEC hardware acceleration...");
+        args.push("--enable-ffnvcodec".to_string());
+        args.push("--enable-nvenc".to_string());
+        args.push("--enable-nvdec".to_string());
+      } else {
+        self.info("Skipping NVENC/NVDEC (not supported on armv7)");
+      }
+
+      // V4L2 M2M - ARM/embedded hardware acceleration
       if is_arm {
         self.info("Enabling V4L2 M2M for ARM target...");
         args.push("--enable-v4l2-m2m".to_string());
