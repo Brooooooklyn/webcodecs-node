@@ -39,6 +39,9 @@ jobs:
         with:
           version: 0.15.2
 
+      - name: Setup nasm
+        uses: ilammy/setup-nasm@v1
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
