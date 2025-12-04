@@ -82,7 +82,7 @@ jobs:
           apt-get update
           apt-get install -y \
             gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
-            libatomic1-armhf-cross \
+            libc6-dev-armhf-cross libatomic1-armhf-cross \
             git build-essential cmake ninja-build \
             wget curl gnupg pkg-config \
             autoconf automake libtool \
