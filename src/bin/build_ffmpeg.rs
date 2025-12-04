@@ -789,6 +789,52 @@ Cflags: -I${{includedir}}
     self.run_cmake_build(&build_dir)?;
     self.run_cmake_install(&build_dir)?;
 
+    // Ensure opus.pc is installed with correct prefix
+    // CMake may generate it in the build directory
+    let pkgconfig_dir = self.prefix.join("lib").join("pkgconfig");
+    fs::create_dir_all(&pkgconfig_dir)?;
+
+    // Check if opus.pc exists in pkgconfig dir, if not try to copy from build
+    let dest_pc = pkgconfig_dir.join("opus.pc");
+    if !dest_pc.exists() {
+      // Try common locations for the generated .pc file
+      let possible_sources = [
+        build_dir.join("opus.pc"),
+        build_dir.join("lib").join("pkgconfig").join("opus.pc"),
+        source.join("opus.pc.in"), // Template file
+      ];
+
+      for src in &possible_sources {
+        if src.exists() && src.extension().map(|e| e == "pc").unwrap_or(false) {
+          let content = fs::read_to_string(src)?;
+          let fixed = self.fix_pc_file_prefix(&content, &prefix_str);
+          fs::write(&dest_pc, fixed)?;
+          self.log(&format!("Copied and fixed opus.pc to pkgconfig"));
+          break;
+        }
+      }
+
+      // If still not found, generate a basic opus.pc
+      if !dest_pc.exists() {
+        let opus_pc = format!(
+          r#"prefix={}
+exec_prefix=${{prefix}}
+libdir=${{exec_prefix}}/lib
+includedir=${{prefix}}/include
+
+Name: opus
+Description: Opus audio codec
+Version: 1.5.2
+Libs: -L${{libdir}} -lopus
+Cflags: -I${{includedir}} -I${{includedir}}/opus
+"#,
+          prefix_str
+        );
+        fs::write(&dest_pc, opus_pc)?;
+        self.log("Generated opus.pc manually");
+      }
+    }
+
     self.info("opus built successfully");
     Ok(())
   }
