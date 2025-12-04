@@ -332,7 +332,10 @@ exec zig c++ {} $args
     if dest_pc.exists() {
       let content = fs::read_to_string(&dest_pc)?;
       if content.contains(&format!("prefix={}", prefix_str)) {
-        self.log(&format!("{} already exists with correct prefix", pc_filename));
+        self.log(&format!(
+          "{} already exists with correct prefix",
+          pc_filename
+        ));
         return Ok(());
       }
       // Fix prefix if needed
@@ -535,6 +538,37 @@ Cflags: -I${{includedir}}{}
       .and_then(|t| CrossCompileConfig::from_target(t))
   }
 
+  /// Get common cmake arguments for cross-compilation
+  fn cmake_cross_args(&self) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(cross) = self.cross_config() {
+      args.push(format!(
+        "-DCMAKE_SYSTEM_NAME={}",
+        match cross.os.as_str() {
+          "linux" => "Linux",
+          "freebsd" => "FreeBSD",
+          _ => "Linux",
+        }
+      ));
+      args.push(format!("-DCMAKE_SYSTEM_PROCESSOR={}", cross.arch));
+
+      // For system CC (GCC cross-toolchain), provide pthread/math hints
+      // to avoid cmake test failures during cross-compilation
+      if self.use_system_cc {
+        // Tell cmake the compiler can link basic executables (skip try_compile tests)
+        args.push("-DCMAKE_C_COMPILER_WORKS=ON".to_string());
+        args.push("-DCMAKE_CXX_COMPILER_WORKS=ON".to_string());
+        // Tell cmake that pthread works (it's built into glibc)
+        args.push("-DTHREADS_PREFER_PTHREAD_FLAG=ON".to_string());
+        // Pre-set pthread test result (0 = success, avoids try_run)
+        args.push("-DTHREADS_PTHREAD_ARG=0".to_string());
+        // Tell cmake not to try running test executables
+        args.push("-DCMAKE_CROSSCOMPILING_EMULATOR=".to_string());
+      }
+    }
+    args
+  }
+
   /// Log a message if verbose mode is enabled
   fn log(&self, msg: &str) {
     if self.verbose {
@@ -717,10 +751,7 @@ Cflags: -I${{includedir}}{}
     let source_dir_abs = source_dir.canonicalize()?;
 
     let mut cmd = Command::new("cmake");
-    cmd
-      .arg("-G")
-      .arg("Unix Makefiles")
-      .args(args);
+    cmd.arg("-G").arg("Unix Makefiles").args(args);
 
     // Pass CFLAGS/CXXFLAGS to cmake if set in environment
     if let Ok(cflags) = env::var("CFLAGS") {
@@ -832,15 +863,8 @@ Cflags: -I${{includedir}}{}
       "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".to_string(),
     ];
 
-    // Cross-compilation hints for CMake (zig wrapper filters incompatible -march flags)
-    if let Some(cross) = self.cross_config() {
-      args.push(format!("-DCMAKE_SYSTEM_NAME={}", match cross.os.as_str() {
-        "linux" => "Linux",
-        "freebsd" => "FreeBSD",
-        _ => "Linux",
-      }));
-      args.push(format!("-DCMAKE_SYSTEM_PROCESSOR={}", cross.arch));
-    }
+    // Add cross-compilation hints for CMake
+    args.extend(self.cmake_cross_args());
 
     let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     self.run_cmake(&cmake_source, &build_dir, &args_refs)?;
@@ -864,7 +888,8 @@ Libs: -L${{libdir}} -lx265
 Libs.private: -lstdc++ -lm -lpthread
 Cflags: -I${{includedir}}
 "#,
-      prefix_str, X265_BRANCH.trim_start_matches("Release_")
+      prefix_str,
+      X265_BRANCH.trim_start_matches("Release_")
     );
     fs::write(pkgconfig_dir.join("x265.pc"), x265_pc)?;
     self.log("Generated x265.pc");
@@ -953,7 +978,10 @@ Cflags: -I${{includedir}}
       "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".to_string(),
     ];
 
-    // Cross-compilation and SIMD optimization
+    // Add cross-compilation hints for CMake
+    args.extend(self.cmake_cross_args());
+
+    // Target-specific SIMD optimization
     // Zig wrapper transforms -march flags to -mcpu=generic+feature
     if let Some(cross) = self.cross_config() {
       match cross.arch.as_str() {
@@ -1002,11 +1030,14 @@ Cflags: -I${{includedir}}
 
     let prefix_str = self.prefix.to_string_lossy().to_string();
 
-    let args = vec![
+    let mut args = vec![
       format!("-DCMAKE_INSTALL_PREFIX={}", prefix_str),
       "-DBUILD_SHARED_LIBS=OFF".to_string(),
       "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".to_string(),
     ];
+
+    // Add cross-compilation hints for CMake
+    args.extend(self.cmake_cross_args());
 
     let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     self.run_cmake(&source, &build_dir, &args_refs)?;
@@ -1089,7 +1120,7 @@ Cflags: -I${{includedir}}
 
     let prefix_str = self.prefix.to_string_lossy().to_string();
 
-    let args = vec![
+    let mut args = vec![
       format!("-DCMAKE_INSTALL_PREFIX={}", prefix_str),
       "-DBUILD_SHARED_LIBS=OFF".to_string(),
       "-DWEBP_BUILD_ANIM_UTILS=OFF".to_string(),
@@ -1103,6 +1134,9 @@ Cflags: -I${{includedir}}
       "-DWEBP_BUILD_EXTRAS=OFF".to_string(),
       "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".to_string(),
     ];
+
+    // Add cross-compilation hints for CMake
+    args.extend(self.cmake_cross_args());
 
     let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     self.run_cmake(&source, &build_dir, &args_refs)?;
@@ -1142,7 +1176,11 @@ Cflags: -I${{includedir}}
         fs::write(&dest, fixed)?;
         self.log(&format!("Copied and fixed {} to pkgconfig", pc_file));
       } else {
-        self.log(&format!("Warning: {} not found at {}, skipping", pc_file, src.display()));
+        self.log(&format!(
+          "Warning: {} not found at {}, skipping",
+          pc_file,
+          src.display()
+        ));
       }
     }
 
@@ -1332,6 +1370,11 @@ Cflags: -I${{includedir}}
     fs::create_dir_all(&self.prefix)?;
     fs::create_dir_all(&self.source_dir)?;
 
+    // Canonicalize paths to resolve ./ and symlinks
+    // This ensures .pc files have clean absolute paths that pkg-config can resolve
+    self.prefix = self.prefix.canonicalize()?;
+    self.source_dir = self.source_dir.canonicalize()?;
+
     // Check prerequisites
     self.check_prerequisites()?;
 
@@ -1476,7 +1519,13 @@ fn parse_args() -> Result<BuildContext, String> {
   };
 
   Ok(BuildContext::new(
-    output, source_dir, target, jobs, verbose, skip_deps, use_system_cc,
+    output,
+    source_dir,
+    target,
+    jobs,
+    verbose,
+    skip_deps,
+    use_system_cc,
   ))
 }
 
