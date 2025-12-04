@@ -41,8 +41,10 @@ struct BuildContext {
   verbose: bool,
   /// Skip building dependencies
   skip_deps: bool,
-  /// Use zig as compiler (if available)
+  /// Use zig as compiler (if available and not overridden)
   use_zig: bool,
+  /// Use system CC/CXX from environment variables (disables zig)
+  use_system_cc: bool,
   /// Directory containing zig wrapper scripts (created lazily)
   zig_wrapper_dir: Option<PathBuf>,
 }
@@ -98,15 +100,20 @@ impl BuildContext {
     jobs: usize,
     verbose: bool,
     skip_deps: bool,
+    use_system_cc: bool,
   ) -> Self {
-    // Detect if zig is available
-    let use_zig = Command::new("zig")
-      .arg("version")
-      .stdout(Stdio::null())
-      .stderr(Stdio::null())
-      .status()
-      .map(|s| s.success())
-      .unwrap_or(false);
+    // Detect if zig is available (only if not using system CC)
+    let use_zig = if use_system_cc {
+      false
+    } else {
+      Command::new("zig")
+        .arg("version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    };
 
     Self {
       prefix,
@@ -116,6 +123,7 @@ impl BuildContext {
       verbose,
       skip_deps,
       use_zig,
+      use_system_cc,
       zig_wrapper_dir: None,
     }
   }
@@ -394,8 +402,13 @@ Cflags: -I${{includedir}}{}
     })
   }
 
-  /// Get C compiler command (uses zig wrapper for cross-compilation)
+  /// Get C compiler command (uses zig wrapper for cross-compilation, or system CC)
   fn get_cc(&self) -> String {
+    // If using system CC, check environment variable first
+    if self.use_system_cc {
+      return env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    }
+
     if self.use_zig {
       if let Some(ref wrapper_dir) = self.zig_wrapper_dir {
         // Use wrapper script that filters incompatible flags
@@ -410,8 +423,13 @@ Cflags: -I${{includedir}}{}
     }
   }
 
-  /// Get C++ compiler command (uses zig wrapper for cross-compilation)
+  /// Get C++ compiler command (uses zig wrapper for cross-compilation, or system CXX)
   fn get_cxx(&self) -> String {
+    // If using system CC, check environment variable first
+    if self.use_system_cc {
+      return env::var("CXX").unwrap_or_else(|_| "c++".to_string());
+    }
+
     if self.use_zig {
       if let Some(ref wrapper_dir) = self.zig_wrapper_dir {
         // Use wrapper script that filters incompatible flags
@@ -428,6 +446,11 @@ Cflags: -I${{includedir}}{}
 
   /// Get AR command
   fn get_ar(&self) -> String {
+    // If using system CC, check environment variable first
+    if self.use_system_cc {
+      return env::var("AR").unwrap_or_else(|_| "ar".to_string());
+    }
+
     if self.use_zig {
       "zig ar".to_string()
     } else {
@@ -437,11 +460,27 @@ Cflags: -I${{includedir}}{}
 
   /// Get RANLIB command
   fn get_ranlib(&self) -> String {
+    // If using system CC, check environment variable first
+    if self.use_system_cc {
+      return env::var("RANLIB").unwrap_or_else(|_| "ranlib".to_string());
+    }
+
     if self.use_zig {
       "zig ranlib".to_string()
     } else {
       "ranlib".to_string()
     }
+  }
+
+  /// Get AS (assembler) command
+  fn get_as(&self) -> String {
+    // If using system CC, check environment variable first
+    if self.use_system_cc {
+      return env::var("AS").unwrap_or_else(|_| "as".to_string());
+    }
+
+    // When using zig, use CC as assembler (zig cc handles .S files)
+    self.get_cc()
   }
 
   /// Get cross-compilation config if cross-compiling
@@ -573,20 +612,19 @@ Cflags: -I${{includedir}}{}
     cmd.env("PKG_CONFIG_PATH", &full_pkg_path);
 
     // For cross-compilation, set PKG_CONFIG_LIBDIR to only search our prefix
-    // and PKG_CONFIG_SYSROOT_DIR to prevent pkg-config from checking system libs
+    // Note: Don't set PKG_CONFIG_SYSROOT_DIR because our .pc files already have
+    // absolute paths, and sysroot would cause doubled paths
     if self.target.is_some() {
       cmd.env("PKG_CONFIG_LIBDIR", &full_pkg_path);
-      cmd.env("PKG_CONFIG_SYSROOT_DIR", self.prefix.as_os_str());
     }
 
-    // Set compiler environment variables (zig handles cross-compilation via -target)
+    // Set compiler environment variables
     cmd.env("CC", self.get_cc());
     cmd.env("CXX", self.get_cxx());
     cmd.env("AR", self.get_ar());
     cmd.env("RANLIB", self.get_ranlib());
-    // Use CC as assembler too (zig cc handles .S files)
-    cmd.env("AS", self.get_cc());
-    cmd.env("CCAS", self.get_cc());
+    cmd.env("AS", self.get_as());
+    cmd.env("CCAS", self.get_as());
 
     self.run_command_visible(&mut cmd)
   }
@@ -620,14 +658,13 @@ Cflags: -I${{includedir}}{}
       .arg(&source_dir_abs)
       .current_dir(build_dir);
 
-    // Set compiler via environment variables (zig handles cross-compilation via -target)
+    // Set compiler via environment variables
     cmd.env("CC", self.get_cc());
     cmd.env("CXX", self.get_cxx());
     cmd.env("AR", self.get_ar());
     cmd.env("RANLIB", self.get_ranlib());
-    // Use CC as assembler too (zig cc handles .S files)
-    cmd.env("AS", self.get_cc());
-    cmd.env("CCAS", self.get_cc());
+    cmd.env("AS", self.get_as());
+    cmd.env("CCAS", self.get_as());
 
     self.run_command_visible(&mut cmd)
   }
@@ -1205,11 +1242,6 @@ Cflags: -I${{includedir}}
     // Create zig wrapper scripts if using zig (filters incompatible flags like -march=armv8)
     if self.use_zig {
       self.ensure_zig_wrappers()?;
-      self.info("Using zig as compiler (with wrapper scripts)");
-      self.log(&format!("  CC:  {}", self.get_cc()));
-      self.log(&format!("  CXX: {}", self.get_cxx()));
-    } else {
-      self.info("Using system compiler (cc/c++)");
     }
 
     if !self.skip_deps {
@@ -1245,6 +1277,7 @@ OPTIONS:
     -j, --jobs <N>            Parallel build jobs [default: num_cpus]
     -v, --verbose             Enable verbose output
     --skip-deps               Skip building dependencies
+    --use-system-cc           Use system CC/CXX from environment instead of zig
     -h, --help                Show this help message
 
 SUPPORTED TARGETS:
@@ -1255,8 +1288,15 @@ SUPPORTED TARGETS:
     armv7-unknown-linux-gnueabihf
     x86_64-unknown-freebsd
 
+ENVIRONMENT VARIABLES (when --use-system-cc is set):
+    CC, CXX, AR, RANLIB, AS   Override default compilers/tools
+
 EXAMPLE:
     cargo run --release --bin build-ffmpeg -- -o ./ffmpeg -v
+
+    # Cross-compile for armv7 with GCC toolchain:
+    export CC=arm-linux-gnueabihf-gcc CXX=arm-linux-gnueabihf-g++
+    cargo run --release --bin build-ffmpeg -- -t armv7-unknown-linux-gnueabihf --use-system-cc
 "#
   );
 }
@@ -1271,6 +1311,7 @@ fn parse_args() -> Result<BuildContext, String> {
   let mut jobs = num_cpus::get();
   let mut verbose = false;
   let mut skip_deps = false;
+  let mut use_system_cc = false;
 
   let mut i = 1;
   while i < args.len() {
@@ -1311,6 +1352,9 @@ fn parse_args() -> Result<BuildContext, String> {
       "--skip-deps" => {
         skip_deps = true;
       }
+      "--use-system-cc" => {
+        use_system_cc = true;
+      }
       "-h" | "--help" => {
         print_usage();
         std::process::exit(0);
@@ -1336,7 +1380,7 @@ fn parse_args() -> Result<BuildContext, String> {
   };
 
   Ok(BuildContext::new(
-    output, source_dir, target, jobs, verbose, skip_deps,
+    output, source_dir, target, jobs, verbose, skip_deps, use_system_cc,
   ))
 }
 
@@ -1358,6 +1402,15 @@ fn main() {
   println!("Jobs: {}", ctx.jobs);
   if let Some(ref t) = ctx.target {
     println!("Target: {}", t);
+  }
+  if ctx.use_system_cc {
+    println!("Compiler: system (from environment)");
+    println!("  CC:  {}", ctx.get_cc());
+    println!("  CXX: {}", ctx.get_cxx());
+  } else if ctx.use_zig {
+    println!("Compiler: zig");
+  } else {
+    println!("Compiler: system default");
   }
   println!("========================================");
 

@@ -12,9 +12,10 @@ on:
       - prepare-release
 
 env:
-  FFMPEG_VERSION: ${{ github.event.inputs.ffmpeg_version }}
+  FFMPEG_VERSION: ${{ github.event.inputs.ffmpeg_version || 'n8.0.1' }}
 
 jobs:
+  # Build for x86_64 and aarch64 targets using zig
   build-ffmpeg:
     strategy:
       fail-fast: false
@@ -22,14 +23,13 @@ jobs:
         target:
           - x86_64-unknown-linux-gnu
           - aarch64-unknown-linux-gnu
-          - armv7-unknown-linux-gnueabihf
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
 
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -38,9 +38,6 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
-
-      - name: Setup nasm
-        uses: ilammy/setup-nasm@v1
 
       - name: Install build dependencies
         run: |
@@ -69,8 +66,71 @@ jobs:
           path: ffmpeg-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
+  # Build armv7 using native GCC cross-toolchain (zig has issues with nasm/assembly)
+  build-ffmpeg-armv7:
+    name: Build armv7-unknown-linux-gnueabihf
+    runs-on: ubuntu-latest
+    container:
+      image: debian:bullseye
+
+    steps:
+      - name: Setup tools
+        run: |
+          apt-get update
+          apt-get install -y \
+            gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
+            libatomic1-armhf-cross \
+            git build-essential cmake ninja-build \
+            wget curl gnupg pkg-config \
+            autoconf automake libtool \
+            nasm yasm
+
+      - uses: actions/checkout@v4
+
+      - name: Setup cmake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.x'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-gnueabihf
+
+      - name: Config git
+        run: git config --global --add safe.directory "$(pwd)"
+
+      - name: Build FFmpeg
+        run: |
+          export CC=arm-linux-gnueabihf-gcc
+          export CXX=arm-linux-gnueabihf-g++
+          export AR=arm-linux-gnueabihf-ar
+          export RANLIB=arm-linux-gnueabihf-ranlib
+          export AS=arm-linux-gnueabihf-as
+          export STRIP=arm-linux-gnueabihf-strip
+          SKIP_FFMPEG_BUILD=1 cargo build --release --bin build-ffmpeg
+          ./target/release/build-ffmpeg \
+            --target armv7-unknown-linux-gnueabihf \
+            --output ./ffmpeg-armv7-unknown-linux-gnueabihf \
+            --use-system-cc \
+            --verbose
+
+      - name: Create tarball
+        run: |
+          tar -czvf ffmpeg-armv7-unknown-linux-gnueabihf.tar.gz \
+            -C ./ffmpeg-armv7-unknown-linux-gnueabihf .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-armv7-unknown-linux-gnueabihf
+          path: ffmpeg-armv7-unknown-linux-gnueabihf.tar.gz
+          if-no-files-found: error
+
   create-release:
-    needs: build-ffmpeg
+    needs:
+      - build-ffmpeg
+      - build-ffmpeg-armv7
     runs-on: ubuntu-latest
     permissions:
       contents: write
