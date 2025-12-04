@@ -1379,7 +1379,11 @@ Cflags: -I${{includedir}}
         self.info("=== FFmpeg configure failed, printing config.log (last 200 lines) ===");
         if let Ok(content) = fs::read_to_string(&config_log) {
           let lines: Vec<&str> = content.lines().collect();
-          let start = if lines.len() > 200 { lines.len() - 200 } else { 0 };
+          let start = if lines.len() > 200 {
+            lines.len() - 200
+          } else {
+            0
+          };
           for line in &lines[start..] {
             self.info(line);
           }

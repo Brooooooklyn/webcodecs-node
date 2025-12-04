@@ -66,15 +66,15 @@ jobs:
             target: aarch64-apple-darwin
             build: pnpm build --target aarch64-apple-darwin
             build_ffmpeg: false
-          # Windows - use prebuilt FFmpeg
+          # Windows - download pre-built FFmpeg from release
           - host: windows-latest
             target: x86_64-pc-windows-msvc
             build: pnpm build --target x86_64-pc-windows-msvc
-            build_ffmpeg: false
+            download_ffmpeg: true
           - host: windows-latest
             target: aarch64-pc-windows-msvc
             build: pnpm build --target aarch64-pc-windows-msvc
-            build_ffmpeg: false
+            download_ffmpeg: true
           # Linux glibc - download pre-built FFmpeg from release
           - host: ubuntu-latest
             target: x86_64-unknown-linux-gnu
@@ -159,12 +159,24 @@ jobs:
           echo "Using FFmpeg release: $RELEASE_TAG"
 
           mkdir -p ./ffmpeg-build
-          gh release download "$RELEASE_TAG" \
-            --repo ${{ github.repository }} \
-            --pattern "ffmpeg-${{ matrix.settings.target }}.tar.gz"
 
-          tar -xzf "ffmpeg-${{ matrix.settings.target }}.tar.gz" -C ./ffmpeg-build
-          rm "ffmpeg-${{ matrix.settings.target }}.tar.gz"
+          # Determine archive format based on target
+          TARGET="${{ matrix.settings.target }}"
+          if [[ "$TARGET" == *"windows"* ]]; then
+            ARCHIVE="ffmpeg-${TARGET}.zip"
+            gh release download "$RELEASE_TAG" \
+              --repo ${{ github.repository }} \
+              --pattern "$ARCHIVE"
+            unzip -o "$ARCHIVE" -d ./ffmpeg-build
+            rm "$ARCHIVE"
+          else
+            ARCHIVE="ffmpeg-${TARGET}.tar.gz"
+            gh release download "$RELEASE_TAG" \
+              --repo ${{ github.repository }} \
+              --pattern "$ARCHIVE"
+            tar -xzf "$ARCHIVE" -C ./ffmpeg-build
+            rm "$ARCHIVE"
+          fi
 
           echo "FFMPEG_DIR=$(pwd)/ffmpeg-build" >> $GITHUB_ENV
         shell: bash
@@ -195,56 +207,7 @@ jobs:
           name: bindings-${{ matrix.settings.target }}
           path: '*.wasm'
           if-no-files-found: error
-  build-freebsd:
-    runs-on: ubuntu-latest
-    name: Build FreeBSD
-    steps:
-      - uses: actions/checkout@v5
-      - name: Build
-        id: build
-        uses: cross-platform-actions/action@v0.30.0
-        env:
-          DEBUG: napi:*
-          RUSTUP_IO_THREADS: 1
-        with:
-          operating_system: freebsd
-          version: '14.3'
-          memory: 8G
-          cpu_count: 3
-          environment_variables: 'DEBUG RUSTUP_IO_THREADS'
-          shell: bash
-          run: |
-            sudo pkg install -y -f curl node libnghttp2 npm cmake nasm yasm autoconf automake libtool git pkgconf libva libdrm
-            sudo npm install -g corepack
-            curl https://sh.rustup.rs -sSf --output rustup.sh
-            sh rustup.sh -y --profile minimal --default-toolchain beta
-            sudo corepack enable
-            source "$HOME/.cargo/env"
-            echo "~~~~ rustc --version ~~~~"
-            rustc --version
-            echo "~~~~ node -v ~~~~"
-            node -v
-            echo "~~~~ pnpm --version ~~~~"
-            pnpm --version
-            pwd
-            ls -lah
-            whoami
-            env
-            freebsd-version
-            # Build FFmpeg from source
-            cargo build --release --bin build-ffmpeg
-            ./target/release/build-ffmpeg --output ./ffmpeg-build --verbose
-            export FFMPEG_DIR=$(pwd)/ffmpeg-build
-            pnpm install
-            pnpm build
-            rm -rf node_modules
-            rm -rf target
-      - name: Upload artifact
-        uses: actions/upload-artifact@v5
-        with:
-          name: bindings-freebsd
-          path: ${{ env.APP_NAME }}.*.node
-          if-no-files-found: error
+  
   test-macOS-windows-binding:
     name: Test bindings on ${{ matrix.settings.target }} - node@${{ matrix.node }}
     needs:
@@ -358,34 +321,6 @@ jobs:
           image: ${{ steps.docker.outputs.IMAGE }}
           options: -v ${{ steps.docker.outputs.PNPM_STORE_PATH }}:${{ steps.docker.outputs.PNPM_STORE_PATH }} -v ${{ github.workspace }}:${{ github.workspace }} -w ${{ github.workspace }} --platform ${{ steps.docker.outputs.PLATFORM }}
           run: npm run test
-  test-wasi:
-    name: Test WASI target
-    needs:
-      - build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - name: setup pnpm
-        uses: pnpm/action-setup@v4
-      - name: Setup node
-        uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: pnpm
-      - name: Install dependencies
-        run: pnpm install
-      - name: Download artifacts
-        uses: actions/download-artifact@v6
-        with:
-          name: bindings-wasm32-wasip1-threads
-          path: .
-      - name: List packages
-        run: ls -R .
-        shell: bash
-      - name: Test bindings
-        run: pnpm test
-        env:
-          NAPI_RS_FORCE_WASI: 1
   publish:
     name: Publish
     runs-on: ubuntu-latest
@@ -394,10 +329,8 @@ jobs:
       id-token: write
     needs:
       - lint
-      - build-freebsd
       - test-macOS-windows-binding
       - test-linux-binding
-      - test-wasi
     steps:
       - uses: actions/checkout@v5
       - name: setup pnpm

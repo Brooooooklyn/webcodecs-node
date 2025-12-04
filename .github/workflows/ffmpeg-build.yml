@@ -69,6 +69,76 @@ jobs:
           path: ffmpeg-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
+  # Build Windows targets using vcpkg (pure MSVC, no MSYS2/MinGW)
+  build-ffmpeg-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            triplet: x64-windows-static
+            arch: x64
+          - target: aarch64-pc-windows-msvc
+            triplet: arm64-windows-static
+            arch: arm64
+
+    name: Build ${{ matrix.target }}
+    runs-on: windows-latest
+
+    env:
+      VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: '74e6536215718009aae747d86d84b78376bf9e09'
+
+      - name: Install FFmpeg with codecs via vcpkg
+        run: |
+          vcpkg install ffmpeg[avcodec,swresample,swscale,gpl,x264,x265,vpx,aom,opus,mp3lame,webp]:${{ matrix.triplet }}
+
+      - name: Prepare output directory
+        run: |
+          $prefix = "ffmpeg-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "$prefix/lib"
+          New-Item -ItemType Directory -Force -Path "$prefix/include"
+
+          # Copy libraries
+          Copy-Item -Path "$env:VCPKG_ROOT/installed/${{ matrix.triplet }}/lib/*.lib" -Destination "$prefix/lib/" -Force
+
+          # Copy headers
+          Copy-Item -Path "$env:VCPKG_ROOT/installed/${{ matrix.triplet }}/include/libav*" -Destination "$prefix/include/" -Recurse -Force
+          Copy-Item -Path "$env:VCPKG_ROOT/installed/${{ matrix.triplet }}/include/libsw*" -Destination "$prefix/include/" -Recurse -Force
+
+          # Copy codec headers if present
+          $codecHeaders = @("x264.h", "x264_config.h", "x265.h", "x265_config.h", "vpx", "aom", "opus", "lame", "webp")
+          foreach ($header in $codecHeaders) {
+            $srcPath = "$env:VCPKG_ROOT/installed/${{ matrix.triplet }}/include/$header"
+            if (Test-Path $srcPath) {
+              Copy-Item -Path $srcPath -Destination "$prefix/include/" -Recurse -Force
+            }
+          }
+
+          # List output
+          Write-Host "=== Libraries ==="
+          Get-ChildItem "$prefix/lib/"
+          Write-Host "=== Headers ==="
+          Get-ChildItem "$prefix/include/" -Recurse
+
+      - name: Create archive
+        run: |
+          Compress-Archive -Path "ffmpeg-${{ matrix.target }}/*" -DestinationPath "ffmpeg-${{ matrix.target }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-${{ matrix.target }}
+          path: ffmpeg-${{ matrix.target }}.zip
+          if-no-files-found: error
+
   # Build armv7 using native GCC cross-toolchain (zig has issues with nasm/assembly)
   build-ffmpeg-armv7:
     name: Build armv7-unknown-linux-gnueabihf
@@ -138,6 +208,7 @@ jobs:
     needs:
       - build-ffmpeg
       - build-ffmpeg-armv7
+      - build-ffmpeg-windows
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -152,6 +223,7 @@ jobs:
         run: |
           mkdir -p release
           find artifacts -name '*.tar.gz' -exec mv {} release/ \;
+          find artifacts -name '*.zip' -exec mv {} release/ \;
           ls -la release/
 
       - name: Create GitHub Release
@@ -169,11 +241,19 @@ jobs:
             - Image: libwebp
 
             ## Targets
+
+            ### Linux
             - x86_64-unknown-linux-gnu
             - aarch64-unknown-linux-gnu
             - armv7-unknown-linux-gnueabihf
             - x86_64-unknown-linux-musl
             - aarch64-unknown-linux-musl
-          files: release/*.tar.gz
+
+            ### Windows (MSVC)
+            - x86_64-pc-windows-msvc
+            - aarch64-pc-windows-msvc
+          files: |
+            release/*.tar.gz
+            release/*.zip
           draft: false
           prerelease: false

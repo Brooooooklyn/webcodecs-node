@@ -97,6 +97,7 @@ fn get_ffmpeg_dir(target_os: &str, target_arch: &str) -> PathBuf {
     ("linux", "x86_64") => "linux-x64",
     ("linux", "aarch64") => "linux-arm64",
     ("windows", "x86_64") => "win32-x64",
+    ("windows", "aarch64") => "win32-arm64",
     _ => "unknown",
   };
 
@@ -105,7 +106,7 @@ fn get_ffmpeg_dir(target_os: &str, target_arch: &str) -> PathBuf {
     return bundled;
   }
 
-  // 5. Try downloading from GitHub Releases (Linux only)
+  // 5. Try downloading from GitHub Releases (Linux and Windows)
   let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
   if let Some(downloaded) = download_ffmpeg_from_release(target_os, target_arch, &target_env) {
     return downloaded;
@@ -125,13 +126,11 @@ fn get_ffmpeg_dir(target_os: &str, target_arch: &str) -> PathBuf {
         - Or download from: https://github.com/{}/releases\n\
      \n\
      For CI: Ensure the ffmpeg-build.yml workflow has been run to create a release.",
-    target_os,
-    target_arch,
-    repo
+    target_os, target_arch, repo
   );
 }
 
-/// Download FFmpeg from GitHub Releases (Linux only)
+/// Download FFmpeg from GitHub Releases (Linux and Windows)
 fn download_ffmpeg_from_release(
   target_os: &str,
   target_arch: &str,
@@ -142,18 +141,27 @@ fn download_ffmpeg_from_release(
     return None;
   }
 
-  // Only download for Linux targets
-  if target_os != "linux" {
-    return None;
-  }
-
-  // Map to Rust target triple
-  let target = match (target_arch, target_env) {
-    ("x86_64", "gnu") => "x86_64-unknown-linux-gnu",
-    ("x86_64", "musl") => "x86_64-unknown-linux-musl",
-    ("aarch64", "gnu") => "aarch64-unknown-linux-gnu",
-    ("aarch64", "musl") => "aarch64-unknown-linux-musl",
-    ("arm", "gnueabihf") => "armv7-unknown-linux-gnueabihf",
+  // Map to Rust target triple and determine archive format
+  let (target, is_windows) = match target_os {
+    "linux" => {
+      let t = match (target_arch, target_env) {
+        ("x86_64", "gnu") => "x86_64-unknown-linux-gnu",
+        ("x86_64", "musl") => "x86_64-unknown-linux-musl",
+        ("aarch64", "gnu") => "aarch64-unknown-linux-gnu",
+        ("aarch64", "musl") => "aarch64-unknown-linux-musl",
+        ("arm", "gnueabihf") => "armv7-unknown-linux-gnueabihf",
+        _ => return None,
+      };
+      (t, false)
+    }
+    "windows" => {
+      let t = match target_arch {
+        "x86_64" => "x86_64-pc-windows-msvc",
+        "aarch64" => "aarch64-pc-windows-msvc",
+        _ => return None,
+      };
+      (t, true)
+    }
     _ => return None,
   };
 
@@ -166,18 +174,30 @@ fn download_ffmpeg_from_release(
     Err(_) => find_latest_ffmpeg_release(&repo)?,
   };
 
+  let (archive_ext, archive_name) = if is_windows {
+    ("zip", format!("ffmpeg-{}.zip", target))
+  } else {
+    ("tar.gz", format!("ffmpeg-{}.tar.gz", target))
+  };
+
   let download_url = format!(
-    "https://github.com/{}/releases/download/{}/ffmpeg-{}.tar.gz",
-    repo, release_tag, target
+    "https://github.com/{}/releases/download/{}/{}",
+    repo, release_tag, archive_name
   );
 
   // Download to OUT_DIR
   let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
   let ffmpeg_dir = out_dir.join("ffmpeg");
-  let tarball_path = out_dir.join(format!("ffmpeg-{}.tar.gz", target));
+  let archive_path = out_dir.join(&archive_name);
 
-  // Skip if already extracted
-  if ffmpeg_dir.join("lib").join("libavcodec.a").exists() {
+  // Skip if already extracted - check for platform-specific library
+  let lib_check = if is_windows {
+    ffmpeg_dir.join("lib").join("avcodec.lib")
+  } else {
+    ffmpeg_dir.join("lib").join("libavcodec.a")
+  };
+
+  if lib_check.exists() {
     println!(
       "cargo:warning=Using cached FFmpeg at {}",
       ffmpeg_dir.display()
@@ -190,7 +210,7 @@ fn download_ffmpeg_from_release(
   // Download using curl (available on all CI runners)
   let status = Command::new("curl")
     .args(["-L", "-f", "-o"])
-    .arg(&tarball_path)
+    .arg(&archive_path)
     .arg(&download_url)
     .status();
 
@@ -211,26 +231,42 @@ fn download_ffmpeg_from_release(
     return None;
   }
 
-  // Extract tarball
-  let status = Command::new("tar")
-    .arg("xzf")
-    .arg(&tarball_path)
-    .arg("-C")
-    .arg(&ffmpeg_dir)
-    .status();
+  // Extract archive based on format
+  let extract_status = if is_windows {
+    // Use PowerShell to extract zip on Windows
+    Command::new("powershell")
+      .args([
+        "-NoProfile",
+        "-Command",
+        &format!(
+          "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
+          archive_path.display(),
+          ffmpeg_dir.display()
+        ),
+      ])
+      .status()
+  } else {
+    // Use tar for Linux
+    Command::new("tar")
+      .arg("xzf")
+      .arg(&archive_path)
+      .arg("-C")
+      .arg(&ffmpeg_dir)
+      .status()
+  };
 
-  match status {
+  match extract_status {
     Ok(s) if s.success() => {
-      // Clean up tarball
-      let _ = fs::remove_file(&tarball_path);
-      println!(
-        "cargo:warning=FFmpeg extracted to {}",
-        ffmpeg_dir.display()
-      );
+      // Clean up archive
+      let _ = fs::remove_file(&archive_path);
+      println!("cargo:warning=FFmpeg extracted to {}", ffmpeg_dir.display());
       Some(ffmpeg_dir)
     }
     _ => {
-      println!("cargo:warning=Failed to extract FFmpeg tarball");
+      println!(
+        "cargo:warning=Failed to extract FFmpeg {} archive",
+        archive_ext
+      );
       None
     }
   }
@@ -314,17 +350,29 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
   let ffmpeg_libs = ["avcodec", "avutil", "swscale", "swresample"];
 
   for lib in &ffmpeg_libs {
-    let static_lib = lib_dir.join(format!("lib{}.a", lib));
-    if static_lib.exists() {
+    // Try different naming conventions (Unix .a and Windows .lib)
+    let possible_names = [
+      format!("lib{}.a", lib), // Unix: libavcodec.a
+      format!("{}.lib", lib),  // Windows MSVC: avcodec.lib
+    ];
+
+    let static_lib = possible_names
+      .iter()
+      .map(|name| lib_dir.join(name))
+      .find(|path| path.exists());
+
+    if let Some(path) = static_lib {
       // Use link-arg to specify full path - this forces static linking
-      println!("cargo:rustc-link-arg={}", static_lib.display());
+      println!("cargo:rustc-link-arg={}", path.display());
     } else {
       panic!(
-        "Static library lib{}.a not found at {}. \
+        "Static library for {} not found at {}. \
          Static linking is required. Please install FFmpeg with static libraries \
-         or set FFMPEG_DIR to point to an FFmpeg installation with static libs.",
+         or set FFMPEG_DIR to point to an FFmpeg installation with static libs. \
+         Looked for: {:?}",
         lib,
-        lib_dir.display()
+        lib_dir.display(),
+        possible_names
       );
     }
   }
@@ -372,7 +420,7 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
       }
     } else if *required {
       panic!(
-        "Required static library lib{}.a not found. \
+        "Required static library for '{}' not found. \
          Static linking is required. Searched paths: {:?}",
         lib, codec_lib_paths
       );
@@ -385,6 +433,10 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
     match target_os {
       "macos" => println!("cargo:rustc-link-lib=c++"),
       "linux" => println!("cargo:rustc-link-lib=static=c++"),
+      "windows" => {
+        // MSVC uses msvcrt automatically, but we need to ensure C++ runtime is linked
+        // For static linking with MSVC, the runtime is usually already included
+      }
       _ => {}
     }
   }
@@ -394,9 +446,15 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
 fn get_codec_library_paths(target_os: &str) -> Vec<PathBuf> {
   let mut paths = Vec::new();
 
-  // Add paths from LIBRARY_PATH environment variable
-  if let Ok(lib_path) = env::var("LIBRARY_PATH") {
-    for path in lib_path.split(':') {
+  // Add paths from LIBRARY_PATH environment variable (Unix) or LIB (Windows)
+  let (lib_path_var, separator) = if target_os == "windows" {
+    ("LIB", ';')
+  } else {
+    ("LIBRARY_PATH", ':')
+  };
+
+  if let Ok(lib_path) = env::var(lib_path_var) {
+    for path in lib_path.split(separator) {
       paths.push(PathBuf::from(path));
     }
   }
@@ -414,6 +472,11 @@ fn get_codec_library_paths(target_os: &str) -> Vec<PathBuf> {
       paths.push(PathBuf::from("/usr/lib/x86_64-linux-gnu"));
       paths.push(PathBuf::from("/usr/lib/aarch64-linux-gnu"));
     }
+    "windows" => {
+      // Common Windows FFmpeg install locations
+      paths.push(PathBuf::from("C:\\ffmpeg\\lib"));
+      paths.push(PathBuf::from("C:\\Program Files\\ffmpeg\\lib"));
+    }
     _ => {}
   }
 
@@ -429,14 +492,22 @@ fn get_codec_library_paths(target_os: &str) -> Vec<PathBuf> {
   paths
 }
 
-/// Find static library path if it exists
+/// Find static library path if it exists (handles both Unix .a and Windows .lib formats)
 fn find_static_lib_path(name: &str, paths: &[PathBuf]) -> Option<PathBuf> {
-  let static_name = format!("lib{}.a", name);
+  // Try different naming conventions
+  let possible_names = [
+    format!("lib{}.a", name),   // Unix: libfoo.a
+    format!("{}.lib", name),    // Windows MSVC: foo.lib
+    format!("{}.a", name),      // Some libs: foo.a
+    format!("lib{}.lib", name), // Rare: libfoo.lib
+  ];
 
   for path in paths {
-    let full_path = path.join(&static_name);
-    if full_path.exists() {
-      return Some(full_path);
+    for static_name in &possible_names {
+      let full_path = path.join(static_name);
+      if full_path.exists() {
+        return Some(full_path);
+      }
     }
   }
   None
@@ -485,9 +556,21 @@ fn link_platform_libraries(target_os: &str) {
     }
 
     "windows" => {
-      // Windows system libraries
+      // Windows system libraries required by FFmpeg
+      // Based on rust-ffmpeg-sys requirements
       let libs = [
-        "bcrypt", "ole32", "oleaut32", "user32", "ws2_32", "secur32", "advapi32",
+        "bcrypt",   // Cryptography
+        "ole32",    // COM/OLE
+        "oleaut32", // OLE Automation
+        "user32",   // Windows API
+        "gdi32",    // Graphics Device Interface
+        "vfw32",    // Video for Windows
+        "strmiids", // DirectShow GUIDs
+        "shlwapi",  // Shell Lightweight API
+        "shell32",  // Shell API
+        "ws2_32",   // Windows Sockets
+        "secur32",  // Security API
+        "advapi32", // Advanced Windows API
       ];
 
       for lib in &libs {
