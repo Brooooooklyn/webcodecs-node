@@ -1190,6 +1190,27 @@ Cflags: -I${{includedir}}
     self.run_cmake_build(&build_dir)?;
     self.run_cmake_install(&build_dir)?;
 
+    // Generate ogg.pc (CMake may not generate it or may generate it incorrectly)
+    let pkgconfig_dir = self.prefix.join("lib").join("pkgconfig");
+    fs::create_dir_all(&pkgconfig_dir)?;
+    let ogg_pc = format!(
+      r#"prefix={}
+exec_prefix=${{prefix}}
+libdir=${{exec_prefix}}/lib
+includedir=${{prefix}}/include
+
+Name: ogg
+Description: ogg is a library for manipulating ogg bitstreams
+Version: {}
+Libs: -L${{libdir}} -logg
+Cflags: -I${{includedir}}
+"#,
+      prefix_str,
+      OGG_BRANCH.trim_start_matches('v')
+    );
+    fs::write(pkgconfig_dir.join("ogg.pc"), ogg_pc)?;
+    self.log("Generated ogg.pc");
+
     self.info("libogg built successfully");
     Ok(())
   }
@@ -1222,6 +1243,69 @@ Cflags: -I${{includedir}}
     self.run_cmake(&source, &build_dir, &args_refs)?;
     self.run_cmake_build(&build_dir)?;
     self.run_cmake_install(&build_dir)?;
+
+    // Generate proper .pc files with -lm dependency (vorbis uses math functions)
+    // CMake-generated .pc files often miss -lm for static linking
+    let pkgconfig_dir = self.prefix.join("lib").join("pkgconfig");
+    fs::create_dir_all(&pkgconfig_dir)?;
+
+    let vorbis_pc = format!(
+      r#"prefix={}
+exec_prefix=${{prefix}}
+libdir=${{exec_prefix}}/lib
+includedir=${{prefix}}/include
+
+Name: vorbis
+Description: vorbis is the primary Ogg Vorbis library
+Version: {}
+Requires: ogg
+Libs: -L${{libdir}} -lvorbis
+Libs.private: -lm
+Cflags: -I${{includedir}}
+"#,
+      prefix_str,
+      VORBIS_BRANCH.trim_start_matches('v')
+    );
+    fs::write(pkgconfig_dir.join("vorbis.pc"), vorbis_pc)?;
+
+    let vorbisenc_pc = format!(
+      r#"prefix={}
+exec_prefix=${{prefix}}
+libdir=${{exec_prefix}}/lib
+includedir=${{prefix}}/include
+
+Name: vorbisenc
+Description: vorbisenc is a library for encoding Vorbis audio
+Version: {}
+Requires: vorbis
+Libs: -L${{libdir}} -lvorbisenc
+Libs.private: -lm
+Cflags: -I${{includedir}}
+"#,
+      prefix_str,
+      VORBIS_BRANCH.trim_start_matches('v')
+    );
+    fs::write(pkgconfig_dir.join("vorbisenc.pc"), vorbisenc_pc)?;
+
+    let vorbisfile_pc = format!(
+      r#"prefix={}
+exec_prefix=${{prefix}}
+libdir=${{exec_prefix}}/lib
+includedir=${{prefix}}/include
+
+Name: vorbisfile
+Description: vorbisfile is a library for decoding Vorbis audio
+Version: {}
+Requires: vorbis
+Libs: -L${{libdir}} -lvorbisfile
+Libs.private: -lm
+Cflags: -I${{includedir}}
+"#,
+      prefix_str,
+      VORBIS_BRANCH.trim_start_matches('v')
+    );
+    fs::write(pkgconfig_dir.join("vorbisfile.pc"), vorbisfile_pc)?;
+    self.log("Generated vorbis .pc files with -lm dependency");
 
     self.info("libvorbis built successfully");
     Ok(())
