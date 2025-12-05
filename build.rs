@@ -434,7 +434,7 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
   if linked_x265 {
     match target_os {
       "macos" => println!("cargo:rustc-link-lib=c++"),
-      "linux" => println!("cargo:rustc-link-lib=static=c++"),
+      "linux" => println!("cargo:rustc-link-lib=stdc++"),
       "windows" => {
         // MSVC uses msvcrt automatically, but we need to ensure C++ runtime is linked
         // For static linking with MSVC, the runtime is usually already included
@@ -498,10 +498,11 @@ fn get_codec_library_paths(target_os: &str) -> Vec<PathBuf> {
 fn find_static_lib_path(name: &str, paths: &[PathBuf]) -> Option<PathBuf> {
   // Try different naming conventions
   let possible_names = [
-    format!("lib{}.a", name),   // Unix: libfoo.a
-    format!("{}.lib", name),    // Windows MSVC: foo.lib
-    format!("{}.a", name),      // Some libs: foo.a
-    format!("lib{}.lib", name), // Rare: libfoo.lib
+    format!("lib{}.a", name),       // Unix: libfoo.a
+    format!("{}.lib", name),        // Windows MSVC: foo.lib
+    format!("{}.a", name),          // Some libs: foo.a
+    format!("lib{}.lib", name),     // Rare: libfoo.lib
+    format!("{}-static.lib", name), // vcpkg static: foo-static.lib
   ];
 
   for path in paths {
@@ -543,7 +544,7 @@ fn link_platform_libraries(target_os: &str) {
 
     "linux" => {
       // Basic system libraries
-      println!("cargo:rustc-link-lib=z");
+      // Note: zlib is provided by libz-sys crate dependency
       println!("cargo:rustc-link-lib=m");
       println!("cargo:rustc-link-lib=pthread");
       println!("cargo:rustc-link-lib=dl");

@@ -139,6 +139,9 @@ jobs:
         run: ${{ matrix.settings.setup }}
         if: ${{ matrix.settings.setup }}
         shell: bash
+      - name: Install FFmpeg (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        run: brew install ffmpeg
       - name: Download FFmpeg from release
         if: ${{ matrix.settings.download_ffmpeg }}
         env:

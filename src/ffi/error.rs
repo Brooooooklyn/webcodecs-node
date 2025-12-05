@@ -120,7 +120,7 @@ pub struct FFmpegError {
 impl FFmpegError {
   /// Create error from FFmpeg error code
   pub fn from_code(code: c_int) -> Self {
-    let mut buf = [0i8; 256];
+    let mut buf = [0 as std::os::raw::c_char; 256];
     unsafe {
       super::avutil::av_strerror(code, buf.as_mut_ptr(), buf.len());
       let message = CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned();
@@ -241,7 +241,7 @@ pub fn check_error_except_eagain_eof(ret: c_int) -> FFmpegResult<Option<c_int>> 
 
 /// Get error message for an FFmpeg error code
 pub fn get_error_message(code: c_int) -> String {
-  let mut buf = [0i8; 256];
+  let mut buf = [0 as std::os::raw::c_char; 256];
   unsafe {
     super::avutil::av_strerror(code, buf.as_mut_ptr(), buf.len());
     CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()

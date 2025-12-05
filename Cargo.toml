@@ -33,6 +33,9 @@ thiserror = "2"
 # Concurrent data structures
 crossbeam = "0.8"
 
+# Zlib for FFmpeg static linking (builds zlib from source if needed)
+libz-sys = { version = "1.1.23", default-features = false, features = ["static"] }
+
 [build-dependencies]
 napi-build = "2"
 cc = "1.0"
