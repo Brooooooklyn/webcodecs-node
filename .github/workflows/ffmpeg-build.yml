@@ -98,7 +98,7 @@ jobs:
 
       - name: Install FFmpeg with codecs via vcpkg
         run: |
-          vcpkg install ffmpeg[avcodec,swresample,swscale,gpl,x264,x265,vpx,aom,opus,mp3lame,webp]:${{ matrix.triplet }}
+          vcpkg install ffmpeg[avcodec,swresample,swscale,gpl,x264,x265,vpx,aom,opus,mp3lame,vorbis,webp]:${{ matrix.triplet }}
 
       - name: Prepare output directory
         run: |
@@ -114,7 +114,7 @@ jobs:
           Copy-Item -Path "$env:VCPKG_ROOT/installed/${{ matrix.triplet }}/include/libsw*" -Destination "$prefix/include/" -Recurse -Force
 
           # Copy codec headers if present
-          $codecHeaders = @("x264.h", "x264_config.h", "x265.h", "x265_config.h", "vpx", "aom", "opus", "lame", "webp")
+          $codecHeaders = @("x264.h", "x264_config.h", "x265.h", "x265_config.h", "vpx", "aom", "opus", "lame", "vorbis", "ogg", "webp")
           foreach ($header in $codecHeaders) {
             $srcPath = "$env:VCPKG_ROOT/installed/${{ matrix.triplet }}/include/$header"
             if (Test-Path $srcPath) {
@@ -244,7 +244,7 @@ jobs:
             ## Included Libraries
             - FFmpeg: avcodec, avutil, swscale, swresample
             - Video: x264, x265, libvpx, libaom
-            - Audio: opus, mp3lame
+            - Audio: opus, mp3lame, vorbis
             - Image: libwebp
 
             ## Targets

@@ -114,7 +114,7 @@ fn get_ffmpeg_dir(target_os: &str, target_arch: &str) -> PathBuf {
 
   // 6. FAIL - no fallback to building from source
   let repo =
-    env::var("FFMPEG_GITHUB_REPO").unwrap_or_else(|_| "anthropics/webcodec-node".to_string());
+    env::var("FFMPEG_GITHUB_REPO").unwrap_or_else(|_| "Brooooooklyn/webcodec-node".to_string());
   panic!(
     "FFmpeg not found for target {}-{}.\n\
      \n\
@@ -166,7 +166,7 @@ fn download_ffmpeg_from_release(
   };
 
   let repo =
-    env::var("FFMPEG_GITHUB_REPO").unwrap_or_else(|_| "anthropics/webcodec-node".to_string());
+    env::var("FFMPEG_GITHUB_REPO").unwrap_or_else(|_| "Brooooooklyn/webcodec-node".to_string());
 
   // Determine release tag
   let release_tag = match env::var("FFMPEG_RELEASE_TAG") {
@@ -343,8 +343,10 @@ fn link_ffmpeg(ffmpeg_dir: &Path, target_os: &str) {
 
 /// Link FFmpeg statically using full paths to .a files
 fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
-  // Get codec library paths
-  let codec_lib_paths = get_codec_library_paths(target_os);
+  // Get codec library paths, with lib_dir as highest priority
+  let mut codec_lib_paths = get_codec_library_paths(target_os);
+  // Insert lib_dir at the front so downloaded/bundled FFmpeg libs are found first
+  codec_lib_paths.insert(0, lib_dir.to_path_buf());
 
   // FFmpeg core libraries - link using full paths
   let ffmpeg_libs = ["avcodec", "avutil", "swscale", "swresample"];

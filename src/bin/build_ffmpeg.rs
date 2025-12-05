@@ -21,6 +21,10 @@ const AOM_BRANCH: &str = "v3.13.1";
 const OPUS_REPO: &str = "https://github.com/xiph/opus.git";
 const OPUS_BRANCH: &str = "v1.5.2";
 const LAME_URL: &str = "https://sourceforge.net/projects/lame/files/lame/3.100/lame-3.100.tar.gz";
+const OGG_REPO: &str = "https://github.com/xiph/ogg.git";
+const OGG_BRANCH: &str = "v1.3.5";
+const VORBIS_REPO: &str = "https://github.com/xiph/vorbis.git";
+const VORBIS_BRANCH: &str = "v1.3.7";
 const WEBP_REPO: &str = "https://chromium.googlesource.com/webm/libwebp";
 const WEBP_BRANCH: &str = "v1.6.0";
 const NV_CODEC_HEADERS_REPO: &str = "https://github.com/FFmpeg/nv-codec-headers.git";
@@ -1158,6 +1162,71 @@ Cflags: -I${{includedir}}
     Ok(())
   }
 
+  /// Build libogg (required by vorbis)
+  fn build_ogg(&self) -> io::Result<()> {
+    self.info("Building libogg...");
+
+    let source = self.source_dir.join("ogg");
+    self.git_clone(OGG_REPO, Some(OGG_BRANCH), &source)?;
+
+    let build_dir = source.join("build");
+    fs::create_dir_all(&build_dir)?;
+
+    let prefix_str = self.prefix.to_string_lossy().to_string();
+
+    let mut args = vec![
+      format!("-DCMAKE_INSTALL_PREFIX={}", prefix_str),
+      "-DBUILD_SHARED_LIBS=OFF".to_string(),
+      "-DINSTALL_DOCS=OFF".to_string(),
+      "-DBUILD_TESTING=OFF".to_string(),
+      "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".to_string(),
+    ];
+
+    // Add cross-compilation hints for CMake
+    args.extend(self.cmake_cross_args());
+
+    let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    self.run_cmake(&source, &build_dir, &args_refs)?;
+    self.run_cmake_build(&build_dir)?;
+    self.run_cmake_install(&build_dir)?;
+
+    self.info("libogg built successfully");
+    Ok(())
+  }
+
+  /// Build libvorbis (depends on libogg)
+  fn build_vorbis(&self) -> io::Result<()> {
+    self.info("Building libvorbis...");
+
+    let source = self.source_dir.join("vorbis");
+    self.git_clone(VORBIS_REPO, Some(VORBIS_BRANCH), &source)?;
+
+    let build_dir = source.join("build");
+    fs::create_dir_all(&build_dir)?;
+
+    let prefix_str = self.prefix.to_string_lossy().to_string();
+
+    let mut args = vec![
+      format!("-DCMAKE_INSTALL_PREFIX={}", prefix_str),
+      "-DBUILD_SHARED_LIBS=OFF".to_string(),
+      "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".to_string(),
+      // Tell vorbis where to find ogg
+      format!("-DOGG_INCLUDE_DIR={}/include", prefix_str),
+      format!("-DOGG_LIBRARY={}/lib/libogg.a", prefix_str),
+    ];
+
+    // Add cross-compilation hints for CMake
+    args.extend(self.cmake_cross_args());
+
+    let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    self.run_cmake(&source, &build_dir, &args_refs)?;
+    self.run_cmake_build(&build_dir)?;
+    self.run_cmake_install(&build_dir)?;
+
+    self.info("libvorbis built successfully");
+    Ok(())
+  }
+
   /// Build libwebp
   fn build_webp(&self) -> io::Result<()> {
     self.info("Building libwebp...");
@@ -1300,6 +1369,7 @@ Cflags: -I${{includedir}}
       // Audio codecs
       "--enable-libopus".to_string(),
       "--enable-libmp3lame".to_string(),
+      "--enable-libvorbis".to_string(),
       // Image codecs
       "--enable-libwebp".to_string(),
       // Include/lib paths
@@ -1485,6 +1555,8 @@ Cflags: -I${{includedir}}
       self.build_aom()?;
       self.build_opus()?;
       self.build_lame()?;
+      self.build_ogg()?; // Must be before vorbis
+      self.build_vorbis()?;
       self.build_webp()?;
     }
 
