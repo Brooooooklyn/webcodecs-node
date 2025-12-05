@@ -55,7 +55,7 @@ jobs:
 
       - name: Build FFmpeg
         run: |
-          SKIP_FFMPEG_BUILD=1 cargo build --release --bin build-ffmpeg
+          cargo build --release -p build-ffmpeg
           ./target/release/build-ffmpeg \
             --target ${{ matrix.target }} \
             --output ./ffmpeg-${{ matrix.target }} \
@@ -207,7 +207,7 @@ jobs:
           # Enable NEON for armv7 hard-float
           export CFLAGS="-march=armv7-a -mfpu=neon -mfloat-abi=hard"
           export CXXFLAGS="-march=armv7-a -mfpu=neon -mfloat-abi=hard"
-          SKIP_FFMPEG_BUILD=1 cargo build --release --bin build-ffmpeg
+          cargo build --release -p build-ffmpeg
           ./target/release/build-ffmpeg \
             --target armv7-unknown-linux-gnueabihf \
             --output ./ffmpeg-armv7-unknown-linux-gnueabihf \

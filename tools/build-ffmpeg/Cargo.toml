@@ -1,0 +1,15 @@
+[package]
+name = "build-ffmpeg"
+version = "0.1.0"
+edition = "2021"
+authors = ["LongYinan <lynweklm@gmail.com>"]
+description = "FFmpeg build tool for webcodec-node"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "build-ffmpeg"
+path = "src/main.rs"
+
+[dependencies]
+num_cpus = "1.17"

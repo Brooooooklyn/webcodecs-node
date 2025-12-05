@@ -1,3 +1,6 @@
+[workspace]
+members = ["tools/build-ffmpeg"]
+
 [package]
 name = "webcodec-node"
 version = "0.1.0"
@@ -10,19 +13,12 @@ repository = "https://github.com/user/webcodec-node"
 [lib]
 crate-type = ["cdylib"]
 
-[[bin]]
-name = "build-ffmpeg"
-path = "src/bin/build_ffmpeg.rs"
-
 [dependencies]
 # NAPI-RS bindings
 napi = { version = "3.0.0", features = ["async", "napi8", "web_stream"] }
 napi-derive = "3.0.0"
 
 futures = "0.3"
-
-# For build-ffmpeg binary
-num_cpus = "1.17"
 
 # Async runtime
 tokio = { version = "1", features = ["sync", "rt-multi-thread"] }
