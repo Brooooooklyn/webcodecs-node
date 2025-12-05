@@ -27,6 +27,10 @@ jobs:
           - aarch64-unknown-linux-musl
 
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      attestations: write
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
@@ -62,6 +66,11 @@ jobs:
           tar -czvf ffmpeg-${{ matrix.target }}.tar.gz \
             -C ./ffmpeg-${{ matrix.target }} .
 
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ffmpeg-${{ matrix.target }}.tar.gz
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -84,6 +93,10 @@ jobs:
 
     name: Build ${{ matrix.target }}
     runs-on: windows-latest
+    permissions:
+      id-token: write
+      attestations: write
+      contents: read
 
     env:
       VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
@@ -132,6 +145,11 @@ jobs:
         run: |
           Compress-Archive -Path "ffmpeg-${{ matrix.target }}/*" -DestinationPath "ffmpeg-${{ matrix.target }}.zip"
 
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ffmpeg-${{ matrix.target }}.zip
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -143,6 +161,10 @@ jobs:
   build-ffmpeg-armv7:
     name: Build armv7-unknown-linux-gnueabihf
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      attestations: write
+      contents: read
     container:
       image: debian:bullseye
 
@@ -197,6 +219,11 @@ jobs:
           tar -czvf ffmpeg-armv7-unknown-linux-gnueabihf.tar.gz \
             -C ./ffmpeg-armv7-unknown-linux-gnueabihf .
 
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ffmpeg-armv7-unknown-linux-gnueabihf.tar.gz
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -212,8 +239,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      id-token: write
-      attestations: write
 
     steps:
       - name: Download all artifacts
@@ -227,11 +252,6 @@ jobs:
           find artifacts -name '*.tar.gz' -exec mv {} release/ \;
           find artifacts -name '*.zip' -exec mv {} release/ \;
           ls -la release/
-
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: 'release/*'
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
