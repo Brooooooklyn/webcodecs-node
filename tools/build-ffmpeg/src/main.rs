@@ -904,12 +904,25 @@ Cflags: -I${{includedir}}{}
     let prefix_str = self.prefix.to_string_lossy().to_string();
     let cmake_source = source.join("source");
 
+    // Check if this is armv7 target (assembly doesn't work reliably with cross-compilation)
+    let is_armv7 = self
+      .target
+      .as_ref()
+      .map(|t| t.starts_with("armv7") || t.starts_with("arm-"))
+      .unwrap_or(false);
+
     let mut args = vec![
       format!("-DCMAKE_INSTALL_PREFIX={}", prefix_str),
       "-DENABLE_SHARED=OFF".to_string(),
       "-DENABLE_CLI=OFF".to_string(),
       "-DHIGH_BIT_DEPTH=ON".to_string(),
-      "-DENABLE_ASSEMBLY=ON".to_string(), // Ensure SIMD optimizations are enabled
+      // Disable assembly for armv7 - cross-compiled ARM assembly doesn't link properly
+      // x265's setupAssemblyPrimitives() is missing when cross-compiling for armv7
+      if is_armv7 {
+        "-DENABLE_ASSEMBLY=OFF".to_string()
+      } else {
+        "-DENABLE_ASSEMBLY=ON".to_string()
+      },
       "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".to_string(),
     ];
 
