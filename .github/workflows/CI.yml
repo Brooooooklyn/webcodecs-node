@@ -58,7 +58,7 @@ jobs:
       matrix:
         settings:
           # macOS - use homebrew FFmpeg
-          - host: macos-latest
+          - host: macos-15-intel
             target: x86_64-apple-darwin
             build: pnpm build --target x86_64-apple-darwin
             build_ffmpeg: false
@@ -139,12 +139,9 @@ jobs:
         run: ${{ matrix.settings.setup }}
         if: ${{ matrix.settings.setup }}
         shell: bash
-      - name: Install FFmpeg (macOS arm64)
-        if: ${{ matrix.settings.target == 'aarch64-apple-darwin' }}
+      - name: Install FFmpeg (macOS)
+        if: ${{ contains(matrix.settings.target, 'apple') }}
         run: brew install ffmpeg
-      - name: Install FFmpeg (macOS x64)
-        if: ${{ matrix.settings.target == 'x86_64-apple-darwin' }}
-        run: arch -x86_64 /usr/local/bin/brew install ffmpeg
       - name: Download FFmpeg from release
         if: ${{ matrix.settings.download_ffmpeg }}
         env:
