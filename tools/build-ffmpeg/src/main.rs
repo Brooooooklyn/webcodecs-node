@@ -30,6 +30,8 @@ const WEBP_BRANCH: &str = "v1.6.0";
 const NV_CODEC_HEADERS_REPO: &str = "https://github.com/FFmpeg/nv-codec-headers.git";
 const NV_CODEC_HEADERS_BRANCH: &str = "n13.0.19.0";
 const FFMPEG_REPO: &str = "https://github.com/FFmpeg/FFmpeg.git";
+const ZLIB_REPO: &str = "https://github.com/madler/zlib.git";
+const ZLIB_VERSION: &str = "v1.3.1";
 
 /// Build context containing all configuration
 struct BuildContext {
@@ -810,6 +812,46 @@ Cflags: -I${{includedir}}{}
     let mut cmd = Command::new("cmake");
     cmd.args(["--install", "."]).current_dir(build_dir);
     self.run_command(&mut cmd)
+  }
+
+  /// Build zlib from source (required for PNG decoder and other compression)
+  fn build_zlib(&self) -> io::Result<()> {
+    self.info("Building zlib...");
+
+    let source = self.source_dir.join("zlib");
+    self.git_clone(ZLIB_REPO, Some(ZLIB_VERSION), &source)?;
+
+    let build_dir = source.join("build");
+    fs::create_dir_all(&build_dir)?;
+
+    let prefix_str = self.prefix.to_string_lossy().to_string();
+
+    let mut args = vec![
+      format!("-DCMAKE_INSTALL_PREFIX={}", prefix_str),
+      "-DBUILD_SHARED_LIBS=OFF".to_string(),
+      "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".to_string(),
+    ];
+
+    // Add cross-compilation hints for CMake
+    args.extend(self.cmake_cross_args());
+
+    let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    self.run_cmake(&source, &build_dir, &args_refs)?;
+    self.run_cmake_build(&build_dir)?;
+    self.run_cmake_install(&build_dir)?;
+
+    // Ensure zlib.pc exists with correct prefix
+    self.ensure_pc_file(
+      "zlib",
+      &build_dir,
+      ZLIB_VERSION.trim_start_matches('v'),
+      "zlib compression library",
+      "",
+      "",
+    )?;
+
+    self.info("zlib built successfully");
+    Ok(())
   }
 
   /// Build x264
@@ -1636,6 +1678,7 @@ Cflags: -I${{includedir}}
 
     if !self.skip_deps {
       // Build dependencies in order
+      self.build_zlib()?; // Required for PNG decoder
       self.build_x264()?;
       self.build_x265()?;
       self.build_vpx()?;
