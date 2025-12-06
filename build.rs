@@ -412,6 +412,9 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str, target_env: &str) {
     ("soxr", false),      // SoX resampler
     ("snappy", false),    // Snappy compression
     ("zimg", false),      // Z image processing library
+    // Compression library (built by build-ffmpeg for Linux, vcpkg for Windows)
+    ("zlib", false),      // zlib compression (required for PNG decoder)
+    ("z", false),         // zlib on some systems uses 'libz.a' naming
   ];
 
   let mut linked_x265 = false;
@@ -569,7 +572,7 @@ fn link_platform_libraries(target_os: &str) {
 
     "linux" => {
       // Basic system libraries
-      // Note: zlib is provided by libz-sys crate dependency
+      // Note: zlib is linked via codec_libs (built by build-ffmpeg)
       println!("cargo:rustc-link-lib=m");
       println!("cargo:rustc-link-lib=pthread");
       println!("cargo:rustc-link-lib=dl");
@@ -601,7 +604,6 @@ fn link_platform_libraries(target_os: &str) {
         "advapi32", // Advanced Windows API
         "mfplat",   // Media Foundation Platform
         "mfuuid",   // Media Foundation GUIDs
-        "zlib",     // Compression (required for PNG and other codecs)
       ];
 
       for lib in &libs {
