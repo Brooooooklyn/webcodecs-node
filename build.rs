@@ -578,6 +578,7 @@ fn link_platform_libraries(target_os: &str) {
         "advapi32", // Advanced Windows API
         "mfplat",   // Media Foundation Platform
         "mfuuid",   // Media Foundation GUIDs
+        "zlib",     // Compression (required for PNG and other codecs)
       ];
 
       for lib in &libs {
