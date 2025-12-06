@@ -12,7 +12,7 @@ pub mod resampler;
 pub mod scaler;
 
 pub use audio_buffer::AudioSampleBuffer;
-pub use context::{CodecContext, CodecType};
+pub use context::{CodecContext, CodecType, DecoderCreationResult, EncoderCreationResult};
 pub use frame::Frame;
 pub use hwdevice::HwDeviceContext;
 pub use packet::Packet;

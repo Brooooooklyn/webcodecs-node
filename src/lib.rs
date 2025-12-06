@@ -32,6 +32,7 @@ pub use webcodecs::{
   get_hardware_accelerators,
   get_preferred_hardware_accelerator,
   is_hardware_accelerator_available,
+  reset_hardware_fallback_state,
   // Audio types
   AudioData,
   AudioDataCopyToOptions,

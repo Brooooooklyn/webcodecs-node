@@ -7,7 +7,7 @@
 
 import test from 'ava'
 
-import { VideoEncoder, VideoDecoder, VideoFrame } from '../../index.js'
+import { resetHardwareFallbackState, VideoEncoder, VideoDecoder, VideoFrame } from '../../index.js'
 import {
   generateSolidColorI420Frame,
   generateGradientI420Frame,
@@ -23,6 +23,11 @@ import {
   CodecRegistry,
   type CodecType,
 } from '../helpers/codec-matrix.js'
+
+// Reset hardware fallback state before each test to ensure test isolation
+test.beforeEach(() => {
+  resetHardwareFallbackState()
+})
 
 // Helper to create test encoder with callbacks
 function createTestEncoder() {

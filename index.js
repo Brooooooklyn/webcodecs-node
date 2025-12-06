@@ -605,6 +605,7 @@ module.exports.LatencyMode = nativeBinding.LatencyMode
 module.exports.OpusApplication = nativeBinding.OpusApplication
 module.exports.OpusBitstreamFormat = nativeBinding.OpusBitstreamFormat
 module.exports.OpusSignal = nativeBinding.OpusSignal
+module.exports.resetHardwareFallbackState = nativeBinding.resetHardwareFallbackState
 module.exports.VideoColorPrimaries = nativeBinding.VideoColorPrimaries
 module.exports.VideoEncoderBitrateMode = nativeBinding.VideoEncoderBitrateMode
 module.exports.VideoMatrixCoefficients = nativeBinding.VideoMatrixCoefficients

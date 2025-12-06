@@ -11,6 +11,7 @@ mod encoded_audio_chunk;
 mod encoded_video_chunk;
 pub mod error;
 mod hardware;
+pub(crate) mod hw_fallback;
 mod image_decoder;
 mod video_decoder;
 mod video_encoder;
@@ -37,6 +38,7 @@ pub use hardware::{
   get_available_hardware_accelerators, get_hardware_accelerators,
   get_preferred_hardware_accelerator, is_hardware_accelerator_available, HardwareAccelerator,
 };
+pub use hw_fallback::reset_hardware_fallback_state;
 pub use image_decoder::{
   ImageDecodeOptions, ImageDecodeResult, ImageDecoder, ImageDecoderInit, ImageTrack, ImageTrackList,
 };

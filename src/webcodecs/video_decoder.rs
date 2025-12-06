@@ -74,6 +74,9 @@ pub struct VideoDecoderSupport {
   pub config: VideoDecoderConfig,
 }
 
+/// Threshold for detecting silent decoder failure (no output after N chunks)
+const SILENT_FAILURE_THRESHOLD: u32 = 3;
+
 /// Internal decoder state
 struct VideoDecoderInner {
   state: CodecState,
@@ -89,6 +92,40 @@ struct VideoDecoderInner {
   error_callback: ErrorCallback,
   /// Optional dequeue event callback (ThreadsafeFunction for multi-thread support)
   dequeue_callback: Option<ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, true>>,
+
+  // ========================================================================
+  // Hardware acceleration tracking (for Chromium-aligned fallback behavior)
+  // ========================================================================
+  /// Whether the decoder is using hardware acceleration
+  is_hardware: bool,
+  /// Hardware acceleration preference from config
+  hw_preference: HardwareAcceleration,
+  /// Count of consecutive decodes with no output (for silent failure detection)
+  silent_decode_count: u32,
+  /// Whether first output has been produced (disables silent failure detection after)
+  first_output_produced: bool,
+  /// Buffered chunks during silent failure detection period (for re-decoding on fallback)
+  pending_chunks: Vec<Arc<RwLock<Option<EncodedVideoChunkInner>>>>,
+}
+
+/// Get the preferred hardware device type for the current platform
+fn get_platform_hw_type() -> AVHWDeviceType {
+  #[cfg(target_os = "macos")]
+  {
+    AVHWDeviceType::Videotoolbox
+  }
+  #[cfg(target_os = "linux")]
+  {
+    AVHWDeviceType::Vaapi
+  }
+  #[cfg(target_os = "windows")]
+  {
+    AVHWDeviceType::D3d11va
+  }
+  #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+  {
+    AVHWDeviceType::Cuda
+  }
 }
 
 /// VideoDecoder - WebCodecs-compliant video decoder
@@ -154,6 +191,12 @@ impl VideoDecoder {
       output_callback: init.output,
       error_callback: init.error,
       dequeue_callback: None,
+      // Hardware acceleration tracking (Chromium-aligned)
+      is_hardware: false,
+      hw_preference: HardwareAcceleration::NoPreference,
+      silent_decode_count: 0,
+      first_output_produced: false,
+      pending_chunks: Vec::new(),
     };
 
     let inner = Arc::new(Mutex::new(inner));
@@ -191,6 +234,10 @@ impl VideoDecoder {
   }
 
   /// Process a decode command
+  ///
+  /// Implements Chromium-aligned silent failure detection:
+  /// - If hardware decoder produces no output after SILENT_FAILURE_THRESHOLD chunks,
+  ///   either report error (prefer-hardware) or fall back to software (no-preference)
   fn process_decode(
     inner: &Arc<Mutex<VideoDecoderInner>>,
     chunk: Arc<RwLock<Option<EncodedVideoChunkInner>>>,
@@ -233,6 +280,11 @@ impl VideoDecoder {
     // Drop the chunk read guard before decoding
     drop(chunk_read_guard);
 
+    // Buffer chunk during silent failure detection period (for re-decoding on fallback)
+    if guard.is_hardware && !guard.first_output_produced {
+      guard.pending_chunks.push(chunk.clone());
+    }
+
     // Get context
     let context = match guard.context.as_mut() {
       Some(ctx) => ctx,
@@ -248,6 +300,35 @@ impl VideoDecoder {
     let frames = match decode_chunk_data(context, &data, timestamp, duration) {
       Ok(f) => f,
       Err(e) => {
+        // Handle decode error - may trigger fallback for hardware decoder
+        if guard.is_hardware && !guard.first_output_produced {
+          match &guard.hw_preference {
+            HardwareAcceleration::PreferHardware => {
+              // prefer-hardware: Report error, don't fall back
+              guard.decode_queue_size = guard.decode_queue_size.saturating_sub(1);
+              let _ = Self::fire_dequeue_event(&guard);
+              Self::report_error(
+                &mut guard,
+                &format!("OperationError: Hardware decoding failed: {}", e),
+              );
+              return;
+            }
+            HardwareAcceleration::NoPreference => {
+              // no-preference: Try to fall back to software
+              let pending = std::mem::take(&mut guard.pending_chunks);
+              if Self::fallback_to_software(&mut guard).is_ok() {
+                // Re-decode buffered chunks with software decoder
+                guard.decode_queue_size = guard.decode_queue_size.saturating_sub(1);
+                let _ = Self::fire_dequeue_event(&guard);
+                drop(guard);
+                Self::redecode_pending_chunks(inner, pending);
+                return;
+              }
+              // Fallback failed, report original error
+            }
+            _ => {}
+          }
+        }
         guard.decode_queue_size = guard.decode_queue_size.saturating_sub(1);
         let _ = Self::fire_dequeue_event(&guard);
         Self::report_error(&mut guard, &format!("Decode failed: {}", e));
@@ -261,12 +342,157 @@ impl VideoDecoder {
     guard.decode_queue_size = guard.decode_queue_size.saturating_sub(1);
     let _ = Self::fire_dequeue_event(&guard);
 
+    // Check for silent failure (hardware decoder, no frames produced)
+    if frames.is_empty() {
+      if guard.is_hardware && !guard.first_output_produced {
+        guard.silent_decode_count += 1;
+
+        if guard.silent_decode_count >= SILENT_FAILURE_THRESHOLD {
+          // Silent failure detected - hardware decoder not producing output
+          match &guard.hw_preference {
+            HardwareAcceleration::PreferHardware => {
+              // prefer-hardware: Report error, don't fall back
+              Self::report_error(
+                &mut guard,
+                "OperationError: Hardware decoder not producing output (silent failure)",
+              );
+              return;
+            }
+            HardwareAcceleration::NoPreference => {
+              // no-preference: Silently fall back to software and re-decode buffered chunks
+              let pending = std::mem::take(&mut guard.pending_chunks);
+              if Self::fallback_to_software(&mut guard).is_ok() {
+                // Re-decode all buffered chunks with software decoder
+                drop(guard);
+                Self::redecode_pending_chunks(inner, pending);
+                return;
+              }
+              // Fallback failed - continue with hardware (may never produce output)
+            }
+            _ => {}
+          }
+        }
+      }
+      // No frames this decode - normal for B-frames, etc.
+      return;
+    }
+
+    // Successfully produced output
+    if guard.is_hardware && !guard.first_output_produced {
+      guard.first_output_produced = true;
+      guard.silent_decode_count = 0;
+      guard.pending_chunks.clear(); // No longer need the buffer
+    }
+
     // Convert internal frames to VideoFrames and call output callback
     for frame in frames {
       let video_frame = VideoFrame::from_internal(frame, timestamp, duration);
       guard
         .output_callback
         .call(video_frame, ThreadsafeFunctionCallMode::NonBlocking);
+    }
+  }
+
+  /// Fall back to software decoder (for no-preference mode)
+  fn fallback_to_software(inner: &mut VideoDecoderInner) -> Result<()> {
+    // Get the codec ID from existing config
+    let decoder_config = inner
+      .config
+      .as_ref()
+      .ok_or_else(|| Error::new(Status::GenericFailure, "No decoder config"))?
+      .clone();
+
+    // Drain existing decoder before dropping (AV1 safety)
+    if let Some(ctx) = inner.context.as_mut() {
+      let _ = ctx.send_packet(None);
+      while ctx.receive_frame().ok().flatten().is_some() {}
+    }
+
+    // Create software decoder
+    let mut context = CodecContext::new_decoder(decoder_config.codec_id).map_err(|e| {
+      Error::new(
+        Status::GenericFailure,
+        format!("Failed to create software decoder: {}", e),
+      )
+    })?;
+
+    // Configure decoder with same settings
+    context.configure_decoder(&decoder_config).map_err(|e| {
+      Error::new(
+        Status::GenericFailure,
+        format!("Failed to configure software decoder: {}", e),
+      )
+    })?;
+
+    // Open the decoder
+    context.open().map_err(|e| {
+      Error::new(
+        Status::GenericFailure,
+        format!("Failed to open software decoder: {}", e),
+      )
+    })?;
+
+    // Replace context and update state
+    inner.context = Some(context);
+    inner.is_hardware = false;
+    inner.silent_decode_count = 0;
+    inner.first_output_produced = false;
+
+    Ok(())
+  }
+
+  /// Re-decode buffered chunks after fallback to software
+  fn redecode_pending_chunks(
+    inner: &Arc<Mutex<VideoDecoderInner>>,
+    chunks: Vec<Arc<RwLock<Option<EncodedVideoChunkInner>>>>,
+  ) {
+    for chunk in chunks {
+      let mut guard = match inner.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+      };
+
+      // Check state
+      if guard.state != CodecState::Configured {
+        return;
+      }
+
+      // Get chunk data
+      let chunk_read_guard = chunk.read();
+      let (timestamp, duration, data) = match chunk_read_guard
+        .as_ref()
+        .ok()
+        .and_then(|d| d.as_ref())
+        .map(|c| (c.timestamp_us, c.duration_us, c.data.clone()))
+      {
+        Some(d) => d,
+        None => continue, // Skip closed chunks
+      };
+      drop(chunk_read_guard);
+
+      // Decode with software decoder
+      let context = match guard.context.as_mut() {
+        Some(ctx) => ctx,
+        None => return,
+      };
+
+      let frames = match decode_chunk_data(context, &data, timestamp, duration) {
+        Ok(f) => f,
+        Err(_) => continue, // Skip failed chunks during re-decode
+      };
+
+      // Mark first output produced on success
+      if !frames.is_empty() && !guard.first_output_produced {
+        guard.first_output_produced = true;
+      }
+
+      // Output frames
+      for frame in frames {
+        let video_frame = VideoFrame::from_internal(frame, timestamp, duration);
+        guard
+          .output_callback
+          .call(video_frame, ThreadsafeFunctionCallMode::NonBlocking);
+      }
     }
   }
 
@@ -396,6 +622,11 @@ impl VideoDecoder {
   }
 
   /// Configure the decoder
+  ///
+  /// Implements Chromium-aligned hardware acceleration behavior:
+  /// - `prefer-hardware`: Try hardware only, report error if fails
+  /// - `no-preference`: Try hardware first, silently fall back to software
+  /// - `prefer-software`: Use software only
   #[napi]
   pub fn configure(&self, config: VideoDecoderConfig) -> Result<()> {
     let mut inner = self
@@ -417,18 +648,50 @@ impl VideoDecoder {
       }
     };
 
-    // Determine hardware acceleration
-    let hw_type = config
+    // Parse hardware preference (default to no-preference per spec)
+    let hw_preference = config
       .hardware_acceleration
-      .as_ref()
-      .and_then(parse_hw_acceleration);
+      .unwrap_or(HardwareAcceleration::NoPreference);
+
+    // Determine hardware type based on preference and global state
+    //
+    // NOTE: Unlike encoding, hardware DECODING via FFmpeg often produces incorrect
+    // output (null format, garbage data) on many systems. Therefore, we only use
+    // hardware decoding when explicitly requested via prefer-hardware.
+    //
+    // Behavior:
+    // - prefer-hardware: Try hardware only (may produce errors if HW unavailable)
+    // - no-preference: Use software (safest default)
+    // - prefer-software: Use software
+    let hw_type = match &hw_preference {
+      HardwareAcceleration::PreferHardware => Some(get_platform_hw_type()),
+      // For no-preference and prefer-software, use software decoding
+      // Hardware decoding via FFmpeg often produces incorrect output
+      HardwareAcceleration::NoPreference | HardwareAcceleration::PreferSoftware => None,
+    };
 
     // Create decoder context with optional hardware acceleration
-    let mut context = match CodecContext::new_decoder_with_hw(codec_id, hw_type) {
-      Ok(ctx) => ctx,
-      Err(e) => {
-        Self::report_error(&mut inner, &format!("Failed to create decoder: {}", e));
-        return Ok(());
+    let (mut context, is_hardware) = if let Some(hw) = hw_type {
+      // Hardware decoder requested (prefer-hardware only)
+      match CodecContext::new_decoder_with_hw_info(codec_id, Some(hw)) {
+        Ok(result) => (result.context, result.is_hardware),
+        Err(e) => {
+          // Hardware decoder creation failed - report error (no fallback for prefer-hardware)
+          Self::report_error(
+            &mut inner,
+            &format!("OperationError: Hardware decoder creation failed: {}", e),
+          );
+          return Ok(());
+        }
+      }
+    } else {
+      // Software decoder (no-preference or prefer-software)
+      match CodecContext::new_decoder(codec_id) {
+        Ok(ctx) => (ctx, false),
+        Err(e) => {
+          Self::report_error(&mut inner, &format!("Failed to create decoder: {}", e));
+          return Ok(());
+        }
       }
     };
 
@@ -456,6 +719,13 @@ impl VideoDecoder {
     inner.state = CodecState::Configured;
     inner.frame_count = 0;
     inner.decode_queue_size = 0;
+
+    // Store hardware acceleration tracking state
+    inner.is_hardware = is_hardware;
+    inner.hw_preference = hw_preference;
+    inner.silent_decode_count = 0;
+    inner.first_output_produced = false;
+    inner.pending_chunks.clear();
 
     Ok(())
   }
@@ -570,6 +840,13 @@ impl VideoDecoder {
     inner.frame_count = 0;
     inner.decode_queue_size = 0;
 
+    // Reset hardware tracking state
+    inner.is_hardware = false;
+    inner.hw_preference = HardwareAcceleration::NoPreference;
+    inner.silent_decode_count = 0;
+    inner.first_output_produced = false;
+    inner.pending_chunks.clear();
+
     // Create new channel and worker for future decode operations
     let (sender, receiver) = channel::unbounded();
     self.command_sender = Some(sender);
@@ -609,6 +886,12 @@ impl VideoDecoder {
     inner.codec_string.clear();
     inner.state = CodecState::Closed;
     inner.decode_queue_size = 0;
+
+    // Reset hardware tracking state
+    inner.is_hardware = false;
+    inner.silent_decode_count = 0;
+    inner.first_output_produced = false;
+    inner.pending_chunks.clear();
 
     Ok(())
   }
@@ -661,32 +944,6 @@ fn parse_codec_string(codec: &str) -> Result<AVCodecID> {
       Status::GenericFailure,
       format!("Unsupported codec: {}", codec),
     ))
-  }
-}
-
-/// Parse hardware acceleration preference to device type
-fn parse_hw_acceleration(ha: &HardwareAcceleration) -> Option<AVHWDeviceType> {
-  match ha {
-    HardwareAcceleration::PreferHardware => {
-      // Return platform-preferred hardware type
-      #[cfg(target_os = "macos")]
-      {
-        Some(AVHWDeviceType::Videotoolbox)
-      }
-      #[cfg(target_os = "linux")]
-      {
-        Some(AVHWDeviceType::Vaapi)
-      }
-      #[cfg(target_os = "windows")]
-      {
-        Some(AVHWDeviceType::D3d11va)
-      }
-      #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-      {
-        None
-      }
-    }
-    _ => None,
   }
 }
 

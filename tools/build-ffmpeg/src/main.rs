@@ -867,6 +867,7 @@ Cflags: -I${{includedir}}{}
       "-DENABLE_SHARED=OFF".to_string(),
       "-DENABLE_CLI=OFF".to_string(),
       "-DHIGH_BIT_DEPTH=ON".to_string(),
+      "-DENABLE_ASSEMBLY=ON".to_string(), // Ensure SIMD optimizations are enabled
       "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".to_string(),
     ];
 
@@ -1456,6 +1457,8 @@ Cflags: -I${{includedir}}
       "--enable-libvorbis".to_string(),
       // Image codecs
       "--enable-libwebp".to_string(),
+      // Core dependencies
+      "--enable-zlib".to_string(), // Required for PNG decoder
       // Include/lib paths
       format!("--extra-cflags=-I{} -fPIC", include_dir.display()),
       format!("--extra-ldflags=-L{}", lib_dir.display()),

@@ -385,7 +385,14 @@ export declare class VideoDecoder {
   set ondequeue(callback?: (() => unknown) | undefined | null)
   /** Get the dequeue event handler (per WebCodecs spec) */
   get ondequeue(): (() => unknown) | null
-  /** Configure the decoder */
+  /**
+   * Configure the decoder
+   *
+   * Implements Chromium-aligned hardware acceleration behavior:
+   * - `prefer-hardware`: Try hardware only, report error if fails
+   * - `no-preference`: Try hardware first, silently fall back to software
+   * - `prefer-software`: Use software only
+   */
   configure(config: VideoDecoderConfig): void
   /** Decode an encoded video chunk */
   decode(chunk: EncodedVideoChunk): void
@@ -899,6 +906,17 @@ export interface PlaneLayout {
   /** Number of bytes per row (stride) */
   stride: number
 }
+
+/**
+ * Reset all hardware fallback state.
+ *
+ * This clears all failure counts and re-enables hardware acceleration.
+ * Useful for:
+ * - Test isolation (call in beforeEach)
+ * - Error recovery after fixing hardware issues
+ * - Manual reset by users
+ */
+export declare function resetHardwareFallbackState(): void
 
 /** SVC (Scalable Video Coding) output metadata (W3C WebCodecs spec) */
 export interface SvcOutputMetadata {

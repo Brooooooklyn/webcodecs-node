@@ -86,10 +86,12 @@ test('ImageDecoder detects animated GIF format', async (t) => {
   t.is(decoder.type, 'image/gif')
   t.true(decoder.complete)
 
-  // Before first decode, animated = true but frameCount = 0
+  // animated is set synchronously in constructor
   const tracksBefore = decoder.tracks
   t.true(tracksBefore.selectedTrack!.animated)
-  t.is(tracksBefore.selectedTrack!.frameCount, 0)
+  // Note: frameCount may be 0 or populated depending on whether
+  // background pre-parsing has completed. Use tracks.ready to
+  // reliably get the frame count (see test below).
 
   decoder.close()
 })

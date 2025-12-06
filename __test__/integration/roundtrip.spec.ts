@@ -7,7 +7,7 @@
 
 import test from 'ava'
 
-import { VideoEncoder, VideoDecoder, VideoFrame } from '../../index.js'
+import { resetHardwareFallbackState, VideoEncoder, VideoDecoder, VideoFrame } from '../../index.js'
 import {
   generateSolidColorI420Frame,
   generateGradientI420Frame,
@@ -19,6 +19,11 @@ import {
 } from '../helpers/index.js'
 import { compareBuffers, PSNRThresholds, formatPSNR, getQualityDescription } from '../helpers/frame-comparator.js'
 import { createEncoderConfig, createDecoderConfig } from '../helpers/codec-matrix.js'
+
+// Reset hardware fallback state before each test to ensure test isolation
+test.beforeEach(() => {
+  resetHardwareFallbackState()
+})
 
 // Helper to create test encoder with callbacks
 function createTestEncoder() {

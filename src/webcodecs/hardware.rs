@@ -107,6 +107,9 @@ pub fn get_preferred_hardware_accelerator() -> Option<String> {
     if HwDeviceContext::is_available(AVHWDeviceType::D3d11va) {
       return Some("d3d11va".to_string());
     }
+    if HwDeviceContext::is_available(AVHWDeviceType::Dxva2) {
+      return Some("dxva2".to_string());
+    }
   }
 
   // Try CUDA as fallback (cross-platform with NVIDIA)

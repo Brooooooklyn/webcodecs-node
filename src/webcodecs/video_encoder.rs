@@ -3,8 +3,14 @@
 //! Provides video encoding functionality using FFmpeg.
 //! See: https://w3c.github.io/webcodecs/#videoencoder-interface
 
-use crate::codec::{BitrateMode as CodecBitrateMode, CodecContext, EncoderConfig, Frame, Scaler};
+use crate::codec::{
+  BitrateMode as CodecBitrateMode, CodecContext, EncoderConfig, EncoderCreationResult, Frame,
+  Scaler,
+};
 use crate::ffi::{AVCodecID, AVHWDeviceType, AVPixelFormat};
+use crate::webcodecs::hw_fallback::{
+  is_hw_encoding_disabled, record_hw_encoding_failure, record_hw_encoding_success,
+};
 use crate::webcodecs::{
   EncodedVideoChunk, HardwareAcceleration, LatencyMode, VideoEncoderBitrateMode,
   VideoEncoderConfig, VideoFrame,
@@ -185,6 +191,9 @@ impl FromNapiValue for VideoEncoderInit {
   }
 }
 
+/// Threshold for detecting silent encoder failure (no output after N frames)
+const SILENT_FAILURE_THRESHOLD: u32 = 3;
+
 /// Internal encoder state
 struct VideoEncoderInner {
   state: CodecState,
@@ -201,6 +210,42 @@ struct VideoEncoderInner {
   error_callback: ErrorCallback,
   /// Optional dequeue event callback (ThreadsafeFunction for multi-thread support)
   dequeue_callback: Option<ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, true>>,
+
+  // ========================================================================
+  // Hardware acceleration tracking (for Chromium-aligned fallback behavior)
+  // ========================================================================
+  /// Whether the encoder is using hardware acceleration
+  is_hardware: bool,
+  /// Name of the encoder (e.g., "h264_videotoolbox", "libx264")
+  encoder_name: String,
+  /// Hardware acceleration preference from config
+  hw_preference: HardwareAcceleration,
+  /// Count of consecutive encodes with no output (for silent failure detection)
+  silent_encode_count: u32,
+  /// Whether first output has been produced (disables silent failure detection after)
+  first_output_produced: bool,
+  /// Buffered frames during silent failure detection period (for re-encoding on fallback)
+  pending_frames: Vec<(Frame, i64, Option<VideoEncoderEncodeOptions>)>,
+}
+
+/// Get the preferred hardware device type for the current platform
+fn get_platform_hw_type() -> AVHWDeviceType {
+  #[cfg(target_os = "macos")]
+  {
+    AVHWDeviceType::Videotoolbox
+  }
+  #[cfg(target_os = "linux")]
+  {
+    AVHWDeviceType::Vaapi
+  }
+  #[cfg(target_os = "windows")]
+  {
+    AVHWDeviceType::D3d11va
+  }
+  #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+  {
+    AVHWDeviceType::Cuda
+  }
 }
 
 /// VideoEncoder - WebCodecs-compliant video encoder
@@ -272,6 +317,13 @@ impl VideoEncoder {
       output_callback: init.output,
       error_callback: init.error,
       dequeue_callback: None,
+      // Hardware acceleration tracking
+      is_hardware: false,
+      encoder_name: String::new(),
+      hw_preference: HardwareAcceleration::NoPreference,
+      silent_encode_count: 0,
+      first_output_produced: false,
+      pending_frames: Vec::new(),
     };
 
     let inner = Arc::new(Mutex::new(inner));
@@ -413,14 +465,234 @@ impl VideoEncoder {
     let packets = match context.encode(Some(&frame_to_encode)) {
       Ok(pkts) => pkts,
       Err(e) => {
+        // For hardware encoder with no-preference, try fallback to software
+        if guard.is_hardware
+          && !guard.first_output_produced
+          && guard.hw_preference == HardwareAcceleration::NoPreference
+        {
+          // Buffer current frame for re-encoding
+          if let Ok(cloned) = frame_to_encode.try_clone() {
+            guard
+              .pending_frames
+              .push((cloned, timestamp, _options.clone()));
+          }
+          let pending_frames = std::mem::take(&mut guard.pending_frames);
+
+          if Self::fallback_to_software(&mut guard) {
+            // Re-encode all buffered frames with software encoder
+            for (buffered_frame, buffered_ts, _buffered_opts) in pending_frames {
+              let mut frame_to_reencode = buffered_frame;
+              frame_to_reencode.set_pts(buffered_ts);
+
+              if let Some(ctx) = guard.context.as_mut() {
+                if let Ok(pkts) = ctx.encode(Some(&frame_to_reencode)) {
+                  for packet in pkts {
+                    let chunk = EncodedVideoChunk::from_packet(&packet);
+                    let metadata = if !guard.extradata_sent && packet.is_key() {
+                      guard.extradata_sent = true;
+                      EncodedVideoChunkMetadata {
+                        decoder_config: Some(VideoDecoderConfigOutput {
+                          codec: codec_string.clone(),
+                          coded_width: Some(width),
+                          coded_height: Some(height),
+                          description: guard
+                            .context
+                            .as_ref()
+                            .and_then(|ctx| ctx.extradata().map(|d| Uint8Array::from(d.to_vec()))),
+                        }),
+                        svc: None,
+                        alpha_side_data: None,
+                      }
+                    } else {
+                      EncodedVideoChunkMetadata {
+                        decoder_config: None,
+                        svc: None,
+                        alpha_side_data: None,
+                      }
+                    };
+                    guard.output_callback.call(
+                      (chunk, metadata).into(),
+                      ThreadsafeFunctionCallMode::NonBlocking,
+                    );
+                    guard.first_output_produced = true;
+                  }
+                }
+              }
+            }
+            guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+            let _ = Self::fire_dequeue_event(&guard);
+            return;
+          }
+          // Fallback failed - report error with context
+          let codec = guard
+            .config
+            .as_ref()
+            .map(|c| c.codec.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+          let encoder_name = guard.encoder_name.clone();
+          Self::report_error(
+            &mut guard,
+            &format!(
+              "OperationError: {} encoder ({}) failed: {} (software fallback also failed)",
+              codec, encoder_name, e
+            ),
+          );
+        } else {
+          let codec = guard
+            .config
+            .as_ref()
+            .map(|c| c.codec.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+          let encoder_name = guard.encoder_name.clone();
+          Self::report_error(
+            &mut guard,
+            &format!(
+              "OperationError: {} encoder ({}) failed: {}",
+              codec, encoder_name, e
+            ),
+          );
+        }
         guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
         let _ = Self::fire_dequeue_event(&guard);
-        Self::report_error(&mut guard, &format!("Encode failed: {}", e));
         return;
       }
     };
 
     guard.frame_count += 1;
+
+    // ========================================================================
+    // Silent failure detection (Chromium-aligned behavior)
+    // ========================================================================
+    // Some hardware encoders may be created successfully but fail to produce
+    // output (e.g., in CI VMs where VideoToolbox is detected but doesn't work).
+    // We detect this by tracking consecutive encodes with no output.
+    //
+    // IMPORTANT: This only applies to hardware encoders. Software encoders
+    // naturally buffer frames (e.g., for B-frame reordering) and may not
+    // produce output for the first few frames - this is expected behavior.
+
+    if packets.is_empty() && guard.is_hardware && !guard.first_output_produced {
+      // Buffer the frame for potential re-encoding on fallback
+      // Use try_clone since Frame doesn't implement Clone
+      if let Ok(cloned_frame) = frame_to_encode.try_clone() {
+        guard
+          .pending_frames
+          .push((cloned_frame, timestamp, _options.clone()));
+      }
+      guard.silent_encode_count += 1;
+
+      if guard.silent_encode_count >= SILENT_FAILURE_THRESHOLD {
+        match guard.hw_preference {
+          HardwareAcceleration::PreferHardware => {
+            // prefer-hardware: Report error, no fallback
+            // Record failure for global tracking
+            record_hw_encoding_failure();
+            guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+            let _ = Self::fire_dequeue_event(&guard);
+            let codec = guard
+              .config
+              .as_ref()
+              .map(|c| c.codec.clone())
+              .unwrap_or_else(|| "unknown".to_string());
+            let encoder_name = guard.encoder_name.clone();
+            Self::report_error(
+              &mut guard,
+              &format!(
+                "OperationError: {} encoder ({}) failed to produce output (silent failure after {} frames)",
+                codec, encoder_name, SILENT_FAILURE_THRESHOLD
+              ),
+            );
+            return;
+          }
+          HardwareAcceleration::NoPreference => {
+            // no-preference with hardware: Try to fall back to software
+            let pending_frames = std::mem::take(&mut guard.pending_frames);
+
+            if Self::fallback_to_software(&mut guard) {
+              // Re-encode all buffered frames with software encoder
+              for (buffered_frame, buffered_ts, _buffered_opts) in pending_frames {
+                let mut frame_to_reencode = buffered_frame;
+                frame_to_reencode.set_pts(buffered_ts);
+
+                if let Some(ctx) = guard.context.as_mut() {
+                  if let Ok(pkts) = ctx.encode(Some(&frame_to_reencode)) {
+                    // Process any output packets from re-encoding
+                    for packet in pkts {
+                      let chunk = EncodedVideoChunk::from_packet(&packet);
+                      let metadata = if !guard.extradata_sent && packet.is_key() {
+                        guard.extradata_sent = true;
+                        EncodedVideoChunkMetadata {
+                          decoder_config: Some(VideoDecoderConfigOutput {
+                            codec: codec_string.clone(),
+                            coded_width: Some(width),
+                            coded_height: Some(height),
+                            description: guard.context.as_ref().and_then(|ctx| {
+                              ctx.extradata().map(|d| Uint8Array::from(d.to_vec()))
+                            }),
+                          }),
+                          svc: None,
+                          alpha_side_data: None,
+                        }
+                      } else {
+                        EncodedVideoChunkMetadata {
+                          decoder_config: None,
+                          svc: None,
+                          alpha_side_data: None,
+                        }
+                      };
+                      guard.output_callback.call(
+                        (chunk, metadata).into(),
+                        ThreadsafeFunctionCallMode::NonBlocking,
+                      );
+                      guard.first_output_produced = true;
+                    }
+                  }
+                }
+              }
+
+              // Decrement queue size and continue
+              guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+              let _ = Self::fire_dequeue_event(&guard);
+              return;
+            } else {
+              // Fallback failed, report error
+              // Record failure for global tracking
+              record_hw_encoding_failure();
+              guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
+              let _ = Self::fire_dequeue_event(&guard);
+              let codec = guard
+                .config
+                .as_ref()
+                .map(|c| c.codec.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+              let encoder_name = guard.encoder_name.clone();
+              Self::report_error(
+                &mut guard,
+                &format!(
+                  "OperationError: {} encoder ({}) failed (silent failure) and software fallback unavailable",
+                  codec,
+                  encoder_name
+                ),
+              );
+              return;
+            }
+          }
+          HardwareAcceleration::PreferSoftware => {
+            // This shouldn't happen (is_hardware should be false), but handle it anyway
+          }
+        }
+      }
+    } else if !packets.is_empty() {
+      // Successfully produced output - mark first output and clear buffer
+      guard.first_output_produced = true;
+      guard.silent_encode_count = 0;
+      guard.pending_frames.clear();
+
+      // Record success for global tracking (resets failure count)
+      if guard.is_hardware {
+        record_hw_encoding_success();
+      }
+    }
 
     // Decrement queue size and fire dequeue event
     guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
@@ -523,6 +795,111 @@ impl VideoEncoder {
     Ok(())
   }
 
+  /// Attempt to fall back to software encoder (for no-preference mode)
+  ///
+  /// This is called when hardware encoder silently fails (produces no output).
+  /// Returns true if fallback succeeded, false otherwise.
+  fn fallback_to_software(inner: &mut VideoEncoderInner) -> bool {
+    let config = match inner.config.as_ref() {
+      Some(c) => c,
+      None => return false,
+    };
+
+    let codec_id = match parse_codec_string(&config.codec) {
+      Ok(id) => id,
+      Err(_) => return false,
+    };
+
+    // Create software encoder (hw_type = None forces software)
+    let result = match CodecContext::new_encoder_with_hw_info(codec_id, None) {
+      Ok(r) => r,
+      Err(_) => return false,
+    };
+
+    // Configure the new encoder with same settings
+    let bitrate_mode = match config.bitrate_mode {
+      Some(VideoEncoderBitrateMode::Constant) => CodecBitrateMode::Constant,
+      Some(VideoEncoderBitrateMode::Variable) => CodecBitrateMode::Variable,
+      Some(VideoEncoderBitrateMode::Quantizer) => CodecBitrateMode::Quantizer,
+      None => CodecBitrateMode::Constant,
+    };
+
+    let (gop_size, max_b_frames) = match config.latency_mode {
+      Some(LatencyMode::Realtime) => (10, 0),
+      _ => (60, 2),
+    };
+
+    let encoder_config = EncoderConfig {
+      width: config.width,
+      height: config.height,
+      pixel_format: AVPixelFormat::Yuv420p,
+      bitrate: config.bitrate.unwrap_or(5_000_000.0) as u64,
+      framerate_num: config.framerate.unwrap_or(30.0) as u32,
+      framerate_den: 1,
+      gop_size,
+      max_b_frames,
+      thread_count: 0,
+      profile: None,
+      level: None,
+      bitrate_mode,
+      rc_max_rate: None,
+      rc_buffer_size: None,
+      crf: None,
+    };
+
+    let mut context = result.context;
+    if context.configure_encoder(&encoder_config).is_err() {
+      return false;
+    }
+
+    if context.open().is_err() {
+      return false;
+    }
+
+    // Replace the hardware context with software
+    inner.context = Some(context);
+    inner.is_hardware = false;
+    inner.encoder_name = result.encoder_name;
+    inner.silent_encode_count = 0;
+    inner.first_output_produced = false;
+    inner.extradata_sent = false;
+
+    true
+  }
+
+  /// Create a software encoder with the given configuration
+  ///
+  /// Used for fallback when hardware encoder fails during configure/open.
+  fn create_software_encoder(
+    codec_id: AVCodecID,
+    encoder_config: &EncoderConfig,
+  ) -> Result<(CodecContext, String)> {
+    let result = CodecContext::new_encoder_with_hw_info(codec_id, None).map_err(|e| {
+      Error::new(
+        Status::GenericFailure,
+        format!("Failed to create software encoder: {}", e),
+      )
+    })?;
+
+    let mut context = result.context;
+
+    context.configure_encoder(encoder_config).map_err(|e| {
+      Error::new(
+        Status::GenericFailure,
+        format!("Failed to configure software encoder: {}", e),
+      )
+    })?;
+
+    context.open().map_err(|e| {
+      Error::new(
+        Status::GenericFailure,
+        format!("Failed to open software encoder: {}", e),
+      )
+    })?;
+
+    Ok((context, result.encoder_name))
+  }
+
   /// Get encoder state
   #[napi(getter)]
   pub fn state(&self) -> Result<CodecState> {
@@ -608,30 +985,54 @@ impl VideoEncoder {
       }
     };
 
-    // Determine hardware acceleration
-    let hw_type = config
+    // Determine hardware acceleration preference (Chromium-aligned behavior)
+    let hw_preference = config
       .hardware_acceleration
-      .as_ref()
-      .and_then(|ha| match ha {
-        HardwareAcceleration::PreferHardware => {
-          #[cfg(target_os = "macos")]
-          {
-            Some(AVHWDeviceType::Videotoolbox)
-          }
-          #[cfg(not(target_os = "macos"))]
-          {
-            Some(AVHWDeviceType::Cuda)
-          }
-        }
-        _ => None,
-      });
+      .unwrap_or(HardwareAcceleration::NoPreference);
 
-    // Create encoder context
-    let mut context = match CodecContext::new_encoder_with_hw(codec_id, hw_type) {
-      Ok(ctx) => ctx,
+    // Determine hardware type based on preference:
+    // - prefer-hardware: Try hardware only, error if fails
+    // - no-preference: Try hardware first, fallback to software at runtime
+    // - prefer-software: Use software only
+    //
+    // Also check if hardware encoding is globally disabled due to repeated failures
+    let hw_type = match &hw_preference {
+      HardwareAcceleration::PreferHardware => {
+        // prefer-hardware: Always try hardware (even if globally disabled, per user request)
+        Some(get_platform_hw_type())
+      }
+      HardwareAcceleration::NoPreference => {
+        // no-preference: Use hardware unless globally disabled
+        if is_hw_encoding_disabled() {
+          None // Skip hardware, use software
+        } else {
+          Some(get_platform_hw_type())
+        }
+      }
+      HardwareAcceleration::PreferSoftware => None,
+    };
+
+    // Create encoder context with hardware acceleration info
+    let EncoderCreationResult {
+      mut context,
+      mut is_hardware,
+      mut encoder_name,
+    } = match CodecContext::new_encoder_with_hw_info(codec_id, hw_type) {
+      Ok(result) => result,
       Err(e) => {
-        Self::report_error(&mut inner, &format!("Failed to create encoder: {}", e));
-        return Ok(());
+        // For no-preference, try again with software only if HW failed at creation
+        if hw_preference == HardwareAcceleration::NoPreference {
+          match CodecContext::new_encoder_with_hw_info(codec_id, None) {
+            Ok(result) => result,
+            Err(e2) => {
+              Self::report_error(&mut inner, &format!("Failed to create encoder: {}", e2));
+              return Ok(());
+            }
+          }
+        } else {
+          Self::report_error(&mut inner, &format!("Failed to create encoder: {}", e));
+          return Ok(());
+        }
       }
     };
 
@@ -669,14 +1070,56 @@ impl VideoEncoder {
     };
 
     if let Err(e) = context.configure_encoder(&encoder_config) {
-      Self::report_error(&mut inner, &format!("Failed to configure encoder: {}", e));
-      return Ok(());
+      // For no-preference, try software fallback if hardware configure fails
+      if hw_preference == HardwareAcceleration::NoPreference && is_hardware {
+        match Self::create_software_encoder(codec_id, &encoder_config) {
+          Ok((sw_ctx, sw_name)) => {
+            context = sw_ctx;
+            is_hardware = false;
+            encoder_name = sw_name;
+          }
+          Err(e2) => {
+            Self::report_error(
+              &mut inner,
+              &format!(
+                "Failed to configure encoder: {} (software fallback also failed: {})",
+                e, e2
+              ),
+            );
+            return Ok(());
+          }
+        }
+      } else {
+        Self::report_error(&mut inner, &format!("Failed to configure encoder: {}", e));
+        return Ok(());
+      }
     }
 
     // Open the encoder
     if let Err(e) = context.open() {
-      Self::report_error(&mut inner, &format!("Failed to open encoder: {}", e));
-      return Ok(());
+      // For no-preference, try software fallback if hardware open fails
+      if hw_preference == HardwareAcceleration::NoPreference && is_hardware {
+        match Self::create_software_encoder(codec_id, &encoder_config) {
+          Ok((sw_ctx, sw_name)) => {
+            context = sw_ctx;
+            is_hardware = false;
+            encoder_name = sw_name;
+          }
+          Err(e2) => {
+            Self::report_error(
+              &mut inner,
+              &format!(
+                "Failed to open encoder: {} (software fallback also failed: {})",
+                e, e2
+              ),
+            );
+            return Ok(());
+          }
+        }
+      } else {
+        Self::report_error(&mut inner, &format!("Failed to open encoder: {}", e));
+        return Ok(());
+      }
     }
 
     inner.context = Some(context);
@@ -685,6 +1128,14 @@ impl VideoEncoder {
     inner.extradata_sent = false;
     inner.frame_count = 0;
     inner.encode_queue_size = 0;
+
+    // Hardware acceleration tracking
+    inner.is_hardware = is_hardware;
+    inner.encoder_name = encoder_name;
+    inner.hw_preference = hw_preference;
+    inner.silent_encode_count = 0;
+    inner.first_output_produced = false;
+    inner.pending_frames.clear();
 
     Ok(())
   }
@@ -832,6 +1283,14 @@ impl VideoEncoder {
     inner.frame_count = 0;
     inner.extradata_sent = false;
     inner.encode_queue_size = 0;
+
+    // Reset hardware tracking state
+    inner.is_hardware = false;
+    inner.encoder_name = String::new();
+    inner.hw_preference = HardwareAcceleration::NoPreference;
+    inner.silent_encode_count = 0;
+    inner.first_output_produced = false;
+    inner.pending_frames.clear();
 
     // Create new channel and worker for future encode operations
     let (sender, receiver) = channel::unbounded();

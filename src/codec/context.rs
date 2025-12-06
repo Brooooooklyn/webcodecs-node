@@ -29,6 +29,24 @@ use super::{
   EncoderConfig, Frame, HwDeviceContext, Packet,
 };
 
+/// Result of encoder creation with metadata about hardware acceleration
+pub struct EncoderCreationResult {
+  /// The created codec context
+  pub context: CodecContext,
+  /// Whether the encoder uses hardware acceleration
+  pub is_hardware: bool,
+  /// Name of the encoder (e.g., "h264_videotoolbox", "libx264")
+  pub encoder_name: String,
+}
+
+/// Result of decoder creation with metadata about hardware acceleration
+pub struct DecoderCreationResult {
+  /// The created codec context
+  pub context: CodecContext,
+  /// Whether the decoder uses hardware acceleration
+  pub is_hardware: bool,
+}
+
 /// Type of codec (encoder or decoder)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecType {
@@ -105,6 +123,55 @@ impl CodecContext {
     Self::new_encoder(codec_id)
   }
 
+  /// Create encoder with hardware acceleration preference and return metadata
+  ///
+  /// Unlike `new_encoder_with_hw`, this function returns information about
+  /// whether hardware acceleration was actually used, enabling runtime fallback.
+  pub fn new_encoder_with_hw_info(
+    codec_id: AVCodecID,
+    hw_type: Option<AVHWDeviceType>,
+  ) -> CodecResult<EncoderCreationResult> {
+    // Try hardware encoder first if requested
+    if let Some(hw) = hw_type {
+      let hw_name = get_hw_encoder_name(codec_id, hw);
+      if let Some(name) = hw_name {
+        if let Ok(mut ctx) = Self::new_encoder_by_name(name) {
+          // Try to create and attach hardware device context
+          if hw_encoder_needs_device_context(hw) {
+            if let Ok(hw_device) = HwDeviceContext::new(hw) {
+              ctx.set_hw_device(hw_device);
+            }
+          }
+          return Ok(EncoderCreationResult {
+            context: ctx,
+            is_hardware: true,
+            encoder_name: name.to_string(),
+          });
+        }
+      }
+    }
+
+    // Fall back to software encoder
+    let sw_name = get_sw_encoder_name(codec_id);
+    if let Some(name) = sw_name {
+      if let Ok(ctx) = Self::new_encoder_by_name(name) {
+        return Ok(EncoderCreationResult {
+          context: ctx,
+          is_hardware: false,
+          encoder_name: name.to_string(),
+        });
+      }
+    }
+
+    // Last resort: generic codec ID lookup
+    let ctx = Self::new_encoder(codec_id)?;
+    Ok(EncoderCreationResult {
+      context: ctx,
+      is_hardware: false,
+      encoder_name: format!("codec_{:?}", codec_id),
+    })
+  }
+
   /// Create decoder with hardware acceleration preference
   pub fn new_decoder_with_hw(
     codec_id: AVCodecID,
@@ -123,6 +190,32 @@ impl CodecContext {
     }
 
     Ok(ctx)
+  }
+
+  /// Create decoder with hardware acceleration preference and return metadata
+  ///
+  /// Unlike `new_decoder_with_hw`, this function returns information about
+  /// whether hardware acceleration was actually used, enabling runtime fallback.
+  pub fn new_decoder_with_hw_info(
+    codec_id: AVCodecID,
+    hw_type: Option<AVHWDeviceType>,
+  ) -> CodecResult<DecoderCreationResult> {
+    let mut ctx = Self::new_decoder(codec_id)?;
+    let mut is_hardware = false;
+
+    // Attach hardware device context if requested
+    if let Some(hw) = hw_type {
+      if let Ok(hw_device) = HwDeviceContext::new(hw) {
+        ctx.set_hw_device(hw_device);
+        is_hardware = true;
+      }
+      // Hardware decode will fall back to software if device creation fails
+    }
+
+    Ok(DecoderCreationResult {
+      context: ctx,
+      is_hardware,
+    })
   }
 
   // ========================================================================
@@ -269,11 +362,13 @@ impl CodecContext {
         ffctx_set_level(ctx, level);
       }
 
-      // Suppress x265 verbose logging via x265-params
+      // Configure x265 via x265-params:
+      // - preset=medium: Ensures consistent quality across platforms
+      // - log-level=error: Suppress verbose x265 logging
       av_opt_set(
         ctx as *mut std::ffi::c_void,
         c"x265-params".as_ptr(),
-        c"log-level=error".as_ptr(),
+        c"preset=medium:log-level=error".as_ptr(),
         opt_flag::SEARCH_CHILDREN,
       );
     }

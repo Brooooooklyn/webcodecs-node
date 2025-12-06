@@ -111,7 +111,7 @@ jobs:
 
       - name: Install FFmpeg with codecs via vcpkg
         run: |
-          vcpkg install ffmpeg[avcodec,swresample,swscale,gpl,x264,x265,vpx,aom,opus,mp3lame,vorbis,webp]:${{ matrix.triplet }}
+          vcpkg install ffmpeg[avcodec,swresample,swscale,gpl,x264,x265,vpx,aom,opus,mp3lame,vorbis,webp,zlib]:${{ matrix.triplet }}
 
       - name: List vcpkg installed libraries
         run: |
