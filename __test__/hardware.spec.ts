@@ -234,10 +234,10 @@ test('platform: preferred accelerator matches platform', (t) => {
       t.true(['vaapi', 'cuda', 'qsv'].includes(preferred), `Linux should prefer vaapi, cuda, or qsv, got ${preferred}`)
       break
     case 'win32':
-      // Windows could prefer d3d11va, cuda, or qsv
+      // Windows could prefer d3d11va, dxva2, cuda, or qsv
       t.true(
-        ['d3d11va', 'cuda', 'qsv'].includes(preferred),
-        `Windows should prefer d3d11va, cuda, or qsv, got ${preferred}`,
+        ['d3d11va', 'dxva2', 'cuda', 'qsv'].includes(preferred),
+        `Windows should prefer d3d11va, dxva2, cuda, or qsv, got ${preferred}`,
       )
       break
     default:
@@ -283,7 +283,8 @@ test('hardware encoding: H.264 with prefer-hardware', async (t) => {
   if (chunks.length === 0 && errors.length === 0) {
     t.pass('Hardware encoder detected but encoding unavailable (likely CI VM), skipping')
   } else if (errors.length > 0) {
-    t.pass(`Hardware encoding failed with error (expected in CI): ${errors[0].message}`)
+    const errorMsg = errors[0]?.message ?? String(errors[0])
+    t.pass(`Hardware encoding failed with error (expected in CI): ${errorMsg}`)
   } else {
     t.true(chunks.length > 0, 'Hardware encoder should produce output')
   }

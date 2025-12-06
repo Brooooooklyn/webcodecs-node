@@ -26,7 +26,6 @@ fn main() {
   // Get target information
   let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
   let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-  let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
 
   // Get FFmpeg directory
   let ffmpeg_dir = get_ffmpeg_dir(&target_os, &target_arch);
@@ -35,7 +34,7 @@ fn main() {
   compile_accessors(&ffmpeg_dir);
 
   // Link FFmpeg libraries
-  link_ffmpeg(&ffmpeg_dir, &target_os, &target_env);
+  link_ffmpeg(&ffmpeg_dir, &target_os);
 
   // Re-run if these files change
   println!("cargo:rerun-if-changed=src/ffi/accessors.c");
@@ -332,18 +331,18 @@ fn compile_accessors(ffmpeg_dir: &Path) {
 }
 
 /// Link FFmpeg libraries (static only)
-fn link_ffmpeg(ffmpeg_dir: &Path, target_os: &str, target_env: &str) {
+fn link_ffmpeg(ffmpeg_dir: &Path, target_os: &str) {
   let lib_dir = ffmpeg_dir.join("lib");
 
   // Always use static linking - panic if static libs not found
-  link_static_ffmpeg(&lib_dir, target_os, target_env);
+  link_static_ffmpeg(&lib_dir, target_os);
 
   // Platform-specific system libraries
   link_platform_libraries(target_os);
 }
 
 /// Link FFmpeg statically using full paths to .a files
-fn link_static_ffmpeg(lib_dir: &Path, target_os: &str, target_env: &str) {
+fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
   // Get codec library paths, with lib_dir as highest priority
   let mut codec_lib_paths = get_codec_library_paths(target_os);
   // Insert lib_dir at the front so downloaded/bundled FFmpeg libs are found first
@@ -413,17 +412,17 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str, target_env: &str) {
     ("snappy", false),    // Snappy compression
     ("zimg", false),      // Z image processing library
     // Compression library (built by build-ffmpeg for Linux, vcpkg for Windows)
-    ("zlib", false),      // zlib compression (required for PNG decoder)
-    ("z", false),         // zlib on some systems uses 'libz.a' naming
+    ("zlib", false), // zlib compression (required for PNG decoder)
+    ("z", false),    // zlib on some systems uses 'libz.a' naming
   ];
 
   let mut linked_x265 = false;
 
-  // On Linux with GNU libc, we need --whole-archive for codec libraries because
-  // FFmpeg uses function pointer tables to reference codecs. Without --whole-archive,
-  // the linker won't pull in symbols like VP8GetInfo that aren't directly referenced.
-  // This is only needed for GNU environments (glibc), not musl.
-  let use_whole_archive = target_os == "linux" && target_env == "gnu";
+  // On Linux, we need --whole-archive for codec libraries because FFmpeg uses
+  // function pointer tables to reference codecs. Without --whole-archive, the
+  // linker won't pull in symbols like VP8GetInfo that aren't directly referenced.
+  // This applies to both GNU (glibc) and musl environments.
+  let use_whole_archive = target_os == "linux";
 
   // Collect all codec library paths first (for --whole-archive grouping)
   let mut codec_paths: Vec<PathBuf> = Vec::new();

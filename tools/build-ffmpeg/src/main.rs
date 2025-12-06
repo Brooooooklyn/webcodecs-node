@@ -214,6 +214,8 @@ done
 if [ -n "$cpu_features" ]; then
   args="-mcpu=generic$cpu_features $args"
 fi
+# Disable UBSan - zig enables it by default but we don't link the runtime
+args="-fno-sanitize=undefined $args"
 exec zig cc {} $args
 "#,
       target_arg
@@ -278,6 +280,8 @@ done
 if [ -n "$cpu_features" ]; then
   args="-mcpu=generic$cpu_features $args"
 fi
+# Disable UBSan - zig enables it by default but we don't link the runtime
+args="-fno-sanitize=undefined $args"
 exec zig c++ {} $args
 "#,
       target_arg

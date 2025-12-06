@@ -153,14 +153,22 @@ pub struct AudioEncoder {
 
 impl Drop for AudioEncoder {
   fn drop(&mut self) {
-    // Drop the sender to signal the worker to stop.
-    // The worker will see the channel disconnect and exit its loop.
+    // Signal worker to stop
     self.command_sender = None;
 
-    // Don't join the worker thread here - it would block the JS thread during GC.
-    // Instead, let the thread become detached and finish on its own.
-    // Safety: The Arc<Mutex<AudioEncoderInner>> ensures the inner state (including
-    // callbacks and FFmpeg context) stays alive until the worker exits.
+    // Wait for worker to finish (brief block, necessary for safety)
+    if let Some(handle) = self.worker_handle.take() {
+      let _ = handle.join();
+    }
+
+    // Drain encoder to ensure codec threads finish before context drops.
+    // This prevents potential SIGSEGV with codecs that use internal threads.
+    if let Ok(mut inner) = self.inner.lock() {
+      if let Some(ctx) = inner.context.as_mut() {
+        let _ = ctx.send_frame(None);
+        while ctx.receive_packet().ok().flatten().is_some() {}
+      }
+    }
   }
 }
 
