@@ -26,6 +26,7 @@ fn main() {
   // Get target information
   let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
   let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+  let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
 
   // Get FFmpeg directory
   let ffmpeg_dir = get_ffmpeg_dir(&target_os, &target_arch);
@@ -34,7 +35,7 @@ fn main() {
   compile_accessors(&ffmpeg_dir);
 
   // Link FFmpeg libraries
-  link_ffmpeg(&ffmpeg_dir, &target_os);
+  link_ffmpeg(&ffmpeg_dir, &target_os, &target_env);
 
   // Re-run if these files change
   println!("cargo:rerun-if-changed=src/ffi/accessors.c");
@@ -331,18 +332,18 @@ fn compile_accessors(ffmpeg_dir: &Path) {
 }
 
 /// Link FFmpeg libraries (static only)
-fn link_ffmpeg(ffmpeg_dir: &Path, target_os: &str) {
+fn link_ffmpeg(ffmpeg_dir: &Path, target_os: &str, target_env: &str) {
   let lib_dir = ffmpeg_dir.join("lib");
 
   // Always use static linking - panic if static libs not found
-  link_static_ffmpeg(&lib_dir, target_os);
+  link_static_ffmpeg(&lib_dir, target_os, target_env);
 
   // Platform-specific system libraries
   link_platform_libraries(target_os);
 }
 
 /// Link FFmpeg statically using full paths to .a files
-fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
+fn link_static_ffmpeg(lib_dir: &Path, target_os: &str, target_env: &str) {
   // Get codec library paths, with lib_dir as highest priority
   let mut codec_lib_paths = get_codec_library_paths(target_os);
   // Insert lib_dir at the front so downloaded/bundled FFmpeg libs are found first
@@ -415,9 +416,18 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
 
   let mut linked_x265 = false;
 
+  // On Linux with GNU libc, we need --whole-archive for codec libraries because
+  // FFmpeg uses function pointer tables to reference codecs. Without --whole-archive,
+  // the linker won't pull in symbols like VP8GetInfo that aren't directly referenced.
+  // This is only needed for GNU environments (glibc), not musl.
+  let use_whole_archive = target_os == "linux" && target_env == "gnu";
+
+  // Collect all codec library paths first (for --whole-archive grouping)
+  let mut codec_paths: Vec<PathBuf> = Vec::new();
+
   for (lib, required) in &codec_libs {
     if let Some(path) = find_static_lib_path(lib, &codec_lib_paths) {
-      println!("cargo:rustc-link-arg={}", path.display());
+      codec_paths.push(path);
       if *lib == "x265" {
         linked_x265 = true;
       }
@@ -429,6 +439,19 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
       );
     }
     // Optional libraries are silently skipped if not found
+  }
+
+  // Link codec libraries with --whole-archive on Linux
+  if use_whole_archive && !codec_paths.is_empty() {
+    println!("cargo:rustc-link-arg=-Wl,--whole-archive");
+  }
+
+  for path in &codec_paths {
+    println!("cargo:rustc-link-arg={}", path.display());
+  }
+
+  if use_whole_archive && !codec_paths.is_empty() {
+    println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
   }
 
   // x265 requires C++ runtime
