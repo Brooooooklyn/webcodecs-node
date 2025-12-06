@@ -113,6 +113,11 @@ jobs:
         run: |
           vcpkg install ffmpeg[avcodec,swresample,swscale,gpl,x264,x265,vpx,aom,opus,mp3lame,vorbis,webp]:${{ matrix.triplet }}
 
+      - name: List vcpkg installed libraries
+        run: |
+          Write-Host "=== All installed .lib files in vcpkg ==="
+          Get-ChildItem "$env:VCPKG_ROOT/installed/${{ matrix.triplet }}/lib/*.lib" | ForEach-Object { $_.Name }
+
       - name: Prepare output directory
         run: |
           $prefix = "ffmpeg-${{ matrix.target }}"

@@ -401,6 +401,7 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
     ("aribb24", false), // ARIB STD-B24 decoder
     // Other optional libraries
     ("mp3lame", false),   // MP3 encoder
+    ("mpghip", false),    // MP3 decoder (required by mp3lame on Windows/vcpkg)
     ("opus", false),      // Opus audio codec
     ("vorbis", false),    // Vorbis audio
     ("vorbisenc", false), // Vorbis encoder
@@ -497,12 +498,13 @@ fn get_codec_library_paths(target_os: &str) -> Vec<PathBuf> {
 /// Find static library path if it exists (handles both Unix .a and Windows .lib formats)
 fn find_static_lib_path(name: &str, paths: &[PathBuf]) -> Option<PathBuf> {
   // Try different naming conventions
-  let possible_names = [
-    format!("lib{}.a", name),       // Unix: libfoo.a
-    format!("{}.lib", name),        // Windows MSVC: foo.lib
-    format!("{}.a", name),          // Some libs: foo.a
-    format!("lib{}.lib", name),     // Rare: libfoo.lib
-    format!("{}-static.lib", name), // vcpkg static: foo-static.lib
+  let possible_names = vec![
+    format!("lib{}.a", name),          // Unix: libfoo.a
+    format!("{}.lib", name),           // Windows MSVC: foo.lib
+    format!("{}.a", name),             // Some libs: foo.a
+    format!("lib{}.lib", name),        // Windows: libfoo.lib
+    format!("{}-static.lib", name),    // vcpkg static: foo-static.lib
+    format!("lib{}-static.lib", name), // vcpkg static: libfoo-static.lib
   ];
 
   for path in paths {
@@ -574,17 +576,12 @@ fn link_platform_libraries(target_os: &str) {
         "ws2_32",   // Windows Sockets
         "secur32",  // Security API
         "advapi32", // Advanced Windows API
+        "mfplat",   // Media Foundation Platform
+        "mfuuid",   // Media Foundation GUIDs
       ];
 
       for lib in &libs {
         println!("cargo:rustc-link-lib={}", lib);
-      }
-
-      // Media Foundation for hardware acceleration
-      #[cfg(feature = "hwaccel")]
-      {
-        println!("cargo:rustc-link-lib=mfplat");
-        println!("cargo:rustc-link-lib=mfuuid");
       }
     }
 
