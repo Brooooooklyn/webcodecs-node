@@ -97,7 +97,7 @@ jobs:
             target: aarch64-unknown-linux-musl
             build: pnpm build --target aarch64-unknown-linux-musl -x
             download_ffmpeg: true
-    name: stable - ${{ matrix.settings.target }} - node@20
+    name: stable - ${{ matrix.settings.target }} - node@24
     runs-on: ${{ matrix.settings.host }}
     steps:
       - uses: actions/checkout@v5
@@ -106,7 +106,7 @@ jobs:
       - name: Setup node
         uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
       - name: Install
         uses: dtolnay/rust-toolchain@stable
@@ -139,9 +139,12 @@ jobs:
         run: ${{ matrix.settings.setup }}
         if: ${{ matrix.settings.setup }}
         shell: bash
-      - name: Install FFmpeg (macOS)
-        if: ${{ runner.os == 'macOS' }}
+      - name: Install FFmpeg (macOS arm64)
+        if: ${{ matrix.settings.target == 'aarch64-apple-darwin' }}
         run: brew install ffmpeg
+      - name: Install FFmpeg (macOS x64)
+        if: ${{ matrix.settings.target == 'x86_64-apple-darwin' }}
+        run: arch -x86_64 /usr/local/bin/brew install ffmpeg
       - name: Download FFmpeg from release
         if: ${{ matrix.settings.download_ffmpeg }}
         env:
