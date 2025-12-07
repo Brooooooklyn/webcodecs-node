@@ -231,16 +231,6 @@ test('codec: H.265 encode-decode roundtrip', async (t) => {
   const width = 320
   const height = 240
 
-  // Skip on musl (Alpine Linux) - x265 produces inconsistent quality on musl libc
-  // due to differences in CPU feature detection, threading, or math precision.
-  // See: https://github.com/anthropics/claude-code/issues/XXX for investigation.
-  const isMusl = process.platform === 'linux' && process.report?.getReport()?.header?.glibcVersionRuntime === undefined
-  if (isMusl) {
-    t.log('H.265 skipped on musl - x265 quality inconsistencies on musl libc')
-    t.pass()
-    return
-  }
-
   // Check if H.265 is supported
   const support = await VideoEncoder.isConfigSupported(createEncoderConfig('h265', width, height))
   if (!support.supported) {

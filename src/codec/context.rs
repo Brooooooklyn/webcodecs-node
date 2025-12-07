@@ -365,10 +365,12 @@ impl CodecContext {
       // Configure x265 via x265-params:
       // - preset=medium: Ensures consistent quality across platforms
       // - log-level=error: Suppress verbose x265 logging
+      // - qpmax=40: Limit maximum QP to prevent extreme quality degradation
+      //   (default is 69, which allows very low quality in edge cases like single-frame encoding)
       av_opt_set(
         ctx as *mut std::ffi::c_void,
         c"x265-params".as_ptr(),
-        c"preset=medium:log-level=error".as_ptr(),
+        c"preset=medium:log-level=error:qpmax=40".as_ptr(),
         opt_flag::SEARCH_CHILDREN,
       );
     }

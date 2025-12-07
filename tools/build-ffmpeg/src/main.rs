@@ -938,6 +938,9 @@ Cflags: -I${{includedir}}{}
     if self.use_zig {
       // Set CLANG=1 - enables Clang-specific optimizations (zig is Clang-based)
       args.push("-DCLANG=1".to_string());
+      // Set GCC=1 - enables assembly file compilation (x265 CMakeLists.txt:714 requires this)
+      // Without GCC=1, x265 falls back to C implementations which have different precision
+      args.push("-DGCC=1".to_string());
 
       // Set CMAKE_SIZEOF_VOID_P for proper X64 detection during cross-compilation.
       // x265 uses this to determine if we're building for 64-bit (X64=1).
