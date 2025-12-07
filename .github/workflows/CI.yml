@@ -60,11 +60,19 @@ jobs:
           # macOS - use homebrew FFmpeg
           - host: macos-15-intel
             target: x86_64-apple-darwin
-            build: pnpm build --target x86_64-apple-darwin
+            build: |
+              clang --version
+              export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER=clang
+              export CC=clang
+              pnpm build --target x86_64-apple-darwin
             build_ffmpeg: false
           - host: macos-latest
             target: aarch64-apple-darwin
-            build: pnpm build --target aarch64-apple-darwin
+            build: |
+              clang --version
+              export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=clang
+              export CC=clang
+              pnpm build --target aarch64-apple-darwin
             build_ffmpeg: false
           # Windows - download pre-built FFmpeg from release
           - host: windows-latest
@@ -139,9 +147,11 @@ jobs:
         run: ${{ matrix.settings.setup }}
         if: ${{ matrix.settings.setup }}
         shell: bash
-      - name: Install FFmpeg (macOS)
+      - name: Install FFmpeg and clang (macOS)
         if: ${{ contains(matrix.settings.target, 'apple') }}
-        run: brew install ffmpeg
+        run: |
+          brew install llvm@20 ffmpeg
+          echo "$(brew --prefix llvm@20)/bin:$PATH" >> $GITHUB_PATH
       - name: Download FFmpeg from release
         if: ${{ matrix.settings.download_ffmpeg }}
         env:
@@ -185,13 +195,6 @@ jobs:
         shell: bash
       - name: Install dependencies
         run: pnpm install
-      - name: Setup node x86
-        uses: actions/setup-node@v6
-        if: matrix.settings.target == 'i686-pc-windows-msvc'
-        with:
-          node-version: 22
-          cache: pnpm
-          architecture: x86
       - name: Build
         run: ${{ matrix.settings.build }}
         shell: bash

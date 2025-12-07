@@ -930,6 +930,29 @@ Cflags: -I${{includedir}}{}
       "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".to_string(),
     ];
 
+    // Force cmake to properly detect zig as GCC/Clang-compatible for x265 SIMD configuration.
+    // x265's CMakeLists.txt uses CMAKE_CXX_COMPILER_ID to set GCC/CLANG variables which control:
+    // 1. SIMD intrinsic compiler flags (-msse3, -mssse3, -msse4.1)
+    // 2. NASM assembly flags (HAVE_ALIGNED_STACK)
+    // When using zig wrappers, cmake may not correctly detect the compiler ID.
+    if self.use_zig {
+      // Set CLANG=1 - enables Clang-specific optimizations (zig is Clang-based)
+      args.push("-DCLANG=1".to_string());
+
+      // Set CMAKE_SIZEOF_VOID_P for proper X64 detection during cross-compilation.
+      // x265 uses this to determine if we're building for 64-bit (X64=1).
+      if let Some(cross) = self.cross_config() {
+        match cross.arch.as_str() {
+          "x86_64" | "aarch64" => {
+            args.push("-DCMAKE_SIZEOF_VOID_P=8".to_string());
+          }
+          _ => {
+            args.push("-DCMAKE_SIZEOF_VOID_P=4".to_string());
+          }
+        }
+      }
+    }
+
     // Add cross-compilation hints for CMake
     args.extend(self.cmake_cross_args());
 

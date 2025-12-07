@@ -31,7 +31,7 @@ fn main() {
   let ffmpeg_dir = get_ffmpeg_dir(&target_os, &target_arch);
 
   // Compile C accessor library
-  compile_accessors(&ffmpeg_dir);
+  compile_accessors(&ffmpeg_dir, &target_os);
 
   // Link FFmpeg libraries
   link_ffmpeg(&ffmpeg_dir, &target_os);
@@ -308,7 +308,7 @@ fn find_latest_ffmpeg_release(repo: &str) -> Option<String> {
 }
 
 /// Compile the C accessor library
-fn compile_accessors(ffmpeg_dir: &Path) {
+fn compile_accessors(ffmpeg_dir: &Path, target_os: &str) {
   let include_dir = ffmpeg_dir.join("include");
 
   let mut build = cc::Build::new();
@@ -318,10 +318,16 @@ fn compile_accessors(ffmpeg_dir: &Path) {
     .warnings(true)
     .extra_warnings(true);
 
-  // Platform-specific flags
-  #[cfg(target_os = "macos")]
-  {
-    build.flag("-Wno-deprecated-declarations");
+  match target_os {
+    "macos" => {
+      build.flag("-Wno-deprecated-declarations");
+    }
+    "linux" => {
+      build
+        .flag_if_supported("-static")
+        .cpp_link_stdlib_static(true);
+    }
+    _ => {}
   }
 
   // Compile
@@ -575,6 +581,14 @@ fn link_platform_libraries(target_os: &str) {
       println!("cargo:rustc-link-lib=m");
       println!("cargo:rustc-link-lib=pthread");
       println!("cargo:rustc-link-lib=dl");
+
+      // Link libgcc for armv7 - provides __gnu_f2h_ieee half-precision float intrinsic.
+      // When using zig as the cross-compiler for armv7, zig generates code that calls
+      // __gnu_f2h_ieee for half-precision float conversions, but doesn't link libgcc.
+      let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+      if target_arch == "arm" {
+        println!("cargo:rustc-link-lib=static=gcc");
+      }
 
       // VAAPI for hardware acceleration (if available)
       #[cfg(feature = "hwaccel")]
