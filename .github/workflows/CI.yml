@@ -147,11 +147,20 @@ jobs:
         run: ${{ matrix.settings.setup }}
         if: ${{ matrix.settings.setup }}
         shell: bash
-      - name: Install FFmpeg and clang (macOS)
+      - name: Install FFmpeg and build static dav1d (macOS)
         if: ${{ contains(matrix.settings.target, 'apple') }}
         run: |
-          brew install llvm@20 ffmpeg
+          brew install llvm@20 ffmpeg meson ninja nasm
           echo "$(brew --prefix llvm@20)/bin:$PATH" >> $GITHUB_PATH
+
+          # Build dav1d static library (Homebrew only provides dynamic .dylib)
+          # FFmpeg is built with --enable-libdav1d, so libavcodec.a has undefined
+          # dav1d symbols that need to be resolved by linking libdav1d.a
+          git clone --depth 1 --branch 1.5.2 https://code.videolan.org/videolan/dav1d.git
+          cd dav1d
+          meson setup build --default-library=static --buildtype=release -Denable_tools=false -Denable_tests=false
+          ninja -C build
+          sudo cp build/src/libdav1d.a "$(brew --prefix)/lib/"
       - name: Download FFmpeg from release
         if: ${{ matrix.settings.download_ffmpeg }}
         env:
