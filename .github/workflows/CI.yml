@@ -92,10 +92,6 @@ jobs:
             target: aarch64-unknown-linux-gnu
             build: pnpm build --target aarch64-unknown-linux-gnu --use-napi-cross
             download_ffmpeg: true
-          - host: ubuntu-latest
-            target: armv7-unknown-linux-gnueabihf
-            build: pnpm build --target armv7-unknown-linux-gnueabihf --use-napi-cross
-            download_ffmpeg: true
           # Linux musl - download pre-built FFmpeg from release
           - host: ubuntu-latest
             target: x86_64-unknown-linux-musl
@@ -222,7 +218,99 @@ jobs:
           name: bindings-${{ matrix.settings.target }}
           path: '*.wasm'
           if-no-files-found: error
-  
+
+  # Build armv7 separately using debian:bullseye container with GCC cross-toolchain
+  # This matches the FFmpeg build environment exactly (ffmpeg-build.yml)
+  build-armv7:
+    name: stable - armv7-unknown-linux-gnueabihf - node@24
+    runs-on: ubuntu-latest
+    container:
+      image: debian:bullseye
+
+    steps:
+      - name: Setup tools
+        run: |
+          apt-get update
+          apt-get install -y \
+            gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
+            libc6-dev-armhf-cross libatomic1-armhf-cross \
+            git build-essential pkg-config \
+            curl ca-certificates
+
+      - uses: actions/checkout@v5
+
+      - name: Config git
+        run: git config --global --add safe.directory "$(pwd)"
+
+      - name: Setup cmake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.x'
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-gnueabihf
+
+      - name: Download FFmpeg from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Install gh CLI
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          apt-get update && apt-get install -y gh
+
+          RELEASE_TAG=$(gh release list --repo ${{ github.repository }} \
+            --exclude-drafts --exclude-pre-releases \
+            --json tagName --jq '.[].tagName | select(startswith("ffmpeg-"))' \
+            | head -n1)
+
+          if [ -z "$RELEASE_TAG" ]; then
+            echo "ERROR: No FFmpeg release found!"
+            exit 1
+          fi
+
+          echo "Using FFmpeg release: $RELEASE_TAG"
+          mkdir -p ./ffmpeg-build
+
+          gh release download "$RELEASE_TAG" \
+            --repo ${{ github.repository }} \
+            --pattern "ffmpeg-armv7-unknown-linux-gnueabihf.tar.gz"
+          tar -xzf ffmpeg-armv7-unknown-linux-gnueabihf.tar.gz -C ./ffmpeg-build
+          rm ffmpeg-armv7-unknown-linux-gnueabihf.tar.gz
+
+          echo "FFMPEG_DIR=$(pwd)/ffmpeg-build" >> $GITHUB_ENV
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build
+        run: |
+          export CC=arm-linux-gnueabihf-gcc
+          export CXX=arm-linux-gnueabihf-g++
+          export AR=arm-linux-gnueabihf-ar
+          export RANLIB=arm-linux-gnueabihf-ranlib
+          export CFLAGS="-march=armv7-a -mfpu=neon -mfloat-abi=hard"
+          export CXXFLAGS="-march=armv7-a -mfpu=neon -mfloat-abi=hard"
+          export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
+          pnpm build --target armv7-unknown-linux-gnueabihf
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: bindings-armv7-unknown-linux-gnueabihf
+          path: '*.node'
+          if-no-files-found: error
+
   test-macOS-windows-binding:
     name: Test bindings on ${{ matrix.settings.target }} - node@${{ matrix.node }}
     needs:
@@ -270,6 +358,7 @@ jobs:
     name: Test ${{ matrix.target }} - node@${{ matrix.node }}
     needs:
       - build
+      - build-armv7
     strategy:
       fail-fast: false
       matrix:
