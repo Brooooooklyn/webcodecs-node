@@ -306,6 +306,70 @@ exec zig c++ {} $args
     Ok(())
   }
 
+  /// Generate a CMake toolchain file for zig cross-compilation.
+  /// This forces compiler ID detection which shell script wrappers confuse.
+  ///
+  /// When using zig wrapper scripts (#!/bin/sh that invoke zig cc), CMake cannot
+  /// correctly identify the compiler, which breaks x265's assembly configuration:
+  /// - x265 uses CMAKE_CXX_COMPILER_ID to set GCC/CLANG variables
+  /// - These control NASM flags (HAVE_ALIGNED_STACK) and ARM assembly compilation
+  /// - Without proper detection, assembly is either not compiled or uses wrong flags
+  ///
+  /// The toolchain file forces CMAKE_CXX_COMPILER_ID=Clang, which x265 handles correctly.
+  fn generate_cmake_toolchain(&mut self) -> io::Result<Option<PathBuf>> {
+    if !self.use_zig {
+      return Ok(None);
+    }
+
+    let wrapper_dir = self.ensure_zig_wrappers()?;
+    let cross = match self.cross_config() {
+      Some(c) => c,
+      None => return Ok(None),
+    };
+
+    let toolchain_path = wrapper_dir.join("toolchain.cmake");
+    let cc_path = wrapper_dir.join("cc");
+    let cxx_path = wrapper_dir.join("c++");
+
+    let toolchain_content = format!(
+      r#"# Auto-generated CMake toolchain file for zig cross-compilation
+# Forces compiler ID detection which shell script wrappers confuse
+
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR {arch})
+
+# Set compilers to zig wrappers
+set(CMAKE_C_COMPILER "{cc}")
+set(CMAKE_CXX_COMPILER "{cxx}")
+
+# Force compiler identification to Clang (zig is Clang-based)
+# This is critical for x265 which uses CMAKE_CXX_COMPILER_ID
+# to set GCC/CLANG variables that control assembly compilation
+set(CMAKE_C_COMPILER_ID Clang)
+set(CMAKE_CXX_COMPILER_ID Clang)
+set(CMAKE_C_COMPILER_FORCED TRUE)
+set(CMAKE_CXX_COMPILER_FORCED TRUE)
+
+# Disable compiler ABI detection (not needed for static libs)
+set(CMAKE_C_ABI_COMPILED TRUE)
+set(CMAKE_CXX_ABI_COMPILED TRUE)
+
+# Cross-compilation settings
+set(CMAKE_CROSSCOMPILING TRUE)
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+"#,
+      arch = cross.arch,
+      cc = cc_path.display(),
+      cxx = cxx_path.display(),
+    );
+
+    fs::write(&toolchain_path, toolchain_content)?;
+    self.log(&format!("Generated CMake toolchain: {:?}", toolchain_path));
+    Ok(Some(toolchain_path))
+  }
+
   /// Fix the prefix in a .pc file to point to the install directory
   fn fix_pc_file_prefix(&self, content: &str, prefix: &str) -> String {
     let mut result = String::new();
@@ -889,7 +953,7 @@ Cflags: -I${{includedir}}{}
   }
 
   /// Build x265
-  fn build_x265(&self) -> io::Result<()> {
+  fn build_x265(&mut self) -> io::Result<()> {
     self.info("Building x265...");
 
     let source = self.source_dir.join("x265_git");
@@ -930,20 +994,14 @@ Cflags: -I${{includedir}}{}
       "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".to_string(),
     ];
 
-    // Force cmake to properly detect zig as GCC/Clang-compatible for x265 SIMD configuration.
-    // x265's CMakeLists.txt uses CMAKE_CXX_COMPILER_ID to set GCC/CLANG variables which control:
-    // 1. SIMD intrinsic compiler flags (-msse3, -mssse3, -msse4.1)
-    // 2. NASM assembly flags (HAVE_ALIGNED_STACK)
-    // When using zig wrappers, cmake may not correctly detect the compiler ID.
-    if self.use_zig {
-      // Set CLANG=1 - enables Clang-specific optimizations (zig is Clang-based)
-      args.push("-DCLANG=1".to_string());
-      // Set GCC=1 - enables assembly file compilation (x265 CMakeLists.txt:714 requires this)
-      // Without GCC=1, x265 falls back to C implementations which have different precision
-      args.push("-DGCC=1".to_string());
-
-      // Set CMAKE_SIZEOF_VOID_P for proper X64 detection during cross-compilation.
-      // x265 uses this to determine if we're building for 64-bit (X64=1).
+    // For zig builds, use a CMake toolchain file that forces compiler ID detection.
+    // Shell script wrappers confuse CMake's compiler identification, which breaks x265's
+    // assembly configuration (GCC/CLANG variables control NASM flags and ARM assembly).
+    // The toolchain file forces CMAKE_CXX_COMPILER_ID=Clang, which x265 handles correctly.
+    if let Some(toolchain) = self.generate_cmake_toolchain()? {
+      args.push(format!("-DCMAKE_TOOLCHAIN_FILE={}", toolchain.display()));
+      // Toolchain file handles cross-compilation settings, but we still need CMAKE_SIZEOF_VOID_P
+      // for x265's X64 detection (it uses this to determine 64-bit builds).
       if let Some(cross) = self.cross_config() {
         match cross.arch.as_str() {
           "x86_64" | "aarch64" => {
@@ -954,10 +1012,10 @@ Cflags: -I${{includedir}}{}
           }
         }
       }
+    } else {
+      // Non-zig builds: use standard cmake cross-compilation hints
+      args.extend(self.cmake_cross_args());
     }
-
-    // Add cross-compilation hints for CMake
-    args.extend(self.cmake_cross_args());
 
     let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     self.run_cmake(&cmake_source, &build_dir, &args_refs)?;
