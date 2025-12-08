@@ -15,8 +15,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # NAPI-RS bindings
-napi = { version = "3.0.0", features = ["async", "napi8", "web_stream"] }
-napi-derive = "3.0.0"
+napi = { version = "3", features = ["async", "napi4", "web_stream"] }
+napi-derive = "3"
 
 futures = "0.3"
 
@@ -31,7 +31,7 @@ crossbeam = "0.8"
 
 [build-dependencies]
 napi-build = "2"
-cc = "1.0"
+cc = "1"
 
 [profile.release]
 lto = true

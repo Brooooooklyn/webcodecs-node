@@ -7,9 +7,6 @@ on:
         description: 'FFmpeg version tag (e.g., n8.0.1)'
         required: true
         default: 'n8.0.1'
-  push:
-    branches:
-      - prepare-release
 
 env:
   FFMPEG_VERSION: ${{ github.event.inputs.ffmpeg_version || 'n8.0.1' }}
