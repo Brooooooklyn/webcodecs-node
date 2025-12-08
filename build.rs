@@ -449,6 +449,24 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
     // Optional libraries are silently skipped if not found
   }
 
+  // Link libgcc FIRST for armv7 - must come BEFORE --whole-archive block.
+  // libaom uses Highway SIMD library which generates f16 conversion code on ARM NEON.
+  // On ARMv7, these conversions require __gnu_f2h_ieee from libgcc.
+  // Static linker is order-sensitive: libgcc must appear BEFORE libaom.
+  let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+  if target_arch == "arm" && target_os == "linux" {
+    let cc = env::var("CC").unwrap_or_else(|_| "gcc".to_string());
+    if let Ok(output) = Command::new(&cc).arg("-print-libgcc-file-name").output() {
+      if output.status.success() {
+        let libgcc_path = String::from_utf8_lossy(&output.stdout);
+        let libgcc_path = libgcc_path.trim();
+        if !libgcc_path.is_empty() && Path::new(libgcc_path).exists() {
+          println!("cargo:rustc-link-arg={}", libgcc_path);
+        }
+      }
+    }
+  }
+
   // Link codec libraries with --whole-archive on Linux
   if use_whole_archive && !codec_paths.is_empty() {
     println!("cargo:rustc-link-arg=-Wl,--whole-archive");
@@ -581,26 +599,6 @@ fn link_platform_libraries(target_os: &str) {
       println!("cargo:rustc-link-lib=m");
       println!("cargo:rustc-link-lib=pthread");
       println!("cargo:rustc-link-lib=dl");
-
-      // Link libgcc for armv7 - provides __gnu_f2h_ieee half-precision float intrinsic.
-      // libaom uses Highway SIMD library which generates f16 conversion code on ARM NEON.
-      // On ARMv7, these conversions require __gnu_f2h_ieee from libgcc.
-      let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-      if target_arch == "arm" {
-        // Get libgcc path from the cross-compiler.
-        // The CC env var is set by CI: CC=arm-linux-gnueabihf-gcc
-        let cc = env::var("CC").unwrap_or_else(|_| "gcc".to_string());
-        if let Ok(output) = Command::new(&cc).arg("-print-libgcc-file-name").output() {
-          if output.status.success() {
-            let libgcc_path = String::from_utf8_lossy(&output.stdout);
-            let libgcc_path = libgcc_path.trim();
-            if let Some(libgcc_dir) = Path::new(libgcc_path).parent() {
-              println!("cargo:rustc-link-search=native={}", libgcc_dir.display());
-            }
-          }
-        }
-        println!("cargo:rustc-link-lib=static=gcc");
-      }
 
       // VAAPI for hardware acceleration (if available)
       #[cfg(feature = "hwaccel")]
