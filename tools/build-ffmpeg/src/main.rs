@@ -668,10 +668,10 @@ Cflags: -I${{includedir}}{}
     if status.success() {
       Ok(())
     } else {
-      Err(io::Error::new(
-        io::ErrorKind::Other,
-        format!("Command failed with status: {}", status),
-      ))
+      Err(io::Error::other(format!(
+        "Command failed with status: {}",
+        status
+      )))
     }
   }
 
@@ -682,10 +682,10 @@ Cflags: -I${{includedir}}{}
     if status.success() {
       Ok(())
     } else {
-      Err(io::Error::new(
-        io::ErrorKind::Other,
-        format!("Command failed with status: {}", status),
-      ))
+      Err(io::Error::other(format!(
+        "Command failed with status: {}",
+        status
+      )))
     }
   }
 
@@ -1085,15 +1085,12 @@ Cflags: -I${{includedir}}
 
       // ARM SIMD optimizations - zig wrapper transforms -march flags to -mcpu=generic+feature
       // Note: armv7 uses generic-gnu target so NEON is not available via assembly
-      match cross.arch.as_str() {
-        "aarch64" => {
-          args.push("--enable-neon".to_string());
-          args.push("--enable-neon-dotprod".to_string());
-          args.push("--enable-neon-i8mm".to_string());
-          args.push("--enable-sve".to_string());
-          args.push("--enable-sve2".to_string());
-        }
-        _ => {}
+      if cross.arch.as_str() == "aarch64" {
+        args.push("--enable-neon".to_string());
+        args.push("--enable-neon-dotprod".to_string());
+        args.push("--enable-neon-i8mm".to_string());
+        args.push("--enable-sve".to_string());
+        args.push("--enable-sve2".to_string());
       }
     }
 
@@ -1271,6 +1268,15 @@ Cflags: -I${{includedir}}
       "--disable-frontend".to_string(),
       "--with-pic".to_string(),
     ];
+
+    // Enable NASM assembly for x86 targets (improves encoding performance)
+    let is_x86 = match &self.target {
+      Some(target) => target.contains("x86_64") || target.contains("i686"),
+      None => cfg!(target_arch = "x86_64") || cfg!(target_arch = "x86"),
+    };
+    if is_x86 {
+      args.push("--enable-nasm".to_string());
+    }
 
     // Cross-compilation: zig handles toolchain via CC/CXX, just need --host for config detection
     if let Some(target) = &self.target {
@@ -1480,6 +1486,7 @@ Cflags: -I${{includedir}}
       "-DWEBP_BUILD_WEBPMUX=OFF".to_string(),
       "-DWEBP_BUILD_EXTRAS=OFF".to_string(),
       "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".to_string(),
+      "-DWEBP_ENABLE_SIMD=ON".to_string(), // Enable SIMD optimizations (SSE/NEON)
     ];
 
     // Add cross-compilation hints for CMake
