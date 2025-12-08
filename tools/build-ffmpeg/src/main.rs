@@ -983,7 +983,9 @@ Cflags: -I${{includedir}}{}
       format!("-DCMAKE_INSTALL_PREFIX={}", prefix_str),
       "-DENABLE_SHARED=OFF".to_string(),
       "-DENABLE_CLI=OFF".to_string(),
-      "-DHIGH_BIT_DEPTH=ON".to_string(),
+      // Use 8-bit encoding by default. HIGH_BIT_DEPTH=ON would only support 10/12-bit input,
+      // which breaks 8-bit I420 frames. Multi-lib build would be needed for both.
+      "-DHIGH_BIT_DEPTH=OFF".to_string(),
       // Disable assembly for armv7 - cross-compiled ARM assembly doesn't link properly
       // x265's setupAssemblyPrimitives() is missing when cross-compiling for armv7
       if is_armv7 {
