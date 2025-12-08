@@ -56,6 +56,7 @@ struct BuildContext {
 }
 
 /// Cross-compilation configuration (architecture/OS detection only, zig handles toolchain)
+#[derive(Clone)]
 struct CrossCompileConfig {
   /// Target architecture (e.g., "aarch64", "x86_64")
   arch: String,
@@ -952,9 +953,16 @@ Cflags: -I${{includedir}}{}
     Ok(())
   }
 
-  /// Build x265
+  /// Build x265 with multi-lib support (8-bit, 10-bit, 12-bit)
+  ///
+  /// x265 multi-lib allows encoding at any bit depth from a single library.
+  /// The build process:
+  /// 1. Build 12-bit library (HIGH_BIT_DEPTH=ON, MAIN12=ON)
+  /// 2. Build 10-bit library (HIGH_BIT_DEPTH=ON)
+  /// 3. Build 8-bit library with links to 10-bit and 12-bit
+  /// 4. Combine all three into a single static library
   fn build_x265(&mut self) -> io::Result<()> {
-    self.info("Building x265...");
+    self.info("Building x265 (multi-lib: 8/10/12-bit)...");
 
     let source = self.source_dir.join("x265_git");
     self.git_clone(X265_REPO, Some(X265_BRANCH), &source)?;
@@ -966,11 +974,8 @@ Cflags: -I${{includedir}}{}
       .current_dir(&source);
     let _ = self.run_command(&mut cmd); // Ignore errors if already fetched
 
-    let build_dir = source.join("build").join("custom");
-    fs::create_dir_all(&build_dir)?;
-
-    let prefix_str = self.prefix.to_string_lossy().to_string();
     let cmake_source = source.join("source");
+    let multilib_dir = source.join("build").join("multilib");
 
     // Check if this is armv7 target (assembly doesn't work reliably with cross-compilation)
     let is_armv7 = self
@@ -979,55 +984,197 @@ Cflags: -I${{includedir}}{}
       .map(|t| t.starts_with("armv7") || t.starts_with("arm-"))
       .unwrap_or(false);
 
-    let mut args = vec![
-      format!("-DCMAKE_INSTALL_PREFIX={}", prefix_str),
-      "-DENABLE_SHARED=OFF".to_string(),
-      "-DENABLE_CLI=OFF".to_string(),
-      // Use 8-bit encoding by default. HIGH_BIT_DEPTH=ON would only support 10/12-bit input,
-      // which breaks 8-bit I420 frames. Multi-lib build would be needed for both.
-      "-DHIGH_BIT_DEPTH=OFF".to_string(),
-      // Disable assembly for armv7 - cross-compiled ARM assembly doesn't link properly
-      // x265's setupAssemblyPrimitives() is missing when cross-compiling for armv7
-      if is_armv7 {
-        "-DENABLE_ASSEMBLY=OFF".to_string()
-      } else {
-        "-DENABLE_ASSEMBLY=ON".to_string()
-      },
-      "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".to_string(),
-    ];
+    // Generate toolchain file once for all builds
+    let toolchain = self.generate_cmake_toolchain()?;
 
-    // For zig builds, use a CMake toolchain file that forces compiler ID detection.
-    // Shell script wrappers confuse CMake's compiler identification, which breaks x265's
-    // assembly configuration (GCC/CLANG variables control NASM flags and ARM assembly).
-    // The toolchain file forces CMAKE_CXX_COMPILER_ID=Clang, which x265 handles correctly.
-    if let Some(toolchain) = self.generate_cmake_toolchain()? {
-      args.push(format!("-DCMAKE_TOOLCHAIN_FILE={}", toolchain.display()));
-      // Toolchain file handles cross-compilation settings, but we still need CMAKE_SIZEOF_VOID_P
-      // for x265's X64 detection (it uses this to determine 64-bit builds).
-      if let Some(cross) = self.cross_config() {
-        match cross.arch.as_str() {
-          "x86_64" | "aarch64" => {
-            args.push("-DCMAKE_SIZEOF_VOID_P=8".to_string());
-          }
-          _ => {
-            args.push("-DCMAKE_SIZEOF_VOID_P=4".to_string());
+    // Helper to get common CMake args for all bit-depth builds
+    let get_common_args = |prefix: &str| -> Vec<String> {
+      let args = vec![
+        format!("-DCMAKE_INSTALL_PREFIX={}", prefix),
+        "-DENABLE_SHARED=OFF".to_string(),
+        "-DENABLE_CLI=OFF".to_string(),
+        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".to_string(),
+        if is_armv7 {
+          "-DENABLE_ASSEMBLY=OFF".to_string()
+        } else {
+          "-DENABLE_ASSEMBLY=ON".to_string()
+        },
+      ];
+      args
+    };
+
+    // Helper to add toolchain args
+    let add_toolchain_args =
+      |args: &mut Vec<String>,
+       toolchain: &Option<PathBuf>,
+       cross_config: Option<CrossCompileConfig>| {
+        if let Some(tc) = toolchain {
+          args.push(format!("-DCMAKE_TOOLCHAIN_FILE={}", tc.display()));
+          if let Some(cross) = cross_config {
+            match cross.arch.as_str() {
+              "x86_64" | "aarch64" => args.push("-DCMAKE_SIZEOF_VOID_P=8".to_string()),
+              _ => args.push("-DCMAKE_SIZEOF_VOID_P=4".to_string()),
+            }
           }
         }
-      }
-    } else {
-      // Non-zig builds: use standard cmake cross-compilation hints
-      args.extend(self.cmake_cross_args());
+      };
+
+    let cross_config = self.cross_config();
+    let prefix_str = self.prefix.to_string_lossy().to_string();
+
+    // ========== Step 1: Build 12-bit library ==========
+    self.log("Building x265 12-bit library...");
+    let build_12bit = multilib_dir.join("12bit");
+    fs::create_dir_all(&build_12bit)?;
+
+    let mut args_12bit = get_common_args(&prefix_str);
+    args_12bit.extend([
+      "-DHIGH_BIT_DEPTH=ON".to_string(),
+      "-DMAIN12=ON".to_string(),
+      "-DEXPORT_C_API=OFF".to_string(), // Don't export API, will be linked into main lib
+    ]);
+    add_toolchain_args(&mut args_12bit, &toolchain, cross_config.clone());
+    if toolchain.is_none() {
+      args_12bit.extend(self.cmake_cross_args());
     }
 
-    let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    self.run_cmake(&cmake_source, &build_dir, &args_refs)?;
-    self.run_cmake_build(&build_dir)?;
-    self.run_cmake_install(&build_dir)?;
+    let args_refs: Vec<&str> = args_12bit.iter().map(|s| s.as_str()).collect();
+    self.run_cmake(&cmake_source, &build_12bit, &args_refs)?;
+    self.run_cmake_build(&build_12bit)?;
 
-    // Generate x265.pc manually (CMake doesn't always generate it)
+    // ========== Step 2: Build 10-bit library ==========
+    self.log("Building x265 10-bit library...");
+    let build_10bit = multilib_dir.join("10bit");
+    fs::create_dir_all(&build_10bit)?;
+
+    let mut args_10bit = get_common_args(&prefix_str);
+    args_10bit.extend([
+      "-DHIGH_BIT_DEPTH=ON".to_string(),
+      "-DEXPORT_C_API=OFF".to_string(), // Don't export API, will be linked into main lib
+    ]);
+    add_toolchain_args(&mut args_10bit, &toolchain, cross_config.clone());
+    if toolchain.is_none() {
+      args_10bit.extend(self.cmake_cross_args());
+    }
+
+    let args_refs: Vec<&str> = args_10bit.iter().map(|s| s.as_str()).collect();
+    self.run_cmake(&cmake_source, &build_10bit, &args_refs)?;
+    self.run_cmake_build(&build_10bit)?;
+
+    // ========== Step 3: Build 8-bit library (main) ==========
+    self.log("Building x265 8-bit library (main)...");
+    let build_8bit = multilib_dir.join("8bit");
+    fs::create_dir_all(&build_8bit)?;
+
+    // Create symlinks to the 10-bit and 12-bit libraries
+    let lib_10bit = build_10bit.join("libx265.a");
+    let lib_12bit = build_12bit.join("libx265.a");
+    let link_10bit = build_8bit.join("libx265_main10.a");
+    let link_12bit = build_8bit.join("libx265_main12.a");
+
+    // Remove old symlinks if they exist
+    let _ = fs::remove_file(&link_10bit);
+    let _ = fs::remove_file(&link_12bit);
+
+    #[cfg(unix)]
+    {
+      std::os::unix::fs::symlink(&lib_10bit, &link_10bit)?;
+      std::os::unix::fs::symlink(&lib_12bit, &link_12bit)?;
+    }
+    #[cfg(not(unix))]
+    {
+      fs::copy(&lib_10bit, &link_10bit)?;
+      fs::copy(&lib_12bit, &link_12bit)?;
+    }
+
+    let mut args_8bit = get_common_args(&prefix_str);
+    args_8bit.extend([
+      "-DEXTRA_LIB=x265_main10.a;x265_main12.a".to_string(),
+      format!("-DEXTRA_LINK_FLAGS=-L{}", build_8bit.display()),
+      "-DLINKED_10BIT=ON".to_string(),
+      "-DLINKED_12BIT=ON".to_string(),
+    ]);
+    add_toolchain_args(&mut args_8bit, &toolchain, cross_config);
+    if toolchain.is_none() {
+      args_8bit.extend(self.cmake_cross_args());
+    }
+
+    let args_refs: Vec<&str> = args_8bit.iter().map(|s| s.as_str()).collect();
+    self.run_cmake(&cmake_source, &build_8bit, &args_refs)?;
+    self.run_cmake_build(&build_8bit)?;
+
+    // ========== Step 4: Combine libraries ==========
+    self.log("Combining x265 multi-lib into single static library...");
+
+    let lib_8bit = build_8bit.join("libx265.a");
+    let lib_main = build_8bit.join("libx265_main.a");
+    let lib_combined = build_8bit.join("libx265_combined.a");
+
+    // Rename 8-bit library
+    fs::rename(&lib_8bit, &lib_main)?;
+
+    // Combine all three libraries
+    #[cfg(target_os = "macos")]
+    {
+      // macOS: use libtool
+      let mut cmd = Command::new("libtool");
+      cmd.args([
+        "-static",
+        "-o",
+        lib_combined.to_str().unwrap(),
+        lib_main.to_str().unwrap(),
+        lib_10bit.to_str().unwrap(),
+        lib_12bit.to_str().unwrap(),
+      ]);
+      self.run_command(&mut cmd)?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+      // Linux: use ar with MRI script
+      let mri_script = build_8bit.join("combine.mri");
+      let mri_content = format!(
+        "CREATE {}\nADDLIB {}\nADDLIB {}\nADDLIB {}\nSAVE\nEND\n",
+        lib_combined.display(),
+        lib_main.display(),
+        lib_10bit.display(),
+        lib_12bit.display()
+      );
+      fs::write(&mri_script, mri_content)?;
+
+      // Try zig ar first, then fall back to system ar
+      let ar_cmd = if self.use_zig { "zig" } else { "ar" };
+      let ar_args: Vec<&str> = if self.use_zig {
+        vec!["ar", "-M"]
+      } else {
+        vec!["-M"]
+      };
+
+      let mut cmd = Command::new(ar_cmd);
+      cmd.args(&ar_args).stdin(fs::File::open(&mri_script)?);
+      self.run_command(&mut cmd)?;
+    }
+
+    // ========== Step 5: Install ==========
+    self.log("Installing x265 multi-lib...");
+
+    // Install combined library
+    let lib_dir = self.prefix.join("lib");
+    fs::create_dir_all(&lib_dir)?;
+    fs::copy(&lib_combined, lib_dir.join("libx265.a"))?;
+
+    // Install headers
+    let include_dir = self.prefix.join("include");
+    fs::create_dir_all(&include_dir)?;
+
+    // Copy headers from 8-bit build (they're the same for all bit depths)
+    let x265_h = cmake_source.join("x265.h");
+    let x265_config_h = build_8bit.join("x265_config.h");
+    fs::copy(&x265_h, include_dir.join("x265.h"))?;
+    fs::copy(&x265_config_h, include_dir.join("x265_config.h"))?;
+
+    // Generate x265.pc manually
     let pkgconfig_dir = self.prefix.join("lib").join("pkgconfig");
     fs::create_dir_all(&pkgconfig_dir)?;
-    let prefix_str = self.prefix.to_string_lossy().to_string();
     let x265_pc = format!(
       r#"prefix={}
 exec_prefix=${{prefix}}
@@ -1035,7 +1182,7 @@ libdir=${{exec_prefix}}/lib
 includedir=${{prefix}}/include
 
 Name: x265
-Description: H.265/HEVC video encoder
+Description: H.265/HEVC video encoder (multi-lib: 8/10/12-bit)
 Version: {}
 Libs: -L${{libdir}} -lx265
 Libs.private: -lstdc++ -lm -lpthread -ldl
@@ -1047,7 +1194,7 @@ Cflags: -I${{includedir}}
     fs::write(pkgconfig_dir.join("x265.pc"), x265_pc)?;
     self.log("Generated x265.pc");
 
-    self.info("x265 built successfully");
+    self.info("x265 multi-lib built successfully (8/10/12-bit support)");
     Ok(())
   }
 
