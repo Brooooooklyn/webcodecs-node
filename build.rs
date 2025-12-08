@@ -583,10 +583,22 @@ fn link_platform_libraries(target_os: &str) {
       println!("cargo:rustc-link-lib=dl");
 
       // Link libgcc for armv7 - provides __gnu_f2h_ieee half-precision float intrinsic.
-      // When using zig as the cross-compiler for armv7, zig generates code that calls
-      // __gnu_f2h_ieee for half-precision float conversions, but doesn't link libgcc.
+      // libaom uses Highway SIMD library which generates f16 conversion code on ARM NEON.
+      // On ARMv7, these conversions require __gnu_f2h_ieee from libgcc.
       let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
       if target_arch == "arm" {
+        // Get libgcc path from the cross-compiler.
+        // The CC env var is set by CI: CC=arm-linux-gnueabihf-gcc
+        let cc = env::var("CC").unwrap_or_else(|_| "gcc".to_string());
+        if let Ok(output) = Command::new(&cc).arg("-print-libgcc-file-name").output() {
+          if output.status.success() {
+            let libgcc_path = String::from_utf8_lossy(&output.stdout);
+            let libgcc_path = libgcc_path.trim();
+            if let Some(libgcc_dir) = Path::new(libgcc_path).parent() {
+              println!("cargo:rustc-link-search=native={}", libgcc_dir.display());
+            }
+          }
+        }
         println!("cargo:rustc-link-lib=static=gcc");
       }
 
