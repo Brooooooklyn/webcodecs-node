@@ -103,6 +103,10 @@ jobs:
             download_ffmpeg: true
     name: stable - ${{ matrix.settings.target }} - node@24
     runs-on: ${{ matrix.settings.host }}
+    permissions:
+      id-token: write
+      attestations: write
+      contents: read
     steps:
       - uses: actions/checkout@v5
       - name: setup pnpm
@@ -203,6 +207,11 @@ jobs:
       - name: Build
         run: ${{ matrix.settings.build }}
         shell: bash
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        if: matrix.settings.target != 'wasm32-wasip1-threads'
+        with:
+          subject-path: '*.node'
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         if: matrix.settings.target != 'wasm32-wasip1-threads'
@@ -224,6 +233,10 @@ jobs:
   build-armv7:
     name: stable - armv7-unknown-linux-gnueabihf - node@24
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      attestations: write
+      contents: read
     container:
       image: debian:bullseye
 
@@ -303,6 +316,11 @@ jobs:
           export CXXFLAGS="-march=armv7-a -mfpu=neon -mfloat-abi=hard"
           export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
           pnpm build --target armv7-unknown-linux-gnueabihf
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: '*.node'
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
