@@ -1114,9 +1114,15 @@ Cflags: -I${{includedir}}{}
     fs::rename(&lib_8bit, &lib_main)?;
 
     // Combine all three libraries
-    #[cfg(target_os = "macos")]
-    {
-      // macOS: use libtool
+    // Determine target OS (not host OS) for choosing the right archiver
+    let is_target_macos = self
+      .target
+      .as_ref()
+      .map(|t| t.contains("darwin") || t.contains("apple"))
+      .unwrap_or(cfg!(target_os = "macos"));
+
+    if is_target_macos {
+      // macOS targets: use libtool
       let mut cmd = Command::new("libtool");
       cmd.args([
         "-static",
@@ -1127,10 +1133,8 @@ Cflags: -I${{includedir}}{}
         lib_12bit.to_str().unwrap(),
       ]);
       self.run_command(&mut cmd)?;
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-      // Linux: use ar with MRI script
+    } else {
+      // Linux/Windows targets: use ar with MRI script
       let mri_script = build_8bit.join("combine.mri");
       let mri_content = format!(
         "CREATE {}\nADDLIB {}\nADDLIB {}\nADDLIB {}\nSAVE\nEND\n",
@@ -1141,7 +1145,7 @@ Cflags: -I${{includedir}}{}
       );
       fs::write(&mri_script, mri_content)?;
 
-      // Try zig ar first, then fall back to system ar
+      // Use zig ar for cross-compilation, system ar otherwise
       let ar_cmd = if self.use_zig { "zig" } else { "ar" };
       let ar_args: Vec<&str> = if self.use_zig {
         vec!["ar", "-M"]
