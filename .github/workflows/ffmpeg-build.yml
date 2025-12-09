@@ -262,8 +262,8 @@ jobs:
               printf 'Version: %s\n' "$version"
               printf 'Libs: %s\n' "$libs"
               printf 'Cflags: %s\n' "$cflags"
-              [ -n "$libs_private" ] && printf 'Libs.private: %s\n' "$libs_private"
-              [ -n "$requires" ] && printf 'Requires: %s\n' "$requires"
+              if [ -n "$libs_private" ]; then printf 'Libs.private: %s\n' "$libs_private"; fi
+              if [ -n "$requires" ]; then printf 'Requires: %s\n' "$requires"; fi
             } > "$file"
           }
 
@@ -376,7 +376,7 @@ jobs:
 
           # Copy vcpkg codec libs that FFmpeg depends on
           $vcpkgLibDir = "$env:VCPKG_ROOT/installed/x64-windows-static/lib"
-          $codecLibs = @("x264.lib", "x265.lib", "x265-static.lib", "vpx.lib", "opus.lib", "mp3lame.lib", "mpghip.lib", "vorbis.lib", "vorbisenc.lib", "ogg.lib", "webp.lib", "webpdecoder.lib", "webpdemux.lib", "webpmux.lib", "sharpyuv.lib", "zlib.lib")
+          $codecLibs = @("libx264.lib", "x265-static.lib", "vpx.lib", "opus.lib", "libmp3lame-static.lib", "libmpghip-static.lib", "vorbis.lib", "vorbisenc.lib", "vorbisfile.lib", "ogg.lib", "libwebp.lib", "libwebpdecoder.lib", "libwebpdemux.lib", "libwebpmux.lib", "libsharpyuv.lib", "zlib.lib")
           foreach ($lib in $codecLibs) {
             $srcPath = "$vcpkgLibDir/$lib"
             if (Test-Path $srcPath) {
