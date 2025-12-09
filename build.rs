@@ -610,8 +610,8 @@ fn link_platform_libraries(target_os: &str) {
     }
 
     "windows" => {
-      // Windows system libraries required by FFmpeg
-      // Based on rust-ffmpeg-sys requirements
+      // Windows system libraries required by FFmpeg and rav1e
+      // Based on rust-ffmpeg-sys requirements + rav1e dependencies
       let libs = [
         "bcrypt",   // Cryptography
         "ole32",    // COM/OLE
@@ -627,6 +627,8 @@ fn link_platform_libraries(target_os: &str) {
         "advapi32", // Advanced Windows API
         "mfplat",   // Media Foundation Platform
         "mfuuid",   // Media Foundation GUIDs
+        "userenv",  // User environment (required by rav1e)
+        "ntdll",    // NT runtime (required by rav1e)
       ];
 
       for lib in &libs {

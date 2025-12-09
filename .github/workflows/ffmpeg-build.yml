@@ -75,20 +75,9 @@ jobs:
           path: ffmpeg-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
-  # Build Windows targets using vcpkg (pure MSVC, no MSYS2/MinGW)
-  build-ffmpeg-windows:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-pc-windows-msvc
-            triplet: x64-windows-static
-            arch: x64
-          - target: aarch64-pc-windows-msvc
-            triplet: arm64-windows-static
-            arch: arm64
-
-    name: Build ${{ matrix.target }}
+  # Build Windows arm64 using vcpkg (libaom for AV1)
+  build-ffmpeg-windows-arm64:
+    name: Build aarch64-pc-windows-msvc
     runs-on: windows-latest
     permissions:
       id-token: write
@@ -96,7 +85,7 @@ jobs:
       contents: read
 
     env:
-      VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
+      VCPKG_DEFAULT_TRIPLET: arm64-windows-static
 
     steps:
       - uses: actions/checkout@v4
@@ -108,30 +97,30 @@ jobs:
 
       - name: Install FFmpeg with codecs via vcpkg
         run: |
-          vcpkg install ffmpeg[avcodec,swresample,swscale,gpl,x264,x265,vpx,aom,opus,mp3lame,vorbis,webp,zlib]:${{ matrix.triplet }}
+          vcpkg install ffmpeg[avcodec,swresample,swscale,gpl,x264,x265,vpx,aom,opus,mp3lame,vorbis,webp,zlib]:arm64-windows-static
 
       - name: List vcpkg installed libraries
         run: |
           Write-Host "=== All installed .lib files in vcpkg ==="
-          Get-ChildItem "$env:VCPKG_ROOT/installed/${{ matrix.triplet }}/lib/*.lib" | ForEach-Object { $_.Name }
+          Get-ChildItem "$env:VCPKG_ROOT/installed/arm64-windows-static/lib/*.lib" | ForEach-Object { $_.Name }
 
       - name: Prepare output directory
         run: |
-          $prefix = "ffmpeg-${{ matrix.target }}"
+          $prefix = "ffmpeg-aarch64-pc-windows-msvc"
           New-Item -ItemType Directory -Force -Path "$prefix/lib"
           New-Item -ItemType Directory -Force -Path "$prefix/include"
 
           # Copy libraries
-          Copy-Item -Path "$env:VCPKG_ROOT/installed/${{ matrix.triplet }}/lib/*.lib" -Destination "$prefix/lib/" -Force
+          Copy-Item -Path "$env:VCPKG_ROOT/installed/arm64-windows-static/lib/*.lib" -Destination "$prefix/lib/" -Force
 
           # Copy headers
-          Copy-Item -Path "$env:VCPKG_ROOT/installed/${{ matrix.triplet }}/include/libav*" -Destination "$prefix/include/" -Recurse -Force
-          Copy-Item -Path "$env:VCPKG_ROOT/installed/${{ matrix.triplet }}/include/libsw*" -Destination "$prefix/include/" -Recurse -Force
+          Copy-Item -Path "$env:VCPKG_ROOT/installed/arm64-windows-static/include/libav*" -Destination "$prefix/include/" -Recurse -Force
+          Copy-Item -Path "$env:VCPKG_ROOT/installed/arm64-windows-static/include/libsw*" -Destination "$prefix/include/" -Recurse -Force
 
           # Copy codec headers if present
           $codecHeaders = @("x264.h", "x264_config.h", "x265.h", "x265_config.h", "vpx", "aom", "opus", "lame", "vorbis", "ogg", "webp")
           foreach ($header in $codecHeaders) {
-            $srcPath = "$env:VCPKG_ROOT/installed/${{ matrix.triplet }}/include/$header"
+            $srcPath = "$env:VCPKG_ROOT/installed/arm64-windows-static/include/$header"
             if (Test-Path $srcPath) {
               Copy-Item -Path $srcPath -Destination "$prefix/include/" -Recurse -Force
             }
@@ -145,18 +134,250 @@ jobs:
 
       - name: Create archive
         run: |
-          Compress-Archive -Path "ffmpeg-${{ matrix.target }}/*" -DestinationPath "ffmpeg-${{ matrix.target }}.zip"
+          Compress-Archive -Path "ffmpeg-aarch64-pc-windows-msvc/*" -DestinationPath "ffmpeg-aarch64-pc-windows-msvc.zip"
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: ffmpeg-${{ matrix.target }}.zip
+          subject-path: ffmpeg-aarch64-pc-windows-msvc.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ffmpeg-${{ matrix.target }}
-          path: ffmpeg-${{ matrix.target }}.zip
+          name: ffmpeg-aarch64-pc-windows-msvc
+          path: ffmpeg-aarch64-pc-windows-msvc.zip
+          if-no-files-found: error
+
+  # Build Windows x64 from source with rav1e (libaom crashes on Windows MSVC)
+  build-ffmpeg-windows-x64:
+    name: Build x86_64-pc-windows-msvc
+    runs-on: windows-latest
+    permissions:
+      id-token: write
+      attestations: write
+      contents: read
+
+    env:
+      VCPKG_DEFAULT_TRIPLET: x64-windows-static
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Visual Studio environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          update: true
+          path-type: inherit
+          install: >-
+            make
+            diffutils
+            pkg-config
+
+      - name: Setup NASM
+        uses: ilammy/setup-nasm@v1
+
+      - name: Download rav1e prebuilt
+        shell: pwsh
+        run: |
+          $RAV1E_VERSION = "0.8.1"
+          $url = "https://github.com/xiph/rav1e/releases/download/v$RAV1E_VERSION/rav1e-$RAV1E_VERSION-windows-msvc-generic.zip"
+          Invoke-WebRequest -Uri $url -OutFile rav1e.zip
+          Expand-Archive -Path rav1e.zip -DestinationPath rav1e-extracted
+          # rav1e extracts to rav1e-windows-msvc-sdk/
+          Move-Item "rav1e-extracted/rav1e-windows-msvc-sdk" rav1e-dist
+          Write-Host "=== rav1e contents ==="
+          Get-ChildItem rav1e-dist -Recurse
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: '74e6536215718009aae747d86d84b78376bf9e09'
+
+      - name: Install codec dependencies (without FFmpeg)
+        run: |
+          vcpkg install `
+            x264:x64-windows-static `
+            x265:x64-windows-static `
+            libvpx:x64-windows-static `
+            opus:x64-windows-static `
+            mp3lame:x64-windows-static `
+            libogg:x64-windows-static `
+            libvorbis:x64-windows-static `
+            libwebp:x64-windows-static `
+            zlib:x64-windows-static
+
+      - name: Clone FFmpeg
+        run: |
+          git clone --depth=1 -b ${{ env.FFMPEG_VERSION }} https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+
+      - name: Create pkg-config files
+        shell: pwsh
+        run: |
+          $vcpkgInstalled = "$env:VCPKG_ROOT/installed/x64-windows-static"
+          $rav1eDir = "$PWD/rav1e-dist"
+
+          New-Item -ItemType Directory -Force -Path pkgconfig
+
+          # Helper function to create pkg-config files without leading whitespace
+          function Write-PkgConfig {
+            param($Path, $Prefix, $Name, $Desc, $Version, $Libs, $Cflags, $LibsPrivate, $Requires)
+            $content = "prefix=$Prefix`nlibdir=`${prefix}/lib`nincludedir=`${prefix}/include`n`nName: $Name`nDescription: $Desc`nVersion: $Version`nLibs: $Libs`nCflags: $Cflags"
+            if ($LibsPrivate) { $content += "`nLibs.private: $LibsPrivate" }
+            if ($Requires) { $content += "`nRequires: $Requires" }
+            $content | Set-Content -Path $Path -NoNewline
+          }
+
+          # rav1e
+          Write-PkgConfig -Path "pkgconfig/rav1e.pc" -Prefix $rav1eDir -Name "rav1e" -Desc "rav1e AV1 encoder" -Version "0.8.1" -Libs '-L${libdir} -lrav1e' -Cflags '-I${includedir}/rav1e' -LibsPrivate "-lws2_32 -luserenv -lntdll -lbcrypt -lkernel32 -ldbghelp"
+
+          # x264
+          Write-PkgConfig -Path "pkgconfig/x264.pc" -Prefix $vcpkgInstalled -Name "x264" -Desc "x264 H.264 encoder" -Version "0.164" -Libs '-L${libdir} -lx264' -Cflags '-I${includedir}'
+
+          # x265
+          Write-PkgConfig -Path "pkgconfig/x265.pc" -Prefix $vcpkgInstalled -Name "x265" -Desc "x265 HEVC encoder" -Version "3.5" -Libs '-L${libdir} -lx265-static' -Cflags '-I${includedir}'
+
+          # vpx
+          Write-PkgConfig -Path "pkgconfig/vpx.pc" -Prefix $vcpkgInstalled -Name "vpx" -Desc "WebM VP8/VP9 codec" -Version "1.13.0" -Libs '-L${libdir} -lvpx' -Cflags '-I${includedir}'
+
+          # opus
+          Write-PkgConfig -Path "pkgconfig/opus.pc" -Prefix $vcpkgInstalled -Name "opus" -Desc "Opus audio codec" -Version "1.4" -Libs '-L${libdir} -lopus' -Cflags '-I${includedir}/opus'
+
+          # libmp3lame
+          Write-PkgConfig -Path "pkgconfig/libmp3lame.pc" -Prefix $vcpkgInstalled -Name "libmp3lame" -Desc "LAME MP3 encoder" -Version "3.100" -Libs '-L${libdir} -lmp3lame' -Cflags '-I${includedir}'
+
+          # vorbis
+          Write-PkgConfig -Path "pkgconfig/vorbis.pc" -Prefix $vcpkgInstalled -Name "vorbis" -Desc "Vorbis audio codec" -Version "1.3.7" -Libs '-L${libdir} -lvorbis -lvorbisenc -logg' -Cflags '-I${includedir}'
+
+          # vorbisenc
+          Write-PkgConfig -Path "pkgconfig/vorbisenc.pc" -Prefix $vcpkgInstalled -Name "vorbisenc" -Desc "Vorbis encoder" -Version "1.3.7" -Libs '-L${libdir} -lvorbisenc' -Cflags '-I${includedir}' -Requires "vorbis"
+
+          # libwebp
+          Write-PkgConfig -Path "pkgconfig/libwebp.pc" -Prefix $vcpkgInstalled -Name "libwebp" -Desc "WebP image codec" -Version "1.3.2" -Libs '-L${libdir} -lwebp -lsharpyuv' -Cflags '-I${includedir}'
+
+          # zlib
+          Write-PkgConfig -Path "pkgconfig/zlib.pc" -Prefix $vcpkgInstalled -Name "zlib" -Desc "zlib compression library" -Version "1.3" -Libs '-L${libdir} -lzlib' -Cflags '-I${includedir}'
+
+          Write-Host "=== pkg-config files created ==="
+          Get-ChildItem pkgconfig/
+          Write-Host "=== rav1e.pc content ==="
+          Get-Content pkgconfig/rav1e.pc
+          Write-Host ""
+          Write-Host "=== libmp3lame.pc content ==="
+          Get-Content pkgconfig/libmp3lame.pc
+
+      - name: Build FFmpeg with MSVC toolchain
+        shell: msys2 {0}
+        run: |
+          # Convert Windows paths to MSYS paths
+          VCPKG_ROOT_MSYS=$(cygpath "$VCPKG_ROOT")
+          VCPKG_INSTALLED="$VCPKG_ROOT_MSYS/installed/x64-windows-static"
+          RAV1E_DIR=$(cygpath "$(pwd)/rav1e-dist")
+          PREFIX=$(cygpath "$(pwd)/ffmpeg-x86_64-pc-windows-msvc")
+          PKGCONFIG_DIR=$(cygpath "$(pwd)/pkgconfig")
+
+          # Set up pkg-config path
+          export PKG_CONFIG_PATH="$PKGCONFIG_DIR"
+
+          # Debug: test pkg-config
+          echo "=== Testing pkg-config ==="
+          pkg-config --exists x264 && echo "x264: found" || echo "x264: not found"
+          pkg-config --exists x265 && echo "x265: found" || echo "x265: not found"
+          pkg-config --exists vpx && echo "vpx: found" || echo "vpx: not found"
+          pkg-config --exists rav1e && echo "rav1e: found" || echo "rav1e: not found"
+          pkg-config --exists opus && echo "opus: found" || echo "opus: not found"
+          pkg-config --exists libmp3lame && echo "libmp3lame: found" || echo "libmp3lame: not found"
+
+          cd ffmpeg-src
+
+          # Configure FFmpeg with MSVC toolchain
+          ./configure \
+            --prefix="$PREFIX" \
+            --toolchain=msvc \
+            --enable-static \
+            --disable-shared \
+            --enable-gpl \
+            --enable-version3 \
+            --enable-libx264 \
+            --enable-libx265 \
+            --enable-libvpx \
+            --enable-librav1e \
+            --enable-libopus \
+            --enable-libmp3lame \
+            --enable-libvorbis \
+            --enable-libwebp \
+            --enable-zlib \
+            --disable-programs \
+            --disable-doc \
+            --disable-autodetect \
+            --enable-avcodec \
+            --enable-swscale \
+            --enable-swresample \
+            --disable-avformat \
+            --disable-avfilter \
+            --disable-avdevice \
+            --disable-network \
+            --extra-cflags="-I$VCPKG_INSTALLED/include -I$RAV1E_DIR/include" \
+            --extra-ldflags="-LIBPATH:$VCPKG_INSTALLED/lib -LIBPATH:$RAV1E_DIR/lib" \
+            --pkg-config-flags="--static"
+
+          make -j$(nproc)
+          make install
+
+      - name: Copy rav1e and codec libs to output
+        shell: pwsh
+        run: |
+          $prefix = "ffmpeg-x86_64-pc-windows-msvc"
+
+          # Copy rav1e
+          Copy-Item "rav1e-dist/lib/rav1e.lib" -Destination "$prefix/lib/" -Force
+          New-Item -ItemType Directory -Force -Path "$prefix/include/rav1e"
+          Copy-Item "rav1e-dist/include/rav1e/*" -Destination "$prefix/include/rav1e/" -Force
+
+          # Copy vcpkg codec libs that FFmpeg depends on
+          $vcpkgLibDir = "$env:VCPKG_ROOT/installed/x64-windows-static/lib"
+          $codecLibs = @("x264.lib", "x265.lib", "x265-static.lib", "vpx.lib", "opus.lib", "mp3lame.lib", "mpghip.lib", "vorbis.lib", "vorbisenc.lib", "ogg.lib", "webp.lib", "webpdecoder.lib", "webpdemux.lib", "webpmux.lib", "sharpyuv.lib", "zlib.lib")
+          foreach ($lib in $codecLibs) {
+            $srcPath = "$vcpkgLibDir/$lib"
+            if (Test-Path $srcPath) {
+              Copy-Item -Path $srcPath -Destination "$prefix/lib/" -Force
+            }
+          }
+
+          # Copy vcpkg codec headers
+          $vcpkgIncDir = "$env:VCPKG_ROOT/installed/x64-windows-static/include"
+          $codecHeaders = @("x264.h", "x264_config.h", "x265.h", "x265_config.h", "vpx", "opus", "lame", "vorbis", "ogg", "webp")
+          foreach ($header in $codecHeaders) {
+            $srcPath = "$vcpkgIncDir/$header"
+            if (Test-Path $srcPath) {
+              Copy-Item -Path $srcPath -Destination "$prefix/include/" -Recurse -Force
+            }
+          }
+
+          Write-Host "=== Libraries ==="
+          Get-ChildItem "$prefix/lib/"
+          Write-Host "=== Headers ==="
+          Get-ChildItem "$prefix/include/" -Recurse
+
+      - name: Create archive
+        run: |
+          Compress-Archive -Path "ffmpeg-x86_64-pc-windows-msvc/*" -DestinationPath "ffmpeg-x86_64-pc-windows-msvc.zip"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ffmpeg-x86_64-pc-windows-msvc.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-x86_64-pc-windows-msvc
+          path: ffmpeg-x86_64-pc-windows-msvc.zip
           if-no-files-found: error
 
   # Build armv7 using native GCC cross-toolchain (zig has issues with nasm/assembly)
@@ -237,7 +458,8 @@ jobs:
     needs:
       - build-ffmpeg
       - build-ffmpeg-armv7
-      - build-ffmpeg-windows
+      - build-ffmpeg-windows-arm64
+      - build-ffmpeg-windows-x64
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -265,7 +487,7 @@ jobs:
 
             ## Included Libraries
             - FFmpeg: avcodec, avutil, swscale, swresample
-            - Video: x264, x265, libvpx, libaom
+            - Video: x264, x265, libvpx, libaom (Linux/arm64), rav1e (Windows x64)
             - Audio: opus, mp3lame, vorbis
             - Image: libwebp
 
@@ -279,8 +501,8 @@ jobs:
             - aarch64-unknown-linux-musl
 
             ### Windows (MSVC)
-            - x86_64-pc-windows-msvc
-            - aarch64-pc-windows-msvc
+            - x86_64-pc-windows-msvc (uses rav1e for AV1 encoding)
+            - aarch64-pc-windows-msvc (uses libaom for AV1 encoding)
 
             ## Verification
 
