@@ -159,6 +159,7 @@ jobs:
 
     env:
       VCPKG_DEFAULT_TRIPLET: x64-windows-static
+      RAV1E_VERSION: "0.8.1"
 
     steps:
       - uses: actions/checkout@v4
@@ -185,7 +186,7 @@ jobs:
       - name: Download rav1e prebuilt
         shell: pwsh
         run: |
-          $RAV1E_VERSION = "0.8.1"
+          $RAV1E_VERSION = "${{ env.RAV1E_VERSION }}"
           $url = "https://github.com/xiph/rav1e/releases/download/v$RAV1E_VERSION/rav1e-$RAV1E_VERSION-windows-msvc-generic.zip"
           Invoke-WebRequest -Uri $url -OutFile rav1e.zip
           Expand-Archive -Path rav1e.zip -DestinationPath rav1e-extracted
@@ -224,6 +225,17 @@ jobs:
       - name: Build FFmpeg with MSVC toolchain
         shell: msys2 {0}
         run: |
+          # Add NASM to PATH for assembly optimizations (x264, x265, vpx benefit from this)
+          # NASM is installed via ilammy/setup-nasm@v1 to C:/Program Files/NASM
+          NASM_PATH="/c/Program Files/NASM"
+          if [ -d "$NASM_PATH" ]; then
+            export PATH="$PATH:$NASM_PATH"
+            echo "=== NASM version ==="
+            nasm --version || echo "NASM not functional"
+          else
+            echo "WARNING: NASM directory not found at $NASM_PATH, assembly optimizations may be disabled"
+          fi
+
           # Convert paths to Windows mixed-style (D:/a/...) for MSVC compatibility
           # Use cygpath -m for Windows-style paths that work with both MSYS2 tools and MSVC
           VCPKG_ROOT_WIN=$(cygpath -m "$VCPKG_ROOT")
@@ -256,6 +268,7 @@ jobs:
 
           # Create pkg-config files with Windows-style paths for MSVC
           # Using printf to avoid heredoc indentation issues in YAML
+          # Note: FFmpeg's --toolchain=msvc converts -L/-l to MSVC format internally
 
           # Helper function to create pkg-config files
           create_pc() {
@@ -275,17 +288,17 @@ jobs:
             } > "$file"
           }
 
-          # rav1e (Windows paths for MSVC)
+          # rav1e - use .lib extension directly for MSVC
           create_pc "$PKGCONFIG_DIR_MSYS/rav1e.pc" "$RAV1E_DIR" "rav1e" "rav1e AV1 encoder" "0.8.1" \
             '-L${libdir} -lrav1e' '-I${includedir}/rav1e' "-lws2_32 -luserenv -lntdll -lbcrypt"
 
-          # x264 (vcpkg names it libx264.lib)
+          # x264 (vcpkg names it libx264.lib, FFmpeg expects -lx264)
           create_pc "$PKGCONFIG_DIR_MSYS/x264.pc" "$VCPKG_INSTALLED" "x264" "x264 H.264 encoder" "0.164" \
-            '-L${libdir} -llibx264' '-I${includedir}'
+            '-L${libdir} -lx264' '-I${includedir}'
 
-          # x265
+          # x265 (vcpkg names it x265-static.lib)
           create_pc "$PKGCONFIG_DIR_MSYS/x265.pc" "$VCPKG_INSTALLED" "x265" "x265 HEVC encoder" "3.5" \
-            '-L${libdir} -lx265-static' '-I${includedir}'
+            '-L${libdir} -lx265' '-I${includedir}'
 
           # vpx
           create_pc "$PKGCONFIG_DIR_MSYS/vpx.pc" "$VCPKG_INSTALLED" "vpx" "WebM VP8/VP9 codec" "1.13.0" \
@@ -297,26 +310,53 @@ jobs:
 
           # libmp3lame (vcpkg names it libmp3lame-static.lib)
           create_pc "$PKGCONFIG_DIR_MSYS/libmp3lame.pc" "$VCPKG_INSTALLED" "libmp3lame" "LAME MP3 encoder" "3.100" \
-            '-L${libdir} -llibmp3lame-static' '-I${includedir}'
+            '-L${libdir} -lmp3lame' '-I${includedir}'
+
+          # ogg (required by vorbis)
+          create_pc "$PKGCONFIG_DIR_MSYS/ogg.pc" "$VCPKG_INSTALLED" "ogg" "Ogg bitstream library" "1.3.5" \
+            '-L${libdir} -logg' '-I${includedir}'
 
           # vorbis
           create_pc "$PKGCONFIG_DIR_MSYS/vorbis.pc" "$VCPKG_INSTALLED" "vorbis" "Vorbis audio codec" "1.3.7" \
-            '-L${libdir} -lvorbis -logg' '-I${includedir}'
+            '-L${libdir} -lvorbis' '-I${includedir}' "" "ogg"
 
           # vorbisenc
           create_pc "$PKGCONFIG_DIR_MSYS/vorbisenc.pc" "$VCPKG_INSTALLED" "vorbisenc" "Vorbis encoder" "1.3.7" \
             '-L${libdir} -lvorbisenc' '-I${includedir}' "" "vorbis"
 
-          # libwebp (vcpkg names it libwebp.lib, libsharpyuv.lib)
+          # vorbisfile
+          create_pc "$PKGCONFIG_DIR_MSYS/vorbisfile.pc" "$VCPKG_INSTALLED" "vorbisfile" "Vorbis file decoder" "1.3.7" \
+            '-L${libdir} -lvorbisfile' '-I${includedir}' "" "vorbis"
+
+          # libwebp
           create_pc "$PKGCONFIG_DIR_MSYS/libwebp.pc" "$VCPKG_INSTALLED" "libwebp" "WebP image codec" "1.3.2" \
-            '-L${libdir} -llibwebp -llibsharpyuv' '-I${includedir}'
+            '-L${libdir} -lwebp -lsharpyuv' '-I${includedir}'
 
           # zlib
           create_pc "$PKGCONFIG_DIR_MSYS/zlib.pc" "$VCPKG_INSTALLED" "zlib" "zlib compression library" "1.3" \
-            '-L${libdir} -lzlib' '-I${includedir}'
+            '-L${libdir} -lz' '-I${includedir}'
 
           # Set up pkg-config path (use MSYS path for pkg-config tool)
           export PKG_CONFIG_PATH="$PKGCONFIG_DIR_MSYS"
+
+          # Create library symlinks with names FFmpeg expects
+          # vcpkg uses different naming conventions than FFmpeg's -l flags expect
+          echo "=== Creating library symlinks for FFmpeg compatibility ==="
+          cd "$VCPKG_INSTALLED_MSYS/lib"
+          # x264: libx264.lib -> x264.lib
+          [ -f libx264.lib ] && [ ! -f x264.lib ] && cp libx264.lib x264.lib && echo "Created x264.lib"
+          # mp3lame: libmp3lame-static.lib -> mp3lame.lib
+          [ -f libmp3lame-static.lib ] && [ ! -f mp3lame.lib ] && cp libmp3lame-static.lib mp3lame.lib && echo "Created mp3lame.lib"
+          # x265: x265-static.lib -> x265.lib
+          [ -f x265-static.lib ] && [ ! -f x265.lib ] && cp x265-static.lib x265.lib && echo "Created x265.lib"
+          # webp: libwebp.lib -> webp.lib
+          [ -f libwebp.lib ] && [ ! -f webp.lib ] && cp libwebp.lib webp.lib && echo "Created webp.lib"
+          # sharpyuv: libsharpyuv.lib -> sharpyuv.lib
+          [ -f libsharpyuv.lib ] && [ ! -f sharpyuv.lib ] && cp libsharpyuv.lib sharpyuv.lib && echo "Created sharpyuv.lib"
+          # zlib: zlib.lib -> z.lib
+          [ -f zlib.lib ] && [ ! -f z.lib ] && cp zlib.lib z.lib && echo "Created z.lib"
+          ls -la *.lib | head -30
+          cd -
 
           # Debug: show pkg-config file content and test
           echo "=== libmp3lame.pc content ==="
@@ -372,6 +412,14 @@ jobs:
           make -j$(nproc)
           make install
 
+      - name: Upload FFmpeg config.log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-config-log-x64
+          path: ffmpeg-src/ffbuild/config.log
+          if-no-files-found: ignore
+
       - name: Copy rav1e and codec libs to output
         shell: pwsh
         run: |
@@ -383,12 +431,33 @@ jobs:
           Copy-Item "rav1e-dist/include/rav1e/*" -Destination "$prefix/include/rav1e/" -Force
 
           # Copy vcpkg codec libs that FFmpeg depends on
+          Write-Host "=== Copying codec libraries ==="
           $vcpkgLibDir = "$env:VCPKG_ROOT/installed/x64-windows-static/lib"
-          $codecLibs = @("libx264.lib", "x265-static.lib", "vpx.lib", "opus.lib", "libmp3lame-static.lib", "libmpghip-static.lib", "vorbis.lib", "vorbisenc.lib", "vorbisfile.lib", "ogg.lib", "libwebp.lib", "libwebpdecoder.lib", "libwebpdemux.lib", "libwebpmux.lib", "libsharpyuv.lib", "zlib.lib")
+          $codecLibs = @(
+            "libx264.lib",
+            "x265-static.lib",
+            "vpx.lib",
+            "opus.lib",
+            "libmp3lame-static.lib",
+            "libmpghip-static.lib",
+            "vorbis.lib",
+            "vorbisenc.lib",
+            "vorbisfile.lib",
+            "ogg.lib",
+            "libwebp.lib",
+            "libwebpdecoder.lib",
+            "libwebpdemux.lib",
+            "libwebpmux.lib",
+            "libsharpyuv.lib",
+            "zlib.lib"
+          )
           foreach ($lib in $codecLibs) {
             $srcPath = "$vcpkgLibDir/$lib"
             if (Test-Path $srcPath) {
               Copy-Item -Path $srcPath -Destination "$prefix/lib/" -Force
+              Write-Host "  Copied: $lib"
+            } else {
+              Write-Host "  WARNING: $lib not found at $srcPath"
             }
           }
 
