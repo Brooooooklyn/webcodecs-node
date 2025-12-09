@@ -104,18 +104,23 @@ test('AudioDecoder: configure() with MP3 codec', (t) => {
   decoder.close()
 })
 
-test('AudioDecoder: configure() with FLAC codec', (t) => {
-  const { decoder } = createTestDecoder()
+test('AudioDecoder: configure() with FLAC codec requires description', async (t) => {
+  const { decoder, errors } = createTestDecoder()
 
+  // FLAC requires a description (STREAMINFO) per W3C WebCodecs spec
   decoder.configure({
     codec: 'flac',
     sampleRate: 48000,
     numberOfChannels: 2,
   })
 
-  t.is(decoder.state, 'configured')
+  // Wait for error callback to be called (it's async via ThreadsafeFunction)
+  await new Promise((resolve) => setTimeout(resolve, 50))
 
-  decoder.close()
+  // Should trigger error callback and close decoder (no description provided)
+  t.is(decoder.state, 'closed')
+  t.is(errors.length, 1)
+  t.true(errors[0].message.includes('NotSupportedError'))
 })
 
 test('AudioDecoder: configure() with mono audio', (t) => {
@@ -144,14 +149,16 @@ test('AudioDecoder: configure() with invalid codec triggers error callback', (t)
   // Error callback transitions to closed
   t.is(decoder.state, 'closed')
 
-  decoder.close()
+  // Already closed by error callback, so close() throws InvalidStateError
+  const error = t.throws(() => decoder.close())
+  t.true(error?.message.includes('InvalidStateError'))
 })
 
 // ============================================================================
 // State Machine Tests
 // ============================================================================
 
-test('AudioDecoder: decode() on unconfigured triggers error callback', (t) => {
+test('AudioDecoder: decode() on unconfigured throws InvalidStateError', (t) => {
   const { decoder } = createTestDecoder()
 
   const chunk = new EncodedAudioChunk({
@@ -160,15 +167,12 @@ test('AudioDecoder: decode() on unconfigured triggers error callback', (t) => {
     data: new Uint8Array([0x00, 0x01, 0x02]),
   })
 
-  // decode() on unconfigured decoder should trigger error callback
-  decoder.decode(chunk)
-
-  t.is(decoder.state, 'closed', 'Decoder should be closed after error')
-
-  decoder.close()
+  // W3C spec: decode() on unconfigured decoder should throw InvalidStateError
+  const error = t.throws(() => decoder.decode(chunk))
+  t.true(error?.message.includes('InvalidStateError'))
 })
 
-test('AudioDecoder: decode() on closed triggers error callback', (t) => {
+test('AudioDecoder: decode() on closed throws InvalidStateError', (t) => {
   const { decoder } = createTestDecoder()
 
   decoder.configure({
@@ -185,11 +189,9 @@ test('AudioDecoder: decode() on closed triggers error callback', (t) => {
     data: new Uint8Array([0x00, 0x01, 0x02]),
   })
 
-  // decode() on closed decoder should trigger error callback
-  decoder.decode(chunk)
-
-  // Test passes if no crash - error callback will be invoked asynchronously
-  t.pass('decode() on closed decoder did not crash')
+  // W3C spec: decode() on closed decoder should throw InvalidStateError
+  const error = t.throws(() => decoder.decode(chunk))
+  t.true(error?.message.includes('InvalidStateError'))
 })
 
 test('AudioDecoder: reset() returns to unconfigured state', (t) => {
@@ -233,7 +235,7 @@ test('AudioDecoder: can reconfigure after reset', (t) => {
   decoder.close()
 })
 
-test('AudioDecoder: close() is idempotent', (t) => {
+test('AudioDecoder: close() on closed decoder throws InvalidStateError', (t) => {
   const { decoder } = createTestDecoder()
 
   decoder.configure({
@@ -242,8 +244,10 @@ test('AudioDecoder: close() is idempotent', (t) => {
     numberOfChannels: 2,
   })
 
-  t.notThrows(() => decoder.close())
-  t.notThrows(() => decoder.close())
+  decoder.close()
+  // W3C spec: second close should throw InvalidStateError
+  const error = t.throws(() => decoder.close())
+  t.true(error?.message.includes('InvalidStateError'))
 })
 
 // ============================================================================

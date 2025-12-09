@@ -8,6 +8,7 @@ export * from './frame-generator.js'
 export * from './frame-comparator.js'
 export * from './codec-matrix.js'
 export * from './audio-generator.js'
+export * from './wpt-utils.js'
 
 // Re-export types from the native module
 export type { EncodedVideoChunk } from '../../index.js'

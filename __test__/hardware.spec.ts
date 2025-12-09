@@ -187,10 +187,7 @@ test('getPreferredHardwareAccelerator: returns null when none available', (t) =>
   } else {
     // On CI VMs, accelerators may be detected but not actually usable
     // This matches Chromium's behavior where detection != availability
-    t.true(
-      preferred === null || typeof preferred === 'string',
-      'Should return null or a valid accelerator name',
-    )
+    t.true(preferred === null || typeof preferred === 'string', 'Should return null or a valid accelerator name')
   }
 })
 

@@ -456,6 +456,13 @@ impl CodecContext {
         ffctx_set_thread_count(ctx, 0);
       }
 
+      // Low-latency mode (for optimizeForLatency in WebCodecs)
+      // AV_CODEC_FLAG_LOW_DELAY = (1 << 19) = 524288
+      // Forces low delay output to reduce buffering
+      if config.low_latency {
+        ffi::accessors::ffctx_set_flags(ctx, 1 << 19);
+      }
+
       // TODO: Set extradata if provided
       // This requires allocating memory with av_malloc
     }

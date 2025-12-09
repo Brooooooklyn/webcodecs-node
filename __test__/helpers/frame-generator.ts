@@ -5,7 +5,8 @@
  * for encoding/decoding validation.
  */
 
-import { VideoFrame, type VideoFrameBufferInit } from '../../index.js'
+import { VideoFrame } from '../../index.js'
+import type { VideoFrameBufferInit } from '../../standard.js'
 
 /** RGB color representation */
 export interface RGBColor {

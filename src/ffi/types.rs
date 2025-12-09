@@ -52,14 +52,14 @@ pub enum AVCodecID {
   // Video codecs
   Mjpeg = 7, // Motion JPEG
   H264 = 27,
-  Png = 61,  // PNG image
-  Gif = 97,  // GIF image
-  Bmp = 128, // BMP image
+  Png = 61, // PNG image
+  Bmp = 78, // BMP image
+  Gif = 97, // GIF image
   Vp8 = 139,
   Vp9 = 167,
+  Webp = 171, // WebP image
   Hevc = 173, // H.265
-  Webp = 225, // WebP image
-  Av1 = 226,
+  Av1 = 225,
   // Audio codecs (starting at 0x10000 = 65536)
   PcmS16le = 65536, // PCM signed 16-bit little-endian
   PcmS16be = 65537, // PCM signed 16-bit big-endian

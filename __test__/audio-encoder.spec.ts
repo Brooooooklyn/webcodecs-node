@@ -137,7 +137,9 @@ test('AudioEncoder: configure() with invalid codec triggers error callback', (t)
   // Error callback transitions to closed
   t.is(encoder.state, 'closed')
 
-  encoder.close()
+  // Already closed by error callback, so close() throws InvalidStateError
+  const error = t.throws(() => encoder.close())
+  t.true(error?.message.includes('InvalidStateError'))
 })
 
 // ============================================================================
@@ -233,21 +235,19 @@ test('AudioEncoder: encode() with AAC', async (t) => {
 // State Machine Tests
 // ============================================================================
 
-test('AudioEncoder: encode() on unconfigured triggers error callback', (t) => {
+test('AudioEncoder: encode() on unconfigured throws InvalidStateError', (t) => {
   const { encoder } = createTestEncoder()
 
   const audio = generateSilence(960, 2, 48000, 'f32', 0)
 
-  // encode() on unconfigured encoder should trigger error callback
-  encoder.encode(audio)
-
-  t.is(encoder.state, 'closed', 'Encoder should be closed after error')
+  // W3C spec: encode() on unconfigured encoder should throw InvalidStateError
+  const error = t.throws(() => encoder.encode(audio))
+  t.true(error?.message.includes('InvalidStateError'))
 
   audio.close()
-  encoder.close()
 })
 
-test('AudioEncoder: encode() on closed triggers error callback', (t) => {
+test('AudioEncoder: encode() on closed throws InvalidStateError', (t) => {
   const { encoder } = createTestEncoder()
 
   encoder.configure({
@@ -260,13 +260,11 @@ test('AudioEncoder: encode() on closed triggers error callback', (t) => {
 
   const audio = generateSilence(960, 2, 48000, 'f32', 0)
 
-  // encode() on closed encoder should trigger error callback
-  encoder.encode(audio)
+  // W3C spec: encode() on closed encoder should throw InvalidStateError
+  const error = t.throws(() => encoder.encode(audio))
+  t.true(error?.message.includes('InvalidStateError'))
 
   audio.close()
-
-  // Test passes if no crash - error callback will be invoked asynchronously
-  t.pass('encode() on closed encoder did not crash')
 })
 
 test('AudioEncoder: reset() returns to unconfigured state', (t) => {
@@ -311,7 +309,7 @@ test('AudioEncoder: can reconfigure after reset', (t) => {
   encoder.close()
 })
 
-test('AudioEncoder: close() is idempotent', (t) => {
+test('AudioEncoder: close() on closed encoder throws InvalidStateError', (t) => {
   const { encoder } = createTestEncoder()
 
   encoder.configure({
@@ -320,8 +318,10 @@ test('AudioEncoder: close() is idempotent', (t) => {
     numberOfChannels: 2,
   })
 
-  t.notThrows(() => encoder.close())
-  t.notThrows(() => encoder.close())
+  encoder.close()
+  // W3C spec: second close should throw InvalidStateError
+  const error = t.throws(() => encoder.close())
+  t.true(error?.message.includes('InvalidStateError'))
 })
 
 // ============================================================================

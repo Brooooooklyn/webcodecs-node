@@ -107,16 +107,16 @@ test('VideoDecoder: state transitions correctly', (t) => {
   t.is(decoder.state, 'closed')
 })
 
-test('VideoDecoder: close() is idempotent', (t) => {
+test('VideoDecoder: close() on closed decoder throws InvalidStateError', (t) => {
   const { decoder } = createTestDecoder()
   decoder.configure(createDecoderConfig('h264'))
 
   decoder.close()
   t.is(decoder.state, 'closed')
 
-  // Second close should not throw
-  t.notThrows(() => decoder.close())
-  t.is(decoder.state, 'closed')
+  // W3C spec: second close should throw InvalidStateError
+  const error = t.throws(() => decoder.close())
+  t.true(error?.message.includes('InvalidStateError'))
 })
 
 // ============================================================================
@@ -387,31 +387,26 @@ test('VideoDecoder: isConfigSupported() returns false for unknown codec', async 
 // Error Handling Tests (Errors via callback)
 // ============================================================================
 
-test('VideoDecoder: decode() on unconfigured decoder triggers error callback', async (t) => {
+test('VideoDecoder: decode() on unconfigured decoder throws InvalidStateError', async (t) => {
   const chunks = await createEncodedH264Chunks(320, 240, 1)
 
   const { decoder } = createTestDecoder()
 
-  // decode() on unconfigured decoder should trigger error callback
-  decoder.decode(chunks[0])
-
-  t.is(decoder.state, 'closed', 'Decoder should be closed after error')
-
-  decoder.close()
+  // W3C spec: decode() on unconfigured decoder should throw InvalidStateError
+  const error = t.throws(() => decoder.decode(chunks[0]))
+  t.true(error?.message.includes('InvalidStateError'))
 })
 
-test('VideoDecoder: decode() on closed decoder triggers error callback', async (t) => {
+test('VideoDecoder: decode() on closed decoder throws InvalidStateError', async (t) => {
   const chunks = await createEncodedH264Chunks(320, 240, 1)
 
   const { decoder } = createTestDecoder()
   decoder.configure(createDecoderConfig('h264'))
   decoder.close()
 
-  // decode() on closed decoder should trigger error callback
-  decoder.decode(chunks[0])
-
-  // Test passes if no crash - error callback will be invoked asynchronously
-  t.pass('decode() on closed decoder did not crash')
+  // W3C spec: decode() on closed decoder should throw InvalidStateError
+  const error = t.throws(() => decoder.decode(chunks[0]))
+  t.true(error?.message.includes('InvalidStateError'))
 })
 
 // ============================================================================

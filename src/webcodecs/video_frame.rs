@@ -82,6 +82,12 @@ impl VideoPixelFormat {
       AVPixelFormat::Nv21 => Some(VideoPixelFormat::NV21),
       AVPixelFormat::Rgba => Some(VideoPixelFormat::RGBA),
       AVPixelFormat::Bgra => Some(VideoPixelFormat::BGRA),
+      // ARGB/ABGR map to RGBA/BGRA (closest WebCodecs equivalent - channel order adjusted)
+      AVPixelFormat::Argb => Some(VideoPixelFormat::RGBA),
+      AVPixelFormat::Abgr => Some(VideoPixelFormat::BGRA),
+      // RGB24/BGR24 map to RGBX/BGRX (closest WebCodecs equivalent - alpha ignored)
+      AVPixelFormat::Rgb24 => Some(VideoPixelFormat::RGBX),
+      AVPixelFormat::Bgr24 => Some(VideoPixelFormat::BGRX),
       // 10-bit formats
       AVPixelFormat::Yuv420p10le => Some(VideoPixelFormat::I420P10),
       AVPixelFormat::Yuv422p10le => Some(VideoPixelFormat::I422P10),
@@ -189,9 +195,12 @@ pub enum VideoTransferCharacteristics {
   /// SMPTE 170M transfer
   #[napi(value = "smpte170m")]
   Smpte170m,
-  /// IEC 61966-2-1 (sRGB)
+  /// IEC 61966-2-1 (sRGB) - technical name
   #[napi(value = "iec61966-2-1")]
   Iec6196621,
+  /// sRGB transfer (alias for iec61966-2-1)
+  #[napi(value = "srgb")]
+  Srgb,
   /// Linear transfer
   #[napi(value = "linear")]
   Linear,
@@ -225,7 +234,6 @@ pub enum VideoMatrixCoefficients {
 }
 
 /// VideoColorSpaceInit for constructing VideoColorSpace
-#[napi(object)]
 #[derive(Debug, Clone, Default)]
 pub struct VideoColorSpaceInit {
   /// Color primaries
@@ -236,6 +244,163 @@ pub struct VideoColorSpaceInit {
   pub matrix: Option<VideoMatrixCoefficients>,
   /// Full range flag
   pub full_range: Option<bool>,
+}
+
+/// Helper to get a raw napi value from an object property
+unsafe fn get_raw_property(
+  env: napi::sys::napi_env,
+  obj: napi::sys::napi_value,
+  key: &str,
+) -> napi::sys::napi_value {
+  use napi::sys;
+  let mut result: sys::napi_value = std::ptr::null_mut();
+  let key_cstr = std::ffi::CString::new(key).unwrap();
+  sys::napi_get_named_property(env, obj, key_cstr.as_ptr(), &mut result);
+  result
+}
+
+/// Helper to check if a napi value is null or undefined
+fn is_null_or_undefined(env: napi::sys::napi_env, value: napi::sys::napi_value) -> bool {
+  use napi::sys;
+  let mut result: sys::napi_valuetype = sys::ValueType::napi_undefined;
+  unsafe {
+    sys::napi_typeof(env, value, &mut result);
+  }
+  result == sys::ValueType::napi_null || result == sys::ValueType::napi_undefined
+}
+
+impl FromNapiValue for VideoColorSpaceInit {
+  unsafe fn from_napi_value(
+    env: napi::sys::napi_env,
+    value: napi::sys::napi_value,
+  ) -> Result<Self> {
+    let env_wrapper = Env::from_raw(env);
+    let obj = Object::from_napi_value(env, value)?;
+
+    // Validate primaries - optional but must be valid if present
+    let primaries: Option<VideoColorPrimaries> = if obj.has_named_property("primaries")? {
+      let raw_val = get_raw_property(env, value, "primaries");
+      if is_null_or_undefined(env, raw_val) {
+        None
+      } else {
+        let s: String = FromNapiValue::from_napi_value(env, raw_val)?;
+        match s.as_str() {
+          "bt709" => Some(VideoColorPrimaries::Bt709),
+          "bt470bg" => Some(VideoColorPrimaries::Bt470bg),
+          "smpte170m" => Some(VideoColorPrimaries::Smpte170m),
+          "bt2020" => Some(VideoColorPrimaries::Bt2020),
+          "smpte432" => Some(VideoColorPrimaries::Smpte432),
+          _ => {
+            env_wrapper.throw_type_error(&format!("Invalid primaries value: {}", s), None)?;
+            return Err(Error::new(Status::InvalidArg, "Invalid primaries value"));
+          }
+        }
+      }
+    } else {
+      None
+    };
+
+    // Validate transfer - optional but must be valid if present
+    let transfer: Option<VideoTransferCharacteristics> = if obj.has_named_property("transfer")? {
+      let raw_val = get_raw_property(env, value, "transfer");
+      if is_null_or_undefined(env, raw_val) {
+        None
+      } else {
+        let s: String = FromNapiValue::from_napi_value(env, raw_val)?;
+        match s.as_str() {
+          "bt709" => Some(VideoTransferCharacteristics::Bt709),
+          "smpte170m" => Some(VideoTransferCharacteristics::Smpte170m),
+          "iec61966-2-1" => Some(VideoTransferCharacteristics::Iec6196621),
+          "srgb" => Some(VideoTransferCharacteristics::Srgb),
+          "linear" => Some(VideoTransferCharacteristics::Linear),
+          "pq" => Some(VideoTransferCharacteristics::Pq),
+          "hlg" => Some(VideoTransferCharacteristics::Hlg),
+          _ => {
+            env_wrapper.throw_type_error(&format!("Invalid transfer value: {}", s), None)?;
+            return Err(Error::new(Status::InvalidArg, "Invalid transfer value"));
+          }
+        }
+      }
+    } else {
+      None
+    };
+
+    // Validate matrix - optional but must be valid if present
+    let matrix: Option<VideoMatrixCoefficients> = if obj.has_named_property("matrix")? {
+      let raw_val = get_raw_property(env, value, "matrix");
+      if is_null_or_undefined(env, raw_val) {
+        None
+      } else {
+        let s: String = FromNapiValue::from_napi_value(env, raw_val)?;
+        match s.as_str() {
+          "rgb" => Some(VideoMatrixCoefficients::Rgb),
+          "bt709" => Some(VideoMatrixCoefficients::Bt709),
+          "bt470bg" => Some(VideoMatrixCoefficients::Bt470bg),
+          "smpte170m" => Some(VideoMatrixCoefficients::Smpte170m),
+          "bt2020-ncl" => Some(VideoMatrixCoefficients::Bt2020Ncl),
+          _ => {
+            env_wrapper.throw_type_error(&format!("Invalid matrix value: {}", s), None)?;
+            return Err(Error::new(Status::InvalidArg, "Invalid matrix value"));
+          }
+        }
+      }
+    } else {
+      None
+    };
+
+    // fullRange is optional boolean - null/undefined is allowed
+    let full_range: Option<bool> = if obj.has_named_property("fullRange")? {
+      let raw_val = get_raw_property(env, value, "fullRange");
+      if is_null_or_undefined(env, raw_val) {
+        None
+      } else {
+        Some(FromNapiValue::from_napi_value(env, raw_val)?)
+      }
+    } else {
+      None
+    };
+
+    Ok(VideoColorSpaceInit {
+      primaries,
+      transfer,
+      matrix,
+      full_range,
+    })
+  }
+}
+
+impl ToNapiValue for VideoColorSpaceInit {
+  unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+    use napi::sys;
+
+    // Create empty object
+    let mut raw_obj: sys::napi_value = std::ptr::null_mut();
+    let status = sys::napi_create_object(env, &mut raw_obj);
+    if status != sys::Status::napi_ok {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "Failed to create object",
+      ));
+    }
+
+    let mut obj = Object::from_napi_value(env, raw_obj)?;
+
+    // Set fields - Option<T> will serialize correctly
+    if let Some(p) = val.primaries {
+      obj.set("primaries", p)?;
+    }
+    if let Some(t) = val.transfer {
+      obj.set("transfer", t)?;
+    }
+    if let Some(m) = val.matrix {
+      obj.set("matrix", m)?;
+    }
+    if let Some(fr) = val.full_range {
+      obj.set("fullRange", fr)?;
+    }
+
+    Ok(raw_obj)
+  }
 }
 
 /// Video color space parameters (WebCodecs spec) - as a class per spec
@@ -252,7 +417,11 @@ pub struct VideoColorSpace {
 impl VideoColorSpace {
   /// Create a new VideoColorSpace
   #[napi(constructor)]
-  pub fn new(init: Option<VideoColorSpaceInit>) -> Self {
+  pub fn new(
+    #[napi(ts_arg_type = "import('./standard').VideoColorSpaceInit")] init: Option<
+      VideoColorSpaceInit,
+    >,
+  ) -> Self {
     match init {
       Some(init) => VideoColorSpace {
         primaries: init.primaries,
@@ -289,14 +458,69 @@ impl VideoColorSpace {
   }
 
   /// Convert to JSON-compatible object (W3C spec uses toJSON)
+  ///
+  /// Per W3C spec, toJSON() returns explicit null for unset fields.
   #[napi(js_name = "toJSON")]
-  pub fn to_json(&self) -> VideoColorSpaceInit {
-    VideoColorSpaceInit {
-      primaries: self.primaries,
-      transfer: self.transfer,
-      matrix: self.matrix,
-      full_range: self.full_range,
+  pub fn to_json(&self, env: Env) -> Result<Object<'_>> {
+    use napi::sys;
+    let raw_env = env.raw();
+
+    // Create empty object
+    let mut raw_obj: sys::napi_value = std::ptr::null_mut();
+    let status = unsafe { sys::napi_create_object(raw_env, &mut raw_obj) };
+    if status != sys::Status::napi_ok {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "Failed to create object",
+      ));
     }
+
+    // Get null value
+    let mut null_val: sys::napi_value = std::ptr::null_mut();
+    let status = unsafe { sys::napi_get_null(raw_env, &mut null_val) };
+    if status != sys::Status::napi_ok {
+      return Err(Error::new(Status::GenericFailure, "Failed to get null"));
+    }
+
+    let mut obj = unsafe { Object::from_napi_value(raw_env, raw_obj)? };
+
+    // Set primaries - null if not set
+    match &self.primaries {
+      Some(p) => obj.set("primaries", *p)?,
+      None => unsafe {
+        let key = std::ffi::CString::new("primaries").unwrap();
+        sys::napi_set_named_property(raw_env, raw_obj, key.as_ptr(), null_val);
+      },
+    };
+
+    // Set transfer - null if not set
+    match &self.transfer {
+      Some(t) => obj.set("transfer", *t)?,
+      None => unsafe {
+        let key = std::ffi::CString::new("transfer").unwrap();
+        sys::napi_set_named_property(raw_env, raw_obj, key.as_ptr(), null_val);
+      },
+    };
+
+    // Set matrix - null if not set
+    match &self.matrix {
+      Some(m) => obj.set("matrix", *m)?,
+      None => unsafe {
+        let key = std::ffi::CString::new("matrix").unwrap();
+        sys::napi_set_named_property(raw_env, raw_obj, key.as_ptr(), null_val);
+      },
+    };
+
+    // Set fullRange - null if not set
+    match &self.full_range {
+      Some(fr) => obj.set("fullRange", *fr)?,
+      None => unsafe {
+        let key = std::ffi::CString::new("fullRange").unwrap();
+        sys::napi_set_named_property(raw_env, raw_obj, key.as_ptr(), null_val);
+      },
+    };
+
+    Ok(obj)
   }
 }
 
@@ -391,7 +615,6 @@ impl DOMRectReadOnly {
 pub struct VideoFrameMetadata {}
 
 /// Options for creating a VideoFrame from buffer data (VideoFrameBufferInit per spec)
-#[napi(object)]
 pub struct VideoFrameBufferInit {
   /// Pixel format (required)
   pub format: VideoPixelFormat,
@@ -421,8 +644,100 @@ pub struct VideoFrameBufferInit {
   /// Metadata associated with the frame
   pub metadata: Option<VideoFrameMetadata>,
   /// ArrayBuffers to transfer (W3C spec - ignored in Node.js, we always copy)
-  #[napi(ts_type = "ArrayBuffer[]")]
   pub transfer: Option<Vec<Uint8Array>>,
+}
+
+/// Helper to throw TypeError and return an error
+fn throw_type_error(env: napi::sys::napi_env, message: &str) -> Error {
+  let env_wrapper = Env::from_raw(env);
+  let _ = env_wrapper.throw_type_error(message, None);
+  Error::new(Status::InvalidArg, message)
+}
+
+impl FromNapiValue for VideoFrameBufferInit {
+  unsafe fn from_napi_value(
+    env: napi::sys::napi_env,
+    value: napi::sys::napi_value,
+  ) -> Result<Self> {
+    let obj = Object::from_napi_value(env, value)?;
+
+    // Parse format string and validate - required field
+    let format_str: Option<String> = obj.get("format")?;
+    let format = match format_str {
+      Some(s) => match s.as_str() {
+        "I420" => VideoPixelFormat::I420,
+        "I420A" => VideoPixelFormat::I420A,
+        "I422" => VideoPixelFormat::I422,
+        "I422A" => VideoPixelFormat::I422A,
+        "I444" => VideoPixelFormat::I444,
+        "I444A" => VideoPixelFormat::I444A,
+        "I420P10" => VideoPixelFormat::I420P10,
+        "I420AP10" => VideoPixelFormat::I420AP10,
+        "I422P10" => VideoPixelFormat::I422P10,
+        "I422AP10" => VideoPixelFormat::I422AP10,
+        "I444P10" => VideoPixelFormat::I444P10,
+        "I444AP10" => VideoPixelFormat::I444AP10,
+        "I420P12" => VideoPixelFormat::I420P12,
+        "I422P12" => VideoPixelFormat::I422P12,
+        "I444P12" => VideoPixelFormat::I444P12,
+        "NV12" => VideoPixelFormat::NV12,
+        "NV21" => VideoPixelFormat::NV21,
+        "RGBA" => VideoPixelFormat::RGBA,
+        "RGBX" => VideoPixelFormat::RGBX,
+        "BGRA" => VideoPixelFormat::BGRA,
+        "BGRX" => VideoPixelFormat::BGRX,
+        _ => return Err(throw_type_error(env, &format!("Invalid format: {}", s))),
+      },
+      None => return Err(throw_type_error(env, "format is required")),
+    };
+
+    // codedWidth - required
+    let coded_width: u32 = match obj.get("codedWidth")? {
+      Some(w) => w,
+      None => return Err(throw_type_error(env, "codedWidth is required")),
+    };
+
+    // codedHeight - required
+    let coded_height: u32 = match obj.get("codedHeight")? {
+      Some(h) => h,
+      None => return Err(throw_type_error(env, "codedHeight is required")),
+    };
+
+    // timestamp - required
+    let timestamp: i64 = match obj.get("timestamp")? {
+      Some(t) => t,
+      None => return Err(throw_type_error(env, "timestamp is required")),
+    };
+
+    // Optional fields
+    let duration: Option<i64> = obj.get("duration")?;
+    let layout: Option<Vec<PlaneLayout>> = obj.get("layout")?;
+    let visible_rect: Option<DOMRectInit> = obj.get("visibleRect")?;
+    let rotation: Option<f64> = obj.get("rotation")?;
+    let flip: Option<bool> = obj.get("flip")?;
+    let display_width: Option<u32> = obj.get("displayWidth")?;
+    let display_height: Option<u32> = obj.get("displayHeight")?;
+    let color_space: Option<VideoColorSpaceInit> = obj.get("colorSpace")?;
+    let metadata: Option<VideoFrameMetadata> = obj.get("metadata")?;
+    let transfer: Option<Vec<Uint8Array>> = obj.get("transfer")?;
+
+    Ok(VideoFrameBufferInit {
+      format,
+      coded_width,
+      coded_height,
+      timestamp,
+      duration,
+      layout,
+      visible_rect,
+      rotation,
+      flip,
+      display_width,
+      display_height,
+      color_space,
+      metadata,
+      transfer,
+    })
+  }
 }
 
 /// Options for creating a VideoFrame from an image source (VideoFrameInit per spec)
@@ -493,6 +808,8 @@ pub struct VideoFrameRect {
 /// Internal state for VideoFrame
 struct VideoFrameInner {
   frame: Frame,
+  /// Original pixel format (preserved since FFmpeg may convert RGBX→RGBA, etc.)
+  original_format: VideoPixelFormat,
   timestamp_us: i64,
   duration_us: Option<i64>,
   display_width: u32,
@@ -530,10 +847,48 @@ impl VideoFrame {
   /// This is the VideoFrameBufferInit constructor form.
   /// Use `fromVideoFrame()` to create from another VideoFrame.
   #[napi(constructor)]
-  pub fn new(data: Uint8Array, init: VideoFrameBufferInit) -> Result<Self> {
-    let format = init.format.to_av_format();
+  pub fn new(env: Env, data: Uint8Array, init: VideoFrameBufferInit) -> Result<Self> {
     let width = init.coded_width;
     let height = init.coded_height;
+
+    // Validate zero dimensions
+    if width == 0 {
+      env.throw_type_error("codedWidth must be greater than 0", None)?;
+      return Err(Error::new(
+        Status::InvalidArg,
+        "codedWidth must be greater than 0",
+      ));
+    }
+    if height == 0 {
+      env.throw_type_error("codedHeight must be greater than 0", None)?;
+      return Err(Error::new(
+        Status::InvalidArg,
+        "codedHeight must be greater than 0",
+      ));
+    }
+
+    // Validate buffer size before creating frame
+    let expected_size = Self::calculate_buffer_size(init.format, width, height) as usize;
+    if data.len() < expected_size {
+      env.throw_type_error(
+        &format!(
+          "Buffer too small: need {} bytes, got {}",
+          expected_size,
+          data.len()
+        ),
+        None,
+      )?;
+      return Err(Error::new(
+        Status::InvalidArg,
+        format!(
+          "Buffer too small: need {} bytes, got {}",
+          expected_size,
+          data.len()
+        ),
+      ));
+    }
+
+    let format = init.format.to_av_format();
 
     // Create internal frame
     let mut frame = Frame::new_video(width, height, format).map_err(|e| {
@@ -577,6 +932,7 @@ impl VideoFrame {
 
     let inner = VideoFrameInner {
       frame,
+      original_format: init.format,
       timestamp_us: init.timestamp,
       duration_us: init.duration,
       display_width,
@@ -650,6 +1006,7 @@ impl VideoFrame {
 
       let new_inner = VideoFrameInner {
         frame: cloned_frame,
+        original_format: source_inner.original_format,
         timestamp_us,
         duration_us,
         display_width,
@@ -670,9 +1027,12 @@ impl VideoFrame {
   pub fn from_internal(frame: Frame, timestamp_us: i64, duration_us: Option<i64>) -> Self {
     let width = frame.width();
     let height = frame.height();
+    let original_format =
+      VideoPixelFormat::from_av_format(frame.format()).unwrap_or(VideoPixelFormat::I420);
 
     let inner = VideoFrameInner {
       frame,
+      original_format,
       timestamp_us,
       duration_us,
       display_width: width,
@@ -699,6 +1059,8 @@ impl VideoFrame {
     let width = frame.width();
     let height = frame.height();
     let parsed_rotation = parse_rotation(rotation);
+    let original_format =
+      VideoPixelFormat::from_av_format(frame.format()).unwrap_or(VideoPixelFormat::I420);
 
     // Display dimensions may be swapped based on rotation
     let (display_width, display_height) = if parsed_rotation == 90.0 || parsed_rotation == 270.0 {
@@ -709,6 +1071,7 @@ impl VideoFrame {
 
     let inner = VideoFrameInner {
       frame,
+      original_format,
       timestamp_us,
       duration_us,
       display_width,
@@ -733,33 +1096,65 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) if !inner.closed => Ok(VideoPixelFormat::from_av_format(inner.frame.format())),
+      Some(inner) if !inner.closed => Ok(Some(inner.original_format)),
       _ => Ok(None),
     }
   }
 
-  /// Get the coded width in pixels
+  /// Get the coded width in pixels (returns 0 when closed per W3C spec)
   #[napi(getter)]
   pub fn coded_width(&self) -> Result<u32> {
-    self.with_inner(|inner| Ok(inner.frame.width()))
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    match guard.as_ref() {
+      Some(inner) if !inner.closed => Ok(inner.frame.width()),
+      _ => Ok(0),
+    }
   }
 
-  /// Get the coded height in pixels
+  /// Get the coded height in pixels (returns 0 when closed per W3C spec)
   #[napi(getter)]
   pub fn coded_height(&self) -> Result<u32> {
-    self.with_inner(|inner| Ok(inner.frame.height()))
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    match guard.as_ref() {
+      Some(inner) if !inner.closed => Ok(inner.frame.height()),
+      _ => Ok(0),
+    }
   }
 
-  /// Get the display width in pixels
+  /// Get the display width in pixels (returns 0 when closed per W3C spec)
   #[napi(getter)]
   pub fn display_width(&self) -> Result<u32> {
-    self.with_inner(|inner| Ok(inner.display_width))
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    match guard.as_ref() {
+      Some(inner) if !inner.closed => Ok(inner.display_width),
+      _ => Ok(0),
+    }
   }
 
-  /// Get the display height in pixels
+  /// Get the display height in pixels (returns 0 when closed per W3C spec)
   #[napi(getter)]
   pub fn display_height(&self) -> Result<u32> {
-    self.with_inner(|inner| Ok(inner.display_height))
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    match guard.as_ref() {
+      Some(inner) if !inner.closed => Ok(inner.display_height),
+      _ => Ok(0),
+    }
   }
 
   /// Get the coded rect (the region containing valid pixel data)
@@ -804,16 +1199,32 @@ impl VideoFrame {
     }
   }
 
-  /// Get the presentation timestamp in microseconds
+  /// Get the presentation timestamp in microseconds (returns 0 when closed per W3C spec)
   #[napi(getter)]
   pub fn timestamp(&self) -> Result<i64> {
-    self.with_inner(|inner| Ok(inner.timestamp_us))
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    match guard.as_ref() {
+      Some(inner) if !inner.closed => Ok(inner.timestamp_us),
+      _ => Ok(0),
+    }
   }
 
-  /// Get the duration in microseconds
+  /// Get the duration in microseconds (returns null when closed per W3C spec)
   #[napi(getter)]
   pub fn duration(&self) -> Result<Option<i64>> {
-    self.with_inner(|inner| Ok(inner.duration_us))
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    match guard.as_ref() {
+      Some(inner) if !inner.closed => Ok(inner.duration_us),
+      _ => Ok(None),
+    }
   }
 
   /// Get the color space parameters
@@ -831,6 +1242,25 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     Ok(guard.is_none() || guard.as_ref().is_none_or(|i| i.closed))
+  }
+
+  /// Get the number of planes in this VideoFrame (W3C WebCodecs spec)
+  /// The number depends on the pixel format:
+  /// - RGBA, RGBX, BGRA, BGRX: 1 plane
+  /// - NV12, NV21: 2 planes
+  /// - I420, I422, I444: 3 planes
+  /// - I420A, I422A, I444A: 4 planes
+  #[napi(getter)]
+  pub fn number_of_planes(&self) -> Result<u32> {
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    match guard.as_ref() {
+      Some(inner) if !inner.closed => Ok(Self::get_number_of_planes(inner.original_format)),
+      _ => Err(invalid_state_error("VideoFrame is closed")),
+    }
   }
 
   /// Get the rotation in degrees clockwise (0, 90, 180, 270) - W3C WebCodecs spec
@@ -908,9 +1338,9 @@ impl VideoFrame {
 
     if destination.len() < size {
       return Err(Error::new(
-        Status::GenericFailure,
+        Status::InvalidArg,
         format!(
-          "Buffer too small: need {} bytes, got {}",
+          "TypeError: destination buffer too small: need {} bytes, got {}",
           size,
           destination.len()
         ),
@@ -1129,6 +1559,7 @@ impl VideoFrame {
 
       let new_inner = VideoFrameInner {
         frame: cloned_frame,
+        original_format: inner.original_format,
         timestamp_us: inner.timestamp_us,
         duration_us: inner.duration_us,
         display_width: inner.display_width,
@@ -1222,6 +1653,35 @@ impl VideoFrame {
       | VideoPixelFormat::RGBX
       | VideoPixelFormat::BGRA
       | VideoPixelFormat::BGRX => w * h * 4,
+    }
+  }
+
+  fn get_number_of_planes(format: VideoPixelFormat) -> u32 {
+    match format {
+      // RGBA formats: single packed plane
+      VideoPixelFormat::RGBA
+      | VideoPixelFormat::RGBX
+      | VideoPixelFormat::BGRA
+      | VideoPixelFormat::BGRX => 1,
+      // Semi-planar: Y plane + interleaved UV
+      VideoPixelFormat::NV12 | VideoPixelFormat::NV21 => 2,
+      // 3-plane formats: Y, U, V
+      VideoPixelFormat::I420
+      | VideoPixelFormat::I420P10
+      | VideoPixelFormat::I420P12
+      | VideoPixelFormat::I422
+      | VideoPixelFormat::I422P10
+      | VideoPixelFormat::I422P12
+      | VideoPixelFormat::I444
+      | VideoPixelFormat::I444P10
+      | VideoPixelFormat::I444P12 => 3,
+      // 4-plane formats: Y, U, V, A
+      VideoPixelFormat::I420A
+      | VideoPixelFormat::I420AP10
+      | VideoPixelFormat::I422A
+      | VideoPixelFormat::I422AP10
+      | VideoPixelFormat::I444A
+      | VideoPixelFormat::I444AP10 => 4,
     }
   }
 
@@ -1339,6 +1799,125 @@ impl VideoFrame {
             let src_start = y_size + row * width as usize;
             let dst_start = row * linesize1;
             uv_plane[dst_start..dst_start + width as usize]
+              .copy_from_slice(&data[src_start..src_start + width as usize]);
+          }
+        }
+      }
+      VideoPixelFormat::I422 | VideoPixelFormat::I422A => {
+        // I422: 4:2:2 - Y full resolution, U/V half width, full height
+        let y_size = (width * height) as usize;
+        let uv_width = (width / 2) as usize;
+        let uv_size = uv_width * height as usize;
+        let v_offset = y_size + uv_size;
+
+        // Copy Y plane
+        {
+          let y_plane = frame
+            .plane_data_mut(0)
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get Y plane"))?;
+          for row in 0..height as usize {
+            let src_start = row * width as usize;
+            let dst_start = row * linesize0;
+            y_plane[dst_start..dst_start + width as usize]
+              .copy_from_slice(&data[src_start..src_start + width as usize]);
+          }
+        }
+
+        // Copy U plane
+        {
+          let u_plane = frame
+            .plane_data_mut(1)
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get U plane"))?;
+          for row in 0..height as usize {
+            let src_start = y_size + row * uv_width;
+            let dst_start = row * linesize1;
+            u_plane[dst_start..dst_start + uv_width]
+              .copy_from_slice(&data[src_start..src_start + uv_width]);
+          }
+        }
+
+        // Copy V plane
+        {
+          let v_plane = frame
+            .plane_data_mut(2)
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get V plane"))?;
+          for row in 0..height as usize {
+            let src_start = v_offset + row * uv_width;
+            let dst_start = row * linesize2;
+            v_plane[dst_start..dst_start + uv_width]
+              .copy_from_slice(&data[src_start..src_start + uv_width]);
+          }
+        }
+
+        // Copy A plane if present
+        if format == VideoPixelFormat::I422A {
+          let a_offset = v_offset + uv_size;
+          let a_plane = frame
+            .plane_data_mut(3)
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get A plane"))?;
+          for row in 0..height as usize {
+            let src_start = a_offset + row * width as usize;
+            let dst_start = row * linesize3;
+            a_plane[dst_start..dst_start + width as usize]
+              .copy_from_slice(&data[src_start..src_start + width as usize]);
+          }
+        }
+      }
+      VideoPixelFormat::I444 | VideoPixelFormat::I444A => {
+        // I444: 4:4:4 - Y, U, V all full resolution
+        let plane_size = (width * height) as usize;
+        let u_offset = plane_size;
+        let v_offset = plane_size * 2;
+
+        // Copy Y plane
+        {
+          let y_plane = frame
+            .plane_data_mut(0)
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get Y plane"))?;
+          for row in 0..height as usize {
+            let src_start = row * width as usize;
+            let dst_start = row * linesize0;
+            y_plane[dst_start..dst_start + width as usize]
+              .copy_from_slice(&data[src_start..src_start + width as usize]);
+          }
+        }
+
+        // Copy U plane
+        {
+          let u_plane = frame
+            .plane_data_mut(1)
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get U plane"))?;
+          for row in 0..height as usize {
+            let src_start = u_offset + row * width as usize;
+            let dst_start = row * linesize1;
+            u_plane[dst_start..dst_start + width as usize]
+              .copy_from_slice(&data[src_start..src_start + width as usize]);
+          }
+        }
+
+        // Copy V plane
+        {
+          let v_plane = frame
+            .plane_data_mut(2)
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get V plane"))?;
+          for row in 0..height as usize {
+            let src_start = v_offset + row * width as usize;
+            let dst_start = row * linesize2;
+            v_plane[dst_start..dst_start + width as usize]
+              .copy_from_slice(&data[src_start..src_start + width as usize]);
+          }
+        }
+
+        // Copy A plane if present
+        if format == VideoPixelFormat::I444A {
+          let a_offset = plane_size * 3;
+          let a_plane = frame
+            .plane_data_mut(3)
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get A plane"))?;
+          for row in 0..height as usize {
+            let src_start = a_offset + row * width as usize;
+            let dst_start = row * linesize3;
+            a_plane[dst_start..dst_start + width as usize]
               .copy_from_slice(&data[src_start..src_start + width as usize]);
           }
         }

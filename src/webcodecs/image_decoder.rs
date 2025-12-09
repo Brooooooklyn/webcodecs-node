@@ -64,12 +64,20 @@ impl<'env> FromNapiValue for ImageDecoderInit<'env> {
     env: napi::sys::napi_env,
     value: napi::sys::napi_value,
   ) -> Result<Self> {
+    let env_wrapper = Env::from_raw(env);
     let obj = Object::from_napi_value(env, value)?;
 
-    // Get MIME type (required)
-    let mime_type: String = obj
-      .get_named_property("type")
-      .map_err(|_| Error::new(Status::InvalidArg, "Missing required 'type' property"))?;
+    // Get MIME type (required) - throw native TypeError if missing
+    let mime_type: String = match obj.get_named_property("type") {
+      Ok(t) => t,
+      Err(_) => {
+        env_wrapper.throw_type_error("Missing required 'type' property", None)?;
+        return Err(Error::new(
+          Status::InvalidArg,
+          "Missing required 'type' property",
+        ));
+      }
+    };
 
     // Get optional properties
     let color_space_conversion: Option<String> = obj.get("colorSpaceConversion").ok().flatten();
@@ -341,8 +349,8 @@ struct ImageDecoderInner {
   data: ImageDecoderData,
   /// MIME type
   mime_type: String,
-  /// Codec ID for decoding
-  codec_id: AVCodecID,
+  /// Codec ID for decoding (None if MIME type is unsupported)
+  codec_id: Option<AVCodecID>,
   /// Decoder context (created on first decode)
   context: Option<CodecContext>,
   /// Whether data is fully buffered (true for Buffer, becomes true for Stream when finished)
@@ -380,11 +388,11 @@ impl ImageDecoder {
   /// Supports both Uint8Array and ReadableStream as data source per W3C spec
   #[napi(constructor)]
   pub fn new<'env>(env: &'env Env, mut this: This, init: ImageDecoderInit<'env>) -> Result<Self> {
-    // Parse MIME type to codec ID
-    let codec_id = parse_mime_type(&init.mime_type)?;
+    // Parse MIME type to codec ID - accept invalid types (will fail at decode time per W3C spec)
+    let codec_id = parse_mime_type(&init.mime_type).ok();
 
     // Determine if this is an animated format
-    let animated = matches!(codec_id, AVCodecID::Gif | AVCodecID::Webp);
+    let animated = matches!(codec_id, Some(AVCodecID::Gif) | Some(AVCodecID::Webp));
 
     // For static images, there's one frame; for animated, we'll detect later
     let frame_count = if animated { 0 } else { 1 };
@@ -622,9 +630,20 @@ impl ImageDecoder {
             }
           };
 
+          // Check if codec_id is valid (invalid MIME type at construction is deferred to here)
+          let codec_id = match inner.codec_id {
+            Some(id) => id,
+            None => {
+              return Err(Error::new(
+                Status::GenericFailure,
+                format!("Unsupported image type: {}", inner.mime_type),
+              ));
+            }
+          };
+
           // Create decoder context if needed
           if inner.context.is_none() {
-            let mut context = CodecContext::new_decoder(inner.codec_id).map_err(|e| {
+            let mut context = CodecContext::new_decoder(codec_id).map_err(|e| {
               Error::new(
                 Status::GenericFailure,
                 format!("Failed to create decoder: {}", e),
@@ -632,9 +651,10 @@ impl ImageDecoder {
             })?;
 
             let decoder_config = DecoderConfig {
-              codec_id: inner.codec_id,
+              codec_id,
               thread_count: 0,
               extradata: None,
+              low_latency: false,
             };
 
             context.configure_decoder(&decoder_config).map_err(|e| {
@@ -690,7 +710,7 @@ impl ImageDecoder {
           return Err(Error::new(
             Status::InvalidArg,
             format!(
-              "Frame index {} out of bounds (image has {} frames)",
+              "RangeError: Frame index {} out of bounds (image has {} frames)",
               frame_index,
               frames.len()
             ),
@@ -810,7 +830,18 @@ fn pre_parse_and_cache_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<(
     }
   };
 
-  let codec_id = inner_guard.codec_id;
+  // Check if codec_id is valid (invalid MIME type at construction is deferred to here)
+  let codec_id = match inner_guard.codec_id {
+    Some(id) => id,
+    None => {
+      inner_guard.tracks.ready.store(true, Ordering::Release);
+      inner_guard.tracks.ready_notify.notify_waiters();
+      return Err(Error::new(
+        Status::GenericFailure,
+        format!("Unsupported image type: {}", inner_guard.mime_type),
+      ));
+    }
+  };
 
   // Create decoder context
   let mut context = CodecContext::new_decoder(codec_id).map_err(|e| {
@@ -826,6 +857,7 @@ fn pre_parse_and_cache_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<(
     codec_id,
     thread_count: 0,
     extradata: None,
+    low_latency: false,
   };
 
   context.configure_decoder(&decoder_config).map_err(|e| {

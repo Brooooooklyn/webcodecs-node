@@ -71,16 +71,16 @@ test('VideoEncoder: state transitions correctly', (t) => {
   t.is(encoder.state, 'closed')
 })
 
-test('VideoEncoder: close() is idempotent', (t) => {
+test('VideoEncoder: close() on closed encoder throws InvalidStateError', (t) => {
   const { encoder } = createTestEncoder()
   encoder.configure(createEncoderConfig('h264', 320, 240))
 
   encoder.close()
   t.is(encoder.state, 'closed')
 
-  // Second close should not throw
-  t.notThrows(() => encoder.close())
-  t.is(encoder.state, 'closed')
+  // W3C spec: second close should throw InvalidStateError
+  const error = t.throws(() => encoder.close())
+  t.true(error?.message.includes('InvalidStateError'))
 })
 
 // ============================================================================
@@ -361,35 +361,29 @@ test('VideoEncoder: isConfigSupported() returns false for unknown codec', async 
 // Error Handling Tests (Errors via callback)
 // ============================================================================
 
-test('VideoEncoder: encode() on unconfigured encoder triggers error callback', (t) => {
+test('VideoEncoder: encode() on unconfigured encoder throws InvalidStateError', (t) => {
   const { encoder } = createTestEncoder()
   const frame = generateSolidColorI420Frame(320, 240, TestColors.red, 0)
 
-  // encode() on unconfigured encoder should trigger error callback
-  encoder.encode(frame)
+  // W3C spec: encode() on unconfigured encoder should throw InvalidStateError
+  const error = t.throws(() => encoder.encode(frame))
+  t.true(error?.message.includes('InvalidStateError'))
 
   frame.close()
-
-  // Give the error callback a chance to be called
-  t.is(encoder.state, 'closed', 'Encoder should be closed after error')
-
-  encoder.close()
 })
 
-test('VideoEncoder: encode() on closed encoder triggers error callback', (t) => {
+test('VideoEncoder: encode() on closed encoder throws InvalidStateError', (t) => {
   const { encoder } = createTestEncoder()
   encoder.configure(createEncoderConfig('h264', 320, 240))
   encoder.close()
 
   const frame = generateSolidColorI420Frame(320, 240, TestColors.red, 0)
 
-  // encode() on closed encoder should trigger error callback
-  encoder.encode(frame)
+  // W3C spec: encode() on closed encoder should throw InvalidStateError
+  const error = t.throws(() => encoder.encode(frame))
+  t.true(error?.message.includes('InvalidStateError'))
 
   frame.close()
-
-  // Test passes if no crash - error callback will be invoked asynchronously
-  t.pass('encode() on closed encoder did not crash')
 })
 
 // ============================================================================

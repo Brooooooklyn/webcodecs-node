@@ -5,6 +5,8 @@
 
 use crate::codec::{CodecContext, DecoderConfig, Frame, Packet};
 use crate::ffi::{AVCodecID, AVHWDeviceType};
+use crate::webcodecs::error::{invalid_state_error, throw_type_error_unit};
+use crate::webcodecs::promise_reject::reject_with_type_error;
 use crate::webcodecs::{
   CodecState, EncodedVideoChunk, EncodedVideoChunkInner, HardwareAcceleration, VideoDecoderConfig,
   VideoFrame,
@@ -15,6 +17,8 @@ use napi::threadsafe_function::{
   ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
 };
 use napi_derive::napi;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
@@ -23,9 +27,10 @@ use std::thread::JoinHandle;
 type OutputCallback =
   ThreadsafeFunction<VideoFrame, UnknownReturnValue, VideoFrame, Status, false, true>;
 
-/// Type alias for error callback (takes error message)
-/// Still using default CalleeHandled: true for error-first convention
-type ErrorCallback = ThreadsafeFunction<String, UnknownReturnValue, String, Status, true, true>;
+/// Type alias for error callback (takes Error object)
+/// Using CalleeHandled: false because WebCodecs error callback receives Error directly,
+/// not error-first (err, result) style
+type ErrorCallback = ThreadsafeFunction<Error, UnknownReturnValue, Error, Status, false, true>;
 
 // Note: For ondequeue, we use FunctionRef instead of ThreadsafeFunction
 // to support both getter and setter per WebCodecs spec
@@ -40,8 +45,10 @@ enum WorkerCommand {
 
 /// VideoDecoder init dictionary per WebCodecs spec
 pub struct VideoDecoderInit {
-  /// Output callback - called when decoded frame is available
+  /// Output callback - called when decoded frame is available (ThreadsafeFunction for worker)
   pub output: OutputCallback,
+  /// Output callback reference - stored for synchronous calls from main thread
+  pub output_ref: FunctionRef<VideoFrame, UnknownReturnValue>,
   /// Error callback - called when an error occurs
   pub error: ErrorCallback,
 }
@@ -51,17 +58,46 @@ impl FromNapiValue for VideoDecoderInit {
     env: napi::sys::napi_env,
     value: napi::sys::napi_value,
   ) -> Result<Self> {
+    let env_wrapper = Env::from_raw(env);
     let obj = Object::from_napi_value(env, value)?;
 
-    let output: OutputCallback = obj
-      .get_named_property("output")
-      .map_err(|_| Error::new(Status::InvalidArg, "Missing required 'output' callback"))?;
+    // W3C spec: throw TypeError if required callbacks are missing
+    // Get output callback as Function first, then create both FunctionRef and ThreadsafeFunction
+    let output_func: Function<VideoFrame, UnknownReturnValue> =
+      match obj.get_named_property("output") {
+        Ok(cb) => cb,
+        Err(_) => {
+          env_wrapper.throw_type_error("output callback is required", None)?;
+          return Err(Error::new(
+            Status::InvalidArg,
+            "output callback is required",
+          ));
+        }
+      };
 
-    let error: ErrorCallback = obj
-      .get_named_property("error")
-      .map_err(|_| Error::new(Status::InvalidArg, "Missing required 'error' callback"))?;
+    // Create FunctionRef for synchronous calls from main thread (in flush resolver)
+    let output_ref = output_func.create_ref()?;
 
-    Ok(VideoDecoderInit { output, error })
+    // Create ThreadsafeFunction for async calls from worker thread
+    let output: OutputCallback = output_func
+      .build_threadsafe_function()
+      .callee_handled::<false>()
+      .weak::<true>()
+      .build()?;
+
+    let error: ErrorCallback = match obj.get_named_property("error") {
+      Ok(cb) => cb,
+      Err(_) => {
+        env_wrapper.throw_type_error("error callback is required", None)?;
+        return Err(Error::new(Status::InvalidArg, "error callback is required"));
+      }
+    };
+
+    Ok(VideoDecoderInit {
+      output,
+      output_ref,
+      error,
+    })
   }
 }
 
@@ -86,12 +122,29 @@ struct VideoDecoderInner {
   frame_count: u64,
   /// Number of pending decode operations (for decodeQueueSize)
   decode_queue_size: u32,
-  /// Output callback (required per spec)
+  /// Output callback (required per spec) - used by worker thread for error cases
   output_callback: OutputCallback,
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
   /// Optional dequeue event callback (ThreadsafeFunction for multi-thread support)
   dequeue_callback: Option<ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, true>>,
+  /// Whether a keyframe has been received (for delta frame validation)
+  keyframe_received: bool,
+  /// Whether an error has occurred during decoding (for flush error propagation)
+  had_error: bool,
+  /// Pending flush response senders (for AbortError on reset)
+  pending_flush_senders: Vec<crossbeam::channel::Sender<Result<()>>>,
+  /// Queue of input timestamps for correlation with output frames
+  /// (needed because FFmpeg may buffer frames internally and modify PTS)
+  timestamp_queue: std::collections::VecDeque<(i64, Option<i64>)>,
+  /// Atomic flag for flush abort - set by reset() to signal pending flush to abort
+  flush_abort_flag: Option<Arc<AtomicBool>>,
+  /// Queue of decoded frames waiting to be delivered via output callback
+  /// Worker pushes frames here during flush; flush() drains them synchronously via FunctionRef
+  pending_frames: Vec<VideoFrame>,
+  /// Flag indicating whether a flush operation is in progress
+  /// When true, worker queues frames to pending_frames instead of calling NonBlocking callback
+  inside_flush: bool,
 
   // ========================================================================
   // Hardware acceleration tracking (for Chromium-aligned fallback behavior)
@@ -152,10 +205,16 @@ fn get_platform_hw_type() -> AVHWDeviceType {
 pub struct VideoDecoder {
   inner: Arc<Mutex<VideoDecoderInner>>,
   dequeue_callback: Option<FunctionRef<(), UnknownReturnValue>>,
+  /// Output callback reference - stored for synchronous calls from main thread (in flush resolver)
+  /// Wrapped in Rc to allow sharing with spawn_future_with_callback closure
+  /// (Rc is !Send but that's OK - the callback runs on the main thread)
+  output_callback_ref: Rc<FunctionRef<VideoFrame, UnknownReturnValue>>,
   /// Channel sender for worker commands
   command_sender: Option<Sender<WorkerCommand>>,
   /// Worker thread handle
   worker_handle: Option<JoinHandle<()>>,
+  /// Reset abort flag - set by reset() to signal worker to skip pending decodes
+  reset_flag: Arc<AtomicBool>,
 }
 
 impl Drop for VideoDecoder {
@@ -200,6 +259,13 @@ impl VideoDecoder {
       output_callback: init.output,
       error_callback: init.error,
       dequeue_callback: None,
+      keyframe_received: false,
+      had_error: false,
+      pending_flush_senders: Vec::new(),
+      timestamp_queue: std::collections::VecDeque::new(),
+      flush_abort_flag: None,
+      pending_frames: Vec::new(),
+      inside_flush: false,
       // Hardware acceleration tracking (Chromium-aligned)
       is_hardware: false,
       hw_preference: HardwareAcceleration::NoPreference,
@@ -213,23 +279,55 @@ impl VideoDecoder {
     // Create channel for worker commands
     let (sender, receiver) = channel::unbounded();
 
+    // Create reset abort flag
+    let reset_flag = Arc::new(AtomicBool::new(false));
+
     // Spawn worker thread
     let worker_inner = inner.clone();
+    let worker_reset_flag = reset_flag.clone();
     let worker_handle = std::thread::spawn(move || {
-      Self::worker_loop(worker_inner, receiver);
+      Self::worker_loop(worker_inner, receiver, worker_reset_flag);
     });
 
     Ok(Self {
       inner,
       dequeue_callback: None,
+      output_callback_ref: Rc::new(init.output_ref),
       command_sender: Some(sender),
       worker_handle: Some(worker_handle),
+      reset_flag,
     })
   }
 
   /// Worker loop that processes commands from the channel
-  fn worker_loop(inner: Arc<Mutex<VideoDecoderInner>>, receiver: Receiver<WorkerCommand>) {
+  fn worker_loop(
+    inner: Arc<Mutex<VideoDecoderInner>>,
+    receiver: Receiver<WorkerCommand>,
+    reset_flag: Arc<AtomicBool>,
+  ) {
     while let Ok(command) = receiver.recv() {
+      // Check reset flag before processing each command
+      // If reset() was called, skip remaining decode commands
+      if reset_flag.load(Ordering::SeqCst) {
+        // Still process flush commands to send responses, but skip decodes
+        if let WorkerCommand::Flush(response_sender) = command {
+          let _ = response_sender.send(Err(Error::new(
+            Status::GenericFailure,
+            "AbortError: The operation was aborted",
+          )));
+        } else {
+          // For decode commands, just decrement queue and fire dequeue
+          if let Ok(mut guard) = inner.lock() {
+            let old_size = guard.decode_queue_size;
+            guard.decode_queue_size = old_size.saturating_sub(1);
+            if old_size > 0 {
+              let _ = Self::fire_dequeue_event(&guard);
+            }
+          }
+        }
+        continue;
+      }
+
       match command {
         WorkerCommand::Decode(chunk) => {
           Self::process_decode(&inner, chunk);
@@ -258,8 +356,11 @@ impl VideoDecoder {
 
     // Check if decoder is still configured
     if guard.state != CodecState::Configured {
-      guard.decode_queue_size = guard.decode_queue_size.saturating_sub(1);
-      let _ = Self::fire_dequeue_event(&guard);
+      let old_size = guard.decode_queue_size;
+      guard.decode_queue_size = old_size.saturating_sub(1);
+      if old_size > 0 {
+        let _ = Self::fire_dequeue_event(&guard);
+      }
       Self::report_error(&mut guard, "Decoder not configured");
       return;
     }
@@ -275,8 +376,11 @@ impl VideoDecoder {
       }) {
       Ok(c) => c,
       Err(e) => {
-        guard.decode_queue_size = guard.decode_queue_size.saturating_sub(1);
-        let _ = Self::fire_dequeue_event(&guard);
+        let old_size = guard.decode_queue_size;
+        guard.decode_queue_size = old_size.saturating_sub(1);
+        if old_size > 0 {
+          let _ = Self::fire_dequeue_event(&guard);
+        }
         Self::report_error(&mut guard, &e.reason);
         return;
       }
@@ -289,6 +393,10 @@ impl VideoDecoder {
     // Drop the chunk read guard before decoding
     drop(chunk_read_guard);
 
+    // Push timestamp to queue for correlation with output frames
+    // (FFmpeg may buffer frames internally and modify PTS)
+    guard.timestamp_queue.push_back((timestamp, duration));
+
     // Buffer chunk during silent failure detection period (for re-decoding on fallback)
     if guard.is_hardware && !guard.first_output_produced {
       guard.pending_chunks.push(chunk.clone());
@@ -298,8 +406,11 @@ impl VideoDecoder {
     let context = match guard.context.as_mut() {
       Some(ctx) => ctx,
       None => {
-        guard.decode_queue_size = guard.decode_queue_size.saturating_sub(1);
-        let _ = Self::fire_dequeue_event(&guard);
+        let old_size = guard.decode_queue_size;
+        guard.decode_queue_size = old_size.saturating_sub(1);
+        if old_size > 0 {
+          let _ = Self::fire_dequeue_event(&guard);
+        }
         Self::report_error(&mut guard, "No decoder context");
         return;
       }
@@ -314,8 +425,11 @@ impl VideoDecoder {
           match &guard.hw_preference {
             HardwareAcceleration::PreferHardware => {
               // prefer-hardware: Report error, don't fall back
-              guard.decode_queue_size = guard.decode_queue_size.saturating_sub(1);
-              let _ = Self::fire_dequeue_event(&guard);
+              let old_size = guard.decode_queue_size;
+              guard.decode_queue_size = old_size.saturating_sub(1);
+              if old_size > 0 {
+                let _ = Self::fire_dequeue_event(&guard);
+              }
               Self::report_error(
                 &mut guard,
                 &format!("OperationError: Hardware decoding failed: {}", e),
@@ -327,8 +441,11 @@ impl VideoDecoder {
               let pending = std::mem::take(&mut guard.pending_chunks);
               if Self::fallback_to_software(&mut guard).is_ok() {
                 // Re-decode buffered chunks with software decoder
-                guard.decode_queue_size = guard.decode_queue_size.saturating_sub(1);
-                let _ = Self::fire_dequeue_event(&guard);
+                let old_size = guard.decode_queue_size;
+                guard.decode_queue_size = old_size.saturating_sub(1);
+                if old_size > 0 {
+                  let _ = Self::fire_dequeue_event(&guard);
+                }
                 drop(guard);
                 Self::redecode_pending_chunks(inner, pending);
                 return;
@@ -338,8 +455,11 @@ impl VideoDecoder {
             _ => {}
           }
         }
-        guard.decode_queue_size = guard.decode_queue_size.saturating_sub(1);
-        let _ = Self::fire_dequeue_event(&guard);
+        let old_size = guard.decode_queue_size;
+        guard.decode_queue_size = old_size.saturating_sub(1);
+        if old_size > 0 {
+          let _ = Self::fire_dequeue_event(&guard);
+        }
         Self::report_error(&mut guard, &format!("Decode failed: {}", e));
         return;
       }
@@ -347,9 +467,12 @@ impl VideoDecoder {
 
     guard.frame_count += 1;
 
-    // Decrement queue size and fire dequeue event
-    guard.decode_queue_size = guard.decode_queue_size.saturating_sub(1);
-    let _ = Self::fire_dequeue_event(&guard);
+    // Decrement queue size and fire dequeue event (only if queue was not empty)
+    let old_size = guard.decode_queue_size;
+    guard.decode_queue_size = old_size.saturating_sub(1);
+    if old_size > 0 {
+      let _ = Self::fire_dequeue_event(&guard);
+    }
 
     // Check for silent failure (hardware decoder, no frames produced)
     if frames.is_empty() {
@@ -393,12 +516,25 @@ impl VideoDecoder {
       guard.pending_chunks.clear(); // No longer need the buffer
     }
 
-    // Convert internal frames to VideoFrames and call output callback
+    // Convert internal frames to VideoFrames and deliver
     for frame in frames {
-      let video_frame = VideoFrame::from_internal(frame, timestamp, duration);
-      guard
-        .output_callback
-        .call(video_frame, ThreadsafeFunctionCallMode::NonBlocking);
+      // Pop timestamp from queue to preserve original input timestamp
+      // (FFmpeg may modify PTS internally during decoding)
+      let (output_timestamp, output_duration) = guard
+        .timestamp_queue
+        .pop_front()
+        .unwrap_or((timestamp, duration));
+      let video_frame = VideoFrame::from_internal(frame, output_timestamp, output_duration);
+
+      // During flush, queue frames for synchronous delivery in resolver
+      // Otherwise, use NonBlocking callback for immediate delivery
+      if guard.inside_flush {
+        guard.pending_frames.push(video_frame);
+      } else {
+        guard
+          .output_callback
+          .call(video_frame, ThreadsafeFunctionCallMode::NonBlocking);
+      }
     }
   }
 
@@ -495,12 +631,16 @@ impl VideoDecoder {
         guard.first_output_produced = true;
       }
 
-      // Output frames
+      // Deliver frames (queue during flush, NonBlocking otherwise)
       for frame in frames {
         let video_frame = VideoFrame::from_internal(frame, timestamp, duration);
-        guard
-          .output_callback
-          .call(video_frame, ThreadsafeFunctionCallMode::NonBlocking);
+        if guard.inside_flush {
+          guard.pending_frames.push(video_frame);
+        } else {
+          guard
+            .output_callback
+            .call(video_frame, ThreadsafeFunctionCallMode::NonBlocking);
+        }
       }
     }
   }
@@ -511,16 +651,31 @@ impl VideoDecoder {
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
+    // W3C spec: If an error occurred during decoding, flush should reject FIRST
+    // Check this before state check to return EncodingError instead of InvalidStateError
+    if guard.had_error {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "EncodingError: Decode error occurred",
+      ));
+    }
+
+    // W3C spec: flush() should reject if decoder is not in configured state
     if guard.state != CodecState::Configured {
-      Self::report_error(&mut guard, "Decoder not configured");
-      return Ok(());
+      return Err(Error::new(
+        Status::GenericFailure,
+        "InvalidStateError: Decoder is not configured",
+      ));
     }
 
     let context = match guard.context.as_mut() {
       Some(ctx) => ctx,
       None => {
         Self::report_error(&mut guard, "No decoder context");
-        return Ok(());
+        return Err(Error::new(
+          Status::GenericFailure,
+          "EncodingError: No decoder context",
+        ));
       }
     };
 
@@ -528,23 +683,42 @@ impl VideoDecoder {
     let frames = match context.flush_decoder() {
       Ok(f) => f,
       Err(e) => {
-        Self::report_error(&mut guard, &format!("Flush failed: {}", e));
-        return Ok(());
+        let msg = format!("Flush failed: {}", e);
+        Self::report_error(&mut guard, &msg);
+        return Err(Error::new(
+          Status::GenericFailure,
+          format!("EncodingError: {}", msg),
+        ));
       }
     };
 
-    // Convert and call output callback for remaining frames
+    // Queue remaining frames for delivery (always queue during flush for synchronous delivery)
     for frame in frames {
-      let pts = frame.pts();
-      let duration = if frame.duration() > 0 {
-        Some(frame.duration())
-      } else {
-        None
-      };
-      let video_frame = VideoFrame::from_internal(frame, pts, duration);
-      guard
-        .output_callback
-        .call(video_frame, ThreadsafeFunctionCallMode::NonBlocking);
+      // Pop timestamp from queue to preserve original input timestamp
+      // (FFmpeg may modify PTS internally during decoding)
+      let (output_timestamp, output_duration) =
+        guard.timestamp_queue.pop_front().unwrap_or_else(|| {
+          // Fallback to FFmpeg's PTS if queue is empty
+          let pts = frame.pts();
+          let dur = if frame.duration() > 0 {
+            Some(frame.duration())
+          } else {
+            None
+          };
+          (pts, dur)
+        });
+      let video_frame = VideoFrame::from_internal(frame, output_timestamp, output_duration);
+      // Always queue during flush for synchronous delivery in resolver
+      guard.pending_frames.push(video_frame);
+    }
+
+    // Clear any remaining timestamps in queue after flush
+    guard.timestamp_queue.clear();
+
+    // Reset decoder state so it can accept more data (per W3C spec, flush should leave
+    // decoder in configured state, ready for more decode() calls)
+    if let Some(ref mut context) = guard.context {
+      context.flush();
     }
 
     Ok(())
@@ -552,10 +726,12 @@ impl VideoDecoder {
 
   /// Report an error via callback and close the decoder
   fn report_error(inner: &mut VideoDecoderInner, error_msg: &str) {
-    inner.error_callback.call(
-      Ok(error_msg.to_string()),
-      ThreadsafeFunctionCallMode::NonBlocking,
-    );
+    // Create an Error object that will be passed directly to the JS callback
+    let error = Error::new(Status::GenericFailure, error_msg);
+    inner
+      .error_callback
+      .call(error, ThreadsafeFunctionCallMode::NonBlocking);
+    inner.had_error = true;
     inner.state = CodecState::Closed;
   }
 
@@ -637,22 +813,58 @@ impl VideoDecoder {
   /// - `no-preference`: Try hardware first, silently fall back to software
   /// - `prefer-software`: Use software only
   #[napi]
-  pub fn configure(&self, config: VideoDecoderConfig) -> Result<()> {
+  pub fn configure(&self, env: Env, config: VideoDecoderConfig) -> Result<()> {
+    // W3C WebCodecs spec: Validate config synchronously, throw TypeError for invalid
+    // https://w3c.github.io/webcodecs/#dom-videodecoder-configure
+
+    // Validate codec - must be present and not empty
+    let codec = match &config.codec {
+      Some(c) if !c.is_empty() => c.clone(),
+      _ => return throw_type_error_unit(&env, "codec is required"),
+    };
+
+    // Validate coded dimensions if specified
+    if let Some(w) = config.coded_width {
+      if w == 0 {
+        return throw_type_error_unit(&env, "codedWidth must be greater than 0");
+      }
+    }
+    if let Some(h) = config.coded_height {
+      if h == 0 {
+        return throw_type_error_unit(&env, "codedHeight must be greater than 0");
+      }
+    }
+
+    // Validate display aspect dimensions if specified
+    if let Some(dw) = config.display_aspect_width {
+      if dw == 0 {
+        return throw_type_error_unit(&env, "displayAspectWidth must be greater than 0");
+      }
+    }
+    if let Some(dh) = config.display_aspect_height {
+      if dh == 0 {
+        return throw_type_error_unit(&env, "displayAspectHeight must be greater than 0");
+      }
+    }
+
     let mut inner = self
       .inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
+    // W3C spec: throw InvalidStateError if closed
     if inner.state == CodecState::Closed {
-      Self::report_error(&mut inner, "Decoder is closed");
-      return Ok(());
+      return Err(invalid_state_error("Decoder is closed"));
     }
 
     // Parse codec string to determine codec ID
-    let codec_id = match parse_codec_string(&config.codec) {
+    let codec_id = match parse_codec_string(&codec) {
       Ok(id) => id,
       Err(e) => {
-        Self::report_error(&mut inner, &format!("Invalid codec: {}", e));
+        Self::report_error(
+          &mut inner,
+          &format!("NotSupportedError: Invalid codec: {}", e),
+        );
         return Ok(());
       }
     };
@@ -709,6 +921,7 @@ impl VideoDecoder {
       codec_id,
       thread_count: 0, // Auto
       extradata: config.description.as_ref().map(|d| d.to_vec()),
+      low_latency: config.optimize_for_latency.unwrap_or(false),
     };
 
     if let Err(e) = context.configure_decoder(&decoder_config) {
@@ -724,10 +937,11 @@ impl VideoDecoder {
 
     inner.context = Some(context);
     inner.config = Some(decoder_config);
-    inner.codec_string = config.codec;
+    inner.codec_string = codec;
     inner.state = CodecState::Configured;
     inner.frame_count = 0;
     inner.decode_queue_size = 0;
+    inner.keyframe_received = false;
 
     // Store hardware acceleration tracking state
     inner.is_hardware = is_hardware;
@@ -741,7 +955,7 @@ impl VideoDecoder {
 
   /// Decode an encoded video chunk
   #[napi]
-  pub fn decode(&self, chunk: &EncodedVideoChunk) -> Result<()> {
+  pub fn decode(&self, env: Env, chunk: &EncodedVideoChunk) -> Result<()> {
     // Increment queue size first (under lock)
     {
       let mut inner = self
@@ -749,9 +963,32 @@ impl VideoDecoder {
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
+      // W3C spec: throw InvalidStateError if not configured or closed
+      if inner.state == CodecState::Closed {
+        return Err(invalid_state_error("Cannot decode with a closed codec"));
+      }
       if inner.state != CodecState::Configured {
-        Self::report_error(&mut inner, "Decoder not configured");
-        return Ok(());
+        return Err(invalid_state_error(
+          "Cannot decode with an unconfigured codec",
+        ));
+      }
+
+      // W3C spec: throw DataError if first chunk is not a keyframe
+      let is_key = chunk.is_key();
+      if !inner.keyframe_received {
+        if is_key {
+          inner.keyframe_received = true;
+        } else {
+          // Trying to decode a delta frame before any keyframe
+          env.throw_error(
+            "DataError: First chunk must be a keyframe",
+            Some("ERR_WEBCODEC_DATA_ERROR"),
+          )?;
+          return Err(Error::new(
+            Status::InvalidArg,
+            "DataError: First chunk must be a keyframe",
+          ));
+        }
       }
 
       inner.decode_queue_size += 1;
@@ -774,10 +1011,63 @@ impl VideoDecoder {
 
   /// Flush the decoder
   /// Returns a Promise that resolves when flushing is complete
-  #[napi]
-  pub async fn flush(&self) -> Result<()> {
+  ///
+  /// Uses spawn_future_with_callback to check abort flag synchronously in the resolver.
+  /// This ensures that if reset() is called from a callback, the abort flag is checked
+  /// AFTER the callback returns, allowing flush() to return AbortError.
+  #[napi(ts_return_type = "Promise<void>")]
+  pub fn flush<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
+    // Create abort flag for this flush operation
+    let flush_abort_flag = Arc::new(AtomicBool::new(false));
+
+    // W3C spec: Check state upfront and return rejected promise with appropriate error
+    // (not throw synchronously - flush() should always return a promise)
+    {
+      let mut inner = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+      if inner.state == CodecState::Closed {
+        // If closed due to error, return EncodingError; otherwise InvalidStateError
+        let error_msg = if inner.had_error {
+          "EncodingError: Decode error occurred"
+        } else {
+          "InvalidStateError: Cannot flush a closed codec"
+        };
+        // Return immediately rejected promise
+        return env
+          .spawn_future_with_callback(async move { Ok(()) }, move |_env, _| -> Result<()> {
+            Err(Error::new(Status::GenericFailure, error_msg))
+          });
+      }
+      if inner.state == CodecState::Unconfigured {
+        // Return immediately rejected promise
+        return env.spawn_future_with_callback(
+          async move { Ok(()) },
+          move |_env, _| -> Result<()> {
+            Err(invalid_state_error("Cannot flush an unconfigured codec"))
+          },
+        );
+      }
+
+      // Store abort flag for reset() to access
+      inner.flush_abort_flag = Some(flush_abort_flag.clone());
+      // Set inside_flush flag so worker queues frames instead of calling NonBlocking callback
+      inner.inside_flush = true;
+    }
+
     // Create a response channel
     let (response_sender, response_receiver) = channel::bounded::<Result<()>>(1);
+
+    // Track this flush for AbortError on reset()
+    {
+      let mut inner = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+      inner.pending_flush_senders.push(response_sender.clone());
+    }
 
     // Send flush command through the channel to ensure it's processed after all pending decodes
     if let Some(ref sender) = self.command_sender {
@@ -785,26 +1075,74 @@ impl VideoDecoder {
         .send(WorkerCommand::Flush(response_sender))
         .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?;
     } else {
-      return Err(Error::new(
-        Status::GenericFailure,
-        "Decoder has been closed",
-      ));
+      return Err(invalid_state_error("Cannot flush a closed codec"));
     }
 
-    // Wait for response in a blocking thread to not block the event loop
-    spawn_blocking(move || {
-      response_receiver
-        .recv()
-        .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?
-    })
-    .await
-    .map_err(|join_error| {
-      Error::new(
-        Status::GenericFailure,
-        format!("Flush failed: {}", join_error),
-      )
-    })
-    .flatten()
+    // Clone references for the callback closure
+    let inner_clone = self.inner.clone();
+    let output_callback_ref = self.output_callback_ref.clone();
+
+    env.spawn_future_with_callback(
+      async move {
+        // Wait for worker response in a blocking thread
+        let result = spawn_blocking(move || {
+          response_receiver
+            .recv()
+            .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?
+        })
+        .await
+        .map_err(|join_error| {
+          Error::new(
+            Status::GenericFailure,
+            format!("Flush failed: {}", join_error),
+          )
+        })
+        .flatten();
+
+        Ok((result, inner_clone, flush_abort_flag))
+      },
+      move |env, (result, inner, abort_flag)| {
+        // Drain pending frames and call output callback SYNCHRONOUSLY
+        // This runs on the main thread with Env access
+        let frames = {
+          let mut guard = inner
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+          std::mem::take(&mut guard.pending_frames)
+        };
+
+        // Call output callback for each frame synchronously
+        // If callback calls reset(), abort_flag will be set before next iteration
+        let callback = output_callback_ref.borrow_back(env)?;
+        for frame in frames {
+          // Check abort flag before each callback - exit early if reset() was called
+          if abort_flag.load(Ordering::SeqCst) {
+            break;
+          }
+          callback.call(frame)?;
+        }
+
+        // Clean up flags
+        {
+          let mut guard = inner
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+          guard.flush_abort_flag = None;
+          guard.inside_flush = false;
+        }
+
+        // Check abort flag after draining all frames
+        if abort_flag.load(Ordering::SeqCst) {
+          return Err(Error::new(
+            Status::GenericFailure,
+            "AbortError: The operation was aborted",
+          ));
+        }
+
+        // Return worker result
+        result
+      },
+    )
   }
 
   /// Reset the decoder
@@ -817,8 +1155,33 @@ impl VideoDecoder {
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
+      // W3C spec: throw InvalidStateError if closed
       if inner.state == CodecState::Closed {
-        return Err(Error::new(Status::GenericFailure, "Decoder is closed"));
+        return Err(invalid_state_error("Cannot reset a closed codec"));
+      }
+
+      // Set abort flag FIRST (synchronously, before any other reset logic)
+      // This signals any pending flush() that is yielding to return AbortError
+      if let Some(ref flag) = inner.flush_abort_flag {
+        flag.store(true, Ordering::SeqCst);
+      }
+    }
+
+    // Set reset flag to signal worker to skip remaining pending decodes
+    // This must be done BEFORE dropping the command sender
+    self.reset_flag.store(true, Ordering::SeqCst);
+
+    // W3C spec: Abort all pending flushes with AbortError BEFORE dropping sender
+    {
+      let mut inner = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+      for sender in inner.pending_flush_senders.drain(..) {
+        let _ = sender.send(Err(Error::new(
+          Status::GenericFailure,
+          "AbortError: The operation was aborted",
+        )));
       }
     }
 
@@ -848,6 +1211,8 @@ impl VideoDecoder {
     inner.state = CodecState::Unconfigured;
     inner.frame_count = 0;
     inner.decode_queue_size = 0;
+    inner.keyframe_received = false;
+    inner.had_error = false;
 
     // Reset hardware tracking state
     inner.is_hardware = false;
@@ -855,15 +1220,33 @@ impl VideoDecoder {
     inner.silent_decode_count = 0;
     inner.first_output_produced = false;
     inner.pending_chunks.clear();
+    inner.timestamp_queue.clear();
+
+    // Clear flush-related state
+    inner.inside_flush = false;
+    inner.pending_frames.clear();
+
+    // Reset the abort flag for new worker
+    self.reset_flag.store(false, Ordering::SeqCst);
 
     // Create new channel and worker for future decode operations
     let (sender, receiver) = channel::unbounded();
     self.command_sender = Some(sender);
     let worker_inner = self.inner.clone();
+    let worker_reset_flag = self.reset_flag.clone();
+
+    // Create synchronization channel to wait for worker to be ready
+    let (ready_sender, ready_receiver) = channel::bounded::<()>(1);
+
     drop(inner); // Release lock before spawning thread
     self.worker_handle = Some(std::thread::spawn(move || {
-      Self::worker_loop(worker_inner, receiver);
+      // Signal that worker is ready before entering the loop
+      let _ = ready_sender.send(());
+      Self::worker_loop(worker_inner, receiver, worker_reset_flag);
     }));
+
+    // Wait for worker to be ready (prevents race condition)
+    let _ = ready_receiver.recv();
 
     Ok(())
   }
@@ -871,6 +1254,18 @@ impl VideoDecoder {
   /// Close the decoder
   #[napi]
   pub fn close(&mut self) -> Result<()> {
+    // Check state first - W3C spec: throw InvalidStateError if already closed
+    {
+      let inner = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+      if inner.state == CodecState::Closed {
+        return Err(invalid_state_error("Cannot close an already closed codec"));
+      }
+    }
+
     // Drop sender to stop accepting new commands
     self.command_sender = None;
 
@@ -907,53 +1302,396 @@ impl VideoDecoder {
 
   /// Check if a configuration is supported
   /// Returns a Promise that resolves with support information
+  ///
+  /// W3C WebCodecs spec: Throws TypeError for invalid configs,
+  /// returns { supported: false } for valid but unsupported configs.
   #[napi]
-  pub async fn is_config_supported(config: VideoDecoderConfig) -> Result<VideoDecoderSupport> {
-    // Parse codec string
-    let codec_id = match parse_codec_string(&config.codec) {
-      Ok(id) => id,
-      Err(_) => {
-        return Ok(VideoDecoderSupport {
-          supported: false,
-          config,
-        });
-      }
+  pub fn is_config_supported<'env>(
+    env: &'env Env,
+    config: VideoDecoderConfig,
+  ) -> Result<PromiseRaw<'env, VideoDecoderSupport>> {
+    // W3C WebCodecs spec: Validate config, throw TypeError for invalid
+    // https://w3c.github.io/webcodecs/#dom-videodecoder-isconfigsupported
+
+    // Validate codec - must be present and not empty
+    let codec = match &config.codec {
+      Some(c) if !c.is_empty() => c.clone(),
+      Some(_) => return reject_with_type_error(env, "codec is required"),
+      None => return reject_with_type_error(env, "codec is required"),
     };
 
-    // Try to create decoder
-    let result = CodecContext::new_decoder(codec_id);
+    // Validate coded dimensions if specified
+    if let Some(w) = config.coded_width {
+      if w == 0 {
+        return reject_with_type_error(env, "codedWidth must be greater than 0");
+      }
+    }
+    if let Some(h) = config.coded_height {
+      if h == 0 {
+        return reject_with_type_error(env, "codedHeight must be greater than 0");
+      }
+    }
 
-    Ok(VideoDecoderSupport {
-      supported: result.is_ok(),
-      config,
+    // Validate display aspect dimensions if specified
+    if let Some(dw) = config.display_aspect_width {
+      if dw == 0 {
+        return reject_with_type_error(env, "displayAspectWidth must be greater than 0");
+      }
+    }
+    if let Some(dh) = config.display_aspect_height {
+      if dh == 0 {
+        return reject_with_type_error(env, "displayAspectHeight must be greater than 0");
+      }
+    }
+
+    // Validate dimensions if specified
+    let width = config.coded_width.unwrap_or(0);
+    let height = config.coded_height.unwrap_or(0);
+    if width > 0 && height > 0 && !are_dimensions_valid(width, height) {
+      return env.spawn_future(async move {
+        Ok(VideoDecoderSupport {
+          supported: false,
+          config,
+        })
+      });
+    }
+
+    env.spawn_future(async move {
+      // Parse codec string
+      let codec_id = match parse_codec_string(&codec) {
+        Ok(id) => id,
+        Err(_) => {
+          return Ok(VideoDecoderSupport {
+            supported: false,
+            config,
+          });
+        }
+      };
+
+      // Try to create decoder
+      let result = CodecContext::new_decoder(codec_id);
+
+      Ok(VideoDecoderSupport {
+        supported: result.is_ok(),
+        config,
+      })
     })
   }
 }
 
-/// Parse WebCodecs codec string to FFmpeg codec ID
-fn parse_codec_string(codec: &str) -> Result<AVCodecID> {
-  let codec_lower = codec.to_lowercase();
+/// Valid H.264/AVC profiles (decimal values)
+const VALID_AVC_PROFILES: &[u8] = &[
+  66,  // Baseline
+  77,  // Main
+  88,  // Extended
+  100, // High
+  110, // High 10
+  122, // High 4:2:2
+  244, // High 4:4:4 Predictive
+];
 
-  if codec_lower.starts_with("avc1") || codec_lower.starts_with("avc3") || codec_lower == "h264" {
-    Ok(AVCodecID::H264)
-  } else if codec_lower.starts_with("hev1")
-    || codec_lower.starts_with("hvc1")
-    || codec_lower == "h265"
-    || codec_lower == "hevc"
+/// Valid H.264/AVC levels (decimal values)
+const VALID_AVC_LEVELS: &[u8] = &[
+  10, 11, 12, 13, // 1, 1.1, 1.2, 1.3
+  20, 21, 22, // 2, 2.1, 2.2
+  30, 31, 32, // 3, 3.1, 3.2
+  40, 41, 42, // 4, 4.1, 4.2
+  50, 51, 52, // 5, 5.1, 5.2
+  60, 61, 62, // 6, 6.1, 6.2
+];
+
+/// Valid VP9 profiles (0-3)
+const MAX_VP9_PROFILE: u8 = 3;
+
+/// Valid VP9 levels
+const VALID_VP9_LEVELS: &[u8] = &[10, 11, 20, 21, 30, 31, 40, 41, 50, 51, 52, 60, 61, 62];
+
+/// Valid AV1 profiles (0-2)
+const MAX_AV1_PROFILE: u8 = 2;
+
+/// Valid AV1 levels (0-23)
+const MAX_AV1_LEVEL: u8 = 23;
+
+/// Valid HEVC profiles
+const VALID_HEVC_PROFILES: &[u8] = &[1, 2, 3, 4];
+
+/// Maximum dimension (width/height) for decoder
+const MAX_DIMENSION: u32 = 16384;
+
+/// Validate H.264/AVC codec string format and parameters
+/// Format: avc1.PPCCLL or avc3.PPCCLL where PP=profile, CC=constraint, LL=level (hex)
+fn validate_avc_codec(codec: &str) -> bool {
+  // Must start with exactly "avc1." or "avc3."
+  if !codec.starts_with("avc1.") && !codec.starts_with("avc3.") {
+    return codec == "avc1" || codec == "avc3" || codec == "h264";
+  }
+
+  let params = &codec[5..]; // Skip "avc1." or "avc3."
+  if params.len() != 6 {
+    return false;
+  }
+
+  // Parse profile (first 2 hex digits)
+  let profile = match u8::from_str_radix(&params[0..2], 16) {
+    Ok(p) => p,
+    Err(_) => return false,
+  };
+
+  // Parse level (last 2 hex digits)
+  let level = match u8::from_str_radix(&params[4..6], 16) {
+    Ok(l) => l,
+    Err(_) => return false,
+  };
+
+  // Validate profile and level
+  VALID_AVC_PROFILES.contains(&profile) && VALID_AVC_LEVELS.contains(&level)
+}
+
+/// Validate VP9 codec string format and parameters
+/// Format: vp09.PP.LL.BB[.CC.CP.TC.FR.CS] where PP=profile, LL=level, BB=bit depth
+/// Note: Short form "vp9" is considered ambiguous for decoders per W3C spec
+fn validate_vp9_codec(codec: &str) -> bool {
+  // Short form "vp9" is ambiguous for decoders - require full codec string
+  if codec == "vp9" {
+    return false;
+  }
+
+  if !codec.starts_with("vp09.") {
+    return false;
+  }
+
+  let params = &codec[5..]; // Skip "vp09."
+  let parts: Vec<&str> = params.split('.').collect();
+  if parts.len() < 3 {
+    return false;
+  }
+
+  // Parse profile (2 decimal digits)
+  let profile: u8 = match parts[0].parse() {
+    Ok(p) => p,
+    Err(_) => return false,
+  };
+
+  // Parse level (2 decimal digits)
+  let level: u8 = match parts[1].parse() {
+    Ok(l) => l,
+    Err(_) => return false,
+  };
+
+  // Validate profile and level
+  profile <= MAX_VP9_PROFILE && VALID_VP9_LEVELS.contains(&level)
+}
+
+/// Validate AV1 codec string format and parameters
+/// Format: av01.P.LLM.BB[.M.CCC.CP.TC.FR.CS] where P=profile, LL=level, M=tier
+fn validate_av1_codec(codec: &str) -> bool {
+  if codec == "av1" {
+    return true; // Short form is valid
+  }
+
+  if !codec.starts_with("av01.") {
+    return false;
+  }
+
+  let params = &codec[5..]; // Skip "av01."
+  let parts: Vec<&str> = params.split('.').collect();
+  if parts.len() < 3 {
+    return false;
+  }
+
+  // Parse profile (single digit)
+  let profile: u8 = match parts[0].parse() {
+    Ok(p) => p,
+    Err(_) => return false,
+  };
+
+  // Parse level (2 digits + tier letter, e.g., "04M" or "10H")
+  let level_str = parts[1];
+  if level_str.len() < 2 {
+    return false;
+  }
+  let level: u8 = match level_str[..2].parse() {
+    Ok(l) => l,
+    Err(_) => return false,
+  };
+
+  // Validate profile and level
+  profile <= MAX_AV1_PROFILE && level <= MAX_AV1_LEVEL
+}
+
+/// Validate HEVC codec string format and parameters
+/// Format: hvc1.P.CCCCCC.Lxx or hev1.P.CCCCCC.Lxx
+fn validate_hevc_codec(codec: &str) -> bool {
+  if codec == "hevc" || codec == "h265" {
+    return true;
+  }
+
+  if !codec.starts_with("hvc1.") && !codec.starts_with("hev1.") {
+    return codec == "hvc1" || codec == "hev1";
+  }
+
+  let params = &codec[5..]; // Skip "hvc1." or "hev1."
+  let parts: Vec<&str> = params.split('.').collect();
+  if parts.is_empty() {
+    return false;
+  }
+
+  // Parse profile indicator (first part after codec prefix)
+  // Can be "1", "2", "A1", "B1", "C99" etc.
+  let profile_part = parts[0];
+
+  // Extract numeric profile from formats like "1", "A1", "B1", "C99"
+  let profile_num: u8 = if profile_part
+    .chars()
+    .next()
+    .is_some_and(|c| c.is_ascii_digit())
   {
-    Ok(AVCodecID::Hevc)
-  } else if codec_lower == "vp8" {
-    Ok(AVCodecID::Vp8)
-  } else if codec_lower.starts_with("vp09") || codec_lower == "vp9" {
-    Ok(AVCodecID::Vp9)
-  } else if codec_lower.starts_with("av01") || codec_lower == "av1" {
-    Ok(AVCodecID::Av1)
+    // Starts with digit - parse the whole part as profile
+    match profile_part.parse() {
+      Ok(p) => p,
+      Err(_) => return false,
+    }
+  } else if profile_part.len() >= 2 {
+    // Starts with letter - parse digits after the letter
+    match profile_part[1..].parse() {
+      Ok(p) => p,
+      Err(_) => return false,
+    }
   } else {
-    Err(Error::new(
+    return false;
+  };
+
+  // Validate profile (1-4 for standard profiles)
+  // Note: Profile indicators like C99 should fail
+  VALID_HEVC_PROFILES.contains(&profile_num)
+}
+
+/// Check if codec string has valid casing (case-sensitive per W3C spec)
+fn has_valid_codec_casing(codec: &str) -> bool {
+  // Check for leading/trailing whitespace
+  if codec != codec.trim() {
+    return false;
+  }
+
+  // VP8 must be exact lowercase
+  if codec.eq_ignore_ascii_case("vp8") && codec != "vp8" {
+    return false;
+  }
+
+  // VP9 short form must be exact lowercase
+  if codec.eq_ignore_ascii_case("vp9") && codec != "vp9" {
+    return false;
+  }
+
+  // vp09.* must start with lowercase vp09
+  if codec.to_lowercase().starts_with("vp09.") && !codec.starts_with("vp09.") {
+    return false;
+  }
+
+  // av01.* must start with lowercase av01
+  if codec.to_lowercase().starts_with("av01.") && !codec.starts_with("av01.") {
+    return false;
+  }
+
+  // avc1/avc3 must be lowercase
+  if codec.to_lowercase().starts_with("avc1") && !codec.starts_with("avc1") {
+    return false;
+  }
+  if codec.to_lowercase().starts_with("avc3") && !codec.starts_with("avc3") {
+    return false;
+  }
+
+  // hvc1/hev1 must be lowercase
+  if codec.to_lowercase().starts_with("hvc1") && !codec.starts_with("hvc1") {
+    return false;
+  }
+  if codec.to_lowercase().starts_with("hev1") && !codec.starts_with("hev1") {
+    return false;
+  }
+
+  true
+}
+
+/// Check if dimensions are within valid range
+fn are_dimensions_valid(width: u32, height: u32) -> bool {
+  width <= MAX_DIMENSION && height <= MAX_DIMENSION
+}
+
+/// Parse WebCodecs codec string to FFmpeg codec ID
+/// Returns error for unsupported or invalid codec strings
+fn parse_codec_string(codec: &str) -> Result<AVCodecID> {
+  // Handle common codec strings
+  // https://www.w3.org/TR/webcodecs-codec-registry/
+
+  // Check case sensitivity first
+  if !has_valid_codec_casing(codec) {
+    return Err(Error::new(
       Status::GenericFailure,
       format!("Unsupported codec: {}", codec),
-    ))
+    ));
   }
+
+  // H.264/AVC
+  if codec.starts_with("avc1") || codec.starts_with("avc3") || codec == "h264" {
+    if validate_avc_codec(codec) {
+      return Ok(AVCodecID::H264);
+    }
+    return Err(Error::new(
+      Status::GenericFailure,
+      format!("Unsupported codec: {}", codec),
+    ));
+  }
+
+  // HEVC
+  if codec.starts_with("hev1") || codec.starts_with("hvc1") || codec == "h265" || codec == "hevc" {
+    if validate_hevc_codec(codec) {
+      return Ok(AVCodecID::Hevc);
+    }
+    return Err(Error::new(
+      Status::GenericFailure,
+      format!("Unsupported codec: {}", codec),
+    ));
+  }
+
+  // VP8
+  if codec == "vp8" {
+    return Ok(AVCodecID::Vp8);
+  }
+
+  // VP9 - note: short form "vp9" is ambiguous for decoders
+  if codec.starts_with("vp09") {
+    if validate_vp9_codec(codec) {
+      return Ok(AVCodecID::Vp9);
+    }
+    return Err(Error::new(
+      Status::GenericFailure,
+      format!("Unsupported codec: {}", codec),
+    ));
+  }
+
+  // Reject ambiguous "vp9" short form for decoder
+  if codec == "vp9" {
+    return Err(Error::new(
+      Status::GenericFailure,
+      format!("Unsupported codec: {}", codec),
+    ));
+  }
+
+  // AV1
+  if codec.starts_with("av01") || codec == "av1" {
+    if validate_av1_codec(codec) {
+      return Ok(AVCodecID::Av1);
+    }
+    return Err(Error::new(
+      Status::GenericFailure,
+      format!("Unsupported codec: {}", codec),
+    ));
+  }
+
+  Err(Error::new(
+    Status::GenericFailure,
+    format!("Unsupported codec: {}", codec),
+  ))
 }
 
 /// Decode chunk data using FFmpeg
@@ -963,6 +1701,14 @@ fn decode_chunk_data(
   timestamp: i64,
   duration: Option<i64>,
 ) -> Result<Vec<Frame>> {
+  // W3C spec: Empty data should trigger EncodingError
+  if data.is_empty() {
+    return Err(Error::new(
+      Status::GenericFailure,
+      "EncodingError: Cannot decode empty frame data",
+    ));
+  }
+
   // Create a packet and fill it with data
   let mut packet = Packet::new().map_err(|e| {
     Error::new(

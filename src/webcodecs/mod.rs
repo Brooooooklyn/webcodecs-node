@@ -13,6 +13,7 @@ pub mod error;
 mod hardware;
 pub(crate) mod hw_fallback;
 mod image_decoder;
+mod promise_reject;
 mod video_decoder;
 mod video_encoder;
 mod video_frame;

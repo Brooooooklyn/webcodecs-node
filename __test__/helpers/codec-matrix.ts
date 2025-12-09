@@ -5,7 +5,7 @@
  * across different codecs and quality levels.
  */
 
-import type { VideoEncoderConfig, VideoDecoderConfig } from '../../index.js'
+import type { VideoEncoderConfig, VideoDecoderConfig } from '../../standard.js'
 
 /** Supported codec types */
 export type CodecType = 'h264' | 'h265' | 'vp8' | 'vp9' | 'av1'

@@ -158,13 +158,34 @@ impl Frame {
     let fmt = unsafe { ffframe_get_format(self.as_ptr()) };
     // Safe conversion - unknown formats become None
     match fmt {
+      // 8-bit YUV planar formats
       0 => AVPixelFormat::Yuv420p,
       4 => AVPixelFormat::Yuv422p,
       5 => AVPixelFormat::Yuv444p,
-      23 => AVPixelFormat::Nv12,
-      26 => AVPixelFormat::Rgba,
-      28 => AVPixelFormat::Bgra,
       33 => AVPixelFormat::Yuva420p,
+      39 => AVPixelFormat::Yuva422p,
+      40 => AVPixelFormat::Yuva444p,
+      // Semi-planar formats
+      23 => AVPixelFormat::Nv12,
+      24 => AVPixelFormat::Nv21,
+      // RGB formats
+      2 => AVPixelFormat::Rgb24,
+      3 => AVPixelFormat::Bgr24,
+      25 => AVPixelFormat::Argb,
+      26 => AVPixelFormat::Rgba,
+      27 => AVPixelFormat::Abgr,
+      28 => AVPixelFormat::Bgra,
+      // 10-bit YUV formats
+      64 => AVPixelFormat::Yuv420p10le,
+      65 => AVPixelFormat::Yuv422p10le,
+      68 => AVPixelFormat::Yuv444p10le,
+      82 => AVPixelFormat::Yuva420p10le,
+      83 => AVPixelFormat::Yuva422p10le,
+      84 => AVPixelFormat::Yuva444p10le,
+      // 12-bit YUV formats
+      74 => AVPixelFormat::Yuv420p12le,
+      75 => AVPixelFormat::Yuv422p12le,
+      78 => AVPixelFormat::Yuv444p12le,
       _ => AVPixelFormat::None,
     }
   }
@@ -497,10 +518,30 @@ impl Frame {
       if let Some(data) = self.plane_data(plane) {
         let linesize = self.linesize(plane) as usize;
         let width_bytes = match plane {
-          0 => self.width() as usize,
+          0 => match format {
+            // RGBA/BGRA formats: 4 bytes per pixel
+            AVPixelFormat::Rgba
+            | AVPixelFormat::Bgra
+            | AVPixelFormat::Argb
+            | AVPixelFormat::Abgr => self.width() as usize * 4,
+            // RGB24/BGR24: 3 bytes per pixel
+            AVPixelFormat::Rgb24 | AVPixelFormat::Bgr24 => self.width() as usize * 3,
+            // 4:2:2 formats: Y plane is full width
+            AVPixelFormat::Yuv422p | AVPixelFormat::Yuva422p => self.width() as usize,
+            // 4:4:4 formats: Y plane is full width
+            AVPixelFormat::Yuv444p | AVPixelFormat::Yuva444p => self.width() as usize,
+            // Default: 1 byte per pixel (8-bit YUV Y plane)
+            _ => self.width() as usize,
+          },
           _ => match format {
+            // 4:2:0 formats: U/V planes are half width
             AVPixelFormat::Yuv420p | AVPixelFormat::Yuva420p => (self.width() as usize).div_ceil(2),
-            AVPixelFormat::Nv12 => self.width() as usize, // UV interleaved
+            // NV12: UV interleaved, full width
+            AVPixelFormat::Nv12 | AVPixelFormat::Nv21 => self.width() as usize,
+            // 4:2:2 formats: U/V planes are half width
+            AVPixelFormat::Yuv422p | AVPixelFormat::Yuva422p => (self.width() as usize).div_ceil(2),
+            // 4:4:4 formats: U/V planes are full width
+            AVPixelFormat::Yuv444p | AVPixelFormat::Yuva444p => self.width() as usize,
             _ => self.width() as usize,
           },
         };
@@ -508,9 +549,10 @@ impl Frame {
         let height = match plane {
           0 | 3 => self.height() as usize,
           _ => match format {
-            AVPixelFormat::Yuv420p | AVPixelFormat::Nv12 | AVPixelFormat::Yuva420p => {
-              (self.height() as usize).div_ceil(2)
-            }
+            AVPixelFormat::Yuv420p
+            | AVPixelFormat::Nv12
+            | AVPixelFormat::Nv21
+            | AVPixelFormat::Yuva420p => (self.height() as usize).div_ceil(2),
             _ => self.height() as usize,
           },
         };

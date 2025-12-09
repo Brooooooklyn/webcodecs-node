@@ -96,7 +96,6 @@ impl AudioSampleFormat {
 
 /// Options for creating an AudioData (W3C WebCodecs spec)
 /// Note: Per spec, data is included in the init object
-#[napi(object)]
 pub struct AudioDataInit {
   /// Sample format (required)
   pub format: AudioSampleFormat,
@@ -109,10 +108,110 @@ pub struct AudioDataInit {
   /// Timestamp in microseconds (required)
   pub timestamp: i64,
   /// Raw audio sample data (required) - BufferSource per spec
-  pub data: Uint8Array,
-  /// ArrayBuffers to transfer (W3C spec - ignored in Node.js, we always copy)
-  #[napi(ts_type = "ArrayBuffer[]")]
-  pub transfer: Option<Vec<Uint8Array>>,
+  pub data: Vec<u8>,
+}
+
+/// Helper to throw TypeError and return an error
+fn throw_type_error(env: napi::sys::napi_env, message: &str) -> Error {
+  let env_wrapper = Env::from_raw(env);
+  let _ = env_wrapper.throw_type_error(message, None);
+  Error::new(Status::InvalidArg, message)
+}
+
+impl FromNapiValue for AudioDataInit {
+  unsafe fn from_napi_value(
+    env: napi::sys::napi_env,
+    value: napi::sys::napi_value,
+  ) -> Result<Self> {
+    let obj = Object::from_napi_value(env, value)?;
+
+    // Get format (required) - first check if it's a valid string
+    let format_str: Option<String> = obj.get("format")?;
+    let format = match format_str {
+      Some(s) => match s.as_str() {
+        "u8" => AudioSampleFormat::U8,
+        "s16" => AudioSampleFormat::S16,
+        "s32" => AudioSampleFormat::S32,
+        "f32" => AudioSampleFormat::F32,
+        "u8-planar" => AudioSampleFormat::U8Planar,
+        "s16-planar" => AudioSampleFormat::S16Planar,
+        "s32-planar" => AudioSampleFormat::S32Planar,
+        "f32-planar" => AudioSampleFormat::F32Planar,
+        _ => return Err(throw_type_error(env, &format!("Invalid format: {}", s))),
+      },
+      None => return Err(throw_type_error(env, "format is required")),
+    };
+
+    // Get sample_rate (required) - W3C spec uses float
+    let sample_rate: f64 = match obj.get("sampleRate")? {
+      Some(v) => v,
+      None => return Err(throw_type_error(env, "sampleRate is required")),
+    };
+
+    // Get numberOfFrames (required)
+    let number_of_frames: u32 = match obj.get("numberOfFrames")? {
+      Some(v) => v,
+      None => return Err(throw_type_error(env, "numberOfFrames is required")),
+    };
+
+    // Get numberOfChannels (required)
+    let number_of_channels: u32 = match obj.get("numberOfChannels")? {
+      Some(v) => v,
+      None => return Err(throw_type_error(env, "numberOfChannels is required")),
+    };
+
+    // Get timestamp (required)
+    let timestamp: i64 = match obj.get("timestamp")? {
+      Some(v) => v,
+      None => return Err(throw_type_error(env, "timestamp is required")),
+    };
+
+    // Validate data - required field, accept BufferSource (ArrayBuffer, TypedArray, DataView)
+    let data: Vec<u8> = if let Ok(Some(buffer)) = obj.get::<Buffer>("data") {
+      buffer.to_vec()
+    } else if let Ok(Some(array)) = obj.get::<Uint8Array>("data") {
+      array.to_vec()
+    } else if let Ok(Some(array_buffer)) = obj.get::<ArrayBuffer>("data") {
+      array_buffer.to_vec()
+    } else {
+      // Check if data property exists but is undefined/null
+      let has_data = obj.has_named_property("data")?;
+      if !has_data {
+        return Err(throw_type_error(env, "data is required"));
+      }
+
+      // Try getting as object and check for buffer/byteLength properties (DataView, other TypedArrays)
+      if let Ok(Some(data_obj)) = obj.get::<Object>("data") {
+        let byte_length: Option<u32> = data_obj.get("byteLength").ok().flatten();
+        let byte_offset: u32 = data_obj.get("byteOffset").ok().flatten().unwrap_or(0);
+
+        if let (Some(len), Ok(Some(buffer))) = (byte_length, data_obj.get::<ArrayBuffer>("buffer"))
+        {
+          let full_data = buffer.to_vec();
+          let offset = byte_offset as usize;
+          let length = len as usize;
+          if offset + length <= full_data.len() {
+            full_data[offset..offset + length].to_vec()
+          } else {
+            return Err(throw_type_error(env, "data must be a valid BufferSource"));
+          }
+        } else {
+          return Err(throw_type_error(env, "data must be a BufferSource"));
+        }
+      } else {
+        return Err(throw_type_error(env, "data is required"));
+      }
+    };
+
+    Ok(AudioDataInit {
+      format,
+      sample_rate,
+      number_of_frames,
+      number_of_channels,
+      timestamp,
+      data,
+    })
+  }
 }
 
 /// Options for copyTo operation
@@ -150,9 +249,57 @@ impl AudioData {
   /// Create a new AudioData (W3C WebCodecs spec)
   /// Per spec, the constructor takes a single init object containing all parameters including data
   #[napi(constructor)]
-  pub fn new(init: AudioDataInit) -> Result<Self> {
+  pub fn new(
+    env: Env,
+    #[napi(ts_arg_type = "import('./standard').AudioDataInit")] init: AudioDataInit,
+  ) -> Result<Self> {
+    // Validate zero values
+    if init.sample_rate == 0.0 {
+      env.throw_type_error("sampleRate must be greater than 0", None)?;
+      return Err(Error::new(
+        Status::InvalidArg,
+        "sampleRate must be greater than 0",
+      ));
+    }
+    if init.number_of_frames == 0 {
+      env.throw_type_error("numberOfFrames must be greater than 0", None)?;
+      return Err(Error::new(
+        Status::InvalidArg,
+        "numberOfFrames must be greater than 0",
+      ));
+    }
+    if init.number_of_channels == 0 {
+      env.throw_type_error("numberOfChannels must be greater than 0", None)?;
+      return Err(Error::new(
+        Status::InvalidArg,
+        "numberOfChannels must be greater than 0",
+      ));
+    }
+
+    // Validate buffer size
+    let expected_size =
+      Self::calculate_buffer_size(init.format, init.number_of_frames, init.number_of_channels);
+    if init.data.len() < expected_size {
+      env.throw_type_error(
+        &format!(
+          "data buffer too small: need {} bytes, got {}",
+          expected_size,
+          init.data.len()
+        ),
+        None,
+      )?;
+      return Err(Error::new(
+        Status::InvalidArg,
+        format!(
+          "data buffer too small: need {} bytes, got {}",
+          expected_size,
+          init.data.len()
+        ),
+      ));
+    }
+
     let av_format = init.format.to_av_format();
-    let data = init.data.as_ref();
+    let data = &init.data;
     // Convert sample_rate from f64 to u32 for FFmpeg (internally uses integer)
     let sample_rate_u32 = init.sample_rate as u32;
 
@@ -209,6 +356,12 @@ impl AudioData {
     Self {
       inner: Arc::new(Mutex::new(Some(inner))),
     }
+  }
+
+  /// Calculate required buffer size for audio data
+  fn calculate_buffer_size(format: AudioSampleFormat, num_frames: u32, channels: u32) -> usize {
+    let bytes_per_sample = format.bytes_per_sample();
+    num_frames as usize * channels as usize * bytes_per_sample
   }
 
   /// Copy data into frame
@@ -360,6 +513,28 @@ impl AudioData {
     Ok(inner.is_none())
   }
 
+  /// Get the number of planes in this AudioData (W3C WebCodecs spec)
+  /// For interleaved formats: 1
+  /// For planar formats: numberOfChannels
+  #[napi(getter)]
+  pub fn number_of_planes(&self) -> Result<u32> {
+    let inner = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    match &*inner {
+      Some(i) => {
+        if i.format.is_planar() {
+          Ok(i.frame.channels())
+        } else {
+          Ok(1)
+        }
+      }
+      None => Err(invalid_state_error("AudioData is closed")),
+    }
+  }
+
   // ========================================================================
   // Methods (WebCodecs spec)
   // ========================================================================
@@ -367,7 +542,7 @@ impl AudioData {
   /// Get the buffer size required for copyTo (W3C WebCodecs spec)
   /// Note: options is REQUIRED per spec
   #[napi]
-  pub fn allocation_size(&self, options: AudioDataCopyToOptions) -> Result<u32> {
+  pub fn allocation_size(&self, env: Env, options: AudioDataCopyToOptions) -> Result<u32> {
     let inner = self
       .inner
       .lock()
@@ -378,6 +553,30 @@ impl AudioData {
       .ok_or_else(|| invalid_state_error("AudioData is closed"))?;
 
     let format = options.format.unwrap_or(inner.format);
+
+    // Validate planeIndex (throws RangeError per W3C spec)
+    let num_planes = if format.is_planar() {
+      inner.frame.channels()
+    } else {
+      1
+    };
+    if options.plane_index >= num_planes {
+      env.throw_range_error(
+        &format!(
+          "planeIndex {} is out of bounds (numberOfPlanes is {})",
+          options.plane_index, num_planes
+        ),
+        None,
+      )?;
+      return Err(Error::new(
+        Status::InvalidArg,
+        format!(
+          "planeIndex {} is out of bounds (numberOfPlanes is {})",
+          options.plane_index, num_planes
+        ),
+      ));
+    }
+
     let frame_offset = options.frame_offset.unwrap_or(0);
     let num_frames = options
       .frame_count
@@ -399,6 +598,7 @@ impl AudioData {
   #[napi]
   pub fn copy_to(
     &self,
+    env: Env,
     mut destination: Uint8Array,
     options: AudioDataCopyToOptions,
   ) -> Result<()> {
@@ -421,17 +621,39 @@ impl AudioData {
     let bytes_per_sample = format.bytes_per_sample();
     let channels = inner.frame.channels() as usize;
 
+    // Validate planeIndex (throws RangeError per W3C spec)
+    let num_planes = if format.is_planar() { channels } else { 1 };
+    if plane_index >= num_planes {
+      env.throw_range_error(
+        &format!(
+          "planeIndex {} is out of bounds (numberOfPlanes is {})",
+          plane_index, num_planes
+        ),
+        None,
+      )?;
+      return Err(Error::new(
+        Status::InvalidArg,
+        format!(
+          "planeIndex {} is out of bounds (numberOfPlanes is {})",
+          plane_index, num_planes
+        ),
+      ));
+    }
+
     // Get mutable access to the destination buffer safely
     let dest_slice = unsafe { destination.as_mut() };
 
     if format.is_planar() {
-      // Copy single plane
-      if plane_index >= channels {
-        return Err(Error::new(Status::InvalidArg, "Invalid plane index"));
-      }
-
       let copy_size = num_frames * bytes_per_sample;
       if dest_slice.len() < copy_size {
+        env.throw_range_error(
+          &format!(
+            "destination buffer too small: need {} bytes, got {}",
+            copy_size,
+            dest_slice.len()
+          ),
+          None,
+        )?;
         return Err(Error::new(
           Status::InvalidArg,
           "Destination buffer too small",
@@ -460,6 +682,14 @@ impl AudioData {
       // Interleaved output
       let copy_size = num_frames * channels * bytes_per_sample;
       if dest_slice.len() < copy_size {
+        env.throw_range_error(
+          &format!(
+            "destination buffer too small: need {} bytes, got {}",
+            copy_size,
+            dest_slice.len()
+          ),
+          None,
+        )?;
         return Err(Error::new(
           Status::InvalidArg,
           "Destination buffer too small",

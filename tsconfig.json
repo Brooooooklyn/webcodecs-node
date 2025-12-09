@@ -10,7 +10,9 @@
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
     "skipLibCheck": true,
-    "types": ["node"]
+    "types": ["node"],
+    "outDir": "./dist"
   },
-  "include": ["."]
+  "include": ["."],
+  "exclude": ["dist", "node_modules", "ffmpeg-build", "ffmpeg-src", "specs"]
 }

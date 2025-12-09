@@ -99,6 +99,9 @@ pub struct DecoderConfig {
   pub thread_count: u32,
   /// Extra data (codec-specific, e.g., SPS/PPS for H.264)
   pub extradata: Option<Vec<u8>>,
+  /// Enable low-latency mode (for optimizeForLatency in WebCodecs)
+  /// When true, decoder outputs frames immediately without buffering
+  pub low_latency: bool,
 }
 
 impl Default for DecoderConfig {
@@ -107,6 +110,7 @@ impl Default for DecoderConfig {
       codec_id: AVCodecID::H264,
       thread_count: 0,
       extradata: None,
+      low_latency: false,
     }
   }
 }

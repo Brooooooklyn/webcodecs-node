@@ -6,7 +6,6 @@
 use crate::codec::Packet;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use std::io::Write;
 use std::sync::{Arc, RwLock};
 
 /// Type of encoded audio chunk
@@ -35,21 +34,108 @@ pub enum BitrateMode {
 }
 
 /// Options for creating an EncodedAudioChunk
-#[napi(object)]
+/// W3C spec: https://w3c.github.io/webcodecs/#dictdef-encodedaudiochunkinit
 pub struct EncodedAudioChunkInit {
   /// Chunk type (key or delta)
-  #[napi(js_name = "type")]
   pub chunk_type: EncodedAudioChunkType,
   /// Timestamp in microseconds
   pub timestamp: i64,
   /// Duration in microseconds (optional)
-  /// Note: W3C spec uses unsigned long long, but JS number can represent up to 2^53 safely
   pub duration: Option<i64>,
   /// Encoded data (BufferSource per spec)
-  pub data: Uint8Array,
-  /// ArrayBuffers to transfer (W3C spec - ignored in Node.js, we always copy)
-  #[napi(ts_type = "ArrayBuffer[]")]
-  pub transfer: Option<Vec<Uint8Array>>,
+  pub data: Vec<u8>,
+}
+
+impl FromNapiValue for EncodedAudioChunkInit {
+  unsafe fn from_napi_value(
+    env: napi::sys::napi_env,
+    value: napi::sys::napi_value,
+  ) -> Result<Self> {
+    let env_wrapper = Env::from_raw(env);
+    let obj = Object::from_napi_value(env, value)?;
+
+    // Validate type - required field, must throw TypeError if missing
+    let chunk_type_value: Option<String> = obj.get("type")?;
+    let chunk_type = match chunk_type_value {
+      Some(ref s) if s == "key" => EncodedAudioChunkType::Key,
+      Some(ref s) if s == "delta" => EncodedAudioChunkType::Delta,
+      Some(s) => {
+        env_wrapper.throw_type_error(&format!("Invalid chunk type: {}", s), None)?;
+        return Err(Error::new(Status::InvalidArg, "Invalid chunk type"));
+      }
+      None => {
+        env_wrapper.throw_type_error("type is required", None)?;
+        return Err(Error::new(Status::InvalidArg, "type is required"));
+      }
+    };
+
+    // Validate timestamp - required field
+    let timestamp: Option<i64> = obj.get("timestamp")?;
+    let timestamp = match timestamp {
+      Some(ts) => ts,
+      None => {
+        env_wrapper.throw_type_error("timestamp is required", None)?;
+        return Err(Error::new(Status::InvalidArg, "timestamp is required"));
+      }
+    };
+
+    // Duration is optional
+    let duration: Option<i64> = obj.get("duration")?;
+
+    // Validate data - required field, accept BufferSource (ArrayBuffer, TypedArray, DataView)
+    let data: Vec<u8> = if let Ok(Some(buffer)) = obj.get::<Buffer>("data") {
+      buffer.to_vec()
+    } else if let Ok(Some(array)) = obj.get::<Uint8Array>("data") {
+      array.to_vec()
+    } else if let Ok(Some(array_buffer)) = obj.get::<ArrayBuffer>("data") {
+      array_buffer.to_vec()
+    } else {
+      // Check if data property exists but is undefined/null
+      let has_data = obj.has_named_property("data")?;
+      if !has_data {
+        env_wrapper.throw_type_error("data is required", None)?;
+        return Err(Error::new(Status::InvalidArg, "data is required"));
+      }
+
+      // Try getting as object and check for buffer/byteLength properties (DataView, other TypedArrays)
+      if let Ok(Some(data_obj)) = obj.get::<Object>("data") {
+        let byte_length: Option<u32> = data_obj.get("byteLength").ok().flatten();
+        let byte_offset: u32 = data_obj.get("byteOffset").ok().flatten().unwrap_or(0);
+
+        if let (Some(len), Ok(Some(buffer))) = (byte_length, data_obj.get::<ArrayBuffer>("buffer"))
+        {
+          let full_data = buffer.to_vec();
+          let offset = byte_offset as usize;
+          let length = len as usize;
+          if offset + length <= full_data.len() {
+            full_data[offset..offset + length].to_vec()
+          } else {
+            env_wrapper.throw_type_error("data must be a valid BufferSource", None)?;
+            return Err(Error::new(
+              Status::InvalidArg,
+              "data must be a valid BufferSource",
+            ));
+          }
+        } else {
+          env_wrapper.throw_type_error("data must be a BufferSource", None)?;
+          return Err(Error::new(
+            Status::InvalidArg,
+            "data must be a BufferSource",
+          ));
+        }
+      } else {
+        env_wrapper.throw_type_error("data is required", None)?;
+        return Err(Error::new(Status::InvalidArg, "data is required"));
+      }
+    };
+
+    Ok(EncodedAudioChunkInit {
+      chunk_type,
+      timestamp,
+      duration,
+      data,
+    })
+  }
 }
 
 /// Internal state for EncodedAudioChunk
@@ -72,9 +158,11 @@ pub struct EncodedAudioChunk {
 impl EncodedAudioChunk {
   /// Create a new EncodedAudioChunk
   #[napi(constructor)]
-  pub fn new(init: EncodedAudioChunkInit) -> Result<Self> {
+  pub fn new(
+    #[napi(ts_arg_type = "import('./standard').EncodedAudioChunkInit")] init: EncodedAudioChunkInit,
+  ) -> Result<Self> {
     let inner = EncodedAudioChunkInner {
-      data: init.data.to_vec(),
+      data: init.data,
       chunk_type: init.chunk_type,
       timestamp_us: init.timestamp,
       duration_us: init.duration,
@@ -86,7 +174,12 @@ impl EncodedAudioChunk {
   }
 
   /// Create from internal Packet (for encoder output)
-  pub fn from_packet(packet: &Packet, duration_us: Option<i64>) -> Self {
+  /// If explicit_timestamp is provided, it overrides the packet's PTS (for timestamp preservation)
+  pub fn from_packet(
+    packet: &Packet,
+    duration_us: Option<i64>,
+    explicit_timestamp: Option<i64>,
+  ) -> Self {
     // Audio packets are typically all key frames (for most codecs)
     // Some codecs like AAC-LD might have dependencies, but most don't
     let chunk_type = if packet.is_key() {
@@ -98,7 +191,8 @@ impl EncodedAudioChunk {
     let inner = EncodedAudioChunkInner {
       data: packet.to_vec(),
       chunk_type,
-      timestamp_us: packet.pts(),
+      // Use explicit timestamp if provided, otherwise fall back to packet PTS
+      timestamp_us: explicit_timestamp.unwrap_or_else(|| packet.pts()),
       duration_us: duration_us.or_else(|| {
         if packet.duration() > 0 {
           Some(packet.duration())
@@ -137,23 +231,67 @@ impl EncodedAudioChunk {
     self.with_inner(|inner| Ok(inner.data.len() as u32))
   }
 
-  /// Copy the encoded data to a Uint8Array
-  #[napi]
-  pub fn copy_to(&self, mut destination: Uint8Array) -> Result<()> {
+  /// Copy the encoded data to a BufferSource
+  /// W3C spec: throws TypeError if destination is too small
+  #[napi(ts_args_type = "destination: import('./standard').BufferSource")]
+  pub fn copy_to(&self, env: Env, destination: Unknown) -> Result<()> {
     self.with_inner(|inner| {
-      if destination.len() < inner.data.len() {
-        return Err(Error::new(
-          Status::GenericFailure,
-          format!(
-            "Buffer too small: need {} bytes, got {}",
-            inner.data.len(),
-            destination.len()
-          ),
-        ));
-      }
+      // Try to get it as a TypedArray first (most common case)
+      if let Ok(typed_array) = destination.coerce_to_object() {
+        // Check if it has a buffer property (TypedArray/DataView)
+        if let Ok(true) = typed_array.has_named_property("buffer") {
+          // It's a TypedArray or DataView - get its underlying buffer info
+          let byte_length: u32 = typed_array.get("byteLength").ok().flatten().unwrap_or(0);
+          let byte_offset: u32 = typed_array.get("byteOffset").ok().flatten().unwrap_or(0);
+          let buffer: ArrayBuffer = typed_array
+            .get("buffer")?
+            .ok_or_else(|| Error::new(Status::InvalidArg, "Invalid BufferSource"))?;
+          if (byte_length as usize) < inner.data.len() {
+            env.throw_type_error(
+              &format!(
+                "destination is too small: need {} bytes, got {}",
+                inner.data.len(),
+                byte_length
+              ),
+              None,
+            )?;
+            return Ok(());
+          }
 
-      // Use std::io::Write for safe buffer access
-      unsafe { destination.as_mut() }.write_all(&inner.data)?;
+          // Copy data to the view's portion of the buffer
+          let dest_ptr = unsafe { buffer.as_ptr().add(byte_offset as usize) as *mut u8 };
+          unsafe {
+            std::ptr::copy_nonoverlapping(inner.data.as_ptr(), dest_ptr, inner.data.len());
+          }
+        } else {
+          // It's likely an ArrayBuffer directly
+          let byte_length: Option<u32> = typed_array.get("byteLength").ok().flatten();
+          if let Some(len) = byte_length {
+            if (len as usize) < inner.data.len() {
+              env.throw_type_error(
+                &format!(
+                  "destination is too small: need {} bytes, got {}",
+                  inner.data.len(),
+                  len
+                ),
+                None,
+              )?;
+              return Ok(());
+            }
+
+            // Get the ArrayBuffer data pointer
+            let array_buffer = ArrayBuffer::from_unknown(destination)?;
+            let dest_ptr = array_buffer.as_ptr() as *mut u8;
+            unsafe {
+              std::ptr::copy_nonoverlapping(inner.data.as_ptr(), dest_ptr, inner.data.len());
+            }
+          } else {
+            return Err(Error::new(Status::InvalidArg, "Invalid BufferSource"));
+          }
+        }
+      } else {
+        return Err(Error::new(Status::InvalidArg, "Invalid BufferSource"));
+      }
       Ok(())
     })
   }
@@ -302,15 +440,21 @@ pub struct FlacEncoderConfig {
 }
 
 /// Audio encoder configuration (WebCodecs spec)
-#[napi(object)]
+///
+/// Note: codec, sample_rate, and number_of_channels are Option to support
+/// the W3C spec requirement that isConfigSupported() rejects with TypeError
+/// (returns rejected Promise) for missing fields, rather than throwing synchronously.
 #[derive(Debug, Clone)]
 pub struct AudioEncoderConfig {
   /// Codec string (e.g., "mp4a.40.2" for AAC-LC, "opus")
-  pub codec: String,
-  /// Sample rate in Hz (required per spec) - W3C spec uses float
-  pub sample_rate: f64,
-  /// Number of channels (required per spec)
-  pub number_of_channels: u32,
+  /// W3C spec: required, but stored as Option for proper error handling
+  pub codec: Option<String>,
+  /// Sample rate in Hz - W3C spec uses float
+  /// W3C spec: required, but stored as Option for proper error handling
+  pub sample_rate: Option<f64>,
+  /// Number of channels
+  /// W3C spec: required, but stored as Option for proper error handling
+  pub number_of_channels: Option<u32>,
   /// Target bitrate in bits per second
   pub bitrate: Option<f64>,
   /// Bitrate mode (W3C spec enum)
@@ -323,17 +467,131 @@ pub struct AudioEncoderConfig {
   pub flac: Option<FlacEncoderConfig>,
 }
 
+impl FromNapiValue for AudioEncoderConfig {
+  unsafe fn from_napi_value(
+    env: napi::sys::napi_env,
+    value: napi::sys::napi_value,
+  ) -> Result<Self> {
+    let obj = Object::from_napi_value(env, value)?;
+
+    // All fields stored as Option - validation happens in configure() or isConfigSupported()
+    let codec: Option<String> = obj.get("codec")?;
+    let sample_rate: Option<f64> = obj.get("sampleRate")?;
+    let number_of_channels: Option<u32> = obj.get("numberOfChannels")?;
+    let bitrate: Option<f64> = obj.get("bitrate")?;
+    let bitrate_mode: Option<BitrateMode> = obj.get("bitrateMode")?;
+    let opus: Option<OpusEncoderConfig> = obj.get("opus")?;
+    let aac: Option<AacEncoderConfig> = obj.get("aac")?;
+    let flac: Option<FlacEncoderConfig> = obj.get("flac")?;
+
+    Ok(AudioEncoderConfig {
+      codec,
+      sample_rate,
+      number_of_channels,
+      bitrate,
+      bitrate_mode,
+      opus,
+      aac,
+      flac,
+    })
+  }
+}
+
 /// Audio decoder configuration (WebCodecs spec)
-#[napi(object)]
+///
+/// Note: codec, sample_rate, and number_of_channels are Option to support
+/// the W3C spec requirement that isConfigSupported() rejects with TypeError
+/// (returns rejected Promise) for missing fields, rather than throwing synchronously.
 pub struct AudioDecoderConfig {
   /// Codec string (e.g., "mp4a.40.2" for AAC-LC, "opus")
-  pub codec: String,
-  /// Sample rate in Hz (required per spec) - W3C spec uses float
-  pub sample_rate: f64,
-  /// Number of channels (required per spec)
-  pub number_of_channels: u32,
+  /// W3C spec: required, but stored as Option for proper error handling
+  pub codec: Option<String>,
+  /// Sample rate in Hz - W3C spec uses float
+  /// W3C spec: required, but stored as Option for proper error handling
+  pub sample_rate: Option<f64>,
+  /// Number of channels
+  /// W3C spec: required, but stored as Option for proper error handling
+  pub number_of_channels: Option<u32>,
   /// Codec-specific description data (e.g., AudioSpecificConfig for AAC) - BufferSource per spec
   pub description: Option<Uint8Array>,
+}
+
+impl FromNapiValue for AudioDecoderConfig {
+  unsafe fn from_napi_value(
+    env: napi::sys::napi_env,
+    value: napi::sys::napi_value,
+  ) -> Result<Self> {
+    let obj = Object::from_napi_value(env, value)?;
+
+    // All fields stored as Option - validation happens in configure() or isConfigSupported()
+    let codec: Option<String> = obj.get("codec")?;
+    let sample_rate: Option<f64> = obj.get("sampleRate")?;
+    let number_of_channels: Option<u32> = obj.get("numberOfChannels")?;
+    let description: Option<Uint8Array> = obj.get("description")?;
+
+    Ok(AudioDecoderConfig {
+      codec,
+      sample_rate,
+      number_of_channels,
+      description,
+    })
+  }
+}
+
+impl ToNapiValue for AudioEncoderConfig {
+  unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+    let env_wrapper = Env::from_raw(env);
+    let mut obj = Object::new(&env_wrapper)?;
+
+    if let Some(codec) = val.codec {
+      obj.set("codec", codec)?;
+    }
+    if let Some(sample_rate) = val.sample_rate {
+      obj.set("sampleRate", sample_rate)?;
+    }
+    if let Some(number_of_channels) = val.number_of_channels {
+      obj.set("numberOfChannels", number_of_channels)?;
+    }
+    if let Some(bitrate) = val.bitrate {
+      obj.set("bitrate", bitrate)?;
+    }
+    if let Some(bitrate_mode) = val.bitrate_mode {
+      obj.set("bitrateMode", bitrate_mode)?;
+    }
+    if let Some(opus) = val.opus {
+      obj.set("opus", opus)?;
+    }
+    if let Some(aac) = val.aac {
+      obj.set("aac", aac)?;
+    }
+    if let Some(flac) = val.flac {
+      obj.set("flac", flac)?;
+    }
+
+    Object::to_napi_value(env, obj)
+  }
+}
+
+impl ToNapiValue for AudioDecoderConfig {
+  unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+    let env_wrapper = Env::from_raw(env);
+    let mut obj = Object::new(&env_wrapper)?;
+
+    if let Some(codec) = val.codec {
+      obj.set("codec", codec)?;
+    }
+    if let Some(sample_rate) = val.sample_rate {
+      obj.set("sampleRate", sample_rate)?;
+    }
+    if let Some(number_of_channels) = val.number_of_channels {
+      obj.set("numberOfChannels", number_of_channels)?;
+    }
+    if let Some(description) = val.description {
+      obj.set("description", description)?;
+    }
+
+    Object::to_napi_value(env, obj)
+  }
 }
 
 /// Audio encoder support information

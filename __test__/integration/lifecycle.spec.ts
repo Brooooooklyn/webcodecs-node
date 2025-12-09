@@ -233,28 +233,34 @@ test('lifecycle: multiple clones are independent', (t) => {
 // Idempotency Tests
 // ============================================================================
 
-test('lifecycle: encoder close is idempotent', (t) => {
+test('lifecycle: encoder close on closed throws InvalidStateError', (t) => {
   const { encoder } = createTestEncoder()
   encoder.configure(createEncoderConfig('h264', 320, 240))
 
-  // Multiple closes should not throw
+  // First close should succeed
   t.notThrows(() => encoder.close())
-  t.notThrows(() => encoder.close())
-  t.notThrows(() => encoder.close())
-
   t.is(encoder.state, 'closed')
+
+  // W3C spec: subsequent closes should throw InvalidStateError
+  const error1 = t.throws(() => encoder.close())
+  t.true(error1?.message.includes('InvalidStateError'))
+  const error2 = t.throws(() => encoder.close())
+  t.true(error2?.message.includes('InvalidStateError'))
 })
 
-test('lifecycle: decoder close is idempotent', (t) => {
+test('lifecycle: decoder close on closed throws InvalidStateError', (t) => {
   const { decoder } = createTestDecoder()
   decoder.configure(createDecoderConfig('h264'))
 
-  // Multiple closes should not throw
+  // First close should succeed
   t.notThrows(() => decoder.close())
-  t.notThrows(() => decoder.close())
-  t.notThrows(() => decoder.close())
-
   t.is(decoder.state, 'closed')
+
+  // W3C spec: subsequent closes should throw InvalidStateError
+  const error1 = t.throws(() => decoder.close())
+  t.true(error1?.message.includes('InvalidStateError'))
+  const error2 = t.throws(() => decoder.close())
+  t.true(error2?.message.includes('InvalidStateError'))
 })
 
 test('lifecycle: frame close is idempotent', (t) => {
@@ -277,13 +283,11 @@ test('lifecycle: encoder operations fail after close', (t) => {
 
   const frame = generateSolidColorI420Frame(320, 240, TestColors.red, 0)
 
-  // encode() on closed encoder triggers error callback (transitions to closed already)
-  encoder.encode(frame)
+  // W3C spec: encode() on closed encoder should throw InvalidStateError
+  const error = t.throws(() => encoder.encode(frame))
+  t.true(error?.message.includes('InvalidStateError'))
 
   frame.close()
-
-  // Test passes if no crash - error callback will be invoked asynchronously
-  t.pass('encode() on closed encoder did not crash')
 })
 
 test('lifecycle: decoder operations fail after close', async (t) => {
@@ -300,13 +304,11 @@ test('lifecycle: decoder operations fail after close', async (t) => {
   await encoder.flush()
   encoder.close()
 
-  // decode() on closed decoder triggers error callback
+  // W3C spec: decode() on closed decoder should throw InvalidStateError
   if (chunks.length > 0) {
-    decoder.decode(chunks[0])
+    const error = t.throws(() => decoder.decode(chunks[0]))
+    t.true(error?.message.includes('InvalidStateError'))
   }
-
-  // Test passes if no crash - error callback will be invoked asynchronously
-  t.pass('decode() on closed decoder did not crash')
 })
 
 // ============================================================================

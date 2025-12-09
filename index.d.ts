@@ -10,7 +10,7 @@ export declare class AudioData {
    * Create a new AudioData (W3C WebCodecs spec)
    * Per spec, the constructor takes a single init object containing all parameters including data
    */
-  constructor(init: AudioDataInit)
+  constructor(init: import('./standard').AudioDataInit)
   /** Get sample format */
   get format(): AudioSampleFormat | null
   /** Get sample rate in Hz (W3C spec uses float) */
@@ -25,6 +25,12 @@ export declare class AudioData {
   get timestamp(): number
   /** Get whether this AudioData has been closed (W3C WebCodecs spec) */
   get closed(): boolean
+  /**
+   * Get the number of planes in this AudioData (W3C WebCodecs spec)
+   * For interleaved formats: 1
+   * For planar formats: numberOfChannels
+   */
+  get numberOfPlanes(): number
   /**
    * Get the buffer size required for copyTo (W3C WebCodecs spec)
    * Note: options is REQUIRED per spec
@@ -92,6 +98,10 @@ export declare class AudioDecoder {
   /**
    * Flush the decoder
    * Returns a Promise that resolves when flushing is complete
+   *
+   * Uses spawn_future_with_callback to check abort flag synchronously in the resolver.
+   * This ensures that if reset() is called from a callback, the abort flag is checked
+   * AFTER the callback returns, allowing flush() to return AbortError.
    */
   flush(): Promise<void>
   /** Reset the decoder */
@@ -101,6 +111,9 @@ export declare class AudioDecoder {
   /**
    * Check if a configuration is supported
    * Returns a Promise that resolves with support information
+   *
+   * W3C WebCodecs spec: Rejects with TypeError for invalid configs,
+   * returns { supported: false } for valid but unsupported configs.
    */
   static isConfigSupported(config: AudioDecoderConfig): Promise<AudioDecoderSupport>
 }
@@ -156,6 +169,10 @@ export declare class AudioEncoder {
   /**
    * Flush the encoder
    * Returns a Promise that resolves when flushing is complete
+   *
+   * Uses spawn_future_with_callback to check abort flag synchronously in the resolver.
+   * This ensures that if reset() is called from a callback, the abort flag is checked
+   * AFTER the callback returns, allowing flush() to return AbortError.
    */
   flush(): Promise<void>
   /** Reset the encoder */
@@ -165,6 +182,9 @@ export declare class AudioEncoder {
   /**
    * Check if a configuration is supported
    * Returns a Promise that resolves with support information
+   *
+   * W3C WebCodecs spec: Rejects with TypeError for invalid configs,
+   * returns { supported: false } for valid but unsupported configs.
    */
   static isConfigSupported(config: AudioEncoderConfig): Promise<AudioEncoderSupport>
 }
@@ -203,7 +223,7 @@ export declare class DOMRectReadOnly {
  */
 export declare class EncodedAudioChunk {
   /** Create a new EncodedAudioChunk */
-  constructor(init: EncodedAudioChunkInit)
+  constructor(init: import('./standard').EncodedAudioChunkInit)
   /** Get the chunk type */
   get type(): EncodedAudioChunkType
   /** Get the timestamp in microseconds */
@@ -212,8 +232,11 @@ export declare class EncodedAudioChunk {
   get duration(): number | null
   /** Get the byte length of the encoded data */
   get byteLength(): number
-  /** Copy the encoded data to a Uint8Array */
-  copyTo(destination: Uint8Array): void
+  /**
+   * Copy the encoded data to a BufferSource
+   * W3C spec: throws TypeError if destination is too small
+   */
+  copyTo(destination: import('./standard').BufferSource): void
 }
 
 /**
@@ -223,7 +246,7 @@ export declare class EncodedAudioChunk {
  */
 export declare class EncodedVideoChunk {
   /** Create a new EncodedVideoChunk */
-  constructor(init: EncodedVideoChunkInit)
+  constructor(init: import('./standard').EncodedVideoChunkInit)
   /** Get the chunk type */
   get type(): EncodedVideoChunkType
   /** Get the timestamp in microseconds */
@@ -232,8 +255,11 @@ export declare class EncodedVideoChunk {
   get duration(): number | null
   /** Get the byte length of the encoded data */
   get byteLength(): number
-  /** Copy the encoded data to a Uint8Array */
-  copyTo(destination: Uint8Array): void
+  /**
+   * Copy the encoded data to a BufferSource
+   * W3C spec: throws TypeError if destination is too small
+   */
+  copyTo(destination: import('./standard').BufferSource): void
 }
 
 /**
@@ -330,7 +356,7 @@ export declare class ImageTrackList {
 /** Video color space parameters (WebCodecs spec) - as a class per spec */
 export declare class VideoColorSpace {
   /** Create a new VideoColorSpace */
-  constructor(init?: VideoColorSpaceInit | undefined | null)
+  constructor(init?: import('./standard').VideoColorSpaceInit)
   /** Get color primaries */
   get primaries(): VideoColorPrimaries | null
   /** Get transfer characteristics */
@@ -339,8 +365,12 @@ export declare class VideoColorSpace {
   get matrix(): VideoMatrixCoefficients | null
   /** Get full range flag */
   get fullRange(): boolean | null
-  /** Convert to JSON-compatible object (W3C spec uses toJSON) */
-  toJSON(): VideoColorSpaceInit
+  /**
+   * Convert to JSON-compatible object (W3C spec uses toJSON)
+   *
+   * Per W3C spec, toJSON() returns explicit null for unset fields.
+   */
+  toJSON(): object
 }
 
 /**
@@ -399,6 +429,10 @@ export declare class VideoDecoder {
   /**
    * Flush the decoder
    * Returns a Promise that resolves when flushing is complete
+   *
+   * Uses spawn_future_with_callback to check abort flag synchronously in the resolver.
+   * This ensures that if reset() is called from a callback, the abort flag is checked
+   * AFTER the callback returns, allowing flush() to return AbortError.
    */
   flush(): Promise<void>
   /** Reset the decoder */
@@ -408,6 +442,9 @@ export declare class VideoDecoder {
   /**
    * Check if a configuration is supported
    * Returns a Promise that resolves with support information
+   *
+   * W3C WebCodecs spec: Throws TypeError for invalid configs,
+   * returns { supported: false } for valid but unsupported configs.
    */
   static isConfigSupported(config: VideoDecoderConfig): Promise<VideoDecoderSupport>
 }
@@ -464,6 +501,10 @@ export declare class VideoEncoder {
   /**
    * Flush the encoder
    * Returns a Promise that resolves when flushing is complete
+   *
+   * Uses spawn_future_with_callback to check abort flag synchronously in the resolver.
+   * This ensures that if reset() is called from a callback, the abort flag is checked
+   * AFTER the callback returns, allowing flush() to return AbortError.
    */
   flush(): Promise<void>
   /** Reset the encoder */
@@ -473,6 +514,12 @@ export declare class VideoEncoder {
   /**
    * Check if a configuration is supported
    * Returns a Promise that resolves with support information
+   *
+   * W3C WebCodecs spec: Throws TypeError for invalid configs,
+   * returns { supported: false } for valid but unsupported configs.
+   *
+   * Note: The config parameter is validated via FromNapiValue which throws
+   * native TypeError for missing required fields.
    */
   static isConfigSupported(config: VideoEncoderConfig): Promise<VideoEncoderSupport>
 }
@@ -499,13 +546,13 @@ export declare class VideoFrame {
   static fromVideoFrame(source: VideoFrame, init?: VideoFrameInit | undefined | null): VideoFrame
   /** Get the pixel format */
   get format(): VideoPixelFormat | null
-  /** Get the coded width in pixels */
+  /** Get the coded width in pixels (returns 0 when closed per W3C spec) */
   get codedWidth(): number
-  /** Get the coded height in pixels */
+  /** Get the coded height in pixels (returns 0 when closed per W3C spec) */
   get codedHeight(): number
-  /** Get the display width in pixels */
+  /** Get the display width in pixels (returns 0 when closed per W3C spec) */
   get displayWidth(): number
-  /** Get the display height in pixels */
+  /** Get the display height in pixels (returns 0 when closed per W3C spec) */
   get displayHeight(): number
   /**
    * Get the coded rect (the region containing valid pixel data)
@@ -519,14 +566,23 @@ export declare class VideoFrame {
    * Throws InvalidStateError if the VideoFrame is closed
    */
   get visibleRect(): DOMRectReadOnly
-  /** Get the presentation timestamp in microseconds */
+  /** Get the presentation timestamp in microseconds (returns 0 when closed per W3C spec) */
   get timestamp(): number
-  /** Get the duration in microseconds */
+  /** Get the duration in microseconds (returns null when closed per W3C spec) */
   get duration(): number | null
   /** Get the color space parameters */
   get colorSpace(): VideoColorSpace
   /** Get whether this VideoFrame has been closed (W3C WebCodecs spec) */
   get closed(): boolean
+  /**
+   * Get the number of planes in this VideoFrame (W3C WebCodecs spec)
+   * The number depends on the pixel format:
+   * - RGBA, RGBX, BGRA, BGRX: 1 plane
+   * - NV12, NV21: 2 planes
+   * - I420, I422, I444: 3 planes
+   * - I420A, I422A, I444A: 4 planes
+   */
+  get numberOfPlanes(): number
   /** Get the rotation in degrees clockwise (0, 90, 180, 270) - W3C WebCodecs spec */
   get rotation(): number
   /** Get whether horizontal flip is applied - W3C WebCodecs spec */
@@ -584,39 +640,6 @@ export interface AudioDataCopyToOptions {
   format?: AudioSampleFormat
 }
 
-/**
- * Options for creating an AudioData (W3C WebCodecs spec)
- * Note: Per spec, data is included in the init object
- */
-export interface AudioDataInit {
-  /** Sample format (required) */
-  format: AudioSampleFormat
-  /** Sample rate in Hz (required) - W3C spec uses float */
-  sampleRate: number
-  /** Number of frames (samples per channel) (required) */
-  numberOfFrames: number
-  /** Number of channels (required) */
-  numberOfChannels: number
-  /** Timestamp in microseconds (required) */
-  timestamp: number
-  /** Raw audio sample data (required) - BufferSource per spec */
-  data: Uint8Array
-  /** ArrayBuffers to transfer (W3C spec - ignored in Node.js, we always copy) */
-  transfer?: ArrayBuffer[]
-}
-
-/** Audio decoder configuration (WebCodecs spec) */
-export interface AudioDecoderConfig {
-  /** Codec string (e.g., "mp4a.40.2" for AAC-LC, "opus") */
-  codec: string
-  /** Sample rate in Hz (required per spec) - W3C spec uses float */
-  sampleRate: number
-  /** Number of channels (required per spec) */
-  numberOfChannels: number
-  /** Codec-specific description data (e.g., AudioSpecificConfig for AAC) - BufferSource per spec */
-  description?: Uint8Array
-}
-
 /** Decoder configuration output (for passing to decoder) */
 export interface AudioDecoderConfigOutput {
   /** Codec string */
@@ -635,26 +658,6 @@ export interface AudioDecoderSupport {
   supported: boolean
   /** The configuration that was tested */
   config: AudioDecoderConfig
-}
-
-/** Audio encoder configuration (WebCodecs spec) */
-export interface AudioEncoderConfig {
-  /** Codec string (e.g., "mp4a.40.2" for AAC-LC, "opus") */
-  codec: string
-  /** Sample rate in Hz (required per spec) - W3C spec uses float */
-  sampleRate: number
-  /** Number of channels (required per spec) */
-  numberOfChannels: number
-  /** Target bitrate in bits per second */
-  bitrate?: number
-  /** Bitrate mode (W3C spec enum) */
-  bitrateMode?: BitrateMode
-  /** Opus codec-specific configuration */
-  opus?: OpusEncoderConfig
-  /** AAC codec-specific configuration */
-  aac?: AacEncoderConfig
-  /** FLAC codec-specific configuration */
-  flac?: FlacEncoderConfig
 }
 
 /** Encode options for audio */
@@ -728,23 +731,6 @@ export interface DOMRectInit {
   height?: number
 }
 
-/** Options for creating an EncodedAudioChunk */
-export interface EncodedAudioChunkInit {
-  /** Chunk type (key or delta) */
-  type: EncodedAudioChunkType
-  /** Timestamp in microseconds */
-  timestamp: number
-  /**
-   * Duration in microseconds (optional)
-   * Note: W3C spec uses unsigned long long, but JS number can represent up to 2^53 safely
-   */
-  duration?: number
-  /** Encoded data (BufferSource per spec) */
-  data: Uint8Array
-  /** ArrayBuffers to transfer (W3C spec - ignored in Node.js, we always copy) */
-  transfer?: ArrayBuffer[]
-}
-
 /** Output callback metadata for audio */
 export interface EncodedAudioChunkMetadata {
   /** Decoder configuration for this chunk */
@@ -756,23 +742,6 @@ export type EncodedAudioChunkType = /** Key chunk - can be decoded independently
 'key'|
 /** Delta chunk - depends on previous chunks */
 'delta';
-
-/** Options for creating an EncodedVideoChunk */
-export interface EncodedVideoChunkInit {
-  /** Chunk type (key or delta) */
-  type: EncodedVideoChunkType
-  /** Timestamp in microseconds */
-  timestamp: number
-  /**
-   * Duration in microseconds (optional)
-   * Note: W3C spec uses unsigned long long, but JS number can represent up to 2^53 safely
-   */
-  duration?: number
-  /** Encoded data (BufferSource per spec) */
-  data: Uint8Array
-  /** ArrayBuffers to transfer (W3C spec - ignored in Node.js, we always copy) */
-  transfer?: ArrayBuffer[]
-}
 
 /** Output callback metadata per WebCodecs spec */
 export interface EncodedVideoChunkMetadata {
@@ -936,40 +905,6 @@ export type VideoColorPrimaries = /** BT.709 / sRGB primaries */
 /** SMPTE 432 (DCI-P3) */
 'smpte432';
 
-/** VideoColorSpaceInit for constructing VideoColorSpace */
-export interface VideoColorSpaceInit {
-  /** Color primaries */
-  primaries?: VideoColorPrimaries
-  /** Transfer characteristics */
-  transfer?: VideoTransferCharacteristics
-  /** Matrix coefficients */
-  matrix?: VideoMatrixCoefficients
-  /** Full range flag */
-  fullRange?: boolean
-}
-
-/** Video decoder configuration (WebCodecs spec) */
-export interface VideoDecoderConfig {
-  /** Codec string (e.g., "avc1.42001E", "vp8", "vp09.00.10.08") */
-  codec: string
-  /** Coded width in pixels (optional for some codecs) */
-  codedWidth?: number
-  /** Coded height in pixels (optional for some codecs) */
-  codedHeight?: number
-  /** Display aspect width */
-  displayAspectWidth?: number
-  /** Display aspect height */
-  displayAspectHeight?: number
-  /** Color space parameters (uses init object for compatibility) */
-  colorSpace?: VideoColorSpaceInit
-  /** Hardware acceleration preference (W3C spec enum) */
-  hardwareAcceleration?: HardwareAcceleration
-  /** Optimize for latency (W3C spec) */
-  optimizeForLatency?: boolean
-  /** Codec-specific description data (e.g., avcC for H.264) - BufferSource per spec */
-  description?: Uint8Array
-}
-
 /** Decoder configuration output (for passing to decoder) */
 export interface VideoDecoderConfigOutput {
   /** Codec string */
@@ -980,6 +915,10 @@ export interface VideoDecoderConfigOutput {
   codedHeight?: number
   /** Codec description (e.g., avcC for H.264) - Uint8Array per spec */
   description?: Uint8Array
+  /** Display aspect width (for non-square pixels) */
+  displayAspectWidth?: number
+  /** Display aspect height (for non-square pixels) */
+  displayAspectHeight?: number
 }
 
 /** Result of isConfigSupported per WebCodecs spec */
@@ -997,44 +936,6 @@ export type VideoEncoderBitrateMode = /** Variable bitrate (default) */
 'constant'|
 /** Use quantizer parameter from codec-specific options */
 'quantizer';
-
-/**
- * Video encoder configuration (WebCodecs spec)
- * Note: Codec-specific options are encoded in the codec string per W3C spec
- * e.g., "avc1.42001E" encodes profile/level, "vp09.00.10.08" encodes profile/level/depth
- */
-export interface VideoEncoderConfig {
-  /** Codec string (e.g., "avc1.42001E", "vp8", "vp09.00.10.08", "av01.0.04M.08") */
-  codec: string
-  /** Coded width in pixels (required) */
-  width: number
-  /** Coded height in pixels (required) */
-  height: number
-  /** Display width (optional, defaults to width) */
-  displayWidth?: number
-  /** Display height (optional, defaults to height) */
-  displayHeight?: number
-  /** Target bitrate in bits per second */
-  bitrate?: number
-  /** Framerate (frames per second) */
-  framerate?: number
-  /** Hardware acceleration preference (W3C spec enum) */
-  hardwareAcceleration?: HardwareAcceleration
-  /** Latency mode (W3C spec enum) */
-  latencyMode?: LatencyMode
-  /** Bitrate mode (W3C spec enum) */
-  bitrateMode?: VideoEncoderBitrateMode
-  /** Alpha handling (W3C spec enum) */
-  alpha?: AlphaOption
-  /** Scalability mode (SVC) - e.g., "L1T1", "L1T2", "L1T3" */
-  scalabilityMode?: string
-  /** Content hint for encoder optimization */
-  contentHint?: string
-  /** AVC (H.264) codec-specific configuration */
-  avc?: AvcEncoderConfig
-  /** HEVC (H.265) codec-specific configuration */
-  hevc?: HevcEncoderConfig
-}
 
 /** Encode options per WebCodecs spec */
 export interface VideoEncoderEncodeOptions {
@@ -1080,41 +981,6 @@ export interface VideoEncoderSupport {
   supported: boolean
   /** The configuration that was checked */
   config: VideoEncoderConfig
-}
-
-/** Options for creating a VideoFrame from buffer data (VideoFrameBufferInit per spec) */
-export interface VideoFrameBufferInit {
-  /** Pixel format (required) */
-  format: VideoPixelFormat
-  /** Coded width in pixels (required) */
-  codedWidth: number
-  /** Coded height in pixels (required) */
-  codedHeight: number
-  /** Timestamp in microseconds (required) */
-  timestamp: number
-  /**
-   * Duration in microseconds (optional)
-   * Note: W3C spec uses unsigned long long, but JS number can represent up to 2^53 safely
-   */
-  duration?: number
-  /** Layout for input planes (optional, default is tightly-packed) */
-  layout?: Array<PlaneLayout>
-  /** Visible rect within coded size (optional, default is full coded size at 0,0) */
-  visibleRect?: DOMRectInit
-  /** Rotation in degrees clockwise (0, 90, 180, 270) - default 0 */
-  rotation?: number
-  /** Horizontal flip - default false */
-  flip?: boolean
-  /** Display width (defaults to visible width or coded_width) */
-  displayWidth?: number
-  /** Display height (defaults to visible height or coded_height) */
-  displayHeight?: number
-  /** Color space parameters (uses init object) */
-  colorSpace?: VideoColorSpaceInit
-  /** Metadata associated with the frame */
-  metadata?: VideoFrameMetadata
-  /** ArrayBuffers to transfer (W3C spec - ignored in Node.js, we always copy) */
-  transfer?: ArrayBuffer[]
 }
 
 /** Options for copyTo operation */
@@ -1226,8 +1092,10 @@ export type VideoTransferCharacteristics = /** BT.709 transfer */
 'bt709'|
 /** SMPTE 170M transfer */
 'smpte170m'|
-/** IEC 61966-2-1 (sRGB) */
+/** IEC 61966-2-1 (sRGB) - technical name */
 'iec61966-2-1'|
+/** sRGB transfer (alias for iec61966-2-1) */
+'srgb'|
 /** Linear transfer */
 'linear'|
 /** Perceptual Quantizer (HDR) */

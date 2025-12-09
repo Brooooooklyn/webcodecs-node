@@ -8,6 +8,8 @@ use crate::codec::{
   AudioSampleBuffer, CodecContext, Frame, Resampler,
 };
 use crate::ffi::{AVCodecID, AVSampleFormat};
+use crate::webcodecs::error::{invalid_state_error, throw_type_error_unit};
+use crate::webcodecs::promise_reject::reject_with_type_error;
 use crate::webcodecs::{AudioData, AudioEncoderConfig, AudioEncoderSupport, EncodedAudioChunk};
 use crossbeam::channel::{self, Receiver, Sender};
 use napi::bindgen_prelude::*;
@@ -15,6 +17,8 @@ use napi::threadsafe_function::{
   ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
 };
 use napi_derive::napi;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -32,14 +36,18 @@ type OutputCallback = ThreadsafeFunction<
   true,
 >;
 
-/// Type alias for error callback (takes error message)
-/// Still using default CalleeHandled: true for error-first convention
-type ErrorCallback = ThreadsafeFunction<String, UnknownReturnValue, String, Status, true, true>;
+/// Type alias for error callback (takes Error object)
+/// Using CalleeHandled: false because WebCodecs error callback receives Error directly,
+/// not error-first (err, result) style
+type ErrorCallback = ThreadsafeFunction<Error, UnknownReturnValue, Error, Status, false, true>;
 
 /// AudioEncoder init dictionary per WebCodecs spec
 pub struct AudioEncoderInit {
-  /// Output callback - called when encoded chunk is available
+  /// Output callback - called when encoded chunk is available (ThreadsafeFunction for worker)
   pub output: OutputCallback,
+  /// Output callback reference - stored for synchronous calls from main thread
+  pub output_ref:
+    FunctionRef<FnArgs<(EncodedAudioChunk, EncodedAudioChunkMetadata)>, UnknownReturnValue>,
   /// Error callback - called when an error occurs
   pub error: ErrorCallback,
 }
@@ -49,17 +57,48 @@ impl FromNapiValue for AudioEncoderInit {
     env: napi::sys::napi_env,
     value: napi::sys::napi_value,
   ) -> Result<Self> {
+    let env_wrapper = Env::from_raw(env);
     let obj = Object::from_napi_value(env, value)?;
 
-    let output: OutputCallback = obj
-      .get_named_property("output")
-      .map_err(|_| Error::new(Status::InvalidArg, "Missing required 'output' callback"))?;
+    // W3C spec: throw TypeError if required callbacks are missing
+    // Get output callback as Function first, then create both FunctionRef and ThreadsafeFunction
+    let output_func: Function<
+      FnArgs<(EncodedAudioChunk, EncodedAudioChunkMetadata)>,
+      UnknownReturnValue,
+    > = match obj.get_named_property("output") {
+      Ok(cb) => cb,
+      Err(_) => {
+        env_wrapper.throw_type_error("output callback is required", None)?;
+        return Err(Error::new(
+          Status::InvalidArg,
+          "output callback is required",
+        ));
+      }
+    };
 
-    let error: ErrorCallback = obj
-      .get_named_property("error")
-      .map_err(|_| Error::new(Status::InvalidArg, "Missing required 'error' callback"))?;
+    // Create FunctionRef for synchronous calls from main thread (in flush resolver)
+    let output_ref = output_func.create_ref()?;
 
-    Ok(AudioEncoderInit { output, error })
+    // Create ThreadsafeFunction for async calls from worker thread
+    let output: OutputCallback = output_func
+      .build_threadsafe_function()
+      .callee_handled::<false>()
+      .weak::<true>()
+      .build()?;
+
+    let error: ErrorCallback = match obj.get_named_property("error") {
+      Ok(cb) => cb,
+      Err(_) => {
+        env_wrapper.throw_type_error("error callback is required", None)?;
+        return Err(Error::new(Status::InvalidArg, "error callback is required"));
+      }
+    };
+
+    Ok(AudioEncoderInit {
+      output,
+      output_ref,
+      error,
+    })
   }
 }
 
@@ -115,8 +154,33 @@ struct AudioEncoderInner {
   output_callback: OutputCallback,
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
-  /// Optional dequeue event callback
-  dequeue_callback: Option<ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, true>>,
+  /// Optional dequeue event callback (Arc for cloning across mutex boundary)
+  dequeue_callback:
+    Option<Arc<ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, true>>>,
+  /// Pending flush response senders (for AbortError on reset)
+  pending_flush_senders: Vec<Sender<Result<()>>>,
+  /// Queue of input timestamps for correlation with output packets
+  /// (needed because FFmpeg may buffer frames internally)
+  timestamp_queue: std::collections::VecDeque<i64>,
+  /// Base timestamp from the first input AudioData (for timestamp calculation)
+  base_timestamp: Option<i64>,
+  /// Abort channel senders - reset() sends abort signal through these
+  pending_abort_senders: Vec<Sender<()>>,
+  /// Atomic flag for flush abort - set by reset() to signal pending flush to abort
+  flush_abort_flag: Option<Arc<AtomicBool>>,
+  /// W3C spec: Flag to suppress output delivery after reset()
+  /// When true, pending outputs are not delivered to the user callback
+  #[allow(dead_code)]
+  output_suppressed: bool,
+  /// Queue of encoded chunks waiting to be delivered via output callback
+  /// Worker pushes chunks here during flush; flush() drains them synchronously via FunctionRef
+  pending_chunks: Vec<(EncodedAudioChunk, EncodedAudioChunkMetadata)>,
+  /// Flag indicating whether a flush operation is in progress
+  /// When true, worker queues chunks to pending_chunks instead of calling NonBlocking callback
+  inside_flush: bool,
+  /// Flag indicating whether the encoder was closed due to an error
+  /// Used to return EncodingError from flush() instead of InvalidStateError
+  had_error: bool,
 }
 
 /// AudioEncoder - WebCodecs-compliant audio encoder
@@ -145,6 +209,11 @@ struct AudioEncoderInner {
 pub struct AudioEncoder {
   inner: Arc<Mutex<AudioEncoderInner>>,
   dequeue_callback: Option<FunctionRef<(), UnknownReturnValue>>,
+  /// Output callback reference - stored for synchronous calls from main thread (in flush resolver)
+  /// Wrapped in Rc to allow sharing with spawn_future_with_callback closure
+  /// (Rc is !Send but that's OK - the callback runs on the main thread)
+  output_callback_ref:
+    Rc<FunctionRef<FnArgs<(EncodedAudioChunk, EncodedAudioChunkMetadata)>, UnknownReturnValue>>,
   /// Channel sender for worker commands
   command_sender: Option<Sender<EncoderCommand>>,
   /// Worker thread handle
@@ -197,6 +266,15 @@ impl AudioEncoder {
       output_callback: init.output,
       error_callback: init.error,
       dequeue_callback: None,
+      pending_flush_senders: Vec::new(),
+      timestamp_queue: std::collections::VecDeque::new(),
+      base_timestamp: None,
+      pending_abort_senders: Vec::new(),
+      flush_abort_flag: None,
+      output_suppressed: false,
+      pending_chunks: Vec::new(),
+      inside_flush: false,
+      had_error: false,
     };
 
     let inner = Arc::new(Mutex::new(inner));
@@ -213,6 +291,7 @@ impl AudioEncoder {
     Ok(Self {
       inner,
       dequeue_callback: None,
+      output_callback_ref: Rc::new(init.output_ref),
       command_sender: Some(sender),
       worker_handle: Some(worker_handle),
     })
@@ -242,18 +321,29 @@ impl AudioEncoder {
 
     // Check if encoder is still configured
     if guard.state != CodecState::Configured {
-      guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
-      let _ = Self::fire_dequeue_event(&guard);
+      let old_size = guard.encode_queue_size;
+      guard.encode_queue_size = old_size.saturating_sub(1);
+      if old_size > 0 {
+        let _ = Self::fire_dequeue_event(&guard);
+      }
       Self::report_error(&mut guard, "Encoder not configured");
       return;
     }
 
-    // Get config info
+    // Track base timestamp from first input for output timestamp calculation
+    if guard.base_timestamp.is_none() {
+      guard.base_timestamp = Some(timestamp);
+    }
+
+    // Get config info (unwrap validated config values)
     let codec_string = match guard.config.as_ref() {
-      Some(config) => config.codec.clone(),
+      Some(config) => config.codec.clone().unwrap_or_default(),
       None => {
-        guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
-        let _ = Self::fire_dequeue_event(&guard);
+        let old_size = guard.encode_queue_size;
+        guard.encode_queue_size = old_size.saturating_sub(1);
+        if old_size > 0 {
+          let _ = Self::fire_dequeue_event(&guard);
+        }
         Self::report_error(&mut guard, "No encoder config");
         return;
       }
@@ -264,16 +354,22 @@ impl AudioEncoder {
       let sample_buffer = match guard.sample_buffer.as_mut() {
         Some(buf) => buf,
         None => {
-          guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
-          let _ = Self::fire_dequeue_event(&guard);
+          let old_size = guard.encode_queue_size;
+          guard.encode_queue_size = old_size.saturating_sub(1);
+          if old_size > 0 {
+            let _ = Self::fire_dequeue_event(&guard);
+          }
           Self::report_error(&mut guard, "No sample buffer");
           return;
         }
       };
 
       if let Err(e) = sample_buffer.add_frame(&frame) {
-        guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
-        let _ = Self::fire_dequeue_event(&guard);
+        let old_size = guard.encode_queue_size;
+        guard.encode_queue_size = old_size.saturating_sub(1);
+        if old_size > 0 {
+          let _ = Self::fire_dequeue_event(&guard);
+        }
         Self::report_error(&mut guard, &format!("Failed to add samples: {}", e));
         return;
       }
@@ -299,8 +395,11 @@ impl AudioEncoder {
           buf.sample_rate() as i64,
         ),
         None => {
-          guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
-          let _ = Self::fire_dequeue_event(&guard);
+          let old_size = guard.encode_queue_size;
+          guard.encode_queue_size = old_size.saturating_sub(1);
+          if old_size > 0 {
+            let _ = Self::fire_dequeue_event(&guard);
+          }
           Self::report_error(&mut guard, "No sample buffer");
           return;
         }
@@ -315,8 +414,11 @@ impl AudioEncoder {
         let sample_buffer = match guard.sample_buffer.as_mut() {
           Some(buf) => buf,
           None => {
-            guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
-            let _ = Self::fire_dequeue_event(&guard);
+            let old_size = guard.encode_queue_size;
+            guard.encode_queue_size = old_size.saturating_sub(1);
+            if old_size > 0 {
+              let _ = Self::fire_dequeue_event(&guard);
+            }
             Self::report_error(&mut guard, "No sample buffer");
             return;
           }
@@ -324,34 +426,45 @@ impl AudioEncoder {
         match sample_buffer.take_frame() {
           Ok(Some(f)) => f,
           Ok(None) => {
-            guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
-            let _ = Self::fire_dequeue_event(&guard);
+            let old_size = guard.encode_queue_size;
+            guard.encode_queue_size = old_size.saturating_sub(1);
+            if old_size > 0 {
+              let _ = Self::fire_dequeue_event(&guard);
+            }
             Self::report_error(&mut guard, "No frame available");
             return;
           }
           Err(e) => {
-            guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
-            let _ = Self::fire_dequeue_event(&guard);
+            let old_size = guard.encode_queue_size;
+            guard.encode_queue_size = old_size.saturating_sub(1);
+            if old_size > 0 {
+              let _ = Self::fire_dequeue_event(&guard);
+            }
             Self::report_error(&mut guard, &format!("Failed to get frame: {}", e));
             return;
           }
         }
       };
 
-      // Set timestamp (approximate based on frame count)
-      let frame_timestamp = if guard.frame_count == 0 {
-        timestamp
-      } else {
-        timestamp + (guard.frame_count as i64 * frame_size * 1_000_000) / sample_rate
-      };
+      // Calculate timestamp based on base_timestamp (from first input) + frame offset
+      // This ensures timestamps are continuous and the first output has the first input's timestamp
+      let base_ts = guard.base_timestamp.unwrap_or(0);
+      let frame_timestamp =
+        base_ts + (guard.frame_count as i64 * frame_size * 1_000_000) / sample_rate;
       frame_to_encode.set_pts(frame_timestamp);
+
+      // Push timestamp to queue BEFORE encoding (for output correlation)
+      guard.timestamp_queue.push_back(frame_timestamp);
 
       // Encode the frame
       let context = match guard.context.as_mut() {
         Some(ctx) => ctx,
         None => {
-          guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
-          let _ = Self::fire_dequeue_event(&guard);
+          let old_size = guard.encode_queue_size;
+          guard.encode_queue_size = old_size.saturating_sub(1);
+          if old_size > 0 {
+            let _ = Self::fire_dequeue_event(&guard);
+          }
           Self::report_error(&mut guard, "No encoder context");
           return;
         }
@@ -360,8 +473,11 @@ impl AudioEncoder {
       let packets = match context.encode(Some(&frame_to_encode)) {
         Ok(pkts) => pkts,
         Err(e) => {
-          guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
-          let _ = Self::fire_dequeue_event(&guard);
+          let old_size = guard.encode_queue_size;
+          guard.encode_queue_size = old_size.saturating_sub(1);
+          if old_size > 0 {
+            let _ = Self::fire_dequeue_event(&guard);
+          }
           Self::report_error(&mut guard, &format!("Encode failed: {}", e));
           return;
         }
@@ -373,8 +489,10 @@ impl AudioEncoder {
       let duration_us = (frame_size * 1_000_000) / sample_rate;
 
       // Process output packets - call callback for each
+      // Pop timestamp from queue to preserve original input timestamp
       for packet in packets {
-        let chunk = EncodedAudioChunk::from_packet(&packet, Some(duration_us));
+        let output_timestamp = guard.timestamp_queue.pop_front();
+        let chunk = EncodedAudioChunk::from_packet(&packet, Some(duration_us), output_timestamp);
 
         // Create metadata
         let metadata = if !guard.extradata_sent {
@@ -382,7 +500,12 @@ impl AudioEncoder {
           let (target_sample_rate, target_channels) = guard
             .config
             .as_ref()
-            .map(|c| (c.sample_rate, c.number_of_channels))
+            .map(|c| {
+              (
+                c.sample_rate.unwrap_or(48000.0),
+                c.number_of_channels.unwrap_or(2),
+              )
+            })
             .unwrap_or((48000.0, 2));
 
           EncodedAudioChunkMetadata {
@@ -399,89 +522,139 @@ impl AudioEncoder {
           }
         };
 
-        guard.output_callback.call(
-          (chunk, metadata).into(),
-          ThreadsafeFunctionCallMode::NonBlocking,
-        );
-      }
-    }
-
-    // Decrement queue size and fire dequeue event
-    guard.encode_queue_size = guard.encode_queue_size.saturating_sub(1);
-    let _ = Self::fire_dequeue_event(&guard);
-  }
-
-  /// Process a flush command on the worker thread
-  fn process_flush(inner: &Arc<Mutex<AudioEncoderInner>>) -> Result<()> {
-    let mut guard = inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    if guard.state != CodecState::Configured {
-      Self::report_error(&mut guard, "Encoder not configured");
-      return Ok(());
-    }
-
-    // Flush any remaining samples in buffer
-    if let Some(ref mut sample_buffer) = guard.sample_buffer {
-      if let Ok(Some(mut frame)) = sample_buffer.flush() {
-        // Set timestamp
-        let frame_size = sample_buffer.frame_size() as i64;
-        let sample_rate = sample_buffer.sample_rate() as i64;
-        let frame_timestamp = (guard.frame_count as i64 * frame_size * 1_000_000) / sample_rate;
-        frame.set_pts(frame_timestamp);
-
-        let context = match guard.context.as_mut() {
-          Some(ctx) => ctx,
-          None => {
-            Self::report_error(&mut guard, "No encoder context");
-            return Ok(());
-          }
-        };
-
-        if let Ok(packets) = context.encode(Some(&frame)) {
-          let duration_us = (frame.nb_samples() as i64 * 1_000_000) / sample_rate;
-          for packet in packets {
-            let chunk = EncodedAudioChunk::from_packet(&packet, Some(duration_us));
-            let metadata = EncodedAudioChunkMetadata {
-              decoder_config: None,
-            };
-            guard.output_callback.call(
-              (chunk, metadata).into(),
-              ThreadsafeFunctionCallMode::NonBlocking,
-            );
-          }
+        // During flush, queue chunks for synchronous delivery in resolver
+        // Otherwise, use NonBlocking callback for immediate delivery
+        if guard.inside_flush {
+          guard.pending_chunks.push((chunk, metadata));
+        } else {
+          guard.output_callback.call(
+            (chunk, metadata).into(),
+            ThreadsafeFunctionCallMode::NonBlocking,
+          );
         }
       }
     }
 
-    // Flush encoder
-    let context = match guard.context.as_mut() {
-      Some(ctx) => ctx,
-      None => {
-        Self::report_error(&mut guard, "No encoder context");
-        return Ok(());
-      }
+    // Decrement queue size and prepare to fire dequeue event (only if queue was not empty)
+    let old_size = guard.encode_queue_size;
+    guard.encode_queue_size = old_size.saturating_sub(1);
+    let dequeue_callback = if old_size > 0 {
+      guard.dequeue_callback.clone()
+    } else {
+      None
     };
 
-    let packets = match context.flush_encoder() {
-      Ok(pkts) => pkts,
-      Err(e) => {
-        Self::report_error(&mut guard, &format!("Flush failed: {}", e));
-        return Ok(());
-      }
-    };
+    // Release mutex BEFORE calling dequeue callback to avoid deadlock
+    // (callback may read encodeQueueSize which needs the mutex)
+    drop(guard);
 
-    // Process remaining packets - call callback for each
-    for packet in packets {
-      let chunk = EncodedAudioChunk::from_packet(&packet, None);
-      let metadata = EncodedAudioChunkMetadata {
-        decoder_config: None,
+    // Fire dequeue event with NonBlocking mode
+    // Note: With NonBlocking, callbacks may not see the exact queue size at time of dequeue.
+    // This is acceptable per W3C spec which only requires the event to fire when an item
+    // is removed, not that the callback sees a specific queue state.
+    if let Some(ref callback) = dequeue_callback {
+      callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+    }
+  }
+
+  /// Process a flush command on the worker thread
+  fn process_flush(inner: &Arc<Mutex<AudioEncoderInner>>) -> Result<()> {
+    {
+      let mut guard = inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+      // W3C spec: flush() should reject if encoder is not in configured state
+      if guard.state != CodecState::Configured {
+        // If closed due to error, return EncodingError; otherwise InvalidStateError
+        if guard.state == CodecState::Closed && guard.had_error {
+          return Err(Error::new(
+            Status::GenericFailure,
+            "EncodingError: Encode error occurred",
+          ));
+        }
+        return Err(Error::new(
+          Status::GenericFailure,
+          "InvalidStateError: Encoder is not configured",
+        ));
+      }
+
+      // Flush any remaining samples in buffer
+      if let Some(ref mut sample_buffer) = guard.sample_buffer {
+        if let Ok(Some(mut frame)) = sample_buffer.flush() {
+          // Set timestamp using base_timestamp
+          let frame_size = sample_buffer.frame_size() as i64;
+          let sample_rate = sample_buffer.sample_rate() as i64;
+          let base_ts = guard.base_timestamp.unwrap_or(0);
+          let frame_timestamp =
+            base_ts + (guard.frame_count as i64 * frame_size * 1_000_000) / sample_rate;
+          frame.set_pts(frame_timestamp);
+
+          // Push timestamp to queue for output correlation
+          guard.timestamp_queue.push_back(frame_timestamp);
+
+          let context = match guard.context.as_mut() {
+            Some(ctx) => ctx,
+            None => {
+              Self::report_error(&mut guard, "No encoder context");
+              return Ok(());
+            }
+          };
+
+          if let Ok(packets) = context.encode(Some(&frame)) {
+            let duration_us = (frame.nb_samples() as i64 * 1_000_000) / sample_rate;
+            for packet in packets {
+              let output_timestamp = guard.timestamp_queue.pop_front();
+              let chunk =
+                EncodedAudioChunk::from_packet(&packet, Some(duration_us), output_timestamp);
+              let metadata = EncodedAudioChunkMetadata {
+                decoder_config: None,
+              };
+              // Always queue during flush for synchronous delivery
+              guard.pending_chunks.push((chunk, metadata));
+            }
+          }
+        }
+      }
+
+      // Flush encoder
+      let context = match guard.context.as_mut() {
+        Some(ctx) => ctx,
+        None => {
+          Self::report_error(&mut guard, "No encoder context");
+          return Ok(());
+        }
       };
-      guard.output_callback.call(
-        (chunk, metadata).into(),
-        ThreadsafeFunctionCallMode::NonBlocking,
-      );
+
+      let packets = match context.flush_encoder() {
+        Ok(pkts) => pkts,
+        Err(e) => {
+          Self::report_error(&mut guard, &format!("Flush failed: {}", e));
+          return Ok(());
+        }
+      };
+
+      // Queue remaining packets for synchronous delivery in resolver
+      for packet in packets {
+        let output_timestamp = guard.timestamp_queue.pop_front();
+        let chunk = EncodedAudioChunk::from_packet(&packet, None, output_timestamp);
+        let metadata = EncodedAudioChunkMetadata {
+          decoder_config: None,
+        };
+        // Always queue during flush for synchronous delivery
+        guard.pending_chunks.push((chunk, metadata));
+      }
+    } // mutex released here
+
+    // Reset encoder state so it can accept more data (per W3C spec, flush should leave
+    // encoder in configured state, ready for more encode() calls)
+    {
+      let mut guard = inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+      if let Some(ref mut context) = guard.context {
+        context.flush();
+      }
     }
 
     Ok(())
@@ -489,10 +662,12 @@ impl AudioEncoder {
 
   /// Report an error via callback and close the encoder
   fn report_error(inner: &mut AudioEncoderInner, error_msg: &str) {
-    inner.error_callback.call(
-      Ok(error_msg.to_string()),
-      ThreadsafeFunctionCallMode::NonBlocking,
-    );
+    // Create an Error object that will be passed directly to the JS callback
+    let error = Error::new(Status::GenericFailure, error_msg);
+    inner
+      .error_callback
+      .call(error, ThreadsafeFunctionCallMode::NonBlocking);
+    inner.had_error = true;
     inner.state = CodecState::Closed;
   }
 
@@ -539,14 +714,14 @@ impl AudioEncoder {
         .inner
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-      inner.dequeue_callback = Some(
+      inner.dequeue_callback = Some(Arc::new(
         callback
           .borrow_back(env)?
           .build_threadsafe_function()
           .callee_handled::<false>()
           .weak::<true>()
           .build()?,
-      );
+      ));
     }
     self.dequeue_callback = callback;
 
@@ -569,22 +744,55 @@ impl AudioEncoder {
 
   /// Configure the encoder
   #[napi]
-  pub fn configure(&self, config: AudioEncoderConfig) -> Result<()> {
+  pub fn configure(&self, env: Env, config: AudioEncoderConfig) -> Result<()> {
+    // W3C WebCodecs spec: Validate config synchronously, throw TypeError for invalid
+    // https://w3c.github.io/webcodecs/#dom-audioencoder-configure
+
+    // Validate codec - must be present and not empty
+    let codec = match &config.codec {
+      Some(c) if !c.is_empty() => c.clone(),
+      _ => return throw_type_error_unit(&env, "codec is required"),
+    };
+
+    // Validate sample rate - must be present and greater than 0
+    let sample_rate = match config.sample_rate {
+      Some(sr) if sr > 0.0 => sr,
+      Some(_) => return throw_type_error_unit(&env, "sampleRate must be greater than 0"),
+      None => return throw_type_error_unit(&env, "sampleRate is required"),
+    };
+
+    // Validate number of channels - must be present and greater than 0
+    let number_of_channels = match config.number_of_channels {
+      Some(nc) if nc > 0 => nc,
+      Some(_) => return throw_type_error_unit(&env, "numberOfChannels must be greater than 0"),
+      None => return throw_type_error_unit(&env, "numberOfChannels is required"),
+    };
+
+    // Validate bitrate if specified
+    if let Some(bitrate) = config.bitrate {
+      if bitrate <= 0.0 {
+        return throw_type_error_unit(&env, "bitrate must be greater than 0");
+      }
+    }
+
     let mut inner = self
       .inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
+    // W3C spec: throw InvalidStateError if closed
     if inner.state == CodecState::Closed {
-      Self::report_error(&mut inner, "Encoder is closed");
-      return Ok(());
+      return Err(invalid_state_error("Encoder is closed"));
     }
 
     // Parse codec string to determine codec ID
-    let codec_id = match parse_audio_codec_string(&config.codec) {
+    let codec_id = match parse_audio_codec_string(&codec) {
       Ok(id) => id,
       Err(e) => {
-        Self::report_error(&mut inner, &format!("Invalid codec: {}", e));
+        Self::report_error(
+          &mut inner,
+          &format!("NotSupportedError: Invalid codec: {}", e),
+        );
         return Ok(());
       }
     };
@@ -609,12 +817,9 @@ impl AudioEncoder {
     let target_format = get_encoder_sample_format(codec_id);
 
     // Configure encoder (cast f64 sample_rate to u32 for FFmpeg)
-    let sample_rate = config.sample_rate as u32;
-    let channels = config.number_of_channels;
-
     let encoder_config = InternalAudioEncoderConfig {
-      sample_rate,
-      channels,
+      sample_rate: sample_rate as u32,
+      channels: number_of_channels,
       sample_format: target_format,
       bitrate: config.bitrate.unwrap_or(128_000.0) as u64,
       thread_count: 0,
@@ -635,13 +840,18 @@ impl AudioEncoder {
     let frame_size = context.frame_size();
     let frame_size = if frame_size == 0 {
       // Some encoders don't set frame_size, use codec default
-      AudioSampleBuffer::frame_size_for_codec(&config.codec)
+      AudioSampleBuffer::frame_size_for_codec(&codec)
     } else {
       frame_size as usize
     };
 
     // Create sample buffer
-    let sample_buffer = AudioSampleBuffer::new(frame_size, channels, sample_rate, target_format);
+    let sample_buffer = AudioSampleBuffer::new(
+      frame_size,
+      number_of_channels,
+      sample_rate as u32,
+      target_format,
+    );
 
     inner.context = Some(context);
     inner.config = Some(config);
@@ -666,14 +876,22 @@ impl AudioEncoder {
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
+      // W3C spec: throw InvalidStateError if not configured or closed
+      if inner.state == CodecState::Closed {
+        return Err(invalid_state_error("Cannot encode with a closed codec"));
+      }
       if inner.state != CodecState::Configured {
-        Self::report_error(&mut inner, "Encoder not configured");
-        return Ok(());
+        return Err(invalid_state_error(
+          "Cannot encode with an unconfigured codec",
+        ));
       }
 
-      // Get config info
+      // Get config info (unwrap validated config values)
       let (target_sample_rate, target_channels) = match inner.config.as_ref() {
-        Some(config) => (config.sample_rate, config.number_of_channels),
+        Some(config) => (
+          config.sample_rate.unwrap_or(48000.0),
+          config.number_of_channels.unwrap_or(2),
+        ),
         None => {
           Self::report_error(&mut inner, "No encoder config");
           return Ok(());
@@ -791,10 +1009,57 @@ impl AudioEncoder {
 
   /// Flush the encoder
   /// Returns a Promise that resolves when flushing is complete
-  #[napi]
-  pub async fn flush(&self) -> Result<()> {
-    // Create a response channel
+  ///
+  /// Uses spawn_future_with_callback to check abort flag synchronously in the resolver.
+  /// This ensures that if reset() is called from a callback, the abort flag is checked
+  /// AFTER the callback returns, allowing flush() to return AbortError.
+  #[napi(ts_return_type = "Promise<void>")]
+  pub fn flush<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
+    // Create abort flag for this flush operation
+    let flush_abort_flag = Arc::new(AtomicBool::new(false));
+
+    // W3C spec: Check state upfront and return rejected promise with appropriate error
+    // (not throw synchronously - flush() should always return a promise)
+    {
+      let mut inner = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+      if inner.state == CodecState::Closed {
+        // Return immediately rejected promise
+        return env
+          .spawn_future_with_callback(async move { Ok(()) }, move |_env, _| -> Result<()> {
+            Err(invalid_state_error("Cannot flush a closed codec"))
+          });
+      }
+      if inner.state == CodecState::Unconfigured {
+        // Return immediately rejected promise
+        return env.spawn_future_with_callback(
+          async move { Ok(()) },
+          move |_env, _| -> Result<()> {
+            Err(invalid_state_error("Cannot flush an unconfigured codec"))
+          },
+        );
+      }
+
+      // Store abort flag for reset() to access
+      inner.flush_abort_flag = Some(flush_abort_flag.clone());
+      // Set inside_flush flag so worker queues chunks instead of calling NonBlocking callback
+      inner.inside_flush = true;
+    }
+
+    // Create a response channel for worker result
     let (response_sender, response_receiver) = channel::bounded::<Result<()>>(1);
+
+    // Track this flush - store sender in Inner for reset() to use
+    {
+      let mut inner = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+      inner.pending_flush_senders.push(response_sender.clone());
+    }
 
     // Send flush command through the channel to ensure it's processed after all pending encodes
     if let Some(ref sender) = self.command_sender {
@@ -802,26 +1067,74 @@ impl AudioEncoder {
         .send(EncoderCommand::Flush(response_sender))
         .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?;
     } else {
-      return Err(Error::new(
-        Status::GenericFailure,
-        "Encoder has been closed",
-      ));
+      return Err(invalid_state_error("Cannot flush a closed codec"));
     }
 
-    // Wait for response in a blocking thread to not block the event loop
-    spawn_blocking(move || {
-      response_receiver
-        .recv()
-        .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?
-    })
-    .await
-    .map_err(|join_error| {
-      Error::new(
-        Status::GenericFailure,
-        format!("Flush failed: {}", join_error),
-      )
-    })
-    .flatten()
+    // Clone references for the callback closure
+    let inner_clone = self.inner.clone();
+    let output_callback_ref = self.output_callback_ref.clone();
+
+    env.spawn_future_with_callback(
+      async move {
+        // Wait for worker response in a blocking thread
+        let result = spawn_blocking(move || {
+          response_receiver
+            .recv()
+            .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?
+        })
+        .await
+        .map_err(|join_error| {
+          Error::new(
+            Status::GenericFailure,
+            format!("Flush failed: {}", join_error),
+          )
+        })
+        .flatten();
+
+        Ok((result, inner_clone, flush_abort_flag))
+      },
+      move |env, (result, inner, abort_flag)| {
+        // Drain pending chunks and call output callback SYNCHRONOUSLY
+        // This runs on the main thread with Env access
+        let chunks = {
+          let mut guard = inner
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+          std::mem::take(&mut guard.pending_chunks)
+        };
+
+        // Call output callback for each chunk synchronously
+        // If callback calls reset(), abort_flag will be set before next iteration
+        let callback = output_callback_ref.borrow_back(env)?;
+        for (chunk, metadata) in chunks {
+          // Check abort flag before each callback - exit early if reset() was called
+          if abort_flag.load(Ordering::SeqCst) {
+            break;
+          }
+          callback.call((chunk, metadata).into())?;
+        }
+
+        // Clean up flags
+        {
+          let mut guard = inner
+            .lock()
+            .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+          guard.flush_abort_flag = None;
+          guard.inside_flush = false;
+        }
+
+        // Check abort flag after draining all chunks
+        if abort_flag.load(Ordering::SeqCst) {
+          return Err(Error::new(
+            Status::GenericFailure,
+            "AbortError: The operation was aborted",
+          ));
+        }
+
+        // Return worker result
+        result
+      },
+    )
   }
 
   /// Reset the encoder
@@ -829,13 +1142,36 @@ impl AudioEncoder {
   pub fn reset(&mut self) -> Result<()> {
     // Check state first before touching the worker
     {
-      let inner = self
+      let mut inner = self
         .inner
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
+      // W3C spec: throw InvalidStateError if closed
       if inner.state == CodecState::Closed {
-        return Err(Error::new(Status::GenericFailure, "Encoder is closed"));
+        return Err(invalid_state_error("Cannot reset a closed codec"));
+      }
+
+      // Set abort flag FIRST (synchronously, before any other reset logic)
+      // This signals any pending flush() that is yielding to return AbortError
+      if let Some(ref flag) = inner.flush_abort_flag {
+        flag.store(true, Ordering::SeqCst);
+      }
+
+      // W3C spec: Abort all pending flushes with AbortError BEFORE dropping sender
+
+      // Send abort signal through all abort channels - this causes pending flush()
+      // calls to return AbortError via the select! in spawn_blocking
+      for sender in inner.pending_abort_senders.drain(..) {
+        let _ = sender.send(());
+      }
+
+      // Also try to send through the response channel (fallback)
+      for sender in inner.pending_flush_senders.drain(..) {
+        let _ = sender.send(Err(Error::new(
+          Status::GenericFailure,
+          "AbortError: The operation was aborted",
+        )));
       }
     }
 
@@ -861,6 +1197,14 @@ impl AudioEncoder {
     inner.frame_count = 0;
     inner.extradata_sent = false;
     inner.encode_queue_size = 0;
+    inner.timestamp_queue.clear();
+    inner.base_timestamp = None;
+    // Clear any remaining abort senders (shouldn't be any, but just in case)
+    inner.pending_abort_senders.clear();
+
+    // Clear flush-related state
+    inner.inside_flush = false;
+    inner.pending_chunks.clear();
 
     // Create new channel and worker for future encode operations
     let (sender, receiver) = channel::unbounded();
@@ -877,6 +1221,18 @@ impl AudioEncoder {
   /// Close the encoder
   #[napi]
   pub fn close(&mut self) -> Result<()> {
+    // Check state first - W3C spec: throw InvalidStateError if already closed
+    {
+      let inner = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+      if inner.state == CodecState::Closed {
+        return Err(invalid_state_error("Cannot close an already closed codec"));
+      }
+    }
+
     // Drop sender to stop accepting new commands
     self.command_sender = None;
 
@@ -902,30 +1258,69 @@ impl AudioEncoder {
 
   /// Check if a configuration is supported
   /// Returns a Promise that resolves with support information
+  ///
+  /// W3C WebCodecs spec: Rejects with TypeError for invalid configs,
+  /// returns { supported: false } for valid but unsupported configs.
   #[napi]
-  pub async fn is_config_supported(config: AudioEncoderConfig) -> Result<AudioEncoderSupport> {
-    // Parse codec string
-    let codec_id = match parse_audio_codec_string(&config.codec) {
-      Ok(id) => id,
-      Err(_) => {
-        return Ok(AudioEncoderSupport {
-          supported: false,
-          config,
-        });
+  pub fn is_config_supported<'env>(
+    env: &'env Env,
+    config: AudioEncoderConfig,
+  ) -> Result<PromiseRaw<'env, AudioEncoderSupport>> {
+    // W3C WebCodecs spec: Validate config, reject with TypeError for invalid
+    // https://w3c.github.io/webcodecs/#dom-audioencoder-isconfigsupported
+
+    // Validate codec - must be present and not empty
+    let codec = match &config.codec {
+      Some(c) if !c.is_empty() => c.clone(),
+      Some(_) => return reject_with_type_error(env, "codec is required"),
+      None => return reject_with_type_error(env, "codec is required"),
+    };
+
+    // Validate sample rate - must be present and greater than 0
+    let _sample_rate = match config.sample_rate {
+      Some(sr) if sr > 0.0 => sr,
+      Some(_) => return reject_with_type_error(env, "sampleRate must be greater than 0"),
+      None => return reject_with_type_error(env, "sampleRate is required"),
+    };
+
+    // Validate number of channels - must be present and greater than 0
+    let _number_of_channels = match config.number_of_channels {
+      Some(nc) if nc > 0 => nc,
+      Some(_) => return reject_with_type_error(env, "numberOfChannels must be greater than 0"),
+      None => return reject_with_type_error(env, "numberOfChannels is required"),
+    };
+
+    // Validate bitrate if specified
+    if let Some(bitrate) = config.bitrate {
+      if bitrate <= 0.0 {
+        return reject_with_type_error(env, "bitrate must be greater than 0");
       }
-    };
+    }
 
-    // Try to find encoder
-    let encoder_name = get_audio_encoder_name(codec_id);
-    let result = if let Some(name) = encoder_name {
-      CodecContext::new_encoder_by_name(name).or_else(|_| CodecContext::new_encoder(codec_id))
-    } else {
-      CodecContext::new_encoder(codec_id)
-    };
+    env.spawn_future(async move {
+      // Parse codec string
+      let codec_id = match parse_audio_codec_string(&codec) {
+        Ok(id) => id,
+        Err(_) => {
+          return Ok(AudioEncoderSupport {
+            supported: false,
+            config,
+          });
+        }
+      };
 
-    Ok(AudioEncoderSupport {
-      supported: result.is_ok(),
-      config,
+      // Try to find encoder
+      let encoder_name = get_audio_encoder_name(codec_id);
+      let result = if let Some(name) = encoder_name {
+        CodecContext::new_encoder_by_name(name).or_else(|_| CodecContext::new_encoder(codec_id))
+      } else {
+        CodecContext::new_encoder(codec_id)
+      };
+
+      Ok(AudioEncoderSupport {
+        supported: result.is_ok(),
+        config,
+      })
     })
   }
 }
