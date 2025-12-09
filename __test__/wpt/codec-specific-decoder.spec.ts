@@ -2,7 +2,7 @@
  * Codec-Specific Decoder Tests (WPT)
  *
  * Ported from W3C Web Platform Tests:
- * https://github.com/nicosurjana/nicosurjana.git
+ * https://github.com/web-platform-tests/wpt
  *
  * Tests decoding of various video and audio codecs using fixture files.
  */

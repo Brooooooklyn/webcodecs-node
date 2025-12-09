@@ -2,7 +2,7 @@
  * AudioData Tests (WPT)
  *
  * Ported from W3C Web Platform Tests:
- * https://github.com/nicosurjana/nicosurjana.git
+ * https://github.com/web-platform-tests/wpt
  *
  * Tests AudioData construction, copying, cloning, and format conversion.
  */

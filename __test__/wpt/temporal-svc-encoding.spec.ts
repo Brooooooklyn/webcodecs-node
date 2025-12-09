@@ -2,7 +2,7 @@
  * Temporal SVC Encoding Test (WPT)
  *
  * Ported from W3C Web Platform Tests:
- * https://github.com/nicosurjana/nicosurjana.git
+ * https://github.com/web-platform-tests/wpt
  *
  * Tests Scalable Video Coding (SVC) with temporal layers L1T2 and L1T3.
  * Validates that temporal layer IDs are correctly reported in metadata.

@@ -2,7 +2,7 @@
  * AudioDecoder Configuration Tests (WPT)
  *
  * Ported from W3C Web Platform Tests:
- * https://github.com/nicosurjana/nicosurjana.git
+ * https://github.com/web-platform-tests/wpt
  *
  * Tests invalid configurations, unsupported configurations, and valid configurations
  * for AudioDecoder.isConfigSupported() and AudioDecoder.configure().

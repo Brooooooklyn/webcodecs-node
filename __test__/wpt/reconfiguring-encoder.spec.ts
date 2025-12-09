@@ -2,7 +2,7 @@
  * Reconfiguring Encoder Test (WPT)
  *
  * Ported from W3C Web Platform Tests:
- * https://github.com/nicosurjana/nicosurjana.git
+ * https://github.com/web-platform-tests/wpt
  *
  * Tests dynamic encoder reconfiguration with different resolutions and bitrates.
  * Validates that decoder config changes are correctly reflected in output.

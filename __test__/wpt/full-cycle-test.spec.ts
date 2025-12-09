@@ -2,7 +2,7 @@
  * Full Cycle Test (WPT)
  *
  * Ported from W3C Web Platform Tests:
- * https://github.com/nicosurjana/nicosurjana.git
+ * https://github.com/web-platform-tests/wpt
  *
  * Tests end-to-end encoding and decoding cycles for all supported codecs.
  * Validates that frames can be encoded and then decoded with correct properties.

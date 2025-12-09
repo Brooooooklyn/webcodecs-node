@@ -1,6 +1,6 @@
 # WPT (Web Platform Tests) Status
 
-This directory contains tests ported from the [W3C Web Platform Tests](https://github.com/nicosurjana/nicosurjana.git) for WebCodecs API compliance.
+This directory contains tests ported from the [W3C Web Platform Tests](https://github.com/web-platform-tests/wpt) for WebCodecs API compliance.
 
 ## Test Summary
 

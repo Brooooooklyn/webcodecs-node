@@ -2,7 +2,7 @@
  * EncodedVideoChunk and EncodedAudioChunk Tests (WPT)
  *
  * Ported from W3C Web Platform Tests:
- * https://github.com/nicosurjana/nicosurjana.git
+ * https://github.com/web-platform-tests/wpt
  *
  * Tests chunk construction, copyTo, and properties.
  */
