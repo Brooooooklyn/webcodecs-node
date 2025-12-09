@@ -115,7 +115,15 @@ test('AudioDecoder: configure() with FLAC codec requires description', async (t)
   })
 
   // Wait for error callback to be called (it's async via ThreadsafeFunction)
-  await new Promise((resolve) => setTimeout(resolve, 50))
+  // Use polling with timeout for slower platforms (armv7, etc.)
+  // Wait for BOTH decoder to close AND error callback to fire
+  const maxWait = 500
+  const pollInterval = 20
+  let elapsed = 0
+  while ((decoder.state !== 'closed' || errors.length === 0) && elapsed < maxWait) {
+    await new Promise((resolve) => setTimeout(resolve, pollInterval))
+    elapsed += pollInterval
+  }
 
   // Should trigger error callback and close decoder (no description provided)
   t.is(decoder.state, 'closed')

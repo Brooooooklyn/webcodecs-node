@@ -248,6 +248,7 @@ test('platform: preferred accelerator matches platform', (t) => {
 
 test('hardware encoding: H.264 with prefer-hardware', async (t) => {
   const preferred = getPreferredHardwareAccelerator()
+  const isCI = Boolean(process.env.CI || process.env.GITHUB_ACTIONS)
 
   if (preferred === null) {
     t.pass('No hardware accelerator available, skipping')
@@ -271,17 +272,36 @@ test('hardware encoding: H.264 with prefer-hardware', async (t) => {
   })
 
   frame.close()
-  await encoder.flush()
 
   // Hardware encoding may not work in CI VMs even when hardware is detected.
-  // In these cases, the encoder may produce no output without raising errors.
-  // This is expected behavior - hardware detection can succeed but actual
-  // encoding may fail due to lack of real GPU access in virtualized environments.
-  if (chunks.length === 0 && errors.length === 0) {
-    t.pass('Hardware encoder detected but encoding unavailable (likely CI VM), skipping')
+  // The flush() can throw if hardware encoder fails to create compression session.
+  // This is expected behavior in virtualized environments without real GPU access.
+  let flushError: Error | null = null
+  try {
+    await encoder.flush()
+  } catch (e) {
+    flushError = e as Error
+  }
+
+  if (flushError) {
+    if (isCI) {
+      t.pass(`Hardware encoding failed in CI (expected): ${flushError.message}`)
+    } else {
+      t.fail(`Hardware encoding failed locally: ${flushError.message}`)
+    }
+  } else if (chunks.length === 0 && errors.length === 0) {
+    if (isCI) {
+      t.pass('Hardware encoder detected but encoding unavailable (likely CI VM), skipping')
+    } else {
+      t.fail('Hardware encoder produced no output locally')
+    }
   } else if (errors.length > 0) {
     const errorMsg = errors[0]?.message ?? String(errors[0])
-    t.pass(`Hardware encoding failed with error (expected in CI): ${errorMsg}`)
+    if (isCI) {
+      t.pass(`Hardware encoding error callback in CI (expected): ${errorMsg}`)
+    } else {
+      t.fail(`Hardware encoding error locally: ${errorMsg}`)
+    }
   } else {
     t.true(chunks.length > 0, 'Hardware encoder should produce output')
   }
