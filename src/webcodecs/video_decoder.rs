@@ -232,6 +232,8 @@ impl Drop for VideoDecoder {
     // still has internal threads running.
     if let Ok(mut inner) = self.inner.lock() {
       if let Some(ctx) = inner.context.as_mut() {
+        // Flush internal buffers first - this synchronizes libaom's thread pool
+        ctx.flush();
         let _ = ctx.send_packet(None);
         while ctx.receive_frame().ok().flatten().is_some() {}
       }
@@ -549,6 +551,7 @@ impl VideoDecoder {
 
     // Drain existing decoder before dropping (AV1 safety)
     if let Some(ctx) = inner.context.as_mut() {
+      ctx.flush();
       let _ = ctx.send_packet(None);
       while ctx.receive_frame().ok().flatten().is_some() {}
     }
@@ -1200,6 +1203,7 @@ impl VideoDecoder {
 
     // Drain decoder before dropping to ensure libaom/AV1 threads finish
     if let Some(ctx) = inner.context.as_mut() {
+      ctx.flush();
       let _ = ctx.send_packet(None);
       while ctx.receive_frame().ok().flatten().is_some() {}
     }
@@ -1281,6 +1285,8 @@ impl VideoDecoder {
 
     // Drain decoder before dropping to ensure libaom/AV1 threads finish
     if let Some(ctx) = inner.context.as_mut() {
+      // Flush internal buffers first - this synchronizes libaom's thread pool
+      ctx.flush();
       let _ = ctx.send_packet(None);
       while ctx.receive_frame().ok().flatten().is_some() {}
     }

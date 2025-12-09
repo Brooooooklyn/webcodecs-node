@@ -359,6 +359,8 @@ impl Drop for VideoEncoder {
     // still has internal threads running.
     if let Ok(mut inner) = self.inner.lock() {
       if let Some(ctx) = inner.context.as_mut() {
+        // Flush internal buffers first - this synchronizes libaom's thread pool
+        ctx.flush();
         let _ = ctx.send_frame(None);
         while ctx.receive_packet().ok().flatten().is_some() {}
       }
@@ -1736,6 +1738,7 @@ impl VideoEncoder {
 
     // Drain encoder before dropping to ensure libaom/AV1 threads finish
     if let Some(ctx) = inner.context.as_mut() {
+      ctx.flush();
       let _ = ctx.send_frame(None);
       while ctx.receive_packet().ok().flatten().is_some() {}
     }
@@ -1809,6 +1812,8 @@ impl VideoEncoder {
     // Drain encoder before dropping to ensure libaom/AV1 threads finish
     // This prevents SIGSEGV crashes during cleanup
     if let Some(ctx) = inner.context.as_mut() {
+      // Flush internal buffers first - this synchronizes libaom's thread pool
+      ctx.flush();
       // Send NULL frame to signal end of stream
       let _ = ctx.send_frame(None);
       // Drain all remaining packets

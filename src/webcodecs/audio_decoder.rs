@@ -179,6 +179,7 @@ impl Drop for AudioDecoder {
     // This prevents potential SIGSEGV with codecs that use internal threads.
     if let Ok(mut inner) = self.inner.lock() {
       if let Some(ctx) = inner.context.as_mut() {
+        ctx.flush();
         let _ = ctx.send_packet(None);
         while ctx.receive_frame().ok().flatten().is_some() {}
       }
