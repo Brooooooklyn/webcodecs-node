@@ -1,0 +1,245 @@
+# WPT (Web Platform Tests) Status
+
+This directory contains tests ported from the [W3C Web Platform Tests](https://github.com/nicosurjana/nicosurjana.git) for WebCodecs API compliance.
+
+## Test Summary
+
+| Status      | Count |
+| ----------- | ----- |
+| **Passing** | 497   |
+| **Skipped** | 31    |
+| **Failing** | 0     |
+| **Total**   | 528   |
+
+## Test Files Overview
+
+### VideoFrame Tests
+
+| File                      | Tests                  | Status      | Notes                                  |
+| ------------------------- | ---------------------- | ----------- | -------------------------------------- |
+| `video-frame-wpt.spec.ts` | 71 passing, 18 skipped | **Partial** | High bit-depth formats not implemented |
+
+**Skipped Tests (VideoFrame):**
+
+- `I420P10`, `I422P10`, `I444P10` (10-bit formats) - Not mapped in FFmpeg
+- `I420P12`, `I422P12`, `I444P12` (12-bit formats) - Not mapped in FFmpeg
+- `I420AP10`, `I422AP10`, `I444AP10` (10-bit with alpha) - Not mapped in FFmpeg
+- `I422A`, `I444A` (8-bit 4:2:2/4:4:4 with alpha) - Plane extraction issues
+
+**Supported Pixel Formats:**
+
+- 8-bit: `I420`, `I420A`, `I422`, `I444`, `NV12`, `NV21`
+- RGB: `RGBA`, `RGBX`, `BGRA`, `BGRX`
+
+### AudioData Tests
+
+| File                     | Tests      | Status       | Notes                 |
+| ------------------------ | ---------- | ------------ | --------------------- |
+| `audio-data-wpt.spec.ts` | 38 passing | **Complete** | All formats supported |
+
+**Supported Audio Formats:**
+
+- Interleaved: `u8`, `s16`, `s32`, `f32`
+- Planar: `u8-planar`, `s16-planar`, `s32-planar`, `f32-planar`
+
+### Encoded Chunk Tests
+
+| File                        | Tests      | Status       | Notes                                |
+| --------------------------- | ---------- | ------------ | ------------------------------------ |
+| `encoded-chunk-wpt.spec.ts` | 20 passing | **Complete** | EncodedVideoChunk, EncodedAudioChunk |
+
+### ImageDecoder Tests
+
+| File                        | Tests      | Status       | Notes                      |
+| --------------------------- | ---------- | ------------ | -------------------------- |
+| `image-decoder-wpt.spec.ts` | 15 passing | **Complete** | PNG, JPEG, GIF, WebP, AVIF |
+
+### VideoEncoder Tests
+
+| File                             | Tests      | Status       | Notes                           |
+| -------------------------------- | ---------- | ------------ | ------------------------------- |
+| `video-encoder-behavior.spec.ts` | 23 passing | **Complete** | Encode, flush, reset, callbacks |
+| `video-encoder-config.spec.ts`   | 42 passing | **Complete** | isConfigSupported, configure    |
+
+**Supported Video Codecs (Encoding):**
+
+- AV1 (`av01.x.xxM.xx`)
+- VP8 (`vp8`)
+- VP9 (`vp09.xx.xx.xx`)
+- H.264 (`avc1.xxxxxx`) - AVC and Annex B formats
+- H.265 (`hvc1.x.x.Lxxx.xx`, `hev1.x.x.Lxxx.xx`) - HEVC and Annex B formats
+
+### VideoDecoder Tests
+
+| File                             | Tests      | Status       | Notes                           |
+| -------------------------------- | ---------- | ------------ | ------------------------------- |
+| `video-decoder-behavior.spec.ts` | 16 passing | **Complete** | Decode, flush, reset, callbacks |
+| `video-decoder-config.spec.ts`   | 17 passing | **Complete** | isConfigSupported, configure    |
+| `codec-specific-decoder.spec.ts` | 21 passing | **Complete** | H.264, VP8, VP9, AV1 specifics  |
+
+### AudioEncoder Tests
+
+| File                             | Tests      | Status       | Notes                        |
+| -------------------------------- | ---------- | ------------ | ---------------------------- |
+| `audio-encoder-behavior.spec.ts` | 10 passing | **Complete** | Encode, flush, callbacks     |
+| `audio-encoder-config.spec.ts`   | 18 passing | **Complete** | isConfigSupported, configure |
+
+**Supported Audio Codecs (Encoding):**
+
+- AAC (`mp4a.40.2`)
+- Opus (`opus`)
+- MP3 (`mp3`)
+- FLAC (`flac`)
+
+### AudioDecoder Tests
+
+| File                             | Tests      | Status       | Notes                        |
+| -------------------------------- | ---------- | ------------ | ---------------------------- |
+| `audio-decoder-behavior.spec.ts` | 12 passing | **Complete** | Decode, flush, callbacks     |
+| `audio-decoder-config.spec.ts`   | 18 passing | **Complete** | isConfigSupported, configure |
+
+### VideoColorSpace Tests
+
+| File                        | Tests      | Status       | Notes               |
+| --------------------------- | ---------- | ------------ | ------------------- |
+| `video-color-space.spec.ts` | 19 passing | **Complete** | Constructor, toJSON |
+
+### Full Cycle Tests (Encode/Decode Roundtrip)
+
+| File                      | Tests                 | Status       | Notes           |
+| ------------------------- | --------------------- | ------------ | --------------- |
+| `full-cycle-test.spec.ts` | 19 passing, 5 skipped | **Complete** | All codecs work |
+
+**Test Variants:**
+
+- Basic encoding and decoding
+- Realtime latency mode
+- Stripped color space (test bitstream-embedded color space)
+
+**Skipped Tests:**
+
+- Rate control tests (dynamic bitrate reconfiguration) - covered by `reconfiguring-encoder.spec.ts`
+
+### Encoder Reconfiguration Tests
+
+| File                            | Tests     | Status       | Notes      |
+| ------------------------------- | --------- | ------------ | ---------- |
+| `reconfiguring-encoder.spec.ts` | 6 passing | **Complete** | All codecs |
+
+Tests dynamic encoder reconfiguration with:
+
+- Resolution changes (800x600 → 640x480 → 800x600)
+- Bitrate changes
+
+**Supported Codecs:**
+
+- AV1, VP8, VP9 (Profile 0 & 2), H.264 (AVC & Annex B)
+
+### Temporal SVC Encoding Tests
+
+| File                            | Tests                | Status      | Notes                      |
+| ------------------------------- | -------------------- | ----------- | -------------------------- |
+| `temporal-svc-encoding.spec.ts` | 1 passing, 8 skipped | **Pending** | SVC metadata not populated |
+
+**Skipped Tests:**
+All L1T2 and L1T3 tests are skipped because `metadata.svc.temporalLayerId` is not yet populated in encoder output.
+
+**Implementation Status:**
+
+- `scalabilityMode` is parsed and passed to encoder
+- Actual SVC layer metadata extraction from FFmpeg is not implemented
+- See `src/webcodecs/video_encoder.rs` - `svc` field is always `None`
+
+---
+
+## Missing WPT Tests (Not Ported)
+
+### Browser-Specific (Cannot Port)
+
+These tests require browser APIs not available in Node.js:
+
+- `video-frame-serialization.any.js` - MessageChannel transfer
+- `audio-data-serialization.any.js` - MessageChannel transfer
+- `chunk-serialization.any.js` - Serialization
+- `videoFrame-texImage.any.js` - WebGL textures
+- `videoFrame-createImageBitmap.any.js` - ImageBitmap
+- `videoFrame-drawImage.any.js` - Canvas drawing
+- `*.crossOriginIsolated.*` - COOP/COEP tests
+- `*.crossAgentCluster.*` - Cross-agent tests
+- `idlharness.https.any.js` - WebIDL validation
+
+### Orientation Tests (Feature Not Implemented)
+
+VideoFrame `rotation` and `flip` properties are not implemented:
+
+- `videoFrame-orientation.any.js`
+- `video-encoder-orientation.https.any.js`
+- `videoDecoder-codec-specific-orientation.https.any.js`
+
+### Other Missing Tests
+
+- `per-frame-qp-encoding.https.any.js` - Per-frame quantizer options
+- `transfering.https.any.js` - Transfer ownership (partially applicable)
+- `video-encoder-content-hint.https.any.js` - Content hints
+
+---
+
+## Known Implementation Gaps
+
+### High Bit-Depth Pixel Formats
+
+The following formats are defined in WebCodecs spec but not mapped to FFmpeg:
+
+| Format     | Bit Depth      | Status                 |
+| ---------- | -------------- | ---------------------- |
+| `I420P10`  | 10-bit         | Not implemented        |
+| `I422P10`  | 10-bit         | Not implemented        |
+| `I444P10`  | 10-bit         | Not implemented        |
+| `I420P12`  | 12-bit         | Not implemented        |
+| `I422P12`  | 12-bit         | Not implemented        |
+| `I444P12`  | 12-bit         | Not implemented        |
+| `I420AP10` | 10-bit + alpha | Not implemented        |
+| `I422AP10` | 10-bit + alpha | Not implemented        |
+| `I444AP10` | 10-bit + alpha | Not implemented        |
+| `I420AP12` | 12-bit + alpha | Not in spec enum       |
+| `I422AP12` | 12-bit + alpha | Not in spec enum       |
+| `I444AP12` | 12-bit + alpha | Not in spec enum       |
+| `I422A`    | 8-bit + alpha  | Plane extraction issue |
+| `I444A`    | 8-bit + alpha  | Plane extraction issue |
+
+### Temporal SVC
+
+- `scalabilityMode` parameter is parsed but layer metadata is not extracted
+- `metadata.svc.temporalLayerId` always returns `None`
+
+### VideoFrame Orientation
+
+- `rotation` property not implemented
+- `flip` property not implemented
+- Related tests skipped
+
+---
+
+## Running Tests
+
+```bash
+# Run all WPT tests
+pnpm test --match='*wpt*'
+
+# Run specific test file
+npx ava __test__/wpt/video-frame-wpt.spec.ts --verbose
+
+# Run tests matching pattern
+npx ava __test__/wpt/*.spec.ts --match='*VideoEncoder*'
+```
+
+---
+
+## Contributing
+
+When adding new WPT ports:
+
+1. Follow the existing naming convention: `{feature}-wpt.spec.ts` or `{feature}-{aspect}.spec.ts`
+2. Use `test.skip()` for tests that require unimplemented features
+3. Add appropriate comments explaining why tests are skipped
+4. Update this README with the new test status

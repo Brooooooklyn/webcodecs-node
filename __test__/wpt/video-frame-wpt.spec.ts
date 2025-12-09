@@ -959,3 +959,417 @@ test('VideoFrame: numberOfPlanes NV12', (t) => {
 
   frame.close()
 })
+
+// ============================================================================
+// High Bit-Depth Pixel Format Tests (WPT)
+// These formats use 2 bytes per sample instead of 1
+// ============================================================================
+
+/**
+ * Calculate buffer size for YUV formats with given bits per sample
+ */
+function calculateYuvSize(
+  width: number,
+  height: number,
+  subsampleX: number, // 2 for 4:2:0/4:2:2, 1 for 4:4:4
+  subsampleY: number, // 2 for 4:2:0, 1 for 4:2:2/4:4:4
+  bytesPerSample: number,
+  hasAlpha: boolean,
+): number {
+  const ySize = width * height * bytesPerSample
+  const uvWidth = Math.ceil(width / subsampleX)
+  const uvHeight = Math.ceil(height / subsampleY)
+  const uvSize = uvWidth * uvHeight * bytesPerSample * 2
+  const aSize = hasAlpha ? width * height * bytesPerSample : 0
+  return ySize + uvSize + aSize
+}
+
+// ============================================================================
+// High Bit-Depth Format Tests
+// SKIP: These formats are defined in WebCodecs spec but not implemented in FFmpeg mapping.
+// See: src/webcodecs/video_frame.rs - format_to_pixel_format() doesn't map high bit-depth formats
+// ============================================================================
+
+// 10-bit formats (2 bytes per sample)
+
+test.skip('VideoFrame: construction from I420P10 buffer', (t) => {
+  const width = 4
+  const height = 2
+  const size = calculateYuvSize(width, height, 2, 2, 2, false)
+  const data = new Uint8Array(size)
+
+  const frame = new VideoFrame(data, {
+    format: 'I420P10',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 1234,
+  })
+
+  t.is(frame.format, 'I420P10')
+  t.is(frame.codedWidth, width)
+  t.is(frame.codedHeight, height)
+  t.is(frame.timestamp, 1234)
+
+  frame.close()
+})
+
+test.skip('VideoFrame: construction from I422P10 buffer', (t) => {
+  const width = 4
+  const height = 2
+  const size = calculateYuvSize(width, height, 2, 1, 2, false)
+  const data = new Uint8Array(size)
+
+  const frame = new VideoFrame(data, {
+    format: 'I422P10',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 1234,
+  })
+
+  t.is(frame.format, 'I422P10')
+  frame.close()
+})
+
+test.skip('VideoFrame: construction from I444P10 buffer', (t) => {
+  const width = 4
+  const height = 2
+  const size = calculateYuvSize(width, height, 1, 1, 2, false)
+  const data = new Uint8Array(size)
+
+  const frame = new VideoFrame(data, {
+    format: 'I444P10',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 1234,
+  })
+
+  t.is(frame.format, 'I444P10')
+  frame.close()
+})
+
+// 12-bit formats (2 bytes per sample)
+
+test.skip('VideoFrame: construction from I420P12 buffer', (t) => {
+  const width = 4
+  const height = 2
+  const size = calculateYuvSize(width, height, 2, 2, 2, false)
+  const data = new Uint8Array(size)
+
+  const frame = new VideoFrame(data, {
+    format: 'I420P12',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 1234,
+  })
+
+  t.is(frame.format, 'I420P12')
+  frame.close()
+})
+
+test.skip('VideoFrame: construction from I422P12 buffer', (t) => {
+  const width = 4
+  const height = 2
+  const size = calculateYuvSize(width, height, 2, 1, 2, false)
+  const data = new Uint8Array(size)
+
+  const frame = new VideoFrame(data, {
+    format: 'I422P12',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 1234,
+  })
+
+  t.is(frame.format, 'I422P12')
+  frame.close()
+})
+
+test.skip('VideoFrame: construction from I444P12 buffer', (t) => {
+  const width = 4
+  const height = 2
+  const size = calculateYuvSize(width, height, 1, 1, 2, false)
+  const data = new Uint8Array(size)
+
+  const frame = new VideoFrame(data, {
+    format: 'I444P12',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 1234,
+  })
+
+  t.is(frame.format, 'I444P12')
+  frame.close()
+})
+
+// 8-bit alpha variants
+
+test.skip('VideoFrame: construction from I422A buffer', (t) => {
+  const width = 4
+  const height = 2
+  // I422A: Y (w*h) + U (w/2*h) + V (w/2*h) + A (w*h)
+  const ySize = width * height
+  const uvSize = (width / 2) * height * 2
+  const aSize = width * height
+  const data = new Uint8Array(ySize + uvSize + aSize)
+
+  const frame = new VideoFrame(data, {
+    format: 'I422A',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 1234,
+  })
+
+  t.is(frame.format, 'I422A')
+  t.is(frame.numberOfPlanes, 4) // Y, U, V, A
+  frame.close()
+})
+
+test.skip('VideoFrame: construction from I444A buffer', (t) => {
+  const width = 4
+  const height = 2
+  // I444A: Y (w*h) + U (w*h) + V (w*h) + A (w*h)
+  const size = width * height * 4
+  const data = new Uint8Array(size)
+
+  const frame = new VideoFrame(data, {
+    format: 'I444A',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 1234,
+  })
+
+  t.is(frame.format, 'I444A')
+  t.is(frame.numberOfPlanes, 4) // Y, U, V, A
+  frame.close()
+})
+
+// 10-bit alpha variants
+
+test.skip('VideoFrame: construction from I420AP10 buffer', (t) => {
+  const width = 4
+  const height = 2
+  const size = calculateYuvSize(width, height, 2, 2, 2, true)
+  const data = new Uint8Array(size)
+
+  const frame = new VideoFrame(data, {
+    format: 'I420AP10',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 1234,
+  })
+
+  t.is(frame.format, 'I420AP10')
+  t.is(frame.numberOfPlanes, 4) // Y, U, V, A
+  frame.close()
+})
+
+test.skip('VideoFrame: construction from I422AP10 buffer', (t) => {
+  const width = 4
+  const height = 2
+  const size = calculateYuvSize(width, height, 2, 1, 2, true)
+  const data = new Uint8Array(size)
+
+  const frame = new VideoFrame(data, {
+    format: 'I422AP10',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 1234,
+  })
+
+  t.is(frame.format, 'I422AP10')
+  t.is(frame.numberOfPlanes, 4)
+  frame.close()
+})
+
+test.skip('VideoFrame: construction from I444AP10 buffer', (t) => {
+  const width = 4
+  const height = 2
+  const size = calculateYuvSize(width, height, 1, 1, 2, true)
+  const data = new Uint8Array(size)
+
+  const frame = new VideoFrame(data, {
+    format: 'I444AP10',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 1234,
+  })
+
+  t.is(frame.format, 'I444AP10')
+  t.is(frame.numberOfPlanes, 4)
+  frame.close()
+})
+
+// ============================================================================
+// High Bit-Depth copyTo Tests
+// ============================================================================
+
+test.skip('VideoFrame: copyTo I420P10', async (t) => {
+  const width = 4
+  const height = 2
+  const size = calculateYuvSize(width, height, 2, 2, 2, false)
+  const sourceData = new Uint8Array(size)
+
+  // Fill with test pattern
+  for (let i = 0; i < sourceData.length; i++) {
+    sourceData[i] = i % 256
+  }
+
+  const frame = new VideoFrame(sourceData, {
+    format: 'I420P10',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+  })
+
+  const allocSize = frame.allocationSize()
+  t.true(allocSize > 0, 'allocation size should be positive')
+
+  const dest = new Uint8Array(allocSize)
+  const layout = await frame.copyTo(dest)
+
+  t.true(layout.length >= 3, 'should have at least 3 planes (Y, U, V)')
+
+  frame.close()
+})
+
+test.skip('VideoFrame: copyTo I444P10', async (t) => {
+  const width = 4
+  const height = 2
+  const size = calculateYuvSize(width, height, 1, 1, 2, false)
+  const sourceData = new Uint8Array(size)
+
+  for (let i = 0; i < sourceData.length; i++) {
+    sourceData[i] = i % 256
+  }
+
+  const frame = new VideoFrame(sourceData, {
+    format: 'I444P10',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+  })
+
+  const dest = new Uint8Array(frame.allocationSize())
+  await frame.copyTo(dest)
+
+  t.deepEqual(Array.from(dest), Array.from(sourceData))
+
+  frame.close()
+})
+
+test.skip('VideoFrame: copyTo I420AP10 with alpha', async (t) => {
+  const width = 4
+  const height = 2
+  const size = calculateYuvSize(width, height, 2, 2, 2, true)
+  const sourceData = new Uint8Array(size)
+
+  for (let i = 0; i < sourceData.length; i++) {
+    sourceData[i] = i % 256
+  }
+
+  const frame = new VideoFrame(sourceData, {
+    format: 'I420AP10',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+  })
+
+  const dest = new Uint8Array(frame.allocationSize())
+  const layout = await frame.copyTo(dest)
+
+  t.is(layout.length, 4, 'should have 4 planes (Y, U, V, A)')
+
+  frame.close()
+})
+
+// ============================================================================
+// High Bit-Depth allocationSize Tests
+// ============================================================================
+
+test.skip('VideoFrame: allocationSize I420P10', (t) => {
+  const width = 4
+  const height = 2
+  const expectedSize = calculateYuvSize(width, height, 2, 2, 2, false)
+  const data = new Uint8Array(expectedSize)
+
+  const frame = new VideoFrame(data, {
+    format: 'I420P10',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+  })
+
+  t.is(frame.allocationSize(), expectedSize)
+
+  frame.close()
+})
+
+test.skip('VideoFrame: allocationSize I444AP10', (t) => {
+  const width = 4
+  const height = 2
+  const expectedSize = calculateYuvSize(width, height, 1, 1, 2, true)
+  const data = new Uint8Array(expectedSize)
+
+  const frame = new VideoFrame(data, {
+    format: 'I444AP10',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+  })
+
+  t.is(frame.allocationSize(), expectedSize)
+
+  frame.close()
+})
+
+// ============================================================================
+// High Bit-Depth ColorSpace Tests
+// ============================================================================
+
+test.skip('VideoFrame: I420P10 default colorSpace', (t) => {
+  const width = 4
+  const height = 2
+  const size = calculateYuvSize(width, height, 2, 2, 2, false)
+  const data = new Uint8Array(size)
+
+  const frame = new VideoFrame(data, {
+    format: 'I420P10',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+  })
+
+  // 10-bit YUV should have BT.709 color space by default
+  t.is(frame.colorSpace.primaries, 'bt709')
+  t.is(frame.colorSpace.transfer, 'bt709')
+  t.is(frame.colorSpace.matrix, 'bt709')
+  t.is(frame.colorSpace.fullRange, false)
+
+  frame.close()
+})
+
+test.skip('VideoFrame: I420P10 explicit BT.2020 colorSpace', (t) => {
+  const width = 4
+  const height = 2
+  const size = calculateYuvSize(width, height, 2, 2, 2, false)
+  const data = new Uint8Array(size)
+
+  const frame = new VideoFrame(data, {
+    format: 'I420P10',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+    colorSpace: {
+      primaries: 'bt2020',
+      transfer: 'pq',
+      matrix: 'bt2020-ncl',
+      fullRange: false,
+    },
+  })
+
+  t.is(frame.colorSpace.primaries, 'bt2020')
+  t.is(frame.colorSpace.transfer, 'pq')
+  t.is(frame.colorSpace.matrix, 'bt2020-ncl')
+  t.is(frame.colorSpace.fullRange, false)
+
+  frame.close()
+})
