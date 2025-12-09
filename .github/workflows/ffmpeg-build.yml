@@ -224,29 +224,37 @@ jobs:
       - name: Build FFmpeg with MSVC toolchain
         shell: msys2 {0}
         run: |
-          # Convert Windows paths to MSYS paths using cygpath
+          # Convert paths to Windows mixed-style (D:/a/...) for MSVC compatibility
+          # Use cygpath -m for Windows-style paths that work with both MSYS2 tools and MSVC
+          VCPKG_ROOT_WIN=$(cygpath -m "$VCPKG_ROOT")
+          VCPKG_INSTALLED="$VCPKG_ROOT_WIN/installed/x64-windows-static"
+          RAV1E_DIR=$(cygpath -m "$(pwd)/rav1e-dist")
+          PREFIX=$(cygpath -m "$(pwd)/ffmpeg-x86_64-pc-windows-msvc")
+
+          # MSYS-style paths for shell operations
           VCPKG_ROOT_MSYS=$(cygpath "$VCPKG_ROOT")
-          VCPKG_INSTALLED="$VCPKG_ROOT_MSYS/installed/x64-windows-static"
-          RAV1E_DIR=$(cygpath "$(pwd)/rav1e-dist")
-          PREFIX=$(cygpath "$(pwd)/ffmpeg-x86_64-pc-windows-msvc")
+          VCPKG_INSTALLED_MSYS="$VCPKG_ROOT_MSYS/installed/x64-windows-static"
+          RAV1E_DIR_MSYS=$(cygpath "$(pwd)/rav1e-dist")
 
           # Create pkg-config directory
-          PKGCONFIG_DIR=$(pwd)/pkgconfig
-          mkdir -p "$PKGCONFIG_DIR"
+          PKGCONFIG_DIR=$(cygpath -m "$(pwd)/pkgconfig")
+          PKGCONFIG_DIR_MSYS=$(pwd)/pkgconfig
+          mkdir -p "$PKGCONFIG_DIR_MSYS"
 
           echo "=== Path debug ==="
-          echo "VCPKG_INSTALLED: $VCPKG_INSTALLED"
-          echo "RAV1E_DIR: $RAV1E_DIR"
-          echo "PKGCONFIG_DIR: $PKGCONFIG_DIR"
+          echo "VCPKG_INSTALLED (Windows): $VCPKG_INSTALLED"
+          echo "VCPKG_INSTALLED (MSYS): $VCPKG_INSTALLED_MSYS"
+          echo "RAV1E_DIR (Windows): $RAV1E_DIR"
+          echo "PKGCONFIG_DIR (Windows): $PKGCONFIG_DIR"
 
           # List actual library files to verify names
           echo "=== vcpkg lib files ==="
-          ls -la "$VCPKG_INSTALLED/lib/"*.lib 2>/dev/null | head -30 || echo "No .lib files found"
+          ls -la "$VCPKG_INSTALLED_MSYS/lib/"*.lib 2>/dev/null | head -30 || echo "No .lib files found"
 
           echo "=== rav1e lib files ==="
-          ls -la "$RAV1E_DIR/lib/"* 2>/dev/null || echo "No rav1e lib files found"
+          ls -la "$RAV1E_DIR_MSYS/lib/"* 2>/dev/null || echo "No rav1e lib files found"
 
-          # Create pkg-config files with MSYS-style paths
+          # Create pkg-config files with Windows-style paths for MSVC
           # Using printf to avoid heredoc indentation issues in YAML
 
           # Helper function to create pkg-config files
@@ -267,52 +275,52 @@ jobs:
             } > "$file"
           }
 
-          # rav1e
-          create_pc "$PKGCONFIG_DIR/rav1e.pc" "$RAV1E_DIR" "rav1e" "rav1e AV1 encoder" "0.8.1" \
+          # rav1e (Windows paths for MSVC)
+          create_pc "$PKGCONFIG_DIR_MSYS/rav1e.pc" "$RAV1E_DIR" "rav1e" "rav1e AV1 encoder" "0.8.1" \
             '-L${libdir} -lrav1e' '-I${includedir}/rav1e' "-lws2_32 -luserenv -lntdll -lbcrypt"
 
           # x264 (vcpkg names it libx264.lib)
-          create_pc "$PKGCONFIG_DIR/x264.pc" "$VCPKG_INSTALLED" "x264" "x264 H.264 encoder" "0.164" \
+          create_pc "$PKGCONFIG_DIR_MSYS/x264.pc" "$VCPKG_INSTALLED" "x264" "x264 H.264 encoder" "0.164" \
             '-L${libdir} -llibx264' '-I${includedir}'
 
           # x265
-          create_pc "$PKGCONFIG_DIR/x265.pc" "$VCPKG_INSTALLED" "x265" "x265 HEVC encoder" "3.5" \
+          create_pc "$PKGCONFIG_DIR_MSYS/x265.pc" "$VCPKG_INSTALLED" "x265" "x265 HEVC encoder" "3.5" \
             '-L${libdir} -lx265-static' '-I${includedir}'
 
           # vpx
-          create_pc "$PKGCONFIG_DIR/vpx.pc" "$VCPKG_INSTALLED" "vpx" "WebM VP8/VP9 codec" "1.13.0" \
+          create_pc "$PKGCONFIG_DIR_MSYS/vpx.pc" "$VCPKG_INSTALLED" "vpx" "WebM VP8/VP9 codec" "1.13.0" \
             '-L${libdir} -lvpx' '-I${includedir}'
 
           # opus
-          create_pc "$PKGCONFIG_DIR/opus.pc" "$VCPKG_INSTALLED" "opus" "Opus audio codec" "1.4" \
+          create_pc "$PKGCONFIG_DIR_MSYS/opus.pc" "$VCPKG_INSTALLED" "opus" "Opus audio codec" "1.4" \
             '-L${libdir} -lopus' '-I${includedir}/opus'
 
           # libmp3lame (vcpkg names it libmp3lame-static.lib)
-          create_pc "$PKGCONFIG_DIR/libmp3lame.pc" "$VCPKG_INSTALLED" "libmp3lame" "LAME MP3 encoder" "3.100" \
+          create_pc "$PKGCONFIG_DIR_MSYS/libmp3lame.pc" "$VCPKG_INSTALLED" "libmp3lame" "LAME MP3 encoder" "3.100" \
             '-L${libdir} -llibmp3lame-static' '-I${includedir}'
 
           # vorbis
-          create_pc "$PKGCONFIG_DIR/vorbis.pc" "$VCPKG_INSTALLED" "vorbis" "Vorbis audio codec" "1.3.7" \
+          create_pc "$PKGCONFIG_DIR_MSYS/vorbis.pc" "$VCPKG_INSTALLED" "vorbis" "Vorbis audio codec" "1.3.7" \
             '-L${libdir} -lvorbis -logg' '-I${includedir}'
 
           # vorbisenc
-          create_pc "$PKGCONFIG_DIR/vorbisenc.pc" "$VCPKG_INSTALLED" "vorbisenc" "Vorbis encoder" "1.3.7" \
+          create_pc "$PKGCONFIG_DIR_MSYS/vorbisenc.pc" "$VCPKG_INSTALLED" "vorbisenc" "Vorbis encoder" "1.3.7" \
             '-L${libdir} -lvorbisenc' '-I${includedir}' "" "vorbis"
 
           # libwebp (vcpkg names it libwebp.lib, libsharpyuv.lib)
-          create_pc "$PKGCONFIG_DIR/libwebp.pc" "$VCPKG_INSTALLED" "libwebp" "WebP image codec" "1.3.2" \
+          create_pc "$PKGCONFIG_DIR_MSYS/libwebp.pc" "$VCPKG_INSTALLED" "libwebp" "WebP image codec" "1.3.2" \
             '-L${libdir} -llibwebp -llibsharpyuv' '-I${includedir}'
 
           # zlib
-          create_pc "$PKGCONFIG_DIR/zlib.pc" "$VCPKG_INSTALLED" "zlib" "zlib compression library" "1.3" \
+          create_pc "$PKGCONFIG_DIR_MSYS/zlib.pc" "$VCPKG_INSTALLED" "zlib" "zlib compression library" "1.3" \
             '-L${libdir} -lzlib' '-I${includedir}'
 
-          # Set up pkg-config path
-          export PKG_CONFIG_PATH="$PKGCONFIG_DIR"
+          # Set up pkg-config path (use MSYS path for pkg-config tool)
+          export PKG_CONFIG_PATH="$PKGCONFIG_DIR_MSYS"
 
           # Debug: show pkg-config file content and test
           echo "=== libmp3lame.pc content ==="
-          cat "$PKGCONFIG_DIR/libmp3lame.pc"
+          cat "$PKGCONFIG_DIR_MSYS/libmp3lame.pc"
           echo ""
           echo "=== Testing pkg-config ==="
           pkg-config --exists x264 && echo "x264: found" || echo "x264: not found"
