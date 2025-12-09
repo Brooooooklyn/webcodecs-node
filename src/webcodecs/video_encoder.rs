@@ -1571,14 +1571,14 @@ impl VideoEncoder {
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
       if inner.state == CodecState::Closed {
-        // Return immediately rejected promise
+        // Return rejected promise via async to allow error callback to run first
         return env
           .spawn_future_with_callback(async move { Ok(()) }, move |_env, _| -> Result<()> {
             Err(invalid_state_error("Cannot flush a closed codec"))
           });
       }
       if inner.state == CodecState::Unconfigured {
-        // Return immediately rejected promise
+        // Return rejected promise via async to allow error callback to run first
         return env.spawn_future_with_callback(
           async move { Ok(()) },
           move |_env, _| -> Result<()> {

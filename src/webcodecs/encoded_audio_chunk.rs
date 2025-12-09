@@ -243,7 +243,7 @@ impl EncodedAudioChunk {
           // It's a TypedArray or DataView - get its underlying buffer info
           let byte_length: u32 = typed_array.get("byteLength").ok().flatten().unwrap_or(0);
           let byte_offset: u32 = typed_array.get("byteOffset").ok().flatten().unwrap_or(0);
-          let buffer: ArrayBuffer = typed_array
+          let mut buffer: ArrayBuffer = typed_array
             .get("buffer")?
             .ok_or_else(|| Error::new(Status::InvalidArg, "Invalid BufferSource"))?;
           if (byte_length as usize) < inner.data.len() {
@@ -258,11 +258,10 @@ impl EncodedAudioChunk {
             return Ok(());
           }
 
-          // Copy data to the view's portion of the buffer
-          let dest_ptr = unsafe { buffer.as_ptr().add(byte_offset as usize) as *mut u8 };
-          unsafe {
-            std::ptr::copy_nonoverlapping(inner.data.as_ptr(), dest_ptr, inner.data.len());
-          }
+          // Copy data to the view's portion of the buffer using slice-based access
+          let dest_slice = unsafe { buffer.as_mut() };
+          let offset = byte_offset as usize;
+          dest_slice[offset..offset + inner.data.len()].copy_from_slice(&inner.data);
         } else {
           // It's likely an ArrayBuffer directly
           let byte_length: Option<u32> = typed_array.get("byteLength").ok().flatten();
@@ -279,12 +278,10 @@ impl EncodedAudioChunk {
               return Ok(());
             }
 
-            // Get the ArrayBuffer data pointer
-            let array_buffer = ArrayBuffer::from_unknown(destination)?;
-            let dest_ptr = array_buffer.as_ptr() as *mut u8;
-            unsafe {
-              std::ptr::copy_nonoverlapping(inner.data.as_ptr(), dest_ptr, inner.data.len());
-            }
+            // Get the ArrayBuffer and use slice-based access
+            let mut array_buffer = ArrayBuffer::from_unknown(destination)?;
+            let dest_slice = unsafe { array_buffer.as_mut() };
+            dest_slice[..inner.data.len()].copy_from_slice(&inner.data);
           } else {
             return Err(Error::new(Status::InvalidArg, "Invalid BufferSource"));
           }

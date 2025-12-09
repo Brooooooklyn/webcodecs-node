@@ -1035,14 +1035,14 @@ impl VideoDecoder {
         } else {
           "InvalidStateError: Cannot flush a closed codec"
         };
-        // Return immediately rejected promise
+        // Return rejected promise via async to allow error callback to run first
         return env
           .spawn_future_with_callback(async move { Ok(()) }, move |_env, _| -> Result<()> {
             Err(Error::new(Status::GenericFailure, error_msg))
           });
       }
       if inner.state == CodecState::Unconfigured {
-        // Return immediately rejected promise
+        // Return rejected promise via async to allow error callback to run first
         return env.spawn_future_with_callback(
           async move { Ok(()) },
           move |_env, _| -> Result<()> {
