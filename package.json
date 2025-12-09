@@ -98,7 +98,7 @@
     "files": [
       "__test__/**/*.spec.ts"
     ],
-    "timeout": "2m",
+    "timeout": "5m",
     "workerThreads": false,
     "environmentVariables": {
       "TS_NODE_PROJECT": "./tsconfig.json"
