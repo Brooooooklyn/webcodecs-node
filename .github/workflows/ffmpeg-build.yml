@@ -271,9 +271,9 @@ jobs:
           create_pc "$PKGCONFIG_DIR/rav1e.pc" "$RAV1E_DIR" "rav1e" "rav1e AV1 encoder" "0.8.1" \
             '-L${libdir} -lrav1e' '-I${includedir}/rav1e' "-lws2_32 -luserenv -lntdll -lbcrypt"
 
-          # x264
+          # x264 (vcpkg names it libx264.lib)
           create_pc "$PKGCONFIG_DIR/x264.pc" "$VCPKG_INSTALLED" "x264" "x264 H.264 encoder" "0.164" \
-            '-L${libdir} -lx264' '-I${includedir}'
+            '-L${libdir} -llibx264' '-I${includedir}'
 
           # x265
           create_pc "$PKGCONFIG_DIR/x265.pc" "$VCPKG_INSTALLED" "x265" "x265 HEVC encoder" "3.5" \
@@ -287,9 +287,9 @@ jobs:
           create_pc "$PKGCONFIG_DIR/opus.pc" "$VCPKG_INSTALLED" "opus" "Opus audio codec" "1.4" \
             '-L${libdir} -lopus' '-I${includedir}/opus'
 
-          # libmp3lame
+          # libmp3lame (vcpkg names it libmp3lame-static.lib)
           create_pc "$PKGCONFIG_DIR/libmp3lame.pc" "$VCPKG_INSTALLED" "libmp3lame" "LAME MP3 encoder" "3.100" \
-            '-L${libdir} -lmp3lame' '-I${includedir}'
+            '-L${libdir} -llibmp3lame-static' '-I${includedir}'
 
           # vorbis
           create_pc "$PKGCONFIG_DIR/vorbis.pc" "$VCPKG_INSTALLED" "vorbis" "Vorbis audio codec" "1.3.7" \
@@ -299,9 +299,9 @@ jobs:
           create_pc "$PKGCONFIG_DIR/vorbisenc.pc" "$VCPKG_INSTALLED" "vorbisenc" "Vorbis encoder" "1.3.7" \
             '-L${libdir} -lvorbisenc' '-I${includedir}' "" "vorbis"
 
-          # libwebp
+          # libwebp (vcpkg names it libwebp.lib, libsharpyuv.lib)
           create_pc "$PKGCONFIG_DIR/libwebp.pc" "$VCPKG_INSTALLED" "libwebp" "WebP image codec" "1.3.2" \
-            '-L${libdir} -lwebp -lsharpyuv' '-I${includedir}'
+            '-L${libdir} -llibwebp -llibsharpyuv' '-I${includedir}'
 
           # zlib
           create_pc "$PKGCONFIG_DIR/zlib.pc" "$VCPKG_INSTALLED" "zlib" "zlib compression library" "1.3" \
