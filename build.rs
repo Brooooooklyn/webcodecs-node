@@ -385,17 +385,29 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
     }
   }
 
+  // Get target architecture for platform-specific library selection
+  let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+  let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+
   // Codec libraries - order matters for linking
   // Required libraries first, then optional
-  let codec_libs = [
+  //
+  // Note: On Windows x64 MSVC, we use rav1e instead of libaom for AV1 encoding
+  // because libaom crashes with CVE-2025-8879 related issues on MSVC.
+  // See: https://github.com/aspect-build/rules_js/issues/2376
+  let is_windows_msvc_x64 =
+    target_os == "windows" && target_arch == "x86_64" && target_env == "msvc";
+
+  let codec_libs: Vec<(&str, bool)> = vec![
     // Core video codec libraries (required)
     ("x264", true), // H.264
     ("x265", true), // H.265/HEVC
     ("vpx", true),  // VP8/VP9
-    ("aom", true),  // AV1
+    // AV1: Use rav1e on Windows x64 MSVC (libaom crashes), aom elsewhere
+    ("aom", !is_windows_msvc_x64),   // AV1 (required except on Windows x64 MSVC)
+    ("rav1e", is_windows_msvc_x64),  // AV1 encoder (required on Windows x64 MSVC)
     // Optional codec libraries
     ("dav1d", false),     // AV1 decoder
-    ("rav1e", false),     // AV1 encoder (Rust-based)
     ("SvtAv1Enc", false), // SVT-AV1 encoder
     ("xvidcore", false),  // Xvid MPEG-4
     // Image format libraries
@@ -453,7 +465,6 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
   // libaom uses Highway SIMD library which generates f16 conversion code on ARM NEON.
   // On ARMv7, these conversions require __gnu_f2h_ieee from libgcc.
   // Static linker is order-sensitive: libgcc must appear BEFORE libaom.
-  let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
   if target_arch == "arm" && target_os == "linux" {
     let cc = env::var("CC").unwrap_or_else(|_| "gcc".to_string());
     if let Ok(output) = Command::new(&cc).arg("-print-libgcc-file-name").output() {
