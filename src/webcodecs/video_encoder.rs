@@ -623,45 +623,45 @@ impl VideoEncoder {
               if let Some(ctx) = guard.context.as_mut()
                 && let Ok(pkts) = ctx.encode(Some(&frame_to_reencode))
               {
-                  for packet in pkts {
-                    // Use buffered_ts (the original input timestamp) instead of packet.pts()
-                    let chunk = EncodedVideoChunk::from_packet(&packet, Some(buffered_ts));
-                    let metadata = if !guard.extradata_sent && packet.is_key() {
-                      guard.extradata_sent = true;
-                      EncodedVideoChunkMetadata {
-                        decoder_config: Some(VideoDecoderConfigOutput {
-                          codec: codec_string.clone(),
-                          coded_width: Some(width),
-                          coded_height: Some(height),
-                          description: guard
-                            .context
-                            .as_ref()
-                            .and_then(|ctx| ctx.extradata().map(|d| Uint8Array::from(d.to_vec()))),
-                          display_aspect_width: display_width,
-                          display_aspect_height: display_height,
-                        }),
-                        svc: None,
-                        alpha_side_data: None,
-                      }
-                    } else {
-                      EncodedVideoChunkMetadata {
-                        decoder_config: None,
-                        svc: None,
-                        alpha_side_data: None,
-                      }
-                    };
-                    // During flush, queue chunks for synchronous delivery in resolver
-                    // Otherwise, use NonBlocking callback for immediate delivery
-                    if guard.inside_flush {
-                      guard.pending_chunks.push((chunk, metadata));
-                    } else {
-                      guard.output_callback.call(
-                        (chunk, metadata).into(),
-                        ThreadsafeFunctionCallMode::NonBlocking,
-                      );
+                for packet in pkts {
+                  // Use buffered_ts (the original input timestamp) instead of packet.pts()
+                  let chunk = EncodedVideoChunk::from_packet(&packet, Some(buffered_ts));
+                  let metadata = if !guard.extradata_sent && packet.is_key() {
+                    guard.extradata_sent = true;
+                    EncodedVideoChunkMetadata {
+                      decoder_config: Some(VideoDecoderConfigOutput {
+                        codec: codec_string.clone(),
+                        coded_width: Some(width),
+                        coded_height: Some(height),
+                        description: guard
+                          .context
+                          .as_ref()
+                          .and_then(|ctx| ctx.extradata().map(|d| Uint8Array::from(d.to_vec()))),
+                        display_aspect_width: display_width,
+                        display_aspect_height: display_height,
+                      }),
+                      svc: None,
+                      alpha_side_data: None,
                     }
-                    guard.first_output_produced = true;
+                  } else {
+                    EncodedVideoChunkMetadata {
+                      decoder_config: None,
+                      svc: None,
+                      alpha_side_data: None,
+                    }
+                  };
+                  // During flush, queue chunks for synchronous delivery in resolver
+                  // Otherwise, use NonBlocking callback for immediate delivery
+                  if guard.inside_flush {
+                    guard.pending_chunks.push((chunk, metadata));
+                  } else {
+                    guard.output_callback.call(
+                      (chunk, metadata).into(),
+                      ThreadsafeFunctionCallMode::NonBlocking,
+                    );
                   }
+                  guard.first_output_produced = true;
+                }
               }
             }
             let old_size = guard.encode_queue_size;
@@ -771,45 +771,46 @@ impl VideoEncoder {
                 if let Some(ctx) = guard.context.as_mut()
                   && let Ok(pkts) = ctx.encode(Some(&frame_to_reencode))
                 {
-                    // Process any output packets from re-encoding
-                    for packet in pkts {
-                      // Use buffered_ts (the original input timestamp) instead of packet.pts()
-                      let chunk = EncodedVideoChunk::from_packet(&packet, Some(buffered_ts));
-                      let metadata = if !guard.extradata_sent && packet.is_key() {
-                        guard.extradata_sent = true;
-                        EncodedVideoChunkMetadata {
-                          decoder_config: Some(VideoDecoderConfigOutput {
-                            codec: codec_string.clone(),
-                            coded_width: Some(width),
-                            coded_height: Some(height),
-                            description: guard.context.as_ref().and_then(|ctx| {
-                              ctx.extradata().map(|d| Uint8Array::from(d.to_vec()))
-                            }),
-                            display_aspect_width: display_width,
-                            display_aspect_height: display_height,
-                          }),
-                          svc: None,
-                          alpha_side_data: None,
-                        }
-                      } else {
-                        EncodedVideoChunkMetadata {
-                          decoder_config: None,
-                          svc: None,
-                          alpha_side_data: None,
-                        }
-                      };
-                      // During flush, queue chunks for synchronous delivery in resolver
-                      // Otherwise, use NonBlocking callback for immediate delivery
-                      if guard.inside_flush {
-                        guard.pending_chunks.push((chunk, metadata));
-                      } else {
-                        guard.output_callback.call(
-                          (chunk, metadata).into(),
-                          ThreadsafeFunctionCallMode::NonBlocking,
-                        );
+                  // Process any output packets from re-encoding
+                  for packet in pkts {
+                    // Use buffered_ts (the original input timestamp) instead of packet.pts()
+                    let chunk = EncodedVideoChunk::from_packet(&packet, Some(buffered_ts));
+                    let metadata = if !guard.extradata_sent && packet.is_key() {
+                      guard.extradata_sent = true;
+                      EncodedVideoChunkMetadata {
+                        decoder_config: Some(VideoDecoderConfigOutput {
+                          codec: codec_string.clone(),
+                          coded_width: Some(width),
+                          coded_height: Some(height),
+                          description: guard
+                            .context
+                            .as_ref()
+                            .and_then(|ctx| ctx.extradata().map(|d| Uint8Array::from(d.to_vec()))),
+                          display_aspect_width: display_width,
+                          display_aspect_height: display_height,
+                        }),
+                        svc: None,
+                        alpha_side_data: None,
                       }
-                      guard.first_output_produced = true;
+                    } else {
+                      EncodedVideoChunkMetadata {
+                        decoder_config: None,
+                        svc: None,
+                        alpha_side_data: None,
+                      }
+                    };
+                    // During flush, queue chunks for synchronous delivery in resolver
+                    // Otherwise, use NonBlocking callback for immediate delivery
+                    if guard.inside_flush {
+                      guard.pending_chunks.push((chunk, metadata));
+                    } else {
+                      guard.output_callback.call(
+                        (chunk, metadata).into(),
+                        ThreadsafeFunctionCallMode::NonBlocking,
+                      );
                     }
+                    guard.first_output_produced = true;
+                  }
                 }
               }
 

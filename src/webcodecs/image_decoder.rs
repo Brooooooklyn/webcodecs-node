@@ -89,7 +89,9 @@ impl<'env> FromNapiValue for ImageDecoderInit<'env> {
     let data_napi_value: napi::sys::napi_value = {
       let mut result = std::ptr::null_mut();
       napi::check_status!(
-        unsafe { napi::sys::napi_get_named_property(env, value, c"data".as_ptr().cast(), &mut result) },
+        unsafe {
+          napi::sys::napi_get_named_property(env, value, c"data".as_ptr().cast(), &mut result)
+        },
         "Failed to get 'data' property"
       )?;
       result

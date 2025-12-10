@@ -584,38 +584,38 @@ impl AudioEncoder {
       if let Some(ref mut sample_buffer) = guard.sample_buffer
         && let Ok(Some(mut frame)) = sample_buffer.flush()
       {
-          // Set timestamp using base_timestamp
-          let frame_size = sample_buffer.frame_size() as i64;
-          let sample_rate = sample_buffer.sample_rate() as i64;
-          let base_ts = guard.base_timestamp.unwrap_or(0);
-          let frame_timestamp =
-            base_ts + (guard.frame_count as i64 * frame_size * 1_000_000) / sample_rate;
-          frame.set_pts(frame_timestamp);
+        // Set timestamp using base_timestamp
+        let frame_size = sample_buffer.frame_size() as i64;
+        let sample_rate = sample_buffer.sample_rate() as i64;
+        let base_ts = guard.base_timestamp.unwrap_or(0);
+        let frame_timestamp =
+          base_ts + (guard.frame_count as i64 * frame_size * 1_000_000) / sample_rate;
+        frame.set_pts(frame_timestamp);
 
-          // Push timestamp to queue for output correlation
-          guard.timestamp_queue.push_back(frame_timestamp);
+        // Push timestamp to queue for output correlation
+        guard.timestamp_queue.push_back(frame_timestamp);
 
-          let context = match guard.context.as_mut() {
-            Some(ctx) => ctx,
-            None => {
-              Self::report_error(&mut guard, "No encoder context");
-              return Ok(());
-            }
-          };
-
-          if let Ok(packets) = context.encode(Some(&frame)) {
-            let duration_us = (frame.nb_samples() as i64 * 1_000_000) / sample_rate;
-            for packet in packets {
-              let output_timestamp = guard.timestamp_queue.pop_front();
-              let chunk =
-                EncodedAudioChunk::from_packet(&packet, Some(duration_us), output_timestamp);
-              let metadata = EncodedAudioChunkMetadata {
-                decoder_config: None,
-              };
-              // Always queue during flush for synchronous delivery
-              guard.pending_chunks.push((chunk, metadata));
-            }
+        let context = match guard.context.as_mut() {
+          Some(ctx) => ctx,
+          None => {
+            Self::report_error(&mut guard, "No encoder context");
+            return Ok(());
           }
+        };
+
+        if let Ok(packets) = context.encode(Some(&frame)) {
+          let duration_us = (frame.nb_samples() as i64 * 1_000_000) / sample_rate;
+          for packet in packets {
+            let output_timestamp = guard.timestamp_queue.pop_front();
+            let chunk =
+              EncodedAudioChunk::from_packet(&packet, Some(duration_us), output_timestamp);
+            let metadata = EncodedAudioChunkMetadata {
+              decoder_config: None,
+            };
+            // Always queue during flush for synchronous delivery
+            guard.pending_chunks.push((chunk, metadata));
+          }
+        }
       }
 
       // Flush encoder

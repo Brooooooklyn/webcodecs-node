@@ -6,10 +6,10 @@ This directory contains tests ported from the [W3C Web Platform Tests](https://g
 
 | Status      | Count |
 | ----------- | ----- |
-| **Passing** | 497   |
+| **Passing** | 781   |
 | **Skipped** | 31    |
 | **Failing** | 0     |
-| **Total**   | 528   |
+| **Total**   | 812   |
 
 ## Test Files Overview
 

@@ -59,13 +59,14 @@ fn get_ffmpeg_dir(target_os: &str, target_arch: &str) -> PathBuf {
     if let Ok(output) = Command::new("pkg-config")
       .args(["--variable=prefix", "libavcodec"])
       .output()
-      && output.status.success() {
-        let prefix = String::from_utf8_lossy(&output.stdout);
-        let path = PathBuf::from(prefix.trim());
-        if path.exists() {
-          return path;
-        }
+      && output.status.success()
+    {
+      let prefix = String::from_utf8_lossy(&output.stdout);
+      let path = PathBuf::from(prefix.trim());
+      if path.exists() {
+        return path;
       }
+    }
   }
 
   // 3. Try common installation paths
@@ -474,13 +475,14 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
   if target_arch == "arm" && target_os == "linux" {
     let cc = env::var("CC").unwrap_or_else(|_| "gcc".to_string());
     if let Ok(output) = Command::new(&cc).arg("-print-libgcc-file-name").output()
-      && output.status.success() {
-        let libgcc_path = String::from_utf8_lossy(&output.stdout);
-        let libgcc_path = libgcc_path.trim();
-        if !libgcc_path.is_empty() && Path::new(libgcc_path).exists() {
-          println!("cargo:rustc-link-arg={}", libgcc_path);
-        }
+      && output.status.success()
+    {
+      let libgcc_path = String::from_utf8_lossy(&output.stdout);
+      let libgcc_path = libgcc_path.trim();
+      if !libgcc_path.is_empty() && Path::new(libgcc_path).exists() {
+        println!("cargo:rustc-link-arg={}", libgcc_path);
       }
+    }
   }
 
   // Link codec libraries with --whole-archive on Linux

@@ -21,8 +21,8 @@ WebCodecs API implementation for Node.js using FFmpeg, built with napi-rs (Rust 
 | ImageDecoder        | ✅ Complete | JPEG, PNG, WebP, GIF, BMP, AVIF     |
 | Threading           | ✅ Complete | Non-blocking Drop, proper lifecycle |
 | W3C Spec Compliance | ✅ Complete | All APIs aligned                    |
-| Type Definitions    | ✅ Complete | ~930 lines in index.d.ts            |
-| Test Coverage       | ✅ Complete | 282 tests, all passing              |
+| Type Definitions    | ✅ Complete | ~1,100 lines in index.d.ts          |
+| Test Coverage       | ✅ Complete | 560+ tests (33 files), all passing  |
 
 **Remaining Work:**
 
@@ -91,7 +91,10 @@ cargo clippy       # Lint Rust code
 Required static libraries:
 
 - `libavcodec.a`, `libavutil.a`, `libswscale.a`, `libswresample.a`
-- Codec libs: `libx264.a`, `libx265.a`, `libvpx.a`, `libaom.a`
+- Codec libs: `libx264.a`, `libx265.a`, `libvpx.a`
+- AV1 libs (platform-specific):
+  - **Windows x64 MSVC:** `rav1e.lib` (encoder) + `dav1d.lib` (decoder)
+  - **Other platforms:** `libaom.a` (encoder + decoder)
 
 Detection order:
 
@@ -99,6 +102,7 @@ Detection order:
 2. pkg-config
 3. Common paths (`/opt/homebrew`, `/usr/local`, etc.)
 4. Bundled in `ffmpeg/{platform}/`
+5. Auto-download from GitHub Releases (Linux/Windows CI builds)
 
 ## Implemented WebCodecs API
 
@@ -159,7 +163,7 @@ Detection order:
 | `src/codec/context.rs`           | FFmpeg encoder/decoder context wrapper       |
 | `src/lib.rs`                     | Module init with FFmpeg log suppression      |
 | `build.rs`                       | FFmpeg detection and static linking          |
-| `index.d.ts`                     | TypeScript type definitions (~1000 lines)    |
+| `index.d.ts`                     | TypeScript type definitions (~1,100 lines)   |
 
 ## Callback API Pattern (W3C Compliant)
 
@@ -273,11 +277,12 @@ gifDecoder.close()
 
 ## Test Structure
 
-- **16 test files** (~5600+ lines)
-- **282 tests** all passing
+- **33 test files** (~15,000+ lines)
+- **560+ tests** all passing
 - Test helpers in `__test__/helpers/` for frame/audio generation
 - Integration tests for roundtrip, lifecycle, multi-codec, performance
-- Test fixtures in `__test__/fixtures/` for ImageDecoder (PNG, GIF)
+- W3C WPT tests in `__test__/wpt/` for spec compliance verification
+- Test fixtures in `__test__/fixtures/` for ImageDecoder and WPT (video/audio samples)
 
 ## Encoder/Decoder Threading Architecture
 
@@ -382,12 +387,14 @@ src/codec/context.rs:339,362  # Set extradata if provided (non-critical)
 
 ## Known Issues
 
-### AV1 SIGSEGV (libaom)
+### AV1 libaom Issues
 
 **Location:** Native code in libaom library
-**Symptom:** Occasional segmentation fault during AV1 encoder/decoder cleanup
-**Workaround:** AV1 encoder/decoder implementations drain all frames before dropping context
-**Status:** Mitigated with drain workaround in `video_encoder.rs:755-759` and `video_decoder.rs:600-604`
+**Symptom:** Occasional segmentation fault during AV1 encoder/decoder cleanup (CVE-2025-8879)
+**Workaround:**
+- **Windows x64 MSVC:** Uses rav1e (encoder) + dav1d (decoder) instead of libaom
+- **Other platforms:** AV1 encoder/decoder implementations drain all frames before dropping context
+**Status:** Fully resolved on Windows x64; mitigated with drain workaround elsewhere (`video_encoder.rs`, `video_decoder.rs`)
 
 ## Known Limitations
 
@@ -397,7 +404,6 @@ src/codec/context.rs:339,362  # Set extradata if provided (non-critical)
 4. **Duration type** - Using i64 instead of u64 due to NAPI-RS constraints
 5. **ImageDecoder parameters** - `colorSpaceConversion`, `desiredWidth/Height`, `preferAnimation` parsed but not applied
 6. **ImageDecoder GIF animation** - FFmpeg may return only first frame; for full animation use VideoDecoder with GIF codec
-7. **ImageDecoder ReadableStream blocking** - Constructor uses `rt.block_on()` for ReadableStream data collection, which blocks the Node.js event loop during initialization. **Workaround:** Use Uint8Array data source instead of ReadableStream for large images. Location: `src/webcodecs/image_decoder.rs` lines 86-107
 
 ## NAPI-RS Limitations
 
@@ -440,9 +446,21 @@ These are fundamental limitations that cannot be resolved without upstream NAPI-
 
 ## Platform Support
 
-- macOS (x86_64, aarch64)
-- Linux (x86_64, aarch64)
-- Windows (x86_64, aarch64)
+**9 build targets** with full CI coverage:
+
+| Target                        | OS      | AV1 Encoder | AV1 Decoder |
+| ----------------------------- | ------- | ----------- | ----------- |
+| x86_64-apple-darwin           | macOS   | libaom      | libaom      |
+| aarch64-apple-darwin          | macOS   | libaom      | libaom      |
+| x86_64-pc-windows-msvc        | Windows | rav1e       | dav1d       |
+| aarch64-pc-windows-msvc       | Windows | libaom      | libaom      |
+| x86_64-unknown-linux-gnu      | Linux   | libaom      | libaom      |
+| aarch64-unknown-linux-gnu     | Linux   | libaom      | libaom      |
+| x86_64-unknown-linux-musl     | Linux   | libaom      | libaom      |
+| aarch64-unknown-linux-musl    | Linux   | libaom      | libaom      |
+| armv7-unknown-linux-gnueabihf | Linux   | libaom      | libaom      |
+
+**Note:** Windows x64 MSVC uses rav1e + dav1d due to libaom crash issues (CVE-2025-8879).
 
 ## Spec Compliance Notes
 
