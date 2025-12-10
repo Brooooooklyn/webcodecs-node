@@ -2,6 +2,15 @@ import { Bench } from 'tinybench'
 
 import { VideoEncoder, VideoFrame } from '../index.js'
 
+/**
+ * I420 format buffer size multiplier: 1.5x (width * height)
+ * - Y plane: width * height = 1.0
+ * - U plane: (width/2) * (height/2) = 0.25
+ * - V plane: (width/2) * (height/2) = 0.25
+ * - Total: 1.0 + 0.25 + 0.25 = 1.5
+ */
+const I420_SIZE_MULTIPLIER = 1.5
+
 const bench = new Bench()
 
 // Create encoder for benchmarking
@@ -24,7 +33,7 @@ bench.add('Create and configure VideoEncoder', () => {
 })
 
 bench.add('Create VideoFrame (I420)', () => {
-  const buffer = Buffer.alloc(640 * 480 * 1.5)
+  const buffer = Buffer.alloc(640 * 480 * I420_SIZE_MULTIPLIER)
   const frame = new VideoFrame(buffer, {
     format: 'I420',
     codedWidth: 640,
