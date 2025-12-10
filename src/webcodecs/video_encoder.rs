@@ -78,6 +78,10 @@ pub struct VideoDecoderConfigOutput {
   pub display_aspect_width: Option<u32>,
   /// Display aspect height (for non-square pixels)
   pub display_aspect_height: Option<u32>,
+  /// Rotation in degrees clockwise (0, 90, 180, 270) per W3C spec
+  pub rotation: Option<f64>,
+  /// Horizontal flip per W3C spec
+  pub flip: Option<bool>,
 }
 
 // ============================================================================
@@ -168,6 +172,10 @@ enum EncoderCommand {
     frame: Frame,
     timestamp: i64,
     options: Option<VideoEncoderEncodeOptions>,
+    /// Rotation from input VideoFrame (for metadata output)
+    rotation: f64,
+    /// Flip from input VideoFrame (for metadata output)
+    flip: bool,
   },
   /// Flush the encoder and send result back via response channel
   Flush(Sender<Result<()>>),
@@ -273,7 +281,8 @@ struct VideoEncoderInner {
   /// Whether first output has been produced (disables silent failure detection after)
   first_output_produced: bool,
   /// Buffered frames during silent failure detection period (for re-encoding on fallback)
-  pending_frames: Vec<(Frame, i64, Option<VideoEncoderEncodeOptions>)>,
+  /// Tuple: (Frame, timestamp, options, rotation, flip)
+  pending_frames: Vec<(Frame, i64, Option<VideoEncoderEncodeOptions>, f64, bool)>,
   /// Atomic flag for flush abort - set by reset() to signal pending flush to abort
   flush_abort_flag: Option<Arc<AtomicBool>>,
   /// Queue of encoded chunks waiting to be delivered via output callback
@@ -481,8 +490,10 @@ impl VideoEncoder {
           frame,
           timestamp,
           options,
+          rotation,
+          flip,
         } => {
-          Self::process_encode(&inner, frame, timestamp, options);
+          Self::process_encode(&inner, frame, timestamp, options, rotation, flip);
         }
         EncoderCommand::Flush(response_sender) => {
           let result = Self::process_flush(&inner);
@@ -498,6 +509,8 @@ impl VideoEncoder {
     frame: Frame,
     timestamp: i64,
     _options: Option<VideoEncoderEncodeOptions>,
+    rotation: f64,
+    flip: bool,
   ) {
     let mut guard = match inner.lock() {
       Ok(g) => g,
@@ -637,13 +650,15 @@ impl VideoEncoder {
           if let Ok(cloned) = frame_to_encode.try_clone() {
             guard
               .pending_frames
-              .push((cloned, timestamp, _options.clone()));
+              .push((cloned, timestamp, _options.clone(), rotation, flip));
           }
           let pending_frames = std::mem::take(&mut guard.pending_frames);
 
           if Self::fallback_to_software(&mut guard) {
             // Re-encode all buffered frames with software encoder
-            for (buffered_frame, buffered_ts, _buffered_opts) in pending_frames {
+            for (buffered_frame, buffered_ts, _buffered_opts, buffered_rotation, buffered_flip) in
+              pending_frames
+            {
               let mut frame_to_reencode = buffered_frame;
               frame_to_reencode.set_pts(buffered_ts);
 
@@ -666,6 +681,12 @@ impl VideoEncoder {
                           .and_then(|ctx| ctx.extradata().map(|d| Uint8Array::from(d.to_vec()))),
                         display_aspect_width: display_width,
                         display_aspect_height: display_height,
+                        rotation: if buffered_rotation != 0.0 {
+                          Some(buffered_rotation)
+                        } else {
+                          None
+                        },
+                        flip: if buffered_flip { Some(true) } else { None },
                       }),
                       svc: None,
                       alpha_side_data: None,
@@ -755,7 +776,7 @@ impl VideoEncoder {
       if let Ok(cloned_frame) = frame_to_encode.try_clone() {
         guard
           .pending_frames
-          .push((cloned_frame, timestamp, _options.clone()));
+          .push((cloned_frame, timestamp, _options.clone(), rotation, flip));
       }
       guard.silent_encode_count += 1;
 
@@ -791,7 +812,9 @@ impl VideoEncoder {
 
             if Self::fallback_to_software(&mut guard) {
               // Re-encode all buffered frames with software encoder
-              for (buffered_frame, buffered_ts, _buffered_opts) in pending_frames {
+              for (buffered_frame, buffered_ts, _buffered_opts, buffered_rotation, buffered_flip) in
+                pending_frames
+              {
                 let mut frame_to_reencode = buffered_frame;
                 frame_to_reencode.set_pts(buffered_ts);
 
@@ -815,6 +838,12 @@ impl VideoEncoder {
                             .and_then(|ctx| ctx.extradata().map(|d| Uint8Array::from(d.to_vec()))),
                           display_aspect_width: display_width,
                           display_aspect_height: display_height,
+                          rotation: if buffered_rotation != 0.0 {
+                            Some(buffered_rotation)
+                          } else {
+                            None
+                          },
+                          flip: if buffered_flip { Some(true) } else { None },
                         }),
                         svc: None,
                         alpha_side_data: None,
@@ -916,6 +945,12 @@ impl VideoEncoder {
             description: extradata.clone().map(Uint8Array::from),
             display_aspect_width: display_width,
             display_aspect_height: display_height,
+            rotation: if rotation != 0.0 {
+              Some(rotation)
+            } else {
+              None
+            },
+            flip: if flip { Some(true) } else { None },
           }),
           svc: None,
           alpha_side_data: None,
@@ -1668,7 +1703,7 @@ impl VideoEncoder {
     }
 
     // Clone frame and get timestamp on main thread (brief lock)
-    let (internal_frame, timestamp) = {
+    let (internal_frame, timestamp, rotation, flip) = {
       let mut inner = self
         .inner
         .lock()
@@ -1706,10 +1741,14 @@ impl VideoEncoder {
         }
       };
 
+      // Get rotation and flip for metadata output (W3C WebCodecs spec)
+      let rotation = frame.rotation().unwrap_or(0.0);
+      let flip = frame.flip().unwrap_or(false);
+
       // Increment queue size (pending operation)
       inner.encode_queue_size += 1;
 
-      (internal_frame, timestamp)
+      (internal_frame, timestamp, rotation, flip)
     };
 
     // Send encode command to worker thread
@@ -1719,6 +1758,8 @@ impl VideoEncoder {
           frame: internal_frame,
           timestamp,
           options,
+          rotation,
+          flip,
         })
         .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?;
     } else {

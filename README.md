@@ -256,11 +256,10 @@ The encoder automatically applies optimal settings for each hardware encoder bas
 
 ### Not Implemented
 
-| Feature                | Status | Notes                                                                |
-| ---------------------- | ------ | -------------------------------------------------------------------- |
-| VideoFrame orientation | ❌     | `rotation` and `flip` properties                                     |
-| Temporal SVC metadata  | ❌     | `scalabilityMode` parsed but `metadata.svc` not populated            |
-| ImageDecoder options   | ⚠️     | `colorSpaceConversion`, `desiredWidth/Height` parsed but not applied |
+| Feature               | Status | Notes                                                                |
+| --------------------- | ------ | -------------------------------------------------------------------- |
+| Temporal SVC metadata | ❌     | `scalabilityMode` parsed but `metadata.svc` not populated            |
+| ImageDecoder options  | ⚠️     | `colorSpaceConversion`, `desiredWidth/Height` parsed but not applied |
 
 ### Platform-Specific Notes
 

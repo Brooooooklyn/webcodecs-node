@@ -159,6 +159,14 @@ struct VideoDecoderInner {
   first_output_produced: bool,
   /// Buffered chunks during silent failure detection period (for re-decoding on fallback)
   pending_chunks: Vec<Arc<RwLock<Option<EncodedVideoChunkInner>>>>,
+
+  // ========================================================================
+  // Orientation metadata (W3C WebCodecs VideoFrame orientation)
+  // ========================================================================
+  /// Rotation in degrees from config (0, 90, 180, 270)
+  config_rotation: f64,
+  /// Horizontal flip from config
+  config_flip: bool,
 }
 
 /// Get the preferred hardware device type for the current platform
@@ -274,6 +282,9 @@ impl VideoDecoder {
       silent_decode_count: 0,
       first_output_produced: false,
       pending_chunks: Vec::new(),
+      // Orientation metadata (default: no rotation/flip)
+      config_rotation: 0.0,
+      config_flip: false,
     };
 
     let inner = Arc::new(Mutex::new(inner));
@@ -526,7 +537,13 @@ impl VideoDecoder {
         .timestamp_queue
         .pop_front()
         .unwrap_or((timestamp, duration));
-      let video_frame = VideoFrame::from_internal(frame, output_timestamp, output_duration);
+      let video_frame = VideoFrame::from_internal_with_orientation(
+        frame,
+        output_timestamp,
+        output_duration,
+        guard.config_rotation,
+        guard.config_flip,
+      );
 
       // During flush, queue frames for synchronous delivery in resolver
       // Otherwise, use NonBlocking callback for immediate delivery
@@ -636,7 +653,13 @@ impl VideoDecoder {
 
       // Deliver frames (queue during flush, NonBlocking otherwise)
       for frame in frames {
-        let video_frame = VideoFrame::from_internal(frame, timestamp, duration);
+        let video_frame = VideoFrame::from_internal_with_orientation(
+          frame,
+          timestamp,
+          duration,
+          guard.config_rotation,
+          guard.config_flip,
+        );
         if guard.inside_flush {
           guard.pending_frames.push(video_frame);
         } else {
@@ -710,7 +733,13 @@ impl VideoDecoder {
           };
           (pts, dur)
         });
-      let video_frame = VideoFrame::from_internal(frame, output_timestamp, output_duration);
+      let video_frame = VideoFrame::from_internal_with_orientation(
+        frame,
+        output_timestamp,
+        output_duration,
+        guard.config_rotation,
+        guard.config_flip,
+      );
       // Always queue during flush for synchronous delivery in resolver
       guard.pending_frames.push(video_frame);
     }
@@ -952,6 +981,10 @@ impl VideoDecoder {
     inner.silent_decode_count = 0;
     inner.first_output_produced = false;
     inner.pending_chunks.clear();
+
+    // Store orientation metadata from config (W3C WebCodecs spec)
+    inner.config_rotation = config.rotation.unwrap_or(0.0);
+    inner.config_flip = config.flip.unwrap_or(false);
 
     Ok(())
   }

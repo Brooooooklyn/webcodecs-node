@@ -518,6 +518,10 @@ pub struct VideoDecoderConfig {
   pub optimize_for_latency: Option<bool>,
   /// Codec-specific description data (e.g., avcC for H.264) - BufferSource per spec
   pub description: Option<Uint8Array>,
+  /// Rotation in degrees clockwise (0, 90, 180, 270) per W3C spec
+  pub rotation: Option<f64>,
+  /// Horizontal flip per W3C spec
+  pub flip: Option<bool>,
 }
 
 impl FromNapiValue for VideoDecoderConfig {
@@ -553,6 +557,10 @@ impl FromNapiValue for VideoDecoderConfig {
       }
     };
 
+    // Rotation and flip for VideoFrame orientation (W3C WebCodecs spec)
+    let rotation: Option<f64> = obj.get("rotation")?;
+    let flip: Option<bool> = obj.get("flip")?;
+
     Ok(VideoDecoderConfig {
       codec,
       coded_width,
@@ -563,6 +571,8 @@ impl FromNapiValue for VideoDecoderConfig {
       hardware_acceleration,
       optimize_for_latency,
       description,
+      rotation,
+      flip,
     })
   }
 }
@@ -653,6 +663,12 @@ impl ToNapiValue for VideoDecoderConfig {
     }
     if let Some(description) = val.description {
       obj.set("description", description)?;
+    }
+    if let Some(rotation) = val.rotation {
+      obj.set("rotation", rotation)?;
+    }
+    if let Some(flip) = val.flip {
+      obj.set("flip", flip)?;
     }
 
     unsafe { Object::to_napi_value(env, obj) }

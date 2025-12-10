@@ -185,6 +185,10 @@ export interface VideoDecoderConfig {
   optimizeForLatency?: boolean
   /** Codec-specific description (e.g., avcC box for H.264) */
   description?: BufferSource
+  /** Rotation in degrees clockwise (0, 90, 180, 270) - W3C WebCodecs spec */
+  rotation?: number
+  /** Horizontal flip - W3C WebCodecs spec */
+  flip?: boolean
 }
 
 // ============================================================================

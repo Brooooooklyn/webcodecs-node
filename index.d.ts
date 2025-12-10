@@ -919,6 +919,10 @@ export interface VideoDecoderConfigOutput {
   displayAspectWidth?: number
   /** Display aspect height (for non-square pixels) */
   displayAspectHeight?: number
+  /** Rotation in degrees clockwise (0, 90, 180, 270) per W3C spec */
+  rotation?: number
+  /** Horizontal flip per W3C spec */
+  flip?: boolean
 }
 
 /** Result of isConfigSupported per WebCodecs spec */

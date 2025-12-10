@@ -163,9 +163,9 @@ These tests require browser APIs not available in Node.js:
 - `*.crossAgentCluster.*` - Cross-agent tests
 - `idlharness.https.any.js` - WebIDL validation
 
-### Orientation Tests (Feature Not Implemented)
+### Orientation Tests (Pending W3C WPT Tests)
 
-VideoFrame `rotation` and `flip` properties are not implemented:
+VideoFrame `rotation` and `flip` properties are now implemented. Tests pending:
 
 - `videoFrame-orientation.any.js`
 - `video-encoder-orientation.https.any.js`
@@ -192,12 +192,6 @@ VideoFrame `rotation` and `flip` properties are not implemented:
 
 - `scalabilityMode` parameter is parsed but layer metadata is not extracted
 - `metadata.svc.temporalLayerId` always returns `None`
-
-### VideoFrame Orientation
-
-- `rotation` property not implemented
-- `flip` property not implemented
-- Related tests skipped
 
 ---
 
