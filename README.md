@@ -10,8 +10,9 @@ WebCodecs API implementation for Node.js using FFmpeg, built with [NAPI-RS](http
 - **Video encoding/decoding** - H.264, H.265, VP8, VP9, AV1
 - **Audio encoding/decoding** - AAC, Opus, MP3, FLAC, Vorbis, PCM variants
 - **Image decoding** - JPEG, PNG, WebP, GIF, BMP, AVIF
-- **Hardware acceleration** - VideoToolbox (macOS), VAAPI (Linux), Media Foundation (Windows)
+- **Hardware acceleration** - Zero-copy GPU encoding with VideoToolbox (macOS), NVENC (NVIDIA), VAAPI (Linux), QSV (Intel)
 - **Cross-platform** - macOS, Windows, Linux (glibc/musl, x64/arm64/armv7)
+- **Structured logging** - FFmpeg logs redirected to Rust `tracing` crate for easy integration
 
 ## Installation
 
@@ -42,6 +43,8 @@ encoder.configure({
   width: 1920,
   height: 1080,
   bitrate: 5_000_000,
+  hardwareAcceleration: 'prefer-hardware', // Use GPU when available
+  latencyMode: 'realtime', // Optimize for low latency
 })
 
 // Create and encode frames
@@ -148,24 +151,24 @@ decoder.close()
 
 ### Video
 
-| Codec | Codec String          | Encoding | Decoding |
-| ----- | --------------------- | -------- | -------- |
-| H.264 | `avc1.*`              | ✅       | ✅       |
-| H.265 | `hev1.*`, `hvc1.*`    | ✅       | ✅       |
-| VP8   | `vp8`                 | ✅       | ✅       |
-| VP9   | `vp09.*`              | ✅       | ✅       |
-| AV1   | `av01.*`              | ✅       | ✅       |
+| Codec | Codec String       | Encoding | Decoding |
+| ----- | ------------------ | -------- | -------- |
+| H.264 | `avc1.*`           | ✅       | ✅       |
+| H.265 | `hev1.*`, `hvc1.*` | ✅       | ✅       |
+| VP8   | `vp8`              | ✅       | ✅       |
+| VP9   | `vp09.*`           | ✅       | ✅       |
+| AV1   | `av01.*`           | ✅       | ✅       |
 
 ### Audio
 
-| Codec  | Codec String   | Encoding | Decoding |
-| ------ | -------------- | -------- | -------- |
-| AAC    | `mp4a.40.2`    | ✅       | ✅       |
-| Opus   | `opus`         | ✅       | ✅       |
-| MP3    | `mp3`          | ✅       | ✅       |
-| FLAC   | `flac`         | ✅       | ✅       |
-| Vorbis | `vorbis`       | ❌       | ✅       |
-| PCM    | `pcm-*`        | ❌       | ✅       |
+| Codec  | Codec String | Encoding | Decoding |
+| ------ | ------------ | -------- | -------- |
+| AAC    | `mp4a.40.2`  | ✅       | ✅       |
+| Opus   | `opus`       | ✅       | ✅       |
+| MP3    | `mp3`        | ✅       | ✅       |
+| FLAC   | `flac`       | ✅       | ✅       |
+| Vorbis | `vorbis`     | ❌       | ✅       |
+| PCM    | `pcm-*`      | ❌       | ✅       |
 
 ### Image
 
@@ -182,13 +185,13 @@ decoder.close()
 
 Pre-built binaries are available for:
 
-| Platform                      | Architecture |
-| ----------------------------- | ------------ |
-| macOS                         | x64, arm64   |
-| Windows                       | x64, arm64   |
-| Linux (glibc)                 | x64, arm64   |
-| Linux (musl)                  | x64, arm64   |
-| Linux (glibc, gnueabihf)      | armv7        |
+| Platform                 | Architecture |
+| ------------------------ | ------------ |
+| macOS                    | x64, arm64   |
+| Windows                  | x64, arm64   |
+| Linux (glibc)            | x64, arm64   |
+| Linux (musl)             | x64, arm64   |
+| Linux (glibc, gnueabihf) | armv7        |
 
 ## W3C Web Platform Tests Compliance
 
@@ -203,6 +206,7 @@ This implementation is validated against the [W3C Web Platform Tests](https://gi
 | **Failing** | 0     | 0%         |
 
 **Skipped tests** are due to:
+
 - High bit-depth pixel formats (10-bit/12-bit) not mapped to FFmpeg
 - Temporal SVC layer metadata extraction not implemented
 
@@ -210,31 +214,75 @@ This implementation is validated against the [W3C Web Platform Tests](https://gi
 
 19 WPT test files require browser APIs unavailable in Node.js:
 
-| Category | Tests | APIs Required |
-| -------- | ----- | ------------- |
-| Serialization/Transfer | 5 | MessageChannel, structured clone |
-| WebGL/Canvas | 5 | WebGL textures, ImageBitmap, Canvas 2D |
-| Cross-Origin Isolation | 8 | COOP/COEP headers |
-| WebIDL | 1 | IDL interface validation |
+| Category               | Tests | APIs Required                          |
+| ---------------------- | ----- | -------------------------------------- |
+| Serialization/Transfer | 5     | MessageChannel, structured clone       |
+| WebGL/Canvas           | 5     | WebGL textures, ImageBitmap, Canvas 2D |
+| Cross-Origin Isolation | 8     | COOP/COEP headers                      |
+| WebIDL                 | 1     | IDL interface validation               |
 
 See [`__test__/wpt/README.md`](./__test__/wpt/README.md) for detailed test status.
+
+## Hardware Acceleration
+
+Hardware encoding is fully supported with automatic GPU selection and fallback:
+
+| Platform | Encoders     | Features                                               |
+| -------- | ------------ | ------------------------------------------------------ |
+| macOS    | VideoToolbox | H.264, HEVC; realtime mode, allow_sw control           |
+| NVIDIA   | NVENC        | H.264, HEVC, AV1; presets p1-p7, spatial-aq, lookahead |
+| Linux    | VAAPI        | H.264, HEVC, VP9, AV1; quality 0-8                     |
+| Intel    | QSV          | H.264, HEVC, VP9, AV1; presets, lookahead              |
+
+### Configuration
+
+```typescript
+encoder.configure({
+  codec: 'avc1.42001E',
+  width: 1920,
+  height: 1080,
+  // Hardware acceleration preference
+  hardwareAcceleration: 'prefer-hardware', // 'no-preference' | 'prefer-hardware' | 'prefer-software'
+  // Latency mode affects encoder tuning
+  latencyMode: 'realtime', // 'quality' | 'realtime'
+})
+```
+
+- `latencyMode: 'realtime'` - Enables low-latency encoder options (smaller GOP, no B-frames, fast presets)
+- `latencyMode: 'quality'` - Enables quality-focused options (larger GOP, B-frames, lookahead)
+
+The encoder automatically applies optimal settings for each hardware encoder based on the latency mode.
 
 ## Limitations
 
 ### Not Implemented
 
-| Feature | Status | Notes |
-| ------- | ------ | ----- |
-| High bit-depth formats | ❌ | `I420P10`, `I422P10`, `I444P10`, `I420P12`, etc. |
-| VideoFrame orientation | ❌ | `rotation` and `flip` properties |
-| Temporal SVC metadata | ❌ | `scalabilityMode` parsed but `metadata.svc` not populated |
-| Hardware encoding | ⚠️ | Detection works, integration pending |
-| ImageDecoder options | ⚠️ | `colorSpaceConversion`, `desiredWidth/Height` parsed but not applied |
+| Feature                | Status | Notes                                                                |
+| ---------------------- | ------ | -------------------------------------------------------------------- |
+| High bit-depth formats | ❌     | `I420P10`, `I422P10`, `I444P10`, `I420P12`, etc.                     |
+| VideoFrame orientation | ❌     | `rotation` and `flip` properties                                     |
+| Temporal SVC metadata  | ❌     | `scalabilityMode` parsed but `metadata.svc` not populated            |
+| ImageDecoder options   | ⚠️     | `colorSpaceConversion`, `desiredWidth/Height` parsed but not applied |
 
 ### Platform-Specific Notes
 
 - **ImageDecoder GIF animation**: FFmpeg may return only the first frame. Use `VideoDecoder` with GIF codec for full animation.
 - **VideoFrame cloning**: Use `VideoFrame.fromVideoFrame()` factory method (NAPI-RS doesn't support constructor overloading).
+
+## Logging
+
+FFmpeg internal logs are redirected to the Rust `tracing` crate with the `ffmpeg` target. By default, logs are silently discarded unless you configure a tracing subscriber.
+
+To enable FFmpeg logging in your application, you can use any `tracing`-compatible subscriber. For Node.js applications, you can expose this through the native module or use environment-based configuration.
+
+Log level mapping:
+| FFmpeg Level | Tracing Level |
+| ------------ | ------------- |
+| ERROR/FATAL | `error` |
+| WARNING | `warn` |
+| INFO | `info` |
+| VERBOSE | `debug` |
+| DEBUG/TRACE | `trace` |
 
 ## API Reference
 

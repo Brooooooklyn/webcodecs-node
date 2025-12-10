@@ -22,11 +22,11 @@ WebCodecs API implementation for Node.js using FFmpeg, built with napi-rs (Rust 
 | Threading           | ✅ Complete | Non-blocking Drop, proper lifecycle |
 | W3C Spec Compliance | ✅ Complete | All APIs aligned                    |
 | Type Definitions    | ✅ Complete | ~1,100 lines in index.d.ts          |
-| Test Coverage       | ✅ Complete | 560+ tests (33 files), all passing  |
+| Test Coverage       | ✅ Complete | 780+ tests (33 files), all passing  |
+| Hardware Encoding   | ✅ Complete | Zero-copy GPU path, auto-tuning     |
 
 **Remaining Work:**
 
-- Hardware-accelerated encoding integration (detection works)
 - VideoFrame.visibleRect cropping (low priority)
 - Temporal SVC layer application (low priority)
 
@@ -51,7 +51,8 @@ src/
 │   ├── audio_buffer.rs# Audio sample buffers
 │   ├── scaler.rs      # Video scaling
 │   ├── resampler.rs   # Audio resampling
-│   └── hwdevice.rs    # Hardware device management
+│   ├── hwdevice.rs    # Hardware device management
+│   └── hwframes.rs    # Hardware frame context (GPU frame pools)
 ├── webcodecs/     # High-level WebCodecs API classes (NAPI)
 │   ├── video_encoder.rs    # VideoEncoder class
 │   ├── video_decoder.rs    # VideoDecoder class
@@ -83,6 +84,18 @@ pnpm lint          # Run oxlint
 pnpm format        # Format code (prettier, rustfmt, taplo)
 cargo clippy       # Lint Rust code
 ```
+
+## Logging
+
+FFmpeg logs are redirected to Rust's `tracing` crate with the `ffmpeg` target:
+
+- FFmpeg ERROR → `tracing::error!(target: "ffmpeg", ...)`
+- FFmpeg WARNING → `tracing::warn!(target: "ffmpeg", ...)`
+- FFmpeg INFO → `tracing::info!(target: "ffmpeg", ...)`
+- FFmpeg VERBOSE → `tracing::debug!(target: "ffmpeg", ...)`
+- FFmpeg DEBUG/TRACE → `tracing::trace!(target: "ffmpeg", ...)`
+
+Users can configure a tracing subscriber to capture these logs. Without a subscriber, logs are silently discarded.
 
 ## FFmpeg Linking
 
@@ -138,10 +151,24 @@ Detection order:
 
 ### Hardware Acceleration
 
+**Detection API:**
+
 - `getHardwareAccelerators()` - List all known accelerators
 - `getAvailableHardwareAccelerators()` - List available on system
 - `getPreferredHardwareAccelerator()` - Platform-preferred
 - `isHardwareAcceleratorAvailable(name)` - Check specific
+
+**Hardware Encoding (Zero-Copy GPU Path):**
+
+- Automatic hardware encoder selection based on `hardwareAcceleration` config
+- Zero-copy GPU frame upload via `HwFrameContext` (when supported)
+- Automatic I420→NV12 conversion for hardware encoders
+- Platform-specific encoder options auto-applied based on `latencyMode`:
+  - **VideoToolbox (macOS):** `realtime` mode, `allow_sw` disabled
+  - **NVENC (NVIDIA):** Presets p1-p7, tune hq/ll, spatial-aq, rc-lookahead
+  - **VAAPI (Linux):** Quality 0-8 scale
+  - **QSV (Intel):** Presets veryfast-veryslow, look-ahead
+- Graceful fallback: GPU upload failure → CPU frames → software encoder
 
 ### Supported Codecs
 
@@ -161,7 +188,9 @@ Detection order:
 | `src/webcodecs/error.rs`         | DOMException-style error helpers             |
 | `src/webcodecs/codec_string.rs`  | Codec string parser (avc1, vp09, av01, hev1) |
 | `src/codec/context.rs`           | FFmpeg encoder/decoder context wrapper       |
-| `src/lib.rs`                     | Module init with FFmpeg log suppression      |
+| `src/codec/hwframes.rs`          | HwFrameContext for GPU frame pools           |
+| `src/codec/hwdevice.rs`          | HwDeviceContext for hardware devices         |
+| `src/lib.rs`                     | Module init, FFmpeg→tracing log redirect     |
 | `build.rs`                       | FFmpeg detection and static linking          |
 | `index.d.ts`                     | TypeScript type definitions (~1,100 lines)   |
 
@@ -392,18 +421,18 @@ src/codec/context.rs:339,362  # Set extradata if provided (non-critical)
 **Location:** Native code in libaom library
 **Symptom:** Occasional segmentation fault during AV1 encoder/decoder cleanup (CVE-2025-8879)
 **Workaround:**
+
 - **Windows x64 MSVC:** Uses rav1e (encoder) + dav1d (decoder) instead of libaom
 - **Other platforms:** AV1 encoder/decoder implementations drain all frames before dropping context
-**Status:** Fully resolved on Windows x64; mitigated with drain workaround elsewhere (`video_encoder.rs`, `video_decoder.rs`)
+  **Status:** Fully resolved on Windows x64; mitigated with drain workaround elsewhere (`video_encoder.rs`, `video_decoder.rs`)
 
 ## Known Limitations
 
 1. **VideoFrame.visibleRect cropping** - Parameter not implemented, returns error
 2. **Temporal SVC** - Parsing only, layer settings not applied to encoder
-3. **Hardware-accelerated encoding** - Detection works, integration pending
-4. **Duration type** - Using i64 instead of u64 due to NAPI-RS constraints
-5. **ImageDecoder parameters** - `colorSpaceConversion`, `desiredWidth/Height`, `preferAnimation` parsed but not applied
-6. **ImageDecoder GIF animation** - FFmpeg may return only first frame; for full animation use VideoDecoder with GIF codec
+3. **Duration type** - Using i64 instead of u64 due to NAPI-RS constraints
+4. **ImageDecoder parameters** - `colorSpaceConversion`, `desiredWidth/Height`, `preferAnimation` parsed but not applied
+5. **ImageDecoder GIF animation** - FFmpeg may return only first frame; for full animation use VideoDecoder with GIF codec
 
 ## NAPI-RS Limitations
 

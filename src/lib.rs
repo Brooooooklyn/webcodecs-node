@@ -15,13 +15,93 @@ pub mod codec;
 pub mod webcodecs;
 
 use napi_derive::module_init;
+use std::ffi::CStr;
+use std::os::raw::{c_char, c_int, c_void};
+
+/// FFmpeg log callback that redirects to tracing
+///
+/// This callback is called by FFmpeg for all log messages. It formats the message
+/// using FFmpeg's internal formatter and then dispatches to the appropriate
+/// tracing macro based on the log level.
+///
+/// Log messages are filtered by the `ffmpeg` target, so users can control
+/// FFmpeg logging independently via tracing subscriber configuration.
+unsafe extern "C" fn ffmpeg_log_callback(
+  ptr: *mut c_void,
+  level: c_int,
+  fmt: *const c_char,
+  vl: *mut c_void,
+) {
+  // Skip if level is below our threshold (higher number = more verbose)
+  let current_level = unsafe { ffi::avutil::av_log_get_level() };
+  if level > current_level {
+    return;
+  }
+
+  // Format the message using FFmpeg's internal formatter
+  // Buffer size of 1024 is standard for FFmpeg log lines
+  let mut line_buf = [0u8; 1024];
+  let mut print_prefix: c_int = 1;
+
+  let len = unsafe {
+    ffi::avutil::av_log_format_line2(
+      ptr,
+      level,
+      fmt,
+      vl,
+      line_buf.as_mut_ptr() as *mut c_char,
+      line_buf.len() as c_int,
+      &mut print_prefix,
+    )
+  };
+
+  if len <= 0 {
+    return;
+  }
+
+  // Convert to string, trimming trailing newline
+  let msg = match CStr::from_bytes_until_nul(&line_buf) {
+    Ok(cstr) => cstr.to_string_lossy(),
+    Err(_) => return,
+  };
+  let msg = msg.trim_end();
+
+  if msg.is_empty() {
+    return;
+  }
+
+  // Dispatch to appropriate tracing level
+  // FFmpeg log levels: QUIET=-8, PANIC=0, FATAL=8, ERROR=16, WARNING=24, INFO=32, VERBOSE=40, DEBUG=48, TRACE=56
+  match level {
+    l if l <= ffi::avutil::log_level::FATAL => {
+      tracing::error!(target: "ffmpeg", "{}", msg);
+    }
+    l if l <= ffi::avutil::log_level::ERROR => {
+      tracing::error!(target: "ffmpeg", "{}", msg);
+    }
+    l if l <= ffi::avutil::log_level::WARNING => {
+      tracing::warn!(target: "ffmpeg", "{}", msg);
+    }
+    l if l <= ffi::avutil::log_level::INFO => {
+      tracing::info!(target: "ffmpeg", "{}", msg);
+    }
+    l if l <= ffi::avutil::log_level::VERBOSE => {
+      tracing::debug!(target: "ffmpeg", "{}", msg);
+    }
+    _ => {
+      tracing::trace!(target: "ffmpeg", "{}", msg);
+    }
+  }
+}
 
 /// Module initialization - called when the native module is loaded
 #[module_init]
 fn init() {
-  // Suppress verbose FFmpeg logging (only show errors)
+  // Set FFmpeg log level to allow all messages through to our callback
+  // The tracing subscriber will handle actual filtering
   unsafe {
-    ffi::avutil::av_log_set_level(ffi::avutil::log_level::ERROR);
+    ffi::avutil::av_log_set_level(ffi::avutil::log_level::INFO);
+    ffi::avutil::av_log_set_callback(Some(ffmpeg_log_callback));
   }
 }
 

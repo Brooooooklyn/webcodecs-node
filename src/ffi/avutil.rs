@@ -202,6 +202,36 @@ unsafe extern "C" {
   /// Get the current logging level
   pub fn av_log_get_level() -> c_int;
 
+  /// Set custom log callback
+  ///
+  /// The callback receives:
+  /// - ptr: the AVClass context (can be null)
+  /// - level: log level (AV_LOG_* constants)
+  /// - fmt: printf-style format string
+  /// - vl: va_list arguments
+  ///
+  /// Set to null to restore the default FFmpeg log handler
+  pub fn av_log_set_callback(
+    callback: Option<
+      unsafe extern "C" fn(ptr: *mut c_void, level: c_int, fmt: *const c_char, vl: *mut c_void),
+    >,
+  );
+
+  /// Format a log message using FFmpeg's internal formatter
+  /// This is the safe way to handle va_list from the log callback
+  ///
+  /// Returns the number of characters written (excluding null terminator)
+  /// or a negative error code
+  pub fn av_log_format_line2(
+    ptr: *mut c_void,
+    level: c_int,
+    fmt: *const c_char,
+    vl: *mut c_void,
+    line: *mut c_char,
+    line_size: c_int,
+    print_prefix: *mut c_int,
+  ) -> c_int;
+
   // ========================================================================
   // Option Setting (av_opt_set family)
   // ========================================================================

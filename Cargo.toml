@@ -30,6 +30,9 @@ thiserror = "2"
 # Concurrent data structures
 crossbeam = "0.8"
 
+# Logging
+tracing = "0.1"
+
 [build-dependencies]
 napi-build = "2"
 cc = "1"

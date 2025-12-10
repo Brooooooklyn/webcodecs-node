@@ -5,7 +5,7 @@
 
 use crate::codec::{
   BitrateMode as CodecBitrateMode, CodecContext, EncoderConfig, EncoderCreationResult, Frame,
-  Scaler,
+  HwDeviceContext, HwFrameConfig, HwFrameContext, Scaler,
 };
 use crate::ffi::{AVCodecID, AVHWDeviceType, AVPixelFormat};
 use crate::webcodecs::error::{invalid_state_error, throw_type_error_unit};
@@ -282,6 +282,18 @@ struct VideoEncoderInner {
   /// Flag indicating whether a flush operation is in progress
   /// When true, worker queues chunks to pending_chunks instead of calling NonBlocking callback
   inside_flush: bool,
+
+  // ========================================================================
+  // Hardware frame context for zero-copy GPU encoding
+  // ========================================================================
+  /// Hardware device context (needed for creating frame context)
+  hw_device_ctx: Option<HwDeviceContext>,
+  /// Hardware frame context for GPU frame pool
+  hw_frame_ctx: Option<HwFrameContext>,
+  /// Whether to use hardware frame upload path
+  use_hw_frames: bool,
+  /// NV12 scaler for converting I420 to NV12 (required by most hardware encoders)
+  nv12_scaler: Option<Scaler>,
 }
 
 /// Get the preferred hardware device type for the current platform
@@ -403,6 +415,11 @@ impl VideoEncoder {
       flush_abort_flag: None,
       pending_chunks: Vec::new(),
       inside_flush: false,
+      // Hardware frame context fields
+      hw_device_ctx: None,
+      hw_frame_ctx: None,
+      use_hw_frames: false,
+      nv12_scaler: None,
     };
 
     let inner = Arc::new(Mutex::new(inner));
@@ -568,6 +585,16 @@ impl VideoEncoder {
 
     // Set frame PTS
     frame_to_encode.set_pts(timestamp);
+
+    // Upload frame to GPU if hardware frame context is available
+    // This provides zero-copy encoding for hardware encoders
+    if guard.use_hw_frames && guard.hw_frame_ctx.is_some() {
+      let hw_upload_result = Self::try_upload_to_gpu(&mut guard, &frame_to_encode);
+      if let Some(hw_frame) = hw_upload_result {
+        frame_to_encode = hw_frame;
+      }
+      // If upload failed, use_hw_frames is set to false and we continue with CPU frame
+    }
 
     // Push timestamp to queue for correlation with output packets
     // (FFmpeg may modify PTS internally, so we track input timestamps separately)
@@ -1164,6 +1191,124 @@ impl VideoEncoder {
     Ok((context, result.encoder_name))
   }
 
+  /// Try to create hardware frame context for zero-copy GPU encoding
+  ///
+  /// This creates a GPU frame pool that allows uploading CPU frames to GPU memory
+  /// before encoding, which can improve performance for hardware encoders.
+  ///
+  /// Returns (HwDeviceContext, HwFrameContext) on success, or error if creation fails.
+  /// Failure is not fatal - we can fall back to letting the encoder handle CPU frames.
+  fn try_create_hw_frame_context(
+    hw_type: AVHWDeviceType,
+    width: u32,
+    height: u32,
+  ) -> Result<(HwDeviceContext, HwFrameContext)> {
+    // Create hardware device context
+    let device = HwDeviceContext::new(hw_type).map_err(|e| {
+      Error::new(
+        Status::GenericFailure,
+        format!("Failed to create hardware device context: {}", e),
+      )
+    })?;
+
+    // Create hardware frames context with NV12 software format
+    // Most hardware encoders prefer NV12 for input
+    let config = HwFrameConfig {
+      width,
+      height,
+      sw_format: AVPixelFormat::Nv12,
+      hw_format: None, // Auto-detect based on device type
+      pool_size: 20,   // Pre-allocate frames for smooth encoding
+    };
+
+    let frames = HwFrameContext::new(&device, config).map_err(|e| {
+      Error::new(
+        Status::GenericFailure,
+        format!("Failed to create hardware frames context: {}", e),
+      )
+    })?;
+
+    Ok((device, frames))
+  }
+
+  /// Try to upload a CPU frame to GPU for hardware encoding
+  ///
+  /// Converts the frame to NV12 if needed (most hardware encoders prefer NV12),
+  /// then uploads to GPU memory using the hardware frame context.
+  ///
+  /// Returns Some(hw_frame) on success, None on failure.
+  /// On failure, sets guard.use_hw_frames to false for fallback.
+  fn try_upload_to_gpu(guard: &mut VideoEncoderInner, frame: &Frame) -> Option<Frame> {
+    // Convert to NV12 if needed
+    let nv12_frame = if frame.format() != AVPixelFormat::Nv12 {
+      // Create NV12 scaler if needed
+      if guard.nv12_scaler.is_none() {
+        match Scaler::new(
+          frame.width(),
+          frame.height(),
+          frame.format(),
+          frame.width(),
+          frame.height(),
+          AVPixelFormat::Nv12,
+          crate::codec::scaler::ScaleAlgorithm::Bilinear,
+        ) {
+          Ok(scaler) => {
+            guard.nv12_scaler = Some(scaler);
+          }
+          Err(e) => {
+            guard.use_hw_frames = false;
+            eprintln!(
+              "Warning: Failed to create NV12 scaler, falling back to CPU frames: {}",
+              e
+            );
+            return None;
+          }
+        }
+      }
+
+      // Scale to NV12
+      let scaler = guard.nv12_scaler.as_ref()?;
+      match scaler.scale_alloc(frame) {
+        Ok(nv12) => nv12,
+        Err(e) => {
+          guard.use_hw_frames = false;
+          eprintln!(
+            "Warning: NV12 conversion failed, falling back to CPU frames: {}",
+            e
+          );
+          return None;
+        }
+      }
+    } else {
+      // Already NV12, clone for upload
+      match frame.try_clone() {
+        Ok(cloned) => cloned,
+        Err(e) => {
+          guard.use_hw_frames = false;
+          eprintln!(
+            "Warning: Frame clone failed, falling back to CPU frames: {}",
+            e
+          );
+          return None;
+        }
+      }
+    };
+
+    // Upload to GPU
+    let hw_frame_ctx = guard.hw_frame_ctx.as_ref()?;
+    match hw_frame_ctx.upload_frame(&nv12_frame) {
+      Ok(hw_frame) => Some(hw_frame),
+      Err(e) => {
+        guard.use_hw_frames = false;
+        eprintln!(
+          "Warning: GPU upload failed, falling back to CPU frames: {}",
+          e
+        );
+        None
+      }
+    }
+  }
+
   /// Get encoder state
   #[napi(getter)]
   pub fn state(&self) -> Result<CodecState> {
@@ -1431,6 +1576,14 @@ impl VideoEncoder {
       }
     }
 
+    // Apply hardware encoder-specific options based on latency mode
+    // This sets sensible defaults for each hardware encoder (VideoToolbox, NVENC, VAAPI, QSV)
+    // based on whether the user requested realtime (low-latency) or quality mode
+    if is_hardware {
+      let realtime = matches!(config.latency_mode, Some(LatencyMode::Realtime));
+      context.apply_hw_encoder_options(&encoder_name, realtime);
+    }
+
     // Open the encoder
     if let Err(e) = context.open() {
       // For no-preference, try software fallback if hardware open fails
@@ -1458,6 +1611,25 @@ impl VideoEncoder {
       }
     }
 
+    // Try to create hardware frame context for zero-copy GPU encoding
+    // This is optional - if it fails, we fall back to CPU frames (current behavior)
+    let (hw_device_ctx, hw_frame_ctx, use_hw_frames) = if is_hardware {
+      if let Some(hw) = hw_type {
+        match Self::try_create_hw_frame_context(hw, width, height) {
+          Ok((device, frames)) => (Some(device), Some(frames), true),
+          Err(_) => {
+            // Failed to create hw frame context, fall back to CPU frames
+            // This is not an error - hardware encoders can accept CPU frames too
+            (None, None, false)
+          }
+        }
+      } else {
+        (None, None, false)
+      }
+    } else {
+      (None, None, false)
+    };
+
     inner.context = Some(context);
     inner.config = Some(config);
     inner.state = CodecState::Configured;
@@ -1472,6 +1644,12 @@ impl VideoEncoder {
     inner.silent_encode_count = 0;
     inner.first_output_produced = false;
     inner.pending_frames.clear();
+
+    // Hardware frame context for zero-copy GPU encoding
+    inner.hw_device_ctx = hw_device_ctx;
+    inner.hw_frame_ctx = hw_frame_ctx;
+    inner.use_hw_frames = use_hw_frames;
+    inner.nv12_scaler = None; // Will be created lazily if needed
 
     Ok(())
   }

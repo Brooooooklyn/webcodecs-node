@@ -371,6 +371,132 @@ impl CodecContext {
     Ok(())
   }
 
+  /// Apply hardware encoder-specific options based on the encoder name and latency mode
+  ///
+  /// This method sets sensible FFmpeg options for hardware encoders to optimize
+  /// for either low-latency (realtime) or high-quality encoding.
+  ///
+  /// # Arguments
+  /// * `encoder_name` - The FFmpeg encoder name (e.g., "h264_videotoolbox", "h264_nvenc")
+  /// * `realtime` - If true, optimize for low latency; otherwise optimize for quality
+  ///
+  /// # Hardware encoder options applied:
+  ///
+  /// ## VideoToolbox (macOS)
+  /// - realtime=1: Enable realtime encoding mode
+  /// - allow_sw=0: Disable software fallback for consistent behavior
+  ///
+  /// ## NVENC (NVIDIA)
+  /// - preset=p4 (quality) / p1 (realtime): Encoding speed/quality tradeoff
+  /// - tune=hq (quality) / ll (realtime): Tune for high quality or low latency
+  /// - rc-lookahead=20 (quality) / 0 (realtime): Look-ahead frames for better quality
+  /// - spatial-aq=1: Enable spatial adaptive quantization for quality
+  ///
+  /// ## VAAPI (Linux)
+  /// - quality=4 (balanced): 0-8 scale, lower = better quality
+  ///
+  /// ## QSV (Intel)
+  /// - preset=medium (quality) / veryfast (realtime): Speed preset
+  /// - look_ahead=1 (quality) / 0 (realtime): Enable look-ahead for better quality
+  pub fn apply_hw_encoder_options(&mut self, encoder_name: &str, realtime: bool) {
+    unsafe {
+      let ctx = self.ptr.as_ptr() as *mut std::ffi::c_void;
+
+      // VideoToolbox (macOS)
+      if encoder_name.contains("videotoolbox") {
+        if realtime {
+          // Enable realtime encoding for low latency
+          av_opt_set_int(ctx, c"realtime".as_ptr(), 1, opt_flag::SEARCH_CHILDREN);
+        }
+        // Disable software fallback for consistent hardware behavior
+        av_opt_set_int(ctx, c"allow_sw".as_ptr(), 0, opt_flag::SEARCH_CHILDREN);
+      }
+      // NVENC (NVIDIA)
+      else if encoder_name.contains("nvenc") {
+        if realtime {
+          // Low latency: fastest preset, tune for low latency, no look-ahead
+          av_opt_set(
+            ctx,
+            c"preset".as_ptr(),
+            c"p1".as_ptr(),
+            opt_flag::SEARCH_CHILDREN,
+          );
+          av_opt_set(
+            ctx,
+            c"tune".as_ptr(),
+            c"ll".as_ptr(),
+            opt_flag::SEARCH_CHILDREN,
+          );
+          av_opt_set_int(ctx, c"rc-lookahead".as_ptr(), 0, opt_flag::SEARCH_CHILDREN);
+        } else {
+          // Quality mode: balanced preset, HQ tune, enable look-ahead and AQ
+          av_opt_set(
+            ctx,
+            c"preset".as_ptr(),
+            c"p4".as_ptr(),
+            opt_flag::SEARCH_CHILDREN,
+          );
+          av_opt_set(
+            ctx,
+            c"tune".as_ptr(),
+            c"hq".as_ptr(),
+            opt_flag::SEARCH_CHILDREN,
+          );
+          av_opt_set_int(ctx, c"rc-lookahead".as_ptr(), 20, opt_flag::SEARCH_CHILDREN);
+          av_opt_set_int(ctx, c"spatial-aq".as_ptr(), 1, opt_flag::SEARCH_CHILDREN);
+        }
+      }
+      // VAAPI (Linux)
+      else if encoder_name.contains("vaapi") {
+        // quality: 0-8, lower = better quality
+        // Use 2 for quality mode, 6 for realtime
+        let quality = if realtime { 6 } else { 2 };
+        av_opt_set_int(ctx, c"quality".as_ptr(), quality, opt_flag::SEARCH_CHILDREN);
+      }
+      // QSV (Intel)
+      else if encoder_name.contains("qsv") {
+        if realtime {
+          // Low latency: fastest preset, no look-ahead
+          av_opt_set(
+            ctx,
+            c"preset".as_ptr(),
+            c"veryfast".as_ptr(),
+            opt_flag::SEARCH_CHILDREN,
+          );
+          av_opt_set_int(ctx, c"look_ahead".as_ptr(), 0, opt_flag::SEARCH_CHILDREN);
+        } else {
+          // Quality mode: balanced preset with look-ahead
+          av_opt_set(
+            ctx,
+            c"preset".as_ptr(),
+            c"medium".as_ptr(),
+            opt_flag::SEARCH_CHILDREN,
+          );
+          av_opt_set_int(ctx, c"look_ahead".as_ptr(), 1, opt_flag::SEARCH_CHILDREN);
+        }
+      }
+      // D3D11VA / AMF (AMD on Windows) - limited options but try common ones
+      else if encoder_name.contains("amf") {
+        if realtime {
+          av_opt_set(
+            ctx,
+            c"quality".as_ptr(),
+            c"speed".as_ptr(),
+            opt_flag::SEARCH_CHILDREN,
+          );
+        } else {
+          av_opt_set(
+            ctx,
+            c"quality".as_ptr(),
+            c"balanced".as_ptr(),
+            opt_flag::SEARCH_CHILDREN,
+          );
+        }
+      }
+      // Note: Unknown hardware encoders get no special options (safe default)
+    }
+  }
+
   /// Configure the audio encoder with the given settings
   pub fn configure_audio_encoder(&mut self, config: &AudioEncoderConfig) -> CodecResult<()> {
     if self.codec_type != CodecType::Encoder {

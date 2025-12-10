@@ -247,6 +247,10 @@ pub enum AVPixelFormat {
   Videotoolbox = 162,
   Cuda = 119,
   Vaapi = 53,
+  Qsv = 173,
+  D3d11 = 174,
+  Dxva2Vld = 55,
+  Vulkan = 185,
 }
 
 impl AVPixelFormat {
@@ -333,7 +337,53 @@ impl AVPixelFormat {
 
   /// Whether this is a hardware pixel format
   pub fn is_hardware(&self) -> bool {
-    matches!(self, Self::Videotoolbox | Self::Cuda | Self::Vaapi)
+    matches!(
+      self,
+      Self::Videotoolbox
+        | Self::Cuda
+        | Self::Vaapi
+        | Self::Qsv
+        | Self::D3d11
+        | Self::Dxva2Vld
+        | Self::Vulkan
+    )
+  }
+
+  /// Convert from raw FFmpeg pixel format value
+  pub fn from_raw(value: c_int) -> Self {
+    match value {
+      0 => Self::Yuv420p,
+      4 => Self::Yuv422p,
+      5 => Self::Yuv444p,
+      33 => Self::Yuva420p,
+      39 => Self::Yuva422p,
+      40 => Self::Yuva444p,
+      23 => Self::Nv12,
+      24 => Self::Nv21,
+      2 => Self::Rgb24,
+      3 => Self::Bgr24,
+      25 => Self::Argb,
+      26 => Self::Rgba,
+      27 => Self::Abgr,
+      28 => Self::Bgra,
+      64 => Self::Yuv420p10le,
+      65 => Self::Yuv422p10le,
+      68 => Self::Yuv444p10le,
+      74 => Self::Yuv420p12le,
+      75 => Self::Yuv422p12le,
+      78 => Self::Yuv444p12le,
+      82 => Self::Yuva420p10le,
+      83 => Self::Yuva422p10le,
+      84 => Self::Yuva444p10le,
+      162 => Self::Videotoolbox,
+      119 => Self::Cuda,
+      53 => Self::Vaapi,
+      173 => Self::Qsv,
+      174 => Self::D3d11,
+      55 => Self::Dxva2Vld,
+      185 => Self::Vulkan,
+      _ => Self::None,
+    }
   }
 }
 
