@@ -398,14 +398,22 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
   let is_windows_msvc_x64 =
     target_os == "windows" && target_arch == "x86_64" && target_env == "msvc";
 
+  // Work around duplicate Rust runtime symbols when linking rav1e.lib on Windows MSVC.
+  // rav1e is a Rust staticlib that includes rust_eh_personality, which conflicts with
+  // our own Rust runtime. /FORCE:MULTIPLE tells MSVC linker to accept duplicate symbols.
+  // See: https://github.com/rust-lang/rust/issues/129020
+  if is_windows_msvc_x64 {
+    println!("cargo:rustc-link-arg=/FORCE:MULTIPLE");
+  }
+
   let codec_libs: Vec<(&str, bool)> = vec![
     // Core video codec libraries (required)
     ("x264", true), // H.264
     ("x265", true), // H.265/HEVC
     ("vpx", true),  // VP8/VP9
     // AV1: Use rav1e on Windows x64 MSVC (libaom crashes), aom elsewhere
-    ("aom", !is_windows_msvc_x64),   // AV1 (required except on Windows x64 MSVC)
-    ("rav1e", is_windows_msvc_x64),  // AV1 encoder (required on Windows x64 MSVC)
+    ("aom", !is_windows_msvc_x64), // AV1 (required except on Windows x64 MSVC)
+    ("rav1e", is_windows_msvc_x64), // AV1 encoder (required on Windows x64 MSVC)
     // Optional codec libraries
     ("dav1d", false),     // AV1 decoder
     ("SvtAv1Enc", false), // SVT-AV1 encoder
