@@ -219,8 +219,8 @@ pub enum AVPixelFormat {
   Yuv422p = 4,   // I422
   Yuv444p = 5,   // I444
   Yuva420p = 33, // I420A (with alpha)
-  Yuva422p = 39, // I422A (with alpha)
-  Yuva444p = 40, // I444A (with alpha)
+  Yuva422p = 78, // I422A (with alpha)
+  Yuva444p = 79, // I444A (with alpha)
   // Semi-planar formats
   Nv12 = 23,
   Nv21 = 24,
@@ -232,17 +232,17 @@ pub enum AVPixelFormat {
   Abgr = 27,
   Bgra = 28,
   // 10-bit YUV formats
-  Yuv420p10le = 64, // I420P10
-  Yuv422p10le = 65, // I422P10
+  Yuv420p10le = 62, // I420P10
+  Yuv422p10le = 64, // I422P10
   Yuv444p10le = 68, // I444P10
   // 12-bit YUV formats
-  Yuv420p12le = 74, // I420P12
-  Yuv422p12le = 75, // I422P12
-  Yuv444p12le = 78, // I444P12
+  Yuv420p12le = 123, // I420P12
+  Yuv422p12le = 127, // I422P12
+  Yuv444p12le = 131, // I444P12
   // 10-bit YUV with alpha formats
-  Yuva420p10le = 82, // I420AP10
-  Yuva422p10le = 83, // I422AP10
-  Yuva444p10le = 84, // I444AP10
+  Yuva420p10le = 87, // I420AP10
+  Yuva422p10le = 89, // I422AP10
+  Yuva444p10le = 91, // I444AP10
   // Hardware formats
   Videotoolbox = 162,
   Cuda = 119,
@@ -356,8 +356,8 @@ impl AVPixelFormat {
       4 => Self::Yuv422p,
       5 => Self::Yuv444p,
       33 => Self::Yuva420p,
-      39 => Self::Yuva422p,
-      40 => Self::Yuva444p,
+      78 => Self::Yuva422p,
+      79 => Self::Yuva444p,
       23 => Self::Nv12,
       24 => Self::Nv21,
       2 => Self::Rgb24,
@@ -366,15 +366,15 @@ impl AVPixelFormat {
       26 => Self::Rgba,
       27 => Self::Abgr,
       28 => Self::Bgra,
-      64 => Self::Yuv420p10le,
-      65 => Self::Yuv422p10le,
+      62 => Self::Yuv420p10le,
+      64 => Self::Yuv422p10le,
       68 => Self::Yuv444p10le,
-      74 => Self::Yuv420p12le,
-      75 => Self::Yuv422p12le,
-      78 => Self::Yuv444p12le,
-      82 => Self::Yuva420p10le,
-      83 => Self::Yuva422p10le,
-      84 => Self::Yuva444p10le,
+      123 => Self::Yuv420p12le,
+      127 => Self::Yuv422p12le,
+      131 => Self::Yuv444p12le,
+      87 => Self::Yuva420p10le,
+      89 => Self::Yuva422p10le,
+      91 => Self::Yuva444p10le,
       162 => Self::Videotoolbox,
       119 => Self::Cuda,
       53 => Self::Vaapi,

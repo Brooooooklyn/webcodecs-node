@@ -1939,11 +1939,193 @@ impl VideoFrame {
             .copy_from_slice(&data[src_start..src_start + row_bytes]);
         }
       }
-      _ => {
-        return Err(Error::new(
-          Status::GenericFailure,
-          format!("Unsupported format: {:?}", format),
-        ));
+      // 10-bit and 12-bit 4:2:0 formats (2 bytes per sample)
+      VideoPixelFormat::I420P10 | VideoPixelFormat::I420P12 | VideoPixelFormat::I420AP10 => {
+        let bps = 2usize; // bytes per sample
+        let y_row_bytes = width as usize * bps;
+        let y_size = y_row_bytes * height as usize;
+        let uv_width = (width / 2) as usize;
+        let uv_row_bytes = uv_width * bps;
+        let uv_height = (height / 2) as usize;
+        let uv_size = uv_row_bytes * uv_height;
+        let v_offset = y_size + uv_size;
+
+        // Copy Y plane
+        {
+          let y_plane = frame
+            .plane_data_mut(0)
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get Y plane"))?;
+          for row in 0..height as usize {
+            let src_start = row * y_row_bytes;
+            let dst_start = row * linesize0;
+            y_plane[dst_start..dst_start + y_row_bytes]
+              .copy_from_slice(&data[src_start..src_start + y_row_bytes]);
+          }
+        }
+
+        // Copy U plane
+        {
+          let u_plane = frame
+            .plane_data_mut(1)
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get U plane"))?;
+          for row in 0..uv_height {
+            let src_start = y_size + row * uv_row_bytes;
+            let dst_start = row * linesize1;
+            u_plane[dst_start..dst_start + uv_row_bytes]
+              .copy_from_slice(&data[src_start..src_start + uv_row_bytes]);
+          }
+        }
+
+        // Copy V plane
+        {
+          let v_plane = frame
+            .plane_data_mut(2)
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get V plane"))?;
+          for row in 0..uv_height {
+            let src_start = v_offset + row * uv_row_bytes;
+            let dst_start = row * linesize2;
+            v_plane[dst_start..dst_start + uv_row_bytes]
+              .copy_from_slice(&data[src_start..src_start + uv_row_bytes]);
+          }
+        }
+
+        // Copy A plane if present (10-bit alpha)
+        if format == VideoPixelFormat::I420AP10 {
+          let a_offset = v_offset + uv_size;
+          let a_plane = frame
+            .plane_data_mut(3)
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get A plane"))?;
+          for row in 0..height as usize {
+            let src_start = a_offset + row * y_row_bytes;
+            let dst_start = row * linesize3;
+            a_plane[dst_start..dst_start + y_row_bytes]
+              .copy_from_slice(&data[src_start..src_start + y_row_bytes]);
+          }
+        }
+      }
+      // 10-bit and 12-bit 4:2:2 formats (2 bytes per sample)
+      VideoPixelFormat::I422P10 | VideoPixelFormat::I422P12 | VideoPixelFormat::I422AP10 => {
+        let bps = 2usize; // bytes per sample
+        let y_row_bytes = width as usize * bps;
+        let y_size = y_row_bytes * height as usize;
+        let uv_width = (width / 2) as usize;
+        let uv_row_bytes = uv_width * bps;
+        let uv_size = uv_row_bytes * height as usize;
+        let v_offset = y_size + uv_size;
+
+        // Copy Y plane
+        {
+          let y_plane = frame
+            .plane_data_mut(0)
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get Y plane"))?;
+          for row in 0..height as usize {
+            let src_start = row * y_row_bytes;
+            let dst_start = row * linesize0;
+            y_plane[dst_start..dst_start + y_row_bytes]
+              .copy_from_slice(&data[src_start..src_start + y_row_bytes]);
+          }
+        }
+
+        // Copy U plane
+        {
+          let u_plane = frame
+            .plane_data_mut(1)
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get U plane"))?;
+          for row in 0..height as usize {
+            let src_start = y_size + row * uv_row_bytes;
+            let dst_start = row * linesize1;
+            u_plane[dst_start..dst_start + uv_row_bytes]
+              .copy_from_slice(&data[src_start..src_start + uv_row_bytes]);
+          }
+        }
+
+        // Copy V plane
+        {
+          let v_plane = frame
+            .plane_data_mut(2)
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get V plane"))?;
+          for row in 0..height as usize {
+            let src_start = v_offset + row * uv_row_bytes;
+            let dst_start = row * linesize2;
+            v_plane[dst_start..dst_start + uv_row_bytes]
+              .copy_from_slice(&data[src_start..src_start + uv_row_bytes]);
+          }
+        }
+
+        // Copy A plane if present (10-bit alpha)
+        if format == VideoPixelFormat::I422AP10 {
+          let a_offset = v_offset + uv_size;
+          let a_plane = frame
+            .plane_data_mut(3)
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get A plane"))?;
+          for row in 0..height as usize {
+            let src_start = a_offset + row * y_row_bytes;
+            let dst_start = row * linesize3;
+            a_plane[dst_start..dst_start + y_row_bytes]
+              .copy_from_slice(&data[src_start..src_start + y_row_bytes]);
+          }
+        }
+      }
+      // 10-bit and 12-bit 4:4:4 formats (2 bytes per sample)
+      VideoPixelFormat::I444P10 | VideoPixelFormat::I444P12 | VideoPixelFormat::I444AP10 => {
+        let bps = 2usize; // bytes per sample
+        let plane_row_bytes = width as usize * bps;
+        let plane_size = plane_row_bytes * height as usize;
+        let u_offset = plane_size;
+        let v_offset = plane_size * 2;
+
+        // Copy Y plane
+        {
+          let y_plane = frame
+            .plane_data_mut(0)
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get Y plane"))?;
+          for row in 0..height as usize {
+            let src_start = row * plane_row_bytes;
+            let dst_start = row * linesize0;
+            y_plane[dst_start..dst_start + plane_row_bytes]
+              .copy_from_slice(&data[src_start..src_start + plane_row_bytes]);
+          }
+        }
+
+        // Copy U plane
+        {
+          let u_plane = frame
+            .plane_data_mut(1)
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get U plane"))?;
+          for row in 0..height as usize {
+            let src_start = u_offset + row * plane_row_bytes;
+            let dst_start = row * linesize1;
+            u_plane[dst_start..dst_start + plane_row_bytes]
+              .copy_from_slice(&data[src_start..src_start + plane_row_bytes]);
+          }
+        }
+
+        // Copy V plane
+        {
+          let v_plane = frame
+            .plane_data_mut(2)
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get V plane"))?;
+          for row in 0..height as usize {
+            let src_start = v_offset + row * plane_row_bytes;
+            let dst_start = row * linesize2;
+            v_plane[dst_start..dst_start + plane_row_bytes]
+              .copy_from_slice(&data[src_start..src_start + plane_row_bytes]);
+          }
+        }
+
+        // Copy A plane if present (10-bit alpha)
+        if format == VideoPixelFormat::I444AP10 {
+          let a_offset = plane_size * 3;
+          let a_plane = frame
+            .plane_data_mut(3)
+            .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get A plane"))?;
+          for row in 0..height as usize {
+            let src_start = a_offset + row * plane_row_bytes;
+            let dst_start = row * linesize3;
+            a_plane[dst_start..dst_start + plane_row_bytes]
+              .copy_from_slice(&data[src_start..src_start + plane_row_bytes]);
+          }
+        }
       }
     }
 

@@ -162,8 +162,8 @@ impl Frame {
       4 => AVPixelFormat::Yuv422p,
       5 => AVPixelFormat::Yuv444p,
       33 => AVPixelFormat::Yuva420p,
-      39 => AVPixelFormat::Yuva422p,
-      40 => AVPixelFormat::Yuva444p,
+      78 => AVPixelFormat::Yuva422p,
+      79 => AVPixelFormat::Yuva444p,
       // Semi-planar formats
       23 => AVPixelFormat::Nv12,
       24 => AVPixelFormat::Nv21,
@@ -175,16 +175,16 @@ impl Frame {
       27 => AVPixelFormat::Abgr,
       28 => AVPixelFormat::Bgra,
       // 10-bit YUV formats
-      64 => AVPixelFormat::Yuv420p10le,
-      65 => AVPixelFormat::Yuv422p10le,
+      62 => AVPixelFormat::Yuv420p10le,
+      64 => AVPixelFormat::Yuv422p10le,
       68 => AVPixelFormat::Yuv444p10le,
-      82 => AVPixelFormat::Yuva420p10le,
-      83 => AVPixelFormat::Yuva422p10le,
-      84 => AVPixelFormat::Yuva444p10le,
+      87 => AVPixelFormat::Yuva420p10le,
+      89 => AVPixelFormat::Yuva422p10le,
+      91 => AVPixelFormat::Yuva444p10le,
       // 12-bit YUV formats
-      74 => AVPixelFormat::Yuv420p12le,
-      75 => AVPixelFormat::Yuv422p12le,
-      78 => AVPixelFormat::Yuv444p12le,
+      123 => AVPixelFormat::Yuv420p12le,
+      127 => AVPixelFormat::Yuv422p12le,
+      131 => AVPixelFormat::Yuv444p12le,
       _ => AVPixelFormat::None,
     }
   }
@@ -494,9 +494,13 @@ impl Frame {
     let height = match plane {
       0 => self.height() as usize,
       1 | 2 => match self.format() {
-        AVPixelFormat::Yuv420p | AVPixelFormat::Nv12 | AVPixelFormat::Yuva420p => {
-          (self.height() as usize).div_ceil(2)
-        }
+        // 8-bit and 10/12-bit 4:2:0 formats: U/V planes are half height
+        AVPixelFormat::Yuv420p
+        | AVPixelFormat::Nv12
+        | AVPixelFormat::Yuva420p
+        | AVPixelFormat::Yuv420p10le
+        | AVPixelFormat::Yuv420p12le
+        | AVPixelFormat::Yuva420p10le => (self.height() as usize).div_ceil(2),
         _ => self.height() as usize,
       },
       3 => self.height() as usize,
@@ -525,22 +529,44 @@ impl Frame {
             | AVPixelFormat::Abgr => self.width() as usize * 4,
             // RGB24/BGR24: 3 bytes per pixel
             AVPixelFormat::Rgb24 | AVPixelFormat::Bgr24 => self.width() as usize * 3,
-            // 4:2:2 formats: Y plane is full width
+            // 8-bit 4:2:2 formats: Y plane is full width (1 byte per sample)
             AVPixelFormat::Yuv422p | AVPixelFormat::Yuva422p => self.width() as usize,
-            // 4:4:4 formats: Y plane is full width
+            // 8-bit 4:4:4 formats: Y plane is full width (1 byte per sample)
             AVPixelFormat::Yuv444p | AVPixelFormat::Yuva444p => self.width() as usize,
+            // 10-bit and 12-bit formats: 2 bytes per sample
+            AVPixelFormat::Yuv420p10le
+            | AVPixelFormat::Yuv420p12le
+            | AVPixelFormat::Yuva420p10le
+            | AVPixelFormat::Yuv422p10le
+            | AVPixelFormat::Yuv422p12le
+            | AVPixelFormat::Yuva422p10le
+            | AVPixelFormat::Yuv444p10le
+            | AVPixelFormat::Yuv444p12le
+            | AVPixelFormat::Yuva444p10le => self.width() as usize * 2,
             // Default: 1 byte per pixel (8-bit YUV Y plane)
             _ => self.width() as usize,
           },
           _ => match format {
-            // 4:2:0 formats: U/V planes are half width
+            // 8-bit 4:2:0 formats: U/V planes are half width
             AVPixelFormat::Yuv420p | AVPixelFormat::Yuva420p => (self.width() as usize).div_ceil(2),
             // NV12: UV interleaved, full width
             AVPixelFormat::Nv12 | AVPixelFormat::Nv21 => self.width() as usize,
-            // 4:2:2 formats: U/V planes are half width
+            // 8-bit 4:2:2 formats: U/V planes are half width
             AVPixelFormat::Yuv422p | AVPixelFormat::Yuva422p => (self.width() as usize).div_ceil(2),
-            // 4:4:4 formats: U/V planes are full width
+            // 8-bit 4:4:4 formats: U/V planes are full width
             AVPixelFormat::Yuv444p | AVPixelFormat::Yuva444p => self.width() as usize,
+            // 10-bit and 12-bit 4:2:0: U/V planes are half width, 2 bytes per sample
+            AVPixelFormat::Yuv420p10le
+            | AVPixelFormat::Yuv420p12le
+            | AVPixelFormat::Yuva420p10le => (self.width() as usize).div_ceil(2) * 2,
+            // 10-bit and 12-bit 4:2:2: U/V planes are half width, 2 bytes per sample
+            AVPixelFormat::Yuv422p10le
+            | AVPixelFormat::Yuv422p12le
+            | AVPixelFormat::Yuva422p10le => (self.width() as usize).div_ceil(2) * 2,
+            // 10-bit and 12-bit 4:4:4: U/V planes are full width, 2 bytes per sample
+            AVPixelFormat::Yuv444p10le
+            | AVPixelFormat::Yuv444p12le
+            | AVPixelFormat::Yuva444p10le => self.width() as usize * 2,
             _ => self.width() as usize,
           },
         };
@@ -548,10 +574,14 @@ impl Frame {
         let height = match plane {
           0 | 3 => self.height() as usize,
           _ => match format {
+            // 8-bit and 10/12-bit 4:2:0 formats: U/V planes are half height
             AVPixelFormat::Yuv420p
             | AVPixelFormat::Nv12
             | AVPixelFormat::Nv21
-            | AVPixelFormat::Yuva420p => (self.height() as usize).div_ceil(2),
+            | AVPixelFormat::Yuva420p
+            | AVPixelFormat::Yuv420p10le
+            | AVPixelFormat::Yuv420p12le
+            | AVPixelFormat::Yuva420p10le => (self.height() as usize).div_ceil(2),
             _ => self.height() as usize,
           },
         };

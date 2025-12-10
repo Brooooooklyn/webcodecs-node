@@ -201,13 +201,12 @@ This implementation is validated against the [W3C Web Platform Tests](https://gi
 
 | Status      | Count | Percentage |
 | ----------- | ----- | ---------- |
-| **Passing** | 781   | 96.2%      |
-| **Skipped** | 31    | 3.8%       |
+| **Passing** | 799   | 98.4%      |
+| **Skipped** | 13    | 1.6%       |
 | **Failing** | 0     | 0%         |
 
 **Skipped tests** are due to:
 
-- High bit-depth pixel formats (10-bit/12-bit) not mapped to FFmpeg
 - Temporal SVC layer metadata extraction not implemented
 
 ### Tests Not Ported (Browser-Only)
@@ -259,7 +258,6 @@ The encoder automatically applies optimal settings for each hardware encoder bas
 
 | Feature                | Status | Notes                                                                |
 | ---------------------- | ------ | -------------------------------------------------------------------- |
-| High bit-depth formats | ❌     | `I420P10`, `I422P10`, `I444P10`, `I420P12`, etc.                     |
 | VideoFrame orientation | ❌     | `rotation` and `flip` properties                                     |
 | Temporal SVC metadata  | ❌     | `scalabilityMode` parsed but `metadata.svc` not populated            |
 | ImageDecoder options   | ⚠️     | `colorSpaceConversion`, `desiredWidth/Height` parsed but not applied |

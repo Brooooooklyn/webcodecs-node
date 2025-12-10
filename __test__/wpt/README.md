@@ -6,29 +6,24 @@ This directory contains tests ported from the [W3C Web Platform Tests](https://g
 
 | Status      | Count |
 | ----------- | ----- |
-| **Passing** | 781   |
-| **Skipped** | 31    |
+| **Passing** | 515   |
+| **Skipped** | 13    |
 | **Failing** | 0     |
-| **Total**   | 812   |
+| **Total**   | 528   |
 
 ## Test Files Overview
 
 ### VideoFrame Tests
 
-| File                      | Tests                  | Status      | Notes                                  |
-| ------------------------- | ---------------------- | ----------- | -------------------------------------- |
-| `video-frame-wpt.spec.ts` | 71 passing, 18 skipped | **Partial** | High bit-depth formats not implemented |
-
-**Skipped Tests (VideoFrame):**
-
-- `I420P10`, `I422P10`, `I444P10` (10-bit formats) - Not mapped in FFmpeg
-- `I420P12`, `I422P12`, `I444P12` (12-bit formats) - Not mapped in FFmpeg
-- `I420AP10`, `I422AP10`, `I444AP10` (10-bit with alpha) - Not mapped in FFmpeg
-- `I422A`, `I444A` (8-bit 4:2:2/4:4:4 with alpha) - Plane extraction issues
+| File                      | Tests      | Status       | Notes                       |
+| ------------------------- | ---------- | ------------ | --------------------------- |
+| `video-frame-wpt.spec.ts` | 71 passing | **Complete** | All pixel formats supported |
 
 **Supported Pixel Formats:**
 
-- 8-bit: `I420`, `I420A`, `I422`, `I444`, `NV12`, `NV21`
+- 8-bit YUV: `I420`, `I420A`, `I422`, `I422A`, `I444`, `I444A`, `NV12`, `NV21`
+- 10-bit YUV: `I420P10`, `I420AP10`, `I422P10`, `I422AP10`, `I444P10`, `I444AP10`
+- 12-bit YUV: `I420P12`, `I422P12`, `I444P12`
 - RGB: `RGBA`, `RGBX`, `BGRA`, `BGRX`
 
 ### AudioData Tests
@@ -186,26 +181,12 @@ VideoFrame `rotation` and `flip` properties are not implemented:
 
 ## Known Implementation Gaps
 
-### High Bit-Depth Pixel Formats
+### Alpha Plane Extraction (8-bit)
 
-The following formats are defined in WebCodecs spec but not mapped to FFmpeg:
-
-| Format     | Bit Depth      | Status                 |
-| ---------- | -------------- | ---------------------- |
-| `I420P10`  | 10-bit         | Not implemented        |
-| `I422P10`  | 10-bit         | Not implemented        |
-| `I444P10`  | 10-bit         | Not implemented        |
-| `I420P12`  | 12-bit         | Not implemented        |
-| `I422P12`  | 12-bit         | Not implemented        |
-| `I444P12`  | 12-bit         | Not implemented        |
-| `I420AP10` | 10-bit + alpha | Not implemented        |
-| `I422AP10` | 10-bit + alpha | Not implemented        |
-| `I444AP10` | 10-bit + alpha | Not implemented        |
-| `I420AP12` | 12-bit + alpha | Not in spec enum       |
-| `I422AP12` | 12-bit + alpha | Not in spec enum       |
-| `I444AP12` | 12-bit + alpha | Not in spec enum       |
-| `I422A`    | 8-bit + alpha  | Plane extraction issue |
-| `I444A`    | 8-bit + alpha  | Plane extraction issue |
+| Format  | Bit Depth     | Status                 |
+| ------- | ------------- | ---------------------- |
+| `I422A` | 8-bit + alpha | Plane extraction issue |
+| `I444A` | 8-bit + alpha | Plane extraction issue |
 
 ### Temporal SVC
 
