@@ -58,7 +58,7 @@ impl FromNapiValue for AudioDecoderInit {
     value: napi::sys::napi_value,
   ) -> Result<Self> {
     let env_wrapper = Env::from_raw(env);
-    let obj = Object::from_napi_value(env, value)?;
+    let obj = unsafe { Object::from_napi_value(env, value)? };
 
     // W3C spec: throw TypeError if required callbacks are missing
     // Get output callback as Function first, then create both FunctionRef and ThreadsafeFunction
@@ -177,12 +177,12 @@ impl Drop for AudioDecoder {
 
     // Drain decoder to ensure codec threads finish before context drops.
     // This prevents potential SIGSEGV with codecs that use internal threads.
-    if let Ok(mut inner) = self.inner.lock() {
-      if let Some(ctx) = inner.context.as_mut() {
-        ctx.flush();
-        let _ = ctx.send_packet(None);
-        while ctx.receive_frame().ok().flatten().is_some() {}
-      }
+    if let Ok(mut inner) = self.inner.lock()
+      && let Some(ctx) = inner.context.as_mut()
+    {
+      ctx.flush();
+      let _ = ctx.send_packet(None);
+      while ctx.receive_frame().ok().flatten().is_some() {}
     }
   }
 }

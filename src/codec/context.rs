@@ -3,7 +3,7 @@
 //! Provides encoding and decoding functionality with RAII cleanup.
 
 use crate::ffi::{
-  self,
+  self, AVCodec, AVCodecContext, AVCodecID, AVHWDeviceType, AVPixelFormat,
   accessors::{
     ffctx_get_extradata, ffctx_get_extradata_size, ffctx_get_frame_size, ffctx_get_height,
     ffctx_get_pix_fmt, ffctx_get_sample_rate, ffctx_get_width, ffctx_set_bit_rate,
@@ -19,7 +19,6 @@ use crate::ffi::{
   },
   avutil::{av_opt_set, av_opt_set_int, opt_flag},
   error::{AVERROR_EAGAIN, AVERROR_EOF},
-  AVCodec, AVCodecContext, AVCodecID, AVHWDeviceType, AVPixelFormat,
 };
 use std::ffi::CString;
 use std::ptr::NonNull;
@@ -93,30 +92,27 @@ impl CodecContext {
     hw_type: Option<AVHWDeviceType>,
   ) -> CodecResult<Self> {
     // Try hardware encoder first if requested
-    if let Some(hw) = hw_type {
-      let hw_name = get_hw_encoder_name(codec_id, hw);
-      if let Some(name) = hw_name {
-        if let Ok(mut ctx) = Self::new_encoder_by_name(name) {
-          // Try to create and attach hardware device context
-          // Some encoders (like VideoToolbox) don't need it, but VAAPI does
-          if hw_encoder_needs_device_context(hw) {
-            if let Ok(hw_device) = HwDeviceContext::new(hw) {
-              ctx.set_hw_device(hw_device);
-            }
-            // If hw device creation fails, the encoder might still work
-            // (e.g., VideoToolbox manages its own device)
-          }
-          return Ok(ctx);
-        }
+    if let Some(hw) = hw_type
+      && let Some(name) = get_hw_encoder_name(codec_id, hw)
+      && let Ok(mut ctx) = Self::new_encoder_by_name(name)
+    {
+      // Try to create and attach hardware device context
+      // Some encoders (like VideoToolbox) don't need it, but VAAPI does
+      if hw_encoder_needs_device_context(hw)
+        && let Ok(hw_device) = HwDeviceContext::new(hw)
+      {
+        ctx.set_hw_device(hw_device);
       }
+      // If hw device creation fails, the encoder might still work
+      // (e.g., VideoToolbox manages its own device)
+      return Ok(ctx);
     }
 
     // Fall back to software encoder
-    let sw_name = get_sw_encoder_name(codec_id);
-    if let Some(name) = sw_name {
-      if let Ok(ctx) = Self::new_encoder_by_name(name) {
-        return Ok(ctx);
-      }
+    if let Some(name) = get_sw_encoder_name(codec_id)
+      && let Ok(ctx) = Self::new_encoder_by_name(name)
+    {
+      return Ok(ctx);
     }
 
     // Last resort: generic codec ID lookup
@@ -132,35 +128,32 @@ impl CodecContext {
     hw_type: Option<AVHWDeviceType>,
   ) -> CodecResult<EncoderCreationResult> {
     // Try hardware encoder first if requested
-    if let Some(hw) = hw_type {
-      let hw_name = get_hw_encoder_name(codec_id, hw);
-      if let Some(name) = hw_name {
-        if let Ok(mut ctx) = Self::new_encoder_by_name(name) {
-          // Try to create and attach hardware device context
-          if hw_encoder_needs_device_context(hw) {
-            if let Ok(hw_device) = HwDeviceContext::new(hw) {
-              ctx.set_hw_device(hw_device);
-            }
-          }
-          return Ok(EncoderCreationResult {
-            context: ctx,
-            is_hardware: true,
-            encoder_name: name.to_string(),
-          });
-        }
+    if let Some(hw) = hw_type
+      && let Some(name) = get_hw_encoder_name(codec_id, hw)
+      && let Ok(mut ctx) = Self::new_encoder_by_name(name)
+    {
+      // Try to create and attach hardware device context
+      if hw_encoder_needs_device_context(hw)
+        && let Ok(hw_device) = HwDeviceContext::new(hw)
+      {
+        ctx.set_hw_device(hw_device);
       }
+      return Ok(EncoderCreationResult {
+        context: ctx,
+        is_hardware: true,
+        encoder_name: name.to_string(),
+      });
     }
 
     // Fall back to software encoder
-    let sw_name = get_sw_encoder_name(codec_id);
-    if let Some(name) = sw_name {
-      if let Ok(ctx) = Self::new_encoder_by_name(name) {
-        return Ok(EncoderCreationResult {
-          context: ctx,
-          is_hardware: false,
-          encoder_name: name.to_string(),
-        });
-      }
+    if let Some(name) = get_sw_encoder_name(codec_id)
+      && let Ok(ctx) = Self::new_encoder_by_name(name)
+    {
+      return Ok(EncoderCreationResult {
+        context: ctx,
+        is_hardware: false,
+        encoder_name: name.to_string(),
+      });
     }
 
     // Last resort: generic codec ID lookup
@@ -182,12 +175,12 @@ impl CodecContext {
     let mut ctx = Self::new_decoder(codec_id)?;
 
     // Attach hardware device context if requested
-    if let Some(hw) = hw_type {
-      if let Ok(hw_device) = HwDeviceContext::new(hw) {
-        ctx.set_hw_device(hw_device);
-      }
-      // Hardware decode will fall back to software if device creation fails
+    if let Some(hw) = hw_type
+      && let Ok(hw_device) = HwDeviceContext::new(hw)
+    {
+      ctx.set_hw_device(hw_device);
     }
+    // Hardware decode will fall back to software if device creation fails
 
     Ok(ctx)
   }
@@ -204,13 +197,13 @@ impl CodecContext {
     let mut is_hardware = false;
 
     // Attach hardware device context if requested
-    if let Some(hw) = hw_type {
-      if let Ok(hw_device) = HwDeviceContext::new(hw) {
-        ctx.set_hw_device(hw_device);
-        is_hardware = true;
-      }
-      // Hardware decode will fall back to software if device creation fails
+    if let Some(hw) = hw_type
+      && let Ok(hw_device) = HwDeviceContext::new(hw)
+    {
+      ctx.set_hw_device(hw_device);
+      is_hardware = true;
     }
+    // Hardware decode will fall back to software if device creation fails
 
     Ok(DecoderCreationResult {
       context: ctx,

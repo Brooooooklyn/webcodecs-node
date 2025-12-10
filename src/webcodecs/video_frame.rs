@@ -255,7 +255,7 @@ unsafe fn get_raw_property(
   use napi::sys;
   let mut result: sys::napi_value = std::ptr::null_mut();
   let key_cstr = std::ffi::CString::new(key).unwrap();
-  sys::napi_get_named_property(env, obj, key_cstr.as_ptr(), &mut result);
+  unsafe { sys::napi_get_named_property(env, obj, key_cstr.as_ptr(), &mut result) };
   result
 }
 
@@ -275,15 +275,15 @@ impl FromNapiValue for VideoColorSpaceInit {
     value: napi::sys::napi_value,
   ) -> Result<Self> {
     let env_wrapper = Env::from_raw(env);
-    let obj = Object::from_napi_value(env, value)?;
+    let obj = unsafe { Object::from_napi_value(env, value)? };
 
     // Validate primaries - optional but must be valid if present
     let primaries: Option<VideoColorPrimaries> = if obj.has_named_property("primaries")? {
-      let raw_val = get_raw_property(env, value, "primaries");
+      let raw_val = unsafe { get_raw_property(env, value, "primaries") };
       if is_null_or_undefined(env, raw_val) {
         None
       } else {
-        let s: String = FromNapiValue::from_napi_value(env, raw_val)?;
+        let s: String = unsafe { FromNapiValue::from_napi_value(env, raw_val)? };
         match s.as_str() {
           "bt709" => Some(VideoColorPrimaries::Bt709),
           "bt470bg" => Some(VideoColorPrimaries::Bt470bg),
@@ -302,11 +302,11 @@ impl FromNapiValue for VideoColorSpaceInit {
 
     // Validate transfer - optional but must be valid if present
     let transfer: Option<VideoTransferCharacteristics> = if obj.has_named_property("transfer")? {
-      let raw_val = get_raw_property(env, value, "transfer");
+      let raw_val = unsafe { get_raw_property(env, value, "transfer") };
       if is_null_or_undefined(env, raw_val) {
         None
       } else {
-        let s: String = FromNapiValue::from_napi_value(env, raw_val)?;
+        let s: String = unsafe { FromNapiValue::from_napi_value(env, raw_val)? };
         match s.as_str() {
           "bt709" => Some(VideoTransferCharacteristics::Bt709),
           "smpte170m" => Some(VideoTransferCharacteristics::Smpte170m),
@@ -327,11 +327,11 @@ impl FromNapiValue for VideoColorSpaceInit {
 
     // Validate matrix - optional but must be valid if present
     let matrix: Option<VideoMatrixCoefficients> = if obj.has_named_property("matrix")? {
-      let raw_val = get_raw_property(env, value, "matrix");
+      let raw_val = unsafe { get_raw_property(env, value, "matrix") };
       if is_null_or_undefined(env, raw_val) {
         None
       } else {
-        let s: String = FromNapiValue::from_napi_value(env, raw_val)?;
+        let s: String = unsafe { FromNapiValue::from_napi_value(env, raw_val)? };
         match s.as_str() {
           "rgb" => Some(VideoMatrixCoefficients::Rgb),
           "bt709" => Some(VideoMatrixCoefficients::Bt709),
@@ -350,11 +350,11 @@ impl FromNapiValue for VideoColorSpaceInit {
 
     // fullRange is optional boolean - null/undefined is allowed
     let full_range: Option<bool> = if obj.has_named_property("fullRange")? {
-      let raw_val = get_raw_property(env, value, "fullRange");
+      let raw_val = unsafe { get_raw_property(env, value, "fullRange") };
       if is_null_or_undefined(env, raw_val) {
         None
       } else {
-        Some(FromNapiValue::from_napi_value(env, raw_val)?)
+        Some(unsafe { FromNapiValue::from_napi_value(env, raw_val)? })
       }
     } else {
       None
@@ -375,7 +375,7 @@ impl ToNapiValue for VideoColorSpaceInit {
 
     // Create empty object
     let mut raw_obj: sys::napi_value = std::ptr::null_mut();
-    let status = sys::napi_create_object(env, &mut raw_obj);
+    let status = unsafe { sys::napi_create_object(env, &mut raw_obj) };
     if status != sys::Status::napi_ok {
       return Err(Error::new(
         Status::GenericFailure,
@@ -383,7 +383,7 @@ impl ToNapiValue for VideoColorSpaceInit {
       ));
     }
 
-    let mut obj = Object::from_napi_value(env, raw_obj)?;
+    let mut obj = unsafe { Object::from_napi_value(env, raw_obj)? };
 
     // Set fields - Option<T> will serialize correctly
     if let Some(p) = val.primaries {
@@ -659,7 +659,7 @@ impl FromNapiValue for VideoFrameBufferInit {
     env: napi::sys::napi_env,
     value: napi::sys::napi_value,
   ) -> Result<Self> {
-    let obj = Object::from_napi_value(env, value)?;
+    let obj = unsafe { Object::from_napi_value(env, value)? };
 
     // Parse format string and validate - required field
     let format_str: Option<String> = obj.get("format")?;

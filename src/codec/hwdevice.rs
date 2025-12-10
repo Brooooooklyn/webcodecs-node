@@ -3,10 +3,9 @@
 //! Provides hardware acceleration device management for VideoToolbox, CUDA, VAAPI, etc.
 
 use crate::ffi::{
-  self,
+  self, AVBufferRef, AVHWDeviceType,
   avutil::av_buffer_unref,
   hwaccel::{av_hwdevice_ctx_create, av_hwdevice_get_type_name, av_hwdevice_iterate_types},
-  AVBufferRef, AVHWDeviceType,
 };
 use std::ffi::CStr;
 use std::ptr::NonNull;

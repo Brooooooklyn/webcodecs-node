@@ -62,14 +62,14 @@ pub fn is_hw_encoding_disabled() -> bool {
     }
 
     // Check for forgiveness interval - measured from when encoding was disabled
-    if let Some(disabled_at) = state.encoding_disabled_at {
-      if disabled_at.elapsed() >= FORGIVENESS_INTERVAL {
-        // Re-enable hardware after forgiveness period
-        state.encoding_disabled = false;
-        state.encoding_failure_count = 0;
-        state.encoding_disabled_at = None;
-        return false;
-      }
+    if let Some(disabled_at) = state.encoding_disabled_at
+      && disabled_at.elapsed() >= FORGIVENESS_INTERVAL
+    {
+      // Re-enable hardware after forgiveness period
+      state.encoding_disabled = false;
+      state.encoding_failure_count = 0;
+      state.encoding_disabled_at = None;
+      return false;
     }
 
     true

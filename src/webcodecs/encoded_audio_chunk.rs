@@ -52,7 +52,7 @@ impl FromNapiValue for EncodedAudioChunkInit {
     value: napi::sys::napi_value,
   ) -> Result<Self> {
     let env_wrapper = Env::from_raw(env);
-    let obj = Object::from_napi_value(env, value)?;
+    let obj = unsafe { Object::from_napi_value(env, value)? };
 
     // Validate type - required field, must throw TypeError if missing
     let chunk_type_value: Option<String> = obj.get("type")?;
@@ -469,7 +469,7 @@ impl FromNapiValue for AudioEncoderConfig {
     env: napi::sys::napi_env,
     value: napi::sys::napi_value,
   ) -> Result<Self> {
-    let obj = Object::from_napi_value(env, value)?;
+    let obj = unsafe { Object::from_napi_value(env, value)? };
 
     // All fields stored as Option - validation happens in configure() or isConfigSupported()
     let codec: Option<String> = obj.get("codec")?;
@@ -518,7 +518,7 @@ impl FromNapiValue for AudioDecoderConfig {
     env: napi::sys::napi_env,
     value: napi::sys::napi_value,
   ) -> Result<Self> {
-    let obj = Object::from_napi_value(env, value)?;
+    let obj = unsafe { Object::from_napi_value(env, value)? };
 
     // All fields stored as Option - validation happens in configure() or isConfigSupported()
     let codec: Option<String> = obj.get("codec")?;
@@ -565,7 +565,7 @@ impl ToNapiValue for AudioEncoderConfig {
       obj.set("flac", flac)?;
     }
 
-    Object::to_napi_value(env, obj)
+    unsafe { Object::to_napi_value(env, obj) }
   }
 }
 
@@ -587,7 +587,7 @@ impl ToNapiValue for AudioDecoderConfig {
       obj.set("description", description)?;
     }
 
-    Object::to_napi_value(env, obj)
+    unsafe { Object::to_napi_value(env, obj) }
   }
 }
 
@@ -611,16 +611,16 @@ pub struct AudioDecoderSupport {
 
 impl std::fmt::Debug for EncodedAudioChunk {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    if let Ok(guard) = self.inner.read() {
-      if let Some(ref inner) = *guard {
-        return f
-          .debug_struct("EncodedAudioChunk")
-          .field("type", &inner.chunk_type)
-          .field("timestamp", &inner.timestamp_us)
-          .field("duration", &inner.duration_us)
-          .field("byte_length", &inner.data.len())
-          .finish();
-      }
+    if let Ok(guard) = self.inner.read()
+      && let Some(ref inner) = *guard
+    {
+      return f
+        .debug_struct("EncodedAudioChunk")
+        .field("type", &inner.chunk_type)
+        .field("timestamp", &inner.timestamp_us)
+        .field("duration", &inner.duration_us)
+        .field("byte_length", &inner.data.len())
+        .finish();
     }
     f.debug_struct("EncodedAudioChunk")
       .field("closed", &true)

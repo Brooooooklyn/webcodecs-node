@@ -3,13 +3,13 @@
 //! Provides RAII-based memory management for encoded video data.
 
 use crate::ffi::{
-  self,
+  self, AVPacket,
   accessors::{
     ffpkt_data, ffpkt_dts, ffpkt_duration, ffpkt_flags, ffpkt_pts, ffpkt_set_dts,
     ffpkt_set_duration, ffpkt_set_flags, ffpkt_set_pts, ffpkt_size,
   },
   avcodec::{av_new_packet, av_packet_alloc, av_packet_free, av_packet_ref, av_packet_unref},
-  pkt_flag, AVPacket,
+  pkt_flag,
 };
 use std::ptr::NonNull;
 

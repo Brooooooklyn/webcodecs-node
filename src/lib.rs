@@ -27,12 +27,6 @@ fn init() {
 
 // Re-export WebCodecs types at crate root
 pub use webcodecs::{
-  // Hardware acceleration utilities
-  get_available_hardware_accelerators,
-  get_hardware_accelerators,
-  get_preferred_hardware_accelerator,
-  is_hardware_accelerator_available,
-  reset_hardware_fallback_state,
   // Audio types
   AudioData,
   AudioDataCopyToOptions,
@@ -75,4 +69,10 @@ pub use webcodecs::{
   VideoMatrixCoefficients,
   VideoPixelFormat,
   VideoTransferCharacteristics,
+  // Hardware acceleration utilities
+  get_available_hardware_accelerators,
+  get_hardware_accelerators,
+  get_preferred_hardware_accelerator,
+  is_hardware_accelerator_available,
+  reset_hardware_fallback_state,
 };

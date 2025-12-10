@@ -3,7 +3,8 @@
 //! Provides RAII-based memory management and safe access to frame data.
 
 use crate::ffi::{
-  self,
+  self, AVColorPrimaries, AVColorRange, AVColorSpace, AVColorTransferCharacteristic, AVFrame,
+  AVPictureType, AVPixelFormat, AVSampleFormat,
   accessors::{
     ff_get_audio_buffer_size,
     ffframe_data,
@@ -40,8 +41,6 @@ use crate::ffi::{
     ffframe_set_width,
   },
   avutil::{av_frame_alloc, av_frame_clone, av_frame_free, av_frame_get_buffer, av_frame_unref},
-  AVColorPrimaries, AVColorRange, AVColorSpace, AVColorTransferCharacteristic, AVFrame,
-  AVPictureType, AVPixelFormat, AVSampleFormat,
 };
 use std::ptr::NonNull;
 

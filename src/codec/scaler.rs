@@ -3,8 +3,8 @@
 //! Provides pixel format conversion and image scaling functionality.
 
 use crate::ffi::{
-  swscale::{sws_freeContext, sws_getContext, sws_scale},
   AVPixelFormat, SwsContext,
+  swscale::{sws_freeContext, sws_getContext, sws_scale},
 };
 use std::ptr::NonNull;
 

@@ -230,10 +230,10 @@ fn parse_hevc(codec: &str) -> Option<ParsedCodec> {
   if parts.len() >= 4 {
     // Level: Lxxx format (e.g., L120 = 120/30 = 4.0, L150 = 150/30 = 5.0)
     let level_str = parts[3];
-    if level_str.starts_with('L') || level_str.starts_with('l') {
-      if let Ok(level) = level_str[1..].parse::<u8>() {
-        parsed.level = Some(level);
-      }
+    if (level_str.starts_with('L') || level_str.starts_with('l'))
+      && let Ok(level) = level_str[1..].parse::<u8>()
+    {
+      parsed.level = Some(level);
     }
   }
 

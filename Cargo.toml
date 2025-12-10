@@ -4,11 +4,12 @@ members = ["tools/build-ffmpeg"]
 [package]
 name = "webcodec-node"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["LongYinan <lynweklm@gmail.com>"]
 description = "WebCodecs API implementation for Node.js using FFmpeg"
 license = "MIT"
-repository = "https://github.com/user/webcodec-node"
+repository = "https://github.com/Brooooooklyn/webcodec-node"
+publish = false
 
 [lib]
 crate-type = ["cdylib"]

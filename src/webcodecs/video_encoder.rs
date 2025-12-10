@@ -190,7 +190,7 @@ impl FromNapiValue for VideoEncoderInit {
     value: napi::sys::napi_value,
   ) -> Result<Self> {
     let env_wrapper = Env::from_raw(env);
-    let obj = Object::from_napi_value(env, value)?;
+    let obj = unsafe { Object::from_napi_value(env, value)? };
 
     // W3C spec: throw TypeError if required callbacks are missing
     // Get output callback as Function first, then create both FunctionRef and ThreadsafeFunction
@@ -357,13 +357,13 @@ impl Drop for VideoEncoder {
     // Drain encoder to ensure libaom/AV1 threads finish before context drops.
     // This prevents SIGSEGV when avcodec_free_context is called while libaom
     // still has internal threads running.
-    if let Ok(mut inner) = self.inner.lock() {
-      if let Some(ctx) = inner.context.as_mut() {
-        // Flush internal buffers first - this synchronizes libaom's thread pool
-        ctx.flush();
-        let _ = ctx.send_frame(None);
-        while ctx.receive_packet().ok().flatten().is_some() {}
-      }
+    if let Ok(mut inner) = self.inner.lock()
+      && let Some(ctx) = inner.context.as_mut()
+    {
+      // Flush internal buffers first - this synchronizes libaom's thread pool
+      ctx.flush();
+      let _ = ctx.send_frame(None);
+      while ctx.receive_packet().ok().flatten().is_some() {}
     }
   }
 }
@@ -620,8 +620,9 @@ impl VideoEncoder {
               let mut frame_to_reencode = buffered_frame;
               frame_to_reencode.set_pts(buffered_ts);
 
-              if let Some(ctx) = guard.context.as_mut() {
-                if let Ok(pkts) = ctx.encode(Some(&frame_to_reencode)) {
+              if let Some(ctx) = guard.context.as_mut()
+                && let Ok(pkts) = ctx.encode(Some(&frame_to_reencode))
+              {
                   for packet in pkts {
                     // Use buffered_ts (the original input timestamp) instead of packet.pts()
                     let chunk = EncodedVideoChunk::from_packet(&packet, Some(buffered_ts));
@@ -661,7 +662,6 @@ impl VideoEncoder {
                     }
                     guard.first_output_produced = true;
                   }
-                }
               }
             }
             let old_size = guard.encode_queue_size;
@@ -768,8 +768,9 @@ impl VideoEncoder {
                 let mut frame_to_reencode = buffered_frame;
                 frame_to_reencode.set_pts(buffered_ts);
 
-                if let Some(ctx) = guard.context.as_mut() {
-                  if let Ok(pkts) = ctx.encode(Some(&frame_to_reencode)) {
+                if let Some(ctx) = guard.context.as_mut()
+                  && let Ok(pkts) = ctx.encode(Some(&frame_to_reencode))
+                {
                     // Process any output packets from re-encoding
                     for packet in pkts {
                       // Use buffered_ts (the original input timestamp) instead of packet.pts()
@@ -809,7 +810,6 @@ impl VideoEncoder {
                       }
                       guard.first_output_produced = true;
                     }
-                  }
                 }
               }
 
@@ -839,8 +839,7 @@ impl VideoEncoder {
                 &mut guard,
                 &format!(
                   "OperationError: {} encoder ({}) failed (silent failure) and software fallback unavailable",
-                  codec,
-                  encoder_name
+                  codec, encoder_name
                 ),
               );
               return;
@@ -1254,29 +1253,29 @@ impl VideoEncoder {
     };
 
     // Validate display dimensions if specified
-    if let Some(dw) = config.display_width {
-      if dw == 0 {
-        return throw_type_error_unit(&env, "displayWidth must be greater than 0");
-      }
+    if let Some(dw) = config.display_width
+      && dw == 0
+    {
+      return throw_type_error_unit(&env, "displayWidth must be greater than 0");
     }
-    if let Some(dh) = config.display_height {
-      if dh == 0 {
-        return throw_type_error_unit(&env, "displayHeight must be greater than 0");
-      }
+    if let Some(dh) = config.display_height
+      && dh == 0
+    {
+      return throw_type_error_unit(&env, "displayHeight must be greater than 0");
     }
 
     // Validate bitrate if specified
-    if let Some(bitrate) = config.bitrate {
-      if bitrate <= 0.0 {
-        return throw_type_error_unit(&env, "bitrate must be greater than 0");
-      }
+    if let Some(bitrate) = config.bitrate
+      && bitrate <= 0.0
+    {
+      return throw_type_error_unit(&env, "bitrate must be greater than 0");
     }
 
     // Validate framerate if specified
-    if let Some(framerate) = config.framerate {
-      if framerate <= 0.0 {
-        return throw_type_error_unit(&env, "framerate must be greater than 0");
-      }
+    if let Some(framerate) = config.framerate
+      && framerate <= 0.0
+    {
+      return throw_type_error_unit(&env, "framerate must be greater than 0");
     }
 
     let mut inner = self
@@ -1302,14 +1301,14 @@ impl VideoEncoder {
     };
 
     // Validate scalability mode if specified
-    if let Some(ref mode) = config.scalability_mode {
-      if !is_valid_scalability_mode(mode) {
-        Self::report_error(
-          &mut inner,
-          &format!("NotSupportedError: Unsupported scalability mode: {}", mode),
-        );
-        return Ok(());
-      }
+    if let Some(ref mode) = config.scalability_mode
+      && !is_valid_scalability_mode(mode)
+    {
+      Self::report_error(
+        &mut inner,
+        &format!("NotSupportedError: Unsupported scalability mode: {}", mode),
+      );
+      return Ok(());
     }
 
     // Validate dimensions are within reasonable limits
@@ -1867,29 +1866,29 @@ impl VideoEncoder {
     };
 
     // Validate display dimensions if specified
-    if let Some(dw) = config.display_width {
-      if dw == 0 {
-        return reject_with_type_error(env, "displayWidth must be greater than 0");
-      }
+    if let Some(dw) = config.display_width
+      && dw == 0
+    {
+      return reject_with_type_error(env, "displayWidth must be greater than 0");
     }
-    if let Some(dh) = config.display_height {
-      if dh == 0 {
-        return reject_with_type_error(env, "displayHeight must be greater than 0");
-      }
+    if let Some(dh) = config.display_height
+      && dh == 0
+    {
+      return reject_with_type_error(env, "displayHeight must be greater than 0");
     }
 
     // Validate bitrate if specified
-    if let Some(bitrate) = config.bitrate {
-      if bitrate <= 0.0 {
-        return reject_with_type_error(env, "bitrate must be greater than 0");
-      }
+    if let Some(bitrate) = config.bitrate
+      && bitrate <= 0.0
+    {
+      return reject_with_type_error(env, "bitrate must be greater than 0");
     }
 
     // Validate framerate if specified
-    if let Some(framerate) = config.framerate {
-      if framerate <= 0.0 {
-        return reject_with_type_error(env, "framerate must be greater than 0");
-      }
+    if let Some(framerate) = config.framerate
+      && framerate <= 0.0
+    {
+      return reject_with_type_error(env, "framerate must be greater than 0");
     }
 
     // Validate dimensions if specified
@@ -1905,15 +1904,15 @@ impl VideoEncoder {
     }
 
     // Validate scalability mode if specified
-    if let Some(ref mode) = config.scalability_mode {
-      if !is_valid_scalability_mode(mode) {
-        return env.spawn_future(async move {
-          Ok(VideoEncoderSupport {
-            supported: false,
-            config,
-          })
-        });
-      }
+    if let Some(ref mode) = config.scalability_mode
+      && !is_valid_scalability_mode(mode)
+    {
+      return env.spawn_future(async move {
+        Ok(VideoEncoderSupport {
+          supported: false,
+          config,
+        })
+      });
     }
 
     env.spawn_future(async move {

@@ -3,11 +3,11 @@
 //! Provides audio resampling and format conversion functionality.
 
 use crate::ffi::{
+  AVChannelLayout, AVSampleFormat, SwrContext,
   swresample::{
     av_channel_layout_default, av_channel_layout_uninit, swr_alloc_set_opts2, swr_convert,
     swr_free, swr_get_delay, swr_get_out_samples, swr_init,
   },
-  AVChannelLayout, AVSampleFormat, SwrContext,
 };
 use std::ptr::NonNull;
 

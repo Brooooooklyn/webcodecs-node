@@ -4,8 +4,8 @@
 //! See: https://w3c.github.io/webcodecs/#audioencoder-interface
 
 use crate::codec::{
-  context::get_audio_encoder_name, AudioEncoderConfig as InternalAudioEncoderConfig,
-  AudioSampleBuffer, CodecContext, Frame, Resampler,
+  AudioEncoderConfig as InternalAudioEncoderConfig, AudioSampleBuffer, CodecContext, Frame,
+  Resampler, context::get_audio_encoder_name,
 };
 use crate::ffi::{AVCodecID, AVSampleFormat};
 use crate::webcodecs::error::{invalid_state_error, throw_type_error_unit};
@@ -58,7 +58,7 @@ impl FromNapiValue for AudioEncoderInit {
     value: napi::sys::napi_value,
   ) -> Result<Self> {
     let env_wrapper = Env::from_raw(env);
-    let obj = Object::from_napi_value(env, value)?;
+    let obj = unsafe { Object::from_napi_value(env, value)? };
 
     // W3C spec: throw TypeError if required callbacks are missing
     // Get output callback as Function first, then create both FunctionRef and ThreadsafeFunction
@@ -232,12 +232,12 @@ impl Drop for AudioEncoder {
 
     // Drain encoder to ensure codec threads finish before context drops.
     // This prevents potential SIGSEGV with codecs that use internal threads.
-    if let Ok(mut inner) = self.inner.lock() {
-      if let Some(ctx) = inner.context.as_mut() {
-        ctx.flush();
-        let _ = ctx.send_frame(None);
-        while ctx.receive_packet().ok().flatten().is_some() {}
-      }
+    if let Ok(mut inner) = self.inner.lock()
+      && let Some(ctx) = inner.context.as_mut()
+    {
+      ctx.flush();
+      let _ = ctx.send_frame(None);
+      while ctx.receive_packet().ok().flatten().is_some() {}
     }
   }
 }
@@ -581,8 +581,9 @@ impl AudioEncoder {
       }
 
       // Flush any remaining samples in buffer
-      if let Some(ref mut sample_buffer) = guard.sample_buffer {
-        if let Ok(Some(mut frame)) = sample_buffer.flush() {
+      if let Some(ref mut sample_buffer) = guard.sample_buffer
+        && let Ok(Some(mut frame)) = sample_buffer.flush()
+      {
           // Set timestamp using base_timestamp
           let frame_size = sample_buffer.frame_size() as i64;
           let sample_rate = sample_buffer.sample_rate() as i64;
@@ -615,7 +616,6 @@ impl AudioEncoder {
               guard.pending_chunks.push((chunk, metadata));
             }
           }
-        }
       }
 
       // Flush encoder
@@ -770,10 +770,10 @@ impl AudioEncoder {
     };
 
     // Validate bitrate if specified
-    if let Some(bitrate) = config.bitrate {
-      if bitrate <= 0.0 {
-        return throw_type_error_unit(&env, "bitrate must be greater than 0");
-      }
+    if let Some(bitrate) = config.bitrate
+      && bitrate <= 0.0
+    {
+      return throw_type_error_unit(&env, "bitrate must be greater than 0");
     }
 
     let mut inner = self
@@ -1292,10 +1292,10 @@ impl AudioEncoder {
     };
 
     // Validate bitrate if specified
-    if let Some(bitrate) = config.bitrate {
-      if bitrate <= 0.0 {
-        return reject_with_type_error(env, "bitrate must be greater than 0");
-      }
+    if let Some(bitrate) = config.bitrate
+      && bitrate <= 0.0
+    {
+      return reject_with_type_error(env, "bitrate must be greater than 0");
     }
 
     env.spawn_future(async move {

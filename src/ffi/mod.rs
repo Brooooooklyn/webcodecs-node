@@ -12,5 +12,5 @@ pub mod swresample;
 pub mod swscale;
 pub mod types;
 
-pub use error::{check_error, FFmpegError, FFmpegResult};
+pub use error::{FFmpegError, FFmpegResult, check_error};
 pub use types::*;

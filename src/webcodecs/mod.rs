@@ -36,8 +36,8 @@ pub use encoded_video_chunk::{
   VideoDecoderConfig, VideoEncoderBitrateMode, VideoEncoderConfig,
 };
 pub use hardware::{
-  get_available_hardware_accelerators, get_hardware_accelerators,
-  get_preferred_hardware_accelerator, is_hardware_accelerator_available, HardwareAccelerator,
+  HardwareAccelerator, get_available_hardware_accelerators, get_hardware_accelerators,
+  get_preferred_hardware_accelerator, is_hardware_accelerator_available,
 };
 pub use hw_fallback::reset_hardware_fallback_state;
 pub use image_decoder::{

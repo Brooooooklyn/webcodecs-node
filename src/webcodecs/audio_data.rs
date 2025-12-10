@@ -123,7 +123,7 @@ impl FromNapiValue for AudioDataInit {
     env: napi::sys::napi_env,
     value: napi::sys::napi_value,
   ) -> Result<Self> {
-    let obj = Object::from_napi_value(env, value)?;
+    let obj = unsafe { Object::from_napi_value(env, value)? };
 
     // Get format (required) - first check if it's a valid string
     let format_str: Option<String> = obj.get("format")?;
@@ -812,17 +812,17 @@ impl AudioData {
 
 impl std::fmt::Debug for AudioData {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    if let Ok(inner) = self.inner.lock() {
-      if let Some(ref i) = *inner {
-        return f
-          .debug_struct("AudioData")
-          .field("format", &i.format)
-          .field("sample_rate", &i.frame.sample_rate())
-          .field("number_of_frames", &i.frame.nb_samples())
-          .field("number_of_channels", &i.frame.channels())
-          .field("timestamp", &i.timestamp_us)
-          .finish();
-      }
+    if let Ok(inner) = self.inner.lock()
+      && let Some(ref i) = *inner
+    {
+      return f
+        .debug_struct("AudioData")
+        .field("format", &i.format)
+        .field("sample_rate", &i.frame.sample_rate())
+        .field("number_of_frames", &i.frame.nb_samples())
+        .field("number_of_channels", &i.frame.channels())
+        .field("timestamp", &i.timestamp_us)
+        .finish();
     }
     f.debug_struct("AudioData").field("closed", &true).finish()
   }

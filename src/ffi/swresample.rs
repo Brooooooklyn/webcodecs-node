@@ -6,7 +6,7 @@
 use super::types::*;
 use std::os::raw::c_int;
 
-extern "C" {
+unsafe extern "C" {
   // ========================================================================
   // Context Management
   // ========================================================================
@@ -295,42 +295,44 @@ pub unsafe fn create_resampler(
   in_sample_rate: u32,
   in_sample_fmt: AVSampleFormat,
 ) -> *mut SwrContext {
-  // Create channel layouts
-  let mut out_ch_layout: AVChannelLayout = std::mem::zeroed();
-  let mut in_ch_layout: AVChannelLayout = std::mem::zeroed();
+  unsafe {
+    // Create channel layouts
+    let mut out_ch_layout: AVChannelLayout = std::mem::zeroed();
+    let mut in_ch_layout: AVChannelLayout = std::mem::zeroed();
 
-  av_channel_layout_default(&mut out_ch_layout, out_channels as c_int);
-  av_channel_layout_default(&mut in_ch_layout, in_channels as c_int);
+    av_channel_layout_default(&mut out_ch_layout, out_channels as c_int);
+    av_channel_layout_default(&mut in_ch_layout, in_channels as c_int);
 
-  let mut ctx: *mut SwrContext = std::ptr::null_mut();
+    let mut ctx: *mut SwrContext = std::ptr::null_mut();
 
-  let ret = swr_alloc_set_opts2(
-    &mut ctx,
-    &out_ch_layout,
-    out_sample_fmt.as_raw(),
-    out_sample_rate as c_int,
-    &in_ch_layout,
-    in_sample_fmt.as_raw(),
-    in_sample_rate as c_int,
-    0,
-    std::ptr::null_mut(),
-  );
+    let ret = swr_alloc_set_opts2(
+      &mut ctx,
+      &out_ch_layout,
+      out_sample_fmt.as_raw(),
+      out_sample_rate as c_int,
+      &in_ch_layout,
+      in_sample_fmt.as_raw(),
+      in_sample_rate as c_int,
+      0,
+      std::ptr::null_mut(),
+    );
 
-  // Clean up channel layouts
-  av_channel_layout_uninit(&mut out_ch_layout);
-  av_channel_layout_uninit(&mut in_ch_layout);
+    // Clean up channel layouts
+    av_channel_layout_uninit(&mut out_ch_layout);
+    av_channel_layout_uninit(&mut in_ch_layout);
 
-  if ret < 0 || ctx.is_null() {
-    return std::ptr::null_mut();
+    if ret < 0 || ctx.is_null() {
+      return std::ptr::null_mut();
+    }
+
+    if swr_init(ctx) < 0 {
+      let mut ctx_ptr = ctx;
+      swr_free(&mut ctx_ptr);
+      return std::ptr::null_mut();
+    }
+
+    ctx
   }
-
-  if swr_init(ctx) < 0 {
-    let mut ctx_ptr = ctx;
-    swr_free(&mut ctx_ptr);
-    return std::ptr::null_mut();
-  }
-
-  ctx
 }
 
 /// Calculate the number of output samples for a given input sample count
@@ -352,7 +354,7 @@ pub unsafe fn calculate_output_samples(
   }
 
   // Get delay in input sample rate units
-  let delay = swr_get_delay(ctx, in_sample_rate as i64);
+  let delay = unsafe { swr_get_delay(ctx, in_sample_rate as i64) };
 
   // Calculate output samples: (delay + in_samples) * out_rate / in_rate
   // Add 1 for rounding
@@ -375,5 +377,5 @@ pub unsafe fn flush_resampler(ctx: *mut SwrContext, out: *mut *mut u8, out_count
     return 0;
   }
 
-  swr_convert(ctx, out, out_count as c_int, std::ptr::null(), 0)
+  unsafe { swr_convert(ctx, out, out_count as c_int, std::ptr::null(), 0) }
 }

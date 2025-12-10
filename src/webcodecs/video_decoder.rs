@@ -59,7 +59,7 @@ impl FromNapiValue for VideoDecoderInit {
     value: napi::sys::napi_value,
   ) -> Result<Self> {
     let env_wrapper = Env::from_raw(env);
-    let obj = Object::from_napi_value(env, value)?;
+    let obj = unsafe { Object::from_napi_value(env, value)? };
 
     // W3C spec: throw TypeError if required callbacks are missing
     // Get output callback as Function first, then create both FunctionRef and ThreadsafeFunction
@@ -230,13 +230,13 @@ impl Drop for VideoDecoder {
     // Drain decoder to ensure libaom/AV1 threads finish before context drops.
     // This prevents SIGSEGV when avcodec_free_context is called while libaom
     // still has internal threads running.
-    if let Ok(mut inner) = self.inner.lock() {
-      if let Some(ctx) = inner.context.as_mut() {
-        // Flush internal buffers first - this synchronizes libaom's thread pool
-        ctx.flush();
-        let _ = ctx.send_packet(None);
-        while ctx.receive_frame().ok().flatten().is_some() {}
-      }
+    if let Ok(mut inner) = self.inner.lock()
+      && let Some(ctx) = inner.context.as_mut()
+    {
+      // Flush internal buffers first - this synchronizes libaom's thread pool
+      ctx.flush();
+      let _ = ctx.send_packet(None);
+      while ctx.receive_frame().ok().flatten().is_some() {}
     }
   }
 }
@@ -827,27 +827,27 @@ impl VideoDecoder {
     };
 
     // Validate coded dimensions if specified
-    if let Some(w) = config.coded_width {
-      if w == 0 {
-        return throw_type_error_unit(&env, "codedWidth must be greater than 0");
-      }
+    if let Some(w) = config.coded_width
+      && w == 0
+    {
+      return throw_type_error_unit(&env, "codedWidth must be greater than 0");
     }
-    if let Some(h) = config.coded_height {
-      if h == 0 {
-        return throw_type_error_unit(&env, "codedHeight must be greater than 0");
-      }
+    if let Some(h) = config.coded_height
+      && h == 0
+    {
+      return throw_type_error_unit(&env, "codedHeight must be greater than 0");
     }
 
     // Validate display aspect dimensions if specified
-    if let Some(dw) = config.display_aspect_width {
-      if dw == 0 {
-        return throw_type_error_unit(&env, "displayAspectWidth must be greater than 0");
-      }
+    if let Some(dw) = config.display_aspect_width
+      && dw == 0
+    {
+      return throw_type_error_unit(&env, "displayAspectWidth must be greater than 0");
     }
-    if let Some(dh) = config.display_aspect_height {
-      if dh == 0 {
-        return throw_type_error_unit(&env, "displayAspectHeight must be greater than 0");
-      }
+    if let Some(dh) = config.display_aspect_height
+      && dh == 0
+    {
+      return throw_type_error_unit(&env, "displayAspectHeight must be greater than 0");
     }
 
     let mut inner = self
@@ -1327,27 +1327,27 @@ impl VideoDecoder {
     };
 
     // Validate coded dimensions if specified
-    if let Some(w) = config.coded_width {
-      if w == 0 {
-        return reject_with_type_error(env, "codedWidth must be greater than 0");
-      }
+    if let Some(w) = config.coded_width
+      && w == 0
+    {
+      return reject_with_type_error(env, "codedWidth must be greater than 0");
     }
-    if let Some(h) = config.coded_height {
-      if h == 0 {
-        return reject_with_type_error(env, "codedHeight must be greater than 0");
-      }
+    if let Some(h) = config.coded_height
+      && h == 0
+    {
+      return reject_with_type_error(env, "codedHeight must be greater than 0");
     }
 
     // Validate display aspect dimensions if specified
-    if let Some(dw) = config.display_aspect_width {
-      if dw == 0 {
-        return reject_with_type_error(env, "displayAspectWidth must be greater than 0");
-      }
+    if let Some(dw) = config.display_aspect_width
+      && dw == 0
+    {
+      return reject_with_type_error(env, "displayAspectWidth must be greater than 0");
     }
-    if let Some(dh) = config.display_aspect_height {
-      if dh == 0 {
-        return reject_with_type_error(env, "displayAspectHeight must be greater than 0");
-      }
+    if let Some(dh) = config.display_aspect_height
+      && dh == 0
+    {
+      return reject_with_type_error(env, "displayAspectHeight must be greater than 0");
     }
 
     // Validate dimensions if specified

@@ -5,15 +5,15 @@
 
 use crate::codec::{CodecContext, DecoderConfig, Packet};
 use crate::ffi::AVCodecID;
-use crate::webcodecs::error::invalid_state_error;
 use crate::webcodecs::VideoFrame;
+use crate::webcodecs::error::invalid_state_error;
 use futures::stream::{StreamExt, TryStreamExt};
 use napi::bindgen_prelude::*;
 use napi::tokio::sync::Notify;
 use napi_derive::napi;
 use std::sync::{
-  atomic::{AtomicBool, Ordering},
   Arc, Mutex,
+  atomic::{AtomicBool, Ordering},
 };
 
 const COMPLETED_PROMISE: &str = "[[completed]]";
@@ -65,7 +65,7 @@ impl<'env> FromNapiValue for ImageDecoderInit<'env> {
     value: napi::sys::napi_value,
   ) -> Result<Self> {
     let env_wrapper = Env::from_raw(env);
-    let obj = Object::from_napi_value(env, value)?;
+    let obj = unsafe { Object::from_napi_value(env, value)? };
 
     // Get MIME type (required) - throw native TypeError if missing
     let mime_type: String = match obj.get_named_property("type") {
@@ -89,7 +89,7 @@ impl<'env> FromNapiValue for ImageDecoderInit<'env> {
     let data_napi_value: napi::sys::napi_value = {
       let mut result = std::ptr::null_mut();
       napi::check_status!(
-        napi::sys::napi_get_named_property(env, value, c"data".as_ptr().cast(), &mut result),
+        unsafe { napi::sys::napi_get_named_property(env, value, c"data".as_ptr().cast(), &mut result) },
         "Failed to get 'data' property"
       )?;
       result
@@ -679,12 +679,11 @@ impl ImageDecoder {
           let frames = decode_image_data(context, &data_bytes)?;
 
           // Update frame_count
-          if !frames.is_empty() {
-            if let Ok(mut track_inner) = inner.tracks.inner.lock() {
-              if let Some(track) = track_inner.tracks.get_mut(0) {
-                track.frame_count = frames.len() as u32;
-              }
-            }
+          if !frames.is_empty()
+            && let Ok(mut track_inner) = inner.tracks.inner.lock()
+            && let Some(track) = track_inner.tracks.get_mut(0)
+          {
+            track.frame_count = frames.len() as u32;
           }
 
           inner.cached_frames = Some(frames);
@@ -760,12 +759,11 @@ impl ImageDecoder {
     inner.cached_frames = None;
 
     // Reset frame_count for animated formats (will be re-detected on next decode)
-    if let Ok(mut track_inner) = inner.tracks.inner.lock() {
-      if let Some(track) = track_inner.tracks.get_mut(0) {
-        if track.animated {
-          track.frame_count = 0;
-        }
-      }
+    if let Ok(mut track_inner) = inner.tracks.inner.lock()
+      && let Some(track) = track_inner.tracks.get_mut(0)
+      && track.animated
+    {
+      track.frame_count = 0;
     }
 
     Ok(())
@@ -885,12 +883,11 @@ fn pre_parse_and_cache_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<(
   })?;
 
   // Update frame_count in track info
-  if !frames.is_empty() {
-    if let Ok(mut track_inner) = inner_guard.tracks.inner.lock() {
-      if let Some(track) = track_inner.tracks.get_mut(0) {
-        track.frame_count = frames.len() as u32;
-      }
-    }
+  if !frames.is_empty()
+    && let Ok(mut track_inner) = inner_guard.tracks.inner.lock()
+    && let Some(track) = track_inner.tracks.get_mut(0)
+  {
+    track.frame_count = frames.len() as u32;
   }
 
   // Cache the decoded frames

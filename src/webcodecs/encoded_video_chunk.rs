@@ -98,7 +98,7 @@ impl FromNapiValue for EncodedVideoChunkInit {
     value: napi::sys::napi_value,
   ) -> Result<Self> {
     let env_wrapper = Env::from_raw(env);
-    let obj = Object::from_napi_value(env, value)?;
+    let obj = unsafe { Object::from_napi_value(env, value)? };
 
     // Validate type - required field, must throw TypeError if missing
     let chunk_type_value: Option<String> = obj.get("type")?;
@@ -454,7 +454,7 @@ impl FromNapiValue for VideoEncoderConfig {
     env: napi::sys::napi_env,
     value: napi::sys::napi_value,
   ) -> Result<Self> {
-    let obj = Object::from_napi_value(env, value)?;
+    let obj = unsafe { Object::from_napi_value(env, value)? };
 
     // All fields stored as Option - validation happens in configure() or isConfigSupported()
     let codec: Option<String> = obj.get("codec")?;
@@ -526,7 +526,7 @@ impl FromNapiValue for VideoDecoderConfig {
     value: napi::sys::napi_value,
   ) -> Result<Self> {
     let _env_wrapper = Env::from_raw(env);
-    let obj = Object::from_napi_value(env, value)?;
+    let obj = unsafe { Object::from_napi_value(env, value)? };
 
     // All fields stored as Option - validation happens in configure() or isConfigSupported()
     let codec: Option<String> = obj.get("codec")?;
@@ -618,7 +618,7 @@ impl ToNapiValue for VideoEncoderConfig {
       obj.set("hevc", hevc)?;
     }
 
-    Object::to_napi_value(env, obj)
+    unsafe { Object::to_napi_value(env, obj) }
   }
 }
 
@@ -655,6 +655,6 @@ impl ToNapiValue for VideoDecoderConfig {
       obj.set("description", description)?;
     }
 
-    Object::to_napi_value(env, obj)
+    unsafe { Object::to_napi_value(env, obj) }
   }
 }

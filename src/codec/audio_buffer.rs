@@ -151,11 +151,11 @@ impl AudioSampleBuffer {
           let src_offset = sample * self.bytes_per_sample;
           let dst_offset = (sample * self.channels as usize + ch) * self.bytes_per_sample;
 
-          if let Some(ch_data) = frame.audio_channel_data(ch) {
-            if src_offset + self.bytes_per_sample <= ch_data.len() {
-              interleaved[dst_offset..dst_offset + self.bytes_per_sample]
-                .copy_from_slice(&ch_data[src_offset..src_offset + self.bytes_per_sample]);
-            }
+          if let Some(ch_data) = frame.audio_channel_data(ch)
+            && src_offset + self.bytes_per_sample <= ch_data.len()
+          {
+            interleaved[dst_offset..dst_offset + self.bytes_per_sample]
+              .copy_from_slice(&ch_data[src_offset..src_offset + self.bytes_per_sample]);
           }
         }
       }
