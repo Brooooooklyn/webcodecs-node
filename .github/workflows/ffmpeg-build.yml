@@ -159,7 +159,7 @@ jobs:
 
     env:
       VCPKG_DEFAULT_TRIPLET: x64-windows-static
-      RAV1E_VERSION: "0.8.1"
+      RAV1E_VERSION: '0.8.1'
 
     steps:
       - uses: actions/checkout@v4
@@ -206,6 +206,7 @@ jobs:
             x264:x64-windows-static `
             x265:x64-windows-static `
             libvpx:x64-windows-static `
+            dav1d:x64-windows-static `
             opus:x64-windows-static `
             mp3lame:x64-windows-static `
             libogg:x64-windows-static `
@@ -322,6 +323,9 @@ jobs:
           # zlib
           create_pc "$PKGCONFIG_DIR_MSYS/zlib.pc" "$VCPKG_INSTALLED" "zlib" "zlib compression library" "1.3" '-I${includedir}' '-lz'
 
+          # dav1d AV1 decoder
+          create_pc "$PKGCONFIG_DIR_MSYS/dav1d.pc" "$VCPKG_INSTALLED" "dav1d" "dav1d AV1 decoder" "1.5.1" '-I${includedir}' '-ldav1d'
+
           # Set up pkg-config path (use MSYS path for pkg-config tool)
           export PKG_CONFIG_PATH="$PKGCONFIG_DIR_MSYS"
 
@@ -356,6 +360,7 @@ jobs:
           pkg-config --exists x265 && echo "x265: found" || echo "x265: not found"
           pkg-config --exists vpx && echo "vpx: found" || echo "vpx: not found"
           pkg-config --exists rav1e && echo "rav1e: found" || echo "rav1e: not found"
+          pkg-config --exists dav1d && echo "dav1d: found" || echo "dav1d: not found"
           pkg-config --exists opus && echo "opus: found" || echo "opus: not found"
           pkg-config --exists libmp3lame && echo "libmp3lame: found" || echo "libmp3lame: not found"
 
@@ -401,6 +406,7 @@ jobs:
             --enable-libx265 \
             --enable-libvpx \
             --enable-librav1e \
+            --enable-libdav1d \
             --enable-libopus \
             --enable-libmp3lame \
             --enable-libvorbis \
@@ -408,7 +414,7 @@ jobs:
             --enable-zlib \
             --extra-cflags="-I$VCPKG_INSTALLED/include -I$RAV1E_DIR/include -I$RAV1E_DIR/include/rav1e" \
             --extra-ldflags="-libpath:$VCPKG_INSTALLED/lib -libpath:$RAV1E_DIR/lib" \
-            --extra-libs="libx264.lib x265-static.lib vpx.lib rav1e.lib opus.lib libmp3lame-static.lib libmpghip-static.lib vorbis.lib vorbisenc.lib ogg.lib libwebp.lib libsharpyuv.lib zlib.lib ws2_32.lib userenv.lib ntdll.lib bcrypt.lib" \
+            --extra-libs="libx264.lib x265-static.lib vpx.lib rav1e.lib dav1d.lib opus.lib libmp3lame-static.lib libmpghip-static.lib vorbis.lib vorbisenc.lib ogg.lib libwebp.lib libsharpyuv.lib zlib.lib ws2_32.lib userenv.lib ntdll.lib bcrypt.lib" \
             --pkg-config-flags="--static"
 
           make -j$(nproc)
@@ -439,6 +445,7 @@ jobs:
             "libx264.lib",
             "x265-static.lib",
             "vpx.lib",
+            "dav1d.lib",
             "opus.lib",
             "libmp3lame-static.lib",
             "libmpghip-static.lib",

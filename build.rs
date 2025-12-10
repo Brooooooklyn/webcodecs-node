@@ -415,9 +415,9 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
     ("aom", !is_windows_msvc_x64), // AV1 (required except on Windows x64 MSVC)
     ("rav1e", is_windows_msvc_x64), // AV1 encoder (required on Windows x64 MSVC)
     // Optional codec libraries
-    ("dav1d", false),     // AV1 decoder
-    ("SvtAv1Enc", false), // SVT-AV1 encoder
-    ("xvidcore", false),  // Xvid MPEG-4
+    ("dav1d", is_windows_msvc_x64), // AV1 decoder (required on Windows x64 MSVC)
+    ("SvtAv1Enc", false),           // SVT-AV1 encoder
+    ("xvidcore", false),            // Xvid MPEG-4
     // Image format libraries
     ("webp", false),      // WebP support
     ("webpmux", false),   // WebP muxer

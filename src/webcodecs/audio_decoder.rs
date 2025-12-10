@@ -828,10 +828,19 @@ impl AudioDecoder {
     let (sender, receiver) = channel::unbounded();
     self.command_sender = Some(sender);
     let worker_inner = self.inner.clone();
+
+    // Create synchronization channel to wait for worker to be ready
+    let (ready_sender, ready_receiver) = channel::bounded::<()>(1);
+
     drop(inner); // Release lock before spawning thread
     self.worker_handle = Some(std::thread::spawn(move || {
+      // Signal that worker is ready before entering the loop
+      let _ = ready_sender.send(());
       Self::worker_loop(worker_inner, receiver);
     }));
+
+    // Wait for worker to be ready (prevents race condition)
+    let _ = ready_receiver.recv();
 
     Ok(())
   }

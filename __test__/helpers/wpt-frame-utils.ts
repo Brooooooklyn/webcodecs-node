@@ -7,8 +7,8 @@
 
 import type { ExecutionContext } from 'ava'
 
-import { VideoEncoder, VideoFrame } from '../../index.js'
-import type { VideoEncoderConfig, VideoFrameBufferInit } from '../../standard.js'
+import { VideoDecoder, VideoEncoder, VideoFrame } from '../../index.js'
+import type { VideoDecoderConfig, VideoEncoderConfig, VideoFrameBufferInit } from '../../standard.js'
 
 const DOT_SIZE = 20
 const DOT_STEP = DOT_SIZE * 2
@@ -235,6 +235,26 @@ export async function checkEncoderSupport(t: ExecutionContext, config: VideoEnco
     }
   } catch {
     t.log(`Skipping: Config check failed: ${JSON.stringify(config)}`)
+    return t.pass()
+  }
+}
+
+/**
+ * Check if decoder supports the given config, skip test if not.
+ * This is the Node.js equivalent of WPT's checkDecoderSupport.
+ *
+ * @param t - AVA execution context
+ * @param config - Video decoder configuration to check
+ */
+export async function checkDecoderSupport(t: ExecutionContext, config: VideoDecoderConfig): Promise<void> {
+  try {
+    const support = await VideoDecoder.isConfigSupported(config)
+    if (!support.supported) {
+      t.log(`Skipping: Unsupported decoder config: ${JSON.stringify(config)}`)
+      return t.pass()
+    }
+  } catch {
+    t.log(`Skipping: Decoder config check failed: ${JSON.stringify(config)}`)
     return t.pass()
   }
 }
