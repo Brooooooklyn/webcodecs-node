@@ -266,59 +266,61 @@ jobs:
           echo "=== rav1e lib files ==="
           ls -la "$RAV1E_DIR_MSYS/lib/"* 2>/dev/null || echo "No rav1e lib files found"
 
-          # Create pkg-config files for header discovery only
-          # Library linking is handled via --extra-libs to bypass pkg-config name mapping issues
-          # (vcpkg uses different lib names than FFmpeg expects, e.g., libx264.lib vs x264.lib)
+          # Create pkg-config files with proper Libs for configure checks
+          # We create library symlinks so FFmpeg can find libs with expected names
+          # (vcpkg uses different names: libx264.lib vs x264.lib, etc.)
 
-          # Helper function to create headers-only pkg-config files
+          # Helper function to create pkg-config files with Libs
           create_pc() {
-            local file="$1" prefix="$2" name="$3" desc="$4" version="$5" cflags="$6"
+            local file="$1" prefix="$2" name="$3" desc="$4" version="$5" cflags="$6" libs="$7"
             {
               printf 'prefix=%s\n' "$prefix"
+              printf 'libdir=${prefix}/lib\n'
               printf 'includedir=${prefix}/include\n'
               printf '\n'
               printf 'Name: %s\n' "$name"
               printf 'Description: %s\n' "$desc"
               printf 'Version: %s\n' "$version"
+              printf 'Libs: -L${libdir} %s\n' "$libs"
               printf 'Cflags: %s\n' "$cflags"
             } > "$file"
           }
 
-          # rav1e
-          create_pc "$PKGCONFIG_DIR_MSYS/rav1e.pc" "$RAV1E_DIR" "rav1e" "rav1e AV1 encoder" "0.8.1" '-I${includedir}/rav1e'
+          # rav1e (needs system libs for Rust runtime)
+          create_pc "$PKGCONFIG_DIR_MSYS/rav1e.pc" "$RAV1E_DIR" "rav1e" "rav1e AV1 encoder" "0.8.1" '-I${includedir}/rav1e' '-lrav1e -lws2_32 -luserenv -lntdll -lbcrypt'
 
           # x264
-          create_pc "$PKGCONFIG_DIR_MSYS/x264.pc" "$VCPKG_INSTALLED" "x264" "x264 H.264 encoder" "0.164" '-I${includedir}'
+          create_pc "$PKGCONFIG_DIR_MSYS/x264.pc" "$VCPKG_INSTALLED" "x264" "x264 H.264 encoder" "0.164" '-I${includedir}' '-lx264'
 
           # x265
-          create_pc "$PKGCONFIG_DIR_MSYS/x265.pc" "$VCPKG_INSTALLED" "x265" "x265 HEVC encoder" "3.5" '-I${includedir}'
+          create_pc "$PKGCONFIG_DIR_MSYS/x265.pc" "$VCPKG_INSTALLED" "x265" "x265 HEVC encoder" "3.5" '-I${includedir}' '-lx265'
 
           # vpx
-          create_pc "$PKGCONFIG_DIR_MSYS/vpx.pc" "$VCPKG_INSTALLED" "vpx" "WebM VP8/VP9 codec" "1.13.0" '-I${includedir}'
+          create_pc "$PKGCONFIG_DIR_MSYS/vpx.pc" "$VCPKG_INSTALLED" "vpx" "WebM VP8/VP9 codec" "1.13.0" '-I${includedir}' '-lvpx'
 
           # opus
-          create_pc "$PKGCONFIG_DIR_MSYS/opus.pc" "$VCPKG_INSTALLED" "opus" "Opus audio codec" "1.4" '-I${includedir}/opus'
+          create_pc "$PKGCONFIG_DIR_MSYS/opus.pc" "$VCPKG_INSTALLED" "opus" "Opus audio codec" "1.4" '-I${includedir}/opus' '-lopus'
 
-          # libmp3lame
-          create_pc "$PKGCONFIG_DIR_MSYS/libmp3lame.pc" "$VCPKG_INSTALLED" "libmp3lame" "LAME MP3 encoder" "3.100" '-I${includedir}'
+          # libmp3lame (needs mpghip for MP3 decoding interface)
+          create_pc "$PKGCONFIG_DIR_MSYS/libmp3lame.pc" "$VCPKG_INSTALLED" "libmp3lame" "LAME MP3 encoder" "3.100" '-I${includedir}' '-lmp3lame -lmpghip'
 
           # ogg
-          create_pc "$PKGCONFIG_DIR_MSYS/ogg.pc" "$VCPKG_INSTALLED" "ogg" "Ogg bitstream library" "1.3.5" '-I${includedir}'
+          create_pc "$PKGCONFIG_DIR_MSYS/ogg.pc" "$VCPKG_INSTALLED" "ogg" "Ogg bitstream library" "1.3.5" '-I${includedir}' '-logg'
 
-          # vorbis
-          create_pc "$PKGCONFIG_DIR_MSYS/vorbis.pc" "$VCPKG_INSTALLED" "vorbis" "Vorbis audio codec" "1.3.7" '-I${includedir}'
+          # vorbis (depends on ogg)
+          create_pc "$PKGCONFIG_DIR_MSYS/vorbis.pc" "$VCPKG_INSTALLED" "vorbis" "Vorbis audio codec" "1.3.7" '-I${includedir}' '-lvorbis -logg'
 
-          # vorbisenc
-          create_pc "$PKGCONFIG_DIR_MSYS/vorbisenc.pc" "$VCPKG_INSTALLED" "vorbisenc" "Vorbis encoder" "1.3.7" '-I${includedir}'
+          # vorbisenc (depends on vorbis)
+          create_pc "$PKGCONFIG_DIR_MSYS/vorbisenc.pc" "$VCPKG_INSTALLED" "vorbisenc" "Vorbis encoder" "1.3.7" '-I${includedir}' '-lvorbisenc -lvorbis -logg'
 
-          # vorbisfile
-          create_pc "$PKGCONFIG_DIR_MSYS/vorbisfile.pc" "$VCPKG_INSTALLED" "vorbisfile" "Vorbis file decoder" "1.3.7" '-I${includedir}'
+          # vorbisfile (depends on vorbis)
+          create_pc "$PKGCONFIG_DIR_MSYS/vorbisfile.pc" "$VCPKG_INSTALLED" "vorbisfile" "Vorbis file decoder" "1.3.7" '-I${includedir}' '-lvorbisfile -lvorbis -logg'
 
-          # libwebp
-          create_pc "$PKGCONFIG_DIR_MSYS/libwebp.pc" "$VCPKG_INSTALLED" "libwebp" "WebP image codec" "1.3.2" '-I${includedir}'
+          # libwebp (needs sharpyuv)
+          create_pc "$PKGCONFIG_DIR_MSYS/libwebp.pc" "$VCPKG_INSTALLED" "libwebp" "WebP image codec" "1.3.2" '-I${includedir}' '-lwebp -lsharpyuv'
 
           # zlib
-          create_pc "$PKGCONFIG_DIR_MSYS/zlib.pc" "$VCPKG_INSTALLED" "zlib" "zlib compression library" "1.3" '-I${includedir}'
+          create_pc "$PKGCONFIG_DIR_MSYS/zlib.pc" "$VCPKG_INSTALLED" "zlib" "zlib compression library" "1.3" '-I${includedir}' '-lz'
 
           # Set up pkg-config path (use MSYS path for pkg-config tool)
           export PKG_CONFIG_PATH="$PKGCONFIG_DIR_MSYS"
@@ -330,6 +332,8 @@ jobs:
           cd "$VCPKG_INSTALLED_MSYS/lib"
           # mp3lame: libmp3lame-static.lib -> mp3lame.lib
           [ -f libmp3lame-static.lib ] && [ ! -f mp3lame.lib ] && cp libmp3lame-static.lib mp3lame.lib && echo "Created mp3lame.lib"
+          # mpghip: libmpghip-static.lib -> mpghip.lib (required by mp3lame for MP3 decoding)
+          [ -f libmpghip-static.lib ] && [ ! -f mpghip.lib ] && cp libmpghip-static.lib mpghip.lib && echo "Created mpghip.lib"
           # x264: libx264.lib -> x264.lib
           [ -f libx264.lib ] && [ ! -f x264.lib ] && cp libx264.lib x264.lib && echo "Created x264.lib"
           # x265: x265-static.lib -> x265.lib
@@ -404,7 +408,7 @@ jobs:
             --enable-zlib \
             --extra-cflags="-I$VCPKG_INSTALLED/include -I$RAV1E_DIR/include -I$RAV1E_DIR/include/rav1e" \
             --extra-ldflags="-libpath:$VCPKG_INSTALLED/lib -libpath:$RAV1E_DIR/lib" \
-            --extra-libs="libx264.lib x265-static.lib vpx.lib rav1e.lib opus.lib libmp3lame-static.lib vorbis.lib vorbisenc.lib ogg.lib libwebp.lib libsharpyuv.lib zlib.lib ws2_32.lib userenv.lib ntdll.lib bcrypt.lib" \
+            --extra-libs="libx264.lib x265-static.lib vpx.lib rav1e.lib opus.lib libmp3lame-static.lib libmpghip-static.lib vorbis.lib vorbisenc.lib ogg.lib libwebp.lib libsharpyuv.lib zlib.lib ws2_32.lib userenv.lib ntdll.lib bcrypt.lib" \
             --pkg-config-flags="--static"
 
           make -j$(nproc)
