@@ -1,7 +1,7 @@
 {
   "compilerOptions": {
     "target": "ESNext",
-    "lib": ["ESNext"],
+    "lib": ["ES2023"],
     "strict": true,
     "moduleResolution": "bundler",
     "module": "ESNext",
@@ -14,5 +14,8 @@
     "outDir": "./dist",
   },
   "include": ["."],
-  "exclude": ["dist", "node_modules", "ffmpeg-build", "ffmpeg-src", "specs"],
+  "exclude": ["dist", "node_modules", "ffmpeg-build", "ffmpeg-src", "specs", "polyfill.d.ts", "polyfill.js", "__test__/integration/conversion.spec.ts"],
+  "references": [
+    { "path": "./tsconfig.polyfill.json" }
+  ]
 }

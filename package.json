@@ -5,6 +5,18 @@
   "main": "index.js",
   "types": "index.d.ts",
   "browser": "browser.js",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "require": "./index.js",
+      "import": "./index.js"
+    },
+    "./polyfill": {
+      "types": "./polyfill.d.ts",
+      "require": "./polyfill.js",
+      "import": "./polyfill.js"
+    }
+  },
   "repository": {
     "url": "git+ssh://git@github.com/Brooooooklyn/webcodecs-node.git",
     "type": "git"
@@ -21,7 +33,9 @@
   "files": [
     "index.d.ts",
     "index.js",
-    "standard.d.ts"
+    "standard.d.ts",
+    "polyfill.js",
+    "polyfill.d.ts"
   ],
   "napi": {
     "binaryName": "webcodecs",
