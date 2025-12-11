@@ -254,10 +254,9 @@ The encoder automatically applies optimal settings for each hardware encoder bas
 
 ### Not Implemented
 
-| Feature                      | Status | Notes                                             |
-| ---------------------------- | ------ | ------------------------------------------------- |
-| VideoFrame.visibleRect crop  | ❌     | Cropping parameter not implemented, returns error |
-| Multi-spatial SVC (L2T*, S*) | ❌     | Only L1Tx temporal modes populate `metadata.svc`  |
+| Feature                      | Status | Notes                                            |
+| ---------------------------- | ------ | ------------------------------------------------ |
+| Multi-spatial SVC (L2T*, S*) | ❌     | Only L1Tx temporal modes populate `metadata.svc` |
 
 ### ImageDecoder Options
 

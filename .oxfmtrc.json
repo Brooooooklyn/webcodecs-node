@@ -5,13 +5,5 @@
   "printWidth": 120,
   "trailingComma": "all",
   "arrowParens": "always",
-  "ignorePatterns": [
-    "dist/**",
-    "node_modules/**",
-    "build/**",
-    "ffmpeg-build/**",
-    "ffmpeg-src/**",
-    "./index.js",
-    "!**/*.{ts,js}"
-  ]
+  "ignorePatterns": ["dist/**", "node_modules/**", "build/**", "ffmpeg-build/**", "ffmpeg-src/**", "!**/*.{ts,js,json}"]
 }

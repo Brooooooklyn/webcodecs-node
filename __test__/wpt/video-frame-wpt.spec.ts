@@ -740,6 +740,189 @@ test('VideoFrame: visibleRect closed throws', (t) => {
   )
 })
 
+test('VideoFrame: construction with visibleRect crops correctly', (t) => {
+  const width = 8
+  const height = 8
+  const data = new Uint8Array(width * height * 4) // RGBA
+
+  const frame = new VideoFrame(data, {
+    format: 'RGBA',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+    visibleRect: { x: 2, y: 2, width: 4, height: 4 },
+  })
+
+  t.is(frame.codedWidth, 8)
+  t.is(frame.codedHeight, 8)
+  t.is(frame.visibleRect?.x, 2)
+  t.is(frame.visibleRect?.y, 2)
+  t.is(frame.visibleRect?.width, 4)
+  t.is(frame.visibleRect?.height, 4)
+  t.is(frame.displayWidth, 4) // Defaults to visible dimensions
+  t.is(frame.displayHeight, 4)
+
+  frame.close()
+})
+
+test('VideoFrame: I420 with even visibleRect offset succeeds', (t) => {
+  const data = new Uint8Array(64 * 64 * 1.5) // I420
+
+  const frame = new VideoFrame(data, {
+    format: 'I420',
+    codedWidth: 64,
+    codedHeight: 64,
+    timestamp: 0,
+    visibleRect: { x: 2, y: 4, width: 8, height: 8 },
+  })
+
+  t.is(frame.visibleRect?.x, 2)
+  t.is(frame.visibleRect?.y, 4)
+  frame.close()
+})
+
+test('VideoFrame: I420 with odd x offset throws alignment error', (t) => {
+  const data = new Uint8Array(64 * 64 * 1.5) // I420
+
+  const error = t.throws(() => {
+    new VideoFrame(data, {
+      format: 'I420',
+      codedWidth: 64,
+      codedHeight: 64,
+      timestamp: 0,
+      visibleRect: { x: 1, y: 0, width: 4, height: 4 }, // x=1 is odd
+    })
+  })
+
+  t.true(error?.message.includes('alignment'))
+})
+
+test('VideoFrame: I420 with odd y offset throws alignment error', (t) => {
+  const data = new Uint8Array(64 * 64 * 1.5) // I420
+
+  const error = t.throws(() => {
+    new VideoFrame(data, {
+      format: 'I420',
+      codedWidth: 64,
+      codedHeight: 64,
+      timestamp: 0,
+      visibleRect: { x: 0, y: 1, width: 4, height: 4 }, // y=1 is odd
+    })
+  })
+
+  t.true(error?.message.includes('alignment'))
+})
+
+test('VideoFrame: RGBA allows any visibleRect offset', (t) => {
+  const data = new Uint8Array(64 * 64 * 4) // RGBA
+
+  const frame = new VideoFrame(data, {
+    format: 'RGBA',
+    codedWidth: 64,
+    codedHeight: 64,
+    timestamp: 0,
+    visibleRect: { x: 1, y: 3, width: 10, height: 10 }, // Odd offsets OK for RGBA
+  })
+
+  t.is(frame.visibleRect?.x, 1)
+  t.is(frame.visibleRect?.y, 3)
+  frame.close()
+})
+
+test('VideoFrame: visibleRect exceeding bounds throws TypeError', (t) => {
+  const data = new Uint8Array(64 * 64 * 4) // RGBA
+
+  const error = t.throws(() => {
+    new VideoFrame(data, {
+      format: 'RGBA',
+      codedWidth: 64,
+      codedHeight: 64,
+      timestamp: 0,
+      visibleRect: { x: 60, y: 0, width: 10, height: 10 }, // 60+10 > 64
+    })
+  })
+
+  t.true(error?.message.includes('exceeds'))
+})
+
+test('VideoFrame.fromVideoFrame: with visibleRect crops', (t) => {
+  const width = 8
+  const height = 8
+  const data = new Uint8Array(width * height * 4) // RGBA
+
+  const source = new VideoFrame(data, {
+    format: 'RGBA',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+  })
+
+  const cropped = VideoFrame.fromVideoFrame(source, {
+    visibleRect: { x: 2, y: 2, width: 4, height: 4 },
+  })
+
+  t.is(cropped.visibleRect?.x, 2)
+  t.is(cropped.visibleRect?.y, 2)
+  t.is(cropped.visibleRect?.width, 4)
+  t.is(cropped.visibleRect?.height, 4)
+  t.is(cropped.displayWidth, 4)
+  t.is(cropped.displayHeight, 4)
+
+  source.close()
+  cropped.close()
+})
+
+test('VideoFrame: copyTo with rect copies subregion', async (t) => {
+  const width = 8
+  const height = 8
+  const data = new Uint8Array(width * height * 4) // RGBA
+  // Fill with pattern
+  for (let i = 0; i < data.length; i++) {
+    data[i] = i % 256
+  }
+
+  const frame = new VideoFrame(data, {
+    format: 'RGBA',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+  })
+
+  // Copy a 4x4 subregion starting at (2, 2)
+  const subSize = frame.allocationSize({ rect: { x: 2, y: 2, width: 4, height: 4 } })
+  t.is(subSize, 4 * 4 * 4) // 4x4 pixels * 4 bytes per pixel = 64 bytes
+  const subDest = new Uint8Array(subSize)
+
+  await frame.copyTo(subDest, { rect: { x: 2, y: 2, width: 4, height: 4 } })
+
+  // Verify first pixel of subregion matches expected data
+  // Row 2, Col 2 of 8-wide RGBA = offset (2*8 + 2) * 4 = 72
+  t.is(subDest[0], data[72])
+  t.is(subDest[1], data[73])
+  t.is(subDest[2], data[74])
+  t.is(subDest[3], data[75])
+
+  frame.close()
+})
+
+test('VideoFrame: allocationSize uses visible rect by default', (t) => {
+  const data = new Uint8Array(64 * 64 * 4) // RGBA
+
+  const frame = new VideoFrame(data, {
+    format: 'RGBA',
+    codedWidth: 64,
+    codedHeight: 64,
+    timestamp: 0,
+    visibleRect: { x: 0, y: 0, width: 32, height: 32 },
+  })
+
+  // Default allocationSize should use visible rect dimensions
+  const size = frame.allocationSize()
+  t.is(size, 32 * 32 * 4) // 32x32 pixels * 4 bytes per pixel
+
+  frame.close()
+})
+
 // ============================================================================
 // fromVideoFrame Tests
 // ============================================================================

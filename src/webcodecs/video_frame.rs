@@ -870,6 +870,12 @@ struct VideoFrameInner {
   original_format: VideoPixelFormat,
   timestamp_us: i64,
   duration_us: Option<i64>,
+  /// Visible rectangle internal slots per W3C spec
+  visible_left: u32,
+  visible_top: u32,
+  visible_width: u32,
+  visible_height: u32,
+  /// Display dimensions (may differ from visible rect if explicitly set)
   display_width: u32,
   display_height: u32,
   /// Rotation in degrees clockwise (0, 90, 180, 270)
@@ -878,6 +884,118 @@ struct VideoFrameInner {
   flip: bool,
   color_space: VideoColorSpace,
   closed: bool,
+}
+
+/// Get (horizontal_factor, vertical_factor) sub-sampling for chroma planes
+/// Per W3C spec - used for Verify Rect Offset Alignment algorithm
+fn get_subsampling_factors(format: VideoPixelFormat) -> (u32, u32) {
+  match format {
+    // 4:2:0 formats - 2x2 subsampling
+    VideoPixelFormat::I420
+    | VideoPixelFormat::I420A
+    | VideoPixelFormat::I420P10
+    | VideoPixelFormat::I420AP10
+    | VideoPixelFormat::I420P12
+    | VideoPixelFormat::NV12
+    | VideoPixelFormat::NV21 => (2, 2),
+
+    // 4:2:2 formats - 2x1 subsampling (horizontal only)
+    VideoPixelFormat::I422
+    | VideoPixelFormat::I422A
+    | VideoPixelFormat::I422P10
+    | VideoPixelFormat::I422AP10
+    | VideoPixelFormat::I422P12 => (2, 1),
+
+    // 4:4:4 formats and RGB - no subsampling
+    VideoPixelFormat::I444
+    | VideoPixelFormat::I444A
+    | VideoPixelFormat::I444P10
+    | VideoPixelFormat::I444AP10
+    | VideoPixelFormat::I444P12
+    | VideoPixelFormat::RGBA
+    | VideoPixelFormat::RGBX
+    | VideoPixelFormat::BGRA
+    | VideoPixelFormat::BGRX => (1, 1),
+  }
+}
+
+/// Per W3C spec: Verify Rect Offset Alignment
+/// Returns true if rect offset is properly aligned for the format's subsampling
+fn verify_rect_offset_alignment(format: VideoPixelFormat, x: u32, y: u32) -> bool {
+  let (h_factor, v_factor) = get_subsampling_factors(format);
+  // For each plane, x must be multiple of horizontal factor
+  // and y must be multiple of vertical factor
+  x.is_multiple_of(h_factor) && y.is_multiple_of(v_factor)
+}
+
+/// Per W3C spec: Parse Visible Rect algorithm
+/// Takes default rect, optional override rect, coded dimensions, and format
+/// Returns (left, top, width, height) or error
+fn parse_visible_rect(
+  default_rect: (f64, f64, f64, f64), // (x, y, width, height)
+  override_rect: Option<&DOMRectInit>,
+  coded_width: u32,
+  coded_height: u32,
+  format: VideoPixelFormat,
+) -> Result<(u32, u32, u32, u32)> {
+  let (x, y, width, height) = match override_rect {
+    Some(rect) => {
+      let x = rect.x.unwrap_or(default_rect.0);
+      let y = rect.y.unwrap_or(default_rect.1);
+      let width = rect.width.unwrap_or(default_rect.2);
+      let height = rect.height.unwrap_or(default_rect.3);
+      (x, y, width, height)
+    }
+    None => default_rect,
+  };
+
+  // Validate: values must be non-negative and finite
+  if x < 0.0 || y < 0.0 || width <= 0.0 || height <= 0.0 {
+    return Err(Error::new(
+      Status::InvalidArg,
+      "TypeError: visibleRect dimensions must be positive",
+    ));
+  }
+  if !x.is_finite() || !y.is_finite() || !width.is_finite() || !height.is_finite() {
+    return Err(Error::new(
+      Status::InvalidArg,
+      "TypeError: visibleRect values must be finite",
+    ));
+  }
+
+  // Truncate to integer (per spec)
+  let x = x as u32;
+  let y = y as u32;
+  let width = width as u32;
+  let height = height as u32;
+
+  // Validate bounds
+  if x + width > coded_width {
+    return Err(Error::new(
+      Status::InvalidArg,
+      "TypeError: visibleRect.x + width exceeds codedWidth",
+    ));
+  }
+  if y + height > coded_height {
+    return Err(Error::new(
+      Status::InvalidArg,
+      "TypeError: visibleRect.y + height exceeds codedHeight",
+    ));
+  }
+
+  // Verify alignment for subsampled formats
+  if !verify_rect_offset_alignment(format, x, y) {
+    let (h, v) = get_subsampling_factors(format);
+    return Err(Error::new(
+      Status::InvalidArg,
+      format!(
+        "TypeError: visibleRect offset ({}, {}) not aligned for format {:?} (requires {}x{} alignment)",
+        x, y, format, h, v
+      ),
+    ));
+  }
+
+  Ok((x, y, width, height))
 }
 
 /// VideoFrame - represents a frame of video
@@ -970,19 +1088,29 @@ impl VideoFrame {
     let rotation = parse_rotation(init.rotation.unwrap_or(0.0));
     let flip = init.flip.unwrap_or(false);
 
-    // Display dimensions default to visible/coded dimensions, swapped if rotation is 90/270
+    // Parse visible rect per W3C spec (default to full coded size)
+    let default_rect = (0.0, 0.0, width as f64, height as f64);
+    let (visible_left, visible_top, visible_width, visible_height) = parse_visible_rect(
+      default_rect,
+      init.visible_rect.as_ref(),
+      width,
+      height,
+      init.format,
+    )?;
+
+    // Display dimensions default to visible dimensions, swapped if rotation is 90/270
     let display_width = init.display_width.unwrap_or({
       if rotation == 90.0 || rotation == 270.0 {
-        height
+        visible_height
       } else {
-        width
+        visible_width
       }
     });
     let display_height = init.display_height.unwrap_or({
       if rotation == 90.0 || rotation == 270.0 {
-        width
+        visible_width
       } else {
-        height
+        visible_height
       }
     });
 
@@ -993,6 +1121,10 @@ impl VideoFrame {
       original_format: init.format,
       timestamp_us: init.timestamp,
       duration_us: init.duration,
+      visible_left,
+      visible_top,
+      visible_width,
+      visible_height,
       display_width,
       display_height,
       rotation,
@@ -1035,14 +1167,20 @@ impl VideoFrame {
       let timestamp_us = init.timestamp.unwrap_or(source_inner.timestamp_us);
       let duration_us = init.duration.or(source_inner.duration_us);
 
-      // Note: alpha handling and visible_rect cropping are not yet implemented
-      // visible_rect would require sub-region copying which is complex
-      if init.visible_rect.is_some() {
-        return Err(Error::new(
-          Status::GenericFailure,
-          "VideoFrame visibleRect parameter is not yet implemented",
-        ));
-      }
+      // Parse visible rect per W3C spec (source's visible rect is the default)
+      let default_rect = (
+        source_inner.visible_left as f64,
+        source_inner.visible_top as f64,
+        source_inner.visible_width as f64,
+        source_inner.visible_height as f64,
+      );
+      let (visible_left, visible_top, visible_width, visible_height) = parse_visible_rect(
+        default_rect,
+        init.visible_rect.as_ref(),
+        cloned_frame.width(),
+        cloned_frame.height(),
+        source_inner.original_format,
+      )?;
 
       // Handle rotation per W3C spec "Add Rotations" algorithm
       let init_rotation = parse_rotation(init.rotation.unwrap_or(0.0));
@@ -1059,14 +1197,34 @@ impl VideoFrame {
       // Per spec: flip is XOR of base and init flip
       let combined_flip = base_flip != init_flip;
 
-      let display_width = init.display_width.unwrap_or(source_inner.display_width);
-      let display_height = init.display_height.unwrap_or(source_inner.display_height);
+      // Per spec: display dimensions scale proportionally with visible rect changes
+      // If not explicitly provided, scale based on ratio of new visible rect to old
+      let display_width = init.display_width.unwrap_or_else(|| {
+        if source_inner.visible_width > 0 {
+          let scale = visible_width as f64 / source_inner.visible_width as f64;
+          ((source_inner.display_width as f64) * scale).round() as u32
+        } else {
+          visible_width
+        }
+      });
+      let display_height = init.display_height.unwrap_or_else(|| {
+        if source_inner.visible_height > 0 {
+          let scale = visible_height as f64 / source_inner.visible_height as f64;
+          ((source_inner.display_height as f64) * scale).round() as u32
+        } else {
+          visible_height
+        }
+      });
 
       let new_inner = VideoFrameInner {
         frame: cloned_frame,
         original_format: source_inner.original_format,
         timestamp_us,
         duration_us,
+        visible_left,
+        visible_top,
+        visible_width,
+        visible_height,
         display_width,
         display_height,
         rotation: combined_rotation,
@@ -1093,6 +1251,10 @@ impl VideoFrame {
       original_format,
       timestamp_us,
       duration_us,
+      visible_left: 0,
+      visible_top: 0,
+      visible_width: width,
+      visible_height: height,
       display_width: width,
       display_height: height,
       rotation: 0.0,
@@ -1132,6 +1294,10 @@ impl VideoFrame {
       original_format,
       timestamp_us,
       duration_us,
+      visible_left: 0,
+      visible_top: 0,
+      visible_width: width,
+      visible_height: height,
       display_width,
       display_height,
       rotation: parsed_rotation,
@@ -1172,6 +1338,10 @@ impl VideoFrame {
       original_format,
       timestamp_us,
       duration_us,
+      visible_left: 0,
+      visible_top: 0,
+      visible_width: width,
+      visible_height: height,
       display_width: width,
       display_height: height,
       rotation: 0.0,
@@ -1288,10 +1458,10 @@ impl VideoFrame {
 
     match guard.as_ref() {
       Some(inner) if !inner.closed => Ok(DOMRectReadOnly {
-        x: 0.0,
-        y: 0.0,
-        width: inner.display_width as f64,
-        height: inner.display_height as f64,
+        x: inner.visible_left as f64,
+        y: inner.visible_top as f64,
+        width: inner.visible_width as f64,
+        height: inner.visible_height as f64,
       }),
       _ => Err(invalid_state_error("VideoFrame is closed")),
     }
@@ -1384,12 +1554,35 @@ impl VideoFrame {
   #[napi]
   pub fn allocation_size(&self, options: Option<VideoFrameCopyToOptions>) -> Result<u32> {
     self.with_inner(|inner| {
-      let format = options.as_ref().and_then(|o| o.format).unwrap_or_else(|| {
-        VideoPixelFormat::from_av_format(inner.frame.format()).unwrap_or(VideoPixelFormat::I420)
-      });
+      let format = options
+        .as_ref()
+        .and_then(|o| o.format)
+        .unwrap_or(inner.original_format);
 
-      let width = inner.frame.width();
-      let height = inner.frame.height();
+      // Use rect from options or default to visible rect
+      let (width, height) = if let Some(ref opts) = options {
+        if let Some(ref rect) = opts.rect {
+          // Parse and validate rect
+          let default_rect = (
+            inner.visible_left as f64,
+            inner.visible_top as f64,
+            inner.visible_width as f64,
+            inner.visible_height as f64,
+          );
+          let (_, _, w, h) = parse_visible_rect(
+            default_rect,
+            Some(rect),
+            inner.frame.width(),
+            inner.frame.height(),
+            format,
+          )?;
+          (w, h)
+        } else {
+          (inner.visible_width, inner.visible_height)
+        }
+      } else {
+        (inner.visible_width, inner.visible_height)
+      };
 
       Ok(Self::calculate_buffer_size(format, width, height))
     })
@@ -1398,23 +1591,15 @@ impl VideoFrame {
   /// Copy frame data to a Uint8Array
   ///
   /// Returns a Promise that resolves with an array of PlaneLayout objects.
-  /// Options can specify target format. The rect parameter is not yet implemented.
+  /// Options can specify target format and rect for cropped copy.
   #[napi]
   pub async fn copy_to(
     &self,
     mut destination: Uint8Array,
     options: Option<VideoFrameCopyToOptions>,
   ) -> Result<Vec<PlaneLayout>> {
-    // Throw error if rect is specified since it's not implemented
-    if options.as_ref().and_then(|o| o.rect.as_ref()).is_some() {
-      return Err(Error::new(
-        Status::GenericFailure,
-        "VideoFrame.copyTo rect parameter is not yet implemented",
-      ));
-    }
-
-    // Get format, size info and validate destination buffer (brief lock)
-    let (format, width, height, size) = {
+    // Get format, rect info and validate destination buffer (brief lock)
+    let (format, rect_x, rect_y, rect_width, rect_height, size) = {
       let guard = self
         .inner
         .lock()
@@ -1425,13 +1610,29 @@ impl VideoFrame {
         _ => return Err(invalid_state_error("VideoFrame is closed")),
       };
 
-      let format =
-        VideoPixelFormat::from_av_format(inner.frame.format()).unwrap_or(VideoPixelFormat::I420);
-      let width = inner.frame.width();
-      let height = inner.frame.height();
-      let size = Self::calculate_buffer_size(format, width, height) as usize;
+      let format = options
+        .as_ref()
+        .and_then(|o| o.format)
+        .unwrap_or(inner.original_format);
 
-      (format, width, height, size)
+      // Parse rect (default to visible rect)
+      let default_rect = (
+        inner.visible_left as f64,
+        inner.visible_top as f64,
+        inner.visible_width as f64,
+        inner.visible_height as f64,
+      );
+      let rect = options.as_ref().and_then(|o| o.rect.as_ref());
+      let (rect_x, rect_y, rect_width, rect_height) = parse_visible_rect(
+        default_rect,
+        rect,
+        inner.frame.width(),
+        inner.frame.height(),
+        format,
+      )?;
+
+      let size = Self::calculate_buffer_size(format, rect_width, rect_height) as usize;
+      (format, rect_x, rect_y, rect_width, rect_height, size)
     };
 
     if destination.len() < size {
@@ -1459,12 +1660,19 @@ impl VideoFrame {
         _ => return Err(invalid_state_error("VideoFrame is closed")),
       };
 
-      // Allocate temporary buffer and copy frame data
+      // Allocate buffer for cropped data
       let mut temp_buffer = vec![0u8; size];
-      inner
-        .frame
-        .copy_to_buffer(&mut temp_buffer)
-        .map_err(|e| Error::new(Status::GenericFailure, format!("Copy failed: {}", e)))?;
+
+      // Copy cropped region row by row for each plane
+      Self::copy_cropped_data(
+        &inner.frame,
+        format,
+        rect_x,
+        rect_y,
+        rect_width,
+        rect_height,
+        &mut temp_buffer,
+      )?;
 
       Ok(temp_buffer)
     })
@@ -1475,9 +1683,101 @@ impl VideoFrame {
     let dest_buffer = unsafe { destination.as_mut() };
     dest_buffer[..size].copy_from_slice(&copied_data);
 
-    // Calculate and return plane layouts
-    let layouts = Self::get_plane_layouts(format, width, height);
+    // Calculate and return plane layouts for the cropped dimensions
+    let layouts = Self::get_plane_layouts(format, rect_width, rect_height);
     Ok(layouts)
+  }
+
+  /// Copy cropped region from frame to buffer (row-by-row per plane)
+  fn copy_cropped_data(
+    frame: &Frame,
+    format: VideoPixelFormat,
+    rect_x: u32,
+    rect_y: u32,
+    rect_width: u32,
+    rect_height: u32,
+    dest: &mut [u8],
+  ) -> Result<()> {
+    let (h_factor, v_factor) = get_subsampling_factors(format);
+    let bps = format.bytes_per_sample() as u32;
+    let num_planes = Self::get_number_of_planes(format);
+
+    let mut dest_offset = 0usize;
+
+    for plane_idx in 0..num_planes {
+      // Determine plane's properties based on format and plane index
+      let (plane_h_factor, plane_v_factor, plane_sample_bytes) = match (format, plane_idx) {
+        // Y plane (or only plane for RGB) - no subsampling
+        (
+          VideoPixelFormat::RGBA
+          | VideoPixelFormat::RGBX
+          | VideoPixelFormat::BGRA
+          | VideoPixelFormat::BGRX,
+          0,
+        ) => {
+          (1, 1, 4) // RGBA: 4 bytes per pixel
+        }
+        (_, 0) => {
+          // Y plane for YUV formats
+          (1, 1, bps)
+        }
+        // NV12/NV21 UV plane - interleaved, 2 bytes per sample position
+        (VideoPixelFormat::NV12 | VideoPixelFormat::NV21, 1) => {
+          (h_factor, v_factor, 2) // UV interleaved: 2 bytes per chroma sample position
+        }
+        // Alpha plane (4th plane for formats with alpha)
+        (
+          VideoPixelFormat::I420A
+          | VideoPixelFormat::I420AP10
+          | VideoPixelFormat::I422A
+          | VideoPixelFormat::I422AP10
+          | VideoPixelFormat::I444A
+          | VideoPixelFormat::I444AP10,
+          3,
+        ) => {
+          (1, 1, bps) // Alpha plane - same resolution as Y
+        }
+        // U/V planes for planar formats
+        _ => (h_factor, v_factor, bps),
+      };
+
+      // Calculate plane dimensions
+      let plane_src_x = rect_x / plane_h_factor;
+      let plane_src_y = rect_y / plane_v_factor;
+      let plane_width = rect_width / plane_h_factor;
+      let plane_height = rect_height / plane_v_factor;
+      let bytes_per_row = plane_width * plane_sample_bytes;
+
+      // Get source plane data and stride
+      let src_data = frame.data(plane_idx as usize);
+      let src_stride = frame.linesize(plane_idx as usize) as usize;
+
+      if src_data.is_null() {
+        return Err(Error::new(
+          Status::GenericFailure,
+          format!("Plane {} data is null", plane_idx),
+        ));
+      }
+
+      // Copy row by row
+      for row in 0..plane_height {
+        let src_row_offset = ((plane_src_y + row) as usize) * src_stride
+          + (plane_src_x as usize) * (plane_sample_bytes as usize);
+        let dest_row_offset = dest_offset + (row as usize) * (bytes_per_row as usize);
+
+        unsafe {
+          std::ptr::copy_nonoverlapping(
+            src_data.add(src_row_offset),
+            dest.as_mut_ptr().add(dest_row_offset),
+            bytes_per_row as usize,
+          );
+        }
+      }
+
+      dest_offset += (plane_height * bytes_per_row) as usize;
+    }
+
+    Ok(())
   }
 
   /// Calculate plane layouts for a given format
@@ -1660,6 +1960,10 @@ impl VideoFrame {
         original_format: inner.original_format,
         timestamp_us: inner.timestamp_us,
         duration_us: inner.duration_us,
+        visible_left: inner.visible_left,
+        visible_top: inner.visible_top,
+        visible_width: inner.visible_width,
+        visible_height: inner.visible_height,
         display_width: inner.display_width,
         display_height: inner.display_height,
         rotation: inner.rotation,

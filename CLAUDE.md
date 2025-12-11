@@ -25,9 +25,7 @@ WebCodecs API implementation for Node.js using FFmpeg, built with napi-rs (Rust 
 | Test Coverage       | ✅ Complete | 841 tests (34 files), all passing   |
 | Hardware Encoding   | ✅ Complete | Zero-copy GPU path, auto-tuning     |
 
-**Remaining Work:**
-
-- VideoFrame.visibleRect cropping (low priority)
+**Remaining Work:** None - All core features complete.
 
 ## Architecture
 
@@ -427,10 +425,9 @@ src/codec/context.rs:339,362  # Set extradata if provided (non-critical)
 
 ## Known Limitations
 
-1. **VideoFrame.visibleRect cropping** - Parameter not implemented, returns error
-2. **Temporal SVC** - L1Tx modes populate `metadata.svc.temporalLayerId`; multi-spatial modes (L2T*, S*) not supported
-3. **Duration type** - Using i64 instead of u64 due to NAPI-RS constraints
-4. **ImageDecoder GIF animation** - FFmpeg may return only first frame; for full animation use VideoDecoder with GIF codec
+1. **Temporal SVC** - L1Tx modes populate `metadata.svc.temporalLayerId`; multi-spatial modes (L2T*, S*) not supported
+2. **Duration type** - Using i64 instead of u64 due to NAPI-RS constraints
+3. **ImageDecoder GIF animation** - FFmpeg may return only first frame; for full animation use VideoDecoder with GIF codec
 
 ## NAPI-RS Limitations
 
@@ -503,6 +500,8 @@ These are fundamental limitations that cannot be resolved without upstream NAPI-
 | DOMRectReadOnly.toJSON()     | toJSON() method        | ✅ Correct capitalization |
 | VideoFrame.codedRect         | throws on closed       | ✅ InvalidStateError      |
 | VideoFrame.visibleRect       | throws on closed       | ✅ InvalidStateError      |
+| VideoFrame visibleRect param | cropping support       | ✅ Full W3C compliance    |
+| VideoFrame.copyTo rect       | subregion copy         | ✅ Full W3C compliance    |
 | ImageDecoder.closed          | readonly boolean       | ✅ Implemented            |
 | ImageTrackList.ready         | Promise                | ✅ Implemented            |
 | ImageTrackList.item()        | indexed access         | ✅ Implemented            |

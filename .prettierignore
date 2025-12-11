@@ -5,4 +5,5 @@ target
 **/*.cjs
 **/*.ts
 **/*.tsx
+**/*.json
 pnpm-lock.yaml

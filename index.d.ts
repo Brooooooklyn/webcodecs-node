@@ -609,7 +609,7 @@ export declare class VideoFrame {
    * Copy frame data to a Uint8Array
    *
    * Returns a Promise that resolves with an array of PlaneLayout objects.
-   * Options can specify target format. The rect parameter is not yet implemented.
+   * Options can specify target format and rect for cropped copy.
    */
   copyTo(destination: Uint8Array, options?: VideoFrameCopyToOptions | undefined | null): Promise<Array<PlaneLayout>>
   /** Clone this VideoFrame */
