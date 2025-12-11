@@ -17,10 +17,15 @@
  * See: src/webcodecs/video_encoder.rs - temporal layer ID computed, not FFmpeg SVC
  */
 
-import test from 'ava'
+import test, { type ExecutionContext } from 'ava'
 
-import { EncodedVideoChunk, resetHardwareFallbackState, VideoEncoder } from '../../index.js'
-import type { EncodedVideoChunkMetadata, VideoEncoderConfig } from '../../standard.js'
+import {
+  EncodedVideoChunk,
+  resetHardwareFallbackState,
+  VideoEncoder,
+  type EncodedVideoChunkMetadata,
+} from '../../index.js'
+import type { VideoEncoderConfig } from '../../standard.js'
 
 import { checkEncoderSupport, createDottedFrame } from '../helpers/wpt-frame-utils.js'
 
@@ -46,7 +51,7 @@ const SVC_ENCODER_CONFIGS: Record<string, Partial<VideoEncoderConfig>> = {
  * @param codecKey - Key to encoder config
  */
 async function svcTest(
-  t: test.ExecutionContext,
+  t: ExecutionContext,
   layers: number,
   baseLayerDecimator: number,
   codecKey: string,

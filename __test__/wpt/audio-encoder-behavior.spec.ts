@@ -416,7 +416,7 @@ test('AudioEncoder: encoding and decoding roundtrip', async (t) => {
     output: (chunk, metadata) => {
       const config = metadata?.decoderConfig
       if (config) {
-        decoder.configure(config)
+        decoder.configure(config as Parameters<typeof decoder.configure>[0])
       }
       decoder.decode(chunk)
     },
@@ -525,7 +525,7 @@ test('AudioEncoder: channel number variation error', async (t) => {
     // Encoder still open, flush should throw EncodingError
     await t.throwsAsync(encoder.flush(), { message: /EncodingError|InvalidStateError/ })
     t.is(errorCount, 1, 'error for bad channel count')
-    t.is(encoder.state, 'closed', 'encoder closed after error')
+    t.is(encoder.state as string, 'closed', 'encoder closed after error')
   }
 
   goodData1.close()
@@ -595,7 +595,7 @@ test('AudioEncoder: sample rate variation error', async (t) => {
     // Encoder still open, flush should throw EncodingError
     await t.throwsAsync(encoder.flush(), { message: /EncodingError|InvalidStateError/ })
     t.is(errorCount, 1, 'error for bad sample rate')
-    t.is(encoder.state, 'closed', 'encoder closed after error')
+    t.is(encoder.state as string, 'closed', 'encoder closed after error')
   }
 
   goodData1.close()

@@ -10,6 +10,7 @@
 import test from 'ava'
 
 import { EncodedVideoChunk, resetHardwareFallbackState, VideoDecoder, VideoEncoder, VideoFrame } from '../../index.js'
+import type { VideoDecoderConfig } from '../../standard.js'
 import { generateSolidColorI420Frame, TestColors } from '../helpers/frame-generator.js'
 import {
   createCollectingCodecInit,
@@ -32,15 +33,15 @@ async function createEncodedChunks(
   width: number,
   height: number,
   count: number,
-): Promise<{ chunks: EncodedVideoChunk[]; config: Record<string, unknown> }> {
+): Promise<{ chunks: EncodedVideoChunk[]; config: VideoDecoderConfig }> {
   const chunks: EncodedVideoChunk[] = []
-  let decoderConfig: Record<string, unknown> | null = null
+  let decoderConfig: VideoDecoderConfig | null = null
 
   const encoder = new VideoEncoder({
     output: (chunk, metadata) => {
       chunks.push(chunk)
       if (metadata?.decoderConfig && !decoderConfig) {
-        decoderConfig = metadata.decoderConfig as unknown as Record<string, unknown>
+        decoderConfig = metadata.decoderConfig as unknown as VideoDecoderConfig
       }
     },
     error: () => {},

@@ -8,14 +8,23 @@
  * Validates that frames can be encoded and then decoded with correct properties.
  */
 
-import test from 'ava'
+import test, { type ExecutionContext } from 'ava'
 
-import { EncodedVideoChunk, resetHardwareFallbackState, VideoDecoder, VideoEncoder, VideoFrame } from '../../index.js'
+import {
+  EncodedVideoChunk,
+  resetHardwareFallbackState,
+  VideoDecoder,
+  VideoEncoder,
+  VideoFrame,
+  type EncodedVideoChunkMetadata,
+} from '../../index.js'
 import type {
-  EncodedVideoChunkMetadata,
+  VideoColorPrimaries,
   VideoDecoderConfig,
   VideoEncoderConfig,
   VideoEncoderEncodeOptions,
+  VideoMatrixCoefficients,
+  VideoTransferCharacteristics,
 } from '../../standard.js'
 
 import {
@@ -40,7 +49,7 @@ interface FullCycleOptions {
  * Run a full encode/decode cycle test
  */
 async function runFullCycleTest(
-  t: test.ExecutionContext,
+  t: ExecutionContext,
   encoderConfig: VideoEncoderConfig & { hasEmbeddedColorSpace?: boolean },
   options: FullCycleOptions = {},
 ): Promise<void> {
@@ -83,10 +92,22 @@ async function runFullCycleTest(
 
       // Verify color space matches encoder output
       if (encoderColorSpace.primaries !== undefined) {
-        t.is(frame.colorSpace.primaries, encoderColorSpace.primaries, 'colorSpace.primaries')
-        t.is(frame.colorSpace.transfer, encoderColorSpace.transfer, 'colorSpace.transfer')
-        t.is(frame.colorSpace.matrix, encoderColorSpace.matrix, 'colorSpace.matrix')
-        t.is(frame.colorSpace.fullRange, encoderColorSpace.fullRange, 'colorSpace.fullRange')
+        t.is(
+          frame.colorSpace.primaries,
+          (encoderColorSpace.primaries ?? null) as VideoColorPrimaries | null,
+          'colorSpace.primaries',
+        )
+        t.is(
+          frame.colorSpace.transfer,
+          (encoderColorSpace.transfer ?? null) as VideoTransferCharacteristics | null,
+          'colorSpace.transfer',
+        )
+        t.is(
+          frame.colorSpace.matrix,
+          (encoderColorSpace.matrix ?? null) as VideoMatrixCoefficients | null,
+          'colorSpace.matrix',
+        )
+        t.is(frame.colorSpace.fullRange, encoderColorSpace.fullRange ?? null, 'colorSpace.fullRange')
       }
 
       framesDecoded++

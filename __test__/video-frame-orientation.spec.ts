@@ -8,6 +8,19 @@ import test from 'ava'
 
 import { VideoFrame, VideoEncoder, VideoDecoder, EncodedVideoChunk } from '../index.js'
 import { generateSolidColorI420Frame, TestColors } from './helpers/index.js'
+import type { VideoFrameBufferInit, VideoDecoderConfig } from '../standard.js'
+
+// Extended VideoFrameBufferInit with rotation and flip properties (Node.js extension)
+type VideoFrameBufferInitWithOrientation = VideoFrameBufferInit & {
+  rotation?: number
+  flip?: boolean
+}
+
+// Extended VideoDecoderConfig with rotation and flip properties (Node.js extension)
+type VideoDecoderConfigWithOrientation = VideoDecoderConfig & {
+  rotation?: number
+  flip?: boolean
+}
 
 // ============================================================================
 // VideoFrame Rotation Property Tests
@@ -27,7 +40,7 @@ test('VideoFrame: constructor accepts rotation 0', (t) => {
     codedHeight: 240,
     timestamp: 1000,
     rotation: 0,
-  })
+  } as VideoFrameBufferInitWithOrientation)
   t.is(frame.rotation, 0)
   frame.close()
 })
@@ -40,7 +53,7 @@ test('VideoFrame: constructor accepts rotation 90', (t) => {
     codedHeight: 240,
     timestamp: 1000,
     rotation: 90,
-  })
+  } as VideoFrameBufferInitWithOrientation)
   t.is(frame.rotation, 90)
   // Display dimensions are swapped for 90 degree rotation
   t.is(frame.displayWidth, 240)
@@ -56,7 +69,7 @@ test('VideoFrame: constructor accepts rotation 180', (t) => {
     codedHeight: 240,
     timestamp: 1000,
     rotation: 180,
-  })
+  } as VideoFrameBufferInitWithOrientation)
   t.is(frame.rotation, 180)
   // Display dimensions are NOT swapped for 180 degree rotation
   t.is(frame.displayWidth, 320)
@@ -72,7 +85,7 @@ test('VideoFrame: constructor accepts rotation 270', (t) => {
     codedHeight: 240,
     timestamp: 1000,
     rotation: 270,
-  })
+  } as VideoFrameBufferInitWithOrientation)
   t.is(frame.rotation, 270)
   // Display dimensions are swapped for 270 degree rotation
   t.is(frame.displayWidth, 240)
@@ -88,7 +101,7 @@ test('VideoFrame: rotation is normalized to 0-359 range', (t) => {
     codedHeight: 240,
     timestamp: 1000,
     rotation: 360, // Should normalize to 0
-  })
+  } as VideoFrameBufferInitWithOrientation)
   t.is(frame.rotation, 0)
   frame.close()
 })
@@ -102,7 +115,7 @@ test('VideoFrame: rotation rounds to nearest 90 (ties to positive)', (t) => {
     codedHeight: 240,
     timestamp: 1000,
     rotation: 45, // Should round to 90 (ties towards positive)
-  })
+  } as VideoFrameBufferInitWithOrientation)
   t.is(frame.rotation, 90)
   frame.close()
 })
@@ -115,7 +128,7 @@ test('VideoFrame: rotation rounds down for values below midpoint', (t) => {
     codedHeight: 240,
     timestamp: 1000,
     rotation: 44, // Should round to 0
-  })
+  } as VideoFrameBufferInitWithOrientation)
   t.is(frame.rotation, 0)
   frame.close()
 })
@@ -138,7 +151,7 @@ test('VideoFrame: constructor accepts flip true', (t) => {
     codedHeight: 240,
     timestamp: 1000,
     flip: true,
-  })
+  } as VideoFrameBufferInitWithOrientation)
   t.is(frame.flip, true)
   frame.close()
 })
@@ -151,7 +164,7 @@ test('VideoFrame: constructor accepts flip false', (t) => {
     codedHeight: 240,
     timestamp: 1000,
     flip: false,
-  })
+  } as VideoFrameBufferInitWithOrientation)
   t.is(frame.flip, false)
   frame.close()
 })
@@ -168,7 +181,7 @@ test('VideoFrame.fromVideoFrame: preserves rotation from source', (t) => {
     codedHeight: 240,
     timestamp: 1000,
     rotation: 90,
-  })
+  } as VideoFrameBufferInitWithOrientation)
 
   const cloned = VideoFrame.fromVideoFrame(source, { timestamp: 2000 })
   t.is(cloned.rotation, 90)
@@ -185,12 +198,12 @@ test('VideoFrame.fromVideoFrame: combines rotations (add)', (t) => {
     codedHeight: 240,
     timestamp: 1000,
     rotation: 90,
-  })
+  } as VideoFrameBufferInitWithOrientation)
 
   const cloned = VideoFrame.fromVideoFrame(source, {
     timestamp: 2000,
     rotation: 90, // 90 + 90 = 180
-  })
+  } as VideoFrameBufferInitWithOrientation)
   t.is(cloned.rotation, 180)
 
   source.close()
@@ -205,12 +218,12 @@ test('VideoFrame.fromVideoFrame: rotation wraps at 360', (t) => {
     codedHeight: 240,
     timestamp: 1000,
     rotation: 270,
-  })
+  } as VideoFrameBufferInitWithOrientation)
 
   const cloned = VideoFrame.fromVideoFrame(source, {
     timestamp: 2000,
     rotation: 180, // 270 + 180 = 450 -> 90
-  })
+  } as VideoFrameBufferInitWithOrientation)
   t.is(cloned.rotation, 90)
 
   source.close()
@@ -229,7 +242,7 @@ test('VideoFrame.fromVideoFrame: preserves flip from source', (t) => {
     codedHeight: 240,
     timestamp: 1000,
     flip: true,
-  })
+  } as VideoFrameBufferInitWithOrientation)
 
   const cloned = VideoFrame.fromVideoFrame(source, { timestamp: 2000 })
   t.is(cloned.flip, true)
@@ -246,12 +259,12 @@ test('VideoFrame.fromVideoFrame: flip XOR logic (false XOR true = true)', (t) =>
     codedHeight: 240,
     timestamp: 1000,
     flip: false,
-  })
+  } as VideoFrameBufferInitWithOrientation)
 
   const cloned = VideoFrame.fromVideoFrame(source, {
     timestamp: 2000,
     flip: true,
-  })
+  } as VideoFrameBufferInitWithOrientation)
   t.is(cloned.flip, true)
 
   source.close()
@@ -266,12 +279,12 @@ test('VideoFrame.fromVideoFrame: flip XOR logic (true XOR true = false)', (t) =>
     codedHeight: 240,
     timestamp: 1000,
     flip: true,
-  })
+  } as VideoFrameBufferInitWithOrientation)
 
   const cloned = VideoFrame.fromVideoFrame(source, {
     timestamp: 2000,
     flip: true,
-  })
+  } as VideoFrameBufferInitWithOrientation)
   t.is(cloned.flip, false)
 
   source.close()
@@ -321,7 +334,7 @@ test('VideoDecoder: config with rotation applies to output frames', async (t) =>
   decoder.configure({
     codec: 'vp8',
     rotation: 90, // Set rotation in config
-  })
+  } as VideoDecoderConfigWithOrientation)
 
   for (const chunk of chunks) {
     decoder.decode(chunk)
@@ -371,7 +384,7 @@ test('VideoDecoder: config with flip applies to output frames', async (t) => {
   decoder.configure({
     codec: 'vp8',
     flip: true, // Set flip in config
-  })
+  } as VideoDecoderConfigWithOrientation)
 
   for (const chunk of chunks) {
     decoder.decode(chunk)
@@ -420,7 +433,7 @@ test('VideoEncoder: outputs rotation in metadata from input frame', async (t) =>
     codedHeight: 240,
     timestamp: 0,
     rotation: 90,
-  })
+  } as VideoFrameBufferInitWithOrientation)
 
   encoder.encode(frame, { keyFrame: true })
   frame.close()
@@ -461,7 +474,7 @@ test('VideoEncoder: outputs flip in metadata from input frame', async (t) => {
     codedHeight: 240,
     timestamp: 0,
     flip: true,
-  })
+  } as VideoFrameBufferInitWithOrientation)
 
   encoder.encode(frame, { keyFrame: true })
   frame.close()
@@ -506,7 +519,7 @@ test('Roundtrip: rotation preserved through encode/decode cycle', async (t) => {
     codedHeight: 240,
     timestamp: 0,
     rotation: 180,
-  })
+  } as VideoFrameBufferInitWithOrientation)
 
   encoder.encode(frame, { keyFrame: true })
   frame.close()
@@ -528,7 +541,7 @@ test('Roundtrip: rotation preserved through encode/decode cycle', async (t) => {
   decoder.configure({
     codec: 'vp8',
     rotation: decoderConfig?.rotation,
-  })
+  } as VideoDecoderConfigWithOrientation)
 
   for (const chunk of chunks) {
     decoder.decode(chunk)

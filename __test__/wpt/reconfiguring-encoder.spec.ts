@@ -8,10 +8,15 @@
  * Validates that decoder config changes are correctly reflected in output.
  */
 
-import test from 'ava'
+import test, { type ExecutionContext } from 'ava'
 
-import { EncodedVideoChunk, resetHardwareFallbackState, VideoEncoder } from '../../index.js'
-import type { EncodedVideoChunkMetadata, VideoDecoderConfig, VideoEncoderConfig } from '../../standard.js'
+import {
+  EncodedVideoChunk,
+  resetHardwareFallbackState,
+  VideoEncoder,
+  type EncodedVideoChunkMetadata,
+} from '../../index.js'
+import type { VideoDecoderConfig, VideoEncoderConfig } from '../../standard.js'
 
 import { checkEncoderSupport, createFrame } from '../helpers/wpt-frame-utils.js'
 
@@ -36,7 +41,7 @@ const RECONFIG_ENCODER_CONFIGS: Record<string, Partial<VideoEncoderConfig>> = {
  * @param t - AVA execution context
  * @param codecKey - Key to encoder config
  */
-async function runReconfigTest(t: test.ExecutionContext, codecKey: string): Promise<void> {
+async function runReconfigTest(t: ExecutionContext, codecKey: string): Promise<void> {
   const baseConfig = RECONFIG_ENCODER_CONFIGS[codecKey]
   if (!baseConfig) {
     t.fail(`Unknown codec key: ${codecKey}`)

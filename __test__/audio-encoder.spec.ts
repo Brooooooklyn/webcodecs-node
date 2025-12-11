@@ -486,7 +486,7 @@ test('AudioEncoder: AAC ADTS format', async (t) => {
     aac: {
       format: 'adts',
     },
-  })
+  } as Parameters<typeof encoder.configure>[0])
 
   const audio = generateSineTone(440, 1024, 2, 48000, 'f32', 0)
   encoder.encode(audio)

@@ -231,11 +231,13 @@ export async function checkEncoderSupport(t: ExecutionContext, config: VideoEnco
     const support = await VideoEncoder.isConfigSupported(config)
     if (!support.supported) {
       t.log(`Skipping: Unsupported config: ${JSON.stringify(config)}`)
-      return t.pass()
+      t.pass()
+      return
     }
   } catch {
     t.log(`Skipping: Config check failed: ${JSON.stringify(config)}`)
-    return t.pass()
+    t.pass()
+    return
   }
 }
 
@@ -251,11 +253,13 @@ export async function checkDecoderSupport(t: ExecutionContext, config: VideoDeco
     const support = await VideoDecoder.isConfigSupported(config)
     if (!support.supported) {
       t.log(`Skipping: Unsupported decoder config: ${JSON.stringify(config)}`)
-      return t.pass()
+      t.pass()
+      return
     }
   } catch {
     t.log(`Skipping: Decoder config check failed: ${JSON.stringify(config)}`)
-    return t.pass()
+    t.pass()
+    return
   }
 }
 

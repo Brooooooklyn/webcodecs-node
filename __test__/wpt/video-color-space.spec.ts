@@ -337,30 +337,30 @@ test('VideoColorSpace: properties are readonly', (t) => {
   })
 
   // In strict mode (ESM), assigning to getter-only properties throws TypeError
-  // @ts-expect-error - Testing immutability
   t.throws(
     () => {
+      // @ts-expect-error - Testing immutability
       colorSpace.primaries = 'bt2020'
     },
     { instanceOf: TypeError },
   )
-  // @ts-expect-error - Testing immutability
   t.throws(
     () => {
+      // @ts-expect-error - Testing immutability
       colorSpace.transfer = 'pq'
     },
     { instanceOf: TypeError },
   )
-  // @ts-expect-error - Testing immutability
   t.throws(
     () => {
+      // @ts-expect-error - Testing immutability
       colorSpace.matrix = 'rgb'
     },
     { instanceOf: TypeError },
   )
-  // @ts-expect-error - Testing immutability
   t.throws(
     () => {
+      // @ts-expect-error - Testing immutability
       colorSpace.fullRange = true
     },
     { instanceOf: TypeError },

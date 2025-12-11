@@ -95,7 +95,7 @@ export function createErrorTrackingCodecInit<TOutput>() {
 export async function testClosedCodec(
   t: ExecutionContext,
   codec: VideoEncoder | VideoDecoder | AudioEncoder | AudioDecoder,
-  validConfig: Record<string, unknown>,
+  validConfig: object,
   codecInput: VideoFrame | AudioData | EncodedVideoChunk | EncodedAudioChunk,
 ) {
   t.is(codec.state, 'unconfigured')
@@ -106,7 +106,7 @@ export async function testClosedCodec(
   // Configure should throw on closed codec
   t.throws(
     () => {
-      ;(codec as VideoEncoder).configure(validConfig as Parameters<VideoEncoder['configure']>[0])
+      ;(codec as VideoEncoder).configure(validConfig as unknown as Parameters<VideoEncoder['configure']>[0])
     },
     { message: /InvalidStateError/ },
     'configure should throw InvalidStateError',

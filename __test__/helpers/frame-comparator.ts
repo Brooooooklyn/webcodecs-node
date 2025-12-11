@@ -210,11 +210,11 @@ export interface BatchComparisonResult {
   results: FrameComparisonResult[]
 }
 
-export function compareFrameBatch(
+export async function compareFrameBatch(
   originals: VideoFrame[],
   decoded: VideoFrame[],
   threshold: number = PSNRThresholds.acceptable,
-): BatchComparisonResult {
+): Promise<BatchComparisonResult> {
   if (originals.length !== decoded.length) {
     throw new Error(`Frame count mismatch: original=${originals.length}, decoded=${decoded.length}`)
   }
@@ -240,7 +240,7 @@ export function compareFrameBatch(
   let identicalCount = 0
 
   for (let i = 0; i < originals.length; i++) {
-    const result = compareFrames(originals[i], decoded[i], threshold)
+    const result = await compareFrames(originals[i], decoded[i], threshold)
     results.push(result)
 
     if (result.psnr !== Infinity) {

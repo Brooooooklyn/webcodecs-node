@@ -216,11 +216,11 @@ for (const entry of validButUnsupportedConfigs) {
     t.is(newConfig.codec, config.codec, 'codec should be echoed')
     t.is(newConfig.width, config.width, 'width should be echoed')
     t.is(newConfig.height, config.height, 'height should be echoed')
-    if ('bitrate' in config && config.bitrate) {
-      t.is(newConfig.bitrate, config.bitrate, 'bitrate should be echoed')
+    if ('bitrate' in config && config.bitrate !== undefined) {
+      t.is(newConfig.bitrate, config.bitrate as number, 'bitrate should be echoed')
     }
-    if ('framerate' in config && config.framerate) {
-      t.is(newConfig.framerate, config.framerate, 'framerate should be echoed')
+    if ('framerate' in config && config.framerate !== undefined) {
+      t.is(newConfig.framerate, config.framerate as number, 'framerate should be echoed')
     }
   })
 }

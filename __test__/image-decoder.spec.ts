@@ -410,7 +410,12 @@ test('ImageDecoder colorSpaceConversion none returns empty color space', async (
   t.true(result.complete)
 
   // With "none", color space metadata should be ignored (all null per Chromium behavior)
-  const cs = result.image.colorSpace.toJSON()
+  const cs = result.image.colorSpace.toJSON() as {
+    primaries: string | null
+    transfer: string | null
+    matrix: string | null
+    fullRange: boolean | null
+  }
   t.is(cs.primaries, null)
   t.is(cs.transfer, null)
   t.is(cs.matrix, null)

@@ -13,6 +13,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { AudioData, AudioDecoder, AudioEncoder, EncodedAudioChunk, resetHardwareFallbackState } from '../../index.js'
+import type { AudioDecoderConfig } from '../../standard.js'
 import { generateSilence } from '../helpers/audio-generator.js'
 
 import {
@@ -41,15 +42,15 @@ async function createEncodedChunks(
   sampleRate: number,
   channels: number,
   count: number,
-): Promise<{ chunks: EncodedAudioChunk[]; config: Record<string, unknown> }> {
+): Promise<{ chunks: EncodedAudioChunk[]; config: AudioDecoderConfig }> {
   const chunks: EncodedAudioChunk[] = []
-  let decoderConfig: Record<string, unknown> | null = null
+  let decoderConfig: AudioDecoderConfig | null = null
 
   const encoder = new AudioEncoder({
     output: (chunk, metadata) => {
       chunks.push(chunk)
       if (metadata?.decoderConfig && !decoderConfig) {
-        decoderConfig = metadata.decoderConfig as unknown as Record<string, unknown>
+        decoderConfig = metadata.decoderConfig as unknown as AudioDecoderConfig
       }
     },
     error: () => {},
