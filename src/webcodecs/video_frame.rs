@@ -7,7 +7,7 @@ use crate::codec::Frame;
 use crate::ffi::{
   AVColorPrimaries, AVColorRange, AVColorSpace, AVColorTransferCharacteristic, AVPixelFormat,
 };
-use crate::webcodecs::error::invalid_state_error;
+use crate::webcodecs::error::{invalid_state_error, throw_invalid_state_error};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::sync::{Arc, Mutex};
@@ -821,6 +821,88 @@ pub struct VideoFrameInit {
   pub metadata: Option<VideoFrameMetadata>,
 }
 
+/// Unified init type for VideoFrame constructor
+/// Handles both VideoFrameBufferInit (buffer) and VideoFrameInit (frame clone) cases
+/// Required field validation happens in constructor based on source type
+pub struct VideoFrameConstructorInit {
+  // Fields from VideoFrameBufferInit (required for buffer, optional for frame clone)
+  pub format: Option<VideoPixelFormat>,
+  pub coded_width: Option<u32>,
+  pub coded_height: Option<u32>,
+  pub timestamp: Option<i64>,
+  // Optional fields (both cases)
+  pub duration: Option<i64>,
+  pub layout: Option<Vec<PlaneLayout>>,
+  pub visible_rect: Option<DOMRectInit>,
+  pub rotation: Option<f64>,
+  pub flip: Option<bool>,
+  pub display_width: Option<u32>,
+  pub display_height: Option<u32>,
+  pub color_space: Option<VideoColorSpaceInit>,
+  pub metadata: Option<VideoFrameMetadata>,
+  pub transfer: Option<Vec<Uint8Array>>,
+  // Only for frame clone (VideoFrameInit)
+  pub alpha: Option<String>,
+}
+
+impl FromNapiValue for VideoFrameConstructorInit {
+  unsafe fn from_napi_value(
+    env: napi::sys::napi_env,
+    value: napi::sys::napi_value,
+  ) -> Result<Self> {
+    let obj = unsafe { Object::from_napi_value(env, value)? };
+
+    // Parse format string (optional - only required for buffer constructor)
+    let format_str: Option<String> = obj.get("format")?;
+    let format = match format_str {
+      Some(s) => match s.as_str() {
+        "I420" => Some(VideoPixelFormat::I420),
+        "I420A" => Some(VideoPixelFormat::I420A),
+        "I422" => Some(VideoPixelFormat::I422),
+        "I422A" => Some(VideoPixelFormat::I422A),
+        "I444" => Some(VideoPixelFormat::I444),
+        "I444A" => Some(VideoPixelFormat::I444A),
+        "I420P10" => Some(VideoPixelFormat::I420P10),
+        "I420AP10" => Some(VideoPixelFormat::I420AP10),
+        "I422P10" => Some(VideoPixelFormat::I422P10),
+        "I422AP10" => Some(VideoPixelFormat::I422AP10),
+        "I444P10" => Some(VideoPixelFormat::I444P10),
+        "I444AP10" => Some(VideoPixelFormat::I444AP10),
+        "I420P12" => Some(VideoPixelFormat::I420P12),
+        "I422P12" => Some(VideoPixelFormat::I422P12),
+        "I444P12" => Some(VideoPixelFormat::I444P12),
+        "NV12" => Some(VideoPixelFormat::NV12),
+        "NV21" => Some(VideoPixelFormat::NV21),
+        "RGBA" => Some(VideoPixelFormat::RGBA),
+        "RGBX" => Some(VideoPixelFormat::RGBX),
+        "BGRA" => Some(VideoPixelFormat::BGRA),
+        "BGRX" => Some(VideoPixelFormat::BGRX),
+        _ => return Err(throw_type_error(env, &format!("Invalid format: {}", s))),
+      },
+      None => None,
+    };
+
+    // All fields optional - validation happens in constructor based on source type
+    Ok(VideoFrameConstructorInit {
+      format,
+      coded_width: obj.get("codedWidth")?,
+      coded_height: obj.get("codedHeight")?,
+      timestamp: obj.get("timestamp")?,
+      duration: obj.get("duration")?,
+      layout: obj.get("layout")?,
+      visible_rect: obj.get("visibleRect")?,
+      rotation: obj.get("rotation")?,
+      flip: obj.get("flip")?,
+      display_width: obj.get("displayWidth")?,
+      display_height: obj.get("displayHeight")?,
+      color_space: obj.get("colorSpace")?,
+      metadata: obj.get("metadata")?,
+      transfer: obj.get("transfer")?,
+      alpha: obj.get("alpha")?,
+    })
+  }
+}
+
 /// Options for copyTo operation
 #[napi(object)]
 #[derive(Debug, Clone)]
@@ -1018,25 +1100,100 @@ fn parse_rotation(rotation: f64) -> f64 {
 
 #[napi]
 impl VideoFrame {
-  /// Create a new VideoFrame from raw buffer data (BufferSource per spec)
+  /// Create a new VideoFrame from buffer data or another VideoFrame (W3C WebCodecs spec)
   ///
-  /// This is the VideoFrameBufferInit constructor form.
-  /// Use `fromVideoFrame()` to create from another VideoFrame.
-  #[napi(constructor)]
-  pub fn new(env: Env, data: Uint8Array, init: VideoFrameBufferInit) -> Result<Self> {
-    let width = init.coded_width;
-    let height = init.coded_height;
+  /// Two constructor forms per W3C spec:
+  /// 1. `new VideoFrame(data, init)` - from BufferSource with VideoFrameBufferInit
+  /// 2. `new VideoFrame(source, init?)` - from another VideoFrame with optional VideoFrameInit
+  #[napi(
+    constructor,
+    ts_args_type = "source: VideoFrame | Uint8Array, init?: VideoFrameBufferInit | VideoFrameInit"
+  )]
+  pub fn new(env: Env, source: Unknown, init: Option<VideoFrameConstructorInit>) -> Result<Self> {
+    // Try VideoFrame first (check for codedWidth property which only VideoFrame has)
+    if let Ok(source_obj) = source.coerce_to_object()
+      && source_obj.has_named_property("codedWidth").unwrap_or(false)
+    {
+      // It's a VideoFrame - unwrap and use frame clone path
+      let video_frame: &VideoFrame =
+        unsafe { <&VideoFrame>::from_napi_value(env.raw(), source.raw())? };
+
+      // Check if source is closed and throw native DOMException
+      {
+        let guard = video_frame
+          .inner
+          .lock()
+          .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+        let is_closed = match guard.as_ref() {
+          None => true,
+          Some(inner) => inner.closed,
+        };
+        if is_closed {
+          return throw_invalid_state_error(&env, "VideoFrame is closed");
+        }
+      }
+
+      return Self::new_from_video_frame(video_frame, init);
+    }
+
+    // Try as Uint8Array/Buffer
+    let data = Uint8Array::from_unknown(source).map_err(|_| {
+      let _ = env.throw_type_error(
+        "First argument must be a VideoFrame or BufferSource (Uint8Array/Buffer)",
+        None,
+      );
+      Error::new(
+        Status::InvalidArg,
+        "First argument must be a VideoFrame or BufferSource (Uint8Array/Buffer)",
+      )
+    })?;
+
+    Self::new_from_buffer(env, data, init)
+  }
+
+  /// Internal: Create VideoFrame from buffer data (VideoFrameBufferInit constructor form)
+  fn new_from_buffer(
+    env: Env,
+    data: Uint8Array,
+    init: Option<VideoFrameConstructorInit>,
+  ) -> Result<Self> {
+    // init is required for buffer constructor
+    let init = init.ok_or_else(|| {
+      let _ = env.throw_type_error("init is required when creating from buffer", None);
+      Error::new(
+        Status::InvalidArg,
+        "init is required when creating from buffer",
+      )
+    })?;
+
+    // Validate required fields for buffer constructor
+    let format = init.format.ok_or_else(|| {
+      let _ = env.throw_type_error("format is required", None);
+      Error::new(Status::InvalidArg, "format is required")
+    })?;
+    let width = init.coded_width.ok_or_else(|| {
+      let _ = env.throw_type_error("codedWidth is required", None);
+      Error::new(Status::InvalidArg, "codedWidth is required")
+    })?;
+    let height = init.coded_height.ok_or_else(|| {
+      let _ = env.throw_type_error("codedHeight is required", None);
+      Error::new(Status::InvalidArg, "codedHeight is required")
+    })?;
+    let timestamp = init.timestamp.ok_or_else(|| {
+      let _ = env.throw_type_error("timestamp is required", None);
+      Error::new(Status::InvalidArg, "timestamp is required")
+    })?;
 
     // Validate zero dimensions
     if width == 0 {
-      env.throw_type_error("codedWidth must be greater than 0", None)?;
+      let _ = env.throw_type_error("codedWidth must be greater than 0", None);
       return Err(Error::new(
         Status::InvalidArg,
         "codedWidth must be greater than 0",
       ));
     }
     if height == 0 {
-      env.throw_type_error("codedHeight must be greater than 0", None)?;
+      let _ = env.throw_type_error("codedHeight must be greater than 0", None);
       return Err(Error::new(
         Status::InvalidArg,
         "codedHeight must be greater than 0",
@@ -1044,16 +1201,16 @@ impl VideoFrame {
     }
 
     // Validate buffer size before creating frame
-    let expected_size = Self::calculate_buffer_size(init.format, width, height) as usize;
+    let expected_size = Self::calculate_buffer_size(format, width, height) as usize;
     if data.len() < expected_size {
-      env.throw_type_error(
+      let _ = env.throw_type_error(
         &format!(
           "Buffer too small: need {} bytes, got {}",
           expected_size,
           data.len()
         ),
         None,
-      )?;
+      );
       return Err(Error::new(
         Status::InvalidArg,
         format!(
@@ -1064,10 +1221,10 @@ impl VideoFrame {
       ));
     }
 
-    let format = init.format.to_av_format();
+    let av_format = format.to_av_format();
 
     // Create internal frame
-    let mut frame = Frame::new_video(width, height, format).map_err(|e| {
+    let mut frame = Frame::new_video(width, height, av_format).map_err(|e| {
       Error::new(
         Status::GenericFailure,
         format!("Failed to create frame: {}", e),
@@ -1075,11 +1232,11 @@ impl VideoFrame {
     })?;
 
     // Copy data into the frame
-    Self::copy_data_to_frame(&mut frame, &data, init.format, width, height)?;
+    Self::copy_data_to_frame(&mut frame, &data, format, width, height)?;
 
     // Set timestamps (convert from microseconds to time_base units)
     // We use microseconds as time_base internally
-    frame.set_pts(init.timestamp);
+    frame.set_pts(timestamp);
     if let Some(duration) = init.duration {
       frame.set_duration(duration);
     }
@@ -1095,7 +1252,7 @@ impl VideoFrame {
       init.visible_rect.as_ref(),
       width,
       height,
-      init.format,
+      format,
     )?;
 
     // Display dimensions default to visible dimensions, swapped if rotation is 90/270
@@ -1118,8 +1275,8 @@ impl VideoFrame {
 
     let inner = VideoFrameInner {
       frame,
-      original_format: init.format,
-      timestamp_us: init.timestamp,
+      original_format: format,
+      timestamp_us: timestamp,
       duration_us: init.duration,
       visible_left,
       visible_top,
@@ -1138,12 +1295,11 @@ impl VideoFrame {
     })
   }
 
-  /// Create a new VideoFrame from another VideoFrame (image source constructor per spec)
-  ///
-  /// This clones the source VideoFrame and applies any overrides from init.
-  /// Per W3C spec, this is equivalent to `new VideoFrame(videoFrame, init)`.
-  #[napi(factory)]
-  pub fn from_video_frame(source: &VideoFrame, init: Option<VideoFrameInit>) -> Result<Self> {
+  /// Internal: Create VideoFrame from another VideoFrame (image source constructor form)
+  fn new_from_video_frame(
+    source: &VideoFrame,
+    init: Option<VideoFrameConstructorInit>,
+  ) -> Result<Self> {
     source.with_inner(|source_inner| {
       // Clone the underlying frame data
       let cloned_frame = source_inner
@@ -1151,21 +1307,15 @@ impl VideoFrame {
         .try_clone()
         .map_err(|e| Error::new(Status::GenericFailure, format!("Clone failed: {}", e)))?;
 
-      let init = init.unwrap_or(VideoFrameInit {
-        timestamp: None,
-        duration: None,
-        alpha: None,
-        visible_rect: None,
-        rotation: None,
-        flip: None,
-        display_width: None,
-        display_height: None,
-        metadata: None,
-      });
-
-      // Apply overrides from init
-      let timestamp_us = init.timestamp.unwrap_or(source_inner.timestamp_us);
-      let duration_us = init.duration.or(source_inner.duration_us);
+      // Apply overrides from init (all fields optional for frame clone)
+      let timestamp_us = init
+        .as_ref()
+        .and_then(|i| i.timestamp)
+        .unwrap_or(source_inner.timestamp_us);
+      let duration_us = init
+        .as_ref()
+        .and_then(|i| i.duration)
+        .or(source_inner.duration_us);
 
       // Parse visible rect per W3C spec (source's visible rect is the default)
       let default_rect = (
@@ -1176,17 +1326,17 @@ impl VideoFrame {
       );
       let (visible_left, visible_top, visible_width, visible_height) = parse_visible_rect(
         default_rect,
-        init.visible_rect.as_ref(),
+        init.as_ref().and_then(|i| i.visible_rect.as_ref()),
         cloned_frame.width(),
         cloned_frame.height(),
         source_inner.original_format,
       )?;
 
       // Handle rotation per W3C spec "Add Rotations" algorithm
-      let init_rotation = parse_rotation(init.rotation.unwrap_or(0.0));
+      let init_rotation = parse_rotation(init.as_ref().and_then(|i| i.rotation).unwrap_or(0.0));
       let base_rotation = source_inner.rotation;
       let base_flip = source_inner.flip;
-      let init_flip = init.flip.unwrap_or(false);
+      let init_flip = init.as_ref().and_then(|i| i.flip).unwrap_or(false);
 
       // Per spec: if baseFlip is false, combined = base + init; else combined = base - init
       let combined_rotation = if !base_flip {
@@ -1199,22 +1349,28 @@ impl VideoFrame {
 
       // Per spec: display dimensions scale proportionally with visible rect changes
       // If not explicitly provided, scale based on ratio of new visible rect to old
-      let display_width = init.display_width.unwrap_or_else(|| {
-        if source_inner.visible_width > 0 {
-          let scale = visible_width as f64 / source_inner.visible_width as f64;
-          ((source_inner.display_width as f64) * scale).round() as u32
-        } else {
-          visible_width
-        }
-      });
-      let display_height = init.display_height.unwrap_or_else(|| {
-        if source_inner.visible_height > 0 {
-          let scale = visible_height as f64 / source_inner.visible_height as f64;
-          ((source_inner.display_height as f64) * scale).round() as u32
-        } else {
-          visible_height
-        }
-      });
+      let display_width = init
+        .as_ref()
+        .and_then(|i| i.display_width)
+        .unwrap_or_else(|| {
+          if source_inner.visible_width > 0 {
+            let scale = visible_width as f64 / source_inner.visible_width as f64;
+            ((source_inner.display_width as f64) * scale).round() as u32
+          } else {
+            visible_width
+          }
+        });
+      let display_height = init
+        .as_ref()
+        .and_then(|i| i.display_height)
+        .unwrap_or_else(|| {
+          if source_inner.visible_height > 0 {
+            let scale = visible_height as f64 / source_inner.visible_height as f64;
+            ((source_inner.display_height as f64) * scale).round() as u32
+          } else {
+            visible_height
+          }
+        });
 
       let new_inner = VideoFrameInner {
         frame: cloned_frame,
@@ -1429,7 +1585,7 @@ impl VideoFrame {
   /// Returns DOMRectReadOnly per W3C WebCodecs spec
   /// Throws InvalidStateError if the VideoFrame is closed
   #[napi(getter)]
-  pub fn coded_rect(&self) -> Result<DOMRectReadOnly> {
+  pub fn coded_rect(&self, env: Env) -> Result<DOMRectReadOnly> {
     let guard = self
       .inner
       .lock()
@@ -1442,7 +1598,7 @@ impl VideoFrame {
         width: inner.frame.width() as f64,
         height: inner.frame.height() as f64,
       }),
-      _ => Err(invalid_state_error("VideoFrame is closed")),
+      _ => throw_invalid_state_error(&env, "VideoFrame is closed"),
     }
   }
 
@@ -1450,7 +1606,7 @@ impl VideoFrame {
   /// Returns DOMRectReadOnly per W3C WebCodecs spec
   /// Throws InvalidStateError if the VideoFrame is closed
   #[napi(getter)]
-  pub fn visible_rect(&self) -> Result<DOMRectReadOnly> {
+  pub fn visible_rect(&self, env: Env) -> Result<DOMRectReadOnly> {
     let guard = self
       .inner
       .lock()
@@ -1463,7 +1619,7 @@ impl VideoFrame {
         width: inner.visible_width as f64,
         height: inner.visible_height as f64,
       }),
-      _ => Err(invalid_state_error("VideoFrame is closed")),
+      _ => throw_invalid_state_error(&env, "VideoFrame is closed"),
     }
   }
 
@@ -1519,7 +1675,7 @@ impl VideoFrame {
   /// - I420, I422, I444: 3 planes
   /// - I420A, I422A, I444A: 4 planes
   #[napi(getter)]
-  pub fn number_of_planes(&self) -> Result<u32> {
+  pub fn number_of_planes(&self, env: Env) -> Result<u32> {
     let guard = self
       .inner
       .lock()
@@ -1527,7 +1683,7 @@ impl VideoFrame {
 
     match guard.as_ref() {
       Some(inner) if !inner.closed => Ok(Self::get_number_of_planes(inner.original_format)),
-      _ => Err(invalid_state_error("VideoFrame is closed")),
+      _ => throw_invalid_state_error(&env, "VideoFrame is closed"),
     }
   }
 
@@ -1552,40 +1708,48 @@ impl VideoFrame {
 
   /// Calculate the allocation size needed for copyTo
   #[napi]
-  pub fn allocation_size(&self, options: Option<VideoFrameCopyToOptions>) -> Result<u32> {
-    self.with_inner(|inner| {
-      let format = options
-        .as_ref()
-        .and_then(|o| o.format)
-        .unwrap_or(inner.original_format);
+  pub fn allocation_size(&self, env: Env, options: Option<VideoFrameCopyToOptions>) -> Result<u32> {
+    // Check closed state and throw native DOMException
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    let inner = match guard.as_ref() {
+      Some(inner) if !inner.closed => inner,
+      _ => return throw_invalid_state_error(&env, "VideoFrame is closed"),
+    };
 
-      // Use rect from options or default to visible rect
-      let (width, height) = if let Some(ref opts) = options {
-        if let Some(ref rect) = opts.rect {
-          // Parse and validate rect
-          let default_rect = (
-            inner.visible_left as f64,
-            inner.visible_top as f64,
-            inner.visible_width as f64,
-            inner.visible_height as f64,
-          );
-          let (_, _, w, h) = parse_visible_rect(
-            default_rect,
-            Some(rect),
-            inner.frame.width(),
-            inner.frame.height(),
-            format,
-          )?;
-          (w, h)
-        } else {
-          (inner.visible_width, inner.visible_height)
-        }
+    let format = options
+      .as_ref()
+      .and_then(|o| o.format)
+      .unwrap_or(inner.original_format);
+
+    // Use rect from options or default to visible rect
+    let (width, height) = if let Some(ref opts) = options {
+      if let Some(ref rect) = opts.rect {
+        // Parse and validate rect
+        let default_rect = (
+          inner.visible_left as f64,
+          inner.visible_top as f64,
+          inner.visible_width as f64,
+          inner.visible_height as f64,
+        );
+        let (_, _, w, h) = parse_visible_rect(
+          default_rect,
+          Some(rect),
+          inner.frame.width(),
+          inner.frame.height(),
+          format,
+        )?;
+        (w, h)
       } else {
         (inner.visible_width, inner.visible_height)
-      };
+      }
+    } else {
+      (inner.visible_width, inner.visible_height)
+    };
 
-      Ok(Self::calculate_buffer_size(format, width, height))
-    })
+    Ok(Self::calculate_buffer_size(format, width, height))
   }
 
   /// Copy frame data to a Uint8Array
@@ -1948,33 +2112,41 @@ impl VideoFrame {
 
   /// Clone this VideoFrame
   #[napi(js_name = "clone")]
-  pub fn clone_frame(&self) -> Result<VideoFrame> {
-    self.with_inner(|inner| {
-      let cloned_frame = inner
-        .frame
-        .try_clone()
-        .map_err(|e| Error::new(Status::GenericFailure, format!("Clone failed: {}", e)))?;
+  pub fn clone_frame(&self, env: Env) -> Result<VideoFrame> {
+    // Check closed state and throw native DOMException
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    let inner = match guard.as_ref() {
+      Some(inner) if !inner.closed => inner,
+      _ => return throw_invalid_state_error(&env, "VideoFrame is closed"),
+    };
 
-      let new_inner = VideoFrameInner {
-        frame: cloned_frame,
-        original_format: inner.original_format,
-        timestamp_us: inner.timestamp_us,
-        duration_us: inner.duration_us,
-        visible_left: inner.visible_left,
-        visible_top: inner.visible_top,
-        visible_width: inner.visible_width,
-        visible_height: inner.visible_height,
-        display_width: inner.display_width,
-        display_height: inner.display_height,
-        rotation: inner.rotation,
-        flip: inner.flip,
-        color_space: inner.color_space.clone(),
-        closed: false,
-      };
+    let cloned_frame = inner
+      .frame
+      .try_clone()
+      .map_err(|e| Error::new(Status::GenericFailure, format!("Clone failed: {}", e)))?;
 
-      Ok(VideoFrame {
-        inner: Arc::new(Mutex::new(Some(new_inner))),
-      })
+    let new_inner = VideoFrameInner {
+      frame: cloned_frame,
+      original_format: inner.original_format,
+      timestamp_us: inner.timestamp_us,
+      duration_us: inner.duration_us,
+      visible_left: inner.visible_left,
+      visible_top: inner.visible_top,
+      visible_width: inner.visible_width,
+      visible_height: inner.visible_height,
+      display_width: inner.display_width,
+      display_height: inner.display_height,
+      rotation: inner.rotation,
+      flip: inner.flip,
+      color_space: inner.color_space.clone(),
+      closed: false,
+    };
+
+    Ok(VideoFrame {
+      inner: Arc::new(Mutex::new(Some(new_inner))),
     })
   }
 

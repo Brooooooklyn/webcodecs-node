@@ -6,7 +6,7 @@
 use crate::codec::{CodecContext, DecoderConfig, Packet, ScaleAlgorithm, Scaler};
 use crate::ffi::AVCodecID;
 use crate::webcodecs::VideoFrame;
-use crate::webcodecs::error::invalid_state_error;
+use crate::webcodecs::error::{invalid_state_error, throw_invalid_state_error};
 use futures::stream::{StreamExt, TryStreamExt};
 use napi::bindgen_prelude::*;
 use napi::tokio::sync::Notify;
@@ -168,8 +168,8 @@ pub struct ImageDecodeResult {
 impl ImageDecodeResult {
   /// Get the decoded image
   #[napi(getter)]
-  pub fn image(&self) -> Result<VideoFrame> {
-    self.image.clone_frame()
+  pub fn image(&self, env: Env) -> Result<VideoFrame> {
+    self.image.clone_frame(env)
   }
 
   /// Get whether the decode is complete
@@ -586,7 +586,7 @@ impl ImageDecoder {
   /// Promise that resolves when data is fully loaded (per WebCodecs spec)
   /// Returns a new promise chained from the stored promise (allows multiple accesses)
   #[napi(getter)]
-  pub fn completed(&self, this: This) -> Result<PromiseRaw<'_, ()>> {
+  pub fn completed(&self, env: Env, this: This) -> Result<PromiseRaw<'_, ()>> {
     // Check if closed
     {
       let inner = self
@@ -594,7 +594,7 @@ impl ImageDecoder {
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
       if inner.closed {
-        return Err(invalid_state_error("ImageDecoder is closed"));
+        return throw_invalid_state_error(&env, "ImageDecoder is closed");
       }
     }
 
@@ -840,14 +840,14 @@ impl ImageDecoder {
   /// Reset the decoder
   /// Clears cached frames - next decode() will re-decode from stored data
   #[napi]
-  pub fn reset(&self) -> Result<()> {
+  pub fn reset(&self, env: Env) -> Result<()> {
     let mut inner = self
       .inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     if inner.closed {
-      return Err(invalid_state_error("ImageDecoder is closed"));
+      return throw_invalid_state_error(&env, "ImageDecoder is closed");
     }
 
     inner.context = None;

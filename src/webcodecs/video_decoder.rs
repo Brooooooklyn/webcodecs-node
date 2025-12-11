@@ -5,8 +5,10 @@
 
 use crate::codec::{CodecContext, DecoderConfig, Frame, Packet};
 use crate::ffi::{AVCodecID, AVHWDeviceType};
-use crate::webcodecs::error::{invalid_state_error, throw_type_error_unit};
-use crate::webcodecs::promise_reject::reject_with_type_error;
+use crate::webcodecs::error::{
+  DOMExceptionName, throw_data_error, throw_invalid_state_error, throw_type_error_unit,
+};
+use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
 use crate::webcodecs::{
   CodecState, EncodedVideoChunk, EncodedVideoChunkInner, HardwareAcceleration, VideoDecoderConfig,
   VideoFrame, convert_avcc_extradata_to_annexb, convert_avcc_to_annexb,
@@ -934,7 +936,7 @@ impl VideoDecoder {
 
     // W3C spec: throw InvalidStateError if closed
     if inner.state == CodecState::Closed {
-      return Err(invalid_state_error("Decoder is closed"));
+      return throw_invalid_state_error(&env, "Decoder is closed");
     }
 
     // Parse codec string to determine codec ID
@@ -1065,12 +1067,10 @@ impl VideoDecoder {
 
       // W3C spec: throw InvalidStateError if not configured or closed
       if inner.state == CodecState::Closed {
-        return Err(invalid_state_error("Cannot decode with a closed codec"));
+        return throw_invalid_state_error(&env, "Cannot decode with a closed codec");
       }
       if inner.state != CodecState::Configured {
-        return Err(invalid_state_error(
-          "Cannot decode with an unconfigured codec",
-        ));
+        return throw_invalid_state_error(&env, "Cannot decode with an unconfigured codec");
       }
 
       // W3C spec: throw DataError if first chunk is not a keyframe
@@ -1080,14 +1080,7 @@ impl VideoDecoder {
           inner.keyframe_received = true;
         } else {
           // Trying to decode a delta frame before any keyframe
-          env.throw_error(
-            "DataError: First chunk must be a keyframe",
-            Some("ERR_WEBCODEC_DATA_ERROR"),
-          )?;
-          return Err(Error::new(
-            Status::InvalidArg,
-            "DataError: First chunk must be a keyframe",
-          ));
+          return throw_data_error(&env, "First chunk must be a keyframe");
         }
       }
 
@@ -1130,24 +1123,23 @@ impl VideoDecoder {
 
       if inner.state == CodecState::Closed {
         // If closed due to error, return EncodingError; otherwise InvalidStateError
-        let error_msg = if inner.had_error {
-          "EncodingError: Decode error occurred"
+        let (error_name, error_msg) = if inner.had_error {
+          (DOMExceptionName::EncodingError, "Decode error occurred")
         } else {
-          "InvalidStateError: Cannot flush a closed codec"
+          (
+            DOMExceptionName::InvalidStateError,
+            "Cannot flush a closed codec",
+          )
         };
-        // Return rejected promise via async to allow error callback to run first
-        return env
-          .spawn_future_with_callback(async move { Ok(()) }, move |_env, _| -> Result<()> {
-            Err(Error::new(Status::GenericFailure, error_msg))
-          });
+        // Return rejected promise with native DOMException (async to allow error callback to run)
+        return reject_with_dom_exception_async(env, error_name, error_msg);
       }
       if inner.state == CodecState::Unconfigured {
-        // Return rejected promise via async to allow error callback to run first
-        return env.spawn_future_with_callback(
-          async move { Ok(()) },
-          move |_env, _| -> Result<()> {
-            Err(invalid_state_error("Cannot flush an unconfigured codec"))
-          },
+        // Return rejected promise with native DOMException (async to allow error callback to run)
+        return reject_with_dom_exception_async(
+          env,
+          DOMExceptionName::InvalidStateError,
+          "Cannot flush an unconfigured codec",
         );
       }
 
@@ -1175,7 +1167,7 @@ impl VideoDecoder {
         .send(WorkerCommand::Flush(response_sender))
         .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?;
     } else {
-      return Err(invalid_state_error("Cannot flush a closed codec"));
+      return throw_invalid_state_error(env, "Cannot flush a closed codec");
     }
 
     // Clone references for the callback closure
@@ -1239,7 +1231,7 @@ impl VideoDecoder {
           ));
         }
 
-        // Return worker result
+        // Return worker result (errors keep DOMException-style message for now)
         result
       },
     )
@@ -1247,7 +1239,7 @@ impl VideoDecoder {
 
   /// Reset the decoder
   #[napi]
-  pub fn reset(&mut self) -> Result<()> {
+  pub fn reset(&mut self, env: Env) -> Result<()> {
     // Check state first before touching the worker
     {
       let inner = self
@@ -1257,7 +1249,7 @@ impl VideoDecoder {
 
       // W3C spec: throw InvalidStateError if closed
       if inner.state == CodecState::Closed {
-        return Err(invalid_state_error("Cannot reset a closed codec"));
+        return throw_invalid_state_error(&env, "Cannot reset a closed codec");
       }
 
       // Set abort flag FIRST (synchronously, before any other reset logic)
@@ -1354,7 +1346,7 @@ impl VideoDecoder {
 
   /// Close the decoder
   #[napi]
-  pub fn close(&mut self) -> Result<()> {
+  pub fn close(&mut self, env: Env) -> Result<()> {
     // Check state first - W3C spec: throw InvalidStateError if already closed
     {
       let inner = self
@@ -1363,7 +1355,7 @@ impl VideoDecoder {
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
       if inner.state == CodecState::Closed {
-        return Err(invalid_state_error("Cannot close an already closed codec"));
+        return throw_invalid_state_error(&env, "Cannot close an already closed codec");
       }
     }
 

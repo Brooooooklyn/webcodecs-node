@@ -397,7 +397,7 @@ test('AudioDecoder: unconfigured decoder operations', async (t) => {
   t.is(decoder.state, 'unconfigured')
 
   // Flush should reject
-  await t.throwsAsync(decoder.flush(), { message: /InvalidStateError/ })
+  await t.throwsAsync(decoder.flush(), { name: 'InvalidStateError' })
 
   decoder.close()
 })

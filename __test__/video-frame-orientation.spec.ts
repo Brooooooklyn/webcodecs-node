@@ -170,10 +170,10 @@ test('VideoFrame: constructor accepts flip false', (t) => {
 })
 
 // ============================================================================
-// VideoFrame.fromVideoFrame Rotation Combination Tests
+// VideoFrame constructor (from VideoFrame) Rotation Combination Tests
 // ============================================================================
 
-test('VideoFrame.fromVideoFrame: preserves rotation from source', (t) => {
+test('VideoFrame constructor (from VideoFrame): preserves rotation from source', (t) => {
   const data = new Uint8Array((320 * 240 * 3) / 2)
   const source = new VideoFrame(data, {
     format: 'I420',
@@ -183,14 +183,14 @@ test('VideoFrame.fromVideoFrame: preserves rotation from source', (t) => {
     rotation: 90,
   } as VideoFrameBufferInitWithOrientation)
 
-  const cloned = VideoFrame.fromVideoFrame(source, { timestamp: 2000 })
+  const cloned = new VideoFrame(source, { timestamp: 2000 })
   t.is(cloned.rotation, 90)
 
   source.close()
   cloned.close()
 })
 
-test('VideoFrame.fromVideoFrame: combines rotations (add)', (t) => {
+test('VideoFrame constructor (from VideoFrame): combines rotations (add)', (t) => {
   const data = new Uint8Array((320 * 240 * 3) / 2)
   const source = new VideoFrame(data, {
     format: 'I420',
@@ -200,7 +200,7 @@ test('VideoFrame.fromVideoFrame: combines rotations (add)', (t) => {
     rotation: 90,
   } as VideoFrameBufferInitWithOrientation)
 
-  const cloned = VideoFrame.fromVideoFrame(source, {
+  const cloned = new VideoFrame(source, {
     timestamp: 2000,
     rotation: 90, // 90 + 90 = 180
   } as VideoFrameBufferInitWithOrientation)
@@ -210,7 +210,7 @@ test('VideoFrame.fromVideoFrame: combines rotations (add)', (t) => {
   cloned.close()
 })
 
-test('VideoFrame.fromVideoFrame: rotation wraps at 360', (t) => {
+test('VideoFrame constructor (from VideoFrame): rotation wraps at 360', (t) => {
   const data = new Uint8Array((320 * 240 * 3) / 2)
   const source = new VideoFrame(data, {
     format: 'I420',
@@ -220,7 +220,7 @@ test('VideoFrame.fromVideoFrame: rotation wraps at 360', (t) => {
     rotation: 270,
   } as VideoFrameBufferInitWithOrientation)
 
-  const cloned = VideoFrame.fromVideoFrame(source, {
+  const cloned = new VideoFrame(source, {
     timestamp: 2000,
     rotation: 180, // 270 + 180 = 450 -> 90
   } as VideoFrameBufferInitWithOrientation)
@@ -231,10 +231,10 @@ test('VideoFrame.fromVideoFrame: rotation wraps at 360', (t) => {
 })
 
 // ============================================================================
-// VideoFrame.fromVideoFrame Flip Combination Tests
+// VideoFrame constructor (from VideoFrame) Flip Combination Tests
 // ============================================================================
 
-test('VideoFrame.fromVideoFrame: preserves flip from source', (t) => {
+test('VideoFrame constructor (from VideoFrame): preserves flip from source', (t) => {
   const data = new Uint8Array((320 * 240 * 3) / 2)
   const source = new VideoFrame(data, {
     format: 'I420',
@@ -244,14 +244,14 @@ test('VideoFrame.fromVideoFrame: preserves flip from source', (t) => {
     flip: true,
   } as VideoFrameBufferInitWithOrientation)
 
-  const cloned = VideoFrame.fromVideoFrame(source, { timestamp: 2000 })
+  const cloned = new VideoFrame(source, { timestamp: 2000 })
   t.is(cloned.flip, true)
 
   source.close()
   cloned.close()
 })
 
-test('VideoFrame.fromVideoFrame: flip XOR logic (false XOR true = true)', (t) => {
+test('VideoFrame constructor (from VideoFrame): flip XOR logic (false XOR true = true)', (t) => {
   const data = new Uint8Array((320 * 240 * 3) / 2)
   const source = new VideoFrame(data, {
     format: 'I420',
@@ -261,7 +261,7 @@ test('VideoFrame.fromVideoFrame: flip XOR logic (false XOR true = true)', (t) =>
     flip: false,
   } as VideoFrameBufferInitWithOrientation)
 
-  const cloned = VideoFrame.fromVideoFrame(source, {
+  const cloned = new VideoFrame(source, {
     timestamp: 2000,
     flip: true,
   } as VideoFrameBufferInitWithOrientation)
@@ -271,7 +271,7 @@ test('VideoFrame.fromVideoFrame: flip XOR logic (false XOR true = true)', (t) =>
   cloned.close()
 })
 
-test('VideoFrame.fromVideoFrame: flip XOR logic (true XOR true = false)', (t) => {
+test('VideoFrame constructor (from VideoFrame): flip XOR logic (true XOR true = false)', (t) => {
   const data = new Uint8Array((320 * 240 * 3) / 2)
   const source = new VideoFrame(data, {
     format: 'I420',
@@ -281,7 +281,7 @@ test('VideoFrame.fromVideoFrame: flip XOR logic (true XOR true = false)', (t) =>
     flip: true,
   } as VideoFrameBufferInitWithOrientation)
 
-  const cloned = VideoFrame.fromVideoFrame(source, {
+  const cloned = new VideoFrame(source, {
     timestamp: 2000,
     flip: true,
   } as VideoFrameBufferInitWithOrientation)

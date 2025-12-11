@@ -322,7 +322,9 @@ test('ImageDecoder: decode after close throws', async (t) => {
 
   decoder.close()
 
-  await t.throwsAsync(decoder.decode(), { message: /InvalidStateError/ })
+  // Async rejections use standard Error with DOMException name in message
+  const error = await t.throwsAsync(decoder.decode())
+  t.true(error?.message.includes('InvalidStateError'), 'decode on closed should include InvalidStateError')
 })
 
 test('ImageDecoder: double close is safe', async (t) => {
@@ -388,7 +390,7 @@ test('ImageDecoder: reset after close throws', async (t) => {
 
   decoder.close()
 
-  t.throws(() => decoder.reset(), { message: /InvalidStateError/ })
+  t.throws(() => decoder.reset(), { name: 'InvalidStateError' })
 })
 
 // ============================================================================

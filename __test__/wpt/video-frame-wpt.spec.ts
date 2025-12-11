@@ -480,7 +480,7 @@ test('VideoFrame: clone closed throws', (t) => {
     () => {
       frame.clone()
     },
-    { message: /InvalidStateError/ },
+    { name: 'InvalidStateError' },
   )
 })
 
@@ -548,7 +548,9 @@ test('VideoFrame: copyTo closed throws', async (t) => {
 
   frame.close()
 
-  await t.throwsAsync(frame.copyTo(new Uint8Array(32)), { message: /InvalidStateError/ })
+  // Async rejections use standard Error with DOMException name in message
+  const error = await t.throwsAsync(frame.copyTo(new Uint8Array(32)))
+  t.true(error?.message.includes('InvalidStateError'), 'copyTo on closed frame should include InvalidStateError')
 })
 
 test('VideoFrame: copyTo destination too small throws', async (t) => {
@@ -616,7 +618,7 @@ test('VideoFrame: allocationSize closed throws', (t) => {
     () => {
       frame.allocationSize()
     },
-    { message: /InvalidStateError/ },
+    { name: 'InvalidStateError' },
   )
 })
 
@@ -698,7 +700,7 @@ test('VideoFrame: codedRect closed throws', (t) => {
       // eslint-disable-next-line @typescript-eslint/no-unused-expressions
       frame.codedRect
     },
-    { message: /InvalidStateError/ },
+    { name: 'InvalidStateError' },
   )
 })
 
@@ -736,7 +738,7 @@ test('VideoFrame: visibleRect closed throws', (t) => {
       // eslint-disable-next-line @typescript-eslint/no-unused-expressions
       frame.visibleRect
     },
-    { message: /InvalidStateError/ },
+    { name: 'InvalidStateError' },
   )
 })
 
@@ -845,7 +847,7 @@ test('VideoFrame: visibleRect exceeding bounds throws TypeError', (t) => {
   t.true(error?.message.includes('exceeds'))
 })
 
-test('VideoFrame.fromVideoFrame: with visibleRect crops', (t) => {
+test('VideoFrame constructor (from VideoFrame): with visibleRect crops', (t) => {
   const width = 8
   const height = 8
   const data = new Uint8Array(width * height * 4) // RGBA
@@ -857,7 +859,7 @@ test('VideoFrame.fromVideoFrame: with visibleRect crops', (t) => {
     timestamp: 0,
   })
 
-  const cropped = VideoFrame.fromVideoFrame(source, {
+  const cropped = new VideoFrame(source, {
     visibleRect: { x: 2, y: 2, width: 4, height: 4 },
   })
 
@@ -924,10 +926,10 @@ test('VideoFrame: allocationSize uses visible rect by default', (t) => {
 })
 
 // ============================================================================
-// fromVideoFrame Tests
+// VideoFrame constructor (from VideoFrame) Tests
 // ============================================================================
 
-test('VideoFrame.fromVideoFrame: basic clone', (t) => {
+test('VideoFrame constructor (from VideoFrame): basic clone', (t) => {
   const original = new VideoFrame(new Uint8Array(32), {
     format: 'RGBA',
     codedWidth: 4,
@@ -935,7 +937,7 @@ test('VideoFrame.fromVideoFrame: basic clone', (t) => {
     timestamp: 1000,
   })
 
-  const cloned = VideoFrame.fromVideoFrame(original)
+  const cloned = new VideoFrame(original)
 
   t.is(cloned.format, original.format)
   t.is(cloned.codedWidth, original.codedWidth)
@@ -946,7 +948,7 @@ test('VideoFrame.fromVideoFrame: basic clone', (t) => {
   cloned.close()
 })
 
-test('VideoFrame.fromVideoFrame: with new timestamp', (t) => {
+test('VideoFrame constructor (from VideoFrame): with new timestamp', (t) => {
   const original = new VideoFrame(new Uint8Array(32), {
     format: 'RGBA',
     codedWidth: 4,
@@ -954,7 +956,7 @@ test('VideoFrame.fromVideoFrame: with new timestamp', (t) => {
     timestamp: 1000,
   })
 
-  const cloned = VideoFrame.fromVideoFrame(original, { timestamp: 2000 })
+  const cloned = new VideoFrame(original, { timestamp: 2000 })
 
   t.is(cloned.timestamp, 2000)
   t.is(original.timestamp, 1000)
@@ -963,7 +965,7 @@ test('VideoFrame.fromVideoFrame: with new timestamp', (t) => {
   cloned.close()
 })
 
-test('VideoFrame.fromVideoFrame: with new duration', (t) => {
+test('VideoFrame constructor (from VideoFrame): with new duration', (t) => {
   const original = new VideoFrame(new Uint8Array(32), {
     format: 'RGBA',
     codedWidth: 4,
@@ -972,7 +974,7 @@ test('VideoFrame.fromVideoFrame: with new duration', (t) => {
     duration: 1000,
   })
 
-  const cloned = VideoFrame.fromVideoFrame(original, { duration: 2000 })
+  const cloned = new VideoFrame(original, { duration: 2000 })
 
   t.is(cloned.duration, 2000)
   t.is(original.duration, 1000)
@@ -981,7 +983,7 @@ test('VideoFrame.fromVideoFrame: with new duration', (t) => {
   cloned.close()
 })
 
-test('VideoFrame.fromVideoFrame: from closed throws', (t) => {
+test('VideoFrame constructor (from VideoFrame): from closed throws', (t) => {
   const original = new VideoFrame(new Uint8Array(32), {
     format: 'RGBA',
     codedWidth: 4,
@@ -993,9 +995,9 @@ test('VideoFrame.fromVideoFrame: from closed throws', (t) => {
 
   t.throws(
     () => {
-      VideoFrame.fromVideoFrame(original)
+      new VideoFrame(original)
     },
-    { message: /InvalidStateError/ },
+    { name: 'InvalidStateError' },
   )
 })
 

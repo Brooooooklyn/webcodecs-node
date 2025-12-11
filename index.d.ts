@@ -557,19 +557,13 @@ export declare class VideoEncoder {
  */
 export declare class VideoFrame {
   /**
-   * Create a new VideoFrame from raw buffer data (BufferSource per spec)
+   * Create a new VideoFrame from buffer data or another VideoFrame (W3C WebCodecs spec)
    *
-   * This is the VideoFrameBufferInit constructor form.
-   * Use `fromVideoFrame()` to create from another VideoFrame.
+   * Two constructor forms per W3C spec:
+   * 1. `new VideoFrame(data, init)` - from BufferSource with VideoFrameBufferInit
+   * 2. `new VideoFrame(source, init?)` - from another VideoFrame with optional VideoFrameInit
    */
-  constructor(data: Uint8Array, init: VideoFrameBufferInit)
-  /**
-   * Create a new VideoFrame from another VideoFrame (image source constructor per spec)
-   *
-   * This clones the source VideoFrame and applies any overrides from init.
-   * Per W3C spec, this is equivalent to `new VideoFrame(videoFrame, init)`.
-   */
-  static fromVideoFrame(source: VideoFrame, init?: VideoFrameInit | undefined | null): VideoFrame
+  constructor(source: VideoFrame | Uint8Array, init?: VideoFrameBufferInit | VideoFrameInit)
   /** Get the pixel format */
   get format(): VideoPixelFormat | null
   /** Get the coded width in pixels (returns 0 when closed per W3C spec) */

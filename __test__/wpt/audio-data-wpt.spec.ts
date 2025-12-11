@@ -339,7 +339,7 @@ test('AudioData: clone closed throws', (t) => {
     () => {
       audioData.clone()
     },
-    { message: /InvalidStateError/ },
+    { name: 'InvalidStateError' },
   )
 })
 
@@ -429,7 +429,7 @@ test('AudioData: copyTo closed throws', (t) => {
     () => {
       audioData.copyTo(new Uint8Array(8), { planeIndex: 0 })
     },
-    { message: /InvalidStateError/ },
+    { name: 'InvalidStateError' },
   )
 })
 
@@ -510,7 +510,7 @@ test('AudioData: allocationSize closed throws', (t) => {
     () => {
       audioData.allocationSize({ planeIndex: 0 })
     },
-    { message: /InvalidStateError/ },
+    { name: 'InvalidStateError' },
   )
 })
 

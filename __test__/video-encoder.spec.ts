@@ -80,7 +80,8 @@ test('VideoEncoder: close() on closed encoder throws InvalidStateError', (t) => 
 
   // W3C spec: second close should throw InvalidStateError
   const error = t.throws(() => encoder.close())
-  t.true(error?.message.includes('InvalidStateError'))
+  t.true(error instanceof DOMException, 'error should be DOMException instance')
+  t.is((error as DOMException).name, 'InvalidStateError')
 })
 
 // ============================================================================
@@ -394,7 +395,8 @@ test('VideoEncoder: encode() on unconfigured encoder throws InvalidStateError', 
 
   // W3C spec: encode() on unconfigured encoder should throw InvalidStateError
   const error = t.throws(() => encoder.encode(frame))
-  t.true(error?.message.includes('InvalidStateError'))
+  t.true(error instanceof DOMException, 'error should be DOMException instance')
+  t.is((error as DOMException).name, 'InvalidStateError')
 
   frame.close()
 })
@@ -408,7 +410,8 @@ test('VideoEncoder: encode() on closed encoder throws InvalidStateError', (t) =>
 
   // W3C spec: encode() on closed encoder should throw InvalidStateError
   const error = t.throws(() => encoder.encode(frame))
-  t.true(error?.message.includes('InvalidStateError'))
+  t.true(error instanceof DOMException, 'error should be DOMException instance')
+  t.is((error as DOMException).name, 'InvalidStateError')
 
   frame.close()
 })

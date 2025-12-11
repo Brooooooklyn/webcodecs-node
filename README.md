@@ -6,7 +6,7 @@ WebCodecs API implementation for Node.js using FFmpeg, built with [NAPI-RS](http
 
 ## Features
 
-- **W3C WebCodecs API compliant** - Full implementation of the WebCodecs specification
+- **W3C WebCodecs API compliant** - Full implementation of the WebCodecs specification with native `DOMException` errors
 - **Video encoding/decoding** - H.264, H.265, VP8, VP9, AV1
 - **Audio encoding/decoding** - AAC, Opus, MP3, FLAC, Vorbis, PCM variants
 - **Image decoding** - JPEG, PNG, WebP, GIF, BMP, AVIF
@@ -258,6 +258,30 @@ The encoder automatically applies optimal settings for each hardware encoder bas
 | ---------------------------- | ------ | ------------------------------------------------ |
 | Multi-spatial SVC (L2T*, S*) | ❌     | Only L1Tx temporal modes populate `metadata.svc` |
 
+### Error Handling
+
+Synchronous errors (e.g., calling `encode()` on a closed encoder) throw native `DOMException` instances that pass `instanceof DOMException` checks per W3C spec:
+
+```typescript
+try {
+  encoder.encode(frame) // on closed encoder
+} catch (e) {
+  console.log(e instanceof DOMException) // true
+  console.log(e.name) // "InvalidStateError"
+}
+```
+
+Asynchronous error callbacks receive standard `Error` objects with the DOMException name in the message:
+
+```typescript
+const encoder = new VideoEncoder({
+  output: (chunk) => {},
+  error: (e) => {
+    console.log(e.message) // "EncodingError: ..."
+  },
+})
+```
+
 ### ImageDecoder Options
 
 ImageDecoder supports all W3C spec options:
@@ -273,7 +297,6 @@ ImageDecoder supports all W3C spec options:
 ### Platform-Specific Notes
 
 - **ImageDecoder GIF animation**: FFmpeg may return only the first frame. Use `VideoDecoder` with GIF codec for full animation.
-- **VideoFrame cloning**: Use `VideoFrame.fromVideoFrame()` factory method (NAPI-RS doesn't support constructor overloading).
 
 ## Logging
 

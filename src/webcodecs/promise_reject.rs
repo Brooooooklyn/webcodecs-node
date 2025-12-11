@@ -1,9 +1,11 @@
 use std::ptr;
 
 use napi::{
-  bindgen_prelude::{Env, PromiseRaw, Result},
+  bindgen_prelude::{Env, FnArgs, Function, JsObjectValue, PromiseRaw, Result},
   check_status, sys,
 };
+
+use super::error::DOMExceptionName;
 
 /// Reject a promise with a native TypeError
 ///
@@ -49,4 +51,32 @@ pub(crate) fn reject_with_type_error<'env, T>(
   )?;
 
   Ok(PromiseRaw::new(env.raw(), promise))
+}
+/// Reject a promise with a native DOMException (asynchronous)
+///
+/// This delays rejection by one event loop tick to allow pending error callbacks
+/// (from report_error) to run first.
+///
+/// Creates a proper JavaScript DOMException and rejects the promise with it.
+pub(crate) fn reject_with_dom_exception_async<'env>(
+  env: &'env Env,
+  name: DOMExceptionName,
+  message: &str,
+) -> Result<PromiseRaw<'env, ()>> {
+  // Convert to owned strings for use in closure
+  let name_str = name.as_str().to_string();
+  let message_str = message.to_string();
+
+  env
+    .spawn_future(async move { Ok(()) })?
+    .then(move |ctx| {
+      // Get global DOMException constructor and create instance
+      let global = ctx.env.get_global()?;
+      let dom_exception_constructor = global
+        .get_named_property_unchecked::<Function<FnArgs<(String, String)>>>("DOMException")?;
+      let error =
+        dom_exception_constructor.new_instance((message_str.clone(), name_str.clone()).into())?;
+      PromiseRaw::<()>::reject(&ctx.env, error)
+    })?
+    .then(|_| Ok(()))
 }

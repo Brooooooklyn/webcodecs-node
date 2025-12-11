@@ -8,8 +8,8 @@ use crate::codec::{
   Resampler, context::get_audio_encoder_name,
 };
 use crate::ffi::{AVCodecID, AVSampleFormat};
-use crate::webcodecs::error::{invalid_state_error, throw_type_error_unit};
-use crate::webcodecs::promise_reject::reject_with_type_error;
+use crate::webcodecs::error::{DOMExceptionName, throw_invalid_state_error, throw_type_error_unit};
+use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
 use crate::webcodecs::{
   AacBitstreamFormat, AudioData, AudioEncoderConfig, AudioEncoderSupport, EncodedAudioChunk,
 };
@@ -828,7 +828,7 @@ impl AudioEncoder {
 
     // W3C spec: throw InvalidStateError if closed
     if inner.state == CodecState::Closed {
-      return Err(invalid_state_error("Encoder is closed"));
+      return throw_invalid_state_error(&env, "Encoder is closed");
     }
 
     // Parse codec string to determine codec ID
@@ -934,7 +934,7 @@ impl AudioEncoder {
 
   /// Encode audio data
   #[napi]
-  pub fn encode(&self, data: &AudioData) -> Result<()> {
+  pub fn encode(&self, env: Env, data: &AudioData) -> Result<()> {
     // Clone frame, resample if needed, and get timestamp on main thread
     let (frame_to_send, timestamp) = {
       let mut inner = self
@@ -944,12 +944,10 @@ impl AudioEncoder {
 
       // W3C spec: throw InvalidStateError if not configured or closed
       if inner.state == CodecState::Closed {
-        return Err(invalid_state_error("Cannot encode with a closed codec"));
+        return throw_invalid_state_error(&env, "Cannot encode with a closed codec");
       }
       if inner.state != CodecState::Configured {
-        return Err(invalid_state_error(
-          "Cannot encode with an unconfigured codec",
-        ));
+        return throw_invalid_state_error(&env, "Cannot encode with an unconfigured codec");
       }
 
       // Get config info (unwrap validated config values)
@@ -1093,19 +1091,19 @@ impl AudioEncoder {
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
       if inner.state == CodecState::Closed {
-        // Return rejected promise via async to allow error callback to run first
-        return env
-          .spawn_future_with_callback(async move { Ok(()) }, move |_env, _| -> Result<()> {
-            Err(invalid_state_error("Cannot flush a closed codec"))
-          });
+        // Return rejected promise with native DOMException (async to allow error callback to run)
+        return reject_with_dom_exception_async(
+          env,
+          DOMExceptionName::InvalidStateError,
+          "Cannot flush a closed codec",
+        );
       }
       if inner.state == CodecState::Unconfigured {
-        // Return rejected promise via async to allow error callback to run first
-        return env.spawn_future_with_callback(
-          async move { Ok(()) },
-          move |_env, _| -> Result<()> {
-            Err(invalid_state_error("Cannot flush an unconfigured codec"))
-          },
+        // Return rejected promise with native DOMException (async to allow error callback to run)
+        return reject_with_dom_exception_async(
+          env,
+          DOMExceptionName::InvalidStateError,
+          "Cannot flush an unconfigured codec",
         );
       }
 
@@ -1133,7 +1131,7 @@ impl AudioEncoder {
         .send(EncoderCommand::Flush(response_sender))
         .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?;
     } else {
-      return Err(invalid_state_error("Cannot flush a closed codec"));
+      return throw_invalid_state_error(env, "Cannot flush a closed codec");
     }
 
     // Clone references for the callback closure
@@ -1197,7 +1195,7 @@ impl AudioEncoder {
           ));
         }
 
-        // Return worker result
+        // Return worker result (errors keep DOMException-style message for now)
         result
       },
     )
@@ -1205,7 +1203,7 @@ impl AudioEncoder {
 
   /// Reset the encoder
   #[napi]
-  pub fn reset(&mut self) -> Result<()> {
+  pub fn reset(&mut self, env: Env) -> Result<()> {
     // Check state first before touching the worker
     {
       let mut inner = self
@@ -1215,7 +1213,7 @@ impl AudioEncoder {
 
       // W3C spec: throw InvalidStateError if closed
       if inner.state == CodecState::Closed {
-        return Err(invalid_state_error("Cannot reset a closed codec"));
+        return throw_invalid_state_error(&env, "Cannot reset a closed codec");
       }
 
       // Set abort flag FIRST (synchronously, before any other reset logic)
@@ -1286,7 +1284,7 @@ impl AudioEncoder {
 
   /// Close the encoder
   #[napi]
-  pub fn close(&mut self) -> Result<()> {
+  pub fn close(&mut self, env: Env) -> Result<()> {
     // Check state first - W3C spec: throw InvalidStateError if already closed
     {
       let inner = self
@@ -1295,7 +1293,7 @@ impl AudioEncoder {
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
       if inner.state == CodecState::Closed {
-        return Err(invalid_state_error("Cannot close an already closed codec"));
+        return throw_invalid_state_error(&env, "Cannot close an already closed codec");
       }
     }
 

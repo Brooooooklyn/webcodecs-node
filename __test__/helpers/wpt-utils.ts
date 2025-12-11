@@ -108,7 +108,7 @@ export async function testClosedCodec(
     () => {
       ;(codec as VideoEncoder).configure(validConfig as unknown as Parameters<VideoEncoder['configure']>[0])
     },
-    { message: /InvalidStateError/ },
+    { name: 'InvalidStateError' },
     'configure should throw InvalidStateError',
   )
 
@@ -117,7 +117,7 @@ export async function testClosedCodec(
     () => {
       codec.reset()
     },
-    { message: /InvalidStateError/ },
+    { name: 'InvalidStateError' },
     'reset should throw InvalidStateError',
   )
 
@@ -126,7 +126,7 @@ export async function testClosedCodec(
     () => {
       codec.close()
     },
-    { message: /InvalidStateError/ },
+    { name: 'InvalidStateError' },
     'close should throw InvalidStateError',
   )
 
@@ -136,7 +136,7 @@ export async function testClosedCodec(
       () => {
         ;(codec as VideoEncoder).encode(codecInput as VideoFrame)
       },
-      { message: /InvalidStateError/ },
+      { name: 'InvalidStateError' },
       'encode should throw InvalidStateError',
     )
   } else if ('decode' in codec) {
@@ -144,13 +144,13 @@ export async function testClosedCodec(
       () => {
         ;(codec as VideoDecoder).decode(codecInput as EncodedVideoChunk)
       },
-      { message: /InvalidStateError/ },
+      { name: 'InvalidStateError' },
       'decode should throw InvalidStateError',
     )
   }
 
   // Flush should reject on closed codec
-  await t.throwsAsync(codec.flush(), { message: /InvalidStateError/ }, 'flush should reject with InvalidStateError')
+  await t.throwsAsync(codec.flush(), { name: 'InvalidStateError' }, 'flush should reject with InvalidStateError')
 }
 
 /**
@@ -174,7 +174,7 @@ export async function testUnconfiguredCodec(
       () => {
         ;(codec as VideoEncoder).encode(codecInput as VideoFrame)
       },
-      { message: /InvalidStateError/ },
+      { name: 'InvalidStateError' },
       'encode should throw InvalidStateError on unconfigured',
     )
   } else if ('decode' in codec) {
@@ -182,7 +182,7 @@ export async function testUnconfiguredCodec(
       () => {
         ;(codec as VideoDecoder).decode(codecInput as EncodedVideoChunk)
       },
-      { message: /InvalidStateError/ },
+      { name: 'InvalidStateError' },
       'decode should throw InvalidStateError on unconfigured',
     )
   }
@@ -190,7 +190,7 @@ export async function testUnconfiguredCodec(
   // Flush should reject on unconfigured codec
   await t.throwsAsync(
     codec.flush(),
-    { message: /InvalidStateError/ },
+    { name: 'InvalidStateError' },
     'flush should reject with InvalidStateError on unconfigured',
   )
 }

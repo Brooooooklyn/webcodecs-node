@@ -116,7 +116,8 @@ test('VideoDecoder: close() on closed decoder throws InvalidStateError', (t) => 
 
   // W3C spec: second close should throw InvalidStateError
   const error = t.throws(() => decoder.close())
-  t.true(error?.message.includes('InvalidStateError'))
+  t.true(error instanceof DOMException, 'error should be DOMException instance')
+  t.is((error as DOMException).name, 'InvalidStateError')
 })
 
 // ============================================================================
@@ -394,7 +395,8 @@ test('VideoDecoder: decode() on unconfigured decoder throws InvalidStateError', 
 
   // W3C spec: decode() on unconfigured decoder should throw InvalidStateError
   const error = t.throws(() => decoder.decode(chunks[0]))
-  t.true(error?.message.includes('InvalidStateError'))
+  t.true(error instanceof DOMException, 'error should be DOMException instance')
+  t.is((error as DOMException).name, 'InvalidStateError')
 })
 
 test('VideoDecoder: decode() on closed decoder throws InvalidStateError', async (t) => {
@@ -406,7 +408,8 @@ test('VideoDecoder: decode() on closed decoder throws InvalidStateError', async 
 
   // W3C spec: decode() on closed decoder should throw InvalidStateError
   const error = t.throws(() => decoder.decode(chunks[0]))
-  t.true(error?.message.includes('InvalidStateError'))
+  t.true(error instanceof DOMException, 'error should be DOMException instance')
+  t.is((error as DOMException).name, 'InvalidStateError')
 })
 
 // ============================================================================

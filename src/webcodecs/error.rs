@@ -1,10 +1,20 @@
 //! DOMException error helper - WebCodecs spec compliant error handling
 //!
-//! Provides spec-compliant error messages following DOMException naming conventions.
+//! Provides spec-compliant error handling following W3C DOMException conventions.
 //! See: https://developer.mozilla.org/en-US/docs/Web/API/DOMException
 //!
-//! Note: These helpers create Error objects with spec-compliant error names in the message.
-//! The actual DOMException class instantiation happens on the JavaScript side if needed.
+//! ## Native DOMException Support
+//!
+//! This module provides helpers to throw actual JavaScript DOMException objects
+//! that pass `instanceof DOMException` checks per W3C WebCodecs spec.
+//!
+//! Use the `throw_*_error()` helpers with an `Env` reference to throw native DOMException:
+//! - `throw_invalid_state_error()` - for closed objects or wrong state
+//! - `throw_not_supported_error()` - for unsupported codecs/configs
+//! - `throw_encoding_error()` - for encoding/decoding failures
+//! - `throw_data_error()` - for invalid data format
+//! - `throw_abort_error()` - for aborted operations
+//! - `throw_constraint_error()` - for constraint violations
 //!
 //! ## Native TypeError Support
 //!
@@ -64,6 +74,82 @@ pub fn dom_exception(name: DOMExceptionName, message: &str) -> Error {
   )
 }
 
+/// Throw a native JavaScript DOMException
+///
+/// Creates and throws an actual DOMException object that passes `instanceof DOMException` checks.
+/// This is the core function used by all specialized throw_*_error helpers.
+///
+/// # Arguments
+/// * `env` - NAPI environment reference
+/// * `name` - DOMException name (e.g., InvalidStateError, NotSupportedError)
+/// * `message` - Error message
+pub fn throw_dom_exception<T>(env: &Env, name: DOMExceptionName, message: &str) -> Result<T> {
+  let global = env.get_global()?;
+  let dom_exception_constructor =
+    global.get_named_property_unchecked::<Function<FnArgs<(&str, &str)>>>("DOMException")?;
+  let error = dom_exception_constructor.new_instance((message, name.as_str()).into())?;
+  env.throw(error)?;
+  Err(Error::new(
+    Status::GenericFailure,
+    format!("{}: {}", name.as_str(), message),
+  ))
+}
+
+// ============================================================================
+// Native DOMException Throwing Helpers
+// ============================================================================
+// These helpers throw actual native JavaScript DOMException objects
+// that pass `instanceof DOMException` checks per W3C WebCodecs spec.
+
+/// Throw a native InvalidStateError DOMException
+///
+/// Use when operating on a closed object or when in wrong state.
+///
+/// # Example
+/// ```ignore
+/// if inner.closed {
+///     return throw_invalid_state_error(&env, "VideoFrame is closed");
+/// }
+/// ```
+pub fn throw_invalid_state_error<T>(env: &Env, message: &str) -> Result<T> {
+  throw_dom_exception(env, DOMExceptionName::InvalidStateError, message)
+}
+
+/// Throw a native NotSupportedError DOMException
+///
+/// Use when a codec, configuration, or feature is not supported.
+pub fn throw_not_supported_error<T>(env: &Env, message: &str) -> Result<T> {
+  throw_dom_exception(env, DOMExceptionName::NotSupportedError, message)
+}
+
+/// Throw a native EncodingError DOMException
+///
+/// Use when an encoding or decoding operation fails.
+pub fn throw_encoding_error<T>(env: &Env, message: &str) -> Result<T> {
+  throw_dom_exception(env, DOMExceptionName::EncodingError, message)
+}
+
+/// Throw a native DataError DOMException
+///
+/// Use when input data is malformed or invalid.
+pub fn throw_data_error<T>(env: &Env, message: &str) -> Result<T> {
+  throw_dom_exception(env, DOMExceptionName::DataError, message)
+}
+
+/// Throw a native AbortError DOMException
+///
+/// Use when an operation was aborted.
+pub fn throw_abort_error<T>(env: &Env, message: &str) -> Result<T> {
+  throw_dom_exception(env, DOMExceptionName::AbortError, message)
+}
+
+/// Throw a native ConstraintError DOMException
+///
+/// Use when a constraint (like buffer size) is not satisfied.
+pub fn throw_constraint_error<T>(env: &Env, message: &str) -> Result<T> {
+  throw_dom_exception(env, DOMExceptionName::ConstraintError, message)
+}
+
 /// Helper to create NotSupportedError for unsupported codecs/configs
 ///
 /// Use when a codec, configuration, or feature is not supported.
@@ -111,6 +197,40 @@ pub fn type_error(message: &str) -> Error {
 /// Use when a constraint (like buffer size) is not satisfied.
 pub fn constraint_error(message: &str) -> Error {
   dom_exception(DOMExceptionName::ConstraintError, message)
+}
+
+/// Convert an Error with DOMException-style message to native DOMException and throw it
+///
+/// Parses error messages like "EncodingError: Decode failed" and throws the corresponding
+/// native DOMException. Returns PendingException status to propagate to Promise rejection.
+///
+/// Use this in async completion callbacks where worker thread errors need to be
+/// converted to native DOMException for Promise rejection.
+pub fn throw_error_as_dom_exception<T>(env: &Env, error: &Error) -> Result<T> {
+  let message = error.reason.as_str();
+
+  // Parse the error message prefix to determine DOMException type
+  if let Some(rest) = message.strip_prefix("EncodingError:") {
+    return throw_encoding_error(env, rest.trim());
+  }
+  if let Some(rest) = message.strip_prefix("InvalidStateError:") {
+    return throw_invalid_state_error(env, rest.trim());
+  }
+  if let Some(rest) = message.strip_prefix("NotSupportedError:") {
+    return throw_not_supported_error(env, rest.trim());
+  }
+  if let Some(rest) = message.strip_prefix("DataError:") {
+    return throw_data_error(env, rest.trim());
+  }
+  if let Some(rest) = message.strip_prefix("AbortError:") {
+    return throw_abort_error(env, rest.trim());
+  }
+  if let Some(rest) = message.strip_prefix("ConstraintError:") {
+    return throw_constraint_error(env, rest.trim());
+  }
+
+  // Not a DOMException-style message, propagate original error
+  Err(Error::new(error.status, &error.reason))
 }
 
 // ============================================================================

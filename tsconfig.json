@@ -14,8 +14,15 @@
     "outDir": "./dist",
   },
   "include": ["."],
-  "exclude": ["dist", "node_modules", "ffmpeg-build", "ffmpeg-src", "specs", "polyfill.d.ts", "polyfill.js", "__test__/integration/conversion.spec.ts"],
-  "references": [
-    { "path": "./tsconfig.polyfill.json" }
-  ]
+  "exclude": [
+    "dist",
+    "node_modules",
+    "ffmpeg-build",
+    "ffmpeg-src",
+    "specs",
+    "polyfill.d.ts",
+    "polyfill.js",
+    "__test__/integration/conversion.spec.ts",
+  ],
+  "references": [{ "path": "./tsconfig.polyfill.json" }],
 }

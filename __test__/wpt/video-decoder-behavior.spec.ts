@@ -136,14 +136,15 @@ test('VideoDecoder: decode non-key frame first fails', async (t) => {
 
   decoder.configure(config)
 
-  // Decoding a delta frame first should throw DataError
-  t.throws(
+  // Decoding a delta frame first should throw DataError (native DOMException)
+  const error = t.throws(
     () => {
       decoder.decode(deltaChunk)
     },
-    { message: /DataError/ },
+    { name: 'DataError' },
     'decode delta first should throw DataError',
   )
+  t.true(error instanceof DOMException, 'error should be DOMException instance')
 
   decoder.close()
 })
@@ -419,11 +420,14 @@ test('VideoDecoder: decode empty frame triggers error', async (t) => {
   })
   decoder.decode(emptyChunk)
 
-  await t.throwsAsync(decoder.flush(), { message: /EncodingError/ })
+  // Worker errors use standard Error with DOMException name in message
+  const flushError = await t.throwsAsync(decoder.flush())
+  t.true(flushError?.message.includes('EncodingError'), 'flush error should include EncodingError')
 
   const error = await gotError
   t.true(error instanceof Error)
-  t.true(error.message.includes('EncodingError'))
+  // Error callbacks receive standard Error with DOMException name in message
+  t.true(error.message.includes('EncodingError'), 'error callback should include EncodingError')
   t.is(decoder.state, 'closed', 'decoder closed after error')
 })
 

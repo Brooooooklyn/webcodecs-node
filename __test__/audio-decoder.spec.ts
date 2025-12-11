@@ -159,7 +159,8 @@ test('AudioDecoder: configure() with invalid codec triggers error callback', (t)
 
   // Already closed by error callback, so close() throws InvalidStateError
   const error = t.throws(() => decoder.close())
-  t.true(error?.message.includes('InvalidStateError'))
+  t.true(error instanceof DOMException, 'error should be DOMException instance')
+  t.is((error as DOMException).name, 'InvalidStateError')
 })
 
 // ============================================================================
@@ -177,7 +178,8 @@ test('AudioDecoder: decode() on unconfigured throws InvalidStateError', (t) => {
 
   // W3C spec: decode() on unconfigured decoder should throw InvalidStateError
   const error = t.throws(() => decoder.decode(chunk))
-  t.true(error?.message.includes('InvalidStateError'))
+  t.true(error instanceof DOMException, 'error should be DOMException instance')
+  t.is((error as DOMException).name, 'InvalidStateError')
 })
 
 test('AudioDecoder: decode() on closed throws InvalidStateError', (t) => {
@@ -199,7 +201,8 @@ test('AudioDecoder: decode() on closed throws InvalidStateError', (t) => {
 
   // W3C spec: decode() on closed decoder should throw InvalidStateError
   const error = t.throws(() => decoder.decode(chunk))
-  t.true(error?.message.includes('InvalidStateError'))
+  t.true(error instanceof DOMException, 'error should be DOMException instance')
+  t.is((error as DOMException).name, 'InvalidStateError')
 })
 
 test('AudioDecoder: reset() returns to unconfigured state', (t) => {
@@ -255,7 +258,8 @@ test('AudioDecoder: close() on closed decoder throws InvalidStateError', (t) => 
   decoder.close()
   // W3C spec: second close should throw InvalidStateError
   const error = t.throws(() => decoder.close())
-  t.true(error?.message.includes('InvalidStateError'))
+  t.true(error instanceof DOMException, 'error should be DOMException instance')
+  t.is((error as DOMException).name, 'InvalidStateError')
 })
 
 // ============================================================================

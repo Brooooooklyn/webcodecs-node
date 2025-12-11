@@ -5,7 +5,7 @@
 
 use crate::codec::Frame;
 use crate::ffi::AVSampleFormat;
-use crate::webcodecs::error::invalid_state_error;
+use crate::webcodecs::error::{invalid_state_error, throw_invalid_state_error};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::sync::{Arc, Mutex};
@@ -519,7 +519,7 @@ impl AudioData {
   /// For interleaved formats: 1
   /// For planar formats: numberOfChannels
   #[napi(getter)]
-  pub fn number_of_planes(&self) -> Result<u32> {
+  pub fn number_of_planes(&self, env: Env) -> Result<u32> {
     let inner = self
       .inner
       .lock()
@@ -533,7 +533,7 @@ impl AudioData {
           Ok(1)
         }
       }
-      None => Err(invalid_state_error("AudioData is closed")),
+      None => throw_invalid_state_error(&env, "AudioData is closed"),
     }
   }
 
@@ -550,9 +550,10 @@ impl AudioData {
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    let inner = inner
-      .as_ref()
-      .ok_or_else(|| invalid_state_error("AudioData is closed"))?;
+    let inner = match inner.as_ref() {
+      Some(i) => i,
+      None => return throw_invalid_state_error(&env, "AudioData is closed"),
+    };
 
     let format = options.format.unwrap_or(inner.format);
 
@@ -609,9 +610,10 @@ impl AudioData {
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    let inner = inner
-      .as_ref()
-      .ok_or_else(|| invalid_state_error("AudioData is closed"))?;
+    let inner = match inner.as_ref() {
+      Some(i) => i,
+      None => return throw_invalid_state_error(&env, "AudioData is closed"),
+    };
 
     let format = options.format.unwrap_or(inner.format);
     let plane_index = options.plane_index as usize;
@@ -724,15 +726,16 @@ impl AudioData {
 
   /// Create a copy of this AudioData
   #[napi(js_name = "clone")]
-  pub fn clone_audio_data(&self) -> Result<AudioData> {
+  pub fn clone_audio_data(&self, env: Env) -> Result<AudioData> {
     let inner = self
       .inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    let inner = inner
-      .as_ref()
-      .ok_or_else(|| invalid_state_error("AudioData is closed"))?;
+    let inner = match inner.as_ref() {
+      Some(i) => i,
+      None => return throw_invalid_state_error(&env, "AudioData is closed"),
+    };
 
     let cloned_frame = inner.frame.try_clone().map_err(|e| {
       Error::new(

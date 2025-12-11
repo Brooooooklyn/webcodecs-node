@@ -61,7 +61,7 @@ src/
 │   ├── encoded_audio_chunk.rs
 │   ├── image_decoder.rs    # ImageDecoder class
 │   ├── codec_string.rs     # Codec string parsing
-│   └── error.rs            # DOMException-style errors
+│   └── error.rs            # Native DOMException helpers
 └── lib.rs         # Crate root, module init, re-exports
 
 __test__/          # Test suite (ava)
@@ -180,9 +180,9 @@ Detection order:
 | `src/webcodecs/video_decoder.rs` | VideoDecoder implementation                  |
 | `src/webcodecs/audio_encoder.rs` | AudioEncoder with callback API               |
 | `src/webcodecs/audio_decoder.rs` | AudioDecoder implementation                  |
-| `src/webcodecs/video_frame.rs`   | VideoFrame with fromVideoFrame() factory     |
+| `src/webcodecs/video_frame.rs`   | VideoFrame with constructor overloading      |
 | `src/webcodecs/audio_data.rs`    | AudioData with sync copyTo()                 |
-| `src/webcodecs/error.rs`         | DOMException-style error helpers             |
+| `src/webcodecs/error.rs`         | Native DOMException helpers                  |
 | `src/webcodecs/codec_string.rs`  | Codec string parser (avc1, vp09, av01, hev1) |
 | `src/codec/context.rs`           | FFmpeg encoder/decoder context wrapper       |
 | `src/codec/hwframes.rs`          | HwFrameContext for GPU frame pools           |
@@ -255,7 +255,7 @@ const audioData = new AudioData({
 ## VideoFrame Constructors
 
 ```typescript
-// Buffer-based constructor
+// From buffer data (VideoFrameBufferInit - format, codedWidth, codedHeight, timestamp required)
 const frame = new VideoFrame(data, {
   format: 'I420',
   codedWidth: 1920,
@@ -263,8 +263,8 @@ const frame = new VideoFrame(data, {
   timestamp: 0,
 })
 
-// Clone from existing frame (factory method)
-const cloned = VideoFrame.fromVideoFrame(sourceFrame, { timestamp: newTs })
+// From existing VideoFrame (clone with optional overrides)
+const cloned = new VideoFrame(sourceFrame, { timestamp: newTs })
 ```
 
 ## ImageDecoder Usage
@@ -433,11 +433,9 @@ src/codec/context.rs:339,362  # Set extradata if provided (non-critical)
 
 These are fundamental limitations that cannot be resolved without upstream NAPI-RS changes:
 
-| Limitation                     | Impact                                             | Workaround                                                                                 |
-| ------------------------------ | -------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| **No constructor overloading** | VideoFrame cannot have two constructor signatures  | Use `VideoFrame.fromVideoFrame()` factory for cloning                                      |
-| **Duration as i64 not u64**    | Microsecond timestamps use signed integer          | No practical impact for typical usage                                                      |
-| **No native DOMException**     | Errors use standard `Error` with formatted message | Error message includes DOMException name (e.g., "InvalidStateError: VideoFrame is closed") |
+| Limitation                  | Impact                                    | Workaround                            |
+| --------------------------- | ----------------------------------------- | ------------------------------------- |
+| **Duration as i64 not u64** | Microsecond timestamps use signed integer | No practical impact for typical usage |
 
 ## Configuration Options
 
@@ -488,23 +486,24 @@ These are fundamental limitations that cannot be resolved without upstream NAPI-
 
 ## Spec Compliance Notes
 
-| Feature                      | Spec                   | Implementation            |
-| ---------------------------- | ---------------------- | ------------------------- |
-| VideoFrame.copyTo()          | Promise<PlaneLayout[]> | ✅ Async                  |
-| AudioData.copyTo()           | void (sync)            | ✅ Sync                   |
-| AudioData.allocationSize()   | options required       | ✅ Required               |
-| Encoder callbacks            | (chunk, metadata?)     | ✅ Spread args            |
-| AudioData constructor        | data in init           | ✅ Inside init            |
-| Enum casing                  | lowercase              | ✅ "key", "unconfigured"  |
-| VideoColorSpace.toJSON()     | toJSON() method        | ✅ Correct capitalization |
-| DOMRectReadOnly.toJSON()     | toJSON() method        | ✅ Correct capitalization |
-| VideoFrame.codedRect         | throws on closed       | ✅ InvalidStateError      |
-| VideoFrame.visibleRect       | throws on closed       | ✅ InvalidStateError      |
-| VideoFrame visibleRect param | cropping support       | ✅ Full W3C compliance    |
-| VideoFrame.copyTo rect       | subregion copy         | ✅ Full W3C compliance    |
-| ImageDecoder.closed          | readonly boolean       | ✅ Implemented            |
-| ImageTrackList.ready         | Promise                | ✅ Implemented            |
-| ImageTrackList.item()        | indexed access         | ✅ Implemented            |
-| ImageTrackList.selectedIndex | returns -1 if none     | ✅ Implemented            |
-| ImageTrack.selected          | writable property      | ✅ Getter/setter          |
-| SvcOutputMetadata            | temporalLayerId        | ✅ L1Tx modes             |
+| Feature                      | Spec                    | Implementation            |
+| ---------------------------- | ----------------------- | ------------------------- |
+| VideoFrame.copyTo()          | Promise<PlaneLayout[]>  | ✅ Async                  |
+| AudioData.copyTo()           | void (sync)             | ✅ Sync                   |
+| AudioData.allocationSize()   | options required        | ✅ Required               |
+| Encoder callbacks            | (chunk, metadata?)      | ✅ Spread args            |
+| AudioData constructor        | data in init            | ✅ Inside init            |
+| Enum casing                  | lowercase               | ✅ "key", "unconfigured"  |
+| VideoColorSpace.toJSON()     | toJSON() method         | ✅ Correct capitalization |
+| DOMRectReadOnly.toJSON()     | toJSON() method         | ✅ Correct capitalization |
+| VideoFrame.codedRect         | throws on closed        | ✅ InvalidStateError      |
+| VideoFrame.visibleRect       | throws on closed        | ✅ InvalidStateError      |
+| VideoFrame visibleRect param | cropping support        | ✅ Full W3C compliance    |
+| VideoFrame.copyTo rect       | subregion copy          | ✅ Full W3C compliance    |
+| ImageDecoder.closed          | readonly boolean        | ✅ Implemented            |
+| ImageTrackList.ready         | Promise                 | ✅ Implemented            |
+| ImageTrackList.item()        | indexed access          | ✅ Implemented            |
+| ImageTrackList.selectedIndex | returns -1 if none      | ✅ Implemented            |
+| ImageTrack.selected          | writable property       | ✅ Getter/setter          |
+| SvcOutputMetadata            | temporalLayerId         | ✅ L1Tx modes             |
+| DOMException errors          | instanceof DOMException | ✅ Native DOMException    |
