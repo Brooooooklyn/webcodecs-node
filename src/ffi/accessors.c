@@ -96,6 +96,10 @@ void ffctx_set_color_range(AVCodecContext* ctx, int color_range) {
     ctx->color_range = color_range;
 }
 
+int ffctx_get_flags(const AVCodecContext* ctx) {
+    return ctx->flags;
+}
+
 void ffctx_set_flags(AVCodecContext* ctx, int flags) {
     ctx->flags = flags;
 }

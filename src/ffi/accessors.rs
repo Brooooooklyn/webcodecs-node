@@ -54,6 +54,7 @@ unsafe extern "C" {
   pub fn ffctx_get_level(ctx: *const AVCodecContext) -> c_int;
   pub fn ffctx_get_extradata(ctx: *const AVCodecContext) -> *const u8;
   pub fn ffctx_get_extradata_size(ctx: *const AVCodecContext) -> c_int;
+  pub fn ffctx_get_flags(ctx: *const AVCodecContext) -> c_int;
 
   // ========================================================================
   // AVCodecContext Audio Setters

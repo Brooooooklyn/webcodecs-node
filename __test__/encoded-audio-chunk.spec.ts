@@ -274,3 +274,35 @@ test('EncodedAudioChunk: Opus-like data structure', (t) => {
 
   t.is(chunk.byteLength, data.length)
 })
+
+// ============================================================================
+// Error Handling Tests
+// ============================================================================
+
+test('EncodedAudioChunk: invalid type throws TypeError', (t) => {
+  t.throws(
+    () => {
+      new EncodedAudioChunk({
+        type: 'invalid' as any,
+        timestamp: 0,
+        data: new Uint8Array(1),
+      })
+    },
+    { instanceOf: TypeError },
+  )
+})
+
+test('EncodedAudioChunk: copyTo throws if destination too small', (t) => {
+  const chunk = new EncodedAudioChunk({
+    type: 'key',
+    timestamp: 0,
+    data: new Uint8Array(10),
+  })
+
+  t.throws(
+    () => {
+      chunk.copyTo(new Uint8Array(5))
+    },
+    { instanceOf: TypeError },
+  )
+})

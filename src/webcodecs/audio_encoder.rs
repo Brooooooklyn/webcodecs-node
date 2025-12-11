@@ -10,7 +10,9 @@ use crate::codec::{
 use crate::ffi::{AVCodecID, AVSampleFormat};
 use crate::webcodecs::error::{invalid_state_error, throw_type_error_unit};
 use crate::webcodecs::promise_reject::reject_with_type_error;
-use crate::webcodecs::{AudioData, AudioEncoderConfig, AudioEncoderSupport, EncodedAudioChunk};
+use crate::webcodecs::{
+  AacBitstreamFormat, AudioData, AudioEncoderConfig, AudioEncoderSupport, EncodedAudioChunk,
+};
 use crossbeam::channel::{self, Receiver, Sender};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{
@@ -181,6 +183,11 @@ struct AudioEncoderInner {
   /// Flag indicating whether the encoder was closed due to an error
   /// Used to return EncodingError from flush() instead of InvalidStateError
   had_error: bool,
+  /// AAC-specific: Whether to use ADTS format (headers prepended to each frame)
+  use_adts: bool,
+  /// Cached AAC parameters for ADTS header generation
+  /// (sample_rate_index, channel_config)
+  adts_params: Option<(u8, u8)>,
 }
 
 /// AudioEncoder - WebCodecs-compliant audio encoder
@@ -276,6 +283,8 @@ impl AudioEncoder {
       pending_chunks: Vec::new(),
       inside_flush: false,
       had_error: false,
+      use_adts: false,
+      adts_params: None,
     };
 
     let inner = Arc::new(Mutex::new(inner));
@@ -377,11 +386,22 @@ impl AudioEncoder {
     }
 
     // Get extradata before encoding first frame
+    // For FLAC, prepend the "fLaC" header since FFmpeg only returns raw STREAMINFO
     let extradata = if !guard.extradata_sent {
-      guard
+      let raw_extradata = guard
         .context
         .as_ref()
-        .and_then(|ctx| ctx.extradata().map(|d| d.to_vec()))
+        .and_then(|ctx| ctx.extradata().map(|d| d.to_vec()));
+
+      // Check if codec is FLAC and prepend header if needed
+      let is_flac = codec_string.to_lowercase() == "flac";
+      raw_extradata.map(|data| {
+        if is_flac {
+          prepend_flac_header(&data)
+        } else {
+          data
+        }
+      })
     } else {
       None
     };
@@ -491,9 +511,19 @@ impl AudioEncoder {
 
       // Process output packets - call callback for each
       // Pop timestamp from queue to preserve original input timestamp
+      let adts_params = if guard.use_adts {
+        guard.adts_params
+      } else {
+        None
+      };
       for packet in packets {
         let output_timestamp = guard.timestamp_queue.pop_front();
-        let chunk = EncodedAudioChunk::from_packet(&packet, Some(duration_us), output_timestamp);
+        let chunk = EncodedAudioChunk::from_packet_with_adts(
+          &packet,
+          Some(duration_us),
+          output_timestamp,
+          adts_params,
+        );
 
         // Create metadata
         let metadata = if !guard.extradata_sent {
@@ -605,10 +635,19 @@ impl AudioEncoder {
 
         if let Ok(packets) = context.encode(Some(&frame)) {
           let duration_us = (frame.nb_samples() as i64 * 1_000_000) / sample_rate;
+          let adts_params = if guard.use_adts {
+            guard.adts_params
+          } else {
+            None
+          };
           for packet in packets {
             let output_timestamp = guard.timestamp_queue.pop_front();
-            let chunk =
-              EncodedAudioChunk::from_packet(&packet, Some(duration_us), output_timestamp);
+            let chunk = EncodedAudioChunk::from_packet_with_adts(
+              &packet,
+              Some(duration_us),
+              output_timestamp,
+              adts_params,
+            );
             let metadata = EncodedAudioChunkMetadata {
               decoder_config: None,
             };
@@ -636,9 +675,15 @@ impl AudioEncoder {
       };
 
       // Queue remaining packets for synchronous delivery in resolver
+      let adts_params = if guard.use_adts {
+        guard.adts_params
+      } else {
+        None
+      };
       for packet in packets {
         let output_timestamp = guard.timestamp_queue.pop_front();
-        let chunk = EncodedAudioChunk::from_packet(&packet, None, output_timestamp);
+        let chunk =
+          EncodedAudioChunk::from_packet_with_adts(&packet, None, output_timestamp, adts_params);
         let metadata = EncodedAudioChunkMetadata {
           decoder_config: None,
         };
@@ -855,7 +900,6 @@ impl AudioEncoder {
     );
 
     inner.context = Some(context);
-    inner.config = Some(config);
     inner.sample_buffer = Some(sample_buffer);
     inner.target_format = target_format;
     inner.state = CodecState::Configured;
@@ -863,6 +907,27 @@ impl AudioEncoder {
     inner.frame_count = 0;
     inner.resampler = None;
     inner.encode_queue_size = 0;
+
+    // Check if AAC ADTS format is requested
+    let is_aac = codec.to_lowercase().starts_with("mp4a.40") || codec.to_lowercase() == "aac";
+    inner.use_adts = is_aac
+      && config
+        .aac
+        .as_ref()
+        .and_then(|aac| aac.format)
+        .map(|f| f == AacBitstreamFormat::Adts)
+        .unwrap_or(false);
+
+    // Cache ADTS parameters if needed
+    if inner.use_adts {
+      let sample_rate_index = get_aac_sample_rate_index(sample_rate as u32);
+      let channel_config = std::cmp::min(number_of_channels, 7) as u8;
+      inner.adts_params = Some((sample_rate_index, channel_config));
+    } else {
+      inner.adts_params = None;
+    }
+
+    inner.config = Some(config);
 
     Ok(())
   }
@@ -1395,4 +1460,54 @@ fn get_encoder_sample_format(codec_id: AVCodecID) -> AVSampleFormat {
     AVCodecID::Alac => AVSampleFormat::S16p,
     _ => AVSampleFormat::Fltp, // Default to float planar
   }
+}
+
+/// Get AAC sample rate index for ADTS header
+/// Returns the index corresponding to the sample rate in the ADTS header's
+/// sampling_frequency_index field (4 bits, values 0-12)
+fn get_aac_sample_rate_index(sample_rate: u32) -> u8 {
+  match sample_rate {
+    96000 => 0,
+    88200 => 1,
+    64000 => 2,
+    48000 => 3,
+    44100 => 4,
+    32000 => 5,
+    24000 => 6,
+    22050 => 7,
+    16000 => 8,
+    12000 => 9,
+    11025 => 10,
+    8000 => 11,
+    7350 => 12,
+    _ => 15, // 15 means frequency is explicitly specified (not used in simple ADTS)
+  }
+}
+
+/// Prepend FLAC stream header to raw STREAMINFO block from FFmpeg.
+/// FFmpeg returns just the 34-byte STREAMINFO block, but the W3C spec expects
+/// the full FLAC header including "fLaC" magic and metadata block header.
+///
+/// FLAC stream format:
+/// - "fLaC" magic (4 bytes)
+/// - METADATA_BLOCK_HEADER: last-block-flag(1) + type(7) + length(24) (4 bytes)
+/// - METADATA_BLOCK_DATA (STREAMINFO = 34 bytes)
+fn prepend_flac_header(streaminfo: &[u8]) -> Vec<u8> {
+  // Only prepend if this looks like raw STREAMINFO (34 bytes, doesn't start with "fLaC")
+  if streaminfo.len() != 34 || streaminfo.starts_with(b"fLaC") {
+    return streaminfo.to_vec();
+  }
+
+  let mut result = Vec::with_capacity(4 + 4 + 34);
+  // "fLaC" magic
+  result.extend_from_slice(b"fLaC");
+  // METADATA_BLOCK_HEADER: 0x80 = last-metadata-block flag + type 0 (STREAMINFO)
+  // Length = 34 (0x000022)
+  result.push(0x80); // last-metadata-block = 1, type = 0 (STREAMINFO)
+  result.push(0x00);
+  result.push(0x00);
+  result.push(0x22); // length = 34
+  // STREAMINFO data
+  result.extend_from_slice(streaminfo);
+  result
 }

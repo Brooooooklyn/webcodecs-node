@@ -75,6 +75,7 @@
     "emnapi": "^1.7.1",
     "husky": "^9.1.7",
     "lint-staged": "^16.2.7",
+    "mediabunny": "1.25.8",
     "npm-run-all2": "^8.0.4",
     "oxfmt": "^0.17.0",
     "oxlint": "^1.32.0",

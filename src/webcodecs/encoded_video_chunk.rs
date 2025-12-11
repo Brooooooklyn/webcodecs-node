@@ -223,14 +223,31 @@ impl EncodedVideoChunk {
   /// Create from internal Packet (for encoder output)
   /// If explicit_timestamp is provided, it overrides the packet's PTS (for timestamp preservation)
   pub fn from_packet(packet: &Packet, explicit_timestamp: Option<i64>) -> Self {
+    Self::from_packet_with_format(packet, explicit_timestamp, false)
+  }
+
+  /// Create from internal Packet with optional AVCC conversion
+  /// If use_avcc is true, converts from Annex B to AVCC format (length-prefixed NALUs)
+  pub fn from_packet_with_format(
+    packet: &Packet,
+    explicit_timestamp: Option<i64>,
+    use_avcc: bool,
+  ) -> Self {
     let chunk_type = if packet.is_key() {
       EncodedVideoChunkType::Key
     } else {
       EncodedVideoChunkType::Delta
     };
 
+    let raw_data = packet.to_vec();
+    let data = if use_avcc {
+      convert_annexb_to_avcc(&raw_data)
+    } else {
+      raw_data
+    };
+
     let inner = EncodedVideoChunkInner {
-      data: packet.to_vec(),
+      data,
       chunk_type,
       // Use explicit timestamp if provided, otherwise fall back to packet PTS
       timestamp_us: explicit_timestamp.unwrap_or_else(|| packet.pts()),
@@ -357,6 +374,664 @@ impl EncodedVideoChunk {
       )),
     }
   }
+}
+
+/// Convert H.264/H.265 Annex B format to AVCC/HVCC format (length-prefixed NALUs)
+///
+/// Annex B uses start codes (0x00000001 or 0x000001) to delimit NAL units.
+/// AVCC/HVCC uses 4-byte big-endian length prefixes instead.
+///
+/// This function scans for start codes and replaces them with the NAL unit length.
+fn convert_annexb_to_avcc(data: &[u8]) -> Vec<u8> {
+  if data.is_empty() {
+    return Vec::new();
+  }
+
+  // Find all NAL unit boundaries (positions after start codes)
+  let mut nal_starts: Vec<usize> = Vec::new();
+  let mut i = 0;
+
+  while i < data.len() {
+    // Look for 3-byte or 4-byte start code
+    if i + 3 <= data.len() && data[i] == 0 && data[i + 1] == 0 {
+      if data[i + 2] == 1 {
+        // 3-byte start code: 0x000001
+        nal_starts.push(i + 3);
+        i += 3;
+        continue;
+      } else if i + 4 <= data.len() && data[i + 2] == 0 && data[i + 3] == 1 {
+        // 4-byte start code: 0x00000001
+        nal_starts.push(i + 4);
+        i += 4;
+        continue;
+      }
+    }
+    i += 1;
+  }
+
+  if nal_starts.is_empty() {
+    // No start codes found - might already be in AVCC format or invalid data
+    return data.to_vec();
+  }
+
+  // Build AVCC output
+  let mut result = Vec::with_capacity(data.len());
+
+  for (idx, &start) in nal_starts.iter().enumerate() {
+    // Find the end of this NAL unit (start of next, or end of data)
+    let end = if idx + 1 < nal_starts.len() {
+      // Find where the next start code begins (scan backwards from next NAL start)
+      let next_nal_start = nal_starts[idx + 1];
+      // The start code is either 3 or 4 bytes before next_nal_start
+      if next_nal_start >= 4 && data[next_nal_start - 4] == 0 && data[next_nal_start - 3] == 0 {
+        next_nal_start - 4 // 4-byte start code
+      } else {
+        next_nal_start - 3 // 3-byte start code
+      }
+    } else {
+      data.len()
+    };
+
+    let nal_data = &data[start..end];
+    let nal_len = nal_data.len() as u32;
+
+    // Write 4-byte big-endian length prefix
+    result.extend_from_slice(&nal_len.to_be_bytes());
+    // Write NAL unit data
+    result.extend_from_slice(nal_data);
+  }
+
+  result
+}
+
+/// Convert AVCC/HVCC format (length-prefixed NALUs) to Annex B format
+///
+/// AVCC uses 4-byte big-endian length prefixes to delimit NAL units.
+/// Annex B uses start codes (0x00000001) instead.
+///
+/// This function parses length-prefixed NALUs and converts to start code format.
+pub fn convert_avcc_to_annexb(data: &[u8]) -> Vec<u8> {
+  if data.len() < 4 {
+    return data.to_vec();
+  }
+
+  // Check if this looks like AVCC format by trying to parse it
+  // AVCC format has 4-byte BE length prefixes
+  let mut result = Vec::with_capacity(data.len() + 16); // Some extra for start codes
+  let mut i = 0;
+
+  while i + 4 <= data.len() {
+    // Read 4-byte big-endian length
+    let nal_len = u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as usize;
+
+    // Sanity check: length should be reasonable
+    if nal_len == 0 || nal_len > data.len() - i - 4 {
+      // Not valid AVCC format, might already be Annex B - return as-is
+      return data.to_vec();
+    }
+
+    i += 4; // Skip length prefix
+
+    // Write 4-byte start code
+    result.extend_from_slice(&[0, 0, 0, 1]);
+    // Write NAL unit data
+    result.extend_from_slice(&data[i..i + nal_len]);
+
+    i += nal_len;
+  }
+
+  // If we didn't consume all data or didn't produce any output, return original
+  if result.is_empty() || (i != data.len() && i < 4) {
+    return data.to_vec();
+  }
+
+  result
+}
+
+/// Check if data looks like AVCC format (length-prefixed NALUs)
+/// Returns true if the data appears to be in AVCC format
+pub fn is_avcc_format(data: &[u8]) -> bool {
+  if data.len() < 5 {
+    return false;
+  }
+
+  // Check for definite Annex B 4-byte start code (0x00000001)
+  // This is unambiguous - AVCC would never have a length of exactly 1
+  if data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1 {
+    return false; // Definitely Annex B
+  }
+
+  // Check if first 4 bytes look like a reasonable NALU length
+  let nal_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+
+  // NALU length should be > 0 and fit within remaining data
+  if nal_len == 0 || nal_len > data.len() - 4 {
+    return false;
+  }
+
+  // For ambiguous case (could be 3-byte start code 00 00 01):
+  // Check if data[3] is part of length or a NAL header
+  // If 00 00 01 XX where XX is a valid NAL header AND length doesn't make sense, it's Annex B
+  if data[0] == 0 && data[1] == 0 && data[2] == 1 {
+    // This could be 3-byte Annex B (00 00 01 <NAL>) or AVCC with length 0x000001XX
+    // Check if interpreting as AVCC makes sense:
+    // - The 5th byte (data[4]) should be a valid NAL header
+    // - The length (0x000001XX) should match data structure
+
+    let nal_header_if_annexb = data[3]; // NAL header if this is Annex B
+    let nal_header_if_avcc = data[4]; // NAL header if this is AVCC
+
+    // Check if Annex B interpretation is valid (data[3] is valid NAL header)
+    let annexb_forbidden_bit = (nal_header_if_annexb >> 7) & 1;
+    let annexb_nal_type = nal_header_if_annexb & 0x1F;
+    let annexb_valid = annexb_forbidden_bit == 0 && annexb_nal_type <= 23 && annexb_nal_type > 0;
+
+    // Check if AVCC interpretation is valid (data[4] is valid NAL header)
+    let avcc_forbidden_bit = (nal_header_if_avcc >> 7) & 1;
+    let avcc_nal_type = nal_header_if_avcc & 0x1F;
+    let avcc_valid = avcc_forbidden_bit == 0 && avcc_nal_type <= 23 && avcc_nal_type > 0;
+
+    // If only AVCC interpretation is valid, it's AVCC
+    if avcc_valid && !annexb_valid {
+      return true;
+    }
+    // If only Annex B interpretation is valid, it's Annex B
+    if annexb_valid && !avcc_valid {
+      return false;
+    }
+    // If both are valid, prefer AVCC if length exactly matches data
+    if avcc_valid && annexb_valid {
+      // AVCC is more likely if the length exactly consumes remaining data
+      // For a single NAL chunk: nal_len + 4 == data.len()
+      if nal_len + 4 == data.len() {
+        return true;
+      }
+      // For multi-NAL chunk, try parsing multiple NALs
+      let mut offset = 0;
+      let mut valid_multi_nal = true;
+      while offset + 4 <= data.len() {
+        let len = u32::from_be_bytes([
+          data[offset],
+          data[offset + 1],
+          data[offset + 2],
+          data[offset + 3],
+        ]) as usize;
+        if len == 0 || offset + 4 + len > data.len() {
+          valid_multi_nal = false;
+          break;
+        }
+        offset += 4 + len;
+      }
+      if valid_multi_nal && offset == data.len() {
+        return true;
+      }
+      // Default to Annex B for ambiguous cases
+      return false;
+    }
+  }
+
+  // For non-ambiguous cases, check if the 5th byte is a valid NAL header
+  let nal_header = data[4];
+  let h264_nal_type = nal_header & 0x1F;
+  let h264_forbidden_bit = (nal_header >> 7) & 1;
+
+  // For H.264, forbidden_zero_bit must be 0 and NAL type should be valid (1-23)
+  if h264_forbidden_bit == 0 && h264_nal_type > 0 && h264_nal_type <= 23 {
+    return true;
+  }
+
+  // Could be H.265 - check differently
+  // H.265: forbidden_zero_bit (1) + nal_unit_type (6) + nuh_layer_id (6) + nuh_temporal_id_plus1 (3)
+  let h265_forbidden_bit = (nal_header >> 7) & 1;
+  h265_forbidden_bit == 0
+}
+
+/// Convert H.264 Annex B extradata (SPS/PPS with start codes) to avcC box format
+///
+/// avcC format (AVCDecoderConfigurationRecord) per ISO/IEC 14496-15:
+/// - configurationVersion (1 byte) = 1
+/// - AVCProfileIndication (1 byte) - from SPS profile_idc
+/// - profile_compatibility (1 byte) - from SPS constraint_set flags
+/// - AVCLevelIndication (1 byte) - from SPS level_idc
+/// - lengthSizeMinusOne (6 bits reserved=1, 2 bits) = 0xFF (4-byte NALU lengths)
+/// - numOfSequenceParameterSets (3 bits reserved=1, 5 bits count)
+/// - sequenceParameterSetLength (2 bytes BE) + SPS data (for each SPS)
+/// - numOfPictureParameterSets (1 byte)
+/// - pictureParameterSetLength (2 bytes BE) + PPS data (for each PPS)
+pub fn convert_annexb_extradata_to_avcc(data: &[u8]) -> Option<Vec<u8>> {
+  if data.is_empty() {
+    return None;
+  }
+
+  // Parse NAL units from Annex B format
+  let mut sps_list: Vec<&[u8]> = Vec::new();
+  let mut pps_list: Vec<&[u8]> = Vec::new();
+  let mut i = 0;
+
+  while i < data.len() {
+    // Find start code (0x000001 or 0x00000001)
+    let mut start_code_len = 0;
+    if i + 4 <= data.len()
+      && data[i] == 0
+      && data[i + 1] == 0
+      && data[i + 2] == 0
+      && data[i + 3] == 1
+    {
+      start_code_len = 4;
+    } else if i + 3 <= data.len() && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+      start_code_len = 3;
+    }
+
+    if start_code_len > 0 {
+      let nal_start = i + start_code_len;
+
+      // Find end of this NAL (next start code or end of data)
+      let mut nal_end = data.len();
+      let mut j = nal_start;
+      while j < data.len() {
+        // Check for 4-byte start code (00 00 00 01) or 3-byte start code (00 00 01)
+        let is_4byte_start = j + 4 <= data.len()
+          && data[j] == 0
+          && data[j + 1] == 0
+          && data[j + 2] == 0
+          && data[j + 3] == 1;
+        let is_3byte_start =
+          j + 3 <= data.len() && data[j] == 0 && data[j + 1] == 0 && data[j + 2] == 1;
+        if is_4byte_start || is_3byte_start {
+          nal_end = j;
+          break;
+        }
+        j += 1;
+      }
+
+      if nal_start < nal_end {
+        let nal_type = data[nal_start] & 0x1F;
+        match nal_type {
+          7 => sps_list.push(&data[nal_start..nal_end]), // SPS
+          8 => pps_list.push(&data[nal_start..nal_end]), // PPS
+          _ => {}                                        // Skip other NAL types
+        }
+      }
+      i = nal_end;
+    } else {
+      i += 1;
+    }
+  }
+
+  // Need at least one SPS and one PPS
+  if sps_list.is_empty() || pps_list.is_empty() {
+    return None;
+  }
+
+  // Extract profile/level from first SPS
+  // SPS structure: nal_unit_type (1 byte), profile_idc (1 byte), constraint_set (1 byte), level_idc (1 byte)
+  let sps = sps_list[0];
+  if sps.len() < 4 {
+    return None;
+  }
+  let profile_idc = sps[1];
+  let profile_compat = sps[2];
+  let level_idc = sps[3];
+
+  // Build avcC box
+  let mut result = vec![
+    1,              // configurationVersion = 1
+    profile_idc,    // AVCProfileIndication
+    profile_compat, // profile_compatibility
+    level_idc,      // AVCLevelIndication
+    0xFF,           // lengthSizeMinusOne (6 bits reserved=1 + 2 bits value=3)
+  ];
+
+  // numOfSequenceParameterSets (3 bits reserved=1 + 5 bits count)
+  let num_sps = (sps_list.len() as u8).min(31);
+  result.push(0xE0 | num_sps);
+
+  // Write each SPS
+  for sps in sps_list.iter().take(num_sps as usize) {
+    let len = sps.len() as u16;
+    result.extend_from_slice(&len.to_be_bytes());
+    result.extend_from_slice(sps);
+  }
+
+  // numOfPictureParameterSets
+  let num_pps = pps_list.len() as u8;
+  result.push(num_pps);
+
+  // Write each PPS
+  for pps in pps_list.iter().take(num_pps as usize) {
+    let len = pps.len() as u16;
+    result.extend_from_slice(&len.to_be_bytes());
+    result.extend_from_slice(pps);
+  }
+
+  Some(result)
+}
+
+/// Convert H.265 Annex B extradata (VPS/SPS/PPS with start codes) to hvcC box format
+///
+/// hvcC format (HEVCDecoderConfigurationRecord) per ISO/IEC 14496-15
+pub fn convert_annexb_extradata_to_hvcc(data: &[u8]) -> Option<Vec<u8>> {
+  if data.is_empty() {
+    return None;
+  }
+
+  // Parse NAL units from Annex B format
+  let mut vps_list: Vec<&[u8]> = Vec::new();
+  let mut sps_list: Vec<&[u8]> = Vec::new();
+  let mut pps_list: Vec<&[u8]> = Vec::new();
+  let mut i = 0;
+
+  while i < data.len() {
+    // Find start code (0x000001 or 0x00000001)
+    let mut start_code_len = 0;
+    if i + 4 <= data.len()
+      && data[i] == 0
+      && data[i + 1] == 0
+      && data[i + 2] == 0
+      && data[i + 3] == 1
+    {
+      start_code_len = 4;
+    } else if i + 3 <= data.len() && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+      start_code_len = 3;
+    }
+
+    if start_code_len > 0 {
+      let nal_start = i + start_code_len;
+
+      // Find end of this NAL (next start code or end of data)
+      let mut nal_end = data.len();
+      let mut j = nal_start;
+      while j < data.len() {
+        // Check for 4-byte start code (00 00 00 01) or 3-byte start code (00 00 01)
+        let is_4byte_start = j + 4 <= data.len()
+          && data[j] == 0
+          && data[j + 1] == 0
+          && data[j + 2] == 0
+          && data[j + 3] == 1;
+        let is_3byte_start =
+          j + 3 <= data.len() && data[j] == 0 && data[j + 1] == 0 && data[j + 2] == 1;
+        if is_4byte_start || is_3byte_start {
+          nal_end = j;
+          break;
+        }
+        j += 1;
+      }
+
+      if nal_start < nal_end {
+        // HEVC NAL type is (byte[0] >> 1) & 0x3F
+        let nal_type = (data[nal_start] >> 1) & 0x3F;
+        match nal_type {
+          32 => vps_list.push(&data[nal_start..nal_end]), // VPS
+          33 => sps_list.push(&data[nal_start..nal_end]), // SPS
+          34 => pps_list.push(&data[nal_start..nal_end]), // PPS
+          _ => {}                                         // Skip other NAL types
+        }
+      }
+      i = nal_end;
+    } else {
+      i += 1;
+    }
+  }
+
+  // Need at least one SPS and one PPS
+  if sps_list.is_empty() || pps_list.is_empty() {
+    return None;
+  }
+
+  // Parse SPS to extract profile/tier/level
+  // HEVC SPS structure is complex; we'll use defaults for now and copy NAL data
+  let sps = sps_list[0];
+  if sps.len() < 6 {
+    return None;
+  }
+
+  // Build hvcC box
+  let mut result = Vec::new();
+
+  // configurationVersion = 1
+  result.push(1);
+  // general_profile_space (2 bits) + general_tier_flag (1 bit) + general_profile_idc (5 bits)
+  // We'll set defaults: profile_space=0, tier_flag=0, profile_idc=1 (Main)
+  result.push(0x01);
+  // general_profile_compatibility_flags (4 bytes)
+  result.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+  // general_constraint_indicator_flags (6 bytes)
+  result.extend_from_slice(&[0x90, 0x00, 0x00, 0x00, 0x00, 0x00]);
+  // general_level_idc
+  result.push(0x5D); // Level 3.1 default
+  // min_spatial_segmentation_idc (4 bits reserved=1 + 12 bits value)
+  result.extend_from_slice(&[0xF0, 0x00]);
+  // parallelismType (6 bits reserved=1 + 2 bits value)
+  result.push(0xFC);
+  // chromaFormat (6 bits reserved=1 + 2 bits value)
+  result.push(0xFD); // 4:2:0
+  // bitDepthLumaMinus8 (5 bits reserved=1 + 3 bits value)
+  result.push(0xF8);
+  // bitDepthChromaMinus8 (5 bits reserved=1 + 3 bits value)
+  result.push(0xF8);
+  // avgFrameRate (2 bytes)
+  result.extend_from_slice(&[0x00, 0x00]);
+  // constantFrameRate (2 bits) + numTemporalLayers (3 bits) + temporalIdNested (1 bit) + lengthSizeMinusOne (2 bits)
+  result.push(0x0F); // 4-byte NALU lengths
+
+  // numOfArrays
+  let has_vps = !vps_list.is_empty();
+  let num_arrays = if has_vps { 3u8 } else { 2u8 };
+  result.push(num_arrays);
+
+  // HEVC NAL unit types for parameter sets
+  const VPS_NAL_TYPE: u8 = 32;
+  const SPS_NAL_TYPE: u8 = 33;
+  const PPS_NAL_TYPE: u8 = 34;
+
+  // Write VPS array if present
+  if has_vps {
+    // array_completeness (1 bit) + reserved (1 bit) + NAL_unit_type (6 bits)
+    result.push(VPS_NAL_TYPE);
+    let num_vps = (vps_list.len() as u16).min(255);
+    result.extend_from_slice(&num_vps.to_be_bytes());
+    for vps in vps_list.iter().take(num_vps as usize) {
+      let len = vps.len() as u16;
+      result.extend_from_slice(&len.to_be_bytes());
+      result.extend_from_slice(vps);
+    }
+  }
+
+  // Write SPS array
+  result.push(SPS_NAL_TYPE);
+  let num_sps = (sps_list.len() as u16).min(255);
+  result.extend_from_slice(&num_sps.to_be_bytes());
+  for sps in sps_list.iter().take(num_sps as usize) {
+    let len = sps.len() as u16;
+    result.extend_from_slice(&len.to_be_bytes());
+    result.extend_from_slice(sps);
+  }
+
+  // Write PPS array
+  result.push(PPS_NAL_TYPE);
+  let num_pps = (pps_list.len() as u16).min(255);
+  result.extend_from_slice(&num_pps.to_be_bytes());
+  for pps in pps_list.iter().take(num_pps as usize) {
+    let len = pps.len() as u16;
+    result.extend_from_slice(&len.to_be_bytes());
+    result.extend_from_slice(pps);
+  }
+
+  Some(result)
+}
+
+/// Convert avcC box format extradata to Annex B format (SPS/PPS with start codes)
+///
+/// This is the reverse of convert_annexb_extradata_to_avcc.
+/// Used when decoder receives avcC format description but FFmpeg needs Annex B.
+pub fn convert_avcc_extradata_to_annexb(data: &[u8]) -> Option<Vec<u8>> {
+  if data.len() < 7 {
+    return None;
+  }
+
+  // Check version byte - should be 1 for avcC
+  if data[0] != 1 {
+    // Not avcC format, might already be Annex B
+    return None;
+  }
+
+  // Skip: version (1), profile (1), compat (1), level (1), lengthSizeMinusOne (1) = 5 bytes
+  let _length_size_minus_one = (data[4] & 0x03) + 1; // Usually 4
+
+  // Number of SPS (bits 0-4 of byte 5)
+  let num_sps = data[5] & 0x1F;
+
+  let mut result = Vec::new();
+  let mut offset = 6;
+
+  // Read SPS NALUs
+  for _ in 0..num_sps {
+    if offset + 2 > data.len() {
+      return None;
+    }
+    let sps_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+    offset += 2;
+
+    if offset + sps_len > data.len() {
+      return None;
+    }
+
+    // Write start code + SPS
+    result.extend_from_slice(&[0, 0, 0, 1]);
+    result.extend_from_slice(&data[offset..offset + sps_len]);
+    offset += sps_len;
+  }
+
+  // Number of PPS
+  if offset >= data.len() {
+    return None;
+  }
+  let num_pps = data[offset];
+  offset += 1;
+
+  // Read PPS NALUs
+  for _ in 0..num_pps {
+    if offset + 2 > data.len() {
+      return None;
+    }
+    let pps_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+    offset += 2;
+
+    if offset + pps_len > data.len() {
+      return None;
+    }
+
+    // Write start code + PPS
+    result.extend_from_slice(&[0, 0, 0, 1]);
+    result.extend_from_slice(&data[offset..offset + pps_len]);
+    offset += pps_len;
+  }
+
+  Some(result)
+}
+
+/// Check if extradata looks like avcC box format (H.264)
+/// Returns true if the data starts with version byte 1 (avcC signature)
+pub fn is_avcc_extradata(data: &[u8]) -> bool {
+  // avcC starts with configurationVersion = 1
+  // Annex B starts with start code (0x000001 or 0x00000001)
+  // Check minimum length for avcC (version + profile + compat + level + length + numSPS)
+  data.len() >= 7 && data[0] == 1 && !(data[1] == 0 && data[2] == 0)
+}
+
+/// Check if extradata looks like hvcC box format (H.265/HEVC)
+/// Returns true if the data appears to be HEVCDecoderConfigurationRecord
+pub fn is_hvcc_extradata(data: &[u8]) -> bool {
+  // hvcC starts with configurationVersion = 1, followed by profile/tier/level info
+  // Minimum size: 23 bytes header + at least one array entry
+  // Check that it's not Annex B (start code) and has the right version
+  if data.len() < 23 {
+    return false;
+  }
+  // Version should be 1
+  if data[0] != 1 {
+    return false;
+  }
+  // Check it's not Annex B
+  if data[1] == 0 && data[2] == 0 {
+    return false;
+  }
+  // Check numOfArrays at offset 22 - should be reasonable
+  let num_arrays = data[22];
+  num_arrays > 0 && num_arrays <= 8 // Typically 3 (VPS, SPS, PPS) or less
+}
+
+/// Convert hvcC box format extradata to Annex B format (VPS/SPS/PPS with start codes)
+///
+/// hvcC (HEVCDecoderConfigurationRecord) per ISO/IEC 14496-15:
+/// - configurationVersion (1 byte) = 1
+/// - general_profile_space/tier_flag/profile_idc (1 byte)
+/// - general_profile_compatibility_flags (4 bytes)
+/// - general_constraint_indicator_flags (6 bytes)
+/// - general_level_idc (1 byte)
+/// - min_spatial_segmentation_idc (2 bytes with 4 reserved bits)
+/// - parallelismType (1 byte with 6 reserved bits)
+/// - chromaFormat (1 byte with 6 reserved bits)
+/// - bitDepthLumaMinus8 (1 byte with 5 reserved bits)
+/// - bitDepthChromaMinus8 (1 byte with 5 reserved bits)
+/// - avgFrameRate (2 bytes)
+/// - constantFrameRate/numTemporalLayers/temporalIdNested/lengthSizeMinusOne (1 byte)
+/// - numOfArrays (1 byte)
+/// - Arrays of NAL units (VPS, SPS, PPS, etc.)
+pub fn convert_hvcc_extradata_to_annexb(data: &[u8]) -> Option<Vec<u8>> {
+  if data.len() < 23 {
+    return None;
+  }
+
+  // Check version byte - should be 1 for hvcC
+  if data[0] != 1 {
+    return None;
+  }
+
+  // numOfArrays is at offset 22
+  let num_arrays = data[22] as usize;
+  let mut result = Vec::new();
+  let mut offset = 23;
+
+  // Read each array (VPS, SPS, PPS, etc.)
+  for _ in 0..num_arrays {
+    if offset + 3 > data.len() {
+      return None;
+    }
+
+    // First byte: array_completeness (1 bit) + reserved (1 bit) + NAL_unit_type (6 bits)
+    // We don't need the NAL type here, just skip it
+    offset += 1;
+
+    // Number of NAL units in this array (2 bytes BE)
+    let num_nalus = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+    offset += 2;
+
+    // Read each NAL unit
+    for _ in 0..num_nalus {
+      if offset + 2 > data.len() {
+        return None;
+      }
+
+      let nal_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+      offset += 2;
+
+      if offset + nal_len > data.len() {
+        return None;
+      }
+
+      // Write start code + NAL unit
+      result.extend_from_slice(&[0, 0, 0, 1]);
+      result.extend_from_slice(&data[offset..offset + nal_len]);
+      offset += nal_len;
+    }
+  }
+
+  if result.is_empty() {
+    return None;
+  }
+
+  Some(result)
 }
 
 // ============================================================================

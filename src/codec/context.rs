@@ -5,12 +5,13 @@
 use crate::ffi::{
   self, AVCodec, AVCodecContext, AVCodecID, AVHWDeviceType, AVPixelFormat,
   accessors::{
-    ffctx_get_extradata, ffctx_get_extradata_size, ffctx_get_frame_size, ffctx_get_height,
-    ffctx_get_pix_fmt, ffctx_get_sample_rate, ffctx_get_width, ffctx_set_bit_rate,
-    ffctx_set_channels, ffctx_set_framerate, ffctx_set_gop_size, ffctx_set_height,
-    ffctx_set_hw_device_ctx, ffctx_set_level, ffctx_set_max_b_frames, ffctx_set_pix_fmt,
-    ffctx_set_profile, ffctx_set_rc_buffer_size, ffctx_set_rc_max_rate, ffctx_set_sample_fmt,
-    ffctx_set_sample_rate, ffctx_set_thread_count, ffctx_set_time_base, ffctx_set_width,
+    codec_flag, ffctx_get_extradata, ffctx_get_extradata_size, ffctx_get_flags,
+    ffctx_get_frame_size, ffctx_get_height, ffctx_get_pix_fmt, ffctx_get_sample_rate,
+    ffctx_get_width, ffctx_set_bit_rate, ffctx_set_channels, ffctx_set_flags, ffctx_set_framerate,
+    ffctx_set_gop_size, ffctx_set_height, ffctx_set_hw_device_ctx, ffctx_set_level,
+    ffctx_set_max_b_frames, ffctx_set_pix_fmt, ffctx_set_profile, ffctx_set_rc_buffer_size,
+    ffctx_set_rc_max_rate, ffctx_set_sample_fmt, ffctx_set_sample_rate, ffctx_set_thread_count,
+    ffctx_set_time_base, ffctx_set_width,
   },
   avcodec::{
     avcodec_alloc_context3, avcodec_find_decoder, avcodec_find_encoder,
@@ -369,6 +370,17 @@ impl CodecContext {
     }
 
     Ok(())
+  }
+
+  /// Enable GLOBAL_HEADER flag for the encoder.
+  /// This puts codec-specific global headers (e.g., SPS/PPS for H.264) into extradata
+  /// instead of embedding them in every keyframe. Required for AVCC/HVCC format output.
+  pub fn set_global_header(&mut self) {
+    unsafe {
+      let ctx = self.ptr.as_ptr();
+      let current_flags = ffctx_get_flags(ctx);
+      ffctx_set_flags(ctx, current_flags | codec_flag::GLOBAL_HEADER);
+    }
   }
 
   /// Apply hardware encoder-specific options based on the encoder name and latency mode

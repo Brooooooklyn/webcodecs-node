@@ -180,6 +180,17 @@ impl EncodedAudioChunk {
     duration_us: Option<i64>,
     explicit_timestamp: Option<i64>,
   ) -> Self {
+    Self::from_packet_with_adts(packet, duration_us, explicit_timestamp, None)
+  }
+
+  /// Create from internal Packet with optional ADTS header for AAC
+  /// adts_params: Option<(sample_rate_index, channel_config)> - if Some, prepends ADTS header
+  pub fn from_packet_with_adts(
+    packet: &Packet,
+    duration_us: Option<i64>,
+    explicit_timestamp: Option<i64>,
+    adts_params: Option<(u8, u8)>,
+  ) -> Self {
     // Audio packets are typically all key frames (for most codecs)
     // Some codecs like AAC-LD might have dependencies, but most don't
     let chunk_type = if packet.is_key() {
@@ -188,8 +199,15 @@ impl EncodedAudioChunk {
       EncodedAudioChunkType::Delta
     };
 
+    let raw_data = packet.to_vec();
+    let data = if let Some((sample_rate_index, channel_config)) = adts_params {
+      prepend_adts_header(&raw_data, sample_rate_index, channel_config)
+    } else {
+      raw_data
+    };
+
     let inner = EncodedAudioChunkInner {
-      data: packet.to_vec(),
+      data,
       chunk_type,
       // Use explicit timestamp if provided, otherwise fall back to packet PTS
       timestamp_us: explicit_timestamp.unwrap_or_else(|| packet.pts()),
@@ -331,6 +349,54 @@ impl EncodedAudioChunk {
       )),
     }
   }
+}
+
+// ============================================================================
+// ADTS Header Generation for AAC
+// ============================================================================
+
+/// Create an ADTS header for an AAC frame
+/// ADTS header is 7 bytes for no CRC (protection_absent = 1)
+fn create_adts_header(frame_len: usize, sample_rate_index: u8, channel_config: u8) -> [u8; 7] {
+  let frame_length = frame_len + 7; // Include header in length
+
+  // profile = AAC-LC (2), but stored as profile-1 = 1 in ADTS
+  let profile = 1u8;
+
+  let mut header = [0u8; 7];
+
+  // Byte 0: syncword high byte (0xFF)
+  header[0] = 0xFF;
+
+  // Byte 1: syncword low 4 bits (0xF) + ID(0) + layer(00) + protection_absent(1) = 0xF1
+  header[1] = 0xF1;
+
+  // Byte 2: profile(2 bits) + sampling_frequency_index(4 bits) + private_bit(1) + channel_config high bit(1)
+  header[2] =
+    ((profile & 0x03) << 6) | ((sample_rate_index & 0x0F) << 2) | ((channel_config & 0x04) >> 2);
+
+  // Byte 3: channel_config low 2 bits + original_copy(0) + home(0) + copyright_id_bit(0) + copyright_id_start(0) + frame_length high 2 bits
+  header[3] = ((channel_config & 0x03) << 6) | ((frame_length >> 11) & 0x03) as u8;
+
+  // Byte 4: frame_length middle 8 bits
+  header[4] = ((frame_length >> 3) & 0xFF) as u8;
+
+  // Byte 5: frame_length low 3 bits + buffer_fullness high 5 bits (0x7FF for VBR)
+  header[5] = (((frame_length & 0x07) << 5) | 0x1F) as u8;
+
+  // Byte 6: buffer_fullness low 6 bits + number_of_raw_data_blocks(0)
+  header[6] = 0xFC;
+
+  header
+}
+
+/// Prepend ADTS header to raw AAC frame data
+fn prepend_adts_header(frame_data: &[u8], sample_rate_index: u8, channel_config: u8) -> Vec<u8> {
+  let header = create_adts_header(frame_data.len(), sample_rate_index, channel_config);
+  let mut result = Vec::with_capacity(7 + frame_data.len());
+  result.extend_from_slice(&header);
+  result.extend_from_slice(frame_data);
+  result
 }
 
 // ============================================================================

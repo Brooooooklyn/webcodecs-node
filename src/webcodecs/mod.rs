@@ -35,6 +35,11 @@ pub use encoded_video_chunk::{
   EncodedVideoChunkType, HardwareAcceleration, HevcBitstreamFormat, HevcEncoderConfig, LatencyMode,
   VideoDecoderConfig, VideoEncoderBitrateMode, VideoEncoderConfig,
 };
+pub(crate) use encoded_video_chunk::{
+  convert_annexb_extradata_to_avcc, convert_annexb_extradata_to_hvcc,
+  convert_avcc_extradata_to_annexb, convert_avcc_to_annexb, convert_hvcc_extradata_to_annexb,
+  is_avcc_extradata, is_avcc_format, is_hvcc_extradata,
+};
 pub use hardware::{
   HardwareAccelerator, get_available_hardware_accelerators, get_hardware_accelerators,
   get_preferred_hardware_accelerator, is_hardware_accelerator_available,

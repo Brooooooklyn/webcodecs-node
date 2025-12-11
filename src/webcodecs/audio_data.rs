@@ -242,6 +242,8 @@ struct AudioDataInner {
 #[napi]
 pub struct AudioData {
   inner: Arc<Mutex<Option<AudioDataInner>>>,
+  /// Timestamp is preserved after close per W3C spec
+  timestamp_us: i64,
 }
 
 #[napi]
@@ -338,6 +340,7 @@ impl AudioData {
 
     Ok(Self {
       inner: Arc::new(Mutex::new(Some(inner))),
+      timestamp_us: init.timestamp,
     })
   }
 
@@ -355,6 +358,7 @@ impl AudioData {
 
     Self {
       inner: Arc::new(Mutex::new(Some(inner))),
+      timestamp_us,
     }
   }
 
@@ -425,6 +429,7 @@ impl AudioData {
   }
 
   /// Get sample rate in Hz (W3C spec uses float)
+  /// Returns 0 after close per W3C spec
   #[napi(getter)]
   pub fn sample_rate(&self) -> Result<f64> {
     let inner = self
@@ -434,11 +439,12 @@ impl AudioData {
 
     match &*inner {
       Some(i) => Ok(i.frame.sample_rate() as f64),
-      None => Err(invalid_state_error("AudioData is closed")),
+      None => Ok(0.0), // Return 0 after close per W3C spec
     }
   }
 
   /// Get number of frames (samples per channel)
+  /// Returns 0 after close per W3C spec
   #[napi(getter)]
   pub fn number_of_frames(&self) -> Result<u32> {
     let inner = self
@@ -448,11 +454,12 @@ impl AudioData {
 
     match &*inner {
       Some(i) => Ok(i.frame.nb_samples()),
-      None => Err(invalid_state_error("AudioData is closed")),
+      None => Ok(0), // Return 0 after close per W3C spec
     }
   }
 
   /// Get number of channels
+  /// Returns 0 after close per W3C spec
   #[napi(getter)]
   pub fn number_of_channels(&self) -> Result<u32> {
     let inner = self
@@ -462,11 +469,12 @@ impl AudioData {
 
     match &*inner {
       Some(i) => Ok(i.frame.channels()),
-      None => Err(invalid_state_error("AudioData is closed")),
+      None => Ok(0), // Return 0 after close per W3C spec
     }
   }
 
   /// Get duration in microseconds
+  /// Returns 0 after close per W3C spec
   #[napi(getter)]
   pub fn duration(&self) -> Result<i64> {
     let inner = self
@@ -484,22 +492,16 @@ impl AudioData {
           Ok(0)
         }
       }
-      None => Err(invalid_state_error("AudioData is closed")),
+      None => Ok(0), // Return 0 after close per W3C spec
     }
   }
 
   /// Get timestamp in microseconds
+  /// Timestamp is preserved after close per W3C spec
   #[napi(getter)]
   pub fn timestamp(&self) -> Result<i64> {
-    let inner = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    match &*inner {
-      Some(i) => Ok(i.timestamp_us),
-      None => Err(invalid_state_error("AudioData is closed")),
-    }
+    // Timestamp is preserved after close per W3C spec
+    Ok(self.timestamp_us)
   }
 
   /// Get whether this AudioData has been closed (W3C WebCodecs spec)
@@ -746,6 +748,7 @@ impl AudioData {
         timestamp_us: inner.timestamp_us,
         closed: false,
       }))),
+      timestamp_us: self.timestamp_us,
     })
   }
 

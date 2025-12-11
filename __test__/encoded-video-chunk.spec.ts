@@ -260,3 +260,35 @@ test('EncodedVideoChunk: binary data preservation', (t) => {
     t.is(extracted[i], i, `Byte ${i} not preserved`)
   }
 })
+
+// ============================================================================
+// Error Handling Tests
+// ============================================================================
+
+test('EncodedVideoChunk: invalid type throws TypeError', (t) => {
+  t.throws(
+    () => {
+      new EncodedVideoChunk({
+        type: 'invalid' as any,
+        timestamp: 0,
+        data: new Uint8Array(1),
+      })
+    },
+    { instanceOf: TypeError },
+  )
+})
+
+test('EncodedVideoChunk: copyTo throws if destination too small', (t) => {
+  const chunk = new EncodedVideoChunk({
+    type: 'key',
+    timestamp: 0,
+    data: new Uint8Array(10),
+  })
+
+  t.throws(
+    () => {
+      chunk.copyTo(new Uint8Array(5))
+    },
+    { instanceOf: TypeError },
+  )
+})

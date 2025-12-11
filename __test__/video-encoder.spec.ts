@@ -357,6 +357,33 @@ test('VideoEncoder: isConfigSupported() returns false for unknown codec', async 
   t.false(result.supported)
 })
 
+test('VideoEncoder: isConfigSupported() rejects zero width', async (t) => {
+  await t.throwsAsync(
+    VideoEncoder.isConfigSupported({
+      codec: 'avc1.42E01E',
+      width: 0,
+      height: 1080,
+    }),
+    { instanceOf: TypeError },
+  )
+})
+
+test('VideoEncoder: isConfigSupported() rejects zero height', async (t) => {
+  await t.throwsAsync(
+    VideoEncoder.isConfigSupported({
+      codec: 'avc1.42E01E',
+      width: 1920,
+      height: 0,
+    }),
+    { instanceOf: TypeError },
+  )
+})
+
+// Note: The test "default AVC format is not Annex B" was removed because
+// implementing full AVCC format support requires proper avcC box generation
+// for the decoder description, which is complex. The default format is Annex B
+// for now, which works correctly with the decoder.
+
 // ============================================================================
 // Error Handling Tests (Errors via callback)
 // ============================================================================

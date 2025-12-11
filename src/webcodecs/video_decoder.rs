@@ -9,7 +9,8 @@ use crate::webcodecs::error::{invalid_state_error, throw_type_error_unit};
 use crate::webcodecs::promise_reject::reject_with_type_error;
 use crate::webcodecs::{
   CodecState, EncodedVideoChunk, EncodedVideoChunkInner, HardwareAcceleration, VideoDecoderConfig,
-  VideoFrame,
+  VideoFrame, convert_avcc_extradata_to_annexb, convert_avcc_to_annexb,
+  convert_hvcc_extradata_to_annexb, is_avcc_extradata, is_avcc_format, is_hvcc_extradata,
 };
 use crossbeam::channel::{self, Receiver, Sender};
 use napi::bindgen_prelude::*;
@@ -401,10 +402,42 @@ impl VideoDecoder {
 
     let timestamp = encoded_chunk.timestamp_us;
     let duration = encoded_chunk.duration_us;
-    let data = encoded_chunk.data.clone();
+    let raw_data = encoded_chunk.data.clone();
+    let is_keyframe = encoded_chunk.chunk_type == crate::webcodecs::EncodedVideoChunkType::Key;
 
     // Drop the chunk read guard before decoding
     drop(chunk_read_guard);
+
+    // Convert AVCC/HVCC format to Annex B if needed for H.264/H.265
+    // FFmpeg's decoder expects Annex B format (start code prefixed NALUs)
+    // Also prepend SPS/PPS from extradata to keyframes (FFmpeg may not use extradata properly)
+    let data = {
+      let codec = &guard.codec_string;
+      let is_avc_codec = codec.starts_with("avc1")
+        || codec.starts_with("avc3")
+        || codec.starts_with("hvc1")
+        || codec.starts_with("hev1");
+
+      if is_avc_codec && is_avcc_format(&raw_data) {
+        let mut converted = convert_avcc_to_annexb(&raw_data);
+
+        // Prepend SPS/PPS/VPS from extradata to keyframes
+        // This is needed because FFmpeg may not properly use extradata for H.264/H.265
+        if is_keyframe
+          && let Some(config) = guard.config.as_ref()
+          && let Some(extradata) = &config.extradata
+        {
+          // Extradata should already be in Annex B format (converted in configure)
+          // Prepend it to the keyframe data
+          let mut with_extradata = extradata.clone();
+          with_extradata.append(&mut converted);
+          converted = with_extradata;
+        }
+        converted
+      } else {
+        raw_data
+      }
+    };
 
     // Push timestamp to queue for correlation with output frames
     // (FFmpeg may buffer frames internally and modify PTS)
@@ -624,7 +657,7 @@ impl VideoDecoder {
 
       // Get chunk data
       let chunk_read_guard = chunk.read();
-      let (timestamp, duration, data) = match chunk_read_guard
+      let (timestamp, duration, raw_data) = match chunk_read_guard
         .as_ref()
         .ok()
         .and_then(|d| d.as_ref())
@@ -634,6 +667,21 @@ impl VideoDecoder {
         None => continue, // Skip closed chunks
       };
       drop(chunk_read_guard);
+
+      // Convert AVCC/HVCC format to Annex B if needed for H.264/H.265
+      let data = {
+        let codec = &guard.codec_string;
+        let is_avc_codec = codec.starts_with("avc1")
+          || codec.starts_with("avc3")
+          || codec.starts_with("hvc1")
+          || codec.starts_with("hev1");
+
+        if is_avc_codec && is_avcc_format(&raw_data) {
+          convert_avcc_to_annexb(&raw_data)
+        } else {
+          raw_data
+        }
+      };
 
       // Decode with software decoder
       let context = match guard.context.as_mut() {
@@ -948,11 +996,27 @@ impl VideoDecoder {
       }
     };
 
+    // Convert avcC/hvcC extradata to Annex B if needed for H.264/H.265
+    // FFmpeg's decoder expects Annex B format (SPS/PPS/VPS with start codes)
+    let extradata = config.description.as_ref().and_then(|d| {
+      let data = d.to_vec();
+      let is_h264 = codec.starts_with("avc1") || codec.starts_with("avc3");
+      let is_h265 = codec.starts_with("hvc1") || codec.starts_with("hev1");
+
+      if is_h264 && is_avcc_extradata(&data) {
+        convert_avcc_extradata_to_annexb(&data).or(Some(data))
+      } else if is_h265 && is_hvcc_extradata(&data) {
+        convert_hvcc_extradata_to_annexb(&data).or(Some(data))
+      } else {
+        Some(data)
+      }
+    });
+
     // Configure decoder
     let decoder_config = DecoderConfig {
       codec_id,
       thread_count: 0, // Auto
-      extradata: config.description.as_ref().map(|d| d.to_vec()),
+      extradata,
       low_latency: config.optimize_for_latency.unwrap_or(false),
     };
 

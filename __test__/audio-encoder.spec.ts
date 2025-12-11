@@ -456,3 +456,89 @@ test('AudioEncoder: ondequeue can be set to null', (t) => {
 
   encoder.close()
 })
+
+// ============================================================================
+// Format-Specific Tests
+// ============================================================================
+
+test('AudioEncoder: AAC ADTS format', async (t) => {
+  const chunks: Array<{ chunk: any; metadata: any }> = []
+  let firstMetadata: any = null
+
+  const encoder = new AudioEncoder({
+    output: (chunk, metadata) => {
+      chunks.push({ chunk, metadata })
+      if (!firstMetadata && metadata?.decoderConfig) {
+        firstMetadata = metadata
+      }
+    },
+    error: (e) => {
+      throw e
+    },
+  })
+
+  // Configure with ADTS format
+  encoder.configure({
+    codec: 'mp4a.40.2',
+    sampleRate: 48000,
+    numberOfChannels: 2,
+    bitrate: 128000,
+    aac: {
+      format: 'adts',
+    },
+  })
+
+  const audio = generateSineTone(440, 1024, 2, 48000, 'f32', 0)
+  encoder.encode(audio)
+  audio.close()
+
+  await encoder.flush()
+  encoder.close()
+
+  t.true(chunks.length > 0, 'Should have produced at least one chunk')
+
+  // ADTS frames start with sync word 0xFF (first byte is 0xFF)
+  const firstChunk = chunks[0].chunk
+  const data = new Uint8Array(firstChunk.byteLength)
+  firstChunk.copyTo(data)
+  t.is(data[0], 0xff, 'ADTS frame should start with 0xFF sync byte')
+
+  // ADTS mode should NOT have description (no ASC needed)
+  t.is(firstMetadata?.decoderConfig?.description, undefined, 'ADTS mode should not have description')
+})
+
+test('AudioEncoder: FLAC description magic bytes', async (t) => {
+  let flacDescription: Uint8Array | undefined
+
+  const encoder = new AudioEncoder({
+    output: (_chunk, metadata) => {
+      if (metadata?.decoderConfig?.description && !flacDescription) {
+        flacDescription = metadata.decoderConfig.description
+      }
+    },
+    error: (e) => {
+      throw e
+    },
+  })
+
+  encoder.configure({
+    codec: 'flac',
+    sampleRate: 48000,
+    numberOfChannels: 2,
+  })
+
+  const audio = generateSineTone(440, 4608, 2, 48000, 'f32', 0)
+  encoder.encode(audio)
+  audio.close()
+
+  await encoder.flush()
+  encoder.close()
+
+  t.truthy(flacDescription, 'FLAC encoder should produce description')
+
+  // Verify FLAC description starts with 'fLaC' magic (0x664C6143)
+  // description is Uint8Array per W3C spec, extract underlying ArrayBuffer for DataView
+  const view = new DataView(flacDescription!.buffer, flacDescription!.byteOffset, flacDescription!.byteLength)
+  const magic = view.getUint32(0, false) // big-endian
+  t.is(magic, 0x664c6143, "FLAC description should start with 'fLaC' magic bytes")
+})

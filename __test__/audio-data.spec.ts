@@ -249,6 +249,27 @@ test('AudioData: close() releases resources', (t) => {
   t.notThrows(() => audio.close())
 })
 
+test('AudioData: properties after close', (t) => {
+  const audio = generateSilence(1024, 2, 48000, 'f32', 0)
+
+  // Capture timestamp before close (should be preserved)
+  const originalTimestamp = audio.timestamp
+
+  audio.close()
+
+  // Per W3C spec, after close:
+  // - format should be null
+  // - sampleRate should be 0
+  // - numberOfFrames should be 0
+  // - numberOfChannels should be 0
+  // - timestamp should be preserved
+  t.is(audio.format, null, 'format should be null after close')
+  t.is(audio.sampleRate, 0, 'sampleRate should be 0 after close')
+  t.is(audio.numberOfFrames, 0, 'numberOfFrames should be 0 after close')
+  t.is(audio.numberOfChannels, 0, 'numberOfChannels should be 0 after close')
+  t.is(audio.timestamp, originalTimestamp, 'timestamp should be preserved after close')
+})
+
 // ============================================================================
 // Edge Case Tests
 // ============================================================================

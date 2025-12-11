@@ -14,8 +14,9 @@ use crate::webcodecs::hw_fallback::{
 };
 use crate::webcodecs::promise_reject::reject_with_type_error;
 use crate::webcodecs::{
-  EncodedVideoChunk, HardwareAcceleration, LatencyMode, VideoEncoderBitrateMode,
-  VideoEncoderConfig, VideoFrame,
+  AvcBitstreamFormat, EncodedVideoChunk, HardwareAcceleration, HevcBitstreamFormat, LatencyMode,
+  VideoEncoderBitrateMode, VideoEncoderConfig, VideoFrame, convert_annexb_extradata_to_avcc,
+  convert_annexb_extradata_to_hvcc,
 };
 use crossbeam::channel::{self, Receiver, Sender};
 use napi::bindgen_prelude::*;
@@ -313,6 +314,14 @@ struct VideoEncoderInner {
   /// Counter for output frames used to compute temporal layer ID
   /// Reset on configure() and reset()
   output_frame_count: u64,
+
+  // ========================================================================
+  // Bitstream format conversion
+  // ========================================================================
+  /// Whether to convert H.264/H.265 output from Annex B to AVCC/HVCC format
+  /// True for H.264 when avc.format is "avc" (default) or not specified
+  /// True for H.265 when hevc.format is "hevc" (default) or not specified
+  use_avcc_format: bool,
 }
 
 /// Get the preferred hardware device type for the current platform
@@ -442,6 +451,8 @@ impl VideoEncoder {
       // Temporal SVC tracking
       temporal_layer_count: None,
       output_frame_count: 0,
+      // Bitstream format conversion (set during configure)
+      use_avcc_format: false,
     };
 
     let inner = Arc::new(Mutex::new(inner));
@@ -626,17 +637,6 @@ impl VideoEncoder {
     // (FFmpeg may modify PTS internally, so we track input timestamps separately)
     guard.timestamp_queue.push_back(timestamp);
 
-    // Get extradata before encoding
-    let extradata_sent = guard.extradata_sent;
-    let extradata = if !extradata_sent {
-      guard
-        .context
-        .as_ref()
-        .and_then(|ctx| ctx.extradata().map(|d| d.to_vec()))
-    } else {
-      None
-    };
-
     // Encode the frame
     let context = match guard.context.as_mut() {
       Some(ctx) => ctx,
@@ -680,7 +680,11 @@ impl VideoEncoder {
               {
                 for packet in pkts {
                   // Use buffered_ts (the original input timestamp) instead of packet.pts()
-                  let chunk = EncodedVideoChunk::from_packet(&packet, Some(buffered_ts));
+                  let chunk = EncodedVideoChunk::from_packet_with_format(
+                    &packet,
+                    Some(buffered_ts),
+                    guard.use_avcc_format,
+                  );
 
                   // Create SVC metadata if temporal layers are configured
                   let svc =
@@ -843,7 +847,11 @@ impl VideoEncoder {
                   // Process any output packets from re-encoding
                   for packet in pkts {
                     // Use buffered_ts (the original input timestamp) instead of packet.pts()
-                    let chunk = EncodedVideoChunk::from_packet(&packet, Some(buffered_ts));
+                    let chunk = EncodedVideoChunk::from_packet_with_format(
+                      &packet,
+                      Some(buffered_ts),
+                      guard.use_avcc_format,
+                    );
 
                     // Create SVC metadata if temporal layers are configured
                     let svc =
@@ -956,22 +964,49 @@ impl VideoEncoder {
       // Pop timestamp from queue to preserve original input timestamp
       // (FFmpeg may modify PTS internally during encoding)
       let output_timestamp = guard.timestamp_queue.pop_front();
-      let chunk = EncodedVideoChunk::from_packet(&packet, output_timestamp);
+      let chunk = EncodedVideoChunk::from_packet_with_format(
+        &packet,
+        output_timestamp,
+        guard.use_avcc_format,
+      );
 
       // Create SVC metadata if temporal layers are configured
       let svc = create_svc_metadata(guard.temporal_layer_count, guard.output_frame_count);
       guard.output_frame_count += 1;
 
       // Create metadata
+      // Note: extradata must be fetched AFTER encoding, as FFmpeg only sets it after first encode
       let metadata = if !guard.extradata_sent && packet.is_key() {
         guard.extradata_sent = true;
+
+        // Get extradata and optionally convert to avcC/hvcC format for proper AVCC/HVCC mode
+        let description = guard.context.as_ref().and_then(|ctx| {
+          ctx.extradata().and_then(|extradata| {
+            if guard.use_avcc_format {
+              // Convert Annex B extradata to avcC/hvcC box format
+              let is_h264 = codec_string.starts_with("avc1") || codec_string.starts_with("avc3");
+              let is_h265 = codec_string.starts_with("hvc1") || codec_string.starts_with("hev1");
+
+              if is_h264 {
+                convert_annexb_extradata_to_avcc(extradata).map(Uint8Array::from)
+              } else if is_h265 {
+                convert_annexb_extradata_to_hvcc(extradata).map(Uint8Array::from)
+              } else {
+                Some(Uint8Array::from(extradata.to_vec()))
+              }
+            } else {
+              // Annex B mode - use extradata as-is
+              Some(Uint8Array::from(extradata.to_vec()))
+            }
+          })
+        });
 
         EncodedVideoChunkMetadata {
           decoder_config: Some(VideoDecoderConfigOutput {
             codec: codec_string.clone(),
             coded_width: Some(width),
             coded_height: Some(height),
-            description: extradata.clone().map(Uint8Array::from),
+            description,
             display_aspect_width: display_width,
             display_aspect_height: display_height,
             rotation: if rotation != 0.0 {
@@ -1047,16 +1082,76 @@ impl VideoEncoder {
     for packet in packets {
       // Pop timestamp from queue to preserve original input timestamp
       let output_timestamp = guard.timestamp_queue.pop_front();
-      let chunk = EncodedVideoChunk::from_packet(&packet, output_timestamp);
+      let chunk = EncodedVideoChunk::from_packet_with_format(
+        &packet,
+        output_timestamp,
+        guard.use_avcc_format,
+      );
 
       // Create SVC metadata if temporal layers are configured
       let svc = create_svc_metadata(guard.temporal_layer_count, guard.output_frame_count);
       guard.output_frame_count += 1;
 
-      let metadata = EncodedVideoChunkMetadata {
-        decoder_config: None,
-        svc,
-        alpha_side_data: None,
+      // Create metadata (include decoder_config if not sent yet and this is a key frame)
+      let metadata = if !guard.extradata_sent && packet.is_key() {
+        guard.extradata_sent = true;
+
+        // Get config values for metadata
+        let (codec_string, width, height, display_width, display_height) = guard
+          .config
+          .as_ref()
+          .map_or((String::new(), 0, 0, None, None), |c| {
+            (
+              c.codec.clone().unwrap_or_default(),
+              c.width.unwrap_or(0),
+              c.height.unwrap_or(0),
+              c.display_width,
+              c.display_height,
+            )
+          });
+
+        // Get extradata and optionally convert to avcC/hvcC format for proper AVCC/HVCC mode
+        let description = guard.context.as_ref().and_then(|ctx| {
+          ctx.extradata().and_then(|extradata| {
+            if guard.use_avcc_format {
+              // Convert Annex B extradata to avcC/hvcC box format
+              let is_h264 = codec_string.starts_with("avc1") || codec_string.starts_with("avc3");
+              let is_h265 = codec_string.starts_with("hvc1") || codec_string.starts_with("hev1");
+
+              if is_h264 {
+                convert_annexb_extradata_to_avcc(extradata).map(Uint8Array::from)
+              } else if is_h265 {
+                convert_annexb_extradata_to_hvcc(extradata).map(Uint8Array::from)
+              } else {
+                Some(Uint8Array::from(extradata.to_vec()))
+              }
+            } else {
+              // Annex B mode - use extradata as-is
+              Some(Uint8Array::from(extradata.to_vec()))
+            }
+          })
+        });
+
+        EncodedVideoChunkMetadata {
+          decoder_config: Some(VideoDecoderConfigOutput {
+            codec: codec_string,
+            coded_width: Some(width),
+            coded_height: Some(height),
+            description,
+            display_aspect_width: display_width,
+            display_aspect_height: display_height,
+            rotation: None,
+            flip: None,
+          }),
+          svc,
+          alpha_side_data: None,
+        }
+      } else {
+        EncodedVideoChunkMetadata {
+          decoder_config: None,
+          svc,
+          alpha_side_data: None,
+        }
       };
 
       // Always queue during flush for synchronous delivery
@@ -1233,6 +1328,7 @@ impl VideoEncoder {
   fn create_software_encoder(
     codec_id: AVCodecID,
     encoder_config: &EncoderConfig,
+    needs_global_header: bool,
   ) -> Result<(CodecContext, String)> {
     let result = CodecContext::new_encoder_with_hw_info(codec_id, None).map_err(|e| {
       Error::new(
@@ -1249,6 +1345,11 @@ impl VideoEncoder {
         format!("Failed to configure software encoder: {}", e),
       )
     })?;
+
+    // Set GLOBAL_HEADER for AVCC/HVCC format output
+    if needs_global_header {
+      context.set_global_header();
+    }
 
     context.open().map_err(|e| {
       Error::new(
@@ -1535,6 +1636,30 @@ impl VideoEncoder {
       return Ok(());
     }
 
+    // Calculate if GLOBAL_HEADER flag is needed for AVCC/HVCC format
+    // This needs to be determined early since it's used in fallback paths
+    // Only set when AVCC/HVCC format is explicitly requested
+    let needs_global_header = {
+      let is_h264 = codec.starts_with("avc1") || codec.starts_with("avc3") || codec == "h264";
+      let is_h265 = codec.starts_with("hvc1") || codec.starts_with("hev1") || codec == "h265";
+
+      if is_h264 {
+        // For H.264: need global header only if AVCC format is explicitly requested
+        matches!(
+          config.avc.as_ref().and_then(|avc| avc.format),
+          Some(AvcBitstreamFormat::Avc)
+        )
+      } else if is_h265 {
+        // For H.265: need global header only if HVCC format is explicitly requested
+        matches!(
+          config.hevc.as_ref().and_then(|hevc| hevc.format),
+          Some(HevcBitstreamFormat::Hevc)
+        )
+      } else {
+        false
+      }
+    };
+
     // Determine hardware acceleration preference (Chromium-aligned behavior)
     let hw_preference = config
       .hardware_acceleration
@@ -1622,7 +1747,7 @@ impl VideoEncoder {
     if let Err(e) = context.configure_encoder(&encoder_config) {
       // For no-preference, try software fallback if hardware configure fails
       if hw_preference == HardwareAcceleration::NoPreference && is_hardware {
-        match Self::create_software_encoder(codec_id, &encoder_config) {
+        match Self::create_software_encoder(codec_id, &encoder_config, needs_global_header) {
           Ok((sw_ctx, sw_name)) => {
             context = sw_ctx;
             is_hardware = false;
@@ -1653,11 +1778,17 @@ impl VideoEncoder {
       context.apply_hw_encoder_options(&encoder_name, realtime);
     }
 
+    // Set GLOBAL_HEADER flag for AVCC/HVCC format output
+    // This puts SPS/PPS into extradata instead of embedding in keyframes
+    if needs_global_header {
+      context.set_global_header();
+    }
+
     // Open the encoder
     if let Err(e) = context.open() {
       // For no-preference, try software fallback if hardware open fails
       if hw_preference == HardwareAcceleration::NoPreference && is_hardware {
-        match Self::create_software_encoder(codec_id, &encoder_config) {
+        match Self::create_software_encoder(codec_id, &encoder_config, needs_global_header) {
           Ok((sw_ctx, sw_name)) => {
             context = sw_ctx;
             is_hardware = false;
@@ -1727,6 +1858,33 @@ impl VideoEncoder {
       .and_then(|c| c.scalability_mode.as_ref())
       .and_then(|mode| parse_temporal_layer_count(mode));
     inner.output_frame_count = 0;
+
+    // Bitstream format conversion - determine if AVCC/HVCC format is needed
+    // Default is Annex B for all codecs (FFmpeg native format)
+    // AVCC/HVCC output requires proper avcC/hvcC box description which is not yet implemented
+    inner.use_avcc_format = inner.config.as_ref().is_some_and(|c| {
+      let codec_str = c.codec.as_deref().unwrap_or("");
+      let is_h264 =
+        codec_str.starts_with("avc1") || codec_str.starts_with("avc3") || codec_str == "h264";
+      let is_h265 =
+        codec_str.starts_with("hvc1") || codec_str.starts_with("hev1") || codec_str == "h265";
+
+      if is_h264 {
+        // For H.264: use AVCC only if explicitly requested
+        matches!(
+          c.avc.as_ref().and_then(|avc| avc.format),
+          Some(AvcBitstreamFormat::Avc)
+        )
+      } else if is_h265 {
+        // For H.265: use HVCC only if explicitly requested
+        matches!(
+          c.hevc.as_ref().and_then(|hevc| hevc.format),
+          Some(HevcBitstreamFormat::Hevc)
+        )
+      } else {
+        false // Other codecs don't need conversion
+      }
+    });
 
     Ok(())
   }
@@ -2025,6 +2183,9 @@ impl VideoEncoder {
     // Reset temporal SVC tracking
     inner.temporal_layer_count = None;
     inner.output_frame_count = 0;
+
+    // Reset bitstream format conversion
+    inner.use_avcc_format = false;
 
     // Clear flush-related state
     inner.inside_flush = false;

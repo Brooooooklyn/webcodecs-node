@@ -13,15 +13,30 @@ export declare class AudioData {
   constructor(init: import('./standard').AudioDataInit)
   /** Get sample format */
   get format(): AudioSampleFormat | null
-  /** Get sample rate in Hz (W3C spec uses float) */
+  /**
+   * Get sample rate in Hz (W3C spec uses float)
+   * Returns 0 after close per W3C spec
+   */
   get sampleRate(): number
-  /** Get number of frames (samples per channel) */
+  /**
+   * Get number of frames (samples per channel)
+   * Returns 0 after close per W3C spec
+   */
   get numberOfFrames(): number
-  /** Get number of channels */
+  /**
+   * Get number of channels
+   * Returns 0 after close per W3C spec
+   */
   get numberOfChannels(): number
-  /** Get duration in microseconds */
+  /**
+   * Get duration in microseconds
+   * Returns 0 after close per W3C spec
+   */
   get duration(): number
-  /** Get timestamp in microseconds */
+  /**
+   * Get timestamp in microseconds
+   * Timestamp is preserved after close per W3C spec
+   */
   get timestamp(): number
   /** Get whether this AudioData has been closed (W3C WebCodecs spec) */
   get closed(): boolean
