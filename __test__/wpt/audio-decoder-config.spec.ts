@@ -180,13 +180,17 @@ for (const entry of validButUnsupportedConfigs) {
     decoder.configure(entry.config)
 
     // Flush should reject
-    const error = await t.throwsAsync(decoder.flush())
+    try {
+      await decoder.flush()
+      t.fail('flush should reject')
+    } catch (error) {
+      t.truthy(error, 'flush should reject with error')
+    }
 
     t.true(isErrorCallbackCalled, 'error callback should be called')
     t.truthy(errorReceived, 'error should be received')
     t.true(errorReceived!.message.includes('NotSupportedError'), 'error should be NotSupportedError')
     t.is(decoder.state, 'closed', 'decoder should be closed after error')
-    t.truthy(error, 'flush should reject')
   })
 }
 
@@ -257,7 +261,12 @@ for (const entry of supportedButErrorOnConfiguration) {
     decoder.configure(entry.config)
 
     // Flush should reject
-    await t.throwsAsync(decoder.flush())
+    try {
+      await decoder.flush()
+      t.fail('flush should reject')
+    } catch (error) {
+      t.truthy(error, 'flush should reject with error')
+    }
 
     t.true(isErrorCallbackCalled, 'error callback should be called')
     t.is(decoder.state, 'closed', 'decoder should be closed after error')
@@ -397,7 +406,13 @@ test('AudioDecoder: unconfigured decoder operations', async (t) => {
   t.is(decoder.state, 'unconfigured')
 
   // Flush should reject
-  await t.throwsAsync(decoder.flush(), { name: 'InvalidStateError' })
+  try {
+    await decoder.flush()
+    t.fail('flush should reject with InvalidStateError')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'flush error should be DOMException')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 
   decoder.close()
 })

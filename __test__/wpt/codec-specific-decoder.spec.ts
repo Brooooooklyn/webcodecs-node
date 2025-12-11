@@ -687,7 +687,13 @@ test('VideoDecoder: corrupt data triggers error', async (t) => {
 
   decoder.decode(corruptChunk)
 
-  await t.throwsAsync(decoder.flush())
+  // flush() may reject with DOMException (Node < 22 compatibility)
+  try {
+    await decoder.flush()
+    t.fail('flush should have thrown')
+  } catch (e) {
+    t.true(e instanceof Error || e instanceof DOMException, 'should be Error or DOMException')
+  }
 
   const error = await gotError
   t.true(error instanceof Error)
@@ -730,7 +736,13 @@ test('AudioDecoder: corrupt data triggers error', async (t) => {
 
   decoder.decode(corruptChunk)
 
-  await t.throwsAsync(decoder.flush())
+  // flush() may reject with DOMException (Node < 22 compatibility)
+  try {
+    await decoder.flush()
+    t.fail('flush should have thrown')
+  } catch (e) {
+    t.true(e instanceof Error || e instanceof DOMException, 'should be Error or DOMException')
+  }
 
   const error = await gotError
   t.true(error instanceof Error)

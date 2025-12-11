@@ -354,8 +354,20 @@ impl ImageTrackList {
     if self.ready.load(Ordering::Acquire) {
       return Ok(());
     }
-    // Wait for notification
-    self.ready_notify.notified().await;
+
+    // IMPORTANT: Create the listener FIRST, before checking the flag again.
+    // This prevents a race condition where notify_waiters() is called
+    // after our initial check but before we register as a waiter.
+    let notified = self.ready_notify.notified();
+
+    // Check again - if became ready while creating listener, return immediately
+    if self.ready.load(Ordering::Acquire) {
+      return Ok(());
+    }
+
+    // Now safe to wait - the listener is registered, so any subsequent
+    // notify_waiters() call will wake us up
+    notified.await;
     Ok(())
   }
 

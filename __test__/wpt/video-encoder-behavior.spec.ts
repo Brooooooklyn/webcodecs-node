@@ -283,8 +283,12 @@ test('VideoEncoder: encode after reconfigure', async (t) => {
   // Bogus codec should trigger error callback
   encoder.configure({ ...defaultConfig, codec: 'bogus' })
 
-  const error = await t.throwsAsync(encoder.flush())
-  t.truthy(error)
+  try {
+    await encoder.flush()
+    t.fail('flush should reject')
+  } catch (error) {
+    t.truthy(error)
+  }
   t.true(errors.length > 0 || encoder.state === 'closed')
   t.is(encoder.state, 'closed', 'state')
 

@@ -138,9 +138,13 @@ test('AudioEncoder: configure() with invalid codec triggers error callback', (t)
   t.is(encoder.state, 'closed')
 
   // Already closed by error callback, so close() throws InvalidStateError
-  const error = t.throws(() => encoder.close())
-  t.true(error instanceof DOMException, 'error should be DOMException instance')
-  t.is((error as DOMException).name, 'InvalidStateError')
+  try {
+    encoder.close()
+    t.fail('should have thrown')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'error should be DOMException instance')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 })
 
 // ============================================================================
@@ -242,9 +246,13 @@ test('AudioEncoder: encode() on unconfigured throws InvalidStateError', (t) => {
   const audio = generateSilence(960, 2, 48000, 'f32', 0)
 
   // W3C spec: encode() on unconfigured encoder should throw InvalidStateError
-  const error = t.throws(() => encoder.encode(audio))
-  t.true(error instanceof DOMException, 'error should be DOMException instance')
-  t.is((error as DOMException).name, 'InvalidStateError')
+  try {
+    encoder.encode(audio)
+    t.fail('should have thrown')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'error should be DOMException instance')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 
   audio.close()
 })
@@ -263,9 +271,13 @@ test('AudioEncoder: encode() on closed throws InvalidStateError', (t) => {
   const audio = generateSilence(960, 2, 48000, 'f32', 0)
 
   // W3C spec: encode() on closed encoder should throw InvalidStateError
-  const error = t.throws(() => encoder.encode(audio))
-  t.true(error instanceof DOMException, 'error should be DOMException instance')
-  t.is((error as DOMException).name, 'InvalidStateError')
+  try {
+    encoder.encode(audio)
+    t.fail('should have thrown')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'error should be DOMException instance')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 
   audio.close()
 })
@@ -323,9 +335,13 @@ test('AudioEncoder: close() on closed encoder throws InvalidStateError', (t) => 
 
   encoder.close()
   // W3C spec: second close should throw InvalidStateError
-  const error = t.throws(() => encoder.close())
-  t.true(error instanceof DOMException, 'error should be DOMException instance')
-  t.is((error as DOMException).name, 'InvalidStateError')
+  try {
+    encoder.close()
+    t.fail('should have thrown')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'error should be DOMException instance')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 })
 
 // ============================================================================

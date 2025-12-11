@@ -242,12 +242,20 @@ test('lifecycle: encoder close on closed throws InvalidStateError', (t) => {
   t.is(encoder.state, 'closed')
 
   // W3C spec: subsequent closes should throw InvalidStateError
-  const error1 = t.throws(() => encoder.close())
-  t.true(error1 instanceof DOMException, 'error should be DOMException instance')
-  t.is((error1 as DOMException).name, 'InvalidStateError')
-  const error2 = t.throws(() => encoder.close())
-  t.true(error2 instanceof DOMException, 'error should be DOMException instance')
-  t.is((error2 as DOMException).name, 'InvalidStateError')
+  try {
+    encoder.close()
+    t.fail('should have thrown')
+  } catch (error1) {
+    t.true(error1 instanceof DOMException, 'error should be DOMException instance')
+    t.is((error1 as DOMException).name, 'InvalidStateError')
+  }
+  try {
+    encoder.close()
+    t.fail('should have thrown')
+  } catch (error2) {
+    t.true(error2 instanceof DOMException, 'error should be DOMException instance')
+    t.is((error2 as DOMException).name, 'InvalidStateError')
+  }
 })
 
 test('lifecycle: decoder close on closed throws InvalidStateError', (t) => {
@@ -259,12 +267,20 @@ test('lifecycle: decoder close on closed throws InvalidStateError', (t) => {
   t.is(decoder.state, 'closed')
 
   // W3C spec: subsequent closes should throw InvalidStateError
-  const error1 = t.throws(() => decoder.close())
-  t.true(error1 instanceof DOMException, 'error should be DOMException instance')
-  t.is((error1 as DOMException).name, 'InvalidStateError')
-  const error2 = t.throws(() => decoder.close())
-  t.true(error2 instanceof DOMException, 'error should be DOMException instance')
-  t.is((error2 as DOMException).name, 'InvalidStateError')
+  try {
+    decoder.close()
+    t.fail('should have thrown')
+  } catch (error1) {
+    t.true(error1 instanceof DOMException, 'error should be DOMException instance')
+    t.is((error1 as DOMException).name, 'InvalidStateError')
+  }
+  try {
+    decoder.close()
+    t.fail('should have thrown')
+  } catch (error2) {
+    t.true(error2 instanceof DOMException, 'error should be DOMException instance')
+    t.is((error2 as DOMException).name, 'InvalidStateError')
+  }
 })
 
 test('lifecycle: frame close is idempotent', (t) => {
@@ -288,9 +304,13 @@ test('lifecycle: encoder operations fail after close', (t) => {
   const frame = generateSolidColorI420Frame(320, 240, TestColors.red, 0)
 
   // W3C spec: encode() on closed encoder should throw InvalidStateError
-  const error = t.throws(() => encoder.encode(frame))
-  t.true(error instanceof DOMException, 'error should be DOMException instance')
-  t.is((error as DOMException).name, 'InvalidStateError')
+  try {
+    encoder.encode(frame)
+    t.fail('should have thrown')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'error should be DOMException instance')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 
   frame.close()
 })
@@ -311,9 +331,13 @@ test('lifecycle: decoder operations fail after close', async (t) => {
 
   // W3C spec: decode() on closed decoder should throw InvalidStateError
   if (chunks.length > 0) {
-    const error = t.throws(() => decoder.decode(chunks[0]))
-    t.true(error instanceof DOMException, 'error should be DOMException instance')
-    t.is((error as DOMException).name, 'InvalidStateError')
+    try {
+      decoder.decode(chunks[0])
+      t.fail('should have thrown')
+    } catch (error) {
+      t.true(error instanceof DOMException, 'error should be DOMException instance')
+      t.is((error as DOMException).name, 'InvalidStateError')
+    }
   }
 })
 

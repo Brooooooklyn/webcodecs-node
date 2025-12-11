@@ -335,12 +335,13 @@ test('AudioData: clone closed throws', (t) => {
 
   audioData.close()
 
-  t.throws(
-    () => {
-      audioData.clone()
-    },
-    { name: 'InvalidStateError' },
-  )
+  try {
+    audioData.clone()
+    t.fail('clone should throw InvalidStateError')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'clone error should be DOMException')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 })
 
 // ============================================================================
@@ -425,12 +426,13 @@ test('AudioData: copyTo closed throws', (t) => {
 
   audioData.close()
 
-  t.throws(
-    () => {
-      audioData.copyTo(new Uint8Array(8), { planeIndex: 0 })
-    },
-    { name: 'InvalidStateError' },
-  )
+  try {
+    audioData.copyTo(new Uint8Array(8), { planeIndex: 0 })
+    t.fail('copyTo should throw InvalidStateError')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'copyTo error should be DOMException')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 })
 
 test('AudioData: copyTo destination too small throws', (t) => {
@@ -506,12 +508,13 @@ test('AudioData: allocationSize closed throws', (t) => {
 
   audioData.close()
 
-  t.throws(
-    () => {
-      audioData.allocationSize({ planeIndex: 0 })
-    },
-    { name: 'InvalidStateError' },
-  )
+  try {
+    audioData.allocationSize({ planeIndex: 0 })
+    t.fail('allocationSize should throw InvalidStateError')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'allocationSize error should be DOMException')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 })
 
 test('AudioData: allocationSize invalid planeIndex throws', (t) => {

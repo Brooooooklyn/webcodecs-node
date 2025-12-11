@@ -476,12 +476,13 @@ test('VideoFrame: clone closed throws', (t) => {
 
   frame.close()
 
-  t.throws(
-    () => {
-      frame.clone()
-    },
-    { name: 'InvalidStateError' },
-  )
+  try {
+    frame.clone()
+    t.fail('clone should throw InvalidStateError')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'clone error should be DOMException')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 })
 
 // ============================================================================
@@ -614,12 +615,13 @@ test('VideoFrame: allocationSize closed throws', (t) => {
 
   frame.close()
 
-  t.throws(
-    () => {
-      frame.allocationSize()
-    },
-    { name: 'InvalidStateError' },
-  )
+  try {
+    frame.allocationSize()
+    t.fail('allocationSize should throw InvalidStateError')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'allocationSize error should be DOMException')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 })
 
 // ============================================================================
@@ -695,13 +697,14 @@ test('VideoFrame: codedRect closed throws', (t) => {
 
   frame.close()
 
-  t.throws(
-    () => {
-      // eslint-disable-next-line @typescript-eslint/no-unused-expressions
-      frame.codedRect
-    },
-    { name: 'InvalidStateError' },
-  )
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-unused-expressions
+    frame.codedRect
+    t.fail('codedRect should throw InvalidStateError')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'codedRect error should be DOMException')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 })
 
 // ============================================================================
@@ -733,13 +736,14 @@ test('VideoFrame: visibleRect closed throws', (t) => {
 
   frame.close()
 
-  t.throws(
-    () => {
-      // eslint-disable-next-line @typescript-eslint/no-unused-expressions
-      frame.visibleRect
-    },
-    { name: 'InvalidStateError' },
-  )
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-unused-expressions
+    frame.visibleRect
+    t.fail('visibleRect should throw InvalidStateError')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'visibleRect error should be DOMException')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 })
 
 test('VideoFrame: construction with visibleRect crops correctly', (t) => {
@@ -993,12 +997,13 @@ test('VideoFrame constructor (from VideoFrame): from closed throws', (t) => {
 
   original.close()
 
-  t.throws(
-    () => {
-      new VideoFrame(original)
-    },
-    { name: 'InvalidStateError' },
-  )
+  try {
+    new VideoFrame(original)
+    t.fail('VideoFrame from closed should throw InvalidStateError')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'VideoFrame error should be DOMException')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 })
 
 // ============================================================================

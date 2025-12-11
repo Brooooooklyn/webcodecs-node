@@ -104,53 +104,59 @@ export async function testClosedCodec(
   t.is(codec.state, 'closed')
 
   // Configure should throw on closed codec
-  t.throws(
-    () => {
-      ;(codec as VideoEncoder).configure(validConfig as unknown as Parameters<VideoEncoder['configure']>[0])
-    },
-    { name: 'InvalidStateError' },
-    'configure should throw InvalidStateError',
-  )
+  try {
+    ;(codec as VideoEncoder).configure(validConfig as unknown as Parameters<VideoEncoder['configure']>[0])
+    t.fail('configure should throw InvalidStateError')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'configure error should be DOMException')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 
   // Reset should throw on closed codec
-  t.throws(
-    () => {
-      codec.reset()
-    },
-    { name: 'InvalidStateError' },
-    'reset should throw InvalidStateError',
-  )
+  try {
+    codec.reset()
+    t.fail('reset should throw InvalidStateError')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'reset error should be DOMException')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 
   // Close should throw on already closed codec (per W3C spec)
-  t.throws(
-    () => {
-      codec.close()
-    },
-    { name: 'InvalidStateError' },
-    'close should throw InvalidStateError',
-  )
+  try {
+    codec.close()
+    t.fail('close should throw InvalidStateError')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'close error should be DOMException')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 
   // Encode/decode should throw on closed codec
   if ('encode' in codec) {
-    t.throws(
-      () => {
-        ;(codec as VideoEncoder).encode(codecInput as VideoFrame)
-      },
-      { name: 'InvalidStateError' },
-      'encode should throw InvalidStateError',
-    )
+    try {
+      ;(codec as VideoEncoder).encode(codecInput as VideoFrame)
+      t.fail('encode should throw InvalidStateError')
+    } catch (error) {
+      t.true(error instanceof DOMException, 'encode error should be DOMException')
+      t.is((error as DOMException).name, 'InvalidStateError')
+    }
   } else if ('decode' in codec) {
-    t.throws(
-      () => {
-        ;(codec as VideoDecoder).decode(codecInput as EncodedVideoChunk)
-      },
-      { name: 'InvalidStateError' },
-      'decode should throw InvalidStateError',
-    )
+    try {
+      ;(codec as VideoDecoder).decode(codecInput as EncodedVideoChunk)
+      t.fail('decode should throw InvalidStateError')
+    } catch (error) {
+      t.true(error instanceof DOMException, 'decode error should be DOMException')
+      t.is((error as DOMException).name, 'InvalidStateError')
+    }
   }
 
   // Flush should reject on closed codec
-  await t.throwsAsync(codec.flush(), { name: 'InvalidStateError' }, 'flush should reject with InvalidStateError')
+  try {
+    await codec.flush()
+    t.fail('flush should reject with InvalidStateError')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'flush error should be DOMException')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 }
 
 /**
@@ -170,29 +176,31 @@ export async function testUnconfiguredCodec(
 
   // Encode/decode should throw on unconfigured codec
   if ('encode' in codec) {
-    t.throws(
-      () => {
-        ;(codec as VideoEncoder).encode(codecInput as VideoFrame)
-      },
-      { name: 'InvalidStateError' },
-      'encode should throw InvalidStateError on unconfigured',
-    )
+    try {
+      ;(codec as VideoEncoder).encode(codecInput as VideoFrame)
+      t.fail('encode should throw InvalidStateError on unconfigured')
+    } catch (error) {
+      t.true(error instanceof DOMException, 'encode error should be DOMException')
+      t.is((error as DOMException).name, 'InvalidStateError')
+    }
   } else if ('decode' in codec) {
-    t.throws(
-      () => {
-        ;(codec as VideoDecoder).decode(codecInput as EncodedVideoChunk)
-      },
-      { name: 'InvalidStateError' },
-      'decode should throw InvalidStateError on unconfigured',
-    )
+    try {
+      ;(codec as VideoDecoder).decode(codecInput as EncodedVideoChunk)
+      t.fail('decode should throw InvalidStateError on unconfigured')
+    } catch (error) {
+      t.true(error instanceof DOMException, 'decode error should be DOMException')
+      t.is((error as DOMException).name, 'InvalidStateError')
+    }
   }
 
   // Flush should reject on unconfigured codec
-  await t.throwsAsync(
-    codec.flush(),
-    { name: 'InvalidStateError' },
-    'flush should reject with InvalidStateError on unconfigured',
-  )
+  try {
+    await codec.flush()
+    t.fail('flush should reject with InvalidStateError on unconfigured')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'flush error should be DOMException')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 }
 
 /**
@@ -380,4 +388,22 @@ export async function waitFor(
     }
     await delay(intervalMs)
   }
+}
+
+/**
+ * Check if an error is of a specific DOMException type.
+ *
+ * Handles both paths of error return:
+ * 1. Native DOMException (from flush() early state check) - check `.name`
+ * 2. Standard Error with prefixed message (from worker thread) - check `.message`
+ *
+ * This aligns with W3C WPT which checks `error.name` for DOMException type.
+ */
+export function isErrorOfType(error: Error, expectedType: string): boolean {
+  // Check DOMException.name first (native errors from flush() early check)
+  if (error instanceof DOMException && error.name === expectedType) {
+    return true
+  }
+  // Check message content (errors from worker thread have "ErrorType: message" format)
+  return error.message.includes(expectedType)
 }

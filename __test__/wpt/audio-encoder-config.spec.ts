@@ -187,13 +187,17 @@ for (const entry of validButUnsupportedConfigs) {
     encoder.configure(entry.config)
 
     // Flush should reject
-    const error = await t.throwsAsync(encoder.flush())
+    try {
+      await encoder.flush()
+      t.fail('flush should reject')
+    } catch (error) {
+      t.truthy(error, 'flush should reject with error')
+    }
 
     t.true(isErrorCallbackCalled, 'error callback should be called')
     t.truthy(errorReceived, 'error should be received')
     t.true(errorReceived!.message.includes('NotSupportedError'), 'error should be NotSupportedError')
     t.is(encoder.state, 'closed', 'encoder should be closed after error')
-    t.truthy(error, 'flush should reject')
   })
 }
 

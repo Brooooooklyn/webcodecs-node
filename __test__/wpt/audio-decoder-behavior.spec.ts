@@ -21,6 +21,7 @@ import {
   createErrorTrackingCodecInit,
   endAfterEventLoopTurn,
   getDefaultCodecInit,
+  isErrorOfType,
   testClosedCodec,
   testUnconfiguredCodec,
   waitFor,
@@ -424,14 +425,21 @@ test('AudioDecoder: decode empty chunk triggers error', async (t) => {
   })
   decoder.decode(emptyChunk)
 
-  // Worker errors use standard Error with DOMException name in message
-  const flushError = await t.throwsAsync(decoder.flush())
-  t.true(flushError?.message.includes('EncodingError'), 'flush error should include EncodingError')
+  // Errors can be either native DOMException (from flush early check) or standard Error (from worker)
+  let flushError: Error | undefined
+  try {
+    await decoder.flush()
+    t.fail('flush should reject with EncodingError')
+  } catch (error) {
+    flushError = error as Error
+    t.true(error instanceof Error, 'flush error should be Error')
+    t.true(isErrorOfType(flushError, 'EncodingError'), 'flush error should be EncodingError')
+  }
 
   const error = await gotError
   t.true(error instanceof Error)
   // Error callbacks receive standard Error with DOMException name in message
-  t.true(error.message.includes('EncodingError'), 'error message should include EncodingError')
+  t.true(isErrorOfType(error, 'EncodingError'), 'error should be EncodingError')
   t.is(decoder.state, 'closed', 'decoder closed after error')
 })
 

@@ -115,9 +115,13 @@ test('VideoDecoder: close() on closed decoder throws InvalidStateError', (t) => 
   t.is(decoder.state, 'closed')
 
   // W3C spec: second close should throw InvalidStateError
-  const error = t.throws(() => decoder.close())
-  t.true(error instanceof DOMException, 'error should be DOMException instance')
-  t.is((error as DOMException).name, 'InvalidStateError')
+  try {
+    decoder.close()
+    t.fail('should have thrown')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'error should be DOMException instance')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 })
 
 // ============================================================================
@@ -394,9 +398,13 @@ test('VideoDecoder: decode() on unconfigured decoder throws InvalidStateError', 
   const { decoder } = createTestDecoder()
 
   // W3C spec: decode() on unconfigured decoder should throw InvalidStateError
-  const error = t.throws(() => decoder.decode(chunks[0]))
-  t.true(error instanceof DOMException, 'error should be DOMException instance')
-  t.is((error as DOMException).name, 'InvalidStateError')
+  try {
+    decoder.decode(chunks[0])
+    t.fail('should have thrown')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'error should be DOMException instance')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 })
 
 test('VideoDecoder: decode() on closed decoder throws InvalidStateError', async (t) => {
@@ -407,9 +415,13 @@ test('VideoDecoder: decode() on closed decoder throws InvalidStateError', async 
   decoder.close()
 
   // W3C spec: decode() on closed decoder should throw InvalidStateError
-  const error = t.throws(() => decoder.decode(chunks[0]))
-  t.true(error instanceof DOMException, 'error should be DOMException instance')
-  t.is((error as DOMException).name, 'InvalidStateError')
+  try {
+    decoder.decode(chunks[0])
+    t.fail('should have thrown')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'error should be DOMException instance')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 })
 
 // ============================================================================

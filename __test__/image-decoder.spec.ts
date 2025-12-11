@@ -206,9 +206,13 @@ test('ImageDecoder reset() after close() throws', async (t) => {
 
   decoder.close()
 
-  t.throws(() => decoder.reset(), {
-    message: /closed/,
-  })
+  try {
+    decoder.reset()
+    t.fail('reset should throw InvalidStateError')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'reset error should be DOMException')
+    t.is((error as DOMException).name, 'InvalidStateError')
+  }
 })
 
 // ============================================================================
