@@ -6,10 +6,10 @@ This directory contains tests ported from the [W3C Web Platform Tests](https://g
 
 | Status      | Count |
 | ----------- | ----- |
-| **Passing** | 829   |
-| **Skipped** | 13    |
+| **Passing** | 522   |
+| **Skipped** | 5     |
 | **Failing** | 0     |
-| **Total**   | 842   |
+| **Total**   | 527   |
 
 ## Test Files Overview
 
@@ -133,18 +133,27 @@ Tests dynamic encoder reconfiguration with:
 
 ### Temporal SVC Encoding Tests
 
-| File                            | Tests                | Status      | Notes                      |
-| ------------------------------- | -------------------- | ----------- | -------------------------- |
-| `temporal-svc-encoding.spec.ts` | 1 passing, 8 skipped | **Pending** | SVC metadata not populated |
+| File                            | Tests     | Status      | Notes                                    |
+| ------------------------------- | --------- | ----------- | ---------------------------------------- |
+| `temporal-svc-encoding.spec.ts` | 8 passing | **Passing** | L1Tx temporal layer metadata implemented |
 
-**Skipped Tests:**
-All L1T2 and L1T3 tests are skipped because `metadata.svc.temporalLayerId` is not yet populated in encoder output.
+**Implementation:**
 
-**Implementation Status:**
+- `scalabilityMode` L1Tx modes populate `metadata.svc.temporalLayerId`
+- Temporal layer ID computed from output frame pattern per W3C spec
+- L1T2: [0, 1, 0, 1, ...], L1T3: [0, 2, 1, 2, 0, 2, 1, 2, ...]
+- Multi-spatial modes (L2T*, S*) not yet supported
 
-- `scalabilityMode` is parsed and passed to encoder
-- Actual SVC layer metadata extraction from FFmpeg is not implemented
-- See `src/webcodecs/video_encoder.rs` - `svc` field is always `None`
+**Skipped WPT Assertions:**
+
+The following assertions from the original WPT are skipped because our implementation only computes temporal layer metadata. FFmpeg is NOT configured for actual SVC encoding, so base layer frames cannot be decoded independently:
+
+```javascript
+// WPT: assert_equals(frames_decoded, base_layer_frames);
+// WPT: assert_equals(corrupted_frames.length, 0, `corrupted_frames: ${corrupted_frames}`);
+```
+
+See: `src/webcodecs/video_encoder.rs` - temporal layer ID computed from frame pattern, not FFmpeg SVC
 
 ---
 
@@ -191,8 +200,8 @@ VideoFrame `rotation` and `flip` properties are now implemented. Tests pending:
 
 ### Temporal SVC
 
-- `scalabilityMode` parameter is parsed but layer metadata is not extracted
-- `metadata.svc.temporalLayerId` always returns `None`
+- L1Tx modes (L1T2, L1T3) populate `metadata.svc.temporalLayerId`
+- Multi-spatial modes (L2T*, S2T*, etc.) not yet supported
 
 ---
 

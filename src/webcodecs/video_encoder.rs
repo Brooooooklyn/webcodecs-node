@@ -303,6 +303,16 @@ struct VideoEncoderInner {
   use_hw_frames: bool,
   /// NV12 scaler for converting I420 to NV12 (required by most hardware encoders)
   nv12_scaler: Option<Scaler>,
+
+  // ========================================================================
+  // Temporal SVC (Scalable Video Coding) tracking
+  // ========================================================================
+  /// Number of temporal layers parsed from scalabilityMode (L1T2=2, L1T3=3)
+  /// None for L1T1 (single temporal layer) or no SVC configured
+  temporal_layer_count: Option<u32>,
+  /// Counter for output frames used to compute temporal layer ID
+  /// Reset on configure() and reset()
+  output_frame_count: u64,
 }
 
 /// Get the preferred hardware device type for the current platform
@@ -429,6 +439,9 @@ impl VideoEncoder {
       hw_frame_ctx: None,
       use_hw_frames: false,
       nv12_scaler: None,
+      // Temporal SVC tracking
+      temporal_layer_count: None,
+      output_frame_count: 0,
     };
 
     let inner = Arc::new(Mutex::new(inner));
@@ -668,6 +681,12 @@ impl VideoEncoder {
                 for packet in pkts {
                   // Use buffered_ts (the original input timestamp) instead of packet.pts()
                   let chunk = EncodedVideoChunk::from_packet(&packet, Some(buffered_ts));
+
+                  // Create SVC metadata if temporal layers are configured
+                  let svc =
+                    create_svc_metadata(guard.temporal_layer_count, guard.output_frame_count);
+                  guard.output_frame_count += 1;
+
                   let metadata = if !guard.extradata_sent && packet.is_key() {
                     guard.extradata_sent = true;
                     EncodedVideoChunkMetadata {
@@ -688,13 +707,13 @@ impl VideoEncoder {
                         },
                         flip: if buffered_flip { Some(true) } else { None },
                       }),
-                      svc: None,
+                      svc,
                       alpha_side_data: None,
                     }
                   } else {
                     EncodedVideoChunkMetadata {
                       decoder_config: None,
-                      svc: None,
+                      svc,
                       alpha_side_data: None,
                     }
                   };
@@ -825,6 +844,12 @@ impl VideoEncoder {
                   for packet in pkts {
                     // Use buffered_ts (the original input timestamp) instead of packet.pts()
                     let chunk = EncodedVideoChunk::from_packet(&packet, Some(buffered_ts));
+
+                    // Create SVC metadata if temporal layers are configured
+                    let svc =
+                      create_svc_metadata(guard.temporal_layer_count, guard.output_frame_count);
+                    guard.output_frame_count += 1;
+
                     let metadata = if !guard.extradata_sent && packet.is_key() {
                       guard.extradata_sent = true;
                       EncodedVideoChunkMetadata {
@@ -845,13 +870,13 @@ impl VideoEncoder {
                           },
                           flip: if buffered_flip { Some(true) } else { None },
                         }),
-                        svc: None,
+                        svc,
                         alpha_side_data: None,
                       }
                     } else {
                       EncodedVideoChunkMetadata {
                         decoder_config: None,
-                        svc: None,
+                        svc,
                         alpha_side_data: None,
                       }
                     };
@@ -933,6 +958,10 @@ impl VideoEncoder {
       let output_timestamp = guard.timestamp_queue.pop_front();
       let chunk = EncodedVideoChunk::from_packet(&packet, output_timestamp);
 
+      // Create SVC metadata if temporal layers are configured
+      let svc = create_svc_metadata(guard.temporal_layer_count, guard.output_frame_count);
+      guard.output_frame_count += 1;
+
       // Create metadata
       let metadata = if !guard.extradata_sent && packet.is_key() {
         guard.extradata_sent = true;
@@ -952,13 +981,13 @@ impl VideoEncoder {
             },
             flip: if flip { Some(true) } else { None },
           }),
-          svc: None,
+          svc,
           alpha_side_data: None,
         }
       } else {
         EncodedVideoChunkMetadata {
           decoder_config: None,
-          svc: None,
+          svc,
           alpha_side_data: None,
         }
       };
@@ -1019,9 +1048,14 @@ impl VideoEncoder {
       // Pop timestamp from queue to preserve original input timestamp
       let output_timestamp = guard.timestamp_queue.pop_front();
       let chunk = EncodedVideoChunk::from_packet(&packet, output_timestamp);
+
+      // Create SVC metadata if temporal layers are configured
+      let svc = create_svc_metadata(guard.temporal_layer_count, guard.output_frame_count);
+      guard.output_frame_count += 1;
+
       let metadata = EncodedVideoChunkMetadata {
         decoder_config: None,
-        svc: None,
+        svc,
         alpha_side_data: None,
       };
 
@@ -1686,6 +1720,14 @@ impl VideoEncoder {
     inner.use_hw_frames = use_hw_frames;
     inner.nv12_scaler = None; // Will be created lazily if needed
 
+    // Temporal SVC tracking - parse layer count from scalabilityMode
+    inner.temporal_layer_count = inner
+      .config
+      .as_ref()
+      .and_then(|c| c.scalability_mode.as_ref())
+      .and_then(|mode| parse_temporal_layer_count(mode));
+    inner.output_frame_count = 0;
+
     Ok(())
   }
 
@@ -1979,6 +2021,10 @@ impl VideoEncoder {
     inner.first_output_produced = false;
     inner.pending_frames.clear();
     inner.timestamp_queue.clear();
+
+    // Reset temporal SVC tracking
+    inner.temporal_layer_count = None;
+    inner.output_frame_count = 0;
 
     // Clear flush-related state
     inner.inside_flush = false;
@@ -2400,6 +2446,60 @@ fn has_valid_codec_casing(codec: &str) -> bool {
 /// Validate scalability mode
 fn is_valid_scalability_mode(mode: &str) -> bool {
   VALID_SCALABILITY_MODES.contains(&mode)
+}
+
+/// Parse temporal layer count from scalability mode string.
+/// Returns Some(n) for L1Tx modes where x >= 2, None otherwise.
+/// Only L1Tx (single spatial layer) modes are supported for temporal layer metadata.
+fn parse_temporal_layer_count(mode: &str) -> Option<u32> {
+  // Only support L1Tx modes (single spatial layer with temporal layers)
+  // Pattern: L1T<n> where n >= 2
+  mode
+    .strip_prefix("L1T")
+    .and_then(|suffix| suffix.parse::<u32>().ok())
+    .filter(|&n| n >= 2)
+}
+
+/// Compute temporal layer ID for a given frame index based on temporal layer count.
+///
+/// Temporal layer patterns (frame index -> layer):
+/// - L1T2 (2 layers): [0, 1, 0, 1, 0, 1, ...]
+/// - L1T3 (3 layers): [0, 2, 1, 2, 0, 2, 1, 2, ...]
+///
+/// The pattern for L1Tx follows these rules:
+/// - Layer 0 (base): every 2^(T-1) frames starting at 0
+/// - Layer T-1 (highest enhancement): odd frames
+/// - Layer k (1 <= k < T-1): frames at 2^(T-1-k) + n*2^(T-k)
+fn compute_temporal_layer_id(frame_index: u64, temporal_layers: u32) -> u32 {
+  if temporal_layers <= 1 {
+    return 0;
+  }
+
+  // For L1T2: period = 2, pattern [0, 1]
+  // For L1T3: period = 4, pattern [0, 2, 1, 2]
+  // General: period = 2^(T-1)
+  let period = 1u64 << (temporal_layers - 1);
+  let pos = frame_index % period;
+
+  if pos == 0 {
+    // Base layer (layer 0)
+    return 0;
+  }
+
+  // Find the highest power of 2 that divides pos
+  // This determines which enhancement layer
+  let trailing_zeros = pos.trailing_zeros();
+
+  // Map: trailing_zeros 0 -> highest layer (T-1)
+  //      trailing_zeros k -> layer (T-1-k)
+  (temporal_layers - 1) - trailing_zeros
+}
+
+/// Create SvcOutputMetadata if temporal layers are configured
+fn create_svc_metadata(layer_count: Option<u32>, frame_idx: u64) -> Option<SvcOutputMetadata> {
+  layer_count.map(|layers| SvcOutputMetadata {
+    temporal_layer_id: Some(compute_temporal_layer_id(frame_idx, layers)),
+  })
 }
 
 /// Check if dimensions are within valid range

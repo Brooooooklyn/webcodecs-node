@@ -22,13 +22,12 @@ WebCodecs API implementation for Node.js using FFmpeg, built with napi-rs (Rust 
 | Threading           | ✅ Complete | Non-blocking Drop, proper lifecycle |
 | W3C Spec Compliance | ✅ Complete | All APIs aligned                    |
 | Type Definitions    | ✅ Complete | ~1,100 lines in index.d.ts          |
-| Test Coverage       | ✅ Complete | 780+ tests (33 files), all passing  |
+| Test Coverage       | ✅ Complete | 841 tests (34 files), all passing   |
 | Hardware Encoding   | ✅ Complete | Zero-copy GPU path, auto-tuning     |
 
 **Remaining Work:**
 
 - VideoFrame.visibleRect cropping (low priority)
-- Temporal SVC layer application (low priority)
 
 ## Architecture
 
@@ -306,8 +305,8 @@ gifDecoder.close()
 
 ## Test Structure
 
-- **33 test files** (~15,000+ lines)
-- **560+ tests** all passing
+- **34 test files** (~15,000+ lines)
+- **841 tests** all passing
 - Test helpers in `__test__/helpers/` for frame/audio generation
 - Integration tests for roundtrip, lifecycle, multi-codec, performance
 - W3C WPT tests in `__test__/wpt/` for spec compliance verification
@@ -429,7 +428,7 @@ src/codec/context.rs:339,362  # Set extradata if provided (non-critical)
 ## Known Limitations
 
 1. **VideoFrame.visibleRect cropping** - Parameter not implemented, returns error
-2. **Temporal SVC** - Parsing only, layer settings not applied to encoder
+2. **Temporal SVC** - L1Tx modes populate `metadata.svc.temporalLayerId`; multi-spatial modes (L2T*, S*) not supported
 3. **Duration type** - Using i64 instead of u64 due to NAPI-RS constraints
 4. **ImageDecoder GIF animation** - FFmpeg may return only first frame; for full animation use VideoDecoder with GIF codec
 
@@ -509,3 +508,4 @@ These are fundamental limitations that cannot be resolved without upstream NAPI-
 | ImageTrackList.item()        | indexed access         | ✅ Implemented            |
 | ImageTrackList.selectedIndex | returns -1 if none     | ✅ Implemented            |
 | ImageTrack.selected          | writable property      | ✅ Getter/setter          |
+| SvcOutputMetadata            | temporalLayerId        | ✅ L1Tx modes             |

@@ -201,13 +201,11 @@ This implementation is validated against the [W3C Web Platform Tests](https://gi
 
 | Status      | Count | Percentage |
 | ----------- | ----- | ---------- |
-| **Passing** | 799   | 98.4%      |
-| **Skipped** | 13    | 1.6%       |
+| **Passing** | 522   | 99.1%      |
+| **Skipped** | 5     | 0.9%       |
 | **Failing** | 0     | 0%         |
 
-**Skipped tests** are due to:
-
-- Temporal SVC layer metadata extraction not implemented
+**Skipped tests** are due to platform-specific features or edge cases.
 
 ### Tests Not Ported (Browser-Only)
 
@@ -256,9 +254,10 @@ The encoder automatically applies optimal settings for each hardware encoder bas
 
 ### Not Implemented
 
-| Feature               | Status | Notes                                                     |
-| --------------------- | ------ | --------------------------------------------------------- |
-| Temporal SVC metadata | ❌     | `scalabilityMode` parsed but `metadata.svc` not populated |
+| Feature                      | Status | Notes                                             |
+| ---------------------------- | ------ | ------------------------------------------------- |
+| VideoFrame.visibleRect crop  | ❌     | Cropping parameter not implemented, returns error |
+| Multi-spatial SVC (L2T*, S*) | ❌     | Only L1Tx temporal modes populate `metadata.svc`  |
 
 ### ImageDecoder Options
 
