@@ -11,8 +11,8 @@
     "allowSyntheticDefaultImports": true,
     "skipLibCheck": true,
     "types": ["node"],
-    "outDir": "./dist"
+    "outDir": "./dist",
   },
   "include": ["."],
-  "exclude": ["dist", "node_modules", "ffmpeg-build", "ffmpeg-src", "specs"]
+  "exclude": ["dist", "node_modules", "ffmpeg-build", "ffmpeg-src", "specs"],
 }

@@ -77,7 +77,7 @@ export declare class AudioDecoder {
    *
    * @param init - Init dictionary containing output and error callbacks
    */
-  constructor(init: { output: (data: AudioData) => void, error: (error: Error) => void })
+  constructor(init: { output: (data: AudioData) => void; error: (error: Error) => void })
   /** Get decoder state */
   get state(): CodecState
   /** Get number of pending decode operations (per WebCodecs spec) */
@@ -148,7 +148,10 @@ export declare class AudioEncoder {
    *
    * @param init - Init dictionary containing output and error callbacks
    */
-  constructor(init: { output: (chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadata) => void, error: (error: Error) => void })
+  constructor(init: {
+    output: (chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadata) => void
+    error: (error: Error) => void
+  })
   /** Get encoder state */
   get state(): CodecState
   /** Get number of pending encode operations (per WebCodecs spec) */
@@ -195,7 +198,12 @@ export declare class AudioEncoder {
  */
 export declare class DOMRectReadOnly {
   /** Create a new DOMRectReadOnly */
-  constructor(x?: number | undefined | null, y?: number | undefined | null, width?: number | undefined | null, height?: number | undefined | null)
+  constructor(
+    x?: number | undefined | null,
+    y?: number | undefined | null,
+    width?: number | undefined | null,
+    height?: number | undefined | null,
+  )
   /** X coordinate */
   get x(): number
   /** Y coordinate */
@@ -401,7 +409,7 @@ export declare class VideoDecoder {
    *
    * @param init - Init dictionary containing output and error callbacks
    */
-  constructor(init: { output: (frame: VideoFrame) => void, error: (error: Error) => void })
+  constructor(init: { output: (frame: VideoFrame) => void; error: (error: Error) => void })
   /** Get decoder state */
   get state(): CodecState
   /** Get number of pending decode operations (per WebCodecs spec) */
@@ -480,7 +488,10 @@ export declare class VideoEncoder {
    *
    * @param init - Init dictionary containing output and error callbacks
    */
-  constructor(init: { output: (chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadata) => void, error: (error: Error) => void })
+  constructor(init: {
+    output: (chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadata) => void
+    error: (error: Error) => void
+  })
   /** Get encoder state */
   get state(): CodecState
   /** Get number of pending encode operations (per WebCodecs spec) */
@@ -609,9 +620,9 @@ export declare class VideoFrame {
 
 /** AAC bitstream format (W3C WebCodecs AAC Registration) */
 export type AacBitstreamFormat = /** Raw AAC frames - metadata in description */
-'aac'|
-/** ADTS frames - metadata in each frame */
-'adts';
+  | 'aac'
+  /** ADTS frames - metadata in each frame */
+  | 'adts'
 
 /** AAC encoder configuration (W3C WebCodecs AAC Registration) */
 export interface AacEncoderConfig {
@@ -624,9 +635,9 @@ export interface AacEncoderConfig {
  * Default is "discard" per spec
  */
 export type AlphaOption = /** Keep alpha channel if present */
-'keep'|
-/** Discard alpha channel (default per W3C spec) */
-'discard';
+  | 'keep'
+  /** Discard alpha channel (default per W3C spec) */
+  | 'discard'
 
 /** Options for copyTo operation */
 export interface AudioDataCopyToOptions {
@@ -661,9 +672,7 @@ export interface AudioDecoderSupport {
 }
 
 /** Encode options for audio */
-export interface AudioEncoderEncodeOptions {
-
-}
+export interface AudioEncoderEncodeOptions {}
 
 /** Audio encoder support information */
 export interface AudioEncoderSupport {
@@ -675,27 +684,27 @@ export interface AudioEncoderSupport {
 
 /** Audio sample format (WebCodecs spec) */
 export type AudioSampleFormat = /** Unsigned 8-bit integer samples| interleaved */
-'u8'|
-/** Signed 16-bit integer samples| interleaved */
-'s16'|
-/** Signed 32-bit integer samples| interleaved */
-'s32'|
-/** 32-bit float samples| interleaved */
-'f32'|
-/** Unsigned 8-bit integer samples| planar */
-'u8-planar'|
-/** Signed 16-bit integer samples| planar */
-'s16-planar'|
-/** Signed 32-bit integer samples| planar */
-'s32-planar'|
-/** 32-bit float samples| planar */
-'f32-planar';
+  | 'u8'
+  /** Signed 16-bit integer samples| interleaved */
+  | 's16'
+  /** Signed 32-bit integer samples| interleaved */
+  | 's32'
+  /** 32-bit float samples| interleaved */
+  | 'f32'
+  /** Unsigned 8-bit integer samples| planar */
+  | 'u8-planar'
+  /** Signed 16-bit integer samples| planar */
+  | 's16-planar'
+  /** Signed 32-bit integer samples| planar */
+  | 's32-planar'
+  /** 32-bit float samples| planar */
+  | 'f32-planar'
 
 /** AVC (H.264) bitstream format (W3C WebCodecs AVC Registration) */
 export type AvcBitstreamFormat = /** AVC format with parameter sets in description (ISO 14496-15) */
-'avc'|
-/** Annex B format with parameter sets in bitstream */
-'annexb';
+  | 'avc'
+  /** Annex B format with parameter sets in bitstream */
+  | 'annexb'
 
 /** AVC (H.264) encoder configuration (W3C WebCodecs AVC Registration) */
 export interface AvcEncoderConfig {
@@ -705,23 +714,23 @@ export interface AvcEncoderConfig {
 
 /** Bitrate mode for audio encoding (W3C WebCodecs spec) */
 export type BitrateMode = /** Variable bitrate (default) */
-'variable'|
-/** Constant bitrate */
-'constant';
+  | 'variable'
+  /** Constant bitrate */
+  | 'constant'
 
 /** Encoder state per WebCodecs spec */
 export type CodecState = /** Encoder not configured */
-'unconfigured'|
-/** Encoder configured and ready */
-'configured'|
-/** Encoder closed */
-'closed';
+  | 'unconfigured'
+  /** Encoder configured and ready */
+  | 'configured'
+  /** Encoder closed */
+  | 'closed'
 
 /** ColorSpaceConversion for ImageDecoder (W3C WebCodecs spec) */
 export type ColorSpaceConversion = /** Apply default color space conversion (spec default) */
-'default'|
-/** No color space conversion */
-'none';
+  | 'default'
+  /** No color space conversion */
+  | 'none'
 
 /** DOMRectInit for specifying regions */
 export interface DOMRectInit {
@@ -739,9 +748,9 @@ export interface EncodedAudioChunkMetadata {
 
 /** Type of encoded audio chunk */
 export type EncodedAudioChunkType = /** Key chunk - can be decoded independently */
-'key'|
-/** Delta chunk - depends on previous chunks */
-'delta';
+  | 'key'
+  /** Delta chunk - depends on previous chunks */
+  | 'delta'
 
 /** Output callback metadata per WebCodecs spec */
 export interface EncodedVideoChunkMetadata {
@@ -755,9 +764,9 @@ export interface EncodedVideoChunkMetadata {
 
 /** Type of encoded video chunk */
 export type EncodedVideoChunkType = /** Keyframe - can be decoded independently */
-'key'|
-/** Delta frame - depends on previous frames */
-'delta';
+  | 'key'
+  /** Delta frame - depends on previous frames */
+  | 'delta'
 
 /** FLAC encoder configuration (W3C WebCodecs FLAC Registration) */
 export interface FlacEncoderConfig {
@@ -778,11 +787,11 @@ export declare function getPreferredHardwareAccelerator(): string | null
 
 /** Hardware acceleration preference (W3C WebCodecs spec) */
 export type HardwareAcceleration = /** No preference - may use hardware or software */
-'no-preference'|
-/** Prefer hardware acceleration */
-'prefer-hardware'|
-/** Prefer software implementation */
-'prefer-software';
+  | 'no-preference'
+  /** Prefer hardware acceleration */
+  | 'prefer-hardware'
+  /** Prefer software implementation */
+  | 'prefer-software'
 
 /** Hardware accelerator information */
 export interface HardwareAccelerator {
@@ -796,9 +805,9 @@ export interface HardwareAccelerator {
 
 /** HEVC (H.265) bitstream format (W3C WebCodecs HEVC Registration) */
 export type HevcBitstreamFormat = /** HEVC format with parameter sets in description (ISO 14496-15) */
-'hevc'|
-/** Annex B format with parameter sets in bitstream */
-'annexb';
+  | 'hevc'
+  /** Annex B format with parameter sets in bitstream */
+  | 'annexb'
 
 /** HEVC (H.265) encoder configuration (W3C WebCodecs HEVC Registration) */
 export interface HevcEncoderConfig {
@@ -819,23 +828,23 @@ export declare function isHardwareAcceleratorAvailable(name: string): boolean
 
 /** Latency mode for video encoding (W3C WebCodecs spec) */
 export type LatencyMode = /** Optimize for quality (default) */
-'quality'|
-/** Optimize for low latency */
-'realtime';
+  | 'quality'
+  /** Optimize for low latency */
+  | 'realtime'
 
 /** Opus application mode (W3C WebCodecs Opus Registration) */
 export type OpusApplication = /** Optimize for VoIP (speech intelligibility) */
-'voip'|
-/** Optimize for audio fidelity (default) */
-'audio'|
-/** Minimize coding delay */
-'lowdelay';
+  | 'voip'
+  /** Optimize for audio fidelity (default) */
+  | 'audio'
+  /** Minimize coding delay */
+  | 'lowdelay'
 
 /** Opus bitstream format (W3C WebCodecs Opus Registration) */
 export type OpusBitstreamFormat = /** Opus packets (RFC 6716) - no metadata needed for decoding */
-'opus'|
-/** Ogg encapsulation (RFC 7845) - metadata in description */
-'ogg';
+  | 'opus'
+  /** Ogg encapsulation (RFC 7845) - metadata in description */
+  | 'ogg'
 
 /** Opus encoder configuration (W3C WebCodecs Opus Registration) */
 export interface OpusEncoderConfig {
@@ -862,11 +871,11 @@ export interface OpusEncoderConfig {
 
 /** Opus signal type hint (W3C WebCodecs Opus Registration) */
 export type OpusSignal = /** Auto-detect signal type */
-'auto'|
-/** Music signal */
-'music'|
-/** Voice/speech signal */
-'voice';
+  | 'auto'
+  /** Music signal */
+  | 'music'
+  /** Voice/speech signal */
+  | 'voice'
 
 /** Layout information for a single plane per WebCodecs spec */
 export interface PlaneLayout {
@@ -895,15 +904,15 @@ export interface SvcOutputMetadata {
 
 /** Video color primaries (W3C WebCodecs spec) */
 export type VideoColorPrimaries = /** BT.709 / sRGB primaries */
-'bt709'|
-/** BT.470 BG (PAL) */
-'bt470bg'|
-/** SMPTE 170M (NTSC) */
-'smpte170m'|
-/** BT.2020 (UHD) */
-'bt2020'|
-/** SMPTE 432 (DCI-P3) */
-'smpte432';
+  | 'bt709'
+  /** BT.470 BG (PAL) */
+  | 'bt470bg'
+  /** SMPTE 170M (NTSC) */
+  | 'smpte170m'
+  /** BT.2020 (UHD) */
+  | 'bt2020'
+  /** SMPTE 432 (DCI-P3) */
+  | 'smpte432'
 
 /** Decoder configuration output (for passing to decoder) */
 export interface VideoDecoderConfigOutput {
@@ -935,11 +944,11 @@ export interface VideoDecoderSupport {
 
 /** Bitrate mode for video encoding (W3C WebCodecs spec) */
 export type VideoEncoderBitrateMode = /** Variable bitrate (default) */
-'variable'|
-/** Constant bitrate */
-'constant'|
-/** Use quantizer parameter from codec-specific options */
-'quantizer';
+  | 'variable'
+  /** Constant bitrate */
+  | 'constant'
+  /** Use quantizer parameter from codec-specific options */
+  | 'quantizer'
 
 /** Encode options per WebCodecs spec */
 export interface VideoEncoderEncodeOptions {
@@ -1023,9 +1032,7 @@ export interface VideoFrameInit {
  * VideoFrameMetadata - metadata associated with a VideoFrame (W3C spec)
  * Members defined in VideoFrame Metadata Registry - currently empty per spec
  */
-export interface VideoFrameMetadata {
-
-}
+export interface VideoFrameMetadata {}
 
 /** Rectangle for specifying a region */
 export interface VideoFrameRect {
@@ -1037,72 +1044,72 @@ export interface VideoFrameRect {
 
 /** Video matrix coefficients (W3C WebCodecs spec) */
 export type VideoMatrixCoefficients = /** RGB (identity matrix) */
-'rgb'|
-/** BT.709 */
-'bt709'|
-/** BT.470 BG */
-'bt470bg'|
-/** SMPTE 170M */
-'smpte170m'|
-/** BT.2020 non-constant luminance */
-'bt2020-ncl';
+  | 'rgb'
+  /** BT.709 */
+  | 'bt709'
+  /** BT.470 BG */
+  | 'bt470bg'
+  /** SMPTE 170M */
+  | 'smpte170m'
+  /** BT.2020 non-constant luminance */
+  | 'bt2020-ncl'
 
 /** Video pixel format (WebCodecs spec) */
 export type VideoPixelFormat = /** Planar YUV 4:2:0| 12bpp| (1 Cr & Cb sample per 2x2 Y samples) */
-'I420'|
-/** Planar YUV 4:2:0| 12bpp| with alpha plane */
-'I420A'|
-/** Planar YUV 4:2:2| 16bpp */
-'I422'|
-/** Planar YUV 4:2:2| 16bpp| with alpha plane */
-'I422A'|
-/** Planar YUV 4:4:4| 24bpp */
-'I444'|
-/** Planar YUV 4:4:4| 24bpp| with alpha plane */
-'I444A'|
-/** Planar YUV 4:2:0| 10-bit */
-'I420P10'|
-/** Planar YUV 4:2:0| 10-bit| with alpha plane */
-'I420AP10'|
-/** Planar YUV 4:2:2| 10-bit */
-'I422P10'|
-/** Planar YUV 4:2:2| 10-bit| with alpha plane */
-'I422AP10'|
-/** Planar YUV 4:4:4| 10-bit */
-'I444P10'|
-/** Planar YUV 4:4:4| 10-bit| with alpha plane */
-'I444AP10'|
-/** Planar YUV 4:2:0| 12-bit */
-'I420P12'|
-/** Planar YUV 4:2:2| 12-bit */
-'I422P12'|
-/** Planar YUV 4:4:4| 12-bit */
-'I444P12'|
-/** Semi-planar YUV 4:2:0| 12bpp (Y plane + interleaved UV) */
-'NV12'|
-/** Semi-planar YUV 4:2:0| 12bpp (Y plane + interleaved VU) - per W3C WebCodecs spec */
-'NV21'|
-/** RGBA 32bpp */
-'RGBA'|
-/** RGBX 32bpp (alpha ignored) */
-'RGBX'|
-/** BGRA 32bpp */
-'BGRA'|
-/** BGRX 32bpp (alpha ignored) */
-'BGRX';
+  | 'I420'
+  /** Planar YUV 4:2:0| 12bpp| with alpha plane */
+  | 'I420A'
+  /** Planar YUV 4:2:2| 16bpp */
+  | 'I422'
+  /** Planar YUV 4:2:2| 16bpp| with alpha plane */
+  | 'I422A'
+  /** Planar YUV 4:4:4| 24bpp */
+  | 'I444'
+  /** Planar YUV 4:4:4| 24bpp| with alpha plane */
+  | 'I444A'
+  /** Planar YUV 4:2:0| 10-bit */
+  | 'I420P10'
+  /** Planar YUV 4:2:0| 10-bit| with alpha plane */
+  | 'I420AP10'
+  /** Planar YUV 4:2:2| 10-bit */
+  | 'I422P10'
+  /** Planar YUV 4:2:2| 10-bit| with alpha plane */
+  | 'I422AP10'
+  /** Planar YUV 4:4:4| 10-bit */
+  | 'I444P10'
+  /** Planar YUV 4:4:4| 10-bit| with alpha plane */
+  | 'I444AP10'
+  /** Planar YUV 4:2:0| 12-bit */
+  | 'I420P12'
+  /** Planar YUV 4:2:2| 12-bit */
+  | 'I422P12'
+  /** Planar YUV 4:4:4| 12-bit */
+  | 'I444P12'
+  /** Semi-planar YUV 4:2:0| 12bpp (Y plane + interleaved UV) */
+  | 'NV12'
+  /** Semi-planar YUV 4:2:0| 12bpp (Y plane + interleaved VU) - per W3C WebCodecs spec */
+  | 'NV21'
+  /** RGBA 32bpp */
+  | 'RGBA'
+  /** RGBX 32bpp (alpha ignored) */
+  | 'RGBX'
+  /** BGRA 32bpp */
+  | 'BGRA'
+  /** BGRX 32bpp (alpha ignored) */
+  | 'BGRX'
 
 /** Video transfer characteristics (W3C WebCodecs spec) */
 export type VideoTransferCharacteristics = /** BT.709 transfer */
-'bt709'|
-/** SMPTE 170M transfer */
-'smpte170m'|
-/** IEC 61966-2-1 (sRGB) - technical name */
-'iec61966-2-1'|
-/** sRGB transfer (alias for iec61966-2-1) */
-'srgb'|
-/** Linear transfer */
-'linear'|
-/** Perceptual Quantizer (HDR) */
-'pq'|
-/** Hybrid Log-Gamma (HDR) */
-'hlg';
+  | 'bt709'
+  /** SMPTE 170M transfer */
+  | 'smpte170m'
+  /** IEC 61966-2-1 (sRGB) - technical name */
+  | 'iec61966-2-1'
+  /** sRGB transfer (alias for iec61966-2-1) */
+  | 'srgb'
+  /** Linear transfer */
+  | 'linear'
+  /** Perceptual Quantizer (HDR) */
+  | 'pq'
+  /** Hybrid Log-Gamma (HDR) */
+  | 'hlg'

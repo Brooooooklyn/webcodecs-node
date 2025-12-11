@@ -193,7 +193,10 @@ async function runFullCycleTest(
 
 test.serial('Full cycle: AV1 - basic encoding and decoding', async (t) => {
   const config = createEncoderConfig('av1')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: ENCODER_CONFIGS.av1.hasEmbeddedColorSpace })
+  await runFullCycleTest(t, {
+    ...config,
+    hasEmbeddedColorSpace: ENCODER_CONFIGS.av1.hasEmbeddedColorSpace,
+  })
 })
 
 test.serial('Full cycle: AV1 - realtime latency mode', async (t) => {
@@ -222,7 +225,10 @@ test.skip('Full cycle: AV1 - rate control', async (t) => {
 
 test.serial('Full cycle: VP8 - basic encoding and decoding', async (t) => {
   const config = createEncoderConfig('vp8')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: ENCODER_CONFIGS.vp8.hasEmbeddedColorSpace })
+  await runFullCycleTest(t, {
+    ...config,
+    hasEmbeddedColorSpace: ENCODER_CONFIGS.vp8.hasEmbeddedColorSpace,
+  })
 })
 
 test.serial('Full cycle: VP8 - realtime latency mode', async (t) => {
@@ -242,7 +248,10 @@ test.skip('Full cycle: VP8 - rate control', async (t) => {
 
 test.serial('Full cycle: VP9 Profile 0 - basic encoding and decoding', async (t) => {
   const config = createEncoderConfig('vp9_p0')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: ENCODER_CONFIGS.vp9_p0.hasEmbeddedColorSpace })
+  await runFullCycleTest(t, {
+    ...config,
+    hasEmbeddedColorSpace: ENCODER_CONFIGS.vp9_p0.hasEmbeddedColorSpace,
+  })
 })
 
 test.serial('Full cycle: VP9 Profile 0 - realtime latency mode', async (t) => {
@@ -263,7 +272,10 @@ test.skip('Full cycle: VP9 Profile 0 - rate control', async (t) => {
 
 test.serial('Full cycle: VP9 Profile 2 (10-bit) - basic encoding and decoding', async (t) => {
   const config = createEncoderConfig('vp9_p2')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: ENCODER_CONFIGS.vp9_p2.hasEmbeddedColorSpace })
+  await runFullCycleTest(t, {
+    ...config,
+    hasEmbeddedColorSpace: ENCODER_CONFIGS.vp9_p2.hasEmbeddedColorSpace,
+  })
 })
 
 // ============================================================================
@@ -272,7 +284,10 @@ test.serial('Full cycle: VP9 Profile 2 (10-bit) - basic encoding and decoding', 
 
 test.serial('Full cycle: H.264 AVC - basic encoding and decoding', async (t) => {
   const config = createEncoderConfig('h264_avc')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: ENCODER_CONFIGS.h264_avc.hasEmbeddedColorSpace })
+  await runFullCycleTest(t, {
+    ...config,
+    hasEmbeddedColorSpace: ENCODER_CONFIGS.h264_avc.hasEmbeddedColorSpace,
+  })
 })
 
 test.serial('Full cycle: H.264 AVC - realtime latency mode', async (t) => {
@@ -293,7 +308,10 @@ test.skip('Full cycle: H.264 AVC - rate control', async (t) => {
 
 test.serial('Full cycle: H.264 Annex B - basic encoding and decoding', async (t) => {
   const config = createEncoderConfig('h264_annexb')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: ENCODER_CONFIGS.h264_annexb.hasEmbeddedColorSpace })
+  await runFullCycleTest(t, {
+    ...config,
+    hasEmbeddedColorSpace: ENCODER_CONFIGS.h264_annexb.hasEmbeddedColorSpace,
+  })
 })
 
 test.serial('Full cycle: H.264 Annex B - realtime latency mode', async (t) => {
@@ -307,7 +325,10 @@ test.serial('Full cycle: H.264 Annex B - realtime latency mode', async (t) => {
 
 test.serial('Full cycle: H.265 HEVC - basic encoding and decoding', async (t) => {
   const config = createEncoderConfig('h265_hevc')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: ENCODER_CONFIGS.h265_hevc.hasEmbeddedColorSpace })
+  await runFullCycleTest(t, {
+    ...config,
+    hasEmbeddedColorSpace: ENCODER_CONFIGS.h265_hevc.hasEmbeddedColorSpace,
+  })
 })
 
 test.serial('Full cycle: H.265 HEVC - realtime latency mode', async (t) => {
@@ -328,7 +349,10 @@ test.skip('Full cycle: H.265 HEVC - rate control', async (t) => {
 
 test.serial('Full cycle: H.265 Annex B - basic encoding and decoding', async (t) => {
   const config = createEncoderConfig('h265_annexb')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: ENCODER_CONFIGS.h265_annexb.hasEmbeddedColorSpace })
+  await runFullCycleTest(t, {
+    ...config,
+    hasEmbeddedColorSpace: ENCODER_CONFIGS.h265_annexb.hasEmbeddedColorSpace,
+  })
 })
 
 test.serial('Full cycle: H.265 Annex B - realtime latency mode', async (t) => {
