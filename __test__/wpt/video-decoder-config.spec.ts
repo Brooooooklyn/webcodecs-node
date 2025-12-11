@@ -82,10 +82,9 @@ const validButUnsupportedConfigs = [
     comment: 'Audio codec',
     config: { codec: 'vorbis' },
   },
-  {
-    comment: 'Ambiguous codec',
-    config: { codec: 'vp9' },
-  },
+  // Note: W3C WPT considers 'vp9' ambiguous, but we accept it for compatibility
+  // with webcodecs-harness and browser implementations that accept the short form.
+  // Original WPT: { comment: 'Ambiguous codec', config: { codec: 'vp9' } },
   {
     comment: 'Codec with bad casing',
     config: { codec: 'Vp09.00.10.08' },

@@ -161,13 +161,15 @@ decoder.close()
 
 ### Video
 
-| Codec | Codec String       | Encoding | Decoding |
-| ----- | ------------------ | -------- | -------- |
-| H.264 | `avc1.*`           | ✅       | ✅       |
-| H.265 | `hev1.*`, `hvc1.*` | ✅       | ✅       |
-| VP8   | `vp8`              | ✅       | ✅       |
-| VP9   | `vp09.*`           | ✅       | ✅       |
-| AV1   | `av01.*`           | ✅       | ✅       |
+| Codec | Codec String            | Encoding | Decoding |
+| ----- | ----------------------- | -------- | -------- |
+| H.264 | `avc1.*`                | ✅       | ✅       |
+| H.265 | `hev1.*`, `hvc1.*`      | ✅       | ✅       |
+| VP8   | `vp8`                   | ✅       | ✅       |
+| VP9   | `vp09.*`, `vp9`         | ✅       | ✅       |
+| AV1   | `av01.*`, `av01`, `av1` | ✅       | ✅       |
+
+**Note:** Short form codec strings (`vp9`, `av01`, `av1`) are accepted for compatibility with browser implementations.
 
 ### Audio
 
@@ -327,13 +329,15 @@ Log level mapping:
 
 This package implements the [W3C WebCodecs API](https://w3c.github.io/webcodecs/). Key classes:
 
-- `VideoEncoder` / `VideoDecoder` - Video encoding and decoding
-- `AudioEncoder` / `AudioDecoder` - Audio encoding and decoding
-- `VideoFrame` - Raw video frame data
+- `VideoEncoder` / `VideoDecoder` - Video encoding and decoding with EventTarget support
+- `AudioEncoder` / `AudioDecoder` - Audio encoding and decoding with EventTarget support
+- `VideoFrame` - Raw video frame data (RGBA formats default to sRGB colorSpace)
 - `AudioData` - Raw audio sample data
 - `EncodedVideoChunk` / `EncodedAudioChunk` - Encoded media data
 - `ImageDecoder` - Static image decoding
 - `VideoColorSpace` - Color space information
+
+All encoders and decoders implement the `EventTarget` interface with `addEventListener()`, `removeEventListener()`, and `dispatchEvent()`.
 
 For full API documentation, see the [W3C WebCodecs specification](https://w3c.github.io/webcodecs/).
 

@@ -1271,7 +1271,26 @@ impl VideoFrame {
       }
     });
 
-    let color_space = VideoColorSpace::new(init.color_space);
+    // Color space: use provided value, or default to sRGB for RGB formats
+    let color_space = if init.color_space.is_some() {
+      VideoColorSpace::new(init.color_space)
+    } else if matches!(
+      format,
+      VideoPixelFormat::RGBA
+        | VideoPixelFormat::RGBX
+        | VideoPixelFormat::BGRA
+        | VideoPixelFormat::BGRX
+    ) {
+      // Default to sRGB color space for RGB formats per W3C spec
+      VideoColorSpace::from_components(
+        Some(VideoColorPrimaries::Bt709),
+        Some(VideoTransferCharacteristics::Iec6196621), // sRGB
+        Some(VideoMatrixCoefficients::Rgb),
+        Some(true), // fullRange
+      )
+    } else {
+      VideoColorSpace::new(None)
+    };
 
     let inner = VideoFrameInner {
       frame,

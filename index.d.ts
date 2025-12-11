@@ -131,6 +131,20 @@ export declare class AudioDecoder {
    * returns { supported: false } for valid but unsupported configs.
    */
   static isConfigSupported(config: AudioDecoderConfig): Promise<AudioDecoderSupport>
+  /** Add an event listener for the specified event type */
+  addEventListener(
+    eventType: string,
+    callback: () => unknown,
+    options?: AudioDecoderAddEventListenerOptions | undefined | null,
+  ): void
+  /** Remove an event listener for the specified event type */
+  removeEventListener(
+    eventType: string,
+    callback: () => unknown,
+    options?: AudioDecoderEventListenerOptions | undefined | null,
+  ): void
+  /** Dispatch an event to all registered listeners */
+  dispatchEvent(eventType: string): boolean
 }
 
 /**
@@ -205,6 +219,20 @@ export declare class AudioEncoder {
    * returns { supported: false } for valid but unsupported configs.
    */
   static isConfigSupported(config: AudioEncoderConfig): Promise<AudioEncoderSupport>
+  /** Add an event listener for the specified event type */
+  addEventListener(
+    eventType: string,
+    callback: () => unknown,
+    options?: AudioEncoderAddEventListenerOptions | undefined | null,
+  ): void
+  /** Remove an event listener for the specified event type */
+  removeEventListener(
+    eventType: string,
+    callback: () => unknown,
+    options?: AudioEncoderEventListenerOptions | undefined | null,
+  ): void
+  /** Dispatch an event to all registered listeners */
+  dispatchEvent(eventType: string): boolean
 }
 
 /**
@@ -470,6 +498,20 @@ export declare class VideoDecoder {
    * returns { supported: false } for valid but unsupported configs.
    */
   static isConfigSupported(config: VideoDecoderConfig): Promise<VideoDecoderSupport>
+  /** Add an event listener for the specified event type */
+  addEventListener(
+    eventType: string,
+    callback: () => unknown,
+    options?: VideoDecoderAddEventListenerOptions | undefined | null,
+  ): void
+  /** Remove an event listener for the specified event type */
+  removeEventListener(
+    eventType: string,
+    callback: () => unknown,
+    options?: VideoDecoderEventListenerOptions | undefined | null,
+  ): void
+  /** Dispatch an event to all registered listeners */
+  dispatchEvent(eventType: string): boolean
 }
 
 /**
@@ -537,6 +579,20 @@ export declare class VideoEncoder {
   reset(): void
   /** Close the encoder */
   close(): void
+  /** Add an event listener for the specified event type */
+  addEventListener(
+    eventType: string,
+    callback: () => unknown,
+    options?: AddEventListenerOptions | undefined | null,
+  ): void
+  /** Remove an event listener for the specified event type */
+  removeEventListener(
+    eventType: string,
+    callback: () => unknown,
+    options?: EventListenerOptions | undefined | null,
+  ): void
+  /** Dispatch an event to all registered listeners */
+  dispatchEvent(eventType: string): boolean
   /**
    * Check if a configuration is supported
    * Returns a Promise that resolves with support information
@@ -639,6 +695,13 @@ export interface AacEncoderConfig {
   format?: AacBitstreamFormat
 }
 
+/** Options for addEventListener (W3C DOM spec) */
+export interface AddEventListenerOptions {
+  capture?: boolean
+  once?: boolean
+  passive?: boolean
+}
+
 /**
  * Alpha channel handling option (W3C WebCodecs spec)
  * Default is "discard" per spec
@@ -660,6 +723,13 @@ export interface AudioDataCopyToOptions {
   format?: AudioSampleFormat
 }
 
+/** Options for addEventListener (W3C DOM spec) */
+export interface AudioDecoderAddEventListenerOptions {
+  capture?: boolean
+  once?: boolean
+  passive?: boolean
+}
+
 /** Decoder configuration output (for passing to decoder) */
 export interface AudioDecoderConfigOutput {
   /** Codec string */
@@ -672,6 +742,11 @@ export interface AudioDecoderConfigOutput {
   description?: Uint8Array
 }
 
+/** Options for removeEventListener (W3C DOM spec) */
+export interface AudioDecoderEventListenerOptions {
+  capture?: boolean
+}
+
 /** Audio decoder support information */
 export interface AudioDecoderSupport {
   /** Whether the configuration is supported */
@@ -680,8 +755,20 @@ export interface AudioDecoderSupport {
   config: AudioDecoderConfig
 }
 
+/** Options for addEventListener (W3C DOM spec) */
+export interface AudioEncoderAddEventListenerOptions {
+  capture?: boolean
+  once?: boolean
+  passive?: boolean
+}
+
 /** Encode options for audio */
 export interface AudioEncoderEncodeOptions {}
+
+/** Options for removeEventListener (W3C DOM spec) */
+export interface AudioEncoderEventListenerOptions {
+  capture?: boolean
+}
 
 /** Audio encoder support information */
 export interface AudioEncoderSupport {
@@ -776,6 +863,11 @@ export type EncodedVideoChunkType = /** Keyframe - can be decoded independently 
   | 'key'
   /** Delta frame - depends on previous frames */
   | 'delta'
+
+/** Options for removeEventListener (W3C DOM spec) */
+export interface EventListenerOptions {
+  capture?: boolean
+}
 
 /** FLAC encoder configuration (W3C WebCodecs FLAC Registration) */
 export interface FlacEncoderConfig {
@@ -923,6 +1015,13 @@ export type VideoColorPrimaries = /** BT.709 / sRGB primaries */
   /** SMPTE 432 (DCI-P3) */
   | 'smpte432'
 
+/** Options for addEventListener (W3C DOM spec) */
+export interface VideoDecoderAddEventListenerOptions {
+  capture?: boolean
+  once?: boolean
+  passive?: boolean
+}
+
 /** Decoder configuration output (for passing to decoder) */
 export interface VideoDecoderConfigOutput {
   /** Codec string */
@@ -941,6 +1040,11 @@ export interface VideoDecoderConfigOutput {
   rotation?: number
   /** Horizontal flip per W3C spec */
   flip?: boolean
+}
+
+/** Options for removeEventListener (W3C DOM spec) */
+export interface VideoDecoderEventListenerOptions {
+  capture?: boolean
 }
 
 /** Result of isConfigSupported per WebCodecs spec */

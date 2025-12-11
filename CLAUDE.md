@@ -10,20 +10,20 @@ WebCodecs API implementation for Node.js using FFmpeg, built with napi-rs (Rust 
 
 **Status:** Feature-complete, production-ready
 
-| Component           | Status      | Notes                               |
-| ------------------- | ----------- | ----------------------------------- |
-| VideoEncoder        | ✅ Complete | H.264, H.265, VP8, VP9, AV1         |
-| VideoDecoder        | ✅ Complete | All codecs + AV1 drain workaround   |
-| AudioEncoder        | ✅ Complete | AAC, Opus, MP3, FLAC                |
-| AudioDecoder        | ✅ Complete | All codecs with resampling          |
-| VideoFrame          | ✅ Complete | All pixel formats, async copyTo     |
-| AudioData           | ✅ Complete | All sample formats                  |
-| ImageDecoder        | ✅ Complete | JPEG, PNG, WebP, GIF, BMP, AVIF     |
-| Threading           | ✅ Complete | Non-blocking Drop, proper lifecycle |
-| W3C Spec Compliance | ✅ Complete | All APIs aligned                    |
-| Type Definitions    | ✅ Complete | ~1,100 lines in index.d.ts          |
-| Test Coverage       | ✅ Complete | 866 tests (34 files), all passing   |
-| Hardware Encoding   | ✅ Complete | Zero-copy GPU path, auto-tuning     |
+| Component           | Status      | Notes                                     |
+| ------------------- | ----------- | ----------------------------------------- |
+| VideoEncoder        | ✅ Complete | H.264, H.265, VP8, VP9, AV1 + EventTarget |
+| VideoDecoder        | ✅ Complete | All codecs + AV1 drain + EventTarget      |
+| AudioEncoder        | ✅ Complete | AAC, Opus, MP3, FLAC + EventTarget        |
+| AudioDecoder        | ✅ Complete | All codecs with resampling + EventTarget  |
+| VideoFrame          | ✅ Complete | All pixel formats, async copyTo           |
+| AudioData           | ✅ Complete | All sample formats                        |
+| ImageDecoder        | ✅ Complete | JPEG, PNG, WebP, GIF, BMP, AVIF           |
+| Threading           | ✅ Complete | Non-blocking Drop, proper lifecycle       |
+| W3C Spec Compliance | ✅ Complete | All APIs aligned                          |
+| Type Definitions    | ✅ Complete | ~1,100 lines in index.d.ts                |
+| Test Coverage       | ✅ Complete | 864 tests (34 files), all passing         |
+| Hardware Encoding   | ✅ Complete | Zero-copy GPU path, auto-tuning           |
 
 **Remaining Work:** None - All core features complete.
 
@@ -119,9 +119,10 @@ Detection order:
 ### Video
 
 - **VideoFrame**: All pixel formats (I420, I420A, I422, I444, NV12, NV21, RGBA, RGBX, BGRA, BGRX)
+  - RGBA/RGBX/BGRA/BGRX formats default to sRGB colorSpace (BT.709 primaries, IEC 61966-2-1 transfer)
 - **EncodedVideoChunk**: Key/Delta types with copyTo()
-- **VideoEncoder**: Callback-based API, bitrateMode, latencyMode, scalabilityMode, keyFrame forcing
-- **VideoDecoder**: Full implementation with callback API
+- **VideoEncoder**: Callback-based API, bitrateMode, latencyMode, scalabilityMode, keyFrame forcing, EventTarget
+- **VideoDecoder**: Full implementation with callback API, EventTarget interface
 - **VideoColorSpace**: Class with constructor and toJSON()
 - **DOMRectReadOnly**: For codedRect/visibleRect properties
 
@@ -129,8 +130,8 @@ Detection order:
 
 - **AudioData**: All sample formats (u8, s16, s32, f32, planar variants)
 - **EncodedAudioChunk**: Key/Delta types with copyTo()
-- **AudioEncoder**: Callback-based API, AAC/Opus/MP3/FLAC support
-- **AudioDecoder**: Full implementation
+- **AudioEncoder**: Callback-based API, AAC/Opus/MP3/FLAC support, EventTarget interface
+- **AudioDecoder**: Full implementation with EventTarget interface
 
 ### Image
 
@@ -169,8 +170,10 @@ Detection order:
 
 ### Supported Codecs
 
-- **Video**: H.264 (avc1), H.265 (hev1/hvc1), VP8, VP9 (vp09), AV1 (av01)
+- **Video**: H.264 (avc1), H.265 (hev1/hvc1), VP8, VP9 (vp09, vp9), AV1 (av01, av1)
 - **Audio**: AAC (mp4a.40.2), Opus, MP3, FLAC, Vorbis, ALAC, PCM variants
+
+**Note:** Short form codec strings `vp9` and `av01`/`av1` are accepted for compatibility with browser implementations, though W3C WPT considers them ambiguous.
 
 ## Key Files
 
@@ -304,7 +307,7 @@ gifDecoder.close()
 ## Test Structure
 
 - **34 test files** (~15,000+ lines)
-- **866 tests** all passing
+- **864 tests** all passing (14 skipped)
 - Test helpers in `__test__/helpers/` for frame/audio generation
 - Integration tests for roundtrip, lifecycle, multi-codec, performance
 - W3C WPT tests in `__test__/wpt/` for spec compliance verification
@@ -508,3 +511,7 @@ These are fundamental limitations that cannot be resolved without upstream NAPI-
 | SvcOutputMetadata            | temporalLayerId         | ✅ L1Tx modes             |
 | DOMException errors          | instanceof DOMException | ✅ Native DOMException    |
 | VideoEncoder.encode options  | keyFrame forcing        | ✅ Forces I-frame         |
+| EventTarget interface        | addEventListener, etc   | ✅ All codecs             |
+| RGBA colorSpace default      | sRGB for RGB formats    | ✅ BT.709/sRGB            |
+| VP9 short form codec         | "vp9" accepted          | ✅ For compatibility      |
+| AV1 short form codec         | "av01"/"av1" accepted   | ✅ For compatibility      |

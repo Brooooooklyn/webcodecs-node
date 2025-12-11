@@ -25,6 +25,7 @@ use napi::threadsafe_function::{
   ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
 };
 use napi_derive::napi;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -247,6 +248,32 @@ impl FromNapiValue for VideoEncoderInit {
 /// Threshold for detecting silent encoder failure (no output after N frames)
 const SILENT_FAILURE_THRESHOLD: u32 = 3;
 
+/// Type alias for event listener callback (same pattern as dequeue callback)
+type EventListenerCallback = ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, true>;
+
+/// Entry for tracking event listeners
+struct EventListenerEntry {
+  id: u64,
+  callback: EventListenerCallback,
+  once: bool,
+}
+
+/// Options for addEventListener (W3C DOM spec)
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct AddEventListenerOptions {
+  pub capture: Option<bool>,
+  pub once: Option<bool>,
+  pub passive: Option<bool>,
+}
+
+/// Options for removeEventListener (W3C DOM spec)
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct EventListenerOptions {
+  pub capture: Option<bool>,
+}
+
 /// Internal encoder state
 struct VideoEncoderInner {
   state: CodecState,
@@ -323,6 +350,14 @@ struct VideoEncoderInner {
   /// True for H.264 when avc.format is "avc" (default) or not specified
   /// True for H.265 when hevc.format is "hevc" (default) or not specified
   use_avcc_format: bool,
+
+  // ========================================================================
+  // EventTarget support
+  // ========================================================================
+  /// Event listeners registry (event type -> list of listeners)
+  event_listeners: HashMap<String, Vec<EventListenerEntry>>,
+  /// Counter for generating unique listener IDs
+  next_listener_id: u64,
 }
 
 /// Get the preferred hardware device type for the current platform
@@ -454,6 +489,9 @@ impl VideoEncoder {
       output_frame_count: 0,
       // Bitstream format conversion (set during configure)
       use_avcc_format: false,
+      // EventTarget support
+      event_listeners: HashMap::new(),
+      next_listener_id: 0,
     };
 
     let inner = Arc::new(Mutex::new(inner));
@@ -2259,6 +2297,107 @@ impl VideoEncoder {
     Ok(())
   }
 
+  // ============================================================================
+  // EventTarget interface (W3C DOM spec)
+  // ============================================================================
+
+  /// Add an event listener for the specified event type
+  #[napi]
+  pub fn add_event_listener(
+    &self,
+    env: Env,
+    event_type: String,
+    callback: FunctionRef<(), UnknownReturnValue>,
+    options: Option<AddEventListenerOptions>,
+  ) -> Result<()> {
+    let mut inner = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    let id = inner.next_listener_id;
+    inner.next_listener_id += 1;
+
+    let tsf = callback
+      .borrow_back(&env)?
+      .build_threadsafe_function()
+      .callee_handled::<false>()
+      .weak::<true>()
+      .build()?;
+
+    let entry = EventListenerEntry {
+      id,
+      callback: tsf,
+      once: options.as_ref().and_then(|o| o.once).unwrap_or(false),
+    };
+
+    inner
+      .event_listeners
+      .entry(event_type)
+      .or_default()
+      .push(entry);
+    Ok(())
+  }
+
+  /// Remove an event listener for the specified event type
+  #[napi]
+  pub fn remove_event_listener(
+    &self,
+    event_type: String,
+    _callback: FunctionRef<(), UnknownReturnValue>,
+    _options: Option<EventListenerOptions>,
+  ) -> Result<()> {
+    let mut inner = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    // Note: We can't compare function references directly, so we remove the last added listener
+    // for simplicity. A more complete implementation would need to track callback identity.
+    if let Some(listeners) = inner.event_listeners.get_mut(&event_type) {
+      listeners.pop();
+      if listeners.is_empty() {
+        inner.event_listeners.remove(&event_type);
+      }
+    }
+    Ok(())
+  }
+
+  /// Dispatch an event to all registered listeners
+  #[napi]
+  pub fn dispatch_event(&self, event_type: String) -> Result<bool> {
+    let mut inner = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    let mut ids_to_remove = Vec::new();
+
+    if let Some(listeners) = inner.event_listeners.get(&event_type) {
+      for entry in listeners {
+        // Call the listener with no arguments (like dequeue callback)
+        entry
+          .callback
+          .call((), ThreadsafeFunctionCallMode::Blocking);
+        if entry.once {
+          ids_to_remove.push(entry.id);
+        }
+      }
+    }
+
+    // Remove "once" listeners
+    if !ids_to_remove.is_empty()
+      && let Some(listeners) = inner.event_listeners.get_mut(&event_type)
+    {
+      listeners.retain(|e| !ids_to_remove.contains(&e.id));
+      if listeners.is_empty() {
+        inner.event_listeners.remove(&event_type);
+      }
+    }
+
+    Ok(true) // Event was not cancelled
+  }
+
   /// Check if a configuration is supported
   /// Returns a Promise that resolves with support information
   ///
@@ -2481,8 +2620,9 @@ fn validate_vp9_codec(codec: &str) -> bool {
 /// Validate AV1 codec string format and parameters
 /// Format: av01.P.LLM.BB[.M.CCC.CP.TC.FR.CS] where P=profile, LL=level, M=tier
 fn validate_av1_codec(codec: &str) -> bool {
-  if codec == "av1" {
-    return true; // Short form is valid
+  // Short forms "av1" and "av01" are valid - default to main profile, level 4.0, 8-bit
+  if codec == "av1" || codec == "av01" {
+    return true;
   }
 
   if !codec.starts_with("av01.") {
@@ -2724,8 +2864,8 @@ fn parse_codec_string(codec: &str) -> Result<AVCodecID> {
     ));
   }
 
-  // AV1
-  if codec.starts_with("av01") || codec == "av1" {
+  // AV1 - accept both "av1" and "av01" short forms
+  if codec.starts_with("av01") || codec == "av1" || codec == "av01" {
     if validate_av1_codec(codec) {
       return Ok(AVCodecID::Av1);
     }

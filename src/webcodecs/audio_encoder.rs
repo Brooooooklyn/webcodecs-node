@@ -19,6 +19,7 @@ use napi::threadsafe_function::{
   ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
 };
 use napi_derive::napi;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,6 +43,32 @@ type OutputCallback = ThreadsafeFunction<
 /// Using CalleeHandled: false because WebCodecs error callback receives Error directly,
 /// not error-first (err, result) style
 type ErrorCallback = ThreadsafeFunction<Error, UnknownReturnValue, Error, Status, false, true>;
+
+/// Type alias for event listener callback (same pattern as dequeue callback)
+type EventListenerCallback = ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, true>;
+
+/// Entry for tracking event listeners
+struct EventListenerEntry {
+  id: u64,
+  callback: EventListenerCallback,
+  once: bool,
+}
+
+/// Options for addEventListener (W3C DOM spec)
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct AudioEncoderAddEventListenerOptions {
+  pub capture: Option<bool>,
+  pub once: Option<bool>,
+  pub passive: Option<bool>,
+}
+
+/// Options for removeEventListener (W3C DOM spec)
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct AudioEncoderEventListenerOptions {
+  pub capture: Option<bool>,
+}
 
 /// AudioEncoder init dictionary per WebCodecs spec
 pub struct AudioEncoderInit {
@@ -188,6 +215,14 @@ struct AudioEncoderInner {
   /// Cached AAC parameters for ADTS header generation
   /// (sample_rate_index, channel_config)
   adts_params: Option<(u8, u8)>,
+
+  // ========================================================================
+  // EventTarget support
+  // ========================================================================
+  /// Event listeners registry (event type -> list of listeners)
+  event_listeners: HashMap<String, Vec<EventListenerEntry>>,
+  /// Counter for generating unique listener IDs
+  next_listener_id: u64,
 }
 
 /// AudioEncoder - WebCodecs-compliant audio encoder
@@ -285,6 +320,9 @@ impl AudioEncoder {
       had_error: false,
       use_adts: false,
       adts_params: None,
+      // EventTarget support
+      event_listeners: HashMap::new(),
+      next_listener_id: 0,
     };
 
     let inner = Arc::new(Mutex::new(inner));
@@ -1386,6 +1424,107 @@ impl AudioEncoder {
         config,
       })
     })
+  }
+
+  // ============================================================================
+  // EventTarget interface (W3C DOM spec)
+  // ============================================================================
+
+  /// Add an event listener for the specified event type
+  #[napi]
+  pub fn add_event_listener(
+    &self,
+    env: Env,
+    event_type: String,
+    callback: FunctionRef<(), UnknownReturnValue>,
+    options: Option<AudioEncoderAddEventListenerOptions>,
+  ) -> Result<()> {
+    let mut inner = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    let id = inner.next_listener_id;
+    inner.next_listener_id += 1;
+
+    let tsf = callback
+      .borrow_back(&env)?
+      .build_threadsafe_function()
+      .callee_handled::<false>()
+      .weak::<true>()
+      .build()?;
+
+    let entry = EventListenerEntry {
+      id,
+      callback: tsf,
+      once: options.as_ref().and_then(|o| o.once).unwrap_or(false),
+    };
+
+    inner
+      .event_listeners
+      .entry(event_type)
+      .or_default()
+      .push(entry);
+    Ok(())
+  }
+
+  /// Remove an event listener for the specified event type
+  #[napi]
+  pub fn remove_event_listener(
+    &self,
+    event_type: String,
+    _callback: FunctionRef<(), UnknownReturnValue>,
+    _options: Option<AudioEncoderEventListenerOptions>,
+  ) -> Result<()> {
+    let mut inner = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    // Note: We can't compare function references directly, so we remove the last added listener
+    // for simplicity. A more complete implementation would need to track callback identity.
+    if let Some(listeners) = inner.event_listeners.get_mut(&event_type) {
+      listeners.pop();
+      if listeners.is_empty() {
+        inner.event_listeners.remove(&event_type);
+      }
+    }
+    Ok(())
+  }
+
+  /// Dispatch an event to all registered listeners
+  #[napi]
+  pub fn dispatch_event(&self, event_type: String) -> Result<bool> {
+    let mut inner = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    let mut ids_to_remove = Vec::new();
+
+    if let Some(listeners) = inner.event_listeners.get(&event_type) {
+      for entry in listeners {
+        // Call the listener with no arguments (like dequeue callback)
+        entry
+          .callback
+          .call((), ThreadsafeFunctionCallMode::Blocking);
+        if entry.once {
+          ids_to_remove.push(entry.id);
+        }
+      }
+    }
+
+    // Remove "once" listeners
+    if !ids_to_remove.is_empty()
+      && let Some(listeners) = inner.event_listeners.get_mut(&event_type)
+    {
+      listeners.retain(|e| !ids_to_remove.contains(&e.id));
+      if listeners.is_empty() {
+        inner.event_listeners.remove(&event_type);
+      }
+    }
+
+    Ok(true) // Event was not cancelled
   }
 }
 

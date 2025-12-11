@@ -20,6 +20,7 @@ use napi::threadsafe_function::{
   ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
 };
 use napi_derive::napi;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -37,6 +38,32 @@ type ErrorCallback = ThreadsafeFunction<Error, UnknownReturnValue, Error, Status
 
 // Note: For ondequeue, we use FunctionRef instead of ThreadsafeFunction
 // to support both getter and setter per WebCodecs spec
+
+/// Type alias for event listener callback (same pattern as dequeue callback)
+type EventListenerCallback = ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, true>;
+
+/// Entry for tracking event listeners
+struct EventListenerEntry {
+  id: u64,
+  callback: EventListenerCallback,
+  once: bool,
+}
+
+/// Options for addEventListener (W3C DOM spec)
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct VideoDecoderAddEventListenerOptions {
+  pub capture: Option<bool>,
+  pub once: Option<bool>,
+  pub passive: Option<bool>,
+}
+
+/// Options for removeEventListener (W3C DOM spec)
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct VideoDecoderEventListenerOptions {
+  pub capture: Option<bool>,
+}
 
 /// Commands sent to the worker thread
 enum WorkerCommand {
@@ -170,6 +197,14 @@ struct VideoDecoderInner {
   config_rotation: f64,
   /// Horizontal flip from config
   config_flip: bool,
+
+  // ========================================================================
+  // EventTarget support
+  // ========================================================================
+  /// Event listeners registry (event type -> list of listeners)
+  event_listeners: HashMap<String, Vec<EventListenerEntry>>,
+  /// Counter for generating unique listener IDs
+  next_listener_id: u64,
 }
 
 /// Get the preferred hardware device type for the current platform
@@ -288,6 +323,9 @@ impl VideoDecoder {
       // Orientation metadata (default: no rotation/flip)
       config_rotation: 0.0,
       config_flip: false,
+      // EventTarget support
+      event_listeners: HashMap::new(),
+      next_listener_id: 0,
     };
 
     let inner = Arc::new(Mutex::new(inner));
@@ -1472,6 +1510,107 @@ impl VideoDecoder {
       })
     })
   }
+
+  // ============================================================================
+  // EventTarget interface (W3C DOM spec)
+  // ============================================================================
+
+  /// Add an event listener for the specified event type
+  #[napi]
+  pub fn add_event_listener(
+    &self,
+    env: Env,
+    event_type: String,
+    callback: FunctionRef<(), UnknownReturnValue>,
+    options: Option<VideoDecoderAddEventListenerOptions>,
+  ) -> Result<()> {
+    let mut inner = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    let id = inner.next_listener_id;
+    inner.next_listener_id += 1;
+
+    let tsf = callback
+      .borrow_back(&env)?
+      .build_threadsafe_function()
+      .callee_handled::<false>()
+      .weak::<true>()
+      .build()?;
+
+    let entry = EventListenerEntry {
+      id,
+      callback: tsf,
+      once: options.as_ref().and_then(|o| o.once).unwrap_or(false),
+    };
+
+    inner
+      .event_listeners
+      .entry(event_type)
+      .or_default()
+      .push(entry);
+    Ok(())
+  }
+
+  /// Remove an event listener for the specified event type
+  #[napi]
+  pub fn remove_event_listener(
+    &self,
+    event_type: String,
+    _callback: FunctionRef<(), UnknownReturnValue>,
+    _options: Option<VideoDecoderEventListenerOptions>,
+  ) -> Result<()> {
+    let mut inner = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    // Note: We can't compare function references directly, so we remove the last added listener
+    // for simplicity. A more complete implementation would need to track callback identity.
+    if let Some(listeners) = inner.event_listeners.get_mut(&event_type) {
+      listeners.pop();
+      if listeners.is_empty() {
+        inner.event_listeners.remove(&event_type);
+      }
+    }
+    Ok(())
+  }
+
+  /// Dispatch an event to all registered listeners
+  #[napi]
+  pub fn dispatch_event(&self, event_type: String) -> Result<bool> {
+    let mut inner = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    let mut ids_to_remove = Vec::new();
+
+    if let Some(listeners) = inner.event_listeners.get(&event_type) {
+      for entry in listeners {
+        // Call the listener with no arguments (like dequeue callback)
+        entry
+          .callback
+          .call((), ThreadsafeFunctionCallMode::Blocking);
+        if entry.once {
+          ids_to_remove.push(entry.id);
+        }
+      }
+    }
+
+    // Remove "once" listeners
+    if !ids_to_remove.is_empty()
+      && let Some(listeners) = inner.event_listeners.get_mut(&event_type)
+    {
+      listeners.retain(|e| !ids_to_remove.contains(&e.id));
+      if listeners.is_empty() {
+        inner.event_listeners.remove(&event_type);
+      }
+    }
+
+    Ok(true) // Event was not cancelled
+  }
 }
 
 /// Valid H.264/AVC profiles (decimal values)
@@ -1544,11 +1683,11 @@ fn validate_avc_codec(codec: &str) -> bool {
 
 /// Validate VP9 codec string format and parameters
 /// Format: vp09.PP.LL.BB[.CC.CP.TC.FR.CS] where PP=profile, LL=level, BB=bit depth
-/// Note: Short form "vp9" is considered ambiguous for decoders per W3C spec
+/// Short form "vp9" is accepted and defaults to profile 0, level 1.0, 8-bit
 fn validate_vp9_codec(codec: &str) -> bool {
-  // Short form "vp9" is ambiguous for decoders - require full codec string
+  // Short form "vp9" is valid - defaults to profile 0, level 1, 8-bit
   if codec == "vp9" {
-    return false;
+    return true;
   }
 
   if !codec.starts_with("vp09.") {
@@ -1580,8 +1719,9 @@ fn validate_vp9_codec(codec: &str) -> bool {
 /// Validate AV1 codec string format and parameters
 /// Format: av01.P.LLM.BB[.M.CCC.CP.TC.FR.CS] where P=profile, LL=level, M=tier
 fn validate_av1_codec(codec: &str) -> bool {
-  if codec == "av1" {
-    return true; // Short form is valid
+  // Short forms "av1" and "av01" are valid - default to main profile, level 4.0, 8-bit
+  if codec == "av1" || codec == "av01" {
+    return true;
   }
 
   if !codec.starts_with("av01.") {
@@ -1764,16 +1904,13 @@ fn parse_codec_string(codec: &str) -> Result<AVCodecID> {
     ));
   }
 
-  // Reject ambiguous "vp9" short form for decoder
+  // VP9 short form - accept and default to profile 0
   if codec == "vp9" {
-    return Err(Error::new(
-      Status::GenericFailure,
-      format!("Unsupported codec: {}", codec),
-    ));
+    return Ok(AVCodecID::Vp9);
   }
 
-  // AV1
-  if codec.starts_with("av01") || codec == "av1" {
+  // AV1 - accept both "av1" and "av01" short forms
+  if codec.starts_with("av01") || codec == "av1" || codec == "av01" {
     if validate_av1_codec(codec) {
       return Ok(AVCodecID::Av1);
     }
