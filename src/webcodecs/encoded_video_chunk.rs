@@ -875,8 +875,13 @@ pub fn convert_avcc_extradata_to_annexb(data: &[u8]) -> Option<Vec<u8>> {
     return None;
   }
 
-  // Skip: version (1), profile (1), compat (1), level (1), lengthSizeMinusOne (1) = 5 bytes
-  let _length_size_minus_one = (data[4] & 0x03) + 1; // Usually 4
+  // AVCC header layout (first 6 bytes):
+  // byte 0: version (1)
+  // byte 1: profile
+  // byte 2: compatibility
+  // byte 3: level
+  // byte 4: lengthSizeMinusOne (lower 2 bits) - NAL unit length prefix size, usually 4
+  // byte 5: numSPS (lower 5 bits)
 
   // Number of SPS (bits 0-4 of byte 5)
   let num_sps = data[5] & 0x1F;

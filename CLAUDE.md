@@ -22,7 +22,7 @@ WebCodecs API implementation for Node.js using FFmpeg, built with napi-rs (Rust 
 | Threading           | ✅ Complete | Non-blocking Drop, proper lifecycle |
 | W3C Spec Compliance | ✅ Complete | All APIs aligned                    |
 | Type Definitions    | ✅ Complete | ~1,100 lines in index.d.ts          |
-| Test Coverage       | ✅ Complete | 841 tests (34 files), all passing   |
+| Test Coverage       | ✅ Complete | 866 tests (34 files), all passing   |
 | Hardware Encoding   | ✅ Complete | Zero-copy GPU path, auto-tuning     |
 
 **Remaining Work:** None - All core features complete.
@@ -120,7 +120,7 @@ Detection order:
 
 - **VideoFrame**: All pixel formats (I420, I420A, I422, I444, NV12, NV21, RGBA, RGBX, BGRA, BGRX)
 - **EncodedVideoChunk**: Key/Delta types with copyTo()
-- **VideoEncoder**: Callback-based API, bitrateMode, latencyMode, scalabilityMode
+- **VideoEncoder**: Callback-based API, bitrateMode, latencyMode, scalabilityMode, keyFrame forcing
 - **VideoDecoder**: Full implementation with callback API
 - **VideoColorSpace**: Class with constructor and toJSON()
 - **DOMRectReadOnly**: For codedRect/visibleRect properties
@@ -304,7 +304,7 @@ gifDecoder.close()
 ## Test Structure
 
 - **34 test files** (~15,000+ lines)
-- **841 tests** all passing
+- **866 tests** all passing
 - Test helpers in `__test__/helpers/` for frame/audio generation
 - Integration tests for roundtrip, lifecycle, multi-codec, performance
 - W3C WPT tests in `__test__/wpt/` for spec compliance verification
@@ -507,3 +507,4 @@ These are fundamental limitations that cannot be resolved without upstream NAPI-
 | ImageTrack.selected          | writable property       | ✅ Getter/setter          |
 | SvcOutputMetadata            | temporalLayerId         | ✅ L1Tx modes             |
 | DOMException errors          | instanceof DOMException | ✅ Native DOMException    |
+| VideoEncoder.encode options  | keyFrame forcing        | ✅ Forces I-frame         |

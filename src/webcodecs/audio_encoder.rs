@@ -1341,18 +1341,18 @@ impl AudioEncoder {
     };
 
     // Validate sample rate - must be present and greater than 0
-    let _sample_rate = match config.sample_rate {
-      Some(sr) if sr > 0.0 => sr,
+    match config.sample_rate {
+      Some(sr) if sr > 0.0 => {}
       Some(_) => return reject_with_type_error(env, "sampleRate must be greater than 0"),
       None => return reject_with_type_error(env, "sampleRate is required"),
-    };
+    }
 
     // Validate number of channels - must be present and greater than 0
-    let _number_of_channels = match config.number_of_channels {
-      Some(nc) if nc > 0 => nc,
+    match config.number_of_channels {
+      Some(nc) if nc > 0 => {}
       Some(_) => return reject_with_type_error(env, "numberOfChannels must be greater than 0"),
       None => return reject_with_type_error(env, "numberOfChannels is required"),
-    };
+    }
 
     // Validate bitrate if specified
     if let Some(bitrate) = config.bitrate

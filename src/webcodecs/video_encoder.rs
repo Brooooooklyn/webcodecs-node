@@ -7,7 +7,7 @@ use crate::codec::{
   BitrateMode as CodecBitrateMode, CodecContext, EncoderConfig, EncoderCreationResult, Frame,
   HwDeviceContext, HwFrameConfig, HwFrameContext, Scaler,
 };
-use crate::ffi::{AVCodecID, AVHWDeviceType, AVPixelFormat};
+use crate::ffi::{AVCodecID, AVHWDeviceType, AVPictureType, AVPixelFormat};
 use crate::webcodecs::error::DOMExceptionName;
 use crate::webcodecs::error::{throw_invalid_state_error, throw_type_error_unit};
 use crate::webcodecs::hw_fallback::{
@@ -533,7 +533,7 @@ impl VideoEncoder {
     inner: &Arc<Mutex<VideoEncoderInner>>,
     frame: Frame,
     timestamp: i64,
-    _options: Option<VideoEncoderEncodeOptions>,
+    options: Option<VideoEncoderEncodeOptions>,
     rotation: f64,
     flip: bool,
   ) {
@@ -624,6 +624,11 @@ impl VideoEncoder {
     // Set frame PTS
     frame_to_encode.set_pts(timestamp);
 
+    // Force keyframe if requested via encode options (W3C WebCodecs spec)
+    if options.as_ref().is_some_and(|o| o.key_frame == Some(true)) {
+      frame_to_encode.set_pict_type(AVPictureType::I);
+    }
+
     // Upload frame to GPU if hardware frame context is available
     // This provides zero-copy encoding for hardware encoders
     if guard.use_hw_frames && guard.hw_frame_ctx.is_some() {
@@ -664,7 +669,7 @@ impl VideoEncoder {
           if let Ok(cloned) = frame_to_encode.try_clone() {
             guard
               .pending_frames
-              .push((cloned, timestamp, _options.clone(), rotation, flip));
+              .push((cloned, timestamp, options.clone(), rotation, flip));
           }
           let pending_frames = std::mem::take(&mut guard.pending_frames);
 
@@ -800,7 +805,7 @@ impl VideoEncoder {
       if let Ok(cloned_frame) = frame_to_encode.try_clone() {
         guard
           .pending_frames
-          .push((cloned_frame, timestamp, _options.clone(), rotation, flip));
+          .push((cloned_frame, timestamp, options.clone(), rotation, flip));
       }
       guard.silent_encode_count += 1;
 

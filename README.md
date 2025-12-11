@@ -59,6 +59,16 @@ const frame = new VideoFrame(frameData, {
 encoder.encode(frame)
 frame.close()
 
+// Force a keyframe for seeking/streaming
+const frame2 = new VideoFrame(frameData, {
+  format: 'RGBA',
+  codedWidth: 1920,
+  codedHeight: 1080,
+  timestamp: 33333, // 30fps
+})
+encoder.encode(frame2, { keyFrame: true }) // Force I-frame
+frame2.close()
+
 await encoder.flush()
 encoder.close()
 ```

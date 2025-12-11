@@ -36,6 +36,7 @@ use crate::ffi::{
     ffframe_set_format,
     ffframe_set_height,
     ffframe_set_nb_samples,
+    ffframe_set_pict_type,
     ffframe_set_pts,
     ffframe_set_sample_rate,
     ffframe_set_width,
@@ -241,6 +242,21 @@ impl Frame {
       3 => AVPictureType::B,
       _ => AVPictureType::None,
     }
+  }
+
+  /// Set picture type (I, P, B, etc.) - used to force keyframes
+  pub fn set_pict_type(&mut self, pict_type: AVPictureType) {
+    let t = match pict_type {
+      AVPictureType::None => 0,
+      AVPictureType::I => 1,
+      AVPictureType::P => 2,
+      AVPictureType::B => 3,
+      AVPictureType::S => 4,
+      AVPictureType::Si => 5,
+      AVPictureType::Sp => 6,
+      AVPictureType::Bi => 7,
+    };
+    unsafe { ffframe_set_pict_type(self.as_mut_ptr(), t) }
   }
 
   // ========================================================================
