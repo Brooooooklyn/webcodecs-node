@@ -19,10 +19,10 @@
 
 import test from 'ava'
 
-import { EncodedVideoChunk, resetHardwareFallbackState, VideoDecoder, VideoEncoder, VideoFrame } from '../../index.js'
-import type { EncodedVideoChunkMetadata, VideoDecoderConfig, VideoEncoderConfig } from '../../standard.js'
+import { EncodedVideoChunk, resetHardwareFallbackState, VideoEncoder } from '../../index.js'
+import type { EncodedVideoChunkMetadata, VideoEncoderConfig } from '../../standard.js'
 
-import { checkEncoderSupport, createDottedFrame, validateBlackDots } from '../helpers/wpt-frame-utils.js'
+import { checkEncoderSupport, createDottedFrame } from '../helpers/wpt-frame-utils.js'
 
 // Reset hardware fallback state before each test
 test.beforeEach(() => {
@@ -75,10 +75,8 @@ async function svcTest(
   await checkEncoderSupport(t, encoderConfig)
 
   const framesToEncode = 24
-  let framesDecoded = 0
   let framesEncoded = 0
   const chunks: EncodedVideoChunk[] = []
-  const corruptedFrames: number[] = []
 
   // Encoder init (matches WPT encoder_init)
   const encoder = new VideoEncoder({
@@ -112,61 +110,7 @@ async function svcTest(
   }
 
   await encoder.flush()
-
-  // Decoder to validate base layer (matches WPT decoder setup)
-  const decoder = new VideoDecoder({
-    output: async (frame: VideoFrame) => {
-      framesDecoded++
-
-      // Check that we have intended number of dots and no more.
-      // Completely black frame shouldn't pass the test.
-      // WPT: if(!validateBlackDots(frame, frame.timestamp) ||
-      //         validateBlackDots(frame, frame.timestamp + 1)) {
-      //        corrupted_frames.push(frame.timestamp)
-      //      }
-      const isValid = await validateBlackDots(frame, frame.timestamp)
-      const hasExtraDots = await validateBlackDots(frame, frame.timestamp + 1)
-
-      if (!isValid || hasExtraDots) {
-        corruptedFrames.push(frame.timestamp)
-      }
-
-      frame.close()
-    },
-    error: (e: Error) => {
-      // IMPLEMENTATION LIMITATION:
-      // Unlike real SVC encoding, our base layer frames are not independently
-      // decodable because FFmpeg isn't configured for actual SVC. We expect
-      // decoder errors when trying to decode only base layer frames.
-      t.log(`Decoder error (expected - base layer not independently decodable): ${e.message}`)
-    },
-  })
-
-  const decoderConfig: VideoDecoderConfig = {
-    codec: encoderConfig.codec,
-    hardwareAcceleration: encoderConfig.hardwareAcceleration,
-    codedWidth: w,
-    codedHeight: h,
-  }
-  decoder.configure(decoderConfig)
-
-  // Decode base layer chunks (matches WPT loop)
-  for (const chunk of chunks) {
-    decoder.decode(chunk)
-  }
-
-  // Try to flush, but may fail due to missing dependency frames
-  try {
-    await decoder.flush()
-  } catch {
-    t.log('Decoder flush failed (expected - base layer not independently decodable)')
-  }
-
   encoder.close()
-  // Decoder may already be closed if error callback fired
-  if (decoder.state !== 'closed') {
-    decoder.close()
-  }
 
   // WPT: assert_equals(frames_encoded, frames_to_encode);
   t.is(framesEncoded, framesToEncode, 'all frames should be encoded')
@@ -177,17 +121,14 @@ async function svcTest(
   t.is(chunks.length, baseLayerFrames, 'base layer chunk count')
 
   // SKIPPED - IMPLEMENTATION LIMITATION:
-  // The following assertions from the original WPT are skipped because our
-  // implementation only computes temporal layer metadata. FFmpeg is not
-  // configured for actual SVC encoding, so base layer frames cannot be
-  // decoded independently.
+  // Decoder validation from original WPT is skipped because our implementation
+  // only computes temporal layer metadata. FFmpeg is not configured for actual
+  // SVC encoding, so base layer frames cannot be decoded independently.
   //
-  // WPT: assert_equals(frames_decoded, base_layer_frames);
-  // WPT: assert_equals(corrupted_frames.length, 0, `corrupted_frames: ${corrupted_frames}`);
-  //
-  // t.is(framesDecoded, baseLayerFrames, 'decoded frame count')
-  // t.is(corruptedFrames.length, 0, `no corrupted frames: ${corruptedFrames}`)
-
+  // Original WPT assertions (skipped):
+  // - Decoder validates base layer frames are independently decodable
+  // - assert_equals(frames_decoded, base_layer_frames)
+  // - assert_equals(corrupted_frames.length, 0)
   t.log(`SKIPPED: Decoder validation - base layer frames not independently decodable`)
   t.log(`(FFmpeg SVC encoding not configured, only metadata computed)`)
 }
