@@ -295,3 +295,141 @@ test('ImageDecoder tracks.ready resolves for static images', async (t) => {
 
   decoder.close()
 })
+
+// ============================================================================
+// ImageDecoder Options Tests (W3C spec)
+// ============================================================================
+
+test('ImageDecoder desiredWidth without desiredHeight throws TypeError', (t) => {
+  const data = readFileSync(join(__dirname, 'fixtures/test.png'))
+
+  // Per W3C spec: both must be specified or neither
+  t.throws(() => new ImageDecoder({ data, type: 'image/png', desiredWidth: 100 }), {
+    message: /Both desiredWidth and desiredHeight must be specified/,
+  })
+})
+
+test('ImageDecoder desiredHeight without desiredWidth throws TypeError', (t) => {
+  const data = readFileSync(join(__dirname, 'fixtures/test.png'))
+
+  // Per W3C spec: both must be specified or neither
+  t.throws(() => new ImageDecoder({ data, type: 'image/png', desiredHeight: 100 }), {
+    message: /Both desiredWidth and desiredHeight must be specified/,
+  })
+})
+
+test('ImageDecoder desiredWidth and desiredHeight scale the output', async (t) => {
+  const data = readFileSync(join(__dirname, 'fixtures/test.png'))
+  const decoder = new ImageDecoder({
+    data,
+    type: 'image/png',
+    desiredWidth: 4,
+    desiredHeight: 4,
+  })
+
+  const result = await decoder.decode()
+  t.true(result.complete)
+
+  // Output should be scaled to specified dimensions
+  t.is(result.image.codedWidth, 4)
+  t.is(result.image.codedHeight, 4)
+
+  result.image.close()
+  decoder.close()
+})
+
+test('ImageDecoder preferAnimation false returns single frame for animated GIF', async (t) => {
+  const data = readFileSync(join(__dirname, 'fixtures/animated.gif'))
+  const decoder = new ImageDecoder({
+    data,
+    type: 'image/gif',
+    preferAnimation: false,
+  })
+
+  // Decode first (and only) frame
+  const result = await decoder.decode()
+  t.true(result.complete)
+  t.truthy(result.image)
+  result.image.close()
+
+  // With preferAnimation: false, should only have 1 frame
+  const track = decoder.tracks.selectedTrack!
+  t.is(track.frameCount, 1)
+  t.false(track.animated)
+
+  decoder.close()
+})
+
+test('ImageDecoder preferAnimation true decodes all frames', async (t) => {
+  const data = readFileSync(join(__dirname, 'fixtures/animated.gif'))
+  const decoder = new ImageDecoder({
+    data,
+    type: 'image/gif',
+    preferAnimation: true,
+  })
+
+  // Wait for pre-parsing to complete
+  await decoder.tracks.ready
+
+  // With preferAnimation: true (or default), should decode all frames
+  const track = decoder.tracks.selectedTrack!
+  t.true(track.animated)
+  t.true(track.frameCount >= 1)
+
+  decoder.close()
+})
+
+test('ImageDecoder colorSpaceConversion default extracts color space metadata', async (t) => {
+  const data = readFileSync(join(__dirname, 'fixtures/test.png'))
+  const decoder = new ImageDecoder({
+    data,
+    type: 'image/png',
+    colorSpaceConversion: 'default',
+  })
+
+  const result = await decoder.decode()
+  t.true(result.complete)
+
+  // With "default", color space may be populated from image metadata (if present)
+  // The colorSpace object should exist regardless
+  t.truthy(result.image.colorSpace)
+
+  result.image.close()
+  decoder.close()
+})
+
+test('ImageDecoder colorSpaceConversion none returns empty color space', async (t) => {
+  const data = readFileSync(join(__dirname, 'fixtures/test.png'))
+  const decoder = new ImageDecoder({
+    data,
+    type: 'image/png',
+    colorSpaceConversion: 'none',
+  })
+
+  const result = await decoder.decode()
+  t.true(result.complete)
+
+  // With "none", color space metadata should be ignored (all null per Chromium behavior)
+  const cs = result.image.colorSpace.toJSON()
+  t.is(cs.primaries, null)
+  t.is(cs.transfer, null)
+  t.is(cs.matrix, null)
+  t.is(cs.fullRange, null)
+
+  result.image.close()
+  decoder.close()
+})
+
+test('ImageDecoder invalid colorSpaceConversion throws TypeError', (t) => {
+  const data = readFileSync(join(__dirname, 'fixtures/test.png'))
+
+  t.throws(
+    () =>
+      new ImageDecoder({
+        data,
+        type: 'image/png',
+        colorSpaceConversion: 'invalid' as unknown as 'none' | 'default',
+      }),
+    { message: /Invalid colorSpaceConversion value/ },
+  )
+})

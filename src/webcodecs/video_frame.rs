@@ -4,7 +4,9 @@
 //! See: https://developer.mozilla.org/en-US/docs/Web/API/VideoFrame
 
 use crate::codec::Frame;
-use crate::ffi::AVPixelFormat;
+use crate::ffi::{
+  AVColorPrimaries, AVColorRange, AVColorSpace, AVColorTransferCharacteristic, AVPixelFormat,
+};
 use crate::webcodecs::error::invalid_state_error;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -433,6 +435,21 @@ impl VideoColorSpace {
     }
   }
 
+  /// Create VideoColorSpace from individual components (internal use)
+  pub fn from_components(
+    primaries: Option<VideoColorPrimaries>,
+    transfer: Option<VideoTransferCharacteristics>,
+    matrix: Option<VideoMatrixCoefficients>,
+    full_range: Option<bool>,
+  ) -> Self {
+    Self {
+      primaries,
+      transfer,
+      matrix,
+      full_range,
+    }
+  }
+
   /// Get color primaries
   #[napi(getter)]
   pub fn primaries(&self) -> Option<VideoColorPrimaries> {
@@ -522,6 +539,47 @@ impl VideoColorSpace {
 
     Ok(obj)
   }
+}
+
+/// Extract color space metadata from an FFmpeg Frame
+///
+/// Converts FFmpeg color metadata (primaries, transfer, colorspace, range)
+/// to WebCodecs VideoColorSpace. Used for colorSpaceConversion: "default".
+pub fn color_space_from_frame(frame: &Frame) -> VideoColorSpace {
+  let primaries = match frame.color_primaries() {
+    AVColorPrimaries::Bt709 => Some(VideoColorPrimaries::Bt709),
+    AVColorPrimaries::Bt470bg => Some(VideoColorPrimaries::Bt470bg),
+    AVColorPrimaries::Smpte170m => Some(VideoColorPrimaries::Smpte170m),
+    AVColorPrimaries::Bt2020 => Some(VideoColorPrimaries::Bt2020),
+    AVColorPrimaries::Smpte432 => Some(VideoColorPrimaries::Smpte432),
+    _ => None, // Unspecified or unsupported
+  };
+
+  let transfer = match frame.color_trc() {
+    AVColorTransferCharacteristic::Bt709 => Some(VideoTransferCharacteristics::Bt709),
+    AVColorTransferCharacteristic::Smpte170m => Some(VideoTransferCharacteristics::Smpte170m),
+    AVColorTransferCharacteristic::Iec61966_2_1 => Some(VideoTransferCharacteristics::Iec6196621),
+    AVColorTransferCharacteristic::Smpte2084 => Some(VideoTransferCharacteristics::Pq),
+    AVColorTransferCharacteristic::AribStdB67 => Some(VideoTransferCharacteristics::Hlg),
+    _ => None, // Unspecified or unsupported
+  };
+
+  let matrix = match frame.colorspace() {
+    AVColorSpace::Rgb => Some(VideoMatrixCoefficients::Rgb),
+    AVColorSpace::Bt709 => Some(VideoMatrixCoefficients::Bt709),
+    AVColorSpace::Bt470bg => Some(VideoMatrixCoefficients::Bt470bg),
+    AVColorSpace::Smpte170m => Some(VideoMatrixCoefficients::Smpte170m),
+    AVColorSpace::Bt2020Ncl => Some(VideoMatrixCoefficients::Bt2020Ncl),
+    _ => None, // Unspecified or unsupported
+  };
+
+  let full_range = match frame.color_range() {
+    AVColorRange::Jpeg => Some(true),  // Full range (0-255)
+    AVColorRange::Mpeg => Some(false), // Limited range (16-235)
+    _ => None,                         // Unspecified
+  };
+
+  VideoColorSpace::from_components(primaries, transfer, matrix, full_range)
 }
 
 /// DOMRectReadOnly - W3C WebCodecs spec compliant rect class
@@ -1079,6 +1137,46 @@ impl VideoFrame {
       rotation: parsed_rotation,
       flip,
       color_space: VideoColorSpace::default(),
+      closed: false,
+    };
+
+    Self {
+      inner: Arc::new(Mutex::new(Some(inner))),
+    }
+  }
+
+  /// Create a VideoFrame from an internal Frame with color space control (for ImageDecoder)
+  ///
+  /// When `extract_color_space` is true, color space metadata is extracted from the FFmpeg
+  /// frame and populated in the VideoFrame (colorSpaceConversion: "default").
+  /// When false, the VideoFrame has an empty color space (colorSpaceConversion: "none").
+  pub fn from_internal_with_color_space(
+    frame: Frame,
+    timestamp_us: i64,
+    duration_us: Option<i64>,
+    extract_color_space: bool,
+  ) -> Self {
+    let width = frame.width();
+    let height = frame.height();
+    let original_format =
+      VideoPixelFormat::from_av_format(frame.format()).unwrap_or(VideoPixelFormat::I420);
+
+    let color_space = if extract_color_space {
+      color_space_from_frame(&frame)
+    } else {
+      VideoColorSpace::default()
+    };
+
+    let inner = VideoFrameInner {
+      frame,
+      original_format,
+      timestamp_us,
+      duration_us,
+      display_width: width,
+      display_height: height,
+      rotation: 0.0,
+      flip: false,
+      color_space,
       closed: false,
     };
 

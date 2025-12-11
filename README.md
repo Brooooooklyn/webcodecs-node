@@ -256,10 +256,21 @@ The encoder automatically applies optimal settings for each hardware encoder bas
 
 ### Not Implemented
 
-| Feature               | Status | Notes                                                                |
-| --------------------- | ------ | -------------------------------------------------------------------- |
-| Temporal SVC metadata | ❌     | `scalabilityMode` parsed but `metadata.svc` not populated            |
-| ImageDecoder options  | ⚠️     | `colorSpaceConversion`, `desiredWidth/Height` parsed but not applied |
+| Feature               | Status | Notes                                                     |
+| --------------------- | ------ | --------------------------------------------------------- |
+| Temporal SVC metadata | ❌     | `scalabilityMode` parsed but `metadata.svc` not populated |
+
+### ImageDecoder Options
+
+ImageDecoder supports all W3C spec options:
+
+| Option                 | Status | Notes                                                                             |
+| ---------------------- | ------ | --------------------------------------------------------------------------------- |
+| `desiredWidth/Height`  | ✅     | Scales decoded frames to specified dimensions                                     |
+| `preferAnimation`      | ✅     | When `false`, only decodes first frame for animated formats                       |
+| `colorSpaceConversion` | ✅     | `"default"` extracts color space metadata, `"none"` ignores it (Chromium-aligned) |
+
+**Note:** Per W3C spec, `desiredWidth` and `desiredHeight` must both be specified or both omitted.
 
 ### Platform-Specific Notes
 

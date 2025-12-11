@@ -3,7 +3,7 @@
 //! Provides image decoding functionality using FFmpeg.
 //! See: <https://developer.mozilla.org/en-US/docs/Web/API/ImageDecoder>
 
-use crate::codec::{CodecContext, DecoderConfig, Packet};
+use crate::codec::{CodecContext, DecoderConfig, Packet, ScaleAlgorithm, Scaler};
 use crate::ffi::AVCodecID;
 use crate::webcodecs::VideoFrame;
 use crate::webcodecs::error::invalid_state_error;
@@ -49,11 +49,11 @@ pub struct ImageDecoderInit<'env> {
   pub data: Unknown<'env>,
   /// MIME type of the image (e.g., "image/png", "image/jpeg")
   pub mime_type: String,
-  /// Color space conversion hint (optional)
-  pub color_space_conversion: Option<String>,
-  /// Desired width (optional, for scaling)
+  /// Color space conversion mode (default: "default")
+  pub color_space_conversion: ColorSpaceConversion,
+  /// Desired width (optional, for scaling) - must be paired with desired_height
   pub desired_width: Option<u32>,
-  /// Desired height (optional, for scaling)
+  /// Desired height (optional, for scaling) - must be paired with desired_width
   pub desired_height: Option<u32>,
   /// Whether to prefer animation (for animated formats)
   pub prefer_animation: Option<bool>,
@@ -80,10 +80,43 @@ impl<'env> FromNapiValue for ImageDecoderInit<'env> {
     };
 
     // Get optional properties
-    let color_space_conversion: Option<String> = obj.get("colorSpaceConversion").ok().flatten();
+    let color_space_conversion_str: Option<String> = obj.get("colorSpaceConversion").ok().flatten();
+    let color_space_conversion = match color_space_conversion_str.as_deref() {
+      Some("none") => ColorSpaceConversion::None,
+      Some("default") | None => ColorSpaceConversion::Default,
+      Some(invalid) => {
+        env_wrapper.throw_type_error(
+          &format!(
+            "Invalid colorSpaceConversion value '{}'. Expected 'none' or 'default'",
+            invalid
+          ),
+          None,
+        )?;
+        return Err(Error::new(
+          Status::InvalidArg,
+          format!(
+            "Invalid colorSpaceConversion value '{}'. Expected 'none' or 'default'",
+            invalid
+          ),
+        ));
+      }
+    };
+
     let desired_width: Option<u32> = obj.get("desiredWidth").ok().flatten();
     let desired_height: Option<u32> = obj.get("desiredHeight").ok().flatten();
     let prefer_animation: Option<bool> = obj.get("preferAnimation").ok().flatten();
+
+    // W3C spec validation: desiredWidth and desiredHeight must both exist or both be omitted
+    if desired_width.is_some() != desired_height.is_some() {
+      env_wrapper.throw_type_error(
+        "Both desiredWidth and desiredHeight must be specified, or neither",
+        None,
+      )?;
+      return Err(Error::new(
+        Status::InvalidArg,
+        "Both desiredWidth and desiredHeight must be specified, or neither",
+      ));
+    }
 
     // Get data - try Uint8Array first, then ReadableStream
     let data_napi_value: napi::sys::napi_value = {
@@ -363,6 +396,14 @@ struct ImageDecoderInner {
   closed: bool,
   /// Cached decoded frames (for animated images, populated on first decode)
   cached_frames: Option<Vec<crate::codec::Frame>>,
+  /// Color space conversion mode (W3C spec)
+  color_space_conversion: ColorSpaceConversion,
+  /// Desired width for scaling (W3C spec - must be paired with desired_height)
+  desired_width: Option<u32>,
+  /// Desired height for scaling (W3C spec - must be paired with desired_width)
+  desired_height: Option<u32>,
+  /// Whether to prefer animation for animated formats (W3C spec)
+  prefer_animation: Option<bool>,
 }
 
 /// ImageDecoder - WebCodecs-compliant image decoder
@@ -429,6 +470,10 @@ impl ImageDecoder {
       tracks: tracks.clone(),
       closed: false,
       cached_frames: None,
+      color_space_conversion: init.color_space_conversion,
+      desired_width: init.desired_width,
+      desired_height: init.desired_height,
+      prefer_animation: init.prefer_animation,
     }));
 
     if let Ok(buf) = unsafe { init.data.cast::<Uint8Array>() } {
@@ -678,7 +723,51 @@ impl ImageDecoder {
 
           // Decode all frames
           let context = inner.context.as_mut().unwrap();
-          let frames = decode_image_data(context, &data_bytes)?;
+          let mut frames = decode_image_data(context, &data_bytes)?;
+
+          // Apply preferAnimation: if false and format supports animation, only keep first frame
+          if inner.prefer_animation == Some(false) && !frames.is_empty() {
+            frames.truncate(1);
+            // Mark track as non-animated since user explicitly prefers static
+            if let Ok(mut track_inner) = inner.tracks.inner.lock()
+              && let Some(track) = track_inner.tracks.get_mut(0)
+            {
+              track.animated = false;
+            }
+          }
+
+          // Apply desiredWidth/desiredHeight scaling if both are specified
+          let frames = if let (Some(dw), Some(dh)) = (inner.desired_width, inner.desired_height) {
+            let mut scaled_frames = Vec::with_capacity(frames.len());
+            for frame in frames {
+              let scaler = Scaler::new(
+                frame.width(),
+                frame.height(),
+                frame.format(),
+                dw,
+                dh,
+                frame.format(),
+                ScaleAlgorithm::Lanczos,
+              )
+              .map_err(|e| {
+                Error::new(
+                  Status::GenericFailure,
+                  format!("Failed to create scaler: {}", e),
+                )
+              })?;
+
+              let scaled = scaler.scale_alloc(&frame).map_err(|e| {
+                Error::new(
+                  Status::GenericFailure,
+                  format!("Failed to scale frame: {}", e),
+                )
+              })?;
+              scaled_frames.push(scaled);
+            }
+            scaled_frames
+          } else {
+            frames
+          };
 
           // Update frame_count
           if !frames.is_empty()
@@ -727,7 +816,11 @@ impl ImageDecoder {
         })?;
 
         let pts = frame.pts();
-        let video_frame = VideoFrame::from_internal(frame, pts, None);
+
+        // Per Chromium behavior: "default" extracts color space, "none" ignores it
+        let extract_color_space = inner.color_space_conversion == ColorSpaceConversion::Default;
+        let video_frame =
+          VideoFrame::from_internal_with_color_space(frame, pts, None, extract_color_space);
 
         Ok(ImageDecodeResult {
           image: video_frame,
@@ -879,10 +972,62 @@ fn pre_parse_and_cache_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<(
   })?;
 
   // Decode all frames
-  let frames = decode_image_data(&mut context, &data_bytes).inspect_err(|_e| {
+  let mut frames = decode_image_data(&mut context, &data_bytes).inspect_err(|_e| {
     inner_guard.tracks.ready.store(true, Ordering::Release);
     inner_guard.tracks.ready_notify.notify_waiters();
   })?;
+
+  // Apply preferAnimation: if false and format supports animation, only keep first frame
+  let prefer_animation = inner_guard.prefer_animation;
+  if prefer_animation == Some(false) && !frames.is_empty() {
+    frames.truncate(1);
+    // Mark track as non-animated since user explicitly prefers static
+    if let Ok(mut track_inner) = inner_guard.tracks.inner.lock()
+      && let Some(track) = track_inner.tracks.get_mut(0)
+    {
+      track.animated = false;
+    }
+  }
+
+  // Apply desiredWidth/desiredHeight scaling if both are specified
+  let desired_width = inner_guard.desired_width;
+  let desired_height = inner_guard.desired_height;
+  let frames = if let (Some(dw), Some(dh)) = (desired_width, desired_height) {
+    let mut scaled_frames = Vec::with_capacity(frames.len());
+    for frame in frames {
+      // Create scaler for this frame's dimensions and format
+      let scaler = Scaler::new(
+        frame.width(),
+        frame.height(),
+        frame.format(),
+        dw,
+        dh,
+        frame.format(),
+        ScaleAlgorithm::Lanczos, // High quality for images
+      )
+      .map_err(|e| {
+        inner_guard.tracks.ready.store(true, Ordering::Release);
+        inner_guard.tracks.ready_notify.notify_waiters();
+        Error::new(
+          Status::GenericFailure,
+          format!("Failed to create scaler: {}", e),
+        )
+      })?;
+
+      let scaled = scaler.scale_alloc(&frame).map_err(|e| {
+        inner_guard.tracks.ready.store(true, Ordering::Release);
+        inner_guard.tracks.ready_notify.notify_waiters();
+        Error::new(
+          Status::GenericFailure,
+          format!("Failed to scale frame: {}", e),
+        )
+      })?;
+      scaled_frames.push(scaled);
+    }
+    scaled_frames
+  } else {
+    frames
+  };
 
   // Update frame_count in track info
   if !frames.is_empty()

@@ -431,8 +431,7 @@ src/codec/context.rs:339,362  # Set extradata if provided (non-critical)
 1. **VideoFrame.visibleRect cropping** - Parameter not implemented, returns error
 2. **Temporal SVC** - Parsing only, layer settings not applied to encoder
 3. **Duration type** - Using i64 instead of u64 due to NAPI-RS constraints
-4. **ImageDecoder parameters** - `colorSpaceConversion`, `desiredWidth/Height`, `preferAnimation` parsed but not applied
-5. **ImageDecoder GIF animation** - FFmpeg may return only first frame; for full animation use VideoDecoder with GIF codec
+4. **ImageDecoder GIF animation** - FFmpeg may return only first frame; for full animation use VideoDecoder with GIF codec
 
 ## NAPI-RS Limitations
 

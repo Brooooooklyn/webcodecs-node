@@ -19,7 +19,7 @@ pub use hwdevice::HwDeviceContext;
 pub use hwframes::{HwFrameConfig, HwFrameContext};
 pub use packet::Packet;
 pub use resampler::Resampler;
-pub use scaler::Scaler;
+pub use scaler::{ScaleAlgorithm, Scaler};
 
 use crate::ffi::{AVCodecID, AVPixelFormat, AVSampleFormat};
 
