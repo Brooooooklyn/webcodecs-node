@@ -96,7 +96,7 @@ async function runReconfigTest(t: test.ExecutionContext, codecKey: string): Prom
       try {
         processVideoChunk(chunk, metadata)
       } catch (e) {
-        t.fail(`Chunk processing error: ${e}`)
+        t.fail(`Chunk processing error: ${e instanceof Error ? e.message : String(e)}`)
       }
     },
     error: (e: Error) => {

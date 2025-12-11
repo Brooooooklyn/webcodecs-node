@@ -54,7 +54,7 @@
     "format:prettier": "prettier . -w",
     "format:toml": "taplo format",
     "format:rs": "cargo fmt",
-    "lint": "oxlint",
+    "lint": "oxlint --type-aware",
     "prepublishOnly": "napi prepublish -t npm",
     "test": "ava",
     "typecheck": "tsc --noEmit",
@@ -75,7 +75,9 @@
     "husky": "^9.1.7",
     "lint-staged": "^16.2.7",
     "npm-run-all2": "^8.0.4",
-    "oxlint": "^1.31.0",
+    "oxfmt": "^0.17.0",
+    "oxlint": "^1.32.0",
+    "oxlint-tsgolint": "^0.8.5",
     "prettier": "^3.7.4",
     "tinybench": "^6.0.0",
     "typescript": "^5.9.3"
@@ -115,5 +117,5 @@
     "singleQuote": true,
     "arrowParens": "always"
   },
-  "packageManager": "pnpm@10.24.0"
+  "packageManager": "pnpm@10.25.0"
 }

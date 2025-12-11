@@ -92,11 +92,11 @@ export function calculatePSNR(original: Uint8Array, decoded: Uint8Array): number
  * @param decoded - The frame after encode/decode roundtrip
  * @param threshold - PSNR threshold to consider acceptable (default: 30 dB)
  */
-export function compareFrames(
+export async function compareFrames(
   original: VideoFrame,
   decoded: VideoFrame,
   threshold: number = PSNRThresholds.acceptable,
-): FrameComparisonResult {
+): Promise<FrameComparisonResult> {
   // Verify dimensions match
   if (original.codedWidth !== decoded.codedWidth || original.codedHeight !== decoded.codedHeight) {
     throw new Error(
@@ -116,8 +116,8 @@ export function compareFrames(
   const originalData = new Uint8Array(originalSize)
   const decodedData = new Uint8Array(decodedSize)
 
-  original.copyTo(originalData)
-  decoded.copyTo(decodedData)
+  await original.copyTo(originalData)
+  await decoded.copyTo(decodedData)
 
   const mse = calculateMSE(originalData, decodedData)
   const psnr = mse === 0 ? Infinity : 10 * Math.log10((255 * 255) / mse)
@@ -164,11 +164,11 @@ export function compareBuffers(
  *
  * Luminance is typically more sensitive to quality issues than chroma.
  */
-export function compareI420LuminanceOnly(
+export async function compareI420LuminanceOnly(
   original: VideoFrame,
   decoded: VideoFrame,
   threshold: number = PSNRThresholds.acceptable,
-): FrameComparisonResult {
+): Promise<FrameComparisonResult> {
   const width = original.codedWidth
   const height = original.codedHeight
   const ySize = width * height
@@ -177,8 +177,8 @@ export function compareI420LuminanceOnly(
   const originalData = new Uint8Array(original.allocationSize())
   const decodedData = new Uint8Array(decoded.allocationSize())
 
-  original.copyTo(originalData)
-  decoded.copyTo(decodedData)
+  await original.copyTo(originalData)
+  await decoded.copyTo(decodedData)
 
   const originalY = originalData.subarray(0, ySize)
   const decodedY = decodedData.subarray(0, ySize)

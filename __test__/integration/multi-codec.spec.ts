@@ -336,7 +336,7 @@ test('codec: AV1 encode-decode roundtrip', async (t) => {
   } catch (e) {
     original.close()
     encoder.close()
-    t.log(`AV1 encode/decode failed: ${e}`)
+    t.log(`AV1 encode/decode failed: ${e instanceof Error ? e.message : String(e)}`)
     t.pass() // Skip on AV1 errors - not all builds have full AV1 support
   }
 })

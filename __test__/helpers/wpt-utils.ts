@@ -340,7 +340,7 @@ export function typeToArrayType(
     case 'f32':
       return Float32Array
     default:
-      throw new Error(`Unexpected type: ${type}`)
+      throw new Error(`Unexpected type: ${type as string}`)
   }
 }
 

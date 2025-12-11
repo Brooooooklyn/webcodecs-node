@@ -72,7 +72,7 @@ async function runSvcTest(
   const h = encoderConfig.height!
   const framesToEncode = 24
   let framesEncoded = 0
-  let framesDecoded = 0
+  let _framesDecoded = 0
   const baseLayerChunks: EncodedVideoChunk[] = []
   const corruptedFrames: number[] = []
 
@@ -118,7 +118,7 @@ async function runSvcTest(
   // Create decoder to validate base layer
   const decoder = new VideoDecoder({
     output: async (frame: VideoFrame) => {
-      framesDecoded++
+      _framesDecoded++
 
       // Validate the frame has correct dots
       const isValid = await validateBlackDots(frame, frame.timestamp)

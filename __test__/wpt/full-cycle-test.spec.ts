@@ -23,7 +23,6 @@ import {
   createDottedFrame,
   createEncoderConfig,
   ENCODER_CONFIGS,
-  validateBlackDots,
 } from '../helpers/wpt-frame-utils.js'
 
 // Reset hardware fallback state before each test

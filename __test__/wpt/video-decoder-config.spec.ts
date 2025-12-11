@@ -193,7 +193,7 @@ for (const entry of validConfigs) {
       t.is(decoder.state, 'configured', 'decoder should be configured')
       decoder.close()
     } catch (e) {
-      t.fail(`${entry.comment} should not throw: ${e}`)
+      t.fail(`${entry.comment} should not throw: ${e instanceof Error ? e.message : String(e)}`)
     }
   })
 }

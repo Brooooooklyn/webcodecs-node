@@ -195,7 +195,7 @@ export function getBytesPerSample(format: AudioSampleFormat): number {
     case 'f32-planar':
       return 4
     default:
-      throw new Error(`Unknown format: ${format}`)
+      throw new Error(`Unknown format: ${format as string}`)
   }
 }
 
@@ -262,7 +262,7 @@ export function readSample(buffer: Uint8Array, offset: number, format: AudioSamp
     case 'f32-planar':
       return view.getFloat32(offset, true)
     default:
-      throw new Error(`Unknown format: ${format}`)
+      throw new Error(`Unknown format: ${format as string}`)
   }
 }
 

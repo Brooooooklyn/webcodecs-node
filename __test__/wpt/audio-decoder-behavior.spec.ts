@@ -542,10 +542,9 @@ test('AudioDecoder: new flush after reset in callback', async (t) => {
   // First flush should be aborted
   await t.throwsAsync(firstFlushPromise, { message: /AbortError/ })
 
-  // Wait for second flush
-  if (secondFlushPromise) {
-    await secondFlushPromise
-  }
+  // Wait for second flush (may be set by callback)
+  // eslint-disable-next-line @typescript-eslint/await-thenable -- type narrowing limitation
+  if (secondFlushPromise) await secondFlushPromise
 
   // Due to timing, outputs may arrive before or after reset.
   // The key test is that the second flush completes successfully.
