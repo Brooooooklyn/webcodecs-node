@@ -1,4 +1,4 @@
-//! Build script for webcodec-node
+//! Build script for webcodecs-node
 //!
 //! Handles:
 //! 1. NAPI-RS setup
@@ -113,7 +113,7 @@ fn get_ffmpeg_dir(target_os: &str, target_arch: &str) -> PathBuf {
 
   // 6. FAIL - no fallback to building from source
   let repo =
-    env::var("FFMPEG_GITHUB_REPO").unwrap_or_else(|_| "Brooooooklyn/webcodec-node".to_string());
+    env::var("FFMPEG_GITHUB_REPO").unwrap_or_else(|_| "Brooooooklyn/webcodecs-node".to_string());
   panic!(
     "FFmpeg not found for target {}-{}.\n\
      \n\
@@ -165,7 +165,7 @@ fn download_ffmpeg_from_release(
   };
 
   let repo =
-    env::var("FFMPEG_GITHUB_REPO").unwrap_or_else(|_| "Brooooooklyn/webcodec-node".to_string());
+    env::var("FFMPEG_GITHUB_REPO").unwrap_or_else(|_| "Brooooooklyn/webcodecs-node".to_string());
 
   // Determine release tag
   let release_tag = match env::var("FFMPEG_RELEASE_TAG") {

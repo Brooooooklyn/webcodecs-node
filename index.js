@@ -70,13 +70,13 @@ function requireNative() {
   } else if (process.platform === 'android') {
     if (process.arch === 'arm64') {
       try {
-        return require('./webcodec.android-arm64.node')
+        return require('./webcodecs.android-arm64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@napi-rs/webcodec-android-arm64')
-        const bindingPackageVersion = require('@napi-rs/webcodec-android-arm64/package.json').version
+        const binding = require('@napi-rs/webcodecs-android-arm64')
+        const bindingPackageVersion = require('@napi-rs/webcodecs-android-arm64/package.json').version
         if (
           bindingPackageVersion !== '0.0.0' &&
           process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -92,13 +92,13 @@ function requireNative() {
       }
     } else if (process.arch === 'arm') {
       try {
-        return require('./webcodec.android-arm-eabi.node')
+        return require('./webcodecs.android-arm-eabi.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@napi-rs/webcodec-android-arm-eabi')
-        const bindingPackageVersion = require('@napi-rs/webcodec-android-arm-eabi/package.json').version
+        const binding = require('@napi-rs/webcodecs-android-arm-eabi')
+        const bindingPackageVersion = require('@napi-rs/webcodecs-android-arm-eabi/package.json').version
         if (
           bindingPackageVersion !== '0.0.0' &&
           process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -122,13 +122,13 @@ function requireNative() {
         process.config?.variables?.node_target_type === 'shared_library'
       ) {
         try {
-          return require('./webcodec.win32-x64-gnu.node')
+          return require('./webcodecs.win32-x64-gnu.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@napi-rs/webcodec-win32-x64-gnu')
-          const bindingPackageVersion = require('@napi-rs/webcodec-win32-x64-gnu/package.json').version
+          const binding = require('@napi-rs/webcodecs-win32-x64-gnu')
+          const bindingPackageVersion = require('@napi-rs/webcodecs-win32-x64-gnu/package.json').version
           if (
             bindingPackageVersion !== '0.0.0' &&
             process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -144,13 +144,13 @@ function requireNative() {
         }
       } else {
         try {
-          return require('./webcodec.win32-x64-msvc.node')
+          return require('./webcodecs.win32-x64-msvc.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@napi-rs/webcodec-win32-x64-msvc')
-          const bindingPackageVersion = require('@napi-rs/webcodec-win32-x64-msvc/package.json').version
+          const binding = require('@napi-rs/webcodecs-win32-x64-msvc')
+          const bindingPackageVersion = require('@napi-rs/webcodecs-win32-x64-msvc/package.json').version
           if (
             bindingPackageVersion !== '0.0.0' &&
             process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -167,13 +167,13 @@ function requireNative() {
       }
     } else if (process.arch === 'ia32') {
       try {
-        return require('./webcodec.win32-ia32-msvc.node')
+        return require('./webcodecs.win32-ia32-msvc.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@napi-rs/webcodec-win32-ia32-msvc')
-        const bindingPackageVersion = require('@napi-rs/webcodec-win32-ia32-msvc/package.json').version
+        const binding = require('@napi-rs/webcodecs-win32-ia32-msvc')
+        const bindingPackageVersion = require('@napi-rs/webcodecs-win32-ia32-msvc/package.json').version
         if (
           bindingPackageVersion !== '0.0.0' &&
           process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -189,13 +189,13 @@ function requireNative() {
       }
     } else if (process.arch === 'arm64') {
       try {
-        return require('./webcodec.win32-arm64-msvc.node')
+        return require('./webcodecs.win32-arm64-msvc.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@napi-rs/webcodec-win32-arm64-msvc')
-        const bindingPackageVersion = require('@napi-rs/webcodec-win32-arm64-msvc/package.json').version
+        const binding = require('@napi-rs/webcodecs-win32-arm64-msvc')
+        const bindingPackageVersion = require('@napi-rs/webcodecs-win32-arm64-msvc/package.json').version
         if (
           bindingPackageVersion !== '0.0.0' &&
           process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -214,13 +214,13 @@ function requireNative() {
     }
   } else if (process.platform === 'darwin') {
     try {
-      return require('./webcodec.darwin-universal.node')
+      return require('./webcodecs.darwin-universal.node')
     } catch (e) {
       loadErrors.push(e)
     }
     try {
-      const binding = require('@napi-rs/webcodec-darwin-universal')
-      const bindingPackageVersion = require('@napi-rs/webcodec-darwin-universal/package.json').version
+      const binding = require('@napi-rs/webcodecs-darwin-universal')
+      const bindingPackageVersion = require('@napi-rs/webcodecs-darwin-universal/package.json').version
       if (
         bindingPackageVersion !== '0.0.0' &&
         process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -236,13 +236,13 @@ function requireNative() {
     }
     if (process.arch === 'x64') {
       try {
-        return require('./webcodec.darwin-x64.node')
+        return require('./webcodecs.darwin-x64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@napi-rs/webcodec-darwin-x64')
-        const bindingPackageVersion = require('@napi-rs/webcodec-darwin-x64/package.json').version
+        const binding = require('@napi-rs/webcodecs-darwin-x64')
+        const bindingPackageVersion = require('@napi-rs/webcodecs-darwin-x64/package.json').version
         if (
           bindingPackageVersion !== '0.0.0' &&
           process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -258,13 +258,13 @@ function requireNative() {
       }
     } else if (process.arch === 'arm64') {
       try {
-        return require('./webcodec.darwin-arm64.node')
+        return require('./webcodecs.darwin-arm64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@napi-rs/webcodec-darwin-arm64')
-        const bindingPackageVersion = require('@napi-rs/webcodec-darwin-arm64/package.json').version
+        const binding = require('@napi-rs/webcodecs-darwin-arm64')
+        const bindingPackageVersion = require('@napi-rs/webcodecs-darwin-arm64/package.json').version
         if (
           bindingPackageVersion !== '0.0.0' &&
           process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -284,13 +284,13 @@ function requireNative() {
   } else if (process.platform === 'freebsd') {
     if (process.arch === 'x64') {
       try {
-        return require('./webcodec.freebsd-x64.node')
+        return require('./webcodecs.freebsd-x64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@napi-rs/webcodec-freebsd-x64')
-        const bindingPackageVersion = require('@napi-rs/webcodec-freebsd-x64/package.json').version
+        const binding = require('@napi-rs/webcodecs-freebsd-x64')
+        const bindingPackageVersion = require('@napi-rs/webcodecs-freebsd-x64/package.json').version
         if (
           bindingPackageVersion !== '0.0.0' &&
           process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -306,13 +306,13 @@ function requireNative() {
       }
     } else if (process.arch === 'arm64') {
       try {
-        return require('./webcodec.freebsd-arm64.node')
+        return require('./webcodecs.freebsd-arm64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@napi-rs/webcodec-freebsd-arm64')
-        const bindingPackageVersion = require('@napi-rs/webcodec-freebsd-arm64/package.json').version
+        const binding = require('@napi-rs/webcodecs-freebsd-arm64')
+        const bindingPackageVersion = require('@napi-rs/webcodecs-freebsd-arm64/package.json').version
         if (
           bindingPackageVersion !== '0.0.0' &&
           process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -333,13 +333,13 @@ function requireNative() {
     if (process.arch === 'x64') {
       if (isMusl()) {
         try {
-          return require('./webcodec.linux-x64-musl.node')
+          return require('./webcodecs.linux-x64-musl.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@napi-rs/webcodec-linux-x64-musl')
-          const bindingPackageVersion = require('@napi-rs/webcodec-linux-x64-musl/package.json').version
+          const binding = require('@napi-rs/webcodecs-linux-x64-musl')
+          const bindingPackageVersion = require('@napi-rs/webcodecs-linux-x64-musl/package.json').version
           if (
             bindingPackageVersion !== '0.0.0' &&
             process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -355,13 +355,13 @@ function requireNative() {
         }
       } else {
         try {
-          return require('./webcodec.linux-x64-gnu.node')
+          return require('./webcodecs.linux-x64-gnu.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@napi-rs/webcodec-linux-x64-gnu')
-          const bindingPackageVersion = require('@napi-rs/webcodec-linux-x64-gnu/package.json').version
+          const binding = require('@napi-rs/webcodecs-linux-x64-gnu')
+          const bindingPackageVersion = require('@napi-rs/webcodecs-linux-x64-gnu/package.json').version
           if (
             bindingPackageVersion !== '0.0.0' &&
             process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -379,13 +379,13 @@ function requireNative() {
     } else if (process.arch === 'arm64') {
       if (isMusl()) {
         try {
-          return require('./webcodec.linux-arm64-musl.node')
+          return require('./webcodecs.linux-arm64-musl.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@napi-rs/webcodec-linux-arm64-musl')
-          const bindingPackageVersion = require('@napi-rs/webcodec-linux-arm64-musl/package.json').version
+          const binding = require('@napi-rs/webcodecs-linux-arm64-musl')
+          const bindingPackageVersion = require('@napi-rs/webcodecs-linux-arm64-musl/package.json').version
           if (
             bindingPackageVersion !== '0.0.0' &&
             process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -401,13 +401,13 @@ function requireNative() {
         }
       } else {
         try {
-          return require('./webcodec.linux-arm64-gnu.node')
+          return require('./webcodecs.linux-arm64-gnu.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@napi-rs/webcodec-linux-arm64-gnu')
-          const bindingPackageVersion = require('@napi-rs/webcodec-linux-arm64-gnu/package.json').version
+          const binding = require('@napi-rs/webcodecs-linux-arm64-gnu')
+          const bindingPackageVersion = require('@napi-rs/webcodecs-linux-arm64-gnu/package.json').version
           if (
             bindingPackageVersion !== '0.0.0' &&
             process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -425,13 +425,13 @@ function requireNative() {
     } else if (process.arch === 'arm') {
       if (isMusl()) {
         try {
-          return require('./webcodec.linux-arm-musleabihf.node')
+          return require('./webcodecs.linux-arm-musleabihf.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@napi-rs/webcodec-linux-arm-musleabihf')
-          const bindingPackageVersion = require('@napi-rs/webcodec-linux-arm-musleabihf/package.json').version
+          const binding = require('@napi-rs/webcodecs-linux-arm-musleabihf')
+          const bindingPackageVersion = require('@napi-rs/webcodecs-linux-arm-musleabihf/package.json').version
           if (
             bindingPackageVersion !== '0.0.0' &&
             process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -447,13 +447,13 @@ function requireNative() {
         }
       } else {
         try {
-          return require('./webcodec.linux-arm-gnueabihf.node')
+          return require('./webcodecs.linux-arm-gnueabihf.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@napi-rs/webcodec-linux-arm-gnueabihf')
-          const bindingPackageVersion = require('@napi-rs/webcodec-linux-arm-gnueabihf/package.json').version
+          const binding = require('@napi-rs/webcodecs-linux-arm-gnueabihf')
+          const bindingPackageVersion = require('@napi-rs/webcodecs-linux-arm-gnueabihf/package.json').version
           if (
             bindingPackageVersion !== '0.0.0' &&
             process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -471,13 +471,13 @@ function requireNative() {
     } else if (process.arch === 'loong64') {
       if (isMusl()) {
         try {
-          return require('./webcodec.linux-loong64-musl.node')
+          return require('./webcodecs.linux-loong64-musl.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@napi-rs/webcodec-linux-loong64-musl')
-          const bindingPackageVersion = require('@napi-rs/webcodec-linux-loong64-musl/package.json').version
+          const binding = require('@napi-rs/webcodecs-linux-loong64-musl')
+          const bindingPackageVersion = require('@napi-rs/webcodecs-linux-loong64-musl/package.json').version
           if (
             bindingPackageVersion !== '0.0.0' &&
             process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -493,13 +493,13 @@ function requireNative() {
         }
       } else {
         try {
-          return require('./webcodec.linux-loong64-gnu.node')
+          return require('./webcodecs.linux-loong64-gnu.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@napi-rs/webcodec-linux-loong64-gnu')
-          const bindingPackageVersion = require('@napi-rs/webcodec-linux-loong64-gnu/package.json').version
+          const binding = require('@napi-rs/webcodecs-linux-loong64-gnu')
+          const bindingPackageVersion = require('@napi-rs/webcodecs-linux-loong64-gnu/package.json').version
           if (
             bindingPackageVersion !== '0.0.0' &&
             process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -517,13 +517,13 @@ function requireNative() {
     } else if (process.arch === 'riscv64') {
       if (isMusl()) {
         try {
-          return require('./webcodec.linux-riscv64-musl.node')
+          return require('./webcodecs.linux-riscv64-musl.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@napi-rs/webcodec-linux-riscv64-musl')
-          const bindingPackageVersion = require('@napi-rs/webcodec-linux-riscv64-musl/package.json').version
+          const binding = require('@napi-rs/webcodecs-linux-riscv64-musl')
+          const bindingPackageVersion = require('@napi-rs/webcodecs-linux-riscv64-musl/package.json').version
           if (
             bindingPackageVersion !== '0.0.0' &&
             process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -539,13 +539,13 @@ function requireNative() {
         }
       } else {
         try {
-          return require('./webcodec.linux-riscv64-gnu.node')
+          return require('./webcodecs.linux-riscv64-gnu.node')
         } catch (e) {
           loadErrors.push(e)
         }
         try {
-          const binding = require('@napi-rs/webcodec-linux-riscv64-gnu')
-          const bindingPackageVersion = require('@napi-rs/webcodec-linux-riscv64-gnu/package.json').version
+          const binding = require('@napi-rs/webcodecs-linux-riscv64-gnu')
+          const bindingPackageVersion = require('@napi-rs/webcodecs-linux-riscv64-gnu/package.json').version
           if (
             bindingPackageVersion !== '0.0.0' &&
             process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -562,13 +562,13 @@ function requireNative() {
       }
     } else if (process.arch === 'ppc64') {
       try {
-        return require('./webcodec.linux-ppc64-gnu.node')
+        return require('./webcodecs.linux-ppc64-gnu.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@napi-rs/webcodec-linux-ppc64-gnu')
-        const bindingPackageVersion = require('@napi-rs/webcodec-linux-ppc64-gnu/package.json').version
+        const binding = require('@napi-rs/webcodecs-linux-ppc64-gnu')
+        const bindingPackageVersion = require('@napi-rs/webcodecs-linux-ppc64-gnu/package.json').version
         if (
           bindingPackageVersion !== '0.0.0' &&
           process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -584,13 +584,13 @@ function requireNative() {
       }
     } else if (process.arch === 's390x') {
       try {
-        return require('./webcodec.linux-s390x-gnu.node')
+        return require('./webcodecs.linux-s390x-gnu.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@napi-rs/webcodec-linux-s390x-gnu')
-        const bindingPackageVersion = require('@napi-rs/webcodec-linux-s390x-gnu/package.json').version
+        const binding = require('@napi-rs/webcodecs-linux-s390x-gnu')
+        const bindingPackageVersion = require('@napi-rs/webcodecs-linux-s390x-gnu/package.json').version
         if (
           bindingPackageVersion !== '0.0.0' &&
           process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -610,13 +610,13 @@ function requireNative() {
   } else if (process.platform === 'openharmony') {
     if (process.arch === 'arm64') {
       try {
-        return require('./webcodec.openharmony-arm64.node')
+        return require('./webcodecs.openharmony-arm64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@napi-rs/webcodec-openharmony-arm64')
-        const bindingPackageVersion = require('@napi-rs/webcodec-openharmony-arm64/package.json').version
+        const binding = require('@napi-rs/webcodecs-openharmony-arm64')
+        const bindingPackageVersion = require('@napi-rs/webcodecs-openharmony-arm64/package.json').version
         if (
           bindingPackageVersion !== '0.0.0' &&
           process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -632,13 +632,13 @@ function requireNative() {
       }
     } else if (process.arch === 'x64') {
       try {
-        return require('./webcodec.openharmony-x64.node')
+        return require('./webcodecs.openharmony-x64.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@napi-rs/webcodec-openharmony-x64')
-        const bindingPackageVersion = require('@napi-rs/webcodec-openharmony-x64/package.json').version
+        const binding = require('@napi-rs/webcodecs-openharmony-x64')
+        const bindingPackageVersion = require('@napi-rs/webcodecs-openharmony-x64/package.json').version
         if (
           bindingPackageVersion !== '0.0.0' &&
           process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -654,13 +654,13 @@ function requireNative() {
       }
     } else if (process.arch === 'arm') {
       try {
-        return require('./webcodec.openharmony-arm.node')
+        return require('./webcodecs.openharmony-arm.node')
       } catch (e) {
         loadErrors.push(e)
       }
       try {
-        const binding = require('@napi-rs/webcodec-openharmony-arm')
-        const bindingPackageVersion = require('@napi-rs/webcodec-openharmony-arm/package.json').version
+        const binding = require('@napi-rs/webcodecs-openharmony-arm')
+        const bindingPackageVersion = require('@napi-rs/webcodecs-openharmony-arm/package.json').version
         if (
           bindingPackageVersion !== '0.0.0' &&
           process.env.NAPI_RS_ENFORCE_VERSION_CHECK &&
@@ -688,7 +688,7 @@ if (!nativeBinding || process.env.NAPI_RS_FORCE_WASI) {
   let wasiBinding = null
   let wasiBindingError = null
   try {
-    wasiBinding = require('./webcodec.wasi.cjs')
+    wasiBinding = require('./webcodecs.wasi.cjs')
     nativeBinding = wasiBinding
   } catch (err) {
     if (process.env.NAPI_RS_FORCE_WASI) {
@@ -697,7 +697,7 @@ if (!nativeBinding || process.env.NAPI_RS_FORCE_WASI) {
   }
   if (!nativeBinding) {
     try {
-      wasiBinding = require('@napi-rs/webcodec-wasm32-wasi')
+      wasiBinding = require('@napi-rs/webcodecs-wasm32-wasi')
       nativeBinding = wasiBinding
     } catch (err) {
       if (process.env.NAPI_RS_FORCE_WASI) {

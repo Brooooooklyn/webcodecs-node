@@ -1,6 +1,6 @@
-# @napi-rs/webcodec
+# @napi-rs/webcodecs
 
-[![CI](https://github.com/Brooooooklyn/webcodec-node/actions/workflows/CI.yml/badge.svg)](https://github.com/Brooooooklyn/webcodec-node/actions/workflows/CI.yml)
+[![CI](https://github.com/Brooooooklyn/webcodecs-node/actions/workflows/CI.yml/badge.svg)](https://github.com/Brooooooklyn/webcodecs-node/actions/workflows/CI.yml)
 
 WebCodecs API implementation for Node.js using FFmpeg, built with [NAPI-RS](https://napi.rs).
 
@@ -17,11 +17,11 @@ WebCodecs API implementation for Node.js using FFmpeg, built with [NAPI-RS](http
 ## Installation
 
 ```bash
-npm install @napi-rs/webcodec
+npm install @napi-rs/webcodecs
 # or
-pnpm add @napi-rs/webcodec
+pnpm add @napi-rs/webcodecs
 # or
-yarn add @napi-rs/webcodec
+yarn add @napi-rs/webcodecs
 ```
 
 ## Quick Start
@@ -29,7 +29,7 @@ yarn add @napi-rs/webcodec
 ### Video Encoding
 
 ```typescript
-import { VideoEncoder, VideoFrame } from '@napi-rs/webcodec'
+import { VideoEncoder, VideoFrame } from '@napi-rs/webcodecs'
 
 const encoder = new VideoEncoder({
   output: (chunk, metadata) => {
@@ -66,7 +66,7 @@ encoder.close()
 ### Video Decoding
 
 ```typescript
-import { VideoDecoder, EncodedVideoChunk } from '@napi-rs/webcodec'
+import { VideoDecoder, EncodedVideoChunk } from '@napi-rs/webcodecs'
 
 const decoder = new VideoDecoder({
   output: (frame) => {
@@ -97,7 +97,7 @@ decoder.close()
 ### Audio Encoding
 
 ```typescript
-import { AudioEncoder, AudioData } from '@napi-rs/webcodec'
+import { AudioEncoder, AudioData } from '@napi-rs/webcodecs'
 
 const encoder = new AudioEncoder({
   output: (chunk, metadata) => {
@@ -132,7 +132,7 @@ encoder.close()
 ### Image Decoding
 
 ```typescript
-import { ImageDecoder } from '@napi-rs/webcodec'
+import { ImageDecoder } from '@napi-rs/webcodecs'
 import { readFileSync } from 'fs'
 
 const imageData = readFileSync('image.png')

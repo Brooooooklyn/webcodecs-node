@@ -1,12 +1,12 @@
 {
-  "name": "@napi-rs/webcodec",
+  "name": "@napi-rs/webcodecs",
   "version": "0.0.0",
   "description": "WebCodecs API implementation for Node.js using FFmpeg",
   "main": "index.js",
   "types": "index.d.ts",
   "browser": "browser.js",
   "repository": {
-    "url": "git+ssh://git@github.com/Brooooooklyn/webcodec-node.git",
+    "url": "git+ssh://git@github.com/Brooooooklyn/webcodecs-node.git",
     "type": "git"
   },
   "license": "MIT",
@@ -24,7 +24,7 @@
     "standard.d.ts"
   ],
   "napi": {
-    "binaryName": "webcodec",
+    "binaryName": "webcodecs",
     "targets": [
       "x86_64-apple-darwin",
       "aarch64-apple-darwin",

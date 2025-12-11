@@ -2,13 +2,13 @@
 members = ["tools/build-ffmpeg"]
 
 [package]
-name = "webcodec-node"
+name = "webcodecs-node"
 version = "0.1.0"
 edition = "2024"
 authors = ["LongYinan <lynweklm@gmail.com>"]
 description = "WebCodecs API implementation for Node.js using FFmpeg"
 license = "MIT"
-repository = "https://github.com/Brooooooklyn/webcodec-node"
+repository = "https://github.com/Brooooooklyn/webcodecs-node"
 publish = false
 
 [lib]
