@@ -28,7 +28,7 @@ use napi_derive::napi;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
 /// Encoder state per WebCodecs spec
@@ -258,6 +258,19 @@ struct EventListenerEntry {
   once: bool,
 }
 
+/// State for EventTarget interface, separate from main encoder state
+/// to avoid lock contention during encoding operations.
+/// Uses RwLock so addEventListener doesn't block on encode operations.
+#[derive(Default)]
+struct EventListenerState {
+  /// Event listeners registry (event type -> list of listeners)
+  event_listeners: HashMap<String, Vec<EventListenerEntry>>,
+  /// Counter for generating unique listener IDs
+  next_listener_id: u64,
+  /// Optional dequeue event callback (set via ondequeue property)
+  dequeue_callback: Option<EventListenerCallback>,
+}
+
 /// Options for addEventListener (W3C DOM spec)
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
@@ -288,8 +301,6 @@ struct VideoEncoderInner {
   output_callback: OutputCallback,
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
-  /// Optional dequeue event callback (ThreadsafeFunction for multi-thread support)
-  dequeue_callback: Option<ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, true>>,
   /// Pending flush response senders (for AbortError on reset)
   pending_flush_senders: Vec<Sender<Result<()>>>,
   /// Queue of input timestamps for correlation with output packets
@@ -350,14 +361,6 @@ struct VideoEncoderInner {
   /// True for H.264 when avc.format is "avc" (default) or not specified
   /// True for H.265 when hevc.format is "hevc" (default) or not specified
   use_avcc_format: bool,
-
-  // ========================================================================
-  // EventTarget support
-  // ========================================================================
-  /// Event listeners registry (event type -> list of listeners)
-  event_listeners: HashMap<String, Vec<EventListenerEntry>>,
-  /// Counter for generating unique listener IDs
-  next_listener_id: u64,
 }
 
 /// Get the preferred hardware device type for the current platform
@@ -406,6 +409,9 @@ fn get_platform_hw_type() -> AVHWDeviceType {
 #[napi]
 pub struct VideoEncoder {
   inner: Arc<Mutex<VideoEncoderInner>>,
+  /// Separate lock for EventTarget state to avoid lock contention with encode operations.
+  /// This allows addEventListener to complete immediately even when worker holds inner lock.
+  event_state: Arc<RwLock<EventListenerState>>,
   dequeue_callback: Option<FunctionRef<(), UnknownReturnValue>>,
   /// Output callback reference - stored for synchronous calls from main thread (in flush resolver)
   /// Wrapped in Rc to allow sharing with spawn_future_with_callback closure
@@ -466,7 +472,6 @@ impl VideoEncoder {
       encode_queue_size: 0,
       output_callback: init.output,
       error_callback: init.error,
-      dequeue_callback: None,
       pending_flush_senders: Vec::new(),
       timestamp_queue: std::collections::VecDeque::new(),
       // Hardware acceleration tracking
@@ -489,12 +494,12 @@ impl VideoEncoder {
       output_frame_count: 0,
       // Bitstream format conversion (set during configure)
       use_avcc_format: false,
-      // EventTarget support
-      event_listeners: HashMap::new(),
-      next_listener_id: 0,
     };
 
     let inner = Arc::new(Mutex::new(inner));
+
+    // Create separate lock for event listener state (avoids contention with encode operations)
+    let event_state = Arc::new(RwLock::new(EventListenerState::default()));
 
     // Create channel for worker commands
     let (sender, receiver) = channel::unbounded();
@@ -504,13 +509,20 @@ impl VideoEncoder {
 
     // Spawn worker thread
     let worker_inner = inner.clone();
+    let worker_event_state = event_state.clone();
     let worker_reset_flag = reset_flag.clone();
     let worker_handle = std::thread::spawn(move || {
-      Self::worker_loop(worker_inner, receiver, worker_reset_flag);
+      Self::worker_loop(
+        worker_inner,
+        worker_event_state,
+        receiver,
+        worker_reset_flag,
+      );
     });
 
     Ok(Self {
       inner,
+      event_state,
       dequeue_callback: None,
       output_callback_ref: Rc::new(init.output_ref),
       command_sender: Some(sender),
@@ -522,6 +534,7 @@ impl VideoEncoder {
   /// Worker loop that processes commands from the channel
   fn worker_loop(
     inner: Arc<Mutex<VideoEncoderInner>>,
+    event_state: Arc<RwLock<EventListenerState>>,
     receiver: Receiver<EncoderCommand>,
     reset_flag: Arc<AtomicBool>,
   ) {
@@ -541,7 +554,7 @@ impl VideoEncoder {
             let old_size = guard.encode_queue_size;
             guard.encode_queue_size = old_size.saturating_sub(1);
             if old_size > 0 {
-              let _ = Self::fire_dequeue_event(&mut guard);
+              let _ = Self::fire_dequeue_event(&event_state);
             }
           }
         }
@@ -556,10 +569,18 @@ impl VideoEncoder {
           rotation,
           flip,
         } => {
-          Self::process_encode(&inner, frame, timestamp, options, rotation, flip);
+          Self::process_encode(
+            &inner,
+            &event_state,
+            frame,
+            timestamp,
+            options,
+            rotation,
+            flip,
+          );
         }
         EncoderCommand::Flush(response_sender) => {
-          let result = Self::process_flush(&inner);
+          let result = Self::process_flush(&inner, &event_state);
           let _ = response_sender.send(result);
         }
       }
@@ -569,6 +590,7 @@ impl VideoEncoder {
   /// Process an encode command on the worker thread
   fn process_encode(
     inner: &Arc<Mutex<VideoEncoderInner>>,
+    event_state: &Arc<RwLock<EventListenerState>>,
     frame: Frame,
     timestamp: i64,
     options: Option<VideoEncoderEncodeOptions>,
@@ -585,7 +607,7 @@ impl VideoEncoder {
       let old_size = guard.encode_queue_size;
       guard.encode_queue_size = old_size.saturating_sub(1);
       if old_size > 0 {
-        let _ = Self::fire_dequeue_event(&mut guard);
+        let _ = Self::fire_dequeue_event(event_state);
       }
       Self::report_error(&mut guard, "Encoder not configured");
       return;
@@ -604,7 +626,7 @@ impl VideoEncoder {
         let old_size = guard.encode_queue_size;
         guard.encode_queue_size = old_size.saturating_sub(1);
         if old_size > 0 {
-          let _ = Self::fire_dequeue_event(&mut guard);
+          let _ = Self::fire_dequeue_event(event_state);
         }
         Self::report_error(&mut guard, "No encoder config");
         return;
@@ -634,7 +656,7 @@ impl VideoEncoder {
             let old_size = guard.encode_queue_size;
             guard.encode_queue_size = old_size.saturating_sub(1);
             if old_size > 0 {
-              let _ = Self::fire_dequeue_event(&mut guard);
+              let _ = Self::fire_dequeue_event(event_state);
             }
             Self::report_error(&mut guard, &format!("Failed to create scaler: {}", e));
             return;
@@ -649,7 +671,7 @@ impl VideoEncoder {
           let old_size = guard.encode_queue_size;
           guard.encode_queue_size = old_size.saturating_sub(1);
           if old_size > 0 {
-            let _ = Self::fire_dequeue_event(&mut guard);
+            let _ = Self::fire_dequeue_event(event_state);
           }
           Self::report_error(&mut guard, &format!("Failed to scale frame: {}", e));
           return;
@@ -688,7 +710,7 @@ impl VideoEncoder {
         let old_size = guard.encode_queue_size;
         guard.encode_queue_size = old_size.saturating_sub(1);
         if old_size > 0 {
-          let _ = Self::fire_dequeue_event(&mut guard);
+          let _ = Self::fire_dequeue_event(event_state);
         }
         Self::report_error(&mut guard, "No encoder context");
         return;
@@ -782,7 +804,7 @@ impl VideoEncoder {
             let old_size = guard.encode_queue_size;
             guard.encode_queue_size = old_size.saturating_sub(1);
             if old_size > 0 {
-              let _ = Self::fire_dequeue_event(&mut guard);
+              let _ = Self::fire_dequeue_event(event_state);
             }
             return;
           }
@@ -818,7 +840,7 @@ impl VideoEncoder {
         let old_size = guard.encode_queue_size;
         guard.encode_queue_size = old_size.saturating_sub(1);
         if old_size > 0 {
-          let _ = Self::fire_dequeue_event(&mut guard);
+          let _ = Self::fire_dequeue_event(event_state);
         }
         return;
       }
@@ -856,7 +878,7 @@ impl VideoEncoder {
             let old_size = guard.encode_queue_size;
             guard.encode_queue_size = old_size.saturating_sub(1);
             if old_size > 0 {
-              let _ = Self::fire_dequeue_event(&mut guard);
+              let _ = Self::fire_dequeue_event(event_state);
             }
             let codec = guard
               .config
@@ -951,7 +973,7 @@ impl VideoEncoder {
               let old_size = guard.encode_queue_size;
               guard.encode_queue_size = old_size.saturating_sub(1);
               if old_size > 0 {
-                let _ = Self::fire_dequeue_event(&mut guard);
+                let _ = Self::fire_dequeue_event(event_state);
               }
               return;
             } else {
@@ -961,7 +983,7 @@ impl VideoEncoder {
               let old_size = guard.encode_queue_size;
               guard.encode_queue_size = old_size.saturating_sub(1);
               if old_size > 0 {
-                let _ = Self::fire_dequeue_event(&mut guard);
+                let _ = Self::fire_dequeue_event(event_state);
               }
               let codec = guard
                 .config
@@ -1000,7 +1022,7 @@ impl VideoEncoder {
     let old_size = guard.encode_queue_size;
     guard.encode_queue_size = old_size.saturating_sub(1);
     if old_size > 0 {
-      let _ = Self::fire_dequeue_event(&mut guard);
+      let _ = Self::fire_dequeue_event(event_state);
     }
 
     // Process output packets - call callback for each
@@ -1085,7 +1107,10 @@ impl VideoEncoder {
   }
 
   /// Process a flush command on the worker thread
-  fn process_flush(inner: &Arc<Mutex<VideoEncoderInner>>) -> Result<()> {
+  fn process_flush(
+    inner: &Arc<Mutex<VideoEncoderInner>>,
+    _event_state: &Arc<RwLock<EventListenerState>>,
+  ) -> Result<()> {
     let mut guard = inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
@@ -1285,17 +1310,23 @@ impl VideoEncoder {
     inner.state = CodecState::Closed;
   }
 
-  /// Fire dequeue event if callback is set
+  /// Fire dequeue event - uses separate RwLock to avoid blocking addEventListener
   /// Also dispatches to EventTarget listeners registered via addEventListener
-  fn fire_dequeue_event(inner: &mut VideoEncoderInner) -> Result<()> {
+  fn fire_dequeue_event(event_state: &Arc<RwLock<EventListenerState>>) -> Result<()> {
+    // Use write lock only briefly to fire callbacks and remove once listeners
+    let mut state = match event_state.write() {
+      Ok(s) => s,
+      Err(_) => return Err(Error::new(Status::GenericFailure, "Lock poisoned")),
+    };
+
     // 1. Fire ondequeue callback
-    if let Some(ref callback) = inner.dequeue_callback {
+    if let Some(ref callback) = state.dequeue_callback {
       callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
     }
 
     // 2. Fire EventTarget listeners
     let mut ids_to_remove = Vec::new();
-    if let Some(listeners) = inner.event_listeners.get("dequeue") {
+    if let Some(listeners) = state.event_listeners.get("dequeue") {
       for entry in listeners {
         entry
           .callback
@@ -1308,11 +1339,11 @@ impl VideoEncoder {
 
     // 3. Remove "once" listeners
     if !ids_to_remove.is_empty()
-      && let Some(listeners) = inner.event_listeners.get_mut("dequeue")
+      && let Some(listeners) = state.event_listeners.get_mut("dequeue")
     {
       listeners.retain(|e| !ids_to_remove.contains(&e.id));
       if listeners.is_empty() {
-        inner.event_listeners.remove("dequeue");
+        state.event_listeners.remove("dequeue");
       }
     }
 
@@ -1579,20 +1610,24 @@ impl VideoEncoder {
     env: &Env,
     callback: Option<FunctionRef<(), UnknownReturnValue>>,
   ) -> Result<()> {
-    if let Some(ref callback) = callback {
-      let mut inner = self
-        .inner
-        .lock()
-        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-      inner.dequeue_callback = Some(
-        callback
-          .borrow_back(env)?
+    // Update event_state with ThreadsafeFunction for worker thread
+    let mut state = self
+      .event_state
+      .write()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    state.dequeue_callback = match callback {
+      Some(ref cb) => Some(
+        cb.borrow_back(env)?
           .build_threadsafe_function()
           .callee_handled::<false>()
           .weak::<true>()
           .build()?,
-      );
-    }
+      ),
+      None => None,
+    };
+    drop(state); // Release lock before storing FunctionRef
+
+    // Store FunctionRef for getter (main thread only)
     self.dequeue_callback = callback;
 
     Ok(())
@@ -2266,10 +2301,16 @@ impl VideoEncoder {
     let (sender, receiver) = channel::unbounded();
     self.command_sender = Some(sender);
     let worker_inner = self.inner.clone();
+    let worker_event_state = self.event_state.clone();
     let worker_reset_flag = self.reset_flag.clone();
     drop(inner); // Release lock before spawning thread
     self.worker_handle = Some(std::thread::spawn(move || {
-      Self::worker_loop(worker_inner, receiver, worker_reset_flag);
+      Self::worker_loop(
+        worker_inner,
+        worker_event_state,
+        receiver,
+        worker_reset_flag,
+      );
     }));
 
     Ok(())
@@ -2328,6 +2369,7 @@ impl VideoEncoder {
   // ============================================================================
 
   /// Add an event listener for the specified event type
+  /// Uses separate RwLock to avoid blocking on encode operations
   #[napi]
   pub fn add_event_listener(
     &self,
@@ -2336,13 +2378,13 @@ impl VideoEncoder {
     callback: FunctionRef<(), UnknownReturnValue>,
     options: Option<AddEventListenerOptions>,
   ) -> Result<()> {
-    let mut inner = self
-      .inner
-      .lock()
+    let mut state = self
+      .event_state
+      .write()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    let id = inner.next_listener_id;
-    inner.next_listener_id += 1;
+    let id = state.next_listener_id;
+    state.next_listener_id += 1;
 
     let tsf = callback
       .borrow_back(&env)?
@@ -2357,7 +2399,7 @@ impl VideoEncoder {
       once: options.as_ref().and_then(|o| o.once).unwrap_or(false),
     };
 
-    inner
+    state
       .event_listeners
       .entry(event_type)
       .or_default()
@@ -2373,17 +2415,17 @@ impl VideoEncoder {
     _callback: FunctionRef<(), UnknownReturnValue>,
     _options: Option<EventListenerOptions>,
   ) -> Result<()> {
-    let mut inner = self
-      .inner
-      .lock()
+    let mut state = self
+      .event_state
+      .write()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     // Note: We can't compare function references directly, so we remove the last added listener
     // for simplicity. A more complete implementation would need to track callback identity.
-    if let Some(listeners) = inner.event_listeners.get_mut(&event_type) {
+    if let Some(listeners) = state.event_listeners.get_mut(&event_type) {
       listeners.pop();
       if listeners.is_empty() {
-        inner.event_listeners.remove(&event_type);
+        state.event_listeners.remove(&event_type);
       }
     }
     Ok(())
@@ -2392,14 +2434,14 @@ impl VideoEncoder {
   /// Dispatch an event to all registered listeners
   #[napi]
   pub fn dispatch_event(&self, event_type: String) -> Result<bool> {
-    let mut inner = self
-      .inner
-      .lock()
+    let mut state = self
+      .event_state
+      .write()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     let mut ids_to_remove = Vec::new();
 
-    if let Some(listeners) = inner.event_listeners.get(&event_type) {
+    if let Some(listeners) = state.event_listeners.get(&event_type) {
       for entry in listeners {
         // Call the listener with no arguments (like dequeue callback)
         entry
@@ -2413,11 +2455,11 @@ impl VideoEncoder {
 
     // Remove "once" listeners
     if !ids_to_remove.is_empty()
-      && let Some(listeners) = inner.event_listeners.get_mut(&event_type)
+      && let Some(listeners) = state.event_listeners.get_mut(&event_type)
     {
       listeners.retain(|e| !ids_to_remove.contains(&e.id));
       if listeners.is_empty() {
-        inner.event_listeners.remove(&event_type);
+        state.event_listeners.remove(&event_type);
       }
     }
 

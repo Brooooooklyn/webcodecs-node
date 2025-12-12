@@ -219,7 +219,10 @@ export declare class AudioEncoder {
    * returns { supported: false } for valid but unsupported configs.
    */
   static isConfigSupported(config: AudioEncoderConfig): Promise<AudioEncoderSupport>
-  /** Add an event listener for the specified event type */
+  /**
+   * Add an event listener for the specified event type
+   * Uses separate RwLock to avoid blocking on encode operations
+   */
   addEventListener(
     eventType: string,
     callback: () => unknown,
@@ -498,7 +501,10 @@ export declare class VideoDecoder {
    * returns { supported: false } for valid but unsupported configs.
    */
   static isConfigSupported(config: VideoDecoderConfig): Promise<VideoDecoderSupport>
-  /** Add an event listener for the specified event type */
+  /**
+   * Add an event listener for the specified event type
+   * Uses separate RwLock to avoid blocking on decode operations
+   */
   addEventListener(
     eventType: string,
     callback: () => unknown,
@@ -579,7 +585,10 @@ export declare class VideoEncoder {
   reset(): void
   /** Close the encoder */
   close(): void
-  /** Add an event listener for the specified event type */
+  /**
+   * Add an event listener for the specified event type
+   * Uses separate RwLock to avoid blocking on encode operations
+   */
   addEventListener(
     eventType: string,
     callback: () => unknown,

@@ -49,6 +49,19 @@ struct EventListenerEntry {
   once: bool,
 }
 
+/// State for EventTarget interface, separate from main decoder state
+/// to avoid lock contention during decoding operations.
+/// Uses RwLock so addEventListener doesn't block on decode operations.
+#[derive(Default)]
+struct EventListenerState {
+  /// Event listeners registry (event type -> list of listeners)
+  event_listeners: HashMap<String, Vec<EventListenerEntry>>,
+  /// Counter for generating unique listener IDs
+  next_listener_id: u64,
+  /// Optional dequeue event callback (set via ondequeue property)
+  dequeue_callback: Option<EventListenerCallback>,
+}
+
 /// Options for addEventListener (W3C DOM spec)
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
@@ -156,8 +169,6 @@ struct VideoDecoderInner {
   output_callback: OutputCallback,
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
-  /// Optional dequeue event callback (ThreadsafeFunction for multi-thread support)
-  dequeue_callback: Option<ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, true>>,
   /// Whether a keyframe has been received (for delta frame validation)
   keyframe_received: bool,
   /// Whether an error has occurred during decoding (for flush error propagation)
@@ -197,14 +208,6 @@ struct VideoDecoderInner {
   config_rotation: f64,
   /// Horizontal flip from config
   config_flip: bool,
-
-  // ========================================================================
-  // EventTarget support
-  // ========================================================================
-  /// Event listeners registry (event type -> list of listeners)
-  event_listeners: HashMap<String, Vec<EventListenerEntry>>,
-  /// Counter for generating unique listener IDs
-  next_listener_id: u64,
 }
 
 /// Get the preferred hardware device type for the current platform
@@ -250,6 +253,9 @@ fn get_platform_hw_type() -> AVHWDeviceType {
 #[napi]
 pub struct VideoDecoder {
   inner: Arc<Mutex<VideoDecoderInner>>,
+  /// Separate lock for EventTarget state to avoid lock contention with decode operations.
+  /// This allows addEventListener to complete immediately even when worker holds inner lock.
+  event_state: Arc<RwLock<EventListenerState>>,
   dequeue_callback: Option<FunctionRef<(), UnknownReturnValue>>,
   /// Output callback reference - stored for synchronous calls from main thread (in flush resolver)
   /// Wrapped in Rc to allow sharing with spawn_future_with_callback closure
@@ -306,7 +312,6 @@ impl VideoDecoder {
       decode_queue_size: 0,
       output_callback: init.output,
       error_callback: init.error,
-      dequeue_callback: None,
       keyframe_received: false,
       had_error: false,
       pending_flush_senders: Vec::new(),
@@ -323,12 +328,12 @@ impl VideoDecoder {
       // Orientation metadata (default: no rotation/flip)
       config_rotation: 0.0,
       config_flip: false,
-      // EventTarget support
-      event_listeners: HashMap::new(),
-      next_listener_id: 0,
     };
 
     let inner = Arc::new(Mutex::new(inner));
+
+    // Create separate lock for event listener state (avoids contention with decode operations)
+    let event_state = Arc::new(RwLock::new(EventListenerState::default()));
 
     // Create channel for worker commands
     let (sender, receiver) = channel::unbounded();
@@ -338,13 +343,20 @@ impl VideoDecoder {
 
     // Spawn worker thread
     let worker_inner = inner.clone();
+    let worker_event_state = event_state.clone();
     let worker_reset_flag = reset_flag.clone();
     let worker_handle = std::thread::spawn(move || {
-      Self::worker_loop(worker_inner, receiver, worker_reset_flag);
+      Self::worker_loop(
+        worker_inner,
+        worker_event_state,
+        receiver,
+        worker_reset_flag,
+      );
     });
 
     Ok(Self {
       inner,
+      event_state,
       dequeue_callback: None,
       output_callback_ref: Rc::new(init.output_ref),
       command_sender: Some(sender),
@@ -356,6 +368,7 @@ impl VideoDecoder {
   /// Worker loop that processes commands from the channel
   fn worker_loop(
     inner: Arc<Mutex<VideoDecoderInner>>,
+    event_state: Arc<RwLock<EventListenerState>>,
     receiver: Receiver<WorkerCommand>,
     reset_flag: Arc<AtomicBool>,
   ) {
@@ -375,7 +388,7 @@ impl VideoDecoder {
             let old_size = guard.decode_queue_size;
             guard.decode_queue_size = old_size.saturating_sub(1);
             if old_size > 0 {
-              let _ = Self::fire_dequeue_event(&mut guard);
+              let _ = Self::fire_dequeue_event(&event_state);
             }
           }
         }
@@ -384,10 +397,10 @@ impl VideoDecoder {
 
       match command {
         WorkerCommand::Decode(chunk) => {
-          Self::process_decode(&inner, chunk);
+          Self::process_decode(&inner, &event_state, chunk);
         }
         WorkerCommand::Flush(response_sender) => {
-          let result = Self::process_flush(&inner);
+          let result = Self::process_flush(&inner, &event_state);
           let _ = response_sender.send(result);
         }
       }
@@ -401,6 +414,7 @@ impl VideoDecoder {
   ///   either report error (prefer-hardware) or fall back to software (no-preference)
   fn process_decode(
     inner: &Arc<Mutex<VideoDecoderInner>>,
+    event_state: &Arc<RwLock<EventListenerState>>,
     chunk: Arc<RwLock<Option<EncodedVideoChunkInner>>>,
   ) {
     let mut guard = match inner.lock() {
@@ -413,7 +427,7 @@ impl VideoDecoder {
       let old_size = guard.decode_queue_size;
       guard.decode_queue_size = old_size.saturating_sub(1);
       if old_size > 0 {
-        let _ = Self::fire_dequeue_event(&mut guard);
+        let _ = Self::fire_dequeue_event(event_state);
       }
       Self::report_error(&mut guard, "Decoder not configured");
       return;
@@ -433,7 +447,7 @@ impl VideoDecoder {
         let old_size = guard.decode_queue_size;
         guard.decode_queue_size = old_size.saturating_sub(1);
         if old_size > 0 {
-          let _ = Self::fire_dequeue_event(&mut guard);
+          let _ = Self::fire_dequeue_event(event_state);
         }
         Self::report_error(&mut guard, &e.reason);
         return;
@@ -495,7 +509,7 @@ impl VideoDecoder {
         let old_size = guard.decode_queue_size;
         guard.decode_queue_size = old_size.saturating_sub(1);
         if old_size > 0 {
-          let _ = Self::fire_dequeue_event(&mut guard);
+          let _ = Self::fire_dequeue_event(event_state);
         }
         Self::report_error(&mut guard, "No decoder context");
         return;
@@ -514,7 +528,7 @@ impl VideoDecoder {
               let old_size = guard.decode_queue_size;
               guard.decode_queue_size = old_size.saturating_sub(1);
               if old_size > 0 {
-                let _ = Self::fire_dequeue_event(&mut guard);
+                let _ = Self::fire_dequeue_event(event_state);
               }
               Self::report_error(
                 &mut guard,
@@ -530,7 +544,7 @@ impl VideoDecoder {
                 let old_size = guard.decode_queue_size;
                 guard.decode_queue_size = old_size.saturating_sub(1);
                 if old_size > 0 {
-                  let _ = Self::fire_dequeue_event(&mut guard);
+                  let _ = Self::fire_dequeue_event(event_state);
                 }
                 drop(guard);
                 Self::redecode_pending_chunks(inner, pending);
@@ -544,7 +558,7 @@ impl VideoDecoder {
         let old_size = guard.decode_queue_size;
         guard.decode_queue_size = old_size.saturating_sub(1);
         if old_size > 0 {
-          let _ = Self::fire_dequeue_event(&mut guard);
+          let _ = Self::fire_dequeue_event(event_state);
         }
         Self::report_error(&mut guard, &format!("Decode failed: {}", e));
         return;
@@ -557,7 +571,7 @@ impl VideoDecoder {
     let old_size = guard.decode_queue_size;
     guard.decode_queue_size = old_size.saturating_sub(1);
     if old_size > 0 {
-      let _ = Self::fire_dequeue_event(&mut guard);
+      let _ = Self::fire_dequeue_event(event_state);
     }
 
     // Check for silent failure (hardware decoder, no frames produced)
@@ -760,7 +774,10 @@ impl VideoDecoder {
   }
 
   /// Process a flush command
-  fn process_flush(inner: &Arc<Mutex<VideoDecoderInner>>) -> Result<()> {
+  fn process_flush(
+    inner: &Arc<Mutex<VideoDecoderInner>>,
+    _event_state: &Arc<RwLock<EventListenerState>>,
+  ) -> Result<()> {
     let mut guard = inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
@@ -855,17 +872,23 @@ impl VideoDecoder {
     inner.state = CodecState::Closed;
   }
 
-  /// Fire dequeue event if callback is set
+  /// Fire dequeue event - uses separate RwLock to avoid blocking addEventListener
   /// Also dispatches to EventTarget listeners registered via addEventListener
-  fn fire_dequeue_event(inner: &mut VideoDecoderInner) -> Result<()> {
+  fn fire_dequeue_event(event_state: &Arc<RwLock<EventListenerState>>) -> Result<()> {
+    // Use write lock only briefly to fire callbacks and remove once listeners
+    let mut state = match event_state.write() {
+      Ok(s) => s,
+      Err(_) => return Err(Error::new(Status::GenericFailure, "Lock poisoned")),
+    };
+
     // 1. Fire ondequeue callback
-    if let Some(ref callback) = inner.dequeue_callback {
+    if let Some(ref callback) = state.dequeue_callback {
       callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
     }
 
     // 2. Fire EventTarget listeners
     let mut ids_to_remove = Vec::new();
-    if let Some(listeners) = inner.event_listeners.get("dequeue") {
+    if let Some(listeners) = state.event_listeners.get("dequeue") {
       for entry in listeners {
         entry
           .callback
@@ -878,11 +901,11 @@ impl VideoDecoder {
 
     // 3. Remove "once" listeners
     if !ids_to_remove.is_empty()
-      && let Some(listeners) = inner.event_listeners.get_mut("dequeue")
+      && let Some(listeners) = state.event_listeners.get_mut("dequeue")
     {
       listeners.retain(|e| !ids_to_remove.contains(&e.id));
       if listeners.is_empty() {
-        inner.event_listeners.remove("dequeue");
+        state.event_listeners.remove("dequeue");
       }
     }
 
@@ -919,20 +942,24 @@ impl VideoDecoder {
     env: &Env,
     callback: Option<FunctionRef<(), UnknownReturnValue>>,
   ) -> Result<()> {
-    if let Some(ref callback) = callback {
-      let mut inner = self
-        .inner
-        .lock()
-        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-      inner.dequeue_callback = Some(
-        callback
-          .borrow_back(env)?
+    // Update event_state with ThreadsafeFunction for worker thread
+    let mut state = self
+      .event_state
+      .write()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    state.dequeue_callback = match callback {
+      Some(ref cb) => Some(
+        cb.borrow_back(env)?
           .build_threadsafe_function()
           .callee_handled::<false>()
           .weak::<true>()
           .build()?,
-      );
-    }
+      ),
+      None => None,
+    };
+    drop(state); // Release lock before storing FunctionRef
+
+    // Store FunctionRef for getter (main thread only)
     self.dequeue_callback = callback;
 
     Ok(())
@@ -1390,6 +1417,7 @@ impl VideoDecoder {
     let (sender, receiver) = channel::unbounded();
     self.command_sender = Some(sender);
     let worker_inner = self.inner.clone();
+    let worker_event_state = self.event_state.clone();
     let worker_reset_flag = self.reset_flag.clone();
 
     // Create synchronization channel to wait for worker to be ready
@@ -1399,7 +1427,12 @@ impl VideoDecoder {
     self.worker_handle = Some(std::thread::spawn(move || {
       // Signal that worker is ready before entering the loop
       let _ = ready_sender.send(());
-      Self::worker_loop(worker_inner, receiver, worker_reset_flag);
+      Self::worker_loop(
+        worker_inner,
+        worker_event_state,
+        receiver,
+        worker_reset_flag,
+      );
     }));
 
     // Wait for worker to be ready (prevents race condition)
@@ -1542,6 +1575,7 @@ impl VideoDecoder {
   // ============================================================================
 
   /// Add an event listener for the specified event type
+  /// Uses separate RwLock to avoid blocking on decode operations
   #[napi]
   pub fn add_event_listener(
     &self,
@@ -1550,13 +1584,13 @@ impl VideoDecoder {
     callback: FunctionRef<(), UnknownReturnValue>,
     options: Option<VideoDecoderAddEventListenerOptions>,
   ) -> Result<()> {
-    let mut inner = self
-      .inner
-      .lock()
+    let mut state = self
+      .event_state
+      .write()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    let id = inner.next_listener_id;
-    inner.next_listener_id += 1;
+    let id = state.next_listener_id;
+    state.next_listener_id += 1;
 
     let tsf = callback
       .borrow_back(&env)?
@@ -1571,7 +1605,7 @@ impl VideoDecoder {
       once: options.as_ref().and_then(|o| o.once).unwrap_or(false),
     };
 
-    inner
+    state
       .event_listeners
       .entry(event_type)
       .or_default()
@@ -1587,17 +1621,17 @@ impl VideoDecoder {
     _callback: FunctionRef<(), UnknownReturnValue>,
     _options: Option<VideoDecoderEventListenerOptions>,
   ) -> Result<()> {
-    let mut inner = self
-      .inner
-      .lock()
+    let mut state = self
+      .event_state
+      .write()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     // Note: We can't compare function references directly, so we remove the last added listener
     // for simplicity. A more complete implementation would need to track callback identity.
-    if let Some(listeners) = inner.event_listeners.get_mut(&event_type) {
+    if let Some(listeners) = state.event_listeners.get_mut(&event_type) {
       listeners.pop();
       if listeners.is_empty() {
-        inner.event_listeners.remove(&event_type);
+        state.event_listeners.remove(&event_type);
       }
     }
     Ok(())
@@ -1606,14 +1640,14 @@ impl VideoDecoder {
   /// Dispatch an event to all registered listeners
   #[napi]
   pub fn dispatch_event(&self, event_type: String) -> Result<bool> {
-    let mut inner = self
-      .inner
-      .lock()
+    let mut state = self
+      .event_state
+      .write()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     let mut ids_to_remove = Vec::new();
 
-    if let Some(listeners) = inner.event_listeners.get(&event_type) {
+    if let Some(listeners) = state.event_listeners.get(&event_type) {
       for entry in listeners {
         // Call the listener with no arguments (like dequeue callback)
         entry
@@ -1627,11 +1661,11 @@ impl VideoDecoder {
 
     // Remove "once" listeners
     if !ids_to_remove.is_empty()
-      && let Some(listeners) = inner.event_listeners.get_mut(&event_type)
+      && let Some(listeners) = state.event_listeners.get_mut(&event_type)
     {
       listeners.retain(|e| !ids_to_remove.contains(&e.id));
       if listeners.is_empty() {
-        inner.event_listeners.remove(&event_type);
+        state.event_listeners.remove(&event_type);
       }
     }
 
