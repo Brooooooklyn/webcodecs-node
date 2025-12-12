@@ -299,7 +299,7 @@ impl AudioDecoder {
       let old_size = guard.decode_queue_size;
       guard.decode_queue_size = old_size.saturating_sub(1);
       if old_size > 0 {
-        let _ = Self::fire_dequeue_event(&guard);
+        let _ = Self::fire_dequeue_event(&mut guard);
       }
       Self::report_error(&mut guard, "Decoder not configured");
       return;
@@ -310,7 +310,7 @@ impl AudioDecoder {
       let old_size = guard.decode_queue_size;
       guard.decode_queue_size = old_size.saturating_sub(1);
       if old_size > 0 {
-        let _ = Self::fire_dequeue_event(&guard);
+        let _ = Self::fire_dequeue_event(&mut guard);
       }
       Self::report_error(
         &mut guard,
@@ -326,7 +326,7 @@ impl AudioDecoder {
         let old_size = guard.decode_queue_size;
         guard.decode_queue_size = old_size.saturating_sub(1);
         if old_size > 0 {
-          let _ = Self::fire_dequeue_event(&guard);
+          let _ = Self::fire_dequeue_event(&mut guard);
         }
         Self::report_error(&mut guard, "No decoder context");
         return;
@@ -340,7 +340,7 @@ impl AudioDecoder {
         let old_size = guard.decode_queue_size;
         guard.decode_queue_size = old_size.saturating_sub(1);
         if old_size > 0 {
-          let _ = Self::fire_dequeue_event(&guard);
+          let _ = Self::fire_dequeue_event(&mut guard);
         }
         Self::report_error(&mut guard, &format!("Decode failed: {}", e));
         return;
@@ -353,7 +353,7 @@ impl AudioDecoder {
     let old_size = guard.decode_queue_size;
     guard.decode_queue_size = old_size.saturating_sub(1);
     if old_size > 0 {
-      let _ = Self::fire_dequeue_event(&guard);
+      let _ = Self::fire_dequeue_event(&mut guard);
     }
 
     // Convert internal frames to AudioData and deliver
@@ -440,10 +440,36 @@ impl AudioDecoder {
   }
 
   /// Fire dequeue event if callback is set
-  fn fire_dequeue_event(inner: &AudioDecoderInner) -> Result<()> {
+  /// Also dispatches to EventTarget listeners registered via addEventListener
+  fn fire_dequeue_event(inner: &mut AudioDecoderInner) -> Result<()> {
+    // 1. Fire ondequeue callback
     if let Some(ref callback) = inner.dequeue_callback {
       callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
     }
+
+    // 2. Fire EventTarget listeners
+    let mut ids_to_remove = Vec::new();
+    if let Some(listeners) = inner.event_listeners.get("dequeue") {
+      for entry in listeners {
+        entry
+          .callback
+          .call((), ThreadsafeFunctionCallMode::NonBlocking);
+        if entry.once {
+          ids_to_remove.push(entry.id);
+        }
+      }
+    }
+
+    // 3. Remove "once" listeners
+    if !ids_to_remove.is_empty()
+      && let Some(listeners) = inner.event_listeners.get_mut("dequeue")
+    {
+      listeners.retain(|e| !ids_to_remove.contains(&e.id));
+      if listeners.is_empty() {
+        inner.event_listeners.remove("dequeue");
+      }
+    }
+
     Ok(())
   }
 

@@ -541,7 +541,7 @@ impl VideoEncoder {
             let old_size = guard.encode_queue_size;
             guard.encode_queue_size = old_size.saturating_sub(1);
             if old_size > 0 {
-              let _ = Self::fire_dequeue_event(&guard);
+              let _ = Self::fire_dequeue_event(&mut guard);
             }
           }
         }
@@ -585,7 +585,7 @@ impl VideoEncoder {
       let old_size = guard.encode_queue_size;
       guard.encode_queue_size = old_size.saturating_sub(1);
       if old_size > 0 {
-        let _ = Self::fire_dequeue_event(&guard);
+        let _ = Self::fire_dequeue_event(&mut guard);
       }
       Self::report_error(&mut guard, "Encoder not configured");
       return;
@@ -604,7 +604,7 @@ impl VideoEncoder {
         let old_size = guard.encode_queue_size;
         guard.encode_queue_size = old_size.saturating_sub(1);
         if old_size > 0 {
-          let _ = Self::fire_dequeue_event(&guard);
+          let _ = Self::fire_dequeue_event(&mut guard);
         }
         Self::report_error(&mut guard, "No encoder config");
         return;
@@ -634,7 +634,7 @@ impl VideoEncoder {
             let old_size = guard.encode_queue_size;
             guard.encode_queue_size = old_size.saturating_sub(1);
             if old_size > 0 {
-              let _ = Self::fire_dequeue_event(&guard);
+              let _ = Self::fire_dequeue_event(&mut guard);
             }
             Self::report_error(&mut guard, &format!("Failed to create scaler: {}", e));
             return;
@@ -649,7 +649,7 @@ impl VideoEncoder {
           let old_size = guard.encode_queue_size;
           guard.encode_queue_size = old_size.saturating_sub(1);
           if old_size > 0 {
-            let _ = Self::fire_dequeue_event(&guard);
+            let _ = Self::fire_dequeue_event(&mut guard);
           }
           Self::report_error(&mut guard, &format!("Failed to scale frame: {}", e));
           return;
@@ -688,7 +688,7 @@ impl VideoEncoder {
         let old_size = guard.encode_queue_size;
         guard.encode_queue_size = old_size.saturating_sub(1);
         if old_size > 0 {
-          let _ = Self::fire_dequeue_event(&guard);
+          let _ = Self::fire_dequeue_event(&mut guard);
         }
         Self::report_error(&mut guard, "No encoder context");
         return;
@@ -782,7 +782,7 @@ impl VideoEncoder {
             let old_size = guard.encode_queue_size;
             guard.encode_queue_size = old_size.saturating_sub(1);
             if old_size > 0 {
-              let _ = Self::fire_dequeue_event(&guard);
+              let _ = Self::fire_dequeue_event(&mut guard);
             }
             return;
           }
@@ -818,7 +818,7 @@ impl VideoEncoder {
         let old_size = guard.encode_queue_size;
         guard.encode_queue_size = old_size.saturating_sub(1);
         if old_size > 0 {
-          let _ = Self::fire_dequeue_event(&guard);
+          let _ = Self::fire_dequeue_event(&mut guard);
         }
         return;
       }
@@ -856,7 +856,7 @@ impl VideoEncoder {
             let old_size = guard.encode_queue_size;
             guard.encode_queue_size = old_size.saturating_sub(1);
             if old_size > 0 {
-              let _ = Self::fire_dequeue_event(&guard);
+              let _ = Self::fire_dequeue_event(&mut guard);
             }
             let codec = guard
               .config
@@ -951,7 +951,7 @@ impl VideoEncoder {
               let old_size = guard.encode_queue_size;
               guard.encode_queue_size = old_size.saturating_sub(1);
               if old_size > 0 {
-                let _ = Self::fire_dequeue_event(&guard);
+                let _ = Self::fire_dequeue_event(&mut guard);
               }
               return;
             } else {
@@ -961,7 +961,7 @@ impl VideoEncoder {
               let old_size = guard.encode_queue_size;
               guard.encode_queue_size = old_size.saturating_sub(1);
               if old_size > 0 {
-                let _ = Self::fire_dequeue_event(&guard);
+                let _ = Self::fire_dequeue_event(&mut guard);
               }
               let codec = guard
                 .config
@@ -1000,7 +1000,7 @@ impl VideoEncoder {
     let old_size = guard.encode_queue_size;
     guard.encode_queue_size = old_size.saturating_sub(1);
     if old_size > 0 {
-      let _ = Self::fire_dequeue_event(&guard);
+      let _ = Self::fire_dequeue_event(&mut guard);
     }
 
     // Process output packets - call callback for each
@@ -1286,10 +1286,36 @@ impl VideoEncoder {
   }
 
   /// Fire dequeue event if callback is set
-  fn fire_dequeue_event(inner: &VideoEncoderInner) -> Result<()> {
+  /// Also dispatches to EventTarget listeners registered via addEventListener
+  fn fire_dequeue_event(inner: &mut VideoEncoderInner) -> Result<()> {
+    // 1. Fire ondequeue callback
     if let Some(ref callback) = inner.dequeue_callback {
       callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
     }
+
+    // 2. Fire EventTarget listeners
+    let mut ids_to_remove = Vec::new();
+    if let Some(listeners) = inner.event_listeners.get("dequeue") {
+      for entry in listeners {
+        entry
+          .callback
+          .call((), ThreadsafeFunctionCallMode::NonBlocking);
+        if entry.once {
+          ids_to_remove.push(entry.id);
+        }
+      }
+    }
+
+    // 3. Remove "once" listeners
+    if !ids_to_remove.is_empty()
+      && let Some(listeners) = inner.event_listeners.get_mut("dequeue")
+    {
+      listeners.retain(|e| !ids_to_remove.contains(&e.id));
+      if listeners.is_empty() {
+        inner.event_listeners.remove("dequeue");
+      }
+    }
+
     Ok(())
   }
 

@@ -372,7 +372,7 @@ impl AudioEncoder {
       let old_size = guard.encode_queue_size;
       guard.encode_queue_size = old_size.saturating_sub(1);
       if old_size > 0 {
-        let _ = Self::fire_dequeue_event(&guard);
+        let _ = Self::fire_dequeue_event(&mut guard);
       }
       Self::report_error(&mut guard, "Encoder not configured");
       return;
@@ -390,7 +390,7 @@ impl AudioEncoder {
         let old_size = guard.encode_queue_size;
         guard.encode_queue_size = old_size.saturating_sub(1);
         if old_size > 0 {
-          let _ = Self::fire_dequeue_event(&guard);
+          let _ = Self::fire_dequeue_event(&mut guard);
         }
         Self::report_error(&mut guard, "No encoder config");
         return;
@@ -405,7 +405,7 @@ impl AudioEncoder {
           let old_size = guard.encode_queue_size;
           guard.encode_queue_size = old_size.saturating_sub(1);
           if old_size > 0 {
-            let _ = Self::fire_dequeue_event(&guard);
+            let _ = Self::fire_dequeue_event(&mut guard);
           }
           Self::report_error(&mut guard, "No sample buffer");
           return;
@@ -416,7 +416,7 @@ impl AudioEncoder {
         let old_size = guard.encode_queue_size;
         guard.encode_queue_size = old_size.saturating_sub(1);
         if old_size > 0 {
-          let _ = Self::fire_dequeue_event(&guard);
+          let _ = Self::fire_dequeue_event(&mut guard);
         }
         Self::report_error(&mut guard, &format!("Failed to add samples: {}", e));
         return;
@@ -457,7 +457,7 @@ impl AudioEncoder {
           let old_size = guard.encode_queue_size;
           guard.encode_queue_size = old_size.saturating_sub(1);
           if old_size > 0 {
-            let _ = Self::fire_dequeue_event(&guard);
+            let _ = Self::fire_dequeue_event(&mut guard);
           }
           Self::report_error(&mut guard, "No sample buffer");
           return;
@@ -476,7 +476,7 @@ impl AudioEncoder {
             let old_size = guard.encode_queue_size;
             guard.encode_queue_size = old_size.saturating_sub(1);
             if old_size > 0 {
-              let _ = Self::fire_dequeue_event(&guard);
+              let _ = Self::fire_dequeue_event(&mut guard);
             }
             Self::report_error(&mut guard, "No sample buffer");
             return;
@@ -488,7 +488,7 @@ impl AudioEncoder {
             let old_size = guard.encode_queue_size;
             guard.encode_queue_size = old_size.saturating_sub(1);
             if old_size > 0 {
-              let _ = Self::fire_dequeue_event(&guard);
+              let _ = Self::fire_dequeue_event(&mut guard);
             }
             Self::report_error(&mut guard, "No frame available");
             return;
@@ -497,7 +497,7 @@ impl AudioEncoder {
             let old_size = guard.encode_queue_size;
             guard.encode_queue_size = old_size.saturating_sub(1);
             if old_size > 0 {
-              let _ = Self::fire_dequeue_event(&guard);
+              let _ = Self::fire_dequeue_event(&mut guard);
             }
             Self::report_error(&mut guard, &format!("Failed to get frame: {}", e));
             return;
@@ -522,7 +522,7 @@ impl AudioEncoder {
           let old_size = guard.encode_queue_size;
           guard.encode_queue_size = old_size.saturating_sub(1);
           if old_size > 0 {
-            let _ = Self::fire_dequeue_event(&guard);
+            let _ = Self::fire_dequeue_event(&mut guard);
           }
           Self::report_error(&mut guard, "No encoder context");
           return;
@@ -535,7 +535,7 @@ impl AudioEncoder {
           let old_size = guard.encode_queue_size;
           guard.encode_queue_size = old_size.saturating_sub(1);
           if old_size > 0 {
-            let _ = Self::fire_dequeue_event(&guard);
+            let _ = Self::fire_dequeue_event(&mut guard);
           }
           Self::report_error(&mut guard, &format!("Encode failed: {}", e));
           return;
@@ -604,25 +604,15 @@ impl AudioEncoder {
       }
     }
 
-    // Decrement queue size and prepare to fire dequeue event (only if queue was not empty)
+    // Decrement queue size and fire dequeue event (only if queue was not empty)
     let old_size = guard.encode_queue_size;
     guard.encode_queue_size = old_size.saturating_sub(1);
-    let dequeue_callback = if old_size > 0 {
-      guard.dequeue_callback.clone()
-    } else {
-      None
-    };
 
-    // Release mutex BEFORE calling dequeue callback to avoid deadlock
-    // (callback may read encodeQueueSize which needs the mutex)
-    drop(guard);
-
-    // Fire dequeue event with NonBlocking mode
-    // Note: With NonBlocking, callbacks may not see the exact queue size at time of dequeue.
-    // This is acceptable per W3C spec which only requires the event to fire when an item
-    // is removed, not that the callback sees a specific queue state.
-    if let Some(ref callback) = dequeue_callback {
-      callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+    // Fire dequeue event if queue was not empty
+    // Note: Using NonBlocking mode means callbacks are scheduled asynchronously,
+    // so holding the mutex during the call is safe (no re-entrancy deadlock).
+    if old_size > 0 {
+      let _ = Self::fire_dequeue_event(&mut guard);
     }
   }
 
@@ -756,10 +746,36 @@ impl AudioEncoder {
   }
 
   /// Fire dequeue event if callback is set
-  fn fire_dequeue_event(inner: &AudioEncoderInner) -> Result<()> {
+  /// Also dispatches to EventTarget listeners registered via addEventListener
+  fn fire_dequeue_event(inner: &mut AudioEncoderInner) -> Result<()> {
+    // 1. Fire ondequeue callback
     if let Some(ref callback) = inner.dequeue_callback {
       callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
     }
+
+    // 2. Fire EventTarget listeners
+    let mut ids_to_remove = Vec::new();
+    if let Some(listeners) = inner.event_listeners.get("dequeue") {
+      for entry in listeners {
+        entry
+          .callback
+          .call((), ThreadsafeFunctionCallMode::NonBlocking);
+        if entry.once {
+          ids_to_remove.push(entry.id);
+        }
+      }
+    }
+
+    // 3. Remove "once" listeners
+    if !ids_to_remove.is_empty()
+      && let Some(listeners) = inner.event_listeners.get_mut("dequeue")
+    {
+      listeners.retain(|e| !ids_to_remove.contains(&e.id));
+      if listeners.is_empty() {
+        inner.event_listeners.remove("dequeue");
+      }
+    }
+
     Ok(())
   }
 

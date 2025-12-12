@@ -375,7 +375,7 @@ impl VideoDecoder {
             let old_size = guard.decode_queue_size;
             guard.decode_queue_size = old_size.saturating_sub(1);
             if old_size > 0 {
-              let _ = Self::fire_dequeue_event(&guard);
+              let _ = Self::fire_dequeue_event(&mut guard);
             }
           }
         }
@@ -413,7 +413,7 @@ impl VideoDecoder {
       let old_size = guard.decode_queue_size;
       guard.decode_queue_size = old_size.saturating_sub(1);
       if old_size > 0 {
-        let _ = Self::fire_dequeue_event(&guard);
+        let _ = Self::fire_dequeue_event(&mut guard);
       }
       Self::report_error(&mut guard, "Decoder not configured");
       return;
@@ -433,7 +433,7 @@ impl VideoDecoder {
         let old_size = guard.decode_queue_size;
         guard.decode_queue_size = old_size.saturating_sub(1);
         if old_size > 0 {
-          let _ = Self::fire_dequeue_event(&guard);
+          let _ = Self::fire_dequeue_event(&mut guard);
         }
         Self::report_error(&mut guard, &e.reason);
         return;
@@ -495,7 +495,7 @@ impl VideoDecoder {
         let old_size = guard.decode_queue_size;
         guard.decode_queue_size = old_size.saturating_sub(1);
         if old_size > 0 {
-          let _ = Self::fire_dequeue_event(&guard);
+          let _ = Self::fire_dequeue_event(&mut guard);
         }
         Self::report_error(&mut guard, "No decoder context");
         return;
@@ -514,7 +514,7 @@ impl VideoDecoder {
               let old_size = guard.decode_queue_size;
               guard.decode_queue_size = old_size.saturating_sub(1);
               if old_size > 0 {
-                let _ = Self::fire_dequeue_event(&guard);
+                let _ = Self::fire_dequeue_event(&mut guard);
               }
               Self::report_error(
                 &mut guard,
@@ -530,7 +530,7 @@ impl VideoDecoder {
                 let old_size = guard.decode_queue_size;
                 guard.decode_queue_size = old_size.saturating_sub(1);
                 if old_size > 0 {
-                  let _ = Self::fire_dequeue_event(&guard);
+                  let _ = Self::fire_dequeue_event(&mut guard);
                 }
                 drop(guard);
                 Self::redecode_pending_chunks(inner, pending);
@@ -544,7 +544,7 @@ impl VideoDecoder {
         let old_size = guard.decode_queue_size;
         guard.decode_queue_size = old_size.saturating_sub(1);
         if old_size > 0 {
-          let _ = Self::fire_dequeue_event(&guard);
+          let _ = Self::fire_dequeue_event(&mut guard);
         }
         Self::report_error(&mut guard, &format!("Decode failed: {}", e));
         return;
@@ -557,7 +557,7 @@ impl VideoDecoder {
     let old_size = guard.decode_queue_size;
     guard.decode_queue_size = old_size.saturating_sub(1);
     if old_size > 0 {
-      let _ = Self::fire_dequeue_event(&guard);
+      let _ = Self::fire_dequeue_event(&mut guard);
     }
 
     // Check for silent failure (hardware decoder, no frames produced)
@@ -856,10 +856,36 @@ impl VideoDecoder {
   }
 
   /// Fire dequeue event if callback is set
-  fn fire_dequeue_event(inner: &VideoDecoderInner) -> Result<()> {
+  /// Also dispatches to EventTarget listeners registered via addEventListener
+  fn fire_dequeue_event(inner: &mut VideoDecoderInner) -> Result<()> {
+    // 1. Fire ondequeue callback
     if let Some(ref callback) = inner.dequeue_callback {
       callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
     }
+
+    // 2. Fire EventTarget listeners
+    let mut ids_to_remove = Vec::new();
+    if let Some(listeners) = inner.event_listeners.get("dequeue") {
+      for entry in listeners {
+        entry
+          .callback
+          .call((), ThreadsafeFunctionCallMode::NonBlocking);
+        if entry.once {
+          ids_to_remove.push(entry.id);
+        }
+      }
+    }
+
+    // 3. Remove "once" listeners
+    if !ids_to_remove.is_empty()
+      && let Some(listeners) = inner.event_listeners.get_mut("dequeue")
+    {
+      listeners.retain(|e| !ids_to_remove.contains(&e.id));
+      if listeners.is_empty() {
+        inner.event_listeners.remove("dequeue");
+      }
+    }
+
     Ok(())
   }
 
