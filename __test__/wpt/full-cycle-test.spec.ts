@@ -17,15 +17,12 @@ import {
   VideoEncoder,
   VideoFrame,
   type EncodedVideoChunkMetadata,
+  type VideoEncoderEncodeOptions,
+  type VideoColorPrimaries,
+  type VideoMatrixCoefficients,
+  type VideoTransferCharacteristics,
 } from '../../index.js'
-import type {
-  VideoColorPrimaries,
-  VideoDecoderConfig,
-  VideoEncoderConfig,
-  VideoEncoderEncodeOptions,
-  VideoMatrixCoefficients,
-  VideoTransferCharacteristics,
-} from '../../standard.js'
+import type { VideoDecoderConfig, VideoEncoderConfig } from '../../standard.js'
 
 import {
   checkEncoderSupport,
@@ -222,7 +219,11 @@ test.serial('Full cycle: AV1 - basic encoding and decoding', async (t) => {
 
 test.serial('Full cycle: AV1 - realtime latency mode', async (t) => {
   const config = createEncoderConfig('av1')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: true }, { realTimeLatencyMode: true })
+  await runFullCycleTest(
+    t,
+    { ...config, hasEmbeddedColorSpace: ENCODER_CONFIGS.av1.hasEmbeddedColorSpace },
+    { realTimeLatencyMode: true },
+  )
 })
 
 test.serial('Full cycle: AV1 - stripped color space', async (t) => {
@@ -230,14 +231,18 @@ test.serial('Full cycle: AV1 - stripped color space', async (t) => {
   if (ENCODER_CONFIGS.av1.hasEmbeddedColorSpace) {
     await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: true }, { stripDecoderConfigColorSpace: true })
   } else {
-    t.pass('Skipped: codec does not have embedded color space')
+    t.pass('Skipped: FFmpeg does not extract embedded color space')
   }
 })
 
 // Skip: Rate control with mid-stream reconfiguration is covered in reconfiguring-encoder.spec.ts
 test.skip('Full cycle: AV1 - rate control', async (t) => {
   const config = createEncoderConfig('av1')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: true }, { rateControl: true })
+  await runFullCycleTest(
+    t,
+    { ...config, hasEmbeddedColorSpace: ENCODER_CONFIGS.av1.hasEmbeddedColorSpace },
+    { rateControl: true },
+  )
 })
 
 // ============================================================================
@@ -254,13 +259,21 @@ test.serial('Full cycle: VP8 - basic encoding and decoding', async (t) => {
 
 test.serial('Full cycle: VP8 - realtime latency mode', async (t) => {
   const config = createEncoderConfig('vp8')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: false }, { realTimeLatencyMode: true })
+  await runFullCycleTest(
+    t,
+    { ...config, hasEmbeddedColorSpace: ENCODER_CONFIGS.vp8.hasEmbeddedColorSpace },
+    { realTimeLatencyMode: true },
+  )
 })
 
 // Skip: Rate control with mid-stream reconfiguration is covered in reconfiguring-encoder.spec.ts
 test.skip('Full cycle: VP8 - rate control', async (t) => {
   const config = createEncoderConfig('vp8')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: false }, { rateControl: true })
+  await runFullCycleTest(
+    t,
+    { ...config, hasEmbeddedColorSpace: ENCODER_CONFIGS.vp8.hasEmbeddedColorSpace },
+    { rateControl: true },
+  )
 })
 
 // ============================================================================
@@ -277,18 +290,30 @@ test.serial('Full cycle: VP9 Profile 0 - basic encoding and decoding', async (t)
 
 test.serial('Full cycle: VP9 Profile 0 - realtime latency mode', async (t) => {
   const config = createEncoderConfig('vp9_p0')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: true }, { realTimeLatencyMode: true })
+  await runFullCycleTest(
+    t,
+    { ...config, hasEmbeddedColorSpace: ENCODER_CONFIGS.vp9_p0.hasEmbeddedColorSpace },
+    { realTimeLatencyMode: true },
+  )
 })
 
 test.serial('Full cycle: VP9 Profile 0 - stripped color space', async (t) => {
   const config = createEncoderConfig('vp9_p0')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: true }, { stripDecoderConfigColorSpace: true })
+  if (ENCODER_CONFIGS.vp9_p0.hasEmbeddedColorSpace) {
+    await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: true }, { stripDecoderConfigColorSpace: true })
+  } else {
+    t.pass('Skipped: FFmpeg does not extract embedded color space')
+  }
 })
 
 // Skip: Rate control with mid-stream reconfiguration is covered in reconfiguring-encoder.spec.ts
 test.skip('Full cycle: VP9 Profile 0 - rate control', async (t) => {
   const config = createEncoderConfig('vp9_p0')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: true }, { rateControl: true })
+  await runFullCycleTest(
+    t,
+    { ...config, hasEmbeddedColorSpace: ENCODER_CONFIGS.vp9_p0.hasEmbeddedColorSpace },
+    { rateControl: true },
+  )
 })
 
 test.serial('Full cycle: VP9 Profile 2 (10-bit) - basic encoding and decoding', async (t) => {
@@ -313,18 +338,30 @@ test.serial('Full cycle: H.264 AVC - basic encoding and decoding', async (t) => 
 
 test.serial('Full cycle: H.264 AVC - realtime latency mode', async (t) => {
   const config = createEncoderConfig('h264_avc')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: true }, { realTimeLatencyMode: true })
+  await runFullCycleTest(
+    t,
+    { ...config, hasEmbeddedColorSpace: ENCODER_CONFIGS.h264_avc.hasEmbeddedColorSpace },
+    { realTimeLatencyMode: true },
+  )
 })
 
 test.serial('Full cycle: H.264 AVC - stripped color space', async (t) => {
   const config = createEncoderConfig('h264_avc')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: true }, { stripDecoderConfigColorSpace: true })
+  if (ENCODER_CONFIGS.h264_avc.hasEmbeddedColorSpace) {
+    await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: true }, { stripDecoderConfigColorSpace: true })
+  } else {
+    t.pass('Skipped: FFmpeg does not extract embedded color space')
+  }
 })
 
 // Skip: Rate control with mid-stream reconfiguration is covered in reconfiguring-encoder.spec.ts
 test.skip('Full cycle: H.264 AVC - rate control', async (t) => {
   const config = createEncoderConfig('h264_avc')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: true }, { rateControl: true })
+  await runFullCycleTest(
+    t,
+    { ...config, hasEmbeddedColorSpace: ENCODER_CONFIGS.h264_avc.hasEmbeddedColorSpace },
+    { rateControl: true },
+  )
 })
 
 test.serial('Full cycle: H.264 Annex B - basic encoding and decoding', async (t) => {
@@ -337,7 +374,11 @@ test.serial('Full cycle: H.264 Annex B - basic encoding and decoding', async (t)
 
 test.serial('Full cycle: H.264 Annex B - realtime latency mode', async (t) => {
   const config = createEncoderConfig('h264_annexb')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: true }, { realTimeLatencyMode: true })
+  await runFullCycleTest(
+    t,
+    { ...config, hasEmbeddedColorSpace: ENCODER_CONFIGS.h264_annexb.hasEmbeddedColorSpace },
+    { realTimeLatencyMode: true },
+  )
 })
 
 // ============================================================================
@@ -354,18 +395,30 @@ test.serial('Full cycle: H.265 HEVC - basic encoding and decoding', async (t) =>
 
 test.serial('Full cycle: H.265 HEVC - realtime latency mode', async (t) => {
   const config = createEncoderConfig('h265_hevc')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: true }, { realTimeLatencyMode: true })
+  await runFullCycleTest(
+    t,
+    { ...config, hasEmbeddedColorSpace: ENCODER_CONFIGS.h265_hevc.hasEmbeddedColorSpace },
+    { realTimeLatencyMode: true },
+  )
 })
 
 test.serial('Full cycle: H.265 HEVC - stripped color space', async (t) => {
   const config = createEncoderConfig('h265_hevc')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: true }, { stripDecoderConfigColorSpace: true })
+  if (ENCODER_CONFIGS.h265_hevc.hasEmbeddedColorSpace) {
+    await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: true }, { stripDecoderConfigColorSpace: true })
+  } else {
+    t.pass('Skipped: FFmpeg does not extract embedded color space')
+  }
 })
 
 // Skip: Rate control with mid-stream reconfiguration is covered in reconfiguring-encoder.spec.ts
 test.skip('Full cycle: H.265 HEVC - rate control', async (t) => {
   const config = createEncoderConfig('h265_hevc')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: true }, { rateControl: true })
+  await runFullCycleTest(
+    t,
+    { ...config, hasEmbeddedColorSpace: ENCODER_CONFIGS.h265_hevc.hasEmbeddedColorSpace },
+    { rateControl: true },
+  )
 })
 
 test.serial('Full cycle: H.265 Annex B - basic encoding and decoding', async (t) => {
@@ -378,5 +431,9 @@ test.serial('Full cycle: H.265 Annex B - basic encoding and decoding', async (t)
 
 test.serial('Full cycle: H.265 Annex B - realtime latency mode', async (t) => {
   const config = createEncoderConfig('h265_annexb')
-  await runFullCycleTest(t, { ...config, hasEmbeddedColorSpace: true }, { realTimeLatencyMode: true })
+  await runFullCycleTest(
+    t,
+    { ...config, hasEmbeddedColorSpace: ENCODER_CONFIGS.h265_annexb.hasEmbeddedColorSpace },
+    { realTimeLatencyMode: true },
+  )
 })

@@ -8,6 +8,7 @@
 import test from 'ava'
 
 import { resetHardwareFallbackState, VideoEncoder, VideoDecoder, VideoFrame } from '../../index.js'
+import type { EncodedVideoChunkMetadata, VideoDecoderConfig } from '../../index.js'
 import {
   generateSolidColorI420Frame,
   generateFrameSequence,
@@ -22,18 +23,24 @@ test.beforeEach(() => {
 })
 
 // Helper to create test encoder with callbacks
+// Captures decoderConfig from first chunk's metadata for proper AVCC format handling
 function createTestEncoder() {
   const chunks: EncodedVideoChunk[] = []
   const errors: Error[] = []
+  let decoderConfig: VideoDecoderConfig | undefined
 
   const encoder = new VideoEncoder({
-    output: (chunk, _metadata) => {
+    output: (chunk, metadata?: EncodedVideoChunkMetadata) => {
       chunks.push(chunk)
+      // Capture decoderConfig from first chunk (contains description for AVCC format)
+      if (!decoderConfig && metadata?.decoderConfig) {
+        decoderConfig = metadata.decoderConfig as VideoDecoderConfig
+      }
     },
     error: (e) => errors.push(e),
   })
 
-  return { encoder, chunks, errors }
+  return { encoder, chunks, errors, getDecoderConfig: () => decoderConfig }
 }
 
 // Helper to create test decoder with callbacks
@@ -134,7 +141,7 @@ test('lifecycle: encoder close releases resources', async (t) => {
 
 test('lifecycle: decoder close releases resources', async (t) => {
   // First create some encoded chunks
-  const { encoder, chunks } = createTestEncoder()
+  const { encoder, chunks, getDecoderConfig } = createTestEncoder()
   encoder.configure(createEncoderConfig('h264', 320, 240))
   const frame = generateSolidColorI420Frame(320, 240, TestColors.blue, 0)
   encoder.encode(frame, { keyFrame: true })
@@ -142,9 +149,13 @@ test('lifecycle: decoder close releases resources', async (t) => {
   await encoder.flush()
   encoder.close()
 
-  // Decode
+  // Decode - use decoderConfig from encoder metadata (includes description for AVCC format)
   const { decoder, frames: decodedFrames } = createTestDecoder()
-  decoder.configure(createDecoderConfig('h264', { codedWidth: 320, codedHeight: 240 }))
+  const decoderConfig = getDecoderConfig()
+  decoder.configure({
+    ...createDecoderConfig('h264', { codedWidth: 320, codedHeight: 240 }),
+    description: decoderConfig?.description,
+  })
   for (const chunk of chunks) {
     decoder.decode(chunk)
   }

@@ -225,6 +225,10 @@ struct AudioEncoderInner {
   /// Cached AAC parameters for ADTS header generation
   /// (sample_rate_index, channel_config)
   adts_params: Option<(u8, u8)>,
+  /// Cached decoder config for FLAC - W3C FLAC codec spec requires decoderConfig on every chunk
+  /// See: https://w3c.github.io/webcodecs/flac_codec_registration.html
+  /// Stores (codec, sample_rate, number_of_channels, description_bytes)
+  cached_flac_decoder_config: Option<(String, f64, u32, Option<Vec<u8>>)>,
 }
 
 /// AudioEncoder - WebCodecs-compliant audio encoder
@@ -324,6 +328,7 @@ impl AudioEncoder {
       had_error: false,
       use_adts: false,
       adts_params: None,
+      cached_flac_decoder_config: None,
     };
 
     let inner = Arc::new(Mutex::new(inner));
@@ -438,16 +443,19 @@ impl AudioEncoder {
       }
     }
 
+    // Check if codec is FLAC - W3C FLAC spec requires decoderConfig on every chunk
+    let is_flac = codec_string.to_lowercase() == "flac";
+
     // Get extradata before encoding first frame
     // For FLAC, prepend the "fLaC" header since FFmpeg only returns raw STREAMINFO
-    let extradata = if !guard.extradata_sent {
+    // Note: For FLAC, we always try to get extradata because it may not be available
+    // until after encoding starts, but we need it on every chunk per W3C spec
+    let extradata = if !guard.extradata_sent || is_flac {
       let raw_extradata = guard
         .context
         .as_ref()
         .and_then(|ctx| ctx.extradata().map(|d| d.to_vec()));
 
-      // Check if codec is FLAC and prepend header if needed
-      let is_flac = codec_string.to_lowercase() == "flac";
       raw_extradata.map(|data| {
         if is_flac {
           prepend_flac_header(&data)
@@ -579,7 +587,32 @@ impl AudioEncoder {
         );
 
         // Create metadata
-        let metadata = if !guard.extradata_sent {
+        // W3C FLAC codec spec requires decoderConfig on every chunk
+        // See: https://w3c.github.io/webcodecs/flac_codec_registration.html
+        let metadata = if is_flac {
+          // FLAC: Always include decoderConfig with fresh extradata on every chunk
+          let (target_sample_rate, target_channels) = guard
+            .config
+            .as_ref()
+            .map(|c| {
+              (
+                c.sample_rate.unwrap_or(48000.0),
+                c.number_of_channels.unwrap_or(2),
+              )
+            })
+            .unwrap_or((48000.0, 2));
+
+          guard.extradata_sent = true;
+          EncodedAudioChunkMetadata {
+            decoder_config: Some(AudioDecoderConfigOutput {
+              codec: codec_string.clone(),
+              sample_rate: Some(target_sample_rate),
+              number_of_channels: Some(target_channels),
+              description: extradata.clone().map(Uint8Array::from),
+            }),
+          }
+        } else if !guard.extradata_sent {
+          // Non-FLAC: Only send decoderConfig on first chunk
           guard.extradata_sent = true;
           let (target_sample_rate, target_channels) = guard
             .config
@@ -656,6 +689,29 @@ impl AudioEncoder {
         ));
       }
 
+      // Check if FLAC - W3C FLAC spec requires decoderConfig on every chunk
+      let is_flac = guard
+        .config
+        .as_ref()
+        .is_some_and(|c| c.codec.as_deref().unwrap_or("").to_lowercase() == "flac");
+
+      // Get config info for FLAC metadata
+      let (codec_string, target_sample_rate, target_channels) = guard
+        .config
+        .as_ref()
+        .map(|c| {
+          (
+            c.codec.clone().unwrap_or_default(),
+            c.sample_rate.unwrap_or(48000.0),
+            c.number_of_channels.unwrap_or(2),
+          )
+        })
+        .unwrap_or_default();
+
+      // Helper to get FLAC extradata with header
+      let get_flac_extradata =
+        |ctx: &CodecContext| -> Option<Vec<u8>> { ctx.extradata().map(prepend_flac_header) };
+
       // Flush any remaining samples in buffer
       if let Some(ref mut sample_buffer) = guard.sample_buffer
         && let Ok(Some(mut frame)) = sample_buffer.flush()
@@ -686,6 +742,12 @@ impl AudioEncoder {
           } else {
             None
           };
+          // Get fresh extradata for FLAC
+          let extradata = if is_flac {
+            guard.context.as_ref().and_then(get_flac_extradata)
+          } else {
+            None
+          };
           for packet in packets {
             let output_timestamp = guard.timestamp_queue.pop_front();
             let chunk = EncodedAudioChunk::from_packet_with_adts(
@@ -694,9 +756,18 @@ impl AudioEncoder {
               output_timestamp,
               adts_params,
             );
-            let metadata = EncodedAudioChunkMetadata {
-              decoder_config: None,
+            // FLAC requires decoderConfig on every chunk per W3C spec
+            let decoder_config = if is_flac {
+              Some(AudioDecoderConfigOutput {
+                codec: codec_string.clone(),
+                sample_rate: Some(target_sample_rate),
+                number_of_channels: Some(target_channels),
+                description: extradata.clone().map(Uint8Array::from),
+              })
+            } else {
+              None
             };
+            let metadata = EncodedAudioChunkMetadata { decoder_config };
             // Always queue during flush for synchronous delivery
             guard.pending_chunks.push((chunk, metadata));
           }
@@ -726,13 +797,28 @@ impl AudioEncoder {
       } else {
         None
       };
+      // Get fresh extradata for FLAC
+      let extradata = if is_flac {
+        guard.context.as_ref().and_then(get_flac_extradata)
+      } else {
+        None
+      };
       for packet in packets {
         let output_timestamp = guard.timestamp_queue.pop_front();
         let chunk =
           EncodedAudioChunk::from_packet_with_adts(&packet, None, output_timestamp, adts_params);
-        let metadata = EncodedAudioChunkMetadata {
-          decoder_config: None,
+        // FLAC requires decoderConfig on every chunk per W3C spec
+        let decoder_config = if is_flac {
+          Some(AudioDecoderConfigOutput {
+            codec: codec_string.clone(),
+            sample_rate: Some(target_sample_rate),
+            number_of_channels: Some(target_channels),
+            description: extradata.clone().map(Uint8Array::from),
+          })
+        } else {
+          None
         };
+        let metadata = EncodedAudioChunkMetadata { decoder_config };
         // Always queue during flush for synchronous delivery
         guard.pending_chunks.push((chunk, metadata));
       }
@@ -1342,6 +1428,7 @@ impl AudioEncoder {
     inner.state = CodecState::Unconfigured;
     inner.frame_count = 0;
     inner.extradata_sent = false;
+    inner.cached_flac_decoder_config = None;
     inner.encode_queue_size = 0;
     inner.timestamp_queue.clear();
     inner.base_timestamp = None;

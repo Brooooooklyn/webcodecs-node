@@ -14,6 +14,11 @@
  */
 export type BufferSource = ArrayBufferView | ArrayBuffer
 
+/**
+ * AllowSharedBufferSource per WebIDL spec - includes SharedArrayBuffer
+ */
+export type AllowSharedBufferSource = ArrayBuffer | SharedArrayBuffer | ArrayBufferView
+
 // ============================================================================
 // EncodedVideoChunk Types
 // ============================================================================
@@ -149,15 +154,6 @@ export interface HevcEncoderConfig {
   format?: 'hevc' | 'annexb'
 }
 
-/**
- * VideoEncoder encode options
- * @see https://w3c.github.io/webcodecs/#dictdef-videoencoderencodeptions
- */
-export interface VideoEncoderEncodeOptions {
-  /** Force keyframe */
-  keyFrame?: boolean
-}
-
 // ============================================================================
 // VideoDecoder Types
 // ============================================================================
@@ -277,7 +273,28 @@ export interface AudioDecoderConfig {
  * Pixel format for video frames
  * @see https://w3c.github.io/webcodecs/#enumdef-videoframepixelformat
  */
-export type VideoPixelFormat = 'I420' | 'I420A' | 'I422' | 'I444' | 'NV12' | 'RGBA' | 'RGBX' | 'BGRA' | 'BGRX'
+export type VideoPixelFormat =
+  | 'I420'
+  | 'I420A'
+  | 'I422'
+  | 'I422A'
+  | 'I444'
+  | 'I444A'
+  | 'I420P10'
+  | 'I420AP10'
+  | 'I422P10'
+  | 'I422AP10'
+  | 'I444P10'
+  | 'I444AP10'
+  | 'I420P12'
+  | 'I422P12'
+  | 'I444P12'
+  | 'NV12'
+  | 'NV21'
+  | 'RGBA'
+  | 'RGBX'
+  | 'BGRA'
+  | 'BGRX'
 
 /**
  * VideoFrame buffer init
@@ -300,38 +317,6 @@ export interface VideoFrameBufferInit {
   displayHeight?: number
   /** Color space */
   colorSpace?: VideoColorSpaceInit
-}
-
-/**
- * VideoFrame copy-to options
- * @see https://w3c.github.io/webcodecs/#dictdef-videoframecopytoptions
- */
-export interface VideoFrameCopyToOptions {
-  /** Rectangle to copy */
-  rect?: DOMRectInit
-  /** Plane layouts */
-  layout?: PlaneLayout[]
-}
-
-/**
- * Plane layout for video frame data
- * @see https://w3c.github.io/webcodecs/#dictdef-planelayout
- */
-export interface PlaneLayout {
-  /** Offset in bytes */
-  offset: number
-  /** Stride in bytes */
-  stride: number
-}
-
-/**
- * DOMRect init dictionary
- */
-export interface DOMRectInit {
-  x?: number
-  y?: number
-  width?: number
-  height?: number
 }
 
 // ============================================================================
@@ -402,21 +387,6 @@ export interface AudioDataInit {
   transfer?: ArrayBuffer[]
 }
 
-/**
- * AudioData copy-to options
- * @see https://w3c.github.io/webcodecs/#dictdef-audiodatacopytoptions
- */
-export interface AudioDataCopyToOptions {
-  /** Plane index (for planar formats) */
-  planeIndex: number
-  /** Frame offset */
-  frameOffset?: number
-  /** Frame count */
-  frameCount?: number
-  /** Output format */
-  format?: AudioSampleFormat
-}
-
 // ============================================================================
 // ImageDecoder Types
 // ============================================================================
@@ -441,35 +411,3 @@ export interface ImageDecoderInit {
   /** ArrayBuffers to transfer */
   transfer?: ArrayBuffer[]
 }
-
-/**
- * ImageDecoder decode options
- * @see https://w3c.github.io/webcodecs/#dictdef-imagedecodeoptions
- */
-export interface ImageDecodeOptions {
-  /** Frame index */
-  frameIndex?: number
-  /** Complete frames only */
-  completeFramesOnly?: boolean
-}
-
-/**
- * ImageDecoder decode result
- * @see https://w3c.github.io/webcodecs/#dictdef-imagedecoderesult
- */
-export interface ImageDecodeResult {
-  /** Decoded image as VideoFrame */
-  image: import('./index').VideoFrame
-  /** Whether decoding is complete */
-  complete: boolean
-}
-
-// ============================================================================
-// Codec State
-// ============================================================================
-
-/**
- * Codec state
- * @see https://w3c.github.io/webcodecs/#enumdef-codecstate
- */
-export type CodecState = 'unconfigured' | 'configured' | 'closed'

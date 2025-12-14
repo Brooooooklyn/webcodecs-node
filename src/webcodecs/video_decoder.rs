@@ -9,6 +9,7 @@ use crate::webcodecs::error::{
   DOMExceptionName, throw_data_error, throw_invalid_state_error, throw_type_error_unit,
 };
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
+use crate::webcodecs::video_frame::VideoColorSpaceInit;
 use crate::webcodecs::{
   CodecState, EncodedVideoChunk, EncodedVideoChunkInner, HardwareAcceleration, VideoDecoderConfig,
   VideoFrame, convert_avcc_extradata_to_annexb, convert_avcc_to_annexb,
@@ -45,7 +46,7 @@ type EventListenerCallback = ThreadsafeFunction<(), UnknownReturnValue, (), Stat
 /// Entry for tracking event listeners
 struct EventListenerEntry {
   id: u64,
-  callback: EventListenerCallback,
+  callback: Arc<EventListenerCallback>,
   once: bool,
 }
 
@@ -59,7 +60,7 @@ struct EventListenerState {
   /// Counter for generating unique listener IDs
   next_listener_id: u64,
   /// Optional dequeue event callback (set via ondequeue property)
-  dequeue_callback: Option<EventListenerCallback>,
+  dequeue_callback: Option<Arc<EventListenerCallback>>,
 }
 
 /// Options for addEventListener (W3C DOM spec)
@@ -208,6 +209,12 @@ struct VideoDecoderInner {
   config_rotation: f64,
   /// Horizontal flip from config
   config_flip: bool,
+
+  // ========================================================================
+  // Color space metadata (W3C WebCodecs VideoFrame colorSpace)
+  // ========================================================================
+  /// Color space from decoder config - applied to decoded frames
+  config_color_space: Option<VideoColorSpaceInit>,
 }
 
 /// Get the preferred hardware device type for the current platform
@@ -328,6 +335,8 @@ impl VideoDecoder {
       // Orientation metadata (default: no rotation/flip)
       config_rotation: 0.0,
       config_flip: false,
+      // Color space from config (None = extract from FFmpeg frame)
+      config_color_space: None,
     };
 
     let inner = Arc::new(Mutex::new(inner));
@@ -630,6 +639,7 @@ impl VideoDecoder {
         output_duration,
         guard.config_rotation,
         guard.config_flip,
+        guard.config_color_space.as_ref(),
       );
 
       // During flush, queue frames for synchronous delivery in resolver
@@ -639,7 +649,7 @@ impl VideoDecoder {
       } else {
         guard
           .output_callback
-          .call(video_frame, ThreadsafeFunctionCallMode::NonBlocking);
+          .call(video_frame, ThreadsafeFunctionCallMode::Blocking);
       }
     }
   }
@@ -761,13 +771,14 @@ impl VideoDecoder {
           duration,
           guard.config_rotation,
           guard.config_flip,
+          guard.config_color_space.as_ref(),
         );
         if guard.inside_flush {
           guard.pending_frames.push(video_frame);
         } else {
           guard
             .output_callback
-            .call(video_frame, ThreadsafeFunctionCallMode::NonBlocking);
+            .call(video_frame, ThreadsafeFunctionCallMode::Blocking);
         }
       }
     }
@@ -844,6 +855,7 @@ impl VideoDecoder {
         output_duration,
         guard.config_rotation,
         guard.config_flip,
+        guard.config_color_space.as_ref(),
       );
       // Always queue during flush for synchronous delivery in resolver
       guard.pending_frames.push(video_frame);
@@ -867,7 +879,7 @@ impl VideoDecoder {
     let error = Error::new(Status::GenericFailure, error_msg);
     inner
       .error_callback
-      .call(error, ThreadsafeFunctionCallMode::NonBlocking);
+      .call(error, ThreadsafeFunctionCallMode::Blocking);
     inner.had_error = true;
     inner.state = CodecState::Closed;
   }
@@ -875,32 +887,41 @@ impl VideoDecoder {
   /// Fire dequeue event - uses separate RwLock to avoid blocking addEventListener
   /// Also dispatches to EventTarget listeners registered via addEventListener
   fn fire_dequeue_event(event_state: &Arc<RwLock<EventListenerState>>) -> Result<()> {
-    // Use write lock only briefly to fire callbacks and remove once listeners
-    let mut state = match event_state.write() {
-      Ok(s) => s,
-      Err(_) => return Err(Error::new(Status::GenericFailure, "Lock poisoned")),
-    };
+    // Collect callbacks and once-listener IDs while holding lock
+    let (dequeue_callback, listeners_to_fire, ids_to_remove) = {
+      let state = match event_state.read() {
+        Ok(s) => s,
+        Err(_) => return Err(Error::new(Status::GenericFailure, "Lock poisoned")),
+      };
 
-    // 1. Fire ondequeue callback
-    if let Some(ref callback) = state.dequeue_callback {
-      callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
-    }
+      let dequeue_callback = state.dequeue_callback.clone();
 
-    // 2. Fire EventTarget listeners
-    let mut ids_to_remove = Vec::new();
-    if let Some(listeners) = state.event_listeners.get("dequeue") {
-      for entry in listeners {
-        entry
-          .callback
-          .call((), ThreadsafeFunctionCallMode::NonBlocking);
-        if entry.once {
-          ids_to_remove.push(entry.id);
+      let mut listeners_to_fire: Vec<Arc<EventListenerCallback>> = Vec::new();
+      let mut ids_to_remove = Vec::new();
+      if let Some(listeners) = state.event_listeners.get("dequeue") {
+        for entry in listeners {
+          listeners_to_fire.push(entry.callback.clone());
+          if entry.once {
+            ids_to_remove.push(entry.id);
+          }
         }
       }
+
+      (dequeue_callback, listeners_to_fire, ids_to_remove)
+    };
+
+    // Fire callbacks without holding lock (prevents deadlock with Blocking mode)
+    if let Some(ref callback) = dequeue_callback {
+      callback.call((), ThreadsafeFunctionCallMode::Blocking);
     }
 
-    // 3. Remove "once" listeners
+    for callback in &listeners_to_fire {
+      callback.call((), ThreadsafeFunctionCallMode::Blocking);
+    }
+
+    // Remove "once" listeners (acquire write lock)
     if !ids_to_remove.is_empty()
+      && let Ok(mut state) = event_state.write()
       && let Some(listeners) = state.event_listeners.get_mut("dequeue")
     {
       listeners.retain(|e| !ids_to_remove.contains(&e.id));
@@ -948,13 +969,13 @@ impl VideoDecoder {
       .write()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
     state.dequeue_callback = match callback {
-      Some(ref cb) => Some(
+      Some(ref cb) => Some(Arc::new(
         cb.borrow_back(env)?
           .build_threadsafe_function()
           .callee_handled::<false>()
           .weak::<true>()
           .build()?,
-      ),
+      )),
       None => None,
     };
     drop(state); // Release lock before storing FunctionRef
@@ -1142,6 +1163,10 @@ impl VideoDecoder {
     // Store orientation metadata from config (W3C WebCodecs spec)
     inner.config_rotation = config.rotation.unwrap_or(0.0);
     inner.config_flip = config.flip.unwrap_or(false);
+
+    // Store colorSpace from config (W3C WebCodecs spec)
+    // If provided, this colorSpace will be applied to all decoded frames
+    inner.config_color_space = config.color_space;
 
     Ok(())
   }
@@ -1592,12 +1617,14 @@ impl VideoDecoder {
     let id = state.next_listener_id;
     state.next_listener_id += 1;
 
-    let tsf = callback
-      .borrow_back(&env)?
-      .build_threadsafe_function()
-      .callee_handled::<false>()
-      .weak::<true>()
-      .build()?;
+    let tsf = Arc::new(
+      callback
+        .borrow_back(&env)?
+        .build_threadsafe_function()
+        .callee_handled::<false>()
+        .weak::<true>()
+        .build()?,
+    );
 
     let entry = EventListenerEntry {
       id,

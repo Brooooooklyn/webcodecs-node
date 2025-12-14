@@ -50,7 +50,8 @@
       "aarch64-pc-windows-msvc",
       "armv7-unknown-linux-gnueabihf"
     ],
-    "constEnum": false
+    "constEnum": false,
+    "dtsHeaderFile": "dts-header.d.ts"
   },
   "engines": {
     "node": ">= 10"

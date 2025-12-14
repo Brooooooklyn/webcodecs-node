@@ -598,11 +598,14 @@ impl AudioData {
 
   /// Copy audio data to a buffer (W3C WebCodecs spec)
   /// Note: Per spec, this is SYNCHRONOUS and returns undefined
-  #[napi]
+  /// Accepts AllowSharedBufferSource (any TypedArray, DataView, or ArrayBuffer)
+  #[napi(
+    ts_args_type = "destination: import('./standard').AllowSharedBufferSource, options: AudioDataCopyToOptions"
+  )]
   pub fn copy_to(
     &self,
     env: Env,
-    mut destination: Uint8Array,
+    destination: Unknown,
     options: AudioDataCopyToOptions,
   ) -> Result<()> {
     let inner = self
@@ -644,8 +647,38 @@ impl AudioData {
       ));
     }
 
-    // Get mutable access to the destination buffer safely
-    let dest_slice = unsafe { destination.as_mut() };
+    // Extract the underlying buffer from AllowSharedBufferSource (TypedArray, DataView, or ArrayBuffer)
+    let typed_array = destination
+      .coerce_to_object()
+      .map_err(|_| Error::new(Status::InvalidArg, "Invalid AllowSharedBufferSource"))?;
+
+    // Get buffer info - handle both TypedArray/DataView and direct ArrayBuffer
+    let (mut buffer, byte_offset, byte_length): (ArrayBuffer, usize, usize) =
+      if let Ok(true) = typed_array.has_named_property("buffer") {
+        // It's a TypedArray or DataView - get its underlying buffer info
+        let byte_length: u32 = typed_array.get("byteLength").ok().flatten().unwrap_or(0);
+        let byte_offset: u32 = typed_array.get("byteOffset").ok().flatten().unwrap_or(0);
+        let buffer: ArrayBuffer = typed_array
+          .get("buffer")?
+          .ok_or_else(|| Error::new(Status::InvalidArg, "Invalid AllowSharedBufferSource"))?;
+        (buffer, byte_offset as usize, byte_length as usize)
+      } else {
+        // It's likely an ArrayBuffer directly
+        let byte_length: Option<u32> = typed_array.get("byteLength").ok().flatten();
+        if let Some(len) = byte_length {
+          let buffer = ArrayBuffer::from_unknown(destination)?;
+          (buffer, 0, len as usize)
+        } else {
+          return Err(Error::new(
+            Status::InvalidArg,
+            "Invalid AllowSharedBufferSource",
+          ));
+        }
+      };
+
+    // Get mutable access to the destination buffer at the correct offset
+    let full_buffer = unsafe { buffer.as_mut() };
+    let dest_slice = &mut full_buffer[byte_offset..byte_offset + byte_length];
 
     if format.is_planar() {
       let copy_size = num_frames * bytes_per_sample;

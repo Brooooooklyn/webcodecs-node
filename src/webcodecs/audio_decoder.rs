@@ -41,7 +41,7 @@ type EventListenerCallback = ThreadsafeFunction<(), UnknownReturnValue, (), Stat
 /// Entry for tracking event listeners
 struct EventListenerEntry {
   id: u64,
-  callback: EventListenerCallback,
+  callback: Arc<EventListenerCallback>,
   once: bool,
 }
 
@@ -54,7 +54,7 @@ struct EventListenerState {
   /// Counter for generating unique listener IDs
   next_listener_id: u64,
   /// Optional dequeue event callback (set via ondequeue property)
-  dequeue_callback: Option<EventListenerCallback>,
+  dequeue_callback: Option<Arc<EventListenerCallback>>,
 }
 
 /// Options for addEventListener (W3C DOM spec)
@@ -202,6 +202,8 @@ pub struct AudioDecoder {
   command_sender: Option<Sender<DecoderCommand>>,
   /// Worker thread handle
   worker_handle: Option<JoinHandle<()>>,
+  /// Reset abort flag - set by reset() to signal worker to skip pending decodes
+  reset_flag: Arc<AtomicBool>,
 }
 
 impl Drop for AudioDecoder {
@@ -258,11 +260,20 @@ impl AudioDecoder {
     // Create channel for worker commands
     let (sender, receiver) = channel::unbounded();
 
+    // Create reset abort flag
+    let reset_flag = Arc::new(AtomicBool::new(false));
+
     // Spawn worker thread
     let worker_inner = inner.clone();
     let worker_event_state = event_state.clone();
+    let worker_reset_flag = reset_flag.clone();
     let worker_handle = std::thread::spawn(move || {
-      Self::worker_loop(worker_inner, worker_event_state, receiver);
+      Self::worker_loop(
+        worker_inner,
+        worker_event_state,
+        receiver,
+        worker_reset_flag,
+      );
     });
 
     Ok(Self {
@@ -272,6 +283,7 @@ impl AudioDecoder {
       output_callback_ref: Rc::new(init.output_ref),
       command_sender: Some(sender),
       worker_handle: Some(worker_handle),
+      reset_flag,
     })
   }
 
@@ -280,8 +292,31 @@ impl AudioDecoder {
     inner: Arc<Mutex<AudioDecoderInner>>,
     event_state: Arc<RwLock<EventListenerState>>,
     receiver: Receiver<DecoderCommand>,
+    reset_flag: Arc<AtomicBool>,
   ) {
     while let Ok(command) = receiver.recv() {
+      // Check reset flag before processing each command
+      // If reset() was called, skip remaining decode commands
+      if reset_flag.load(Ordering::SeqCst) {
+        // Still process flush commands to send responses, but skip decodes
+        if let DecoderCommand::Flush(response_sender) = command {
+          let _ = response_sender.send(Err(Error::new(
+            Status::GenericFailure,
+            "AbortError: The operation was aborted",
+          )));
+        } else {
+          // For decode commands, just decrement queue and fire dequeue
+          if let Ok(mut guard) = inner.lock() {
+            let old_size = guard.decode_queue_size;
+            guard.decode_queue_size = old_size.saturating_sub(1);
+            if old_size > 0 {
+              let _ = Self::fire_dequeue_event(&event_state);
+            }
+          }
+        }
+        continue;
+      }
+
       match command {
         DecoderCommand::Decode { data, timestamp } => {
           Self::process_decode(&inner, &event_state, data, timestamp);
@@ -380,7 +415,7 @@ impl AudioDecoder {
       } else {
         guard
           .output_callback
-          .call(audio_data, ThreadsafeFunctionCallMode::NonBlocking);
+          .call(audio_data, ThreadsafeFunctionCallMode::Blocking);
       }
     }
   }
@@ -449,7 +484,7 @@ impl AudioDecoder {
     let error = Error::new(Status::GenericFailure, error_msg);
     inner
       .error_callback
-      .call(error, ThreadsafeFunctionCallMode::NonBlocking);
+      .call(error, ThreadsafeFunctionCallMode::Blocking);
     inner.had_error = true;
     inner.state = CodecState::Closed;
   }
@@ -458,37 +493,51 @@ impl AudioDecoder {
   /// Also dispatches to EventTarget listeners registered via addEventListener
   /// Uses separate RwLock to avoid blocking addEventListener during decode
   fn fire_dequeue_event(event_state: &Arc<RwLock<EventListenerState>>) -> Result<()> {
-    // Use write lock only briefly
-    let mut state = match event_state.write() {
-      Ok(s) => s,
-      Err(_) => return Err(Error::new(Status::GenericFailure, "Lock poisoned")),
-    };
+    // Collect callbacks while holding lock, then fire outside lock to prevent deadlock
+    let (dequeue_callback, listeners_to_fire, ids_to_remove) = {
+      let state = match event_state.read() {
+        Ok(s) => s,
+        Err(_) => return Err(Error::new(Status::GenericFailure, "Lock poisoned")),
+      };
 
-    // 1. Fire ondequeue callback
-    if let Some(ref callback) = state.dequeue_callback {
-      callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
-    }
+      // Clone Arc references for callbacks we need to fire
+      let dequeue_callback = state.dequeue_callback.clone();
+      let mut listeners_to_fire: Vec<Arc<EventListenerCallback>> = Vec::new();
+      let mut ids_to_remove = Vec::new();
 
-    // 2. Fire EventTarget listeners
-    let mut ids_to_remove = Vec::new();
-    if let Some(listeners) = state.event_listeners.get("dequeue") {
-      for entry in listeners {
-        entry
-          .callback
-          .call((), ThreadsafeFunctionCallMode::NonBlocking);
-        if entry.once {
-          ids_to_remove.push(entry.id);
+      if let Some(listeners) = state.event_listeners.get("dequeue") {
+        for entry in listeners {
+          listeners_to_fire.push(entry.callback.clone());
+          if entry.once {
+            ids_to_remove.push(entry.id);
+          }
         }
       }
+
+      (dequeue_callback, listeners_to_fire, ids_to_remove)
+    };
+
+    // Fire callbacks WITHOUT holding lock (prevents deadlock)
+    if let Some(ref callback) = dequeue_callback {
+      callback.call((), ThreadsafeFunctionCallMode::Blocking);
     }
 
-    // 3. Remove "once" listeners
-    if !ids_to_remove.is_empty()
-      && let Some(listeners) = state.event_listeners.get_mut("dequeue")
-    {
-      listeners.retain(|e| !ids_to_remove.contains(&e.id));
-      if listeners.is_empty() {
-        state.event_listeners.remove("dequeue");
+    for callback in &listeners_to_fire {
+      callback.call((), ThreadsafeFunctionCallMode::Blocking);
+    }
+
+    // Remove "once" listeners (requires write lock, but callbacks already fired)
+    if !ids_to_remove.is_empty() {
+      let mut state = match event_state.write() {
+        Ok(s) => s,
+        Err(_) => return Err(Error::new(Status::GenericFailure, "Lock poisoned")),
+      };
+
+      if let Some(listeners) = state.event_listeners.get_mut("dequeue") {
+        listeners.retain(|e| !ids_to_remove.contains(&e.id));
+        if listeners.is_empty() {
+          state.event_listeners.remove("dequeue");
+        }
       }
     }
 
@@ -539,7 +588,7 @@ impl AudioDecoder {
           .callee_handled::<false>()
           .weak::<true>()
           .build()?;
-        Some(tsf)
+        Some(Arc::new(tsf))
       }
       None => None,
     };
@@ -873,6 +922,10 @@ impl AudioDecoder {
       }
     }
 
+    // Set reset flag to signal worker to skip remaining pending decodes
+    // This must be done BEFORE dropping the command sender
+    self.reset_flag.store(true, Ordering::SeqCst);
+
     // W3C spec: Abort all pending flushes with AbortError BEFORE dropping sender
     {
       let mut inner = self
@@ -913,11 +966,15 @@ impl AudioDecoder {
     inner.inside_flush = false;
     inner.pending_data.clear();
 
+    // Reset the abort flag for new worker
+    self.reset_flag.store(false, Ordering::SeqCst);
+
     // Create new channel and worker for future decode operations
     let (sender, receiver) = channel::unbounded();
     self.command_sender = Some(sender);
     let worker_inner = self.inner.clone();
     let worker_event_state = self.event_state.clone();
+    let worker_reset_flag = self.reset_flag.clone();
 
     // Create synchronization channel to wait for worker to be ready
     let (ready_sender, ready_receiver) = channel::bounded::<()>(1);
@@ -926,7 +983,12 @@ impl AudioDecoder {
     self.worker_handle = Some(std::thread::spawn(move || {
       // Signal that worker is ready before entering the loop
       let _ = ready_sender.send(());
-      Self::worker_loop(worker_inner, worker_event_state, receiver);
+      Self::worker_loop(
+        worker_inner,
+        worker_event_state,
+        receiver,
+        worker_reset_flag,
+      );
     }));
 
     // Wait for worker to be ready (prevents race condition)
@@ -1059,7 +1121,7 @@ impl AudioDecoder {
 
     let entry = EventListenerEntry {
       id,
-      callback: tsf,
+      callback: Arc::new(tsf),
       once: options.as_ref().and_then(|o| o.once).unwrap_or(false),
     };
 

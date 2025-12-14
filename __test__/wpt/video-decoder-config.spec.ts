@@ -234,11 +234,11 @@ test('VideoDecoder.isConfigSupported() returns a parsed configuration', async (t
     codedHeight: 480,
     displayAspectWidth: 800,
     displayAspectHeight: 600,
-    colorSpace: { primaries: 'bt709' },
+    colorSpace: { primaries: 'bt709' as const },
     futureConfigFeature: 'foo',
   }
 
-  const support = await VideoDecoder.isConfigSupported(config)
+  const support = await VideoDecoder.isConfigSupported(config as Parameters<typeof VideoDecoder.isConfigSupported>[0])
 
   if (!support.supported) {
     t.pass('VP8 not supported on this platform')

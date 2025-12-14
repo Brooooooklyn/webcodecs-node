@@ -8,6 +8,7 @@
 import test from 'ava'
 
 import { resetHardwareFallbackState, VideoEncoder, VideoDecoder, VideoFrame, EncodedVideoChunk } from '../index.js'
+import type { EncodedVideoChunkMetadata, VideoDecoderConfig } from '../index.js'
 import { generateFrameSequence } from './helpers/index.js'
 import { createEncoderConfig, createDecoderConfig } from './helpers/codec-matrix.js'
 
@@ -17,18 +18,24 @@ test.beforeEach(() => {
 })
 
 // Helper to create test encoder with callbacks
+// Captures decoderConfig from first chunk's metadata for proper AVCC format handling
 function createTestEncoder() {
   const chunks: EncodedVideoChunk[] = []
   const errors: Error[] = []
+  let decoderConfig: VideoDecoderConfig | undefined
 
   const encoder = new VideoEncoder({
-    output: (chunk, _metadata) => {
+    output: (chunk, metadata?: EncodedVideoChunkMetadata) => {
       chunks.push(chunk)
+      // Capture decoderConfig from first chunk (contains description for AVCC format)
+      if (!decoderConfig && metadata?.decoderConfig) {
+        decoderConfig = metadata.decoderConfig as VideoDecoderConfig
+      }
     },
     error: (e) => errors.push(e),
   })
 
-  return { encoder, chunks, errors }
+  return { encoder, chunks, errors, getDecoderConfig: () => decoderConfig }
 }
 
 // Helper to create test decoder with callbacks
@@ -48,12 +55,17 @@ function createTestDecoder() {
 // Helper: Create encoded chunks for decoder tests
 // ============================================================================
 
+interface EncodedChunksResult {
+  chunks: EncodedVideoChunk[]
+  decoderConfig: VideoDecoderConfig | undefined
+}
+
 async function createEncodedH264Chunks(
   width: number,
   height: number,
   frameCount: number,
-): Promise<EncodedVideoChunk[]> {
-  const { encoder, chunks } = createTestEncoder()
+): Promise<EncodedChunksResult> {
+  const { encoder, chunks, getDecoderConfig } = createTestEncoder()
   encoder.configure(createEncoderConfig('h264', width, height))
 
   const frames = generateFrameSequence(width, height, frameCount)
@@ -70,8 +82,8 @@ async function createEncodedH264Chunks(
   await encoder.flush()
   encoder.close()
 
-  // Chunks are now class instances directly from the callback
-  return chunks
+  // Return both chunks and decoderConfig (contains description for AVCC format)
+  return { chunks, decoderConfig: getDecoderConfig() }
 }
 
 // ============================================================================
@@ -180,11 +192,14 @@ test('VideoDecoder: configure() can be called multiple times', (t) => {
 // ============================================================================
 
 test('VideoDecoder: decode() single chunk', async (t) => {
-  const chunks = await createEncodedH264Chunks(320, 240, 1)
+  const { chunks, decoderConfig } = await createEncodedH264Chunks(320, 240, 1)
   t.true(chunks.length > 0, 'Should have encoded chunks')
 
   const { decoder, frames } = createTestDecoder()
-  decoder.configure(createDecoderConfig('h264', { codedWidth: 320, codedHeight: 240 }))
+  decoder.configure({
+    ...createDecoderConfig('h264', { codedWidth: 320, codedHeight: 240 }),
+    description: decoderConfig?.description,
+  })
 
   t.notThrows(() => {
     decoder.decode(chunks[0])
@@ -203,11 +218,14 @@ test('VideoDecoder: decode() single chunk', async (t) => {
 })
 
 test('VideoDecoder: decode() multiple chunks', async (t) => {
-  const chunks = await createEncodedH264Chunks(320, 240, 5)
+  const { chunks, decoderConfig } = await createEncodedH264Chunks(320, 240, 5)
   t.true(chunks.length > 0)
 
   const { decoder, frames } = createTestDecoder()
-  decoder.configure(createDecoderConfig('h264', { codedWidth: 320, codedHeight: 240 }))
+  decoder.configure({
+    ...createDecoderConfig('h264', { codedWidth: 320, codedHeight: 240 }),
+    description: decoderConfig?.description,
+  })
 
   for (const chunk of chunks) {
     decoder.decode(chunk)
@@ -228,11 +246,14 @@ test('VideoDecoder: decode() preserves frame properties', async (t) => {
   const width = 320
   const height = 240
 
-  const chunks = await createEncodedH264Chunks(width, height, 1)
+  const { chunks, decoderConfig } = await createEncodedH264Chunks(width, height, 1)
   t.true(chunks.length > 0)
 
   const { decoder, frames } = createTestDecoder()
-  decoder.configure(createDecoderConfig('h264', { codedWidth: width, codedHeight: height }))
+  decoder.configure({
+    ...createDecoderConfig('h264', { codedWidth: width, codedHeight: height }),
+    description: decoderConfig?.description,
+  })
 
   decoder.decode(chunks[0])
   await decoder.flush()
@@ -255,10 +276,13 @@ test('VideoDecoder: decode() preserves frame properties', async (t) => {
 // ============================================================================
 
 test('VideoDecoder: flush() produces all pending output', async (t) => {
-  const chunks = await createEncodedH264Chunks(320, 240, 3)
+  const { chunks, decoderConfig } = await createEncodedH264Chunks(320, 240, 3)
 
   const { decoder, frames } = createTestDecoder()
-  decoder.configure(createDecoderConfig('h264', { codedWidth: 320, codedHeight: 240 }))
+  decoder.configure({
+    ...createDecoderConfig('h264', { codedWidth: 320, codedHeight: 240 }),
+    description: decoderConfig?.description,
+  })
 
   for (const chunk of chunks) {
     decoder.decode(chunk)
@@ -277,10 +301,13 @@ test('VideoDecoder: flush() produces all pending output', async (t) => {
 })
 
 test('VideoDecoder: flush() returns a Promise', async (t) => {
-  const chunks = await createEncodedH264Chunks(320, 240, 1)
+  const { chunks, decoderConfig } = await createEncodedH264Chunks(320, 240, 1)
 
   const { decoder, frames } = createTestDecoder()
-  decoder.configure(createDecoderConfig('h264', { codedWidth: 320, codedHeight: 240 }))
+  decoder.configure({
+    ...createDecoderConfig('h264', { codedWidth: 320, codedHeight: 240 }),
+    description: decoderConfig?.description,
+  })
 
   decoder.decode(chunks[0])
 
@@ -303,10 +330,13 @@ test('VideoDecoder: flush() returns a Promise', async (t) => {
 // ============================================================================
 
 test('VideoDecoder: reset() returns to unconfigured state', async (t) => {
-  const chunks = await createEncodedH264Chunks(320, 240, 1)
+  const { chunks, decoderConfig } = await createEncodedH264Chunks(320, 240, 1)
 
   const { decoder } = createTestDecoder()
-  decoder.configure(createDecoderConfig('h264', { codedWidth: 320, codedHeight: 240 }))
+  decoder.configure({
+    ...createDecoderConfig('h264', { codedWidth: 320, codedHeight: 240 }),
+    description: decoderConfig?.description,
+  })
 
   decoder.decode(chunks[0])
   decoder.reset()
@@ -319,11 +349,14 @@ test('VideoDecoder: reset() returns to unconfigured state', async (t) => {
 
 test('VideoDecoder: reset() then reconfigure allows new decoding', async (t) => {
   // Create two separate encoded streams (each starting with a keyframe)
-  const chunks1 = await createEncodedH264Chunks(320, 240, 1)
-  const chunks2 = await createEncodedH264Chunks(320, 240, 1)
+  const { chunks: chunks1, decoderConfig: decoderConfig1 } = await createEncodedH264Chunks(320, 240, 1)
+  const { chunks: chunks2, decoderConfig: decoderConfig2 } = await createEncodedH264Chunks(320, 240, 1)
 
   const { decoder, frames } = createTestDecoder()
-  decoder.configure(createDecoderConfig('h264', { codedWidth: 320, codedHeight: 240 }))
+  decoder.configure({
+    ...createDecoderConfig('h264', { codedWidth: 320, codedHeight: 240 }),
+    description: decoderConfig1?.description,
+  })
 
   // First decode
   decoder.decode(chunks1[0])
@@ -335,8 +368,11 @@ test('VideoDecoder: reset() then reconfigure allows new decoding', async (t) => 
   decoder.reset()
   t.is(decoder.state, 'unconfigured')
 
-  // Reconfigure
-  decoder.configure(createDecoderConfig('h264', { codedWidth: 320, codedHeight: 240 }))
+  // Reconfigure with second stream's description
+  decoder.configure({
+    ...createDecoderConfig('h264', { codedWidth: 320, codedHeight: 240 }),
+    description: decoderConfig2?.description,
+  })
   t.is(decoder.state, 'configured')
 
   // Second decode should work (with fresh keyframe)
@@ -393,7 +429,7 @@ test('VideoDecoder: isConfigSupported() returns false for unknown codec', async 
 // ============================================================================
 
 test('VideoDecoder: decode() on unconfigured decoder throws InvalidStateError', async (t) => {
-  const chunks = await createEncodedH264Chunks(320, 240, 1)
+  const { chunks } = await createEncodedH264Chunks(320, 240, 1)
 
   const { decoder } = createTestDecoder()
 
@@ -408,7 +444,7 @@ test('VideoDecoder: decode() on unconfigured decoder throws InvalidStateError', 
 })
 
 test('VideoDecoder: decode() on closed decoder throws InvalidStateError', async (t) => {
-  const chunks = await createEncodedH264Chunks(320, 240, 1)
+  const { chunks } = await createEncodedH264Chunks(320, 240, 1)
 
   const { decoder } = createTestDecoder()
   decoder.configure(createDecoderConfig('h264'))
@@ -429,7 +465,7 @@ test('VideoDecoder: decode() on closed decoder throws InvalidStateError', async 
 // ============================================================================
 
 test('VideoDecoder: ondequeue fires when queue decreases', async (t) => {
-  const chunks = await createEncodedH264Chunks(320, 240, 1)
+  const { chunks, decoderConfig } = await createEncodedH264Chunks(320, 240, 1)
 
   const { decoder, frames } = createTestDecoder()
 
@@ -438,7 +474,10 @@ test('VideoDecoder: ondequeue fires when queue decreases', async (t) => {
     dequeueCount++
   }
 
-  decoder.configure(createDecoderConfig('h264', { codedWidth: 320, codedHeight: 240 }))
+  decoder.configure({
+    ...createDecoderConfig('h264', { codedWidth: 320, codedHeight: 240 }),
+    description: decoderConfig?.description,
+  })
 
   decoder.decode(chunks[0])
   await decoder.flush()

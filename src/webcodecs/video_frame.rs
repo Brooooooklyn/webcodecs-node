@@ -474,6 +474,16 @@ impl VideoColorSpace {
     self.full_range
   }
 
+  /// Convert to VideoColorSpaceInit (plain object version)
+  pub fn to_init(&self) -> VideoColorSpaceInit {
+    VideoColorSpaceInit {
+      primaries: self.primaries,
+      transfer: self.transfer,
+      matrix: self.matrix,
+      full_range: self.full_range,
+    }
+  }
+
   /// Convert to JSON-compatible object (W3C spec uses toJSON)
   ///
   /// Per W3C spec, toJSON() returns explicit null for unset fields.
@@ -1444,12 +1454,15 @@ impl VideoFrame {
   }
 
   /// Create a VideoFrame from an internal Frame with rotation/flip (for decoder output)
+  ///
+  /// If `color_space_init` is provided, uses those values. Otherwise extracts from FFmpeg frame.
   pub fn from_internal_with_orientation(
     frame: Frame,
     timestamp_us: i64,
     duration_us: Option<i64>,
     rotation: f64,
     flip: bool,
+    color_space_init: Option<&VideoColorSpaceInit>,
   ) -> Self {
     let width = frame.width();
     let height = frame.height();
@@ -1462,6 +1475,26 @@ impl VideoFrame {
       (height, width)
     } else {
       (width, height)
+    };
+
+    // Use provided colorSpace from decoder config, or extract from FFmpeg frame
+    // If colorSpace is empty (all None), extract from FFmpeg to get embedded bitstream values
+    let color_space = match color_space_init {
+      Some(init)
+        if init.primaries.is_some()
+          || init.transfer.is_some()
+          || init.matrix.is_some()
+          || init.full_range.is_some() =>
+      {
+        VideoColorSpace {
+          primaries: init.primaries,
+          transfer: init.transfer,
+          matrix: init.matrix,
+          full_range: init.full_range,
+        }
+      }
+      // No colorSpace provided or empty colorSpace - extract from FFmpeg frame
+      _ => color_space_from_frame(&frame),
     };
 
     let inner = VideoFrameInner {
@@ -1477,7 +1510,7 @@ impl VideoFrame {
       display_height,
       rotation: parsed_rotation,
       flip,
-      color_space: VideoColorSpace::default(),
+      color_space,
       closed: false,
     };
 

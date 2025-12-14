@@ -16,8 +16,9 @@ use crate::webcodecs::hw_fallback::{
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
 use crate::webcodecs::{
   AvcBitstreamFormat, EncodedVideoChunk, HardwareAcceleration, HevcBitstreamFormat, LatencyMode,
-  VideoEncoderBitrateMode, VideoEncoderConfig, VideoFrame, convert_annexb_extradata_to_avcc,
-  convert_annexb_extradata_to_hvcc,
+  VideoColorSpaceInit, VideoEncoderBitrateMode, VideoEncoderConfig, VideoFrame,
+  convert_annexb_extradata_to_avcc, convert_annexb_extradata_to_hvcc,
+  extract_avcc_from_avcc_packet, extract_hvcc_from_hvcc_packet,
 };
 use crossbeam::channel::{self, Receiver, Sender};
 use napi::bindgen_prelude::*;
@@ -77,6 +78,8 @@ pub struct VideoDecoderConfigOutput {
   pub coded_height: Option<u32>,
   /// Codec description (e.g., avcC for H.264) - Uint8Array per spec
   pub description: Option<Uint8Array>,
+  /// Color space information for the video content
+  pub color_space: Option<VideoColorSpaceInit>,
   /// Display aspect width (for non-square pixels)
   pub display_aspect_width: Option<u32>,
   /// Display aspect height (for non-square pixels)
@@ -254,7 +257,7 @@ type EventListenerCallback = ThreadsafeFunction<(), UnknownReturnValue, (), Stat
 /// Entry for tracking event listeners
 struct EventListenerEntry {
   id: u64,
-  callback: EventListenerCallback,
+  callback: Arc<EventListenerCallback>,
   once: bool,
 }
 
@@ -268,7 +271,7 @@ struct EventListenerState {
   /// Counter for generating unique listener IDs
   next_listener_id: u64,
   /// Optional dequeue event callback (set via ondequeue property)
-  dequeue_callback: Option<EventListenerCallback>,
+  dequeue_callback: Option<Arc<EventListenerCallback>>,
 }
 
 /// Options for addEventListener (W3C DOM spec)
@@ -361,6 +364,12 @@ struct VideoEncoderInner {
   /// True for H.264 when avc.format is "avc" (default) or not specified
   /// True for H.265 when hevc.format is "hevc" (default) or not specified
   use_avcc_format: bool,
+
+  // ========================================================================
+  // Input colorSpace tracking (for decoder config output)
+  // ========================================================================
+  /// Color space from the first input frame (used in decoderConfig metadata)
+  input_color_space: Option<VideoColorSpaceInit>,
 }
 
 /// Get the preferred hardware device type for the current platform
@@ -494,6 +503,8 @@ impl VideoEncoder {
       output_frame_count: 0,
       // Bitstream format conversion (set during configure)
       use_avcc_format: false,
+      // Input colorSpace tracking
+      input_color_space: None,
     };
 
     let inner = Arc::new(Mutex::new(inner));
@@ -768,6 +779,7 @@ impl VideoEncoder {
                           .context
                           .as_ref()
                           .and_then(|ctx| ctx.extradata().map(|d| Uint8Array::from(d.to_vec()))),
+                        color_space: guard.input_color_space.clone(),
                         display_aspect_width: display_width,
                         display_aspect_height: display_height,
                         rotation: if buffered_rotation != 0.0 {
@@ -788,13 +800,13 @@ impl VideoEncoder {
                     }
                   };
                   // During flush, queue chunks for synchronous delivery in resolver
-                  // Otherwise, use NonBlocking callback for immediate delivery
+                  // Otherwise, use Blocking callback for immediate delivery
                   if guard.inside_flush {
                     guard.pending_chunks.push((chunk, metadata));
                   } else {
                     guard.output_callback.call(
                       (chunk, metadata).into(),
-                      ThreadsafeFunctionCallMode::NonBlocking,
+                      ThreadsafeFunctionCallMode::Blocking,
                     );
                   }
                   guard.first_output_produced = true;
@@ -935,6 +947,7 @@ impl VideoEncoder {
                             .context
                             .as_ref()
                             .and_then(|ctx| ctx.extradata().map(|d| Uint8Array::from(d.to_vec()))),
+                          color_space: guard.input_color_space.clone(),
                           display_aspect_width: display_width,
                           display_aspect_height: display_height,
                           rotation: if buffered_rotation != 0.0 {
@@ -961,7 +974,7 @@ impl VideoEncoder {
                     } else {
                       guard.output_callback.call(
                         (chunk, metadata).into(),
-                        ThreadsafeFunctionCallMode::NonBlocking,
+                        ThreadsafeFunctionCallMode::Blocking,
                       );
                     }
                     guard.first_output_produced = true;
@@ -1042,21 +1055,37 @@ impl VideoEncoder {
 
       // Create metadata
       // Note: extradata must be fetched AFTER encoding, as FFmpeg only sets it after first encode
+      // Only include decoder_config if we actually have extradata (for codecs that need it)
       let metadata = if !guard.extradata_sent && packet.is_key() {
-        guard.extradata_sent = true;
+        // Check codec type for format conversion
+        let is_h264 = codec_string.starts_with("avc1")
+          || codec_string.starts_with("avc3")
+          || codec_string == "h264";
+        let is_h265 = codec_string.starts_with("hvc1")
+          || codec_string.starts_with("hev1")
+          || codec_string == "h265";
 
         // Get extradata and optionally convert to avcC/hvcC format for proper AVCC/HVCC mode
         let description = guard.context.as_ref().and_then(|ctx| {
           ctx.extradata().and_then(|extradata| {
             if guard.use_avcc_format {
               // Convert Annex B extradata to avcC/hvcC box format
-              let is_h264 = codec_string.starts_with("avc1") || codec_string.starts_with("avc3");
-              let is_h265 = codec_string.starts_with("hvc1") || codec_string.starts_with("hev1");
-
               if is_h264 {
-                convert_annexb_extradata_to_avcc(extradata).map(Uint8Array::from)
+                // Check if extradata is already in avcC format (starts with 0x01 = config version)
+                // VideoToolbox produces avcC directly, libx264 produces Annex B
+                if !extradata.is_empty() && extradata[0] == 0x01 {
+                  Some(Uint8Array::from(extradata.to_vec()))
+                } else {
+                  convert_annexb_extradata_to_avcc(extradata).map(Uint8Array::from)
+                }
               } else if is_h265 {
-                convert_annexb_extradata_to_hvcc(extradata).map(Uint8Array::from)
+                // Check if extradata is already in hvcC format (starts with 0x01 = config version)
+                // VideoToolbox produces hvcC directly, libx265 produces Annex B
+                if !extradata.is_empty() && extradata[0] == 0x01 {
+                  Some(Uint8Array::from(extradata.to_vec()))
+                } else {
+                  convert_annexb_extradata_to_hvcc(extradata).map(Uint8Array::from)
+                }
               } else {
                 Some(Uint8Array::from(extradata.to_vec()))
               }
@@ -1067,23 +1096,60 @@ impl VideoEncoder {
           })
         });
 
-        EncodedVideoChunkMetadata {
-          decoder_config: Some(VideoDecoderConfigOutput {
-            codec: codec_string.clone(),
-            coded_width: Some(width),
-            coded_height: Some(height),
-            description,
-            display_aspect_width: display_width,
-            display_aspect_height: display_height,
-            rotation: if rotation != 0.0 {
-              Some(rotation)
-            } else {
-              None
-            },
-            flip: if flip { Some(true) } else { None },
-          }),
-          svc,
-          alpha_side_data: None,
+        // Fallback: If extradata is not available but we're in AVCC/HVCC mode,
+        // try to extract SPS/PPS (and VPS for HEVC) from the packet data itself.
+        // VideoToolbox embeds parameter sets inline in the first key frame packet
+        // instead of populating the codec context's extradata field.
+        let description = if description.is_none() && guard.use_avcc_format {
+          if is_h264 {
+            chunk
+              .get_data()
+              .and_then(|data| extract_avcc_from_avcc_packet(&data).map(Uint8Array::from))
+          } else if is_h265 {
+            chunk
+              .get_data()
+              .and_then(|data| extract_hvcc_from_hvcc_packet(&data).map(Uint8Array::from))
+          } else {
+            description
+          }
+        } else {
+          description
+        };
+
+        // Determine if this codec requires description (H.264/H.265 in AVCC mode)
+        // For codecs that require description, only send decoderConfig when description is available
+        // For other codecs (VP8, VP9, AV1), description is optional - send decoderConfig immediately
+        let requires_description = guard.use_avcc_format && (is_h264 || is_h265);
+
+        if requires_description && description.is_none() {
+          // H.264/H.265 needs description - don't send decoderConfig yet, try again on next key frame
+          EncodedVideoChunkMetadata {
+            decoder_config: None,
+            svc,
+            alpha_side_data: None,
+          }
+        } else {
+          // Either we have description, or this codec doesn't require it
+          guard.extradata_sent = true;
+          EncodedVideoChunkMetadata {
+            decoder_config: Some(VideoDecoderConfigOutput {
+              codec: codec_string.clone(),
+              coded_width: Some(width),
+              coded_height: Some(height),
+              description,
+              color_space: guard.input_color_space.clone(),
+              display_aspect_width: display_width,
+              display_aspect_height: display_height,
+              rotation: if rotation != 0.0 {
+                Some(rotation)
+              } else {
+                None
+              },
+              flip: if flip { Some(true) } else { None },
+            }),
+            svc,
+            alpha_side_data: None,
+          }
         }
       } else {
         EncodedVideoChunkMetadata {
@@ -1094,13 +1160,13 @@ impl VideoEncoder {
       };
 
       // During flush, queue chunks for synchronous delivery in resolver
-      // Otherwise, use NonBlocking callback for immediate delivery
+      // Otherwise, use Blocking callback for immediate delivery
       if guard.inside_flush {
         guard.pending_chunks.push((chunk, metadata));
       } else {
         guard.output_callback.call(
           (chunk, metadata).into(),
-          ThreadsafeFunctionCallMode::NonBlocking,
+          ThreadsafeFunctionCallMode::Blocking,
         );
       }
     }
@@ -1130,6 +1196,17 @@ impl VideoEncoder {
       return Ok(());
     }
 
+    // Capture extradata BEFORE flush, as FFmpeg may clear it during drain mode
+    // This is critical for when all output comes during flush (e.g., B-frame encoding)
+    let cached_extradata = if !guard.extradata_sent {
+      guard
+        .context
+        .as_ref()
+        .and_then(|ctx| ctx.extradata().map(|e| e.to_vec()))
+    } else {
+      None
+    };
+
     let context = match guard.context.as_mut() {
       Some(ctx) => ctx,
       None => {
@@ -1145,6 +1222,16 @@ impl VideoEncoder {
         Self::report_error(&mut guard, &format!("Flush failed: {}", e));
         return Ok(());
       }
+    };
+
+    // Try to capture extradata again after flush - VideoToolbox may populate it now
+    let cached_extradata = if cached_extradata.is_none() && !guard.extradata_sent {
+      guard
+        .context
+        .as_ref()
+        .and_then(|ctx| ctx.extradata().map(|e| e.to_vec()))
+    } else {
+      cached_extradata
     };
 
     // Queue remaining packets for synchronous delivery in resolver
@@ -1163,8 +1250,6 @@ impl VideoEncoder {
 
       // Create metadata (include decoder_config if not sent yet and this is a key frame)
       let metadata = if !guard.extradata_sent && packet.is_key() {
-        guard.extradata_sent = true;
-
         // Get config values for metadata
         let (codec_string, width, height, display_width, display_height) = guard
           .config
@@ -1179,41 +1264,99 @@ impl VideoEncoder {
             )
           });
 
-        // Get extradata and optionally convert to avcC/hvcC format for proper AVCC/HVCC mode
-        let description = guard.context.as_ref().and_then(|ctx| {
-          ctx.extradata().and_then(|extradata| {
-            if guard.use_avcc_format {
-              // Convert Annex B extradata to avcC/hvcC box format
-              let is_h264 = codec_string.starts_with("avc1") || codec_string.starts_with("avc3");
-              let is_h265 = codec_string.starts_with("hvc1") || codec_string.starts_with("hev1");
+        // Get extradata - first try cached (captured before flush), then try context
+        // This handles the case where FFmpeg clears extradata during drain mode
+        let extradata_source = cached_extradata
+          .as_deref()
+          .or_else(|| guard.context.as_ref().and_then(|ctx| ctx.extradata()));
 
-              if is_h264 {
-                convert_annexb_extradata_to_avcc(extradata).map(Uint8Array::from)
-              } else if is_h265 {
-                convert_annexb_extradata_to_hvcc(extradata).map(Uint8Array::from)
-              } else {
+        // Check codec type for format conversion
+        let is_h264 = codec_string.starts_with("avc1")
+          || codec_string.starts_with("avc3")
+          || codec_string == "h264";
+        let is_h265 = codec_string.starts_with("hvc1")
+          || codec_string.starts_with("hev1")
+          || codec_string == "h265";
+
+        // Optionally convert to avcC/hvcC format for proper AVCC/HVCC mode
+        let description = extradata_source.and_then(|extradata| {
+          if guard.use_avcc_format {
+            // Convert Annex B extradata to avcC/hvcC box format
+            if is_h264 {
+              // Check if extradata is already in avcC format (starts with 0x01 = config version)
+              // VideoToolbox produces avcC directly, libx264 produces Annex B
+              if !extradata.is_empty() && extradata[0] == 0x01 {
                 Some(Uint8Array::from(extradata.to_vec()))
+              } else {
+                convert_annexb_extradata_to_avcc(extradata).map(Uint8Array::from)
+              }
+            } else if is_h265 {
+              // Check if extradata is already in hvcC format (starts with 0x01 = config version)
+              // VideoToolbox produces hvcC directly, libx265 produces Annex B
+              if !extradata.is_empty() && extradata[0] == 0x01 {
+                Some(Uint8Array::from(extradata.to_vec()))
+              } else {
+                convert_annexb_extradata_to_hvcc(extradata).map(Uint8Array::from)
               }
             } else {
-              // Annex B mode - use extradata as-is
               Some(Uint8Array::from(extradata.to_vec()))
             }
-          })
+          } else {
+            // Annex B mode - use extradata as-is
+            Some(Uint8Array::from(extradata.to_vec()))
+          }
         });
 
-        EncodedVideoChunkMetadata {
-          decoder_config: Some(VideoDecoderConfigOutput {
-            codec: codec_string,
-            coded_width: Some(width),
-            coded_height: Some(height),
-            description,
-            display_aspect_width: display_width,
-            display_aspect_height: display_height,
-            rotation: None,
-            flip: None,
-          }),
-          svc,
-          alpha_side_data: None,
+        // Fallback: If extradata is not available but we're in AVCC/HVCC mode,
+        // try to extract SPS/PPS (and VPS for HEVC) from the packet data itself.
+        // VideoToolbox embeds parameter sets inline in the first key frame packet
+        // instead of populating the codec context's extradata field.
+        let description = if description.is_none() && guard.use_avcc_format {
+          if is_h264 {
+            chunk
+              .get_data()
+              .and_then(|data| extract_avcc_from_avcc_packet(&data).map(Uint8Array::from))
+          } else if is_h265 {
+            chunk
+              .get_data()
+              .and_then(|data| extract_hvcc_from_hvcc_packet(&data).map(Uint8Array::from))
+          } else {
+            description
+          }
+        } else {
+          description
+        };
+
+        // Determine if this codec requires description (H.264/H.265 in AVCC mode)
+        // For codecs that require description, only send decoderConfig when description is available
+        // For other codecs (VP8, VP9, AV1), description is optional - send decoderConfig immediately
+        let requires_description = guard.use_avcc_format && (is_h264 || is_h265);
+
+        if requires_description && description.is_none() {
+          // H.264/H.265 needs description - don't send decoderConfig yet, try again on next key frame
+          EncodedVideoChunkMetadata {
+            decoder_config: None,
+            svc,
+            alpha_side_data: None,
+          }
+        } else {
+          // Either we have description, or this codec doesn't require it
+          guard.extradata_sent = true;
+          EncodedVideoChunkMetadata {
+            decoder_config: Some(VideoDecoderConfigOutput {
+              codec: codec_string,
+              coded_width: Some(width),
+              coded_height: Some(height),
+              description,
+              color_space: guard.input_color_space.clone(),
+              display_aspect_width: display_width,
+              display_aspect_height: display_height,
+              rotation: None,
+              flip: None,
+            }),
+            svc,
+            alpha_side_data: None,
+          }
         }
       } else {
         EncodedVideoChunkMetadata {
@@ -1306,39 +1449,48 @@ impl VideoEncoder {
     let error = Error::new(Status::GenericFailure, error_msg);
     inner
       .error_callback
-      .call(error, ThreadsafeFunctionCallMode::NonBlocking);
+      .call(error, ThreadsafeFunctionCallMode::Blocking);
     inner.state = CodecState::Closed;
   }
 
   /// Fire dequeue event - uses separate RwLock to avoid blocking addEventListener
   /// Also dispatches to EventTarget listeners registered via addEventListener
   fn fire_dequeue_event(event_state: &Arc<RwLock<EventListenerState>>) -> Result<()> {
-    // Use write lock only briefly to fire callbacks and remove once listeners
-    let mut state = match event_state.write() {
-      Ok(s) => s,
-      Err(_) => return Err(Error::new(Status::GenericFailure, "Lock poisoned")),
-    };
+    // Collect callbacks and once-listener IDs while holding lock
+    let (dequeue_callback, listeners_to_fire, ids_to_remove) = {
+      let state = match event_state.read() {
+        Ok(s) => s,
+        Err(_) => return Err(Error::new(Status::GenericFailure, "Lock poisoned")),
+      };
 
-    // 1. Fire ondequeue callback
-    if let Some(ref callback) = state.dequeue_callback {
-      callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
-    }
+      let dequeue_callback = state.dequeue_callback.clone();
 
-    // 2. Fire EventTarget listeners
-    let mut ids_to_remove = Vec::new();
-    if let Some(listeners) = state.event_listeners.get("dequeue") {
-      for entry in listeners {
-        entry
-          .callback
-          .call((), ThreadsafeFunctionCallMode::NonBlocking);
-        if entry.once {
-          ids_to_remove.push(entry.id);
+      let mut listeners_to_fire: Vec<Arc<EventListenerCallback>> = Vec::new();
+      let mut ids_to_remove = Vec::new();
+      if let Some(listeners) = state.event_listeners.get("dequeue") {
+        for entry in listeners {
+          listeners_to_fire.push(entry.callback.clone());
+          if entry.once {
+            ids_to_remove.push(entry.id);
+          }
         }
       }
+
+      (dequeue_callback, listeners_to_fire, ids_to_remove)
+    };
+
+    // Fire callbacks without holding lock (prevents deadlock with Blocking mode)
+    if let Some(ref callback) = dequeue_callback {
+      callback.call((), ThreadsafeFunctionCallMode::Blocking);
     }
 
-    // 3. Remove "once" listeners
+    for callback in &listeners_to_fire {
+      callback.call((), ThreadsafeFunctionCallMode::Blocking);
+    }
+
+    // Remove "once" listeners (acquire write lock)
     if !ids_to_remove.is_empty()
+      && let Ok(mut state) = event_state.write()
       && let Some(listeners) = state.event_listeners.get_mut("dequeue")
     {
       listeners.retain(|e| !ids_to_remove.contains(&e.id));
@@ -1616,13 +1768,13 @@ impl VideoEncoder {
       .write()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
     state.dequeue_callback = match callback {
-      Some(ref cb) => Some(
+      Some(ref cb) => Some(Arc::new(
         cb.borrow_back(env)?
           .build_threadsafe_function()
           .callee_handled::<false>()
           .weak::<true>()
           .build()?,
-      ),
+      )),
       None => None,
     };
     drop(state); // Release lock before storing FunctionRef
@@ -1743,22 +1895,22 @@ impl VideoEncoder {
 
     // Calculate if GLOBAL_HEADER flag is needed for AVCC/HVCC format
     // This needs to be determined early since it's used in fallback paths
-    // Only set when AVCC/HVCC format is explicitly requested
+    // AVCC/HVCC is the W3C default - only disable when Annex B is explicitly requested
     let needs_global_header = {
       let is_h264 = codec.starts_with("avc1") || codec.starts_with("avc3") || codec == "h264";
       let is_h265 = codec.starts_with("hvc1") || codec.starts_with("hev1") || codec == "h265";
 
       if is_h264 {
-        // For H.264: need global header only if AVCC format is explicitly requested
-        matches!(
+        // For H.264: need global header unless Annex B is explicitly requested (W3C default is AVCC)
+        !matches!(
           config.avc.as_ref().and_then(|avc| avc.format),
-          Some(AvcBitstreamFormat::Avc)
+          Some(AvcBitstreamFormat::Annexb)
         )
       } else if is_h265 {
-        // For H.265: need global header only if HVCC format is explicitly requested
-        matches!(
+        // For H.265: need global header unless Annex B is explicitly requested (W3C default is HVCC)
+        !matches!(
           config.hevc.as_ref().and_then(|hevc| hevc.format),
-          Some(HevcBitstreamFormat::Hevc)
+          Some(HevcBitstreamFormat::Annexb)
         )
       } else {
         false
@@ -1965,8 +2117,8 @@ impl VideoEncoder {
     inner.output_frame_count = 0;
 
     // Bitstream format conversion - determine if AVCC/HVCC format is needed
-    // Default is Annex B for all codecs (FFmpeg native format)
-    // AVCC/HVCC output requires proper avcC/hvcC box description which is not yet implemented
+    // W3C spec: Default is AVCC/HVCC format (length-prefixed NAL units)
+    // Use Annex B only if explicitly requested via avc.format or hevc.format
     inner.use_avcc_format = inner.config.as_ref().is_some_and(|c| {
       let codec_str = c.codec.as_deref().unwrap_or("");
       let is_h264 =
@@ -1975,16 +2127,16 @@ impl VideoEncoder {
         codec_str.starts_with("hvc1") || codec_str.starts_with("hev1") || codec_str == "h265";
 
       if is_h264 {
-        // For H.264: use AVCC only if explicitly requested
-        matches!(
+        // For H.264: use AVCC unless explicitly set to Annex B
+        !matches!(
           c.avc.as_ref().and_then(|avc| avc.format),
-          Some(AvcBitstreamFormat::Avc)
+          Some(AvcBitstreamFormat::Annexb)
         )
       } else if is_h265 {
-        // For H.265: use HVCC only if explicitly requested
-        matches!(
+        // For H.265: use HVCC unless explicitly set to Annex B
+        !matches!(
           c.hevc.as_ref().and_then(|hevc| hevc.format),
-          Some(HevcBitstreamFormat::Hevc)
+          Some(HevcBitstreamFormat::Annexb)
         )
       } else {
         false // Other codecs don't need conversion
@@ -2047,6 +2199,13 @@ impl VideoEncoder {
       // Get rotation and flip for metadata output (W3C WebCodecs spec)
       let rotation = frame.rotation().unwrap_or(0.0);
       let flip = frame.flip().unwrap_or(false);
+
+      // Capture colorSpace from first input frame (for decoderConfig metadata)
+      if inner.input_color_space.is_none()
+        && let Ok(color_space) = frame.color_space()
+      {
+        inner.input_color_space = Some(color_space.to_init());
+      }
 
       // Increment queue size (pending operation)
       inner.encode_queue_size += 1;
@@ -2386,12 +2545,14 @@ impl VideoEncoder {
     let id = state.next_listener_id;
     state.next_listener_id += 1;
 
-    let tsf = callback
-      .borrow_back(&env)?
-      .build_threadsafe_function()
-      .callee_handled::<false>()
-      .weak::<true>()
-      .build()?;
+    let tsf = Arc::new(
+      callback
+        .borrow_back(&env)?
+        .build_threadsafe_function()
+        .callee_handled::<false>()
+        .weak::<true>()
+        .build()?,
+    );
 
     let entry = EventListenerEntry {
       id,
@@ -2479,7 +2640,9 @@ impl VideoEncoder {
     env: &'env Env,
     config: VideoEncoderConfig,
   ) -> Result<PromiseRaw<'env, VideoEncoderSupport>> {
-    // W3C WebCodecs spec: Validate config, reject with TypeError for invalid
+    // W3C WebCodecs spec: Validate config
+    // - TypeError for missing required fields
+    // - Return { supported: false } for invalid values
     // https://w3c.github.io/webcodecs/#dom-videoencoder-isconfigsupported
 
     // Validate codec - must be present and not empty
@@ -2489,71 +2652,79 @@ impl VideoEncoder {
       None => return reject_with_type_error(env, "codec is required"),
     };
 
-    // Validate width - must be present and greater than 0
-    match config.width {
-      Some(w) if w > 0 => {}
-      Some(_) => return reject_with_type_error(env, "width must be greater than 0"),
-      None => return reject_with_type_error(env, "width is required"),
-    };
+    // Validate width - must be present (value checked in async block)
+    if config.width.is_none() {
+      return reject_with_type_error(env, "width is required");
+    }
 
-    // Validate height - must be present and greater than 0
-    match config.height {
-      Some(h) if h > 0 => {}
-      Some(_) => return reject_with_type_error(env, "height must be greater than 0"),
-      None => return reject_with_type_error(env, "height is required"),
-    };
+    // Validate height - must be present and non-zero
+    if config.height.is_none() {
+      return reject_with_type_error(env, "height is required");
+    }
 
-    // Validate display dimensions if specified
+    // W3C spec: TypeError for structurally invalid configs (zero values)
+    // These must be checked BEFORE async block to throw synchronously
+    if let Some(w) = config.width
+      && w == 0
+    {
+      return reject_with_type_error(env, "width must be non-zero");
+    }
+
+    if let Some(h) = config.height
+      && h == 0
+    {
+      return reject_with_type_error(env, "height must be non-zero");
+    }
+
     if let Some(dw) = config.display_width
       && dw == 0
     {
-      return reject_with_type_error(env, "displayWidth must be greater than 0");
+      return reject_with_type_error(env, "displayWidth must be non-zero");
     }
+
     if let Some(dh) = config.display_height
       && dh == 0
     {
-      return reject_with_type_error(env, "displayHeight must be greater than 0");
+      return reject_with_type_error(env, "displayHeight must be non-zero");
     }
 
-    // Validate bitrate if specified
     if let Some(bitrate) = config.bitrate
       && bitrate <= 0.0
     {
-      return reject_with_type_error(env, "bitrate must be greater than 0");
-    }
-
-    // Validate framerate if specified
-    if let Some(framerate) = config.framerate
-      && framerate <= 0.0
-    {
-      return reject_with_type_error(env, "framerate must be greater than 0");
-    }
-
-    // Validate dimensions if specified
-    let width = config.width.unwrap_or(0);
-    let height = config.height.unwrap_or(0);
-    if !are_dimensions_valid(width, height) {
-      return env.spawn_future(async move {
-        Ok(VideoEncoderSupport {
-          supported: false,
-          config,
-        })
-      });
-    }
-
-    // Validate scalability mode if specified
-    if let Some(ref mode) = config.scalability_mode
-      && !is_valid_scalability_mode(mode)
-    {
-      return env.spawn_future(async move {
-        Ok(VideoEncoderSupport {
-          supported: false,
-          config,
-        })
-      });
+      return reject_with_type_error(env, "bitrate must be positive");
     }
 
     env.spawn_future(async move {
+      // Validate framerate if specified (return { supported: false } not TypeError)
+      if let Some(framerate) = config.framerate
+        && framerate <= 0.0
+      {
+        return Ok(VideoEncoderSupport {
+          supported: false,
+          config,
+        });
+      }
+
+      // Validate dimensions range
+      let width = config.width.unwrap_or(0);
+      let height = config.height.unwrap_or(0);
+      if !are_dimensions_valid(width, height) {
+        return Ok(VideoEncoderSupport {
+          supported: false,
+          config,
+        });
+      }
+
+      // Validate scalability mode if specified
+      if let Some(ref mode) = config.scalability_mode
+        && !is_valid_scalability_mode(mode)
+      {
+        return Ok(VideoEncoderSupport {
+          supported: false,
+          config,
+        });
+      }
+
       // Parse codec string
       let codec_id = match parse_codec_string(&codec) {
         Ok(id) => id,

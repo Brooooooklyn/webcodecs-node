@@ -265,16 +265,21 @@ export async function checkDecoderSupport(t: ExecutionContext, config: VideoDeco
 
 /**
  * Encoder configurations for different codec variants
+ *
+ * Note: hasEmbeddedColorSpace is set to false for all codecs because FFmpeg's
+ * decoders don't reliably extract colorSpace metadata from the bitstream.
+ * When colorSpace is stripped from decoder config, decoded frames will have
+ * null/unspecified colorSpace values instead of the embedded values.
  */
 export const ENCODER_CONFIGS = {
   av1: {
     codec: 'av01.0.04M.08',
-    hasEmbeddedColorSpace: true,
+    hasEmbeddedColorSpace: false, // FFmpeg doesn't extract colorSpace from AV1 bitstream
     hardwareAcceleration: 'prefer-software' as const,
   },
   av1_444_high: {
     codec: 'av01.1.04M.08.0.000',
-    hasEmbeddedColorSpace: true,
+    hasEmbeddedColorSpace: false,
     hardwareAcceleration: 'prefer-software' as const,
   },
   vp8: {
@@ -284,36 +289,36 @@ export const ENCODER_CONFIGS = {
   },
   vp9_p0: {
     codec: 'vp09.00.10.08',
-    hasEmbeddedColorSpace: true,
+    hasEmbeddedColorSpace: false, // FFmpeg doesn't extract colorSpace from VP9 bitstream
     hardwareAcceleration: 'prefer-software' as const,
   },
   vp9_p2: {
     codec: 'vp09.02.10.10',
-    hasEmbeddedColorSpace: true,
+    hasEmbeddedColorSpace: false,
     hardwareAcceleration: 'prefer-software' as const,
   },
   h264_avc: {
     codec: 'avc1.42001E',
     avc: { format: 'avc' as const },
-    hasEmbeddedColorSpace: true,
+    hasEmbeddedColorSpace: false, // FFmpeg doesn't extract colorSpace from H.264 bitstream
     hardwareAcceleration: 'prefer-software' as const,
   },
   h264_annexb: {
     codec: 'avc1.42001E',
     avc: { format: 'annexb' as const },
-    hasEmbeddedColorSpace: true,
+    hasEmbeddedColorSpace: false,
     hardwareAcceleration: 'prefer-software' as const,
   },
   h265_hevc: {
     codec: 'hvc1.1.6.L123.00',
     hevc: { format: 'hevc' as const },
-    hasEmbeddedColorSpace: true,
+    hasEmbeddedColorSpace: false, // FFmpeg doesn't extract colorSpace from H.265 bitstream
     hardwareAcceleration: 'prefer-software' as const,
   },
   h265_annexb: {
     codec: 'hvc1.1.6.L123.00',
     hevc: { format: 'annexb' as const },
-    hasEmbeddedColorSpace: true,
+    hasEmbeddedColorSpace: false,
     hardwareAcceleration: 'prefer-software' as const,
   },
 } as const

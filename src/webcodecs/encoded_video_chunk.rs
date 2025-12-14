@@ -357,6 +357,11 @@ impl EncodedVideoChunk {
       .unwrap_or(false)
   }
 
+  /// Get a copy of the raw data (internal use only, for extracting SPS/PPS)
+  pub(crate) fn get_data(&self) -> Option<Vec<u8>> {
+    self.with_inner(|inner| Ok(inner.data.clone())).ok()
+  }
+
   fn with_inner<F, R>(&self, f: F) -> Result<R>
   where
     F: FnOnce(&EncodedVideoChunkInner) -> Result<R>,
@@ -698,6 +703,220 @@ pub fn convert_annexb_extradata_to_avcc(data: &[u8]) -> Option<Vec<u8>> {
   result.push(num_pps);
 
   // Write each PPS
+  for pps in pps_list.iter().take(num_pps as usize) {
+    let len = pps.len() as u16;
+    result.extend_from_slice(&len.to_be_bytes());
+    result.extend_from_slice(pps);
+  }
+
+  Some(result)
+}
+
+/// Extract avcC configuration record from AVCC-formatted packet data
+///
+/// AVCC packet format uses 4-byte length prefixes for each NAL unit.
+/// This function parses the packet to find SPS and PPS NAL units,
+/// then builds an avcC (AVCDecoderConfigurationRecord) from them.
+///
+/// This is useful for VideoToolbox which embeds SPS/PPS inline in the first key frame
+/// packet instead of populating the codec context's extradata field.
+pub fn extract_avcc_from_avcc_packet(data: &[u8]) -> Option<Vec<u8>> {
+  if data.len() < 8 {
+    return None;
+  }
+
+  // Parse AVCC-formatted NAL units (4-byte length prefix)
+  let mut sps_list: Vec<Vec<u8>> = Vec::new();
+  let mut pps_list: Vec<Vec<u8>> = Vec::new();
+  let mut offset = 0;
+
+  while offset + 4 <= data.len() {
+    let nal_length = ((data[offset] as usize) << 24)
+      | ((data[offset + 1] as usize) << 16)
+      | ((data[offset + 2] as usize) << 8)
+      | (data[offset + 3] as usize);
+
+    if nal_length == 0 || offset + 4 + nal_length > data.len() {
+      break;
+    }
+
+    let nal_data = &data[offset + 4..offset + 4 + nal_length];
+    if !nal_data.is_empty() {
+      let nal_type = nal_data[0] & 0x1F;
+      match nal_type {
+        7 => sps_list.push(nal_data.to_vec()), // SPS
+        8 => pps_list.push(nal_data.to_vec()), // PPS
+        _ => {}                                // Skip other NAL types (SEI, IDR, etc.)
+      }
+    }
+
+    offset += 4 + nal_length;
+  }
+
+  // Need at least one SPS and one PPS
+  if sps_list.is_empty() || pps_list.is_empty() {
+    return None;
+  }
+
+  // Extract profile/level from first SPS
+  // SPS structure: nal_unit_type (1 byte), profile_idc (1 byte), constraint_set (1 byte), level_idc (1 byte)
+  let sps = &sps_list[0];
+  if sps.len() < 4 {
+    return None;
+  }
+  let profile_idc = sps[1];
+  let profile_compat = sps[2];
+  let level_idc = sps[3];
+
+  // Build avcC box (same format as convert_annexb_extradata_to_avcc)
+  let mut result = vec![
+    1,              // configurationVersion = 1
+    profile_idc,    // AVCProfileIndication
+    profile_compat, // profile_compatibility
+    level_idc,      // AVCLevelIndication
+    0xFF,           // lengthSizeMinusOne = 3 (4 bytes) + reserved 6 bits set to 1
+  ];
+
+  // Number of SPS (3 reserved bits + 5 bits for count)
+  let num_sps = std::cmp::min(sps_list.len(), 31) as u8;
+  result.push(0xE0 | num_sps);
+
+  // Write each SPS
+  for sps in sps_list.iter().take(num_sps as usize) {
+    let len = sps.len() as u16;
+    result.extend_from_slice(&len.to_be_bytes());
+    result.extend_from_slice(sps);
+  }
+
+  // Number of PPS (8 bits for count)
+  let num_pps = std::cmp::min(pps_list.len(), 255) as u8;
+  result.push(num_pps);
+
+  // Write each PPS
+  for pps in pps_list.iter().take(num_pps as usize) {
+    let len = pps.len() as u16;
+    result.extend_from_slice(&len.to_be_bytes());
+    result.extend_from_slice(pps);
+  }
+
+  Some(result)
+}
+
+/// Extract hvcC configuration record from HVCC-formatted packet data
+///
+/// HVCC packet format uses 4-byte length prefixes for each NAL unit.
+/// This function parses the packet to find VPS, SPS, and PPS NAL units,
+/// then builds an hvcC (HEVCDecoderConfigurationRecord) from them.
+///
+/// This is useful for VideoToolbox which embeds VPS/SPS/PPS inline in the first key frame
+/// packet instead of populating the codec context's extradata field.
+pub fn extract_hvcc_from_hvcc_packet(data: &[u8]) -> Option<Vec<u8>> {
+  if data.len() < 8 {
+    return None;
+  }
+
+  // Parse HVCC-formatted NAL units (4-byte length prefix)
+  let mut vps_list: Vec<Vec<u8>> = Vec::new();
+  let mut sps_list: Vec<Vec<u8>> = Vec::new();
+  let mut pps_list: Vec<Vec<u8>> = Vec::new();
+  let mut offset = 0;
+
+  while offset + 4 <= data.len() {
+    let nal_length = ((data[offset] as usize) << 24)
+      | ((data[offset + 1] as usize) << 16)
+      | ((data[offset + 2] as usize) << 8)
+      | (data[offset + 3] as usize);
+
+    if nal_length == 0 || offset + 4 + nal_length > data.len() {
+      break;
+    }
+
+    let nal_data = &data[offset + 4..offset + 4 + nal_length];
+    if !nal_data.is_empty() {
+      // HEVC NAL type is (byte[0] >> 1) & 0x3F
+      let nal_type = (nal_data[0] >> 1) & 0x3F;
+      match nal_type {
+        32 => vps_list.push(nal_data.to_vec()), // VPS
+        33 => sps_list.push(nal_data.to_vec()), // SPS
+        34 => pps_list.push(nal_data.to_vec()), // PPS
+        _ => {}                                 // Skip other NAL types
+      }
+    }
+
+    offset += 4 + nal_length;
+  }
+
+  // Need at least one SPS and one PPS
+  if sps_list.is_empty() || pps_list.is_empty() {
+    return None;
+  }
+
+  // Build hvcC box (same format as convert_annexb_extradata_to_hvcc)
+  let mut result = Vec::new();
+
+  // configurationVersion = 1
+  result.push(1);
+  // general_profile_space (2 bits) + general_tier_flag (1 bit) + general_profile_idc (5 bits)
+  // Default: profile_space=0, tier_flag=0, profile_idc=1 (Main)
+  result.push(0x01);
+  // general_profile_compatibility_flags (4 bytes)
+  result.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+  // general_constraint_indicator_flags (6 bytes)
+  result.extend_from_slice(&[0x90, 0x00, 0x00, 0x00, 0x00, 0x00]);
+  // general_level_idc
+  result.push(0x5D); // Level 3.1 default
+  // min_spatial_segmentation_idc (4 bits reserved=1 + 12 bits value)
+  result.extend_from_slice(&[0xF0, 0x00]);
+  // parallelismType (6 bits reserved=1 + 2 bits value)
+  result.push(0xFC);
+  // chromaFormat (6 bits reserved=1 + 2 bits value)
+  result.push(0xFD); // 4:2:0
+  // bitDepthLumaMinus8 (5 bits reserved=1 + 3 bits value)
+  result.push(0xF8);
+  // bitDepthChromaMinus8 (5 bits reserved=1 + 3 bits value)
+  result.push(0xF8);
+  // avgFrameRate (2 bytes)
+  result.extend_from_slice(&[0x00, 0x00]);
+  // constantFrameRate (2 bits) + numTemporalLayers (3 bits) + temporalIdNested (1 bit) + lengthSizeMinusOne (2 bits)
+  result.push(0x0F); // 4-byte NALU lengths
+
+  // numOfArrays
+  let has_vps = !vps_list.is_empty();
+  let num_arrays = if has_vps { 3u8 } else { 2u8 };
+  result.push(num_arrays);
+
+  // HEVC NAL unit types for parameter sets
+  const VPS_NAL_TYPE: u8 = 32;
+  const SPS_NAL_TYPE: u8 = 33;
+  const PPS_NAL_TYPE: u8 = 34;
+
+  // Write VPS array if present
+  if has_vps {
+    // array_completeness (1 bit) + reserved (1 bit) + NAL_unit_type (6 bits)
+    result.push(VPS_NAL_TYPE);
+    let num_vps = std::cmp::min(vps_list.len(), 255) as u16;
+    result.extend_from_slice(&num_vps.to_be_bytes());
+    for vps in vps_list.iter().take(num_vps as usize) {
+      let len = vps.len() as u16;
+      result.extend_from_slice(&len.to_be_bytes());
+      result.extend_from_slice(vps);
+    }
+  }
+
+  // Write SPS array
+  result.push(SPS_NAL_TYPE);
+  let num_sps = std::cmp::min(sps_list.len(), 255) as u16;
+  result.extend_from_slice(&num_sps.to_be_bytes());
+  for sps in sps_list.iter().take(num_sps as usize) {
+    let len = sps.len() as u16;
+    result.extend_from_slice(&len.to_be_bytes());
+    result.extend_from_slice(sps);
+  }
+
+  // Write PPS array
+  result.push(PPS_NAL_TYPE);
+  let num_pps = std::cmp::min(pps_list.len(), 255) as u16;
+  result.extend_from_slice(&num_pps.to_be_bytes());
   for pps in pps_list.iter().take(num_pps as usize) {
     let len = pps.len() as u16;
     result.extend_from_slice(&len.to_be_bytes());

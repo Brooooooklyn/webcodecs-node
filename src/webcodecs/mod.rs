@@ -38,7 +38,8 @@ pub use encoded_video_chunk::{
 pub(crate) use encoded_video_chunk::{
   convert_annexb_extradata_to_avcc, convert_annexb_extradata_to_hvcc,
   convert_avcc_extradata_to_annexb, convert_avcc_to_annexb, convert_hvcc_extradata_to_annexb,
-  is_avcc_extradata, is_avcc_format, is_hvcc_extradata,
+  extract_avcc_from_avcc_packet, extract_hvcc_from_hvcc_packet, is_avcc_extradata, is_avcc_format,
+  is_hvcc_extradata,
 };
 pub use hardware::{
   HardwareAccelerator, get_available_hardware_accelerators, get_hardware_accelerators,
