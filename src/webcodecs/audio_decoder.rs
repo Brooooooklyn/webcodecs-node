@@ -467,19 +467,21 @@ impl AudioDecoder {
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    // W3C spec: flush() should reject if decoder is not in configured state
-    if guard.state != CodecState::Configured {
-      // If closed due to error, return EncodingError; otherwise InvalidStateError
-      if guard.state == CodecState::Closed && guard.had_error {
-        return Err(Error::new(
-          Status::GenericFailure,
-          "EncodingError: Decode error occurred",
-        ));
-      }
+    // W3C spec: If an error occurred during decoding, flush should reject with EncodingError.
+    // This must be checked first to return the correct error type.
+    if guard.state == CodecState::Closed && guard.had_error {
       return Err(Error::new(
         Status::GenericFailure,
-        "InvalidStateError: Decoder is not configured",
+        "EncodingError: Decode error occurred",
       ));
+    }
+
+    // Per W3C spec: state check happens on main thread (in flush() method).
+    // If state changed after that check (e.g., reconfigure failed but no decode error),
+    // silently succeed. The error callback has already been invoked by the failing operation.
+    // This is consistent with process_decode() which silently discards when state is wrong.
+    if guard.state != CodecState::Configured {
+      return Ok(());
     }
 
     let context = match guard.context.as_mut() {

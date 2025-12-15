@@ -804,8 +804,8 @@ impl VideoDecoder {
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    // W3C spec: If an error occurred during decoding, flush should reject FIRST
-    // Check this before state check to return EncodingError instead of InvalidStateError
+    // W3C spec: If an error occurred during decoding, flush should reject with EncodingError.
+    // This must be checked first to return the correct error type.
     if guard.had_error {
       return Err(Error::new(
         Status::GenericFailure,
@@ -813,22 +813,19 @@ impl VideoDecoder {
       ));
     }
 
-    // W3C spec: flush() should reject if decoder is not in configured state
+    // Per W3C spec: state check happens on main thread (in flush() method).
+    // If state changed after that check (e.g., reconfigure failed but no decode error),
+    // silently succeed. The error callback has already been invoked by the failing operation.
+    // This is consistent with process_decode() which silently discards when state is wrong.
     if guard.state != CodecState::Configured {
-      return Err(Error::new(
-        Status::GenericFailure,
-        "InvalidStateError: Decoder is not configured",
-      ));
+      return Ok(());
     }
 
     let context = match guard.context.as_mut() {
       Some(ctx) => ctx,
       None => {
-        Self::report_error(&mut guard, "No decoder context");
-        return Err(Error::new(
-          Status::GenericFailure,
-          "EncodingError: No decoder context",
-        ));
+        // No context means decoder was reset/closed - silently succeed
+        return Ok(());
       }
     };
 

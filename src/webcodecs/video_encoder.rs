@@ -1192,12 +1192,12 @@ impl VideoEncoder {
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    // W3C spec: flush() should reject if encoder is not in configured state
+    // Per W3C spec: state check happens on main thread (in flush() method).
+    // If state changed after that check (e.g., reconfigure failed), silently succeed.
+    // The error callback has already been invoked by the failing operation.
+    // This is consistent with process_encode() which silently discards when state is wrong.
     if guard.state != CodecState::Configured {
-      return Err(Error::new(
-        Status::GenericFailure,
-        "InvalidStateError: Encoder is not configured",
-      ));
+      return Ok(());
     }
 
     // If no frames have been encoded, skip flushing to avoid putting encoder in EOF state
