@@ -16,6 +16,7 @@ import {
   resetHardwareFallbackState,
   VideoDecoder,
   VideoEncoder,
+  VideoFrame,
 } from '../index.js'
 import {
   generateSolidColorI420Frame,
@@ -179,7 +180,7 @@ test('VideoEncoder: dequeue once:true fires only once', async (t) => {
 test('VideoDecoder: addEventListener dequeue fires when queue decreases', async (t) => {
   const chunks = await createEncodedH264Chunks(320, 240, 1)
 
-  const frames: unknown[] = []
+  const frames: VideoFrame[] = []
   const decoder = new VideoDecoder({
     output: (frame) => {
       frames.push(frame)
@@ -211,7 +212,7 @@ test('VideoDecoder: addEventListener dequeue fires when queue decreases', async 
 
   // Clean up frames
   for (const frame of frames) {
-    ;(frame as { close: () => void }).close()
+    frame.close()
   }
 })
 

@@ -253,18 +253,34 @@ impl FromNapiValue for VideoEncoderInit {
 /// Threshold for detecting silent encoder failure (no output after N frames)
 const SILENT_FAILURE_THRESHOLD: u32 = 3;
 
-/// Type alias for event listener callback (weak to allow Node.js process to exit)
-type EventListenerCallback = ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, true>;
+/// Type alias for weak event listener callback (allows Node.js process to exit)
+type WeakEventListenerCallback =
+  ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, true>;
+
+/// Type alias for strong event listener callback (keeps Node.js alive until called)
+type StrongEventListenerCallback =
+  ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, false>;
+
+/// Backwards compatibility alias for dequeue callback
+type EventListenerCallback = WeakEventListenerCallback;
+
+/// Enum to hold either weak or strong TSF for event listeners
+enum EventListenerCallbackType {
+  /// Weak TSF for regular listeners (doesn't prevent Node.js exit)
+  Weak(Arc<WeakEventListenerCallback>),
+  /// Strong TSF for once listeners (keeps Node.js alive until callback fires)
+  /// Wrapped in Arc to allow cloning for the callback closure
+  Strong(Arc<StrongEventListenerCallback>),
+}
 
 /// Entry for tracking event listeners
-/// Stores both the weak ThreadsafeFunction and a FunctionRef to prevent GC from collecting the callback
+/// Stores either weak TSF (for regular) or strong TSF (for once) listeners
 struct EventListenerEntry {
   id: u64,
-  callback: Arc<EventListenerCallback>,
+  callback: EventListenerCallbackType,
   once: bool,
-  /// Prevents GC from collecting the JS callback while listener is registered
-  /// The weak TSF alone doesn't prevent GC, so we need this to keep the function alive
-  _prevent_gc: FunctionRef<(), UnknownReturnValue>,
+  /// Only needed for Weak variant - Strong TSF keeps the function alive automatically
+  _prevent_gc: Option<FunctionRef<(), UnknownReturnValue>>,
 }
 
 /// State for EventTarget interface, separate from main encoder state
@@ -1515,21 +1531,7 @@ impl VideoEncoder {
       HardwareAcceleration::PreferSoftware => None,
     };
 
-    // Create encoder context
-    let result = match CodecContext::new_encoder_with_hw_info(codec_id, hw_type) {
-      Ok(r) => r,
-      Err(e) => {
-        Self::report_error(
-          &mut guard,
-          &format!("NotSupportedError: Failed to create encoder: {}", e),
-        );
-        return;
-      }
-    };
-
-    let mut context = result.context;
-
-    // Configure encoder
+    // Build encoder config first (needed for software fallback)
     let bitrate_mode = match config.bitrate_mode {
       Some(VideoEncoderBitrateMode::Constant) => CodecBitrateMode::Constant,
       Some(VideoEncoderBitrateMode::Variable) => CodecBitrateMode::Variable,
@@ -1560,15 +1562,7 @@ impl VideoEncoder {
       crf: None,
     };
 
-    if let Err(e) = context.configure_encoder(&encoder_config) {
-      Self::report_error(
-        &mut guard,
-        &format!("NotSupportedError: Failed to configure encoder: {}", e),
-      );
-      return;
-    }
-
-    // Determine if AVCC/HVCC format is needed (set GLOBAL_HEADER)
+    // Determine if AVCC/HVCC format is needed (for create_software_encoder helper)
     let is_h264 = codec_string.starts_with("avc1")
       || codec_string.starts_with("avc3")
       || codec_string == "h264";
@@ -1590,23 +1584,96 @@ impl VideoEncoder {
       false
     };
 
-    if use_avcc_format {
-      context.set_global_header();
-    }
+    // Create encoder context WITH FALLBACK (matching configure() behavior)
+    let (mut context, mut is_hardware, mut encoder_name) =
+      match CodecContext::new_encoder_with_hw_info(codec_id, hw_type) {
+        Ok(r) => (r.context, r.is_hardware, r.encoder_name),
+        Err(e) => {
+          // For no-preference, try software fallback if HW failed at creation
+          if guard.hw_preference == HardwareAcceleration::NoPreference && hw_type.is_some() {
+            match Self::create_software_encoder(codec_id, &encoder_config, use_avcc_format) {
+              Ok((ctx, name)) => (ctx, false, name),
+              Err(e2) => {
+                Self::report_error(
+                  &mut guard,
+                  &format!("NotSupportedError: Failed to create encoder: {}", e2),
+                );
+                return;
+              }
+            }
+          } else {
+            Self::report_error(
+              &mut guard,
+              &format!("NotSupportedError: Failed to create encoder: {}", e),
+            );
+            return;
+          }
+        }
+      };
 
-    if let Err(e) = context.open() {
-      Self::report_error(
-        &mut guard,
-        &format!("NotSupportedError: Failed to open encoder: {}", e),
-      );
-      return;
+    // Configure encoder (with fallback for HW failures)
+    if let Err(e) = context.configure_encoder(&encoder_config) {
+      // Fallback to software if HW configure fails
+      if guard.hw_preference == HardwareAcceleration::NoPreference && is_hardware {
+        match Self::create_software_encoder(codec_id, &encoder_config, use_avcc_format) {
+          Ok((ctx, name)) => {
+            context = ctx;
+            is_hardware = false;
+            encoder_name = name;
+          }
+          Err(e2) => {
+            Self::report_error(
+              &mut guard,
+              &format!("NotSupportedError: Failed to configure encoder: {}", e2),
+            );
+            return;
+          }
+        }
+      } else {
+        Self::report_error(
+          &mut guard,
+          &format!("NotSupportedError: Failed to configure encoder: {}", e),
+        );
+        return;
+      }
+    } else {
+      // Configuration succeeded - set GLOBAL_HEADER and open
+      if use_avcc_format {
+        context.set_global_header();
+      }
+
+      if let Err(e) = context.open() {
+        // Fallback to software if HW open fails
+        if guard.hw_preference == HardwareAcceleration::NoPreference && is_hardware {
+          match Self::create_software_encoder(codec_id, &encoder_config, use_avcc_format) {
+            Ok((ctx, name)) => {
+              context = ctx;
+              is_hardware = false;
+              encoder_name = name;
+            }
+            Err(e2) => {
+              Self::report_error(
+                &mut guard,
+                &format!("NotSupportedError: Failed to open encoder: {}", e2),
+              );
+              return;
+            }
+          }
+        } else {
+          Self::report_error(
+            &mut guard,
+            &format!("NotSupportedError: Failed to open encoder: {}", e),
+          );
+          return;
+        }
+      }
     }
 
     // Update inner state
     guard.context = Some(context);
     guard.config = Some(config.clone());
-    guard.is_hardware = result.is_hardware;
-    guard.encoder_name = result.encoder_name;
+    guard.is_hardware = is_hardware;
+    guard.encoder_name = encoder_name;
     guard.use_avcc_format = use_avcc_format;
 
     // Parse temporal layer count from scalabilityMode
@@ -1648,38 +1715,36 @@ impl VideoEncoder {
     }
 
     // 2. Fire EventTarget listeners
-    // For "once" listeners, use call_with_return_value to ensure _prevent_gc cleanup
-    // For regular listeners, use simple call()
+    // For "once" listeners (Strong TSF): use call_with_return_value to drop TSF after callback
+    // For regular listeners (Weak TSF): use simple call()
     if let Some(listeners) = state.event_listeners.get_mut("dequeue") {
       // Partition into once and regular listeners
       let (once_listeners, regular_listeners): (Vec<_>, Vec<_>) =
         std::mem::take(listeners).into_iter().partition(|e| e.once);
 
-      // Fire regular listeners with simple call()
+      // Fire regular listeners with simple call() (Weak TSF)
       for entry in &regular_listeners {
-        entry
-          .callback
-          .call((), ThreadsafeFunctionCallMode::NonBlocking);
+        if let EventListenerCallbackType::Weak(ref tsf) = entry.callback {
+          tsf.call((), ThreadsafeFunctionCallMode::NonBlocking);
+        }
       }
 
-      // Fire "once" listeners with call_with_return_value for proper _prevent_gc cleanup
-      // The cleanup closure drops _prevent_gc only after the JS callback has executed
-      // IMPORTANT: Clone the Arc to keep TSF alive until callback executes (NonBlocking mode
-      // queues the callback but returns immediately - without this clone, the Arc drops at loop
-      // end and the weak TSF may abort the pending callback)
+      // Fire "once" listeners with call_with_return_value (Strong TSF)
+      // Strong TSF keeps Node.js alive; dropping it in callback releases Node.js
       for entry in once_listeners {
-        let prevent_gc = entry._prevent_gc;
-        let callback_clone = entry.callback.clone();
-        entry.callback.call_with_return_value(
-          (),
-          ThreadsafeFunctionCallMode::NonBlocking,
-          move |_: Result<UnknownReturnValue>, _env: Env| {
-            // Drop callback_clone and prevent_gc after the callback has executed
-            drop(callback_clone);
-            drop(prevent_gc);
-            Ok(())
-          },
-        );
+        if let EventListenerCallbackType::Strong(ref tsf) = entry.callback {
+          // Clone the Arc to move into closure; original drops at loop end
+          let tsf_clone = tsf.clone();
+          tsf.call_with_return_value(
+            (),
+            ThreadsafeFunctionCallMode::NonBlocking,
+            move |_: Result<UnknownReturnValue>, _env: Env| {
+              // Drop TSF clone after callback - releases Node.js to exit
+              drop(tsf_clone);
+              Ok(())
+            },
+          );
+        }
       }
 
       // Put back regular listeners (once listeners are already consumed/removed)
@@ -2807,22 +2872,39 @@ impl VideoEncoder {
     let id = state.next_listener_id;
     state.next_listener_id += 1;
 
-    // Get the function and create both a Ref (to prevent GC) and a weak TSF
+    let once = options.as_ref().and_then(|o| o.once).unwrap_or(false);
     let func = callback.borrow_back(&env)?;
-    let prevent_gc = func.create_ref()?;
-    let tsf = Arc::new(
-      func
-        .build_threadsafe_function()
-        .callee_handled::<false>()
-        .weak::<true>() // Weak to allow Node.js process to exit
-        .build()?,
-    );
+
+    // Create either weak TSF (regular) or strong TSF (once) based on listener type
+    let (callback_type, prevent_gc) = if once {
+      // Once listeners: use strong TSF (keeps Node.js alive until callback fires)
+      // No need for _prevent_gc since strong TSF keeps function alive
+      let tsf = Arc::new(
+        func
+          .build_threadsafe_function()
+          .callee_handled::<false>()
+          .weak::<false>() // Strong - keeps Node.js alive
+          .build()?,
+      );
+      (EventListenerCallbackType::Strong(tsf), None)
+    } else {
+      // Regular listeners: use weak TSF with _prevent_gc
+      let prevent_gc = func.create_ref()?;
+      let tsf = Arc::new(
+        func
+          .build_threadsafe_function()
+          .callee_handled::<false>()
+          .weak::<true>() // Weak - allows Node.js to exit
+          .build()?,
+      );
+      (EventListenerCallbackType::Weak(tsf), Some(prevent_gc))
+    };
 
     let entry = EventListenerEntry {
       id,
-      callback: tsf,
-      once: options.as_ref().and_then(|o| o.once).unwrap_or(false),
-      _prevent_gc: prevent_gc, // Prevents GC while listener is registered
+      callback: callback_type,
+      once,
+      _prevent_gc: prevent_gc,
     };
 
     state
@@ -2870,9 +2952,14 @@ impl VideoEncoder {
     if let Some(listeners) = state.event_listeners.get(&event_type) {
       for entry in listeners {
         // Call the listener with no arguments (like dequeue callback)
-        entry
-          .callback
-          .call((), ThreadsafeFunctionCallMode::Blocking);
+        match &entry.callback {
+          EventListenerCallbackType::Weak(tsf) => {
+            tsf.call((), ThreadsafeFunctionCallMode::Blocking);
+          }
+          EventListenerCallbackType::Strong(tsf) => {
+            tsf.call((), ThreadsafeFunctionCallMode::Blocking);
+          }
+        }
         if entry.once {
           ids_to_remove.push(entry.id);
         }
