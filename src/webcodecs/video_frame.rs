@@ -7,7 +7,10 @@ use crate::codec::Frame;
 use crate::ffi::{
   AVColorPrimaries, AVColorRange, AVColorSpace, AVColorTransferCharacteristic, AVPixelFormat,
 };
-use crate::webcodecs::error::{invalid_state_error, throw_invalid_state_error};
+use crate::webcodecs::error::{
+  enforce_range_long_long, enforce_range_long_long_optional, invalid_state_error,
+  throw_invalid_state_error,
+};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::sync::{Arc, Mutex};
@@ -771,14 +774,18 @@ impl FromNapiValue for VideoFrameBufferInit {
       None => return Err(throw_type_error(env, "codedHeight is required")),
     };
 
-    // timestamp - required
-    let timestamp: i64 = match obj.get("timestamp")? {
-      Some(t) => t,
+    // timestamp - required per WebIDL [EnforceRange] long long
+    // Accept f64 and manually convert per WebIDL spec to handle floating-point values
+    let env_wrapper = Env::from_raw(env);
+    let timestamp_f64: Option<f64> = obj.get("timestamp")?;
+    let timestamp = match timestamp_f64 {
+      Some(ts) => enforce_range_long_long(&env_wrapper, ts, "timestamp")?,
       None => return Err(throw_type_error(env, "timestamp is required")),
     };
 
-    // Optional fields
-    let duration: Option<i64> = obj.get("duration")?;
+    // Duration is optional per WebIDL [EnforceRange] unsigned long long
+    let duration_f64: Option<f64> = obj.get("duration")?;
+    let duration = enforce_range_long_long_optional(&env_wrapper, duration_f64, "duration")?;
     let layout: Option<Vec<PlaneLayout>> = obj.get("layout")?;
     let visible_rect: Option<DOMRectInit> = obj.get("visibleRect")?;
     let rotation: Option<f64> = obj.get("rotation")?;
@@ -893,12 +900,19 @@ impl FromNapiValue for VideoFrameConstructorInit {
     };
 
     // All fields optional - validation happens in constructor based on source type
+    // Parse timestamp and duration as f64 for WebIDL [EnforceRange] long long compliance
+    let env_wrapper = Env::from_raw(env);
+    let timestamp_f64: Option<f64> = obj.get("timestamp")?;
+    let timestamp = enforce_range_long_long_optional(&env_wrapper, timestamp_f64, "timestamp")?;
+    let duration_f64: Option<f64> = obj.get("duration")?;
+    let duration = enforce_range_long_long_optional(&env_wrapper, duration_f64, "duration")?;
+
     Ok(VideoFrameConstructorInit {
       format,
       coded_width: obj.get("codedWidth")?,
       coded_height: obj.get("codedHeight")?,
-      timestamp: obj.get("timestamp")?,
-      duration: obj.get("duration")?,
+      timestamp,
+      duration,
       layout: obj.get("layout")?,
       visible_rect: obj.get("visibleRect")?,
       rotation: obj.get("rotation")?,

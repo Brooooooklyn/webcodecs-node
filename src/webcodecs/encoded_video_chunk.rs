@@ -4,6 +4,7 @@
 //! See: https://developer.mozilla.org/en-US/docs/Web/API/EncodedVideoChunk
 
 use crate::codec::Packet;
+use crate::webcodecs::error::{enforce_range_long_long, enforce_range_long_long_optional};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::sync::{Arc, RwLock};
@@ -115,18 +116,20 @@ impl FromNapiValue for EncodedVideoChunkInit {
       }
     };
 
-    // Validate timestamp - required field
-    let timestamp: Option<i64> = obj.get("timestamp")?;
-    let timestamp = match timestamp {
-      Some(ts) => ts,
+    // Validate timestamp - required field per WebIDL [EnforceRange] long long
+    // Accept f64 and manually convert per WebIDL spec to handle floating-point values
+    let timestamp_f64: Option<f64> = obj.get("timestamp")?;
+    let timestamp = match timestamp_f64 {
+      Some(ts) => enforce_range_long_long(&env_wrapper, ts, "timestamp")?,
       None => {
         env_wrapper.throw_type_error("timestamp is required", None)?;
         return Err(Error::new(Status::InvalidArg, "timestamp is required"));
       }
     };
 
-    // Duration is optional
-    let duration: Option<i64> = obj.get("duration")?;
+    // Duration is optional per WebIDL [EnforceRange] unsigned long long
+    let duration_f64: Option<f64> = obj.get("duration")?;
+    let duration = enforce_range_long_long_optional(&env_wrapper, duration_f64, "duration")?;
 
     // Validate data - required field, accept BufferSource (ArrayBuffer, TypedArray, DataView)
     // Try different buffer types in order of preference

@@ -181,6 +181,8 @@ enum EncoderCommand {
   Encode { frame: Frame, timestamp: i64 },
   /// Flush the encoder and send result back via response channel
   Flush(Sender<Result<()>>),
+  /// Reconfigure the encoder with a new configuration
+  Reconfigure(AudioEncoderConfig),
 }
 
 /// Internal encoder state
@@ -411,6 +413,9 @@ impl AudioEncoder {
         EncoderCommand::Flush(response_sender) => {
           let result = Self::process_flush(&inner, &event_state);
           let _ = response_sender.send(result);
+        }
+        EncoderCommand::Reconfigure(config) => {
+          Self::process_reconfigure(&inner, &config);
         }
       }
     }
@@ -914,6 +919,150 @@ impl AudioEncoder {
     Ok(())
   }
 
+  /// Process a reconfigure command on the worker thread
+  /// Drains old context, clears work state, and creates new encoder context
+  fn process_reconfigure(inner: &Arc<Mutex<AudioEncoderInner>>, config: &AudioEncoderConfig) {
+    let mut guard = match inner.lock() {
+      Ok(g) => g,
+      Err(_) => return, // Lock poisoned
+    };
+
+    // Drain old context (codec thread safety)
+    if let Some(ctx) = guard.context.as_mut() {
+      ctx.flush();
+      let _ = ctx.send_frame(None);
+      while ctx.receive_packet().ok().flatten().is_some() {}
+    }
+
+    // Clear work-related state
+    guard.encode_queue_size = 0;
+    guard.timestamp_queue.clear();
+    guard.frame_count = 0;
+    guard.extradata_sent = false;
+    guard.base_timestamp = None;
+
+    // Parse codec string to determine codec ID
+    let codec = match &config.codec {
+      Some(c) if !c.is_empty() => c.clone(),
+      _ => {
+        Self::report_error(&mut guard, "codec is required");
+        return;
+      }
+    };
+
+    let sample_rate = match config.sample_rate {
+      Some(sr) if sr > 0.0 => sr,
+      _ => {
+        Self::report_error(&mut guard, "sampleRate is required and must be > 0");
+        return;
+      }
+    };
+
+    let number_of_channels = match config.number_of_channels {
+      Some(nc) if nc > 0 => nc,
+      _ => {
+        Self::report_error(&mut guard, "numberOfChannels is required and must be > 0");
+        return;
+      }
+    };
+
+    let codec_id = match parse_audio_codec_string(&codec) {
+      Ok(id) => id,
+      Err(e) => {
+        Self::report_error(
+          &mut guard,
+          &format!("NotSupportedError: Invalid codec: {}", e),
+        );
+        return;
+      }
+    };
+
+    // Get encoder name (prefer external libraries for better quality)
+    let encoder_name = get_audio_encoder_name(codec_id);
+
+    // Create encoder context
+    let mut context = match if let Some(name) = encoder_name {
+      CodecContext::new_encoder_by_name(name).or_else(|_| CodecContext::new_encoder(codec_id))
+    } else {
+      CodecContext::new_encoder(codec_id)
+    } {
+      Ok(ctx) => ctx,
+      Err(e) => {
+        Self::report_error(&mut guard, &format!("Failed to create encoder: {}", e));
+        return;
+      }
+    };
+
+    // Determine target sample format based on codec
+    let target_format = get_encoder_sample_format(codec_id);
+
+    // Configure encoder (cast f64 sample_rate to u32 for FFmpeg)
+    let encoder_config = InternalAudioEncoderConfig {
+      sample_rate: sample_rate as u32,
+      channels: number_of_channels,
+      sample_format: target_format,
+      bitrate: config.bitrate.unwrap_or(128_000.0) as u64,
+      thread_count: 0,
+    };
+
+    if let Err(e) = context.configure_audio_encoder(&encoder_config) {
+      Self::report_error(&mut guard, &format!("Failed to configure encoder: {}", e));
+      return;
+    }
+
+    // Open the encoder
+    if let Err(e) = context.open() {
+      Self::report_error(&mut guard, &format!("Failed to open encoder: {}", e));
+      return;
+    }
+
+    // Get the actual frame size from the encoder
+    let frame_size = context.frame_size();
+    let frame_size = if frame_size == 0 {
+      // Some encoders don't set frame_size, use codec default
+      AudioSampleBuffer::frame_size_for_codec(&codec)
+    } else {
+      frame_size as usize
+    };
+
+    // Create sample buffer
+    let sample_buffer = AudioSampleBuffer::new(
+      frame_size,
+      number_of_channels,
+      sample_rate as u32,
+      target_format,
+    );
+
+    // Check if AAC ADTS format is requested
+    let is_aac = codec.to_lowercase().starts_with("mp4a.40") || codec.to_lowercase() == "aac";
+    let use_adts = is_aac
+      && config
+        .aac
+        .as_ref()
+        .and_then(|aac| aac.format)
+        .map(|f| f == AacBitstreamFormat::Adts)
+        .unwrap_or(false);
+
+    // Cache ADTS parameters if needed
+    let adts_params = if use_adts {
+      let sample_rate_index = get_aac_sample_rate_index(sample_rate as u32);
+      let channel_config = std::cmp::min(number_of_channels, 7) as u8;
+      Some((sample_rate_index, channel_config))
+    } else {
+      None
+    };
+
+    // Update state
+    guard.context = Some(context);
+    guard.sample_buffer = Some(sample_buffer);
+    guard.target_format = target_format;
+    guard.resampler = None;
+    guard.use_adts = use_adts;
+    guard.adts_params = adts_params;
+    guard.config = Some(config.clone());
+    guard.cached_flac_decoder_config = None;
+  }
+
   /// Report an error via callback and close the encoder
   fn report_error(inner: &mut AudioEncoderInner, error_msg: &str) {
     // Create an Error object that will be passed directly to the JS callback
@@ -1053,7 +1202,7 @@ impl AudioEncoder {
 
   /// Configure the encoder
   #[napi]
-  pub fn configure(&self, env: Env, config: AudioEncoderConfig) -> Result<()> {
+  pub fn configure(&mut self, env: Env, config: AudioEncoderConfig) -> Result<()> {
     // W3C WebCodecs spec: Validate config synchronously, throw TypeError for invalid
     // https://w3c.github.io/webcodecs/#dom-audioencoder-configure
 
@@ -1092,6 +1241,36 @@ impl AudioEncoder {
     // W3C spec: throw InvalidStateError if closed
     if inner.state == CodecState::Closed {
       return throw_invalid_state_error(&env, "Encoder is closed");
+    }
+
+    // If already configured, queue reconfigure via microtask for W3C spec FIFO ordering
+    // This ensures pending encode commands are processed before reconfiguration
+    if inner.state == CodecState::Configured {
+      // Validate codec synchronously before queueing
+      let _codec_id = match parse_audio_codec_string(&codec) {
+        Ok(id) => id,
+        Err(e) => {
+          Self::report_error(
+            &mut inner,
+            &format!("NotSupportedError: Invalid codec: {}", e),
+          );
+          return Ok(());
+        }
+      };
+
+      // Store config for immediate property reads
+      inner.config = Some(config.clone());
+
+      // Queue reconfigure via microtask (runs AFTER pending encode microtasks)
+      drop(inner); // Release lock before microtask
+      if let Some(ref sender) = self.command_sender {
+        let sender = sender.clone();
+        PromiseRaw::resolve(&env, ())?.then(move |_| {
+          let _ = sender.send(EncoderCommand::Reconfigure(config));
+          Ok(())
+        })?;
+      }
+      return Ok(());
     }
 
     // Parse codec string to determine codec ID
@@ -1191,6 +1370,24 @@ impl AudioEncoder {
     }
 
     inner.config = Some(config);
+
+    // Create new channel and worker if needed (after reconfiguration)
+    if self.command_sender.is_none() {
+      let (sender, receiver) = channel::unbounded();
+      self.command_sender = Some(sender);
+      let worker_inner = self.inner.clone();
+      let worker_event_state = self.event_state.clone();
+      let worker_reset_flag = self.reset_flag.clone();
+      drop(inner); // Release lock before spawning thread
+      self.worker_handle = Some(std::thread::spawn(move || {
+        Self::worker_loop(
+          worker_inner,
+          worker_event_state,
+          receiver,
+          worker_reset_flag,
+        );
+      }));
+    }
 
     Ok(())
   }
@@ -1316,14 +1513,13 @@ impl AudioEncoder {
       (frame_to_send, timestamp)
     };
 
-    // Send encode command to worker thread (deferred to microtask for W3C spec compliance)
-    // This ensures encodeQueueSize check happens before the worker receives the command
+    // Send encode command via microtask for W3C spec FIFO ordering
+    // This ensures configure() microtasks are processed in correct order with encode()
     if let Some(ref sender) = self.command_sender {
       let sender = sender.clone();
       let reset_flag = self.reset_flag.clone();
       PromiseRaw::resolve(&env, ())?.then(move |_| {
-        // Check reset flag - if reset() was called, skip sending (JS is single-threaded,
-        // so reset() must have completed before this microtask runs)
+        // Check reset flag - if reset() was called, skip sending
         if !reset_flag.load(Ordering::SeqCst) {
           let _ = sender.send(EncoderCommand::Encode {
             frame: frame_to_send,
@@ -1593,10 +1789,8 @@ impl AudioEncoder {
     // Drop sender to stop accepting new commands
     self.command_sender = None;
 
-    // Wait for worker to finish processing remaining tasks
-    if let Some(handle) = self.worker_handle.take() {
-      let _ = handle.join();
-    }
+    // Let worker detach - will exit when channel closes (all senders dropped)
+    self.worker_handle = None;
 
     let mut inner = self
       .inner

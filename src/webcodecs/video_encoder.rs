@@ -185,6 +185,8 @@ enum EncoderCommand {
   },
   /// Flush the encoder and send result back via response channel
   Flush(Sender<Result<()>>),
+  /// Reconfigure the encoder with new config (W3C spec: control message)
+  Reconfigure(VideoEncoderConfig),
 }
 
 /// VideoEncoder init dictionary per WebCodecs spec
@@ -597,6 +599,9 @@ impl VideoEncoder {
         EncoderCommand::Flush(response_sender) => {
           let result = Self::process_flush(&inner, &event_state);
           let _ = response_sender.send(result);
+        }
+        EncoderCommand::Reconfigure(config) => {
+          Self::process_reconfigure(&inner, config);
         }
       }
     }
@@ -1449,6 +1454,174 @@ impl VideoEncoder {
     Ok(())
   }
 
+  /// Process a reconfigure command on the worker thread
+  /// Drains old context and creates new one with updated config
+  fn process_reconfigure(inner: &Arc<Mutex<VideoEncoderInner>>, config: VideoEncoderConfig) {
+    let mut guard = match inner.lock() {
+      Ok(g) => g,
+      Err(_) => return, // Lock poisoned
+    };
+
+    // Don't reconfigure if encoder is closed
+    if guard.state == CodecState::Closed {
+      return;
+    }
+
+    // Drain old context (libaom/AV1 thread safety)
+    if let Some(ctx) = guard.context.as_mut() {
+      ctx.flush();
+      let _ = ctx.send_frame(None);
+      while ctx.receive_packet().ok().flatten().is_some() {}
+    }
+
+    // Clear work-related state
+    guard.encode_queue_size = 0;
+    guard.timestamp_queue.clear();
+    guard.frame_count = 0;
+    guard.extradata_sent = false;
+    guard.output_frame_count = 0;
+    guard.pending_frames.clear();
+
+    // Parse codec to get codec_id
+    let codec_string = match config.codec.as_ref() {
+      Some(c) => c.clone(),
+      None => {
+        Self::report_error(&mut guard, "NotSupportedError: codec is required");
+        return;
+      }
+    };
+
+    let codec_id = match parse_codec_string(&codec_string) {
+      Ok(id) => id,
+      Err(e) => {
+        Self::report_error(
+          &mut guard,
+          &format!("NotSupportedError: Invalid codec: {}", e),
+        );
+        return;
+      }
+    };
+
+    // Determine hardware type based on preference
+    let hw_type = match guard.hw_preference {
+      HardwareAcceleration::PreferHardware => Some(get_platform_hw_type()),
+      HardwareAcceleration::NoPreference => {
+        if is_hw_encoding_disabled() {
+          None
+        } else {
+          Some(get_platform_hw_type())
+        }
+      }
+      HardwareAcceleration::PreferSoftware => None,
+    };
+
+    // Create encoder context
+    let result = match CodecContext::new_encoder_with_hw_info(codec_id, hw_type) {
+      Ok(r) => r,
+      Err(e) => {
+        Self::report_error(
+          &mut guard,
+          &format!("NotSupportedError: Failed to create encoder: {}", e),
+        );
+        return;
+      }
+    };
+
+    let mut context = result.context;
+
+    // Configure encoder
+    let bitrate_mode = match config.bitrate_mode {
+      Some(VideoEncoderBitrateMode::Constant) => CodecBitrateMode::Constant,
+      Some(VideoEncoderBitrateMode::Variable) => CodecBitrateMode::Variable,
+      Some(VideoEncoderBitrateMode::Quantizer) => CodecBitrateMode::Quantizer,
+      None => CodecBitrateMode::Constant,
+    };
+
+    let (gop_size, max_b_frames) = match config.latency_mode {
+      Some(LatencyMode::Realtime) => (10, 0),
+      _ => (60, 2),
+    };
+
+    let encoder_config = EncoderConfig {
+      width: config.width.unwrap_or(0),
+      height: config.height.unwrap_or(0),
+      pixel_format: AVPixelFormat::Yuv420p,
+      bitrate: config.bitrate.unwrap_or(5_000_000.0) as u64,
+      framerate_num: config.framerate.unwrap_or(30.0) as u32,
+      framerate_den: 1,
+      gop_size,
+      max_b_frames,
+      thread_count: 0,
+      profile: None,
+      level: None,
+      bitrate_mode,
+      rc_max_rate: None,
+      rc_buffer_size: None,
+      crf: None,
+    };
+
+    if let Err(e) = context.configure_encoder(&encoder_config) {
+      Self::report_error(
+        &mut guard,
+        &format!("NotSupportedError: Failed to configure encoder: {}", e),
+      );
+      return;
+    }
+
+    // Determine if AVCC/HVCC format is needed (set GLOBAL_HEADER)
+    let is_h264 = codec_string.starts_with("avc1")
+      || codec_string.starts_with("avc3")
+      || codec_string == "h264";
+    let is_h265 = codec_string.starts_with("hvc1")
+      || codec_string.starts_with("hev1")
+      || codec_string == "h265";
+
+    let use_avcc_format = if is_h264 {
+      !matches!(
+        config.avc.as_ref().and_then(|avc| avc.format),
+        Some(AvcBitstreamFormat::Annexb)
+      )
+    } else if is_h265 {
+      !matches!(
+        config.hevc.as_ref().and_then(|hevc| hevc.format),
+        Some(HevcBitstreamFormat::Annexb)
+      )
+    } else {
+      false
+    };
+
+    if use_avcc_format {
+      context.set_global_header();
+    }
+
+    if let Err(e) = context.open() {
+      Self::report_error(
+        &mut guard,
+        &format!("NotSupportedError: Failed to open encoder: {}", e),
+      );
+      return;
+    }
+
+    // Update inner state
+    guard.context = Some(context);
+    guard.config = Some(config.clone());
+    guard.is_hardware = result.is_hardware;
+    guard.encoder_name = result.encoder_name;
+    guard.use_avcc_format = use_avcc_format;
+
+    // Parse temporal layer count from scalabilityMode
+    guard.temporal_layer_count = config
+      .scalability_mode
+      .as_ref()
+      .and_then(|mode| parse_temporal_layer_count(mode));
+
+    // Clear hardware frame context (will be recreated if needed)
+    guard.hw_device_ctx = None;
+    guard.hw_frame_ctx = None;
+    guard.use_hw_frames = false;
+    guard.nv12_scaler = None;
+  }
+
   /// Report an error via callback and close the encoder
   fn report_error(inner: &mut VideoEncoderInner, error_msg: &str) {
     // Create an Error object that will be passed directly to the JS callback
@@ -1818,7 +1991,7 @@ impl VideoEncoder {
 
   /// Configure the encoder
   #[napi]
-  pub fn configure(&self, env: Env, config: VideoEncoderConfig) -> Result<()> {
+  pub fn configure(&mut self, env: Env, config: VideoEncoderConfig) -> Result<()> {
     // W3C WebCodecs spec: Validate config synchronously, throw TypeError for invalid
     // https://w3c.github.io/webcodecs/#dom-videoencoder-configure
 
@@ -1878,6 +2051,48 @@ impl VideoEncoder {
       return throw_invalid_state_error(&env, "Encoder is closed");
     }
 
+    // W3C spec: If already configured, queue reconfigure via microtask
+    // This ensures FIFO ordering with pending encode commands
+    if inner.state == CodecState::Configured {
+      // Validate codec synchronously before queueing
+      let _codec_id = match parse_codec_string(&codec) {
+        Ok(id) => id,
+        Err(e) => {
+          Self::report_error(
+            &mut inner,
+            &format!("NotSupportedError: Invalid codec: {}", e),
+          );
+          return Ok(());
+        }
+      };
+
+      // Validate scalability mode if specified
+      if let Some(ref mode) = config.scalability_mode
+        && !is_valid_scalability_mode(mode)
+      {
+        Self::report_error(
+          &mut inner,
+          &format!("NotSupportedError: Unsupported scalability mode: {}", mode),
+        );
+        return Ok(());
+      }
+
+      // Store config for immediate property reads and new encode validation
+      inner.config = Some(config.clone());
+
+      // Queue reconfigure via microtask (runs AFTER pending encode microtasks)
+      drop(inner); // Release lock before scheduling microtask
+      if let Some(ref sender) = self.command_sender {
+        let sender = sender.clone();
+        PromiseRaw::resolve(&env, ())?.then(move |_| {
+          let _ = sender.send(EncoderCommand::Reconfigure(config));
+          Ok(())
+        })?;
+      }
+      return Ok(());
+    }
+
+    // First-time configure: create context and worker synchronously
     // Parse codec string to determine codec ID
     let codec_id = match parse_codec_string(&codec) {
       Ok(id) => id,
@@ -2160,6 +2375,24 @@ impl VideoEncoder {
       }
     });
 
+    // Create new channel and worker if needed (after reconfiguration)
+    if self.command_sender.is_none() {
+      let (sender, receiver) = channel::unbounded();
+      self.command_sender = Some(sender);
+      let worker_inner = self.inner.clone();
+      let worker_event_state = self.event_state.clone();
+      let worker_reset_flag = self.reset_flag.clone();
+      drop(inner); // Release lock before spawning thread
+      self.worker_handle = Some(std::thread::spawn(move || {
+        Self::worker_loop(
+          worker_inner,
+          worker_event_state,
+          receiver,
+          worker_reset_flag,
+        );
+      }));
+    }
+
     Ok(())
   }
 
@@ -2230,14 +2463,13 @@ impl VideoEncoder {
       (internal_frame, timestamp, rotation, flip)
     };
 
-    // Send encode command to worker thread (deferred to microtask for W3C spec compliance)
-    // This ensures encodeQueueSize is visible to JS before worker processes the command
+    // Send encode command to worker thread via microtask for W3C spec FIFO ordering
+    // This ensures all commands (encode, configure, flush) are ordered correctly
     if let Some(ref sender) = self.command_sender {
       let sender = sender.clone();
       let reset_flag = self.reset_flag.clone();
       PromiseRaw::resolve(&env, ())?.then(move |_| {
-        // Check reset flag - if reset() was called, skip sending (JS is single-threaded,
-        // so reset() must have completed before this microtask runs)
+        // Check reset flag - if reset() was called, skip sending
         if !reset_flag.load(Ordering::SeqCst) {
           let _ = sender.send(EncoderCommand::Encode {
             frame: internal_frame,
@@ -2525,10 +2757,8 @@ impl VideoEncoder {
     // Drop sender to stop accepting new commands
     self.command_sender = None;
 
-    // Wait for worker to finish processing remaining tasks
-    if let Some(handle) = self.worker_handle.take() {
-      let _ = handle.join();
-    }
+    // Let worker detach - will exit when channel closes (all senders dropped)
+    self.worker_handle = None;
 
     let mut inner = self
       .inner

@@ -5,7 +5,9 @@
 
 use crate::codec::Frame;
 use crate::ffi::AVSampleFormat;
-use crate::webcodecs::error::{invalid_state_error, throw_invalid_state_error};
+use crate::webcodecs::error::{
+  enforce_range_long_long, invalid_state_error, throw_invalid_state_error,
+};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::sync::{Arc, Mutex};
@@ -160,9 +162,12 @@ impl FromNapiValue for AudioDataInit {
       None => return Err(throw_type_error(env, "numberOfChannels is required")),
     };
 
-    // Get timestamp (required)
-    let timestamp: i64 = match obj.get("timestamp")? {
-      Some(v) => v,
+    // Get timestamp (required) per WebIDL [EnforceRange] long long
+    // Accept f64 and manually convert per WebIDL spec to handle floating-point values
+    let env_wrapper = Env::from_raw(env);
+    let timestamp_f64: Option<f64> = obj.get("timestamp")?;
+    let timestamp = match timestamp_f64 {
+      Some(ts) => enforce_range_long_long(&env_wrapper, ts, "timestamp")?,
       None => return Err(throw_type_error(env, "timestamp is required")),
     };
 

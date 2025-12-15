@@ -296,3 +296,135 @@ pub fn config_type_error(message: &str) -> Error {
   // Using InvalidArg status for config validation errors
   Error::new(Status::InvalidArg, message)
 }
+
+// ============================================================================
+// WebIDL Type Conversion Helpers
+// ============================================================================
+// These helpers implement WebIDL type conversion algorithms for W3C spec compliance.
+
+/// Convert f64 to i64 per WebIDL `[EnforceRange] long long` algorithm
+///
+/// Per WebIDL spec:
+/// 1. If value is NaN, throw TypeError
+/// 2. If value is +∞ or -∞, throw TypeError
+/// 3. Truncate to integer (like Math.trunc())
+/// 4. If outside i64 range, throw TypeError
+/// 5. Return the value
+///
+/// # Arguments
+/// * `env` - NAPI environment for throwing errors
+/// * `value` - The f64 value to convert
+/// * `field_name` - Name of the field for error messages
+///
+/// # Returns
+/// * `Ok(i64)` - The converted value
+/// * `Err` - TypeError if conversion fails
+pub fn enforce_range_long_long(env: &Env, value: f64, field_name: &str) -> Result<i64> {
+  // WebIDL step 1-2: Check for NaN and infinity
+  if value.is_nan() {
+    env.throw_type_error(&format!("{} cannot be NaN", field_name), None)?;
+    return Err(Error::new(
+      Status::InvalidArg,
+      format!("{} cannot be NaN", field_name),
+    ));
+  }
+  if value.is_infinite() {
+    env.throw_type_error(&format!("{} cannot be Infinity", field_name), None)?;
+    return Err(Error::new(
+      Status::InvalidArg,
+      format!("{} cannot be Infinity", field_name),
+    ));
+  }
+
+  // WebIDL step 3: Truncate to integer
+  let truncated = value.trunc();
+
+  // WebIDL step 4: Check if in range of long long (i64)
+  // i64::MIN = -9223372036854775808, i64::MAX = 9223372036854775807
+  // f64 can represent these exactly as -9223372036854775808.0 and 9223372036854775807.0
+  const I64_MIN_F64: f64 = i64::MIN as f64;
+  const I64_MAX_F64: f64 = i64::MAX as f64;
+
+  if !(I64_MIN_F64..=I64_MAX_F64).contains(&truncated) {
+    env.throw_type_error(
+      &format!("{} is out of range for long long", field_name),
+      None,
+    )?;
+    return Err(Error::new(
+      Status::InvalidArg,
+      format!("{} is out of range for long long", field_name),
+    ));
+  }
+
+  // Safe to convert - value is within i64 range
+  Ok(truncated as i64)
+}
+
+/// Convert optional f64 to i64 per WebIDL `[EnforceRange] long long` algorithm
+///
+/// Same as `enforce_range_long_long` but for optional values.
+pub fn enforce_range_long_long_optional(
+  env: &Env,
+  value: Option<f64>,
+  field_name: &str,
+) -> Result<Option<i64>> {
+  match value {
+    Some(v) => Ok(Some(enforce_range_long_long(env, v, field_name)?)),
+    None => Ok(None),
+  }
+}
+
+/// Convert f64 to u64 per WebIDL `[EnforceRange] unsigned long long` algorithm
+///
+/// Per WebIDL spec:
+/// 1. If value is NaN, throw TypeError
+/// 2. If value is +∞ or -∞, throw TypeError
+/// 3. Truncate to integer (like Math.trunc())
+/// 4. If negative or outside u64 range, throw TypeError
+/// 5. Return the value
+pub fn enforce_range_unsigned_long_long(env: &Env, value: f64, field_name: &str) -> Result<u64> {
+  // WebIDL step 1-2: Check for NaN and infinity
+  if value.is_nan() {
+    env.throw_type_error(&format!("{} cannot be NaN", field_name), None)?;
+    return Err(Error::new(
+      Status::InvalidArg,
+      format!("{} cannot be NaN", field_name),
+    ));
+  }
+  if value.is_infinite() {
+    env.throw_type_error(&format!("{} cannot be Infinity", field_name), None)?;
+    return Err(Error::new(
+      Status::InvalidArg,
+      format!("{} cannot be Infinity", field_name),
+    ));
+  }
+
+  // WebIDL step 3: Truncate to integer
+  let truncated = value.trunc();
+
+  // WebIDL step 4: Check if in range of unsigned long long (u64)
+  if truncated < 0.0 || truncated > u64::MAX as f64 {
+    env.throw_type_error(
+      &format!("{} is out of range for unsigned long long", field_name),
+      None,
+    )?;
+    return Err(Error::new(
+      Status::InvalidArg,
+      format!("{} is out of range for unsigned long long", field_name),
+    ));
+  }
+
+  Ok(truncated as u64)
+}
+
+/// Convert optional f64 to u64 per WebIDL `[EnforceRange] unsigned long long` algorithm
+pub fn enforce_range_unsigned_long_long_optional(
+  env: &Env,
+  value: Option<f64>,
+  field_name: &str,
+) -> Result<Option<u64>> {
+  match value {
+    Some(v) => Ok(Some(enforce_range_unsigned_long_long(env, v, field_name)?)),
+    None => Ok(None),
+  }
+}

@@ -89,6 +89,8 @@ enum WorkerCommand {
   Decode(Arc<RwLock<Option<EncodedVideoChunkInner>>>),
   /// Flush the decoder and send result back via response channel
   Flush(Sender<Result<()>>),
+  /// Reconfigure the decoder with new config (W3C spec: control message)
+  Reconfigure(VideoDecoderConfig),
 }
 
 /// VideoDecoder init dictionary per WebCodecs spec
@@ -415,6 +417,9 @@ impl VideoDecoder {
         WorkerCommand::Flush(response_sender) => {
           let result = Self::process_flush(&inner, &event_state);
           let _ = response_sender.send(result);
+        }
+        WorkerCommand::Reconfigure(config) => {
+          Self::process_reconfigure(&inner, config);
         }
       }
     }
@@ -879,6 +884,143 @@ impl VideoDecoder {
     Ok(())
   }
 
+  /// Process a reconfigure command on the worker thread
+  /// Drains old context and creates new one with updated config
+  fn process_reconfigure(inner: &Arc<Mutex<VideoDecoderInner>>, config: VideoDecoderConfig) {
+    let mut guard = match inner.lock() {
+      Ok(g) => g,
+      Err(_) => return, // Lock poisoned
+    };
+
+    // Don't reconfigure if decoder is closed
+    if guard.state == CodecState::Closed {
+      return;
+    }
+
+    // Drain old context (AV1/libaom thread safety)
+    if let Some(ctx) = guard.context.as_mut() {
+      ctx.flush();
+      let _ = ctx.send_packet(None);
+      while ctx.receive_frame().ok().flatten().is_some() {}
+    }
+
+    // Clear work-related state
+    guard.decode_queue_size = 0;
+    guard.timestamp_queue.clear();
+    guard.keyframe_received = false;
+    guard.silent_decode_count = 0;
+    guard.first_output_produced = false;
+
+    // Parse codec to get codec_id
+    let codec = match config.codec.as_ref() {
+      Some(c) => c.clone(),
+      None => {
+        Self::report_error(&mut guard, "NotSupportedError: codec is required");
+        return;
+      }
+    };
+
+    let codec_id = match parse_codec_string(&codec) {
+      Ok(id) => id,
+      Err(e) => {
+        Self::report_error(
+          &mut guard,
+          &format!("NotSupportedError: Invalid codec: {}", e),
+        );
+        return;
+      }
+    };
+
+    // Determine hardware type based on preference
+    // For decoding, only use hardware for PreferHardware (software is more reliable)
+    let hw_preference = config
+      .hardware_acceleration
+      .unwrap_or(HardwareAcceleration::NoPreference);
+
+    let hw_type = match &hw_preference {
+      HardwareAcceleration::PreferHardware => Some(get_platform_hw_type()),
+      HardwareAcceleration::NoPreference | HardwareAcceleration::PreferSoftware => None,
+    };
+
+    // Create decoder context
+    let (mut context, is_hardware) = if let Some(hw) = hw_type {
+      match CodecContext::new_decoder_with_hw_info(codec_id, Some(hw)) {
+        Ok(result) => (result.context, result.is_hardware),
+        Err(e) => {
+          Self::report_error(
+            &mut guard,
+            &format!("NotSupportedError: Failed to create decoder: {}", e),
+          );
+          return;
+        }
+      }
+    } else {
+      match CodecContext::new_decoder(codec_id) {
+        Ok(ctx) => (ctx, false),
+        Err(e) => {
+          Self::report_error(
+            &mut guard,
+            &format!("NotSupportedError: Failed to create decoder: {}", e),
+          );
+          return;
+        }
+      }
+    };
+
+    // Convert avcC/hvcC extradata to Annex B if needed
+    let extradata = config.description.as_ref().and_then(|d| {
+      let data = d.to_vec();
+      let is_h264 = codec.starts_with("avc1") || codec.starts_with("avc3");
+      let is_h265 = codec.starts_with("hvc1") || codec.starts_with("hev1");
+
+      if is_h264 && is_avcc_extradata(&data) {
+        convert_avcc_extradata_to_annexb(&data).or(Some(data))
+      } else if is_h265 && is_hvcc_extradata(&data) {
+        convert_hvcc_extradata_to_annexb(&data).or(Some(data))
+      } else {
+        Some(data)
+      }
+    });
+
+    // Configure decoder
+    let decoder_config = DecoderConfig {
+      codec_id,
+      thread_count: 0,
+      extradata,
+      low_latency: config.optimize_for_latency.unwrap_or(false),
+    };
+
+    if let Err(e) = context.configure_decoder(&decoder_config) {
+      Self::report_error(
+        &mut guard,
+        &format!("NotSupportedError: Failed to configure decoder: {}", e),
+      );
+      return;
+    }
+
+    if let Err(e) = context.open() {
+      Self::report_error(
+        &mut guard,
+        &format!("NotSupportedError: Failed to open decoder: {}", e),
+      );
+      return;
+    }
+
+    // Update inner state
+    guard.context = Some(context);
+    guard.config = Some(decoder_config);
+    guard.codec_string = codec;
+    guard.is_hardware = is_hardware;
+    guard.hw_preference = hw_preference;
+
+    // Store orientation from config
+    guard.config_rotation = config.rotation.unwrap_or(0.0);
+    guard.config_flip = config.flip.unwrap_or(false);
+
+    // Store colorSpace from config
+    guard.config_color_space = config.color_space;
+  }
+
   /// Report an error via callback and close the decoder
   fn report_error(inner: &mut VideoDecoderInner, error_msg: &str) {
     // Create an Error object that will be passed directly to the JS callback
@@ -1024,7 +1166,7 @@ impl VideoDecoder {
   /// - `no-preference`: Try hardware first, silently fall back to software
   /// - `prefer-software`: Use software only
   #[napi]
-  pub fn configure(&self, env: Env, config: VideoDecoderConfig) -> Result<()> {
+  pub fn configure(&mut self, env: Env, config: VideoDecoderConfig) -> Result<()> {
     // W3C WebCodecs spec: Validate config synchronously, throw TypeError for invalid
     // https://w3c.github.io/webcodecs/#dom-videodecoder-configure
 
@@ -1068,6 +1210,32 @@ impl VideoDecoder {
       return throw_invalid_state_error(&env, "Decoder is closed");
     }
 
+    // W3C spec: If already configured, queue reconfigure via microtask
+    // This ensures FIFO ordering with pending decode commands
+    if inner.state == CodecState::Configured {
+      // Validate codec synchronously before queueing
+      if parse_codec_string(&codec).is_err() {
+        Self::report_error(
+          &mut inner,
+          &format!("NotSupportedError: Invalid codec: {}", codec),
+        );
+        return Ok(());
+      }
+
+      // Queue reconfigure via microtask (runs AFTER pending decode microtasks)
+      // Don't update inner.config here - worker will do it after processing pending decodes
+      drop(inner); // Release lock before scheduling microtask
+      if let Some(ref sender) = self.command_sender {
+        let sender = sender.clone();
+        PromiseRaw::resolve(&env, ())?.then(move |_| {
+          let _ = sender.send(WorkerCommand::Reconfigure(config));
+          Ok(())
+        })?;
+      }
+      return Ok(());
+    }
+
+    // First-time configure: create context and worker synchronously
     // Parse codec string to determine codec ID
     let codec_id = match parse_codec_string(&codec) {
       Ok(id) => id,
@@ -1185,6 +1353,24 @@ impl VideoDecoder {
     // If provided, this colorSpace will be applied to all decoded frames
     inner.config_color_space = config.color_space;
 
+    // Create new channel and worker if needed (after reconfiguration)
+    if self.command_sender.is_none() {
+      let (sender, receiver) = channel::unbounded();
+      self.command_sender = Some(sender);
+      let worker_inner = self.inner.clone();
+      let worker_event_state = self.event_state.clone();
+      let worker_reset_flag = self.reset_flag.clone();
+      drop(inner); // Release lock before spawning thread
+      self.worker_handle = Some(std::thread::spawn(move || {
+        Self::worker_loop(
+          worker_inner,
+          worker_event_state,
+          receiver,
+          worker_reset_flag,
+        );
+      }));
+    }
+
     Ok(())
   }
 
@@ -1220,15 +1406,14 @@ impl VideoDecoder {
       inner.decode_queue_size += 1;
     }
 
-    // Send decode command to worker thread (deferred to microtask for W3C spec compliance)
-    // This ensures decodeQueueSize check happens before the worker receives the command
+    // Send decode command to worker thread via microtask for W3C spec FIFO ordering
+    // This ensures all commands (decode, configure, flush) are ordered correctly
     if let Some(ref sender) = self.command_sender {
       let sender = sender.clone();
       let reset_flag = self.reset_flag.clone();
       let chunk_inner = chunk.inner.clone();
       PromiseRaw::resolve(&env, ())?.then(move |_| {
-        // Check reset flag - if reset() was called, skip sending (JS is single-threaded,
-        // so reset() must have completed before this microtask runs)
+        // Check reset flag - if reset() was called, skip sending
         if !reset_flag.load(Ordering::SeqCst) {
           let _ = sender.send(WorkerCommand::Decode(chunk_inner));
         }
@@ -1517,10 +1702,8 @@ impl VideoDecoder {
     // Drop sender to stop accepting new commands
     self.command_sender = None;
 
-    // Wait for worker to finish processing remaining tasks
-    if let Some(handle) = self.worker_handle.take() {
-      let _ = handle.join();
-    }
+    // Let worker detach - will exit when channel closes (all senders dropped)
+    self.worker_handle = None;
 
     let mut inner = self
       .inner

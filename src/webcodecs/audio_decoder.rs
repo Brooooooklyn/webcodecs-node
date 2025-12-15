@@ -83,6 +83,8 @@ enum DecoderCommand {
   Decode { data: Vec<u8>, timestamp: i64 },
   /// Flush the decoder and send result back via response channel
   Flush(Sender<Result<()>>),
+  /// Reconfigure the decoder with a new configuration
+  Reconfigure(AudioDecoderConfig),
 }
 
 /// AudioDecoder init dictionary per WebCodecs spec
@@ -168,6 +170,9 @@ struct AudioDecoderInner {
   /// Flag indicating whether a flush operation is in progress
   /// When true, worker queues data to pending_data instead of calling NonBlocking callback
   inside_flush: bool,
+  /// Queue of timestamps from input chunks (to preserve original timestamps)
+  /// FFmpeg may return AV_NOPTS_VALUE for frame.pts(), so we track input timestamps
+  timestamp_queue: std::collections::VecDeque<i64>,
 }
 
 /// AudioDecoder - WebCodecs-compliant audio decoder
@@ -256,6 +261,7 @@ impl AudioDecoder {
       flush_abort_flag: None,
       pending_data: Vec::new(),
       inside_flush: false,
+      timestamp_queue: std::collections::VecDeque::new(),
     };
 
     let inner = Arc::new(Mutex::new(inner));
@@ -329,6 +335,9 @@ impl AudioDecoder {
           let result = Self::process_flush(&inner, &event_state);
           let _ = response_sender.send(result);
         }
+        DecoderCommand::Reconfigure(config) => {
+          Self::process_reconfigure(&inner, &config);
+        }
       }
     }
   }
@@ -372,10 +381,16 @@ impl AudioDecoder {
       return;
     }
 
+    // Store the original timestamp for output (FFmpeg may return AV_NOPTS_VALUE)
+    // Must be done before borrowing context to satisfy borrow checker
+    guard.timestamp_queue.push_back(timestamp);
+
     // Get context
     let context = match guard.context.as_mut() {
       Some(ctx) => ctx,
       None => {
+        // Remove the timestamp we just pushed since we're not decoding
+        guard.timestamp_queue.pop_back();
         let old_size = guard.decode_queue_size;
         guard.decode_queue_size = old_size.saturating_sub(1);
         if old_size > 0 {
@@ -410,8 +425,25 @@ impl AudioDecoder {
     }
 
     // Convert internal frames to AudioData and deliver
-    for frame in frames {
-      let pts = frame.pts();
+    // Pop the original timestamp (fallback to frame.pts() if queue empty)
+    let output_timestamp = guard
+      .timestamp_queue
+      .pop_front()
+      .unwrap_or_else(|| frames.first().map(|f| f.pts()).unwrap_or(0));
+    for (i, frame) in frames.into_iter().enumerate() {
+      // For the first frame, use the original input timestamp
+      // For subsequent frames, calculate based on sample count or use frame.pts()
+      let pts = if i == 0 {
+        output_timestamp
+      } else {
+        let frame_pts = frame.pts();
+        // Use frame.pts() if valid, otherwise estimate from first frame timestamp
+        if frame_pts != crate::ffi::types::AV_NOPTS_VALUE {
+          frame_pts
+        } else {
+          output_timestamp
+        }
+      };
       let audio_data = AudioData::from_internal(frame, pts);
 
       // During flush, queue data for synchronous delivery in resolver
@@ -482,6 +514,107 @@ impl AudioDecoder {
     }
 
     Ok(())
+  }
+
+  /// Process a reconfigure command on the worker thread
+  /// Drains old context, clears work state, and creates new decoder context
+  fn process_reconfigure(inner: &Arc<Mutex<AudioDecoderInner>>, config: &AudioDecoderConfig) {
+    let mut guard = match inner.lock() {
+      Ok(g) => g,
+      Err(_) => return, // Lock poisoned
+    };
+
+    // Drain old context (codec thread safety)
+    if let Some(ctx) = guard.context.as_mut() {
+      ctx.flush();
+      let _ = ctx.send_packet(None);
+      while ctx.receive_frame().ok().flatten().is_some() {}
+    }
+
+    // Clear work-related state
+    guard.decode_queue_size = 0;
+    guard.timestamp_queue.clear();
+    guard.frame_count = 0;
+
+    // Parse codec string
+    let codec = match &config.codec {
+      Some(c) if !c.is_empty() => c.clone(),
+      _ => {
+        Self::report_error(&mut guard, "codec is required");
+        return;
+      }
+    };
+
+    let sample_rate = match config.sample_rate {
+      Some(sr) if sr > 0.0 => sr,
+      _ => {
+        Self::report_error(&mut guard, "sampleRate is required and must be > 0");
+        return;
+      }
+    };
+
+    let number_of_channels = match config.number_of_channels {
+      Some(nc) if nc > 0 => nc,
+      _ => {
+        Self::report_error(&mut guard, "numberOfChannels is required and must be > 0");
+        return;
+      }
+    };
+
+    let codec_id = match parse_audio_codec_string(&codec) {
+      Ok(id) => id,
+      Err(e) => {
+        Self::report_error(
+          &mut guard,
+          &format!("NotSupportedError: Invalid codec: {}", e),
+        );
+        return;
+      }
+    };
+
+    // W3C WebCodecs spec: FLAC codec requires description (contains STREAMINFO)
+    let codec_lower = codec.to_lowercase();
+    if codec_lower == "flac" && config.description.is_none() {
+      Self::report_error(
+        &mut guard,
+        "NotSupportedError: FLAC codec requires a description (STREAMINFO)",
+      );
+      return;
+    }
+
+    // Create decoder context
+    let mut context = match CodecContext::new_decoder(codec_id) {
+      Ok(ctx) => ctx,
+      Err(e) => {
+        Self::report_error(&mut guard, &format!("Failed to create decoder: {}", e));
+        return;
+      }
+    };
+
+    // Configure decoder (cast f64 sample_rate to u32 for FFmpeg)
+    let decoder_config = InternalAudioDecoderConfig {
+      codec_id,
+      sample_rate: sample_rate as u32,
+      channels: number_of_channels,
+      thread_count: 0, // Auto
+      extradata: config.description.as_ref().map(|d| d.to_vec()),
+    };
+
+    if let Err(e) = context.configure_audio_decoder(&decoder_config) {
+      Self::report_error(&mut guard, &format!("Failed to configure decoder: {}", e));
+      return;
+    }
+
+    // Open the decoder
+    if let Err(e) = context.open() {
+      Self::report_error(&mut guard, &format!("Failed to open decoder: {}", e));
+      return;
+    }
+
+    // Update state
+    guard.context = Some(context);
+    guard.config = Some(decoder_config);
+    guard.codec_string = codec;
   }
 
   /// Report an error via callback and close the decoder
@@ -627,7 +760,7 @@ impl AudioDecoder {
 
   /// Configure the decoder
   #[napi]
-  pub fn configure(&self, env: Env, config: AudioDecoderConfig) -> Result<()> {
+  pub fn configure(&mut self, env: Env, config: AudioDecoderConfig) -> Result<()> {
     // W3C WebCodecs spec: Validate config synchronously, throw TypeError for invalid
     // https://w3c.github.io/webcodecs/#dom-audiodecoder-configure
 
@@ -659,6 +792,33 @@ impl AudioDecoder {
     // W3C spec: throw InvalidStateError if closed
     if inner.state == CodecState::Closed {
       return throw_invalid_state_error(&env, "Decoder is closed");
+    }
+
+    // If already configured, queue reconfigure via microtask for W3C spec FIFO ordering
+    // This ensures pending decode commands are processed before reconfiguration
+    if inner.state == CodecState::Configured {
+      // Validate codec synchronously before queueing
+      let _codec_id = match parse_audio_codec_string(&codec) {
+        Ok(id) => id,
+        Err(e) => {
+          Self::report_error(
+            &mut inner,
+            &format!("NotSupportedError: Invalid codec: {}", e),
+          );
+          return Ok(());
+        }
+      };
+
+      // Queue reconfigure via microtask (runs AFTER pending decode microtasks)
+      drop(inner); // Release lock before microtask
+      if let Some(ref sender) = self.command_sender {
+        let sender = sender.clone();
+        PromiseRaw::resolve(&env, ())?.then(move |_| {
+          let _ = sender.send(DecoderCommand::Reconfigure(config));
+          Ok(())
+        })?;
+      }
+      return Ok(());
     }
 
     // Parse codec string to determine codec ID
@@ -718,6 +878,25 @@ impl AudioDecoder {
     inner.state = CodecState::Configured;
     inner.frame_count = 0;
     inner.decode_queue_size = 0;
+    inner.timestamp_queue.clear();
+
+    // Create new channel and worker for decode operations
+    if self.command_sender.is_none() {
+      let (sender, receiver) = channel::unbounded();
+      self.command_sender = Some(sender);
+      let worker_inner = self.inner.clone();
+      let worker_event_state = self.event_state.clone();
+      let worker_reset_flag = self.reset_flag.clone();
+      drop(inner);
+      self.worker_handle = Some(std::thread::spawn(move || {
+        Self::worker_loop(
+          worker_inner,
+          worker_event_state,
+          receiver,
+          worker_reset_flag,
+        );
+      }));
+    }
 
     Ok(())
   }
@@ -992,6 +1171,7 @@ impl AudioDecoder {
     // Clear flush-related state
     inner.inside_flush = false;
     inner.pending_data.clear();
+    inner.timestamp_queue.clear();
 
     // Reset the abort flag for new worker
     self.reset_flag.store(false, Ordering::SeqCst);
@@ -1042,10 +1222,8 @@ impl AudioDecoder {
     // Drop sender to stop accepting new commands
     self.command_sender = None;
 
-    // Wait for worker to finish processing remaining tasks
-    if let Some(handle) = self.worker_handle.take() {
-      let _ = handle.join();
-    }
+    // Let worker detach - will exit when channel closes (all senders dropped)
+    self.worker_handle = None;
 
     let mut inner = self
       .inner
