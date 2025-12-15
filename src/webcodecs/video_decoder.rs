@@ -442,7 +442,9 @@ impl VideoDecoder {
       if old_size > 0 {
         let _ = Self::fire_dequeue_event(event_state);
       }
-      Self::report_error(&mut guard, "Decoder not configured");
+      // Per W3C spec: "cease producing output" - silently discard pending work
+      // State could be Unconfigured (reset called) or Closed (close called)
+      // Don't call report_error() - that would set state to Closed and invoke error callback
       return;
     }
 
