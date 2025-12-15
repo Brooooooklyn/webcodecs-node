@@ -697,9 +697,17 @@ export declare class VideoFrame {
    * Throws InvalidStateError if the VideoFrame is closed
    */
   get visibleRect(): DOMRectReadOnly
-  /** Get the presentation timestamp in microseconds (returns 0 when closed per W3C spec) */
+  /**
+   * Get the presentation timestamp in microseconds
+   * Per W3C spec: "The timestamp getter steps are to return [[timestamp]]"
+   * The timestamp is preserved even after close() - only resource reference is cleared
+   */
   get timestamp(): number
-  /** Get the duration in microseconds (returns null when closed per W3C spec) */
+  /**
+   * Get the duration in microseconds
+   * Per W3C spec: "The duration getter steps are to return [[duration]]"
+   * The duration is preserved even after close() - only resource reference is cleared
+   */
   get duration(): number | null
   /** Get the color space parameters */
   get colorSpace(): VideoColorSpace
@@ -734,7 +742,13 @@ export declare class VideoFrame {
   copyTo(destination: Uint8Array, options?: VideoFrameCopyToOptions | undefined | null): Promise<Array<PlaneLayout>>
   /** Clone this VideoFrame */
   clone(): VideoFrame
-  /** Close and release resources */
+  /**
+   * Close and release resources
+   * Per W3C spec "Close VideoFrame" algorithm:
+   * 1. Assign null to frame's [[resource reference]]
+   * 2. Assign true to frame's [[Detached]]
+   * Note: Metadata (timestamp, duration, etc.) remains accessible after close
+   */
   close(): void
 }
 

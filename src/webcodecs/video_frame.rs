@@ -1689,7 +1689,9 @@ impl VideoFrame {
     }
   }
 
-  /// Get the presentation timestamp in microseconds (returns 0 when closed per W3C spec)
+  /// Get the presentation timestamp in microseconds
+  /// Per W3C spec: "The timestamp getter steps are to return [[timestamp]]"
+  /// The timestamp is preserved even after close() - only resource reference is cleared
   #[napi(getter)]
   pub fn timestamp(&self) -> Result<i64> {
     let guard = self
@@ -1698,12 +1700,14 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) if !inner.closed => Ok(inner.timestamp_us),
-      _ => Ok(0),
+      Some(inner) => Ok(inner.timestamp_us),
+      None => Ok(0),
     }
   }
 
-  /// Get the duration in microseconds (returns null when closed per W3C spec)
+  /// Get the duration in microseconds
+  /// Per W3C spec: "The duration getter steps are to return [[duration]]"
+  /// The duration is preserved even after close() - only resource reference is cleared
   #[napi(getter)]
   pub fn duration(&self) -> Result<Option<i64>> {
     let guard = self
@@ -1712,8 +1716,8 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) if !inner.closed => Ok(inner.duration_us),
-      _ => Ok(None),
+      Some(inner) => Ok(inner.duration_us),
+      None => Ok(None),
     }
   }
 
@@ -2217,6 +2221,10 @@ impl VideoFrame {
   }
 
   /// Close and release resources
+  /// Per W3C spec "Close VideoFrame" algorithm:
+  /// 1. Assign null to frame's [[resource reference]]
+  /// 2. Assign true to frame's [[Detached]]
+  /// Note: Metadata (timestamp, duration, etc.) remains accessible after close
   #[napi]
   pub fn close(&self) -> Result<()> {
     let mut guard = self
@@ -2226,8 +2234,9 @@ impl VideoFrame {
 
     if let Some(inner) = guard.as_mut() {
       inner.closed = true;
+      // Note: We keep the inner struct to preserve metadata (timestamp, duration, etc.)
+      // per W3C spec. The FFmpeg Frame memory will be released when VideoFrame is dropped.
     }
-    *guard = None;
 
     Ok(())
   }
