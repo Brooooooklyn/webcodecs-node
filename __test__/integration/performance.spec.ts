@@ -8,6 +8,7 @@
 import test from 'ava'
 
 import { resetHardwareFallbackState, VideoEncoder, VideoDecoder, VideoFrame } from '../../index.js'
+import type { EncodedVideoChunkMetadata, VideoDecoderConfig } from '../../index.js'
 import { generateSolidColorI420Frame, TestColors, calculateI420Size, type EncodedVideoChunk } from '../helpers/index.js'
 import { createEncoderConfig, createDecoderConfig } from '../helpers/codec-matrix.js'
 
@@ -17,18 +18,24 @@ test.beforeEach(() => {
 })
 
 // Helper to create test encoder with callbacks
+// Captures decoderConfig from first chunk's metadata for proper AVCC format handling
 function createTestEncoder() {
   const chunks: EncodedVideoChunk[] = []
   const errors: Error[] = []
+  let decoderConfig: VideoDecoderConfig | undefined
 
   const encoder = new VideoEncoder({
-    output: (chunk, _metadata) => {
+    output: (chunk, metadata?: EncodedVideoChunkMetadata) => {
       chunks.push(chunk)
+      // Capture decoderConfig from first chunk (contains description for AVCC format)
+      if (!decoderConfig && metadata?.decoderConfig) {
+        decoderConfig = metadata.decoderConfig as VideoDecoderConfig
+      }
     },
     error: (e) => errors.push(e),
   })
 
-  return { encoder, chunks, errors }
+  return { encoder, chunks, errors, getDecoderConfig: () => decoderConfig }
 }
 
 // Helper to create test decoder with callbacks
@@ -104,7 +111,7 @@ test('stress: decode 100 chunks', async (t) => {
   const frameCount = 100
 
   // First encode
-  const { encoder, chunks } = createTestEncoder()
+  const { encoder, chunks, getDecoderConfig } = createTestEncoder()
   encoder.configure(createEncoderConfig('h264', width, height))
 
   for (let i = 0; i < frameCount; i++) {
@@ -118,9 +125,10 @@ test('stress: decode 100 chunks', async (t) => {
 
   t.true(chunks.length > 0)
 
-  // Now decode
+  // Now decode - use captured decoderConfig that includes description (SPS/PPS for H.264)
   const { decoder, frames } = createTestDecoder()
-  decoder.configure(createDecoderConfig('h264', { codedWidth: width, codedHeight: height }))
+  const decoderConfig = getDecoderConfig() || createDecoderConfig('h264', { codedWidth: width, codedHeight: height })
+  decoder.configure(decoderConfig)
 
   for (const chunk of chunks) {
     decoder.decode(chunk)
@@ -394,7 +402,7 @@ test('stress: decoder queue size under load', async (t) => {
   const frameCount = 50
 
   // First encode
-  const { encoder, chunks } = createTestEncoder()
+  const { encoder, chunks, getDecoderConfig } = createTestEncoder()
   encoder.configure(createEncoderConfig('h264', width, height))
 
   for (let i = 0; i < frameCount; i++) {
@@ -408,9 +416,10 @@ test('stress: decoder queue size under load', async (t) => {
 
   t.true(chunks.length > 0, 'Should have encoded chunks')
 
-  // Decode
+  // Decode - use captured decoderConfig that includes description (SPS/PPS for H.264)
   const { decoder, frames } = createTestDecoder()
-  decoder.configure(createDecoderConfig('h264', { codedWidth: width, codedHeight: height }))
+  const decoderConfig = getDecoderConfig() || createDecoderConfig('h264', { codedWidth: width, codedHeight: height })
+  decoder.configure(decoderConfig)
 
   let maxQueueSize = 0
 

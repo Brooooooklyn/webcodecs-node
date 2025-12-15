@@ -44,14 +44,18 @@ type OutputCallback = ThreadsafeFunction<
 /// not error-first (err, result) style
 type ErrorCallback = ThreadsafeFunction<Error, UnknownReturnValue, Error, Status, false, true>;
 
-/// Type alias for event listener callback (same pattern as dequeue callback)
+/// Type alias for event listener callback (weak to allow Node.js process to exit)
 type EventListenerCallback = ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, true>;
 
 /// Entry for tracking event listeners
+/// Stores both the weak ThreadsafeFunction and a FunctionRef to prevent GC from collecting the callback
 struct EventListenerEntry {
   id: u64,
-  callback: EventListenerCallback,
+  callback: Arc<EventListenerCallback>,
   once: bool,
+  /// Prevents GC from collecting the JS callback while listener is registered
+  /// The weak TSF alone doesn't prevent GC, so we need this to keep the function alive
+  _prevent_gc: FunctionRef<(), UnknownReturnValue>,
 }
 
 /// State for EventTarget interface, separate from main encoder state
@@ -269,6 +273,8 @@ pub struct AudioEncoder {
   command_sender: Option<Sender<EncoderCommand>>,
   /// Worker thread handle
   worker_handle: Option<JoinHandle<()>>,
+  /// Reset flag - checked by microtasks to skip sending if reset() was called
+  reset_flag: Arc<AtomicBool>,
 }
 
 impl Drop for AudioEncoder {
@@ -339,11 +345,20 @@ impl AudioEncoder {
     // Create channel for worker commands
     let (sender, receiver) = channel::unbounded();
 
+    // Create reset flag for microtask synchronization
+    let reset_flag = Arc::new(AtomicBool::new(false));
+
     // Spawn worker thread
     let worker_inner = inner.clone();
     let worker_event_state = event_state.clone();
+    let worker_reset_flag = reset_flag.clone();
     let worker_handle = std::thread::spawn(move || {
-      Self::worker_loop(worker_inner, worker_event_state, receiver);
+      Self::worker_loop(
+        worker_inner,
+        worker_event_state,
+        receiver,
+        worker_reset_flag,
+      );
     });
 
     Ok(Self {
@@ -353,6 +368,7 @@ impl AudioEncoder {
       output_callback_ref: Rc::new(init.output_ref),
       command_sender: Some(sender),
       worker_handle: Some(worker_handle),
+      reset_flag,
     })
   }
 
@@ -361,8 +377,33 @@ impl AudioEncoder {
     inner: Arc<Mutex<AudioEncoderInner>>,
     event_state: Arc<RwLock<EventListenerState>>,
     receiver: Receiver<EncoderCommand>,
+    reset_flag: Arc<AtomicBool>,
   ) {
+    // Simple blocking recv - channel disconnects when all senders dropped
+    // (including microtask cloned senders after they check reset_flag and skip sending)
     while let Ok(command) = receiver.recv() {
+      // Check reset flag before processing each command
+      // If reset() was called, skip remaining encode commands
+      if reset_flag.load(Ordering::SeqCst) {
+        // Still process flush commands to send responses, but skip encodes
+        if let EncoderCommand::Flush(response_sender) = command {
+          let _ = response_sender.send(Err(Error::new(
+            Status::GenericFailure,
+            "AbortError: The operation was aborted",
+          )));
+        } else {
+          // For encode commands, just decrement queue and fire dequeue
+          if let Ok(mut guard) = inner.lock() {
+            let old_size = guard.encode_queue_size;
+            guard.encode_queue_size = old_size.saturating_sub(1);
+            if old_size > 0 {
+              let _ = Self::fire_dequeue_event(&event_state);
+            }
+          }
+        }
+        continue;
+      }
+
       match command {
         EncoderCommand::Encode { frame, timestamp } => {
           Self::process_encode(&inner, &event_state, frame, timestamp);
@@ -450,7 +491,10 @@ impl AudioEncoder {
     // For FLAC, prepend the "fLaC" header since FFmpeg only returns raw STREAMINFO
     // Note: For FLAC, we always try to get extradata because it may not be available
     // until after encoding starts, but we need it on every chunk per W3C spec
-    let extradata = if !guard.extradata_sent || is_flac {
+    // For ADTS AAC, description is not needed (metadata embedded in frame headers)
+    let extradata = if guard.use_adts {
+      None // ADTS format: No description needed (self-describing)
+    } else if !guard.extradata_sent || is_flac {
       let raw_extradata = guard
         .context
         .as_ref()
@@ -742,12 +786,6 @@ impl AudioEncoder {
           } else {
             None
           };
-          // Get fresh extradata for FLAC
-          let extradata = if is_flac {
-            guard.context.as_ref().and_then(get_flac_extradata)
-          } else {
-            None
-          };
           for packet in packets {
             let output_timestamp = guard.timestamp_queue.pop_front();
             let chunk = EncodedAudioChunk::from_packet_with_adts(
@@ -756,13 +794,34 @@ impl AudioEncoder {
               output_timestamp,
               adts_params,
             );
-            // FLAC requires decoderConfig on every chunk per W3C spec
+            // Create decoderConfig: FLAC on every chunk, others only on first chunk
             let decoder_config = if is_flac {
+              // FLAC: Always include decoderConfig with fresh extradata
+              let extradata = guard.context.as_ref().and_then(get_flac_extradata);
               Some(AudioDecoderConfigOutput {
                 codec: codec_string.clone(),
                 sample_rate: Some(target_sample_rate),
                 number_of_channels: Some(target_channels),
-                description: extradata.clone().map(Uint8Array::from),
+                description: extradata.map(Uint8Array::from),
+              })
+            } else if !guard.extradata_sent {
+              // First chunk: Include decoderConfig
+              guard.extradata_sent = true;
+              // ADTS format: No description (metadata in frame headers)
+              // Raw AAC: Include AudioSpecificConfig
+              let extradata = if guard.use_adts {
+                None
+              } else {
+                guard
+                  .context
+                  .as_ref()
+                  .and_then(|ctx| ctx.extradata().map(|d| d.to_vec()))
+              };
+              Some(AudioDecoderConfigOutput {
+                codec: codec_string.clone(),
+                sample_rate: Some(target_sample_rate),
+                number_of_channels: Some(target_channels),
+                description: extradata.map(Uint8Array::from),
               })
             } else {
               None
@@ -797,23 +856,38 @@ impl AudioEncoder {
       } else {
         None
       };
-      // Get fresh extradata for FLAC
-      let extradata = if is_flac {
-        guard.context.as_ref().and_then(get_flac_extradata)
-      } else {
-        None
-      };
       for packet in packets {
         let output_timestamp = guard.timestamp_queue.pop_front();
         let chunk =
           EncodedAudioChunk::from_packet_with_adts(&packet, None, output_timestamp, adts_params);
-        // FLAC requires decoderConfig on every chunk per W3C spec
+        // Create decoderConfig: FLAC on every chunk, others only on first chunk
         let decoder_config = if is_flac {
+          // FLAC: Always include decoderConfig with fresh extradata
+          let extradata = guard.context.as_ref().and_then(get_flac_extradata);
           Some(AudioDecoderConfigOutput {
             codec: codec_string.clone(),
             sample_rate: Some(target_sample_rate),
             number_of_channels: Some(target_channels),
-            description: extradata.clone().map(Uint8Array::from),
+            description: extradata.map(Uint8Array::from),
+          })
+        } else if !guard.extradata_sent {
+          // First chunk: Include decoderConfig
+          guard.extradata_sent = true;
+          // ADTS format: No description (metadata in frame headers)
+          // Raw AAC: Include AudioSpecificConfig
+          let extradata = if guard.use_adts {
+            None
+          } else {
+            guard
+              .context
+              .as_ref()
+              .and_then(|ctx| ctx.extradata().map(|d| d.to_vec()))
+          };
+          Some(AudioDecoderConfigOutput {
+            codec: codec_string.clone(),
+            sample_rate: Some(target_sample_rate),
+            number_of_channels: Some(target_channels),
+            description: extradata.map(Uint8Array::from),
           })
         } else {
           None
@@ -864,23 +938,42 @@ impl AudioEncoder {
     }
 
     // 2. Fire EventTarget listeners
-    let mut ids_to_remove = Vec::new();
-    if let Some(listeners) = state.event_listeners.get("dequeue") {
-      for entry in listeners {
+    // For "once" listeners, use call_with_return_value to ensure _prevent_gc cleanup
+    // For regular listeners, use simple call()
+    if let Some(listeners) = state.event_listeners.get_mut("dequeue") {
+      // Partition into once and regular listeners
+      let (once_listeners, regular_listeners): (Vec<_>, Vec<_>) =
+        std::mem::take(listeners).into_iter().partition(|e| e.once);
+
+      // Fire regular listeners with simple call()
+      for entry in &regular_listeners {
         entry
           .callback
           .call((), ThreadsafeFunctionCallMode::NonBlocking);
-        if entry.once {
-          ids_to_remove.push(entry.id);
-        }
       }
-    }
 
-    // 3. Remove "once" listeners
-    if !ids_to_remove.is_empty()
-      && let Some(listeners) = state.event_listeners.get_mut("dequeue")
-    {
-      listeners.retain(|e| !ids_to_remove.contains(&e.id));
+      // Fire "once" listeners with call_with_return_value for proper _prevent_gc cleanup
+      // The cleanup closure drops _prevent_gc only after the JS callback has executed
+      // IMPORTANT: Clone the Arc to keep TSF alive until callback executes (NonBlocking mode
+      // queues the callback but returns immediately - without this clone, the Arc drops at loop
+      // end and the weak TSF may abort the pending callback)
+      for entry in once_listeners {
+        let prevent_gc = entry._prevent_gc;
+        let callback_clone = entry.callback.clone();
+        entry.callback.call_with_return_value(
+          (),
+          ThreadsafeFunctionCallMode::NonBlocking,
+          move |_: Result<UnknownReturnValue>, _env: Env| {
+            // Drop callback_clone and prevent_gc after the callback has executed
+            drop(callback_clone);
+            drop(prevent_gc);
+            Ok(())
+          },
+        );
+      }
+
+      // Put back regular listeners (once listeners are already consumed/removed)
+      *listeners = regular_listeners;
       if listeners.is_empty() {
         state.event_listeners.remove("dequeue");
       }
@@ -929,7 +1022,7 @@ impl AudioEncoder {
         cb.borrow_back(env)?
           .build_threadsafe_function()
           .callee_handled::<false>()
-          .weak::<true>()
+          .weak::<true>() // Weak to allow Node.js process to exit
           .build()?,
       ),
       None => None,
@@ -1221,14 +1314,22 @@ impl AudioEncoder {
       (frame_to_send, timestamp)
     };
 
-    // Send encode command to worker thread
+    // Send encode command to worker thread (deferred to microtask for W3C spec compliance)
+    // This ensures encodeQueueSize check happens before the worker receives the command
     if let Some(ref sender) = self.command_sender {
-      sender
-        .send(EncoderCommand::Encode {
-          frame: frame_to_send,
-          timestamp,
-        })
-        .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?;
+      let sender = sender.clone();
+      let reset_flag = self.reset_flag.clone();
+      PromiseRaw::resolve(&env, ())?.then(move |_| {
+        // Check reset flag - if reset() was called, skip sending (JS is single-threaded,
+        // so reset() must have completed before this microtask runs)
+        if !reset_flag.load(Ordering::SeqCst) {
+          let _ = sender.send(EncoderCommand::Encode {
+            frame: frame_to_send,
+            timestamp,
+          });
+        }
+        Ok(())
+      })?;
     } else {
       return Err(Error::new(
         Status::GenericFailure,
@@ -1293,11 +1394,19 @@ impl AudioEncoder {
       inner.pending_flush_senders.push(response_sender.clone());
     }
 
-    // Send flush command through the channel to ensure it's processed after all pending encodes
+    // Send flush command through the channel (deferred to microtask for W3C spec compliance)
+    // This ensures flush is processed after all pending encode microtasks complete (FIFO order)
     if let Some(ref sender) = self.command_sender {
-      sender
-        .send(EncoderCommand::Flush(response_sender))
-        .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?;
+      let sender = sender.clone();
+      let reset_flag = self.reset_flag.clone();
+      PromiseRaw::resolve(env, ())?.then(move |_| {
+        // Check reset flag - if reset() was called, skip sending
+        // (flush Promise is already rejected with AbortError by reset())
+        if !reset_flag.load(Ordering::SeqCst) {
+          let _ = sender.send(EncoderCommand::Flush(response_sender));
+        }
+        Ok(())
+      })?;
     } else {
       return throw_invalid_state_error(env, "Cannot flush a closed codec");
     }
@@ -1407,13 +1516,16 @@ impl AudioEncoder {
       }
     }
 
-    // Drop sender to signal worker to stop (must drop before join!)
-    drop(self.command_sender.take());
+    // Set reset flag to signal worker to skip remaining pending encodes
+    // This must be done BEFORE dropping the command sender
+    self.reset_flag.store(true, Ordering::SeqCst);
 
-    // Wait for worker to finish processing remaining commands
-    if let Some(handle) = self.worker_handle.take() {
-      let _ = handle.join();
-    }
+    // Drop sender to signal worker to stop
+    // Note: Don't join - microtasks might still hold cloned senders. After reset()
+    // returns, microtasks run, see reset_flag=true, skip sending, and drop senders.
+    // Channel then disconnects and worker exits naturally.
+    drop(self.command_sender.take());
+    drop(self.worker_handle.take());
 
     let mut inner = self
       .inner
@@ -1439,14 +1551,23 @@ impl AudioEncoder {
     inner.inside_flush = false;
     inner.pending_chunks.clear();
 
+    // Reset the abort flag for new worker
+    self.reset_flag.store(false, Ordering::SeqCst);
+
     // Create new channel and worker for future encode operations
     let (sender, receiver) = channel::unbounded();
     self.command_sender = Some(sender);
     let worker_inner = self.inner.clone();
     let worker_event_state = self.event_state.clone();
+    let worker_reset_flag = self.reset_flag.clone();
     drop(inner); // Release lock before spawning thread
     self.worker_handle = Some(std::thread::spawn(move || {
-      Self::worker_loop(worker_inner, worker_event_state, receiver);
+      Self::worker_loop(
+        worker_inner,
+        worker_event_state,
+        receiver,
+        worker_reset_flag,
+      );
     }));
 
     Ok(())
@@ -1580,17 +1701,22 @@ impl AudioEncoder {
     let id = state.next_listener_id;
     state.next_listener_id += 1;
 
-    let tsf = callback
-      .borrow_back(&env)?
-      .build_threadsafe_function()
-      .callee_handled::<false>()
-      .weak::<true>()
-      .build()?;
+    // Get the function and create both a Ref (to prevent GC) and a weak TSF
+    let func = callback.borrow_back(&env)?;
+    let prevent_gc = func.create_ref()?;
+    let tsf = Arc::new(
+      func
+        .build_threadsafe_function()
+        .callee_handled::<false>()
+        .weak::<true>() // Weak to allow Node.js process to exit
+        .build()?,
+    );
 
     let entry = EventListenerEntry {
       id,
       callback: tsf,
       once: options.as_ref().and_then(|o| o.once).unwrap_or(false),
+      _prevent_gc: prevent_gc, // Prevents GC while listener is registered
     };
 
     state

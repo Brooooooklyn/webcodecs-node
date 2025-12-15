@@ -35,14 +35,18 @@ type ErrorCallback = ThreadsafeFunction<Error, UnknownReturnValue, Error, Status
 // Note: For ondequeue, we use FunctionRef instead of ThreadsafeFunction
 // to support both getter and setter per WebCodecs spec
 
-/// Type alias for event listener callback (same pattern as dequeue callback)
+/// Type alias for event listener callback (weak to allow Node.js process to exit)
 type EventListenerCallback = ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, true>;
 
 /// Entry for tracking event listeners
+/// Stores both the weak ThreadsafeFunction and a FunctionRef to prevent GC from collecting the callback
 struct EventListenerEntry {
   id: u64,
   callback: Arc<EventListenerCallback>,
   once: bool,
+  /// Prevents GC from collecting the JS callback while listener is registered
+  /// The weak TSF alone doesn't prevent GC, so we need this to keep the function alive
+  _prevent_gc: FunctionRef<(), UnknownReturnValue>,
 }
 
 /// State for EventTarget interface, separate from main decoder state
@@ -493,51 +497,57 @@ impl AudioDecoder {
   /// Also dispatches to EventTarget listeners registered via addEventListener
   /// Uses separate RwLock to avoid blocking addEventListener during decode
   fn fire_dequeue_event(event_state: &Arc<RwLock<EventListenerState>>) -> Result<()> {
-    // Collect callbacks while holding lock, then fire outside lock to prevent deadlock
-    let (dequeue_callback, listeners_to_fire, ids_to_remove) = {
-      let state = match event_state.read() {
-        Ok(s) => s,
-        Err(_) => return Err(Error::new(Status::GenericFailure, "Lock poisoned")),
-      };
-
-      // Clone Arc references for callbacks we need to fire
-      let dequeue_callback = state.dequeue_callback.clone();
-      let mut listeners_to_fire: Vec<Arc<EventListenerCallback>> = Vec::new();
-      let mut ids_to_remove = Vec::new();
-
-      if let Some(listeners) = state.event_listeners.get("dequeue") {
-        for entry in listeners {
-          listeners_to_fire.push(entry.callback.clone());
-          if entry.once {
-            ids_to_remove.push(entry.id);
-          }
-        }
-      }
-
-      (dequeue_callback, listeners_to_fire, ids_to_remove)
+    // Use write lock to fire callbacks and remove once listeners atomically
+    // NonBlocking mode ensures callbacks are queued without blocking the worker thread
+    let mut state = match event_state.write() {
+      Ok(s) => s,
+      Err(_) => return Err(Error::new(Status::GenericFailure, "Lock poisoned")),
     };
 
-    // Fire callbacks WITHOUT holding lock (prevents deadlock)
-    if let Some(ref callback) = dequeue_callback {
-      callback.call((), ThreadsafeFunctionCallMode::Blocking);
+    // 1. Fire ondequeue callback
+    if let Some(ref callback) = state.dequeue_callback {
+      callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
     }
 
-    for callback in &listeners_to_fire {
-      callback.call((), ThreadsafeFunctionCallMode::Blocking);
-    }
+    // 2. Fire EventTarget listeners
+    // For "once" listeners, use call_with_return_value to ensure _prevent_gc cleanup
+    // For regular listeners, use simple call()
+    if let Some(listeners) = state.event_listeners.get_mut("dequeue") {
+      // Partition into once and regular listeners
+      let (once_listeners, regular_listeners): (Vec<_>, Vec<_>) =
+        std::mem::take(listeners).into_iter().partition(|e| e.once);
 
-    // Remove "once" listeners (requires write lock, but callbacks already fired)
-    if !ids_to_remove.is_empty() {
-      let mut state = match event_state.write() {
-        Ok(s) => s,
-        Err(_) => return Err(Error::new(Status::GenericFailure, "Lock poisoned")),
-      };
+      // Fire regular listeners with simple call()
+      for entry in &regular_listeners {
+        entry
+          .callback
+          .call((), ThreadsafeFunctionCallMode::NonBlocking);
+      }
 
-      if let Some(listeners) = state.event_listeners.get_mut("dequeue") {
-        listeners.retain(|e| !ids_to_remove.contains(&e.id));
-        if listeners.is_empty() {
-          state.event_listeners.remove("dequeue");
-        }
+      // Fire "once" listeners with call_with_return_value for proper _prevent_gc cleanup
+      // The cleanup closure drops _prevent_gc only after the JS callback has executed
+      // IMPORTANT: Clone the Arc to keep TSF alive until callback executes (NonBlocking mode
+      // queues the callback but returns immediately - without this clone, the Arc drops at loop
+      // end and the weak TSF may abort the pending callback)
+      for entry in once_listeners {
+        let prevent_gc = entry._prevent_gc;
+        let callback_clone = entry.callback.clone();
+        entry.callback.call_with_return_value(
+          (),
+          ThreadsafeFunctionCallMode::NonBlocking,
+          move |_: Result<UnknownReturnValue>, _env: Env| {
+            // Drop callback_clone and prevent_gc after the callback has executed
+            drop(callback_clone);
+            drop(prevent_gc);
+            Ok(())
+          },
+        );
+      }
+
+      // Put back regular listeners (once listeners are already consumed/removed)
+      *listeners = regular_listeners;
+      if listeners.is_empty() {
+        state.event_listeners.remove("dequeue");
       }
     }
 
@@ -586,7 +596,7 @@ impl AudioDecoder {
           .borrow_back(env)?
           .build_threadsafe_function()
           .callee_handled::<false>()
-          .weak::<true>()
+          .weak::<true>() // Weak to allow Node.js process to exit
           .build()?;
         Some(Arc::new(tsf))
       }
@@ -750,11 +760,19 @@ impl AudioDecoder {
       (data, timestamp)
     };
 
-    // Send decode command to worker thread
+    // Send decode command to worker thread (deferred to microtask for W3C spec compliance)
+    // This ensures decodeQueueSize check happens before the worker receives the command
     if let Some(ref sender) = self.command_sender {
-      sender
-        .send(DecoderCommand::Decode { data, timestamp })
-        .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?;
+      let sender = sender.clone();
+      let reset_flag = self.reset_flag.clone();
+      PromiseRaw::resolve(&env, ())?.then(move |_| {
+        // Check reset flag - if reset() was called, skip sending (JS is single-threaded,
+        // so reset() must have completed before this microtask runs)
+        if !reset_flag.load(Ordering::SeqCst) {
+          let _ = sender.send(DecoderCommand::Decode { data, timestamp });
+        }
+        Ok(())
+      })?;
     } else {
       return Err(Error::new(
         Status::GenericFailure,
@@ -824,11 +842,19 @@ impl AudioDecoder {
       inner.pending_flush_senders.push(response_sender.clone());
     }
 
-    // Send flush command through the channel to ensure it's processed after all pending decodes
+    // Send flush command through the channel (deferred to microtask for W3C spec compliance)
+    // This ensures flush is processed after all pending decode microtasks complete (FIFO order)
     if let Some(ref sender) = self.command_sender {
-      sender
-        .send(DecoderCommand::Flush(response_sender))
-        .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?;
+      let sender = sender.clone();
+      let reset_flag = self.reset_flag.clone();
+      PromiseRaw::resolve(env, ())?.then(move |_| {
+        // Check reset flag - if reset() was called, skip sending
+        // (flush Promise is already rejected with AbortError by reset())
+        if !reset_flag.load(Ordering::SeqCst) {
+          let _ = sender.send(DecoderCommand::Flush(response_sender));
+        }
+        Ok(())
+      })?;
     } else {
       return throw_invalid_state_error(env, "Cannot flush a closed codec");
     }
@@ -940,13 +966,12 @@ impl AudioDecoder {
       }
     }
 
-    // Drop sender to signal worker to stop (must drop before join!)
+    // Drop sender to signal worker to stop
+    // Note: Don't join worker here - with microtask pattern, worker might not exit
+    // immediately if microtasks still hold cloned senders. Worker will exit on
+    // next timeout check when it sees reset_flag is set.
     drop(self.command_sender.take());
-
-    // Wait for worker to finish processing remaining commands
-    if let Some(handle) = self.worker_handle.take() {
-      let _ = handle.join();
-    }
+    drop(self.worker_handle.take()); // Detach old worker thread
 
     let mut inner = self
       .inner
@@ -1112,17 +1137,20 @@ impl AudioDecoder {
     let id = state.next_listener_id;
     state.next_listener_id += 1;
 
-    let tsf = callback
-      .borrow_back(&env)?
+    // Get the function and create both a Ref (to prevent GC) and a weak TSF
+    let func = callback.borrow_back(&env)?;
+    let prevent_gc = func.create_ref()?;
+    let tsf = func
       .build_threadsafe_function()
       .callee_handled::<false>()
-      .weak::<true>()
+      .weak::<true>() // Weak to allow Node.js process to exit
       .build()?;
 
     let entry = EventListenerEntry {
       id,
       callback: Arc::new(tsf),
       once: options.as_ref().and_then(|o| o.once).unwrap_or(false),
+      _prevent_gc: prevent_gc, // Prevents GC while listener is registered
     };
 
     state
