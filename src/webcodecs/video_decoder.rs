@@ -292,8 +292,8 @@ pub struct VideoDecoder {
   /// Wrapped in Rc to allow sharing with spawn_future_with_callback closure
   /// (Rc is !Send but that's OK - the callback runs on the main thread)
   output_callback_ref: Rc<FunctionRef<VideoFrame, UnknownReturnValue>>,
-  /// Channel sender for worker commands
-  command_sender: Option<Sender<WorkerCommand>>,
+  /// Channel sender for worker commands (wrapped in Arc for Weak references in microtasks)
+  command_sender: Option<Arc<Sender<WorkerCommand>>>,
   /// Worker thread handle
   worker_handle: Option<JoinHandle<()>>,
   /// Reset abort flag - set by reset() to signal worker to skip pending decodes
@@ -392,7 +392,7 @@ impl VideoDecoder {
       event_state,
       dequeue_callback: None,
       output_callback_ref: Rc::new(init.output_ref),
-      command_sender: Some(sender),
+      command_sender: Some(Arc::new(sender)),
       worker_handle: Some(worker_handle),
       reset_flag,
     })
@@ -1235,11 +1235,15 @@ impl VideoDecoder {
 
       // Queue reconfigure via microtask (runs AFTER pending decode microtasks)
       // Don't update inner.config here - worker will do it after processing pending decodes
+      // Use Weak reference to allow close() to immediately close channel without deadlock
       drop(inner); // Release lock before scheduling microtask
       if let Some(ref sender) = self.command_sender {
-        let sender = sender.clone();
+        let weak_sender = Arc::downgrade(sender);
         PromiseRaw::resolve(&env, ())?.then(move |_| {
-          let _ = sender.send(WorkerCommand::Reconfigure(config));
+          // Only send if decoder hasn't been closed (weak reference can still upgrade)
+          if let Some(sender) = weak_sender.upgrade() {
+            let _ = sender.send(WorkerCommand::Reconfigure(config));
+          }
           Ok(())
         })?;
       }
@@ -1367,7 +1371,7 @@ impl VideoDecoder {
     // Create new channel and worker if needed (after reconfiguration)
     if self.command_sender.is_none() {
       let (sender, receiver) = channel::unbounded();
-      self.command_sender = Some(sender);
+      self.command_sender = Some(Arc::new(sender));
       let worker_inner = self.inner.clone();
       let worker_event_state = self.event_state.clone();
       let worker_reset_flag = self.reset_flag.clone();
@@ -1419,13 +1423,16 @@ impl VideoDecoder {
 
     // Send decode command to worker thread via microtask for W3C spec FIFO ordering
     // This ensures all commands (decode, configure, flush) are ordered correctly
+    // Use Weak reference to allow close() to immediately close channel without deadlock
     if let Some(ref sender) = self.command_sender {
-      let sender = sender.clone();
+      let weak_sender = Arc::downgrade(sender);
       let reset_flag = self.reset_flag.clone();
       let chunk_inner = chunk.inner.clone();
       PromiseRaw::resolve(&env, ())?.then(move |_| {
-        // Check reset flag - if reset() was called, skip sending
-        if !reset_flag.load(Ordering::SeqCst) {
+        // Check reset flag first, then check if decoder hasn't been closed
+        if !reset_flag.load(Ordering::SeqCst)
+          && let Some(sender) = weak_sender.upgrade()
+        {
           let _ = sender.send(WorkerCommand::Decode(chunk_inner));
         }
         Ok(())
@@ -1501,13 +1508,16 @@ impl VideoDecoder {
 
     // Send flush command through the channel (deferred to microtask for W3C spec compliance)
     // This ensures flush is processed after all pending decode microtasks complete (FIFO order)
+    // Use Weak reference to allow close() to immediately close channel without deadlock
     if let Some(ref sender) = self.command_sender {
-      let sender = sender.clone();
+      let weak_sender = Arc::downgrade(sender);
       let reset_flag = self.reset_flag.clone();
       PromiseRaw::resolve(env, ())?.then(move |_| {
-        // Check reset flag - if reset() was called, skip sending
+        // Check reset flag first, then check if decoder hasn't been closed
         // (flush Promise is already rejected with AbortError by reset())
-        if !reset_flag.load(Ordering::SeqCst) {
+        if !reset_flag.load(Ordering::SeqCst)
+          && let Some(sender) = weak_sender.upgrade()
+        {
           let _ = sender.send(WorkerCommand::Flush(response_sender));
         }
         Ok(())
@@ -1669,7 +1679,7 @@ impl VideoDecoder {
 
     // Create new channel and worker for future decode operations
     let (sender, receiver) = channel::unbounded();
-    self.command_sender = Some(sender);
+    self.command_sender = Some(Arc::new(sender));
     let worker_inner = self.inner.clone();
     let worker_event_state = self.event_state.clone();
     let worker_reset_flag = self.reset_flag.clone();
@@ -1710,11 +1720,17 @@ impl VideoDecoder {
       }
     }
 
-    // Drop sender to stop accepting new commands
+    // Drop sender to stop accepting new commands and close channel.
+    // With Weak references in microtasks, dropping Arc<Sender> immediately closes the channel
+    // even if there are pending microtasks (they use Weak which can't keep the channel alive).
     self.command_sender = None;
 
-    // Let worker detach - will exit when channel closes (all senders dropped)
-    self.worker_handle = None;
+    // Now safe to join worker - channel is closed, worker will see recv() Err and exit.
+    // This prevents resource contention where old worker is still holding FFmpeg resources
+    // while new decoder is being created.
+    if let Some(handle) = self.worker_handle.take() {
+      let _ = handle.join();
+    }
 
     let mut inner = self
       .inner

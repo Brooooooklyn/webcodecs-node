@@ -223,8 +223,8 @@ pub struct AudioDecoder {
   /// Wrapped in Rc to allow sharing with spawn_future_with_callback closure
   /// (Rc is !Send but that's OK - the callback runs on the main thread)
   output_callback_ref: Rc<FunctionRef<AudioData, UnknownReturnValue>>,
-  /// Channel sender for worker commands
-  command_sender: Option<Sender<DecoderCommand>>,
+  /// Channel sender for worker commands (wrapped in Arc for Weak references in microtasks)
+  command_sender: Option<Arc<Sender<DecoderCommand>>>,
   /// Worker thread handle
   worker_handle: Option<JoinHandle<()>>,
   /// Reset abort flag - set by reset() to signal worker to skip pending decodes
@@ -307,7 +307,7 @@ impl AudioDecoder {
       event_state,
       dequeue_callback: None,
       output_callback_ref: Rc::new(init.output_ref),
-      command_sender: Some(sender),
+      command_sender: Some(Arc::new(sender)),
       worker_handle: Some(worker_handle),
       reset_flag,
     })
@@ -826,11 +826,15 @@ impl AudioDecoder {
       };
 
       // Queue reconfigure via microtask (runs AFTER pending decode microtasks)
+      // Use Weak reference to allow close() to immediately close channel without deadlock
       drop(inner); // Release lock before microtask
       if let Some(ref sender) = self.command_sender {
-        let sender = sender.clone();
+        let weak_sender = Arc::downgrade(sender);
         PromiseRaw::resolve(&env, ())?.then(move |_| {
-          let _ = sender.send(DecoderCommand::Reconfigure(config));
+          // Only send if decoder hasn't been closed (weak reference can still upgrade)
+          if let Some(sender) = weak_sender.upgrade() {
+            let _ = sender.send(DecoderCommand::Reconfigure(config));
+          }
           Ok(())
         })?;
       }
@@ -899,7 +903,7 @@ impl AudioDecoder {
     // Create new channel and worker for decode operations
     if self.command_sender.is_none() {
       let (sender, receiver) = channel::unbounded();
-      self.command_sender = Some(sender);
+      self.command_sender = Some(Arc::new(sender));
       let worker_inner = self.inner.clone();
       let worker_event_state = self.event_state.clone();
       let worker_reset_flag = self.reset_flag.clone();
@@ -959,14 +963,18 @@ impl AudioDecoder {
 
     // Send decode command to worker thread (deferred to microtask for W3C spec compliance)
     // This ensures decodeQueueSize check happens before the worker receives the command
+    // Use Weak reference to allow close() to immediately close channel without deadlock
     if let Some(ref sender) = self.command_sender {
-      let sender = sender.clone();
+      let weak_sender = Arc::downgrade(sender);
       let reset_flag = self.reset_flag.clone();
       PromiseRaw::resolve(&env, ())?.then(move |_| {
         // Check reset flag - if reset() was called, skip sending (JS is single-threaded,
         // so reset() must have completed before this microtask runs)
         if !reset_flag.load(Ordering::SeqCst) {
-          let _ = sender.send(DecoderCommand::Decode { data, timestamp });
+          // Only send if decoder hasn't been closed (weak reference can still upgrade)
+          if let Some(sender) = weak_sender.upgrade() {
+            let _ = sender.send(DecoderCommand::Decode { data, timestamp });
+          }
         }
         Ok(())
       })?;
@@ -1041,14 +1049,18 @@ impl AudioDecoder {
 
     // Send flush command through the channel (deferred to microtask for W3C spec compliance)
     // This ensures flush is processed after all pending decode microtasks complete (FIFO order)
+    // Use Weak reference to allow close() to immediately close channel without deadlock
     if let Some(ref sender) = self.command_sender {
-      let sender = sender.clone();
+      let weak_sender = Arc::downgrade(sender);
       let reset_flag = self.reset_flag.clone();
       PromiseRaw::resolve(env, ())?.then(move |_| {
         // Check reset flag - if reset() was called, skip sending
         // (flush Promise is already rejected with AbortError by reset())
         if !reset_flag.load(Ordering::SeqCst) {
-          let _ = sender.send(DecoderCommand::Flush(response_sender));
+          // Only send if decoder hasn't been closed (weak reference can still upgrade)
+          if let Some(sender) = weak_sender.upgrade() {
+            let _ = sender.send(DecoderCommand::Flush(response_sender));
+          }
         }
         Ok(())
       })?;
@@ -1194,7 +1206,7 @@ impl AudioDecoder {
 
     // Create new channel and worker for future decode operations
     let (sender, receiver) = channel::unbounded();
-    self.command_sender = Some(sender);
+    self.command_sender = Some(Arc::new(sender));
     let worker_inner = self.inner.clone();
     let worker_event_state = self.event_state.clone();
     let worker_reset_flag = self.reset_flag.clone();
@@ -1236,10 +1248,15 @@ impl AudioDecoder {
     }
 
     // Drop sender to stop accepting new commands
+    // This immediately closes the channel since Weak references in microtasks
+    // can't keep it alive (they fail to upgrade after Arc is dropped)
     self.command_sender = None;
 
-    // Let worker detach - will exit when channel closes (all senders dropped)
-    self.worker_handle = None;
+    // Now safe to join - worker will see channel disconnect and exit
+    // (Previously caused deadlock when microtasks held strong sender clones)
+    if let Some(handle) = self.worker_handle.take() {
+      let _ = handle.join();
+    }
 
     let mut inner = self
       .inner
