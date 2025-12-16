@@ -274,7 +274,11 @@ test('stress: frame creation and cleanup loop', (t) => {
   t.pass(`Created and closed ${iterations} frames without memory issues`)
 })
 
-test('stress: encoder reconfigure loop', async (t) => {
+// NOTE: These reconfigure tests must run serially (test.serial) because on slow
+// platforms like armv7 QEMU, running them in parallel causes libx264 thread pool
+// exhaustion. This results in AVERROR_EXTERNAL (-542398533) when avcodec_open2()
+// tries to create a new encoder context during reconfiguration.
+test.serial('stress: encoder reconfigure loop', async (t) => {
   const { encoder, chunks } = createTestEncoder()
   const iterations = 20
 
@@ -482,7 +486,7 @@ test('stress: multiple encode-reconfigure cycles', async (t) => {
   t.pass(`Completed ${cycles} encode cycles with fresh encoders`)
 })
 
-test('stress: rapid reconfigure cycles', async (t) => {
+test.serial('stress: rapid reconfigure cycles', async (t) => {
   const width = 320
   const height = 240
   const cycles = 20
