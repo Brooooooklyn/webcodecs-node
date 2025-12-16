@@ -10,20 +10,20 @@ WebCodecs API implementation for Node.js using FFmpeg, built with napi-rs (Rust 
 
 **Status:** Feature-complete, production-ready
 
-| Component           | Status      | Notes                                              |
-| ------------------- | ----------- | -------------------------------------------------- |
-| VideoEncoder        | ✅ Complete | H.264, H.265, VP8, VP9, AV1 + EventTarget          |
-| VideoDecoder        | ✅ Complete | All codecs + AV1 drain + EventTarget               |
-| AudioEncoder        | ✅ Complete | AAC, Opus, MP3, FLAC + EventTarget                 |
-| AudioDecoder        | ✅ Complete | All codecs with resampling + EventTarget           |
-| VideoFrame          | ✅ Complete | All pixel formats, async copyTo, format conversion |
-| AudioData           | ✅ Complete | All sample formats                                 |
-| ImageDecoder        | ✅ Complete | JPEG, PNG, WebP, GIF, BMP, AVIF                    |
-| Threading           | ✅ Complete | Non-blocking Drop, proper lifecycle                |
-| W3C Spec Compliance | ✅ Complete | All APIs aligned                                   |
-| Type Definitions    | ✅ Complete | ~1,100 lines in index.d.ts                         |
-| Test Coverage       | ✅ Complete | 917 tests (34 files), all passing                  |
-| Hardware Encoding   | ✅ Complete | Zero-copy GPU path, auto-tuning                    |
+| Component           | Status      | Notes                                                              |
+| ------------------- | ----------- | ------------------------------------------------------------------ |
+| VideoEncoder        | ✅ Complete | H.264, H.265, VP8, VP9, AV1 + EventTarget                          |
+| VideoDecoder        | ✅ Complete | All codecs + AV1 drain + EventTarget                               |
+| AudioEncoder        | ✅ Complete | AAC, Opus, MP3, FLAC + EventTarget                                 |
+| AudioDecoder        | ✅ Complete | All codecs with resampling + EventTarget                           |
+| VideoFrame          | ✅ Complete | All pixel formats, async copyTo, format conversion, Canvas support |
+| AudioData           | ✅ Complete | All sample formats                                                 |
+| ImageDecoder        | ✅ Complete | JPEG, PNG, WebP, GIF, BMP, AVIF                                    |
+| Threading           | ✅ Complete | Non-blocking Drop, proper lifecycle                                |
+| W3C Spec Compliance | ✅ Complete | All APIs aligned                                                   |
+| Type Definitions    | ✅ Complete | ~1,100 lines in index.d.ts                                         |
+| Test Coverage       | ✅ Complete | 917 tests (34 files), all passing                                  |
+| Hardware Encoding   | ✅ Complete | Zero-copy GPU path, auto-tuning                                    |
 
 **Remaining Work:** None - All core features complete.
 
@@ -295,7 +295,18 @@ const frame = new VideoFrame(data, {
 
 // From existing VideoFrame (clone with optional overrides)
 const cloned = new VideoFrame(sourceFrame, { timestamp: newTs })
+
+// From @napi-rs/canvas Canvas (timestamp required per W3C spec)
+import { createCanvas } from '@napi-rs/canvas'
+const canvas = createCanvas(1920, 1080)
+const ctx = canvas.getContext('2d')
+ctx.fillStyle = '#FF0000'
+ctx.fillRect(0, 0, 1920, 1080)
+const canvasFrame = new VideoFrame(canvas, { timestamp: 0 })
+// canvasFrame.format === 'RGBA', colorSpace defaults to sRGB
 ```
+
+**Note:** `@napi-rs/canvas` is an optional peer dependency. Canvas pixel data is copied as RGBA format with sRGB color space.
 
 ## ImageDecoder Usage
 

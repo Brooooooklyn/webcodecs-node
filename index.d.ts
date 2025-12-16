@@ -45,6 +45,33 @@ export type TypedArray =
   | Float64Array
   | BigInt64Array
   | BigUint64Array
+
+/**
+ * Interface for Canvas-like objects compatible with VideoFrame constructor.
+ * Compatible with @napi-rs/canvas Canvas class.
+ *
+ * @napi-rs/canvas is an optional peer dependency. If installed, Canvas objects
+ * can be used as VideoFrame sources. The Canvas pixel data is copied (RGBA format).
+ */
+export interface CanvasLike {
+  readonly width: number
+  readonly height: number
+  /** Returns raw RGBA pixel data as a Buffer */
+  data(): Uint8Array
+}
+
+export type TypedArray =
+  | Int8Array
+  | Uint8Array
+  | Uint8ClampedArray
+  | Int16Array
+  | Uint16Array
+  | Int32Array
+  | Uint32Array
+  | Float32Array
+  | Float64Array
+  | BigInt64Array
+  | BigUint64Array
 /**
  * AudioData - represents uncompressed audio data
  *
@@ -668,13 +695,14 @@ export declare class VideoEncoder {
  */
 export declare class VideoFrame {
   /**
-   * Create a new VideoFrame from buffer data or another VideoFrame (W3C WebCodecs spec)
+   * Create a new VideoFrame from buffer data, another VideoFrame, or a Canvas (W3C WebCodecs spec)
    *
-   * Two constructor forms per W3C spec:
+   * Constructor forms per W3C spec:
    * 1. `new VideoFrame(data, init)` - from BufferSource with VideoFrameBufferInit
    * 2. `new VideoFrame(source, init?)` - from another VideoFrame with optional VideoFrameInit
+   * 3. `new VideoFrame(canvas, init)` - from @napi-rs/canvas Canvas (requires timestamp in init)
    */
-  constructor(source: VideoFrame | Uint8Array, init?: VideoFrameBufferInit | VideoFrameInit)
+  constructor(source: VideoFrame | Uint8Array | CanvasLike, init?: VideoFrameBufferInit | VideoFrameInit)
   /** Get the pixel format */
   get format(): VideoPixelFormat | null
   /** Get the coded width in pixels (returns 0 when closed per W3C spec) */

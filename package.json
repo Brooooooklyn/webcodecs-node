@@ -72,6 +72,7 @@
   "devDependencies": {
     "@emnapi/core": "^1.7.1",
     "@emnapi/runtime": "^1.7.1",
+    "@napi-rs/canvas": "^0.1.84",
     "@napi-rs/cli": "^3.5.0",
     "@napi-rs/wasm-runtime": "^1.1.0",
     "@oxc-node/core": "^0.0.35",
@@ -91,6 +92,14 @@
     "prettier": "^3.7.4",
     "tinybench": "^6.0.0",
     "typescript": "^5.9.3"
+  },
+  "peerDependencies": {
+    "@napi-rs/canvas": ">=0.1.0"
+  },
+  "peerDependenciesMeta": {
+    "@napi-rs/canvas": {
+      "optional": true
+    }
   },
   "napi": {
     "binaryName": "webcodecs",

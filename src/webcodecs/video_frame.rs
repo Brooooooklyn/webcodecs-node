@@ -1209,14 +1209,15 @@ fn parse_rotation(rotation: f64) -> f64 {
 
 #[napi]
 impl VideoFrame {
-  /// Create a new VideoFrame from buffer data or another VideoFrame (W3C WebCodecs spec)
+  /// Create a new VideoFrame from buffer data, another VideoFrame, or a Canvas (W3C WebCodecs spec)
   ///
-  /// Two constructor forms per W3C spec:
+  /// Constructor forms per W3C spec:
   /// 1. `new VideoFrame(data, init)` - from BufferSource with VideoFrameBufferInit
   /// 2. `new VideoFrame(source, init?)` - from another VideoFrame with optional VideoFrameInit
+  /// 3. `new VideoFrame(canvas, init)` - from @napi-rs/canvas Canvas (requires timestamp in init)
   #[napi(
     constructor,
-    ts_args_type = "source: VideoFrame | Uint8Array, init?: VideoFrameBufferInit | VideoFrameInit"
+    ts_args_type = "source: VideoFrame | Uint8Array | CanvasLike, init?: VideoFrameBufferInit | VideoFrameInit"
   )]
   pub fn new(env: Env, source: Unknown, init: Option<VideoFrameConstructorInit>) -> Result<Self> {
     // Try VideoFrame first (check for codedWidth property which only VideoFrame has)
@@ -1245,25 +1246,46 @@ impl VideoFrame {
       return Self::new_from_video_frame(video_frame, init);
     }
 
+    // Try Canvas (has width, height, data method, but NOT codedWidth/naturalWidth)
+    // This uses duck typing to detect @napi-rs/canvas Canvas objects
+    if let Ok(source_obj) = source.coerce_to_object() {
+      let has_width = source_obj.has_named_property("width").unwrap_or(false);
+      let has_height = source_obj.has_named_property("height").unwrap_or(false);
+      let has_data = source_obj.has_named_property("data").unwrap_or(false);
+      let has_coded_width = source_obj.has_named_property("codedWidth").unwrap_or(false);
+      let has_natural_width = source_obj
+        .has_named_property("naturalWidth")
+        .unwrap_or(false);
+
+      if has_width && has_height && has_data && !has_coded_width && !has_natural_width {
+        // Verify data is a function (Canvas.data() method vs property)
+        if let Ok(data_prop) = source_obj.get_named_property::<Unknown>("data")
+          && data_prop.get_type().unwrap_or(ValueType::Undefined) == ValueType::Function
+        {
+          return Self::new_from_canvas(env, source_obj, init);
+        }
+      }
+    }
+
     // Try as Uint8Array/Buffer
-    let data = Uint8Array::from_unknown(source).map_err(|_| {
+    let data = Uint8ArraySlice::from_unknown(source).map_err(|_| {
       let _ = env.throw_type_error(
-        "First argument must be a VideoFrame or BufferSource (Uint8Array/Buffer)",
+        "First argument must be a VideoFrame, Canvas, or BufferSource (Uint8Array/Buffer)",
         None,
       );
       Error::new(
         Status::InvalidArg,
-        "First argument must be a VideoFrame or BufferSource (Uint8Array/Buffer)",
+        "First argument must be a VideoFrame, Canvas, or BufferSource (Uint8Array/Buffer)",
       )
     })?;
 
-    Self::new_from_buffer(env, data, init)
+    Self::new_from_buffer(env, &data, init)
   }
 
   /// Internal: Create VideoFrame from buffer data (VideoFrameBufferInit constructor form)
   fn new_from_buffer(
     env: Env,
-    data: Uint8Array,
+    data: &[u8],
     init: Option<VideoFrameConstructorInit>,
   ) -> Result<Self> {
     // init is required for buffer constructor
@@ -1343,7 +1365,7 @@ impl VideoFrame {
     // Copy data into the frame (with optional custom layout)
     Self::copy_data_to_frame(
       &mut frame,
-      &data,
+      data,
       format,
       width,
       height,
@@ -1428,6 +1450,137 @@ impl VideoFrame {
     Ok(Self {
       inner: Arc::new(Mutex::new(Some(inner))),
     })
+  }
+
+  /// Internal: Create VideoFrame from @napi-rs/canvas Canvas (CanvasImageSource constructor form)
+  ///
+  /// Per W3C spec, timestamp is REQUIRED when creating from Canvas.
+  /// Canvas.data() returns RGBA pixel data as a Buffer.
+  fn new_from_canvas(
+    env: Env,
+    canvas_obj: Object,
+    init: Option<VideoFrameConstructorInit>,
+  ) -> Result<Self> {
+    // Get canvas dimensions
+    let width: u32 = canvas_obj
+      .get::<u32>("width")
+      .map_err(|_| Error::new(Status::InvalidArg, "Canvas has no width property"))?
+      .ok_or_else(|| Error::new(Status::InvalidArg, "Canvas has no width property"))?;
+    let height: u32 = canvas_obj
+      .get::<u32>("height")
+      .map_err(|_| Error::new(Status::InvalidArg, "Canvas has no height property"))?
+      .ok_or_else(|| Error::new(Status::InvalidArg, "Canvas has no height property"))?;
+
+    // Validate dimensions (must be > 0)
+    if width == 0 {
+      let _ = env.throw_type_error("Canvas width must be greater than 0", None);
+      return Err(Error::new(
+        Status::InvalidArg,
+        "Canvas width must be greater than 0",
+      ));
+    }
+    if height == 0 {
+      let _ = env.throw_type_error("Canvas height must be greater than 0", None);
+      return Err(Error::new(
+        Status::InvalidArg,
+        "Canvas height must be greater than 0",
+      ));
+    }
+
+    // init with timestamp is REQUIRED for Canvas source per W3C spec
+    let init = init.ok_or_else(|| {
+      let _ = env.throw_type_error(
+        "init with timestamp is required when creating from Canvas",
+        None,
+      );
+      Error::new(
+        Status::InvalidArg,
+        "init with timestamp is required when creating from Canvas",
+      )
+    })?;
+
+    let timestamp = init.timestamp.ok_or_else(|| {
+      let _ = env.throw_type_error(
+        "timestamp is required when creating VideoFrame from Canvas",
+        None,
+      );
+      Error::new(
+        Status::InvalidArg,
+        "timestamp is required when creating VideoFrame from Canvas",
+      )
+    })?;
+
+    // Get pixel data by calling canvas.data() with proper 'this' context
+    // Canvas.data() returns a Buffer containing raw RGBA pixel data
+    // We need to use low-level napi to call with 'this' bound to canvas
+    let data_fn: Unknown = canvas_obj
+      .get_named_property("data")
+      .map_err(|_| Error::new(Status::GenericFailure, "Failed to get Canvas.data method"))?;
+
+    let pixel_data: &[u8] = {
+      let mut result: napi::sys::napi_value = std::ptr::null_mut();
+      let status = unsafe {
+        napi::sys::napi_call_function(
+          env.raw(),
+          canvas_obj.raw(), // 'this' is the canvas object
+          data_fn.raw(),    // the data() method
+          0,                // no arguments
+          std::ptr::null(), // no arguments array
+          &mut result,      // result
+        )
+      };
+      if status != napi::sys::Status::napi_ok {
+        return Err(Error::new(
+          Status::GenericFailure,
+          "Canvas.data() call failed",
+        ));
+      }
+      unsafe { FromNapiValue::from_napi_value(env.raw(), result)? }
+    };
+
+    // Validate buffer size (RGBA = 4 bytes per pixel)
+    let expected_size = (width as usize) * (height as usize) * 4;
+    if pixel_data.len() < expected_size {
+      let _ = env.throw_type_error(
+        &format!(
+          "Canvas data buffer too small: need {} bytes, got {}",
+          expected_size,
+          pixel_data.len()
+        ),
+        None,
+      );
+      return Err(Error::new(
+        Status::InvalidArg,
+        format!(
+          "Canvas data buffer too small: need {} bytes, got {}",
+          expected_size,
+          pixel_data.len()
+        ),
+      ));
+    }
+
+    // Build init with Canvas-derived values, preserving user-provided options
+    // Format is always RGBA from Canvas.data()
+    let canvas_init = VideoFrameConstructorInit {
+      format: Some(VideoPixelFormat::RGBA),
+      coded_width: Some(width),
+      coded_height: Some(height),
+      timestamp: Some(timestamp),
+      duration: init.duration,
+      layout: None, // Canvas data is always tightly packed
+      visible_rect: init.visible_rect,
+      rotation: init.rotation,
+      flip: init.flip,
+      display_width: init.display_width,
+      display_height: init.display_height,
+      color_space: init.color_space, // Will default to sRGB in new_from_buffer
+      metadata: init.metadata,
+      transfer: None,
+      alpha: init.alpha,
+    };
+
+    // Delegate to new_from_buffer with pixel data
+    Self::new_from_buffer(env, pixel_data, Some(canvas_init))
   }
 
   /// Internal: Create VideoFrame from another VideoFrame (image source constructor form)
