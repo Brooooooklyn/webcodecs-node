@@ -214,15 +214,6 @@ unsafe extern "C" {
     fmt: c_int,
     search_flags: c_int,
   ) -> c_int;
-
-  /// Set a channel layout option (legacy)
-  #[cfg(not(feature = "ffmpeg_5_1"))]
-  pub fn av_opt_set_channel_layout(
-    obj: *mut std::ffi::c_void,
-    name: *const std::os::raw::c_char,
-    ch_layout: i64,
-    search_flags: c_int,
-  ) -> c_int;
 }
 
 // ============================================================================

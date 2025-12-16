@@ -617,14 +617,6 @@ fn link_platform_libraries(target_os: &str) {
       println!("cargo:rustc-link-lib=m");
       println!("cargo:rustc-link-lib=pthread");
       println!("cargo:rustc-link-lib=dl");
-
-      // VAAPI for hardware acceleration (if available)
-      #[cfg(feature = "hwaccel")]
-      {
-        println!("cargo:rustc-link-lib=va");
-        println!("cargo:rustc-link-lib=va-drm");
-        println!("cargo:rustc-link-lib=va-x11");
-      }
     }
 
     "windows" => {
