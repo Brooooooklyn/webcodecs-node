@@ -11,7 +11,7 @@
     "allowSyntheticDefaultImports": true,
     "skipLibCheck": true,
     "types": ["node"],
-    "outDir": "./dist",
+    "outDir": "./dist"
   },
   "include": ["."],
   "exclude": [
@@ -22,7 +22,7 @@
     "specs",
     "polyfill.d.ts",
     "polyfill.js",
-    "__test__/integration/conversion.spec.ts",
+    "__test__/integration/conversion.spec.ts"
   ],
-  "references": [{ "path": "./tsconfig.polyfill.json" }],
+  "references": [{ "path": "./tsconfig.polyfill.json" }]
 }

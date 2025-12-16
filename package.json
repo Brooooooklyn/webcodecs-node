@@ -2,64 +2,41 @@
   "name": "@napi-rs/webcodecs",
   "version": "0.0.0",
   "description": "WebCodecs API implementation for Node.js using FFmpeg",
-  "main": "index.js",
-  "types": "index.d.ts",
-  "browser": "browser.js",
-  "exports": {
-    ".": {
-      "types": "./index.d.ts",
-      "require": "./index.js",
-      "import": "./index.js"
-    },
-    "./polyfill": {
-      "types": "./polyfill.d.ts",
-      "require": "./polyfill.js",
-      "import": "./polyfill.js"
-    }
-  },
-  "repository": {
-    "url": "git+ssh://git@github.com/Brooooooklyn/webcodecs-node.git",
-    "type": "git"
-  },
-  "license": "MIT",
   "keywords": [
-    "napi-rs",
-    "NAPI",
     "N-API",
+    "NAPI",
     "Rust",
+    "napi-rs",
     "node-addon",
     "node-addon-api"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/Brooooooklyn/webcodecs-node.git"
+  },
+  "license": "MIT",
+  "main": "index.js",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js",
+      "require": "./index.js"
+    },
+    "./polyfill": {
+      "types": "./polyfill.d.ts",
+      "import": "./polyfill.js",
+      "require": "./polyfill.js"
+    }
+  },
+  "browser": "browser.js",
+  "types": "index.d.ts",
   "files": [
     "index.d.ts",
     "index.js",
-    "standard.d.ts",
+    "polyfill.d.ts",
     "polyfill.js",
-    "polyfill.d.ts"
+    "standard.d.ts"
   ],
-  "napi": {
-    "binaryName": "webcodecs",
-    "targets": [
-      "x86_64-apple-darwin",
-      "aarch64-apple-darwin",
-      "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-linux-musl",
-      "x86_64-pc-windows-msvc",
-      "aarch64-unknown-linux-gnu",
-      "aarch64-unknown-linux-musl",
-      "aarch64-pc-windows-msvc",
-      "armv7-unknown-linux-gnueabihf"
-    ],
-    "constEnum": false,
-    "dtsHeaderFile": "dts-header.d.ts"
-  },
-  "engines": {
-    "node": ">= 10"
-  },
-  "publishConfig": {
-    "registry": "https://registry.npmjs.org/",
-    "access": "public"
-  },
   "scripts": {
     "artifacts": "napi artifacts",
     "bench": "node --import @oxc-node/core/register benchmark/bench.ts",
@@ -76,29 +53,6 @@
     "typecheck": "tsc -b tsconfig.json",
     "version": "napi version"
   },
-  "devDependencies": {
-    "@emnapi/core": "^1.7.1",
-    "@emnapi/runtime": "^1.7.1",
-    "@napi-rs/cli": "^3.5.0",
-    "@napi-rs/wasm-runtime": "^1.1.0",
-    "@oxc-node/core": "^0.0.35",
-    "@taplo/cli": "^0.7.0",
-    "@tybys/wasm-util": "^0.10.1",
-    "@types/node": "^24.10.1",
-    "ava": "^6.4.1",
-    "chalk": "^5.6.2",
-    "emnapi": "^1.7.1",
-    "husky": "^9.1.7",
-    "lint-staged": "^16.2.7",
-    "mediabunny": "1.25.8",
-    "npm-run-all2": "^8.0.4",
-    "oxfmt": "^0.17.0",
-    "oxlint": "^1.32.0",
-    "oxlint-tsgolint": "^0.8.5",
-    "prettier": "^3.7.4",
-    "tinybench": "^6.0.0",
-    "typescript": "^5.9.3"
-  },
   "lint-staged": {
     "*.@(js|ts|tsx)": [
       "oxlint --fix",
@@ -111,29 +65,75 @@
       "taplo format"
     ]
   },
+  "devDependencies": {
+    "@emnapi/core": "^1.7.1",
+    "@emnapi/runtime": "^1.7.1",
+    "@napi-rs/cli": "^3.5.0",
+    "@napi-rs/wasm-runtime": "^1.1.0",
+    "@oxc-node/core": "^0.0.35",
+    "@taplo/cli": "^0.7.0",
+    "@tybys/wasm-util": "^0.10.1",
+    "@types/node": "^25.0.2",
+    "ava": "^6.4.1",
+    "chalk": "^5.6.2",
+    "emnapi": "^1.7.1",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.2.7",
+    "mediabunny": "1.26.0",
+    "npm-run-all2": "^8.0.4",
+    "oxfmt": "^0.18.0",
+    "oxlint": "^1.33.0",
+    "oxlint-tsgolint": "^0.9.1",
+    "prettier": "^3.7.4",
+    "tinybench": "^6.0.0",
+    "typescript": "^5.9.3"
+  },
+  "napi": {
+    "binaryName": "webcodecs",
+    "constEnum": false,
+    "dtsHeaderFile": "dts-header.d.ts",
+    "targets": [
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "x86_64-unknown-linux-musl",
+      "x86_64-pc-windows-msvc",
+      "aarch64-unknown-linux-gnu",
+      "aarch64-unknown-linux-musl",
+      "aarch64-pc-windows-msvc",
+      "armv7-unknown-linux-gnueabihf"
+    ]
+  },
+  "packageManager": "pnpm@10.26.0",
+  "prettier": {
+    "arrowParens": "always",
+    "printWidth": 120,
+    "semi": false,
+    "singleQuote": true,
+    "trailingComma": "all"
+  },
   "ava": {
+    "environmentVariables": {
+      "TS_NODE_PROJECT": "./tsconfig.json"
+    },
     "extensions": {
       "ts": "module"
     },
     "files": [
       "__test__/**/*.spec.ts"
     ],
-    "timeout": "5m",
-    "workerThreads": false,
-    "environmentVariables": {
-      "TS_NODE_PROJECT": "./tsconfig.json"
-    },
     "nodeArguments": [
       "--import",
       "@oxc-node/core/register"
-    ]
+    ],
+    "timeout": "5m",
+    "workerThreads": false
   },
-  "prettier": {
-    "printWidth": 120,
-    "semi": false,
-    "trailingComma": "all",
-    "singleQuote": true,
-    "arrowParens": "always"
+  "engines": {
+    "node": ">= 10"
   },
-  "packageManager": "pnpm@10.25.0"
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
 }

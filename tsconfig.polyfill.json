@@ -2,8 +2,8 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "composite": true,
-    "noEmit": false,
+    "noEmit": false
   },
   "include": ["polyfill.d.ts", "polyfill.js"],
-  "exclude": ["dist", "node_modules", "ffmpeg-build", "ffmpeg-src", "specs"],
+  "exclude": ["dist", "node_modules", "ffmpeg-build", "ffmpeg-src", "specs"]
 }
