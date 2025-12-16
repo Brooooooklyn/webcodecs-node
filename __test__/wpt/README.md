@@ -6,18 +6,34 @@ This directory contains tests ported from the [W3C Web Platform Tests](https://g
 
 | Status      | Count |
 | ----------- | ----- |
-| **Passing** | 522   |
+| **Passing** | 573   |
 | **Skipped** | 5     |
 | **Failing** | 0     |
-| **Total**   | 527   |
+| **Total**   | 578   |
 
 ## Test Files Overview
 
 ### VideoFrame Tests
 
-| File                      | Tests      | Status       | Notes                       |
-| ------------------------- | ---------- | ------------ | --------------------------- |
-| `video-frame-wpt.spec.ts` | 71 passing | **Complete** | All pixel formats supported |
+| File                      | Tests       | Status       | Notes                                                |
+| ------------------------- | ----------- | ------------ | ---------------------------------------------------- |
+| `video-frame-wpt.spec.ts` | 116 passing | **Complete** | All pixel formats, format conversion, security (WPT) |
+
+**Format Conversion (WPT `videoFrame-copyTo-rgb.any.js`):**
+
+| Source Format                | Target Format          | Result               |
+| ---------------------------- | ---------------------- | -------------------- |
+| I420, I422, I444, NV12, NV21 | RGBA, RGBX, BGRA, BGRX | ✅ Success           |
+| RGBA, RGBX, BGRA, BGRX       | RGBA, RGBX, BGRA, BGRX | ✅ Success           |
+| RGBA, RGBX, BGRA, BGRX       | I420, I422, I444, NV12 | ❌ NotSupportedError |
+
+**Security Tests (overflow and rect validation):**
+
+| Test Case                             | Expected                | Status  |
+| ------------------------------------- | ----------------------- | ------- |
+| Layout offset overflow (2³²-2)        | TypeError               | ✅ Pass |
+| Layout stride × height overflow       | TypeError               | ✅ Pass |
+| Rect alignment with format conversion | Validates source format | ✅ Pass |
 
 **Supported Pixel Formats:**
 

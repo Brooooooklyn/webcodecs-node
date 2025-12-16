@@ -10,20 +10,20 @@ WebCodecs API implementation for Node.js using FFmpeg, built with napi-rs (Rust 
 
 **Status:** Feature-complete, production-ready
 
-| Component           | Status      | Notes                                     |
-| ------------------- | ----------- | ----------------------------------------- |
-| VideoEncoder        | ✅ Complete | H.264, H.265, VP8, VP9, AV1 + EventTarget |
-| VideoDecoder        | ✅ Complete | All codecs + AV1 drain + EventTarget      |
-| AudioEncoder        | ✅ Complete | AAC, Opus, MP3, FLAC + EventTarget        |
-| AudioDecoder        | ✅ Complete | All codecs with resampling + EventTarget  |
-| VideoFrame          | ✅ Complete | All pixel formats, async copyTo           |
-| AudioData           | ✅ Complete | All sample formats                        |
-| ImageDecoder        | ✅ Complete | JPEG, PNG, WebP, GIF, BMP, AVIF           |
-| Threading           | ✅ Complete | Non-blocking Drop, proper lifecycle       |
-| W3C Spec Compliance | ✅ Complete | All APIs aligned                          |
-| Type Definitions    | ✅ Complete | ~1,100 lines in index.d.ts                |
-| Test Coverage       | ✅ Complete | 864 tests (34 files), all passing         |
-| Hardware Encoding   | ✅ Complete | Zero-copy GPU path, auto-tuning           |
+| Component           | Status      | Notes                                              |
+| ------------------- | ----------- | -------------------------------------------------- |
+| VideoEncoder        | ✅ Complete | H.264, H.265, VP8, VP9, AV1 + EventTarget          |
+| VideoDecoder        | ✅ Complete | All codecs + AV1 drain + EventTarget               |
+| AudioEncoder        | ✅ Complete | AAC, Opus, MP3, FLAC + EventTarget                 |
+| AudioDecoder        | ✅ Complete | All codecs with resampling + EventTarget           |
+| VideoFrame          | ✅ Complete | All pixel formats, async copyTo, format conversion |
+| AudioData           | ✅ Complete | All sample formats                                 |
+| ImageDecoder        | ✅ Complete | JPEG, PNG, WebP, GIF, BMP, AVIF                    |
+| Threading           | ✅ Complete | Non-blocking Drop, proper lifecycle                |
+| W3C Spec Compliance | ✅ Complete | All APIs aligned                                   |
+| Type Definitions    | ✅ Complete | ~1,100 lines in index.d.ts                         |
+| Test Coverage       | ✅ Complete | 917 tests (34 files), all passing                  |
+| Hardware Encoding   | ✅ Complete | Zero-copy GPU path, auto-tuning                    |
 
 **Remaining Work:** None - All core features complete.
 
@@ -516,29 +516,32 @@ These are fundamental limitations that cannot be resolved without upstream NAPI-
 
 ## Spec Compliance Notes
 
-| Feature                      | Spec                    | Implementation              |
-| ---------------------------- | ----------------------- | --------------------------- |
-| VideoFrame.copyTo()          | Promise<PlaneLayout[]>  | ✅ Async                    |
-| AudioData.copyTo()           | void (sync)             | ✅ Sync                     |
-| AudioData.allocationSize()   | options required        | ✅ Required                 |
-| Encoder callbacks            | (chunk, metadata?)      | ✅ Spread args              |
-| AudioData constructor        | data in init            | ✅ Inside init              |
-| Enum casing                  | lowercase               | ✅ "key", "unconfigured"    |
-| VideoColorSpace.toJSON()     | toJSON() method         | ✅ Correct capitalization   |
-| DOMRectReadOnly.toJSON()     | toJSON() method         | ✅ Correct capitalization   |
-| VideoFrame.codedRect         | throws on closed        | ✅ InvalidStateError        |
-| VideoFrame.visibleRect       | throws on closed        | ✅ InvalidStateError        |
-| VideoFrame visibleRect param | cropping support        | ✅ Full W3C compliance      |
-| VideoFrame.copyTo rect       | subregion copy          | ✅ Full W3C compliance      |
-| ImageDecoder.closed          | readonly boolean        | ✅ Implemented              |
-| ImageTrackList.ready         | Promise                 | ✅ Implemented              |
-| ImageTrackList.item()        | indexed access          | ✅ Implemented              |
-| ImageTrackList.selectedIndex | returns -1 if none      | ✅ Implemented              |
-| ImageTrack.selected          | writable property       | ✅ Getter/setter            |
-| SvcOutputMetadata            | temporalLayerId only    | ✅ All multi-temporal modes |
-| DOMException errors          | instanceof DOMException | ✅ Native DOMException      |
-| VideoEncoder.encode options  | keyFrame forcing        | ✅ Forces I-frame           |
-| EventTarget interface        | addEventListener, etc   | ✅ All codecs               |
-| RGBA colorSpace default      | sRGB for RGB formats    | ✅ BT.709/sRGB              |
-| VP9 short form codec         | "vp9" accepted          | ✅ For compatibility        |
-| AV1 short form codec         | "av01"/"av1" accepted   | ✅ For compatibility        |
+| Feature                      | Spec                    | Implementation                |
+| ---------------------------- | ----------------------- | ----------------------------- |
+| VideoFrame.copyTo()          | Promise<PlaneLayout[]>  | ✅ Async                      |
+| AudioData.copyTo()           | void (sync)             | ✅ Sync                       |
+| AudioData.allocationSize()   | options required        | ✅ Required                   |
+| Encoder callbacks            | (chunk, metadata?)      | ✅ Spread args                |
+| AudioData constructor        | data in init            | ✅ Inside init                |
+| Enum casing                  | lowercase               | ✅ "key", "unconfigured"      |
+| VideoColorSpace.toJSON()     | toJSON() method         | ✅ Correct capitalization     |
+| DOMRectReadOnly.toJSON()     | toJSON() method         | ✅ Correct capitalization     |
+| VideoFrame.codedRect         | throws on closed        | ✅ InvalidStateError          |
+| VideoFrame.visibleRect       | throws on closed        | ✅ InvalidStateError          |
+| VideoFrame visibleRect param | cropping support        | ✅ Full W3C compliance        |
+| VideoFrame.copyTo rect       | subregion copy          | ✅ Full W3C compliance        |
+| VideoFrame.copyTo format     | format conversion       | ✅ YUV→RGB, RGB→RGB supported |
+| VideoFrame layout overflow   | TypeError on overflow   | ✅ Checked arithmetic (u64)   |
+| VideoFrame rect validation   | source format alignment | ✅ Validates against source   |
+| ImageDecoder.closed          | readonly boolean        | ✅ Implemented                |
+| ImageTrackList.ready         | Promise                 | ✅ Implemented                |
+| ImageTrackList.item()        | indexed access          | ✅ Implemented                |
+| ImageTrackList.selectedIndex | returns -1 if none      | ✅ Implemented                |
+| ImageTrack.selected          | writable property       | ✅ Getter/setter              |
+| SvcOutputMetadata            | temporalLayerId only    | ✅ All multi-temporal modes   |
+| DOMException errors          | instanceof DOMException | ✅ Native DOMException        |
+| VideoEncoder.encode options  | keyFrame forcing        | ✅ Forces I-frame             |
+| EventTarget interface        | addEventListener, etc   | ✅ All codecs                 |
+| RGBA colorSpace default      | sRGB for RGB formats    | ✅ BT.709/sRGB                |
+| VP9 short form codec         | "vp9" accepted          | ✅ For compatibility          |
+| AV1 short form codec         | "av01"/"av1" accepted   | ✅ For compatibility          |

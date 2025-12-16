@@ -297,6 +297,28 @@ export type VideoPixelFormat =
   | 'BGRX'
 
 /**
+ * Layout information for a single plane
+ * @see https://w3c.github.io/webcodecs/#dictdef-planelayout
+ */
+export interface PlaneLayout {
+  /** Byte offset from the start of the buffer to the start of the plane */
+  offset: number
+  /** Number of bytes per row (stride) */
+  stride: number
+}
+
+/**
+ * DOMRectInit for specifying regions
+ * @see https://drafts.fxtf.org/geometry/#dictdef-domrectinit
+ */
+export interface DOMRectInit {
+  x?: number
+  y?: number
+  width?: number
+  height?: number
+}
+
+/**
  * VideoFrame buffer init
  * @see https://w3c.github.io/webcodecs/#dictdef-videoframebufferinit
  */
@@ -311,6 +333,10 @@ export interface VideoFrameBufferInit {
   timestamp: number
   /** Duration in microseconds */
   duration?: number
+  /** Layout for input planes (offset and stride per plane) */
+  layout?: PlaneLayout[]
+  /** Visible rect within the coded frame */
+  visibleRect?: DOMRectInit
   /** Display width */
   displayWidth?: number
   /** Display height */

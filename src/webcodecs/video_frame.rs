@@ -3,13 +3,13 @@
 //! Represents a frame of video data that can be displayed or encoded.
 //! See: https://developer.mozilla.org/en-US/docs/Web/API/VideoFrame
 
-use crate::codec::Frame;
+use crate::codec::{Frame, Scaler};
 use crate::ffi::{
   AVColorPrimaries, AVColorRange, AVColorSpace, AVColorTransferCharacteristic, AVPixelFormat,
 };
 use crate::webcodecs::error::{
   enforce_range_long_long, enforce_range_long_long_optional, invalid_state_error,
-  throw_invalid_state_error,
+  not_supported_error, throw_invalid_state_error, throw_not_supported_error, type_error,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -166,6 +166,63 @@ impl VideoPixelFormat {
       | VideoPixelFormat::BGRA
       | VideoPixelFormat::BGRX => 4,
     }
+  }
+
+  /// Returns true if this format has an alpha channel
+  pub fn has_alpha(&self) -> bool {
+    matches!(
+      self,
+      VideoPixelFormat::I420A
+        | VideoPixelFormat::I422A
+        | VideoPixelFormat::I444A
+        | VideoPixelFormat::I420AP10
+        | VideoPixelFormat::I422AP10
+        | VideoPixelFormat::I444AP10
+        | VideoPixelFormat::RGBA
+        | VideoPixelFormat::BGRA
+    )
+  }
+
+  /// Returns the equivalent format without alpha, or self if no alpha
+  pub fn without_alpha(&self) -> Self {
+    match self {
+      VideoPixelFormat::I420A => VideoPixelFormat::I420,
+      VideoPixelFormat::I422A => VideoPixelFormat::I422,
+      VideoPixelFormat::I444A => VideoPixelFormat::I444,
+      VideoPixelFormat::I420AP10 => VideoPixelFormat::I420P10,
+      VideoPixelFormat::I422AP10 => VideoPixelFormat::I422P10,
+      VideoPixelFormat::I444AP10 => VideoPixelFormat::I444P10,
+      VideoPixelFormat::RGBA => VideoPixelFormat::RGBX,
+      VideoPixelFormat::BGRA => VideoPixelFormat::BGRX,
+      other => *other,
+    }
+  }
+
+  /// Check if conversion from self to target format is supported
+  ///
+  /// Per WPT videoFrame-copyTo-rgb.any.js:
+  /// - YUV → RGB: supported (I420, I422, I444, NV12 → RGBA, RGBX, BGRA, BGRX)
+  /// - RGB → RGB: supported (between RGBA, RGBX, BGRA, BGRX)
+  /// - RGB → YUV: NOT supported (throws NotSupportedError)
+  pub fn can_convert_to(&self, target: VideoPixelFormat) -> bool {
+    // Same format is always supported
+    if *self == target {
+      return true;
+    }
+
+    // Check if target is RGB family
+    let target_is_rgb = matches!(
+      target,
+      VideoPixelFormat::RGBA
+        | VideoPixelFormat::RGBX
+        | VideoPixelFormat::BGRA
+        | VideoPixelFormat::BGRX
+    );
+
+    // YUV → RGB: supported
+    // RGB → RGB: supported
+    // RGB → YUV: not supported (per WPT test_unsupported_pixel_formats)
+    target_is_rgb
   }
 }
 
@@ -1034,6 +1091,34 @@ fn verify_rect_offset_alignment(format: VideoPixelFormat, x: u32, y: u32) -> boo
   x.is_multiple_of(h_factor) && y.is_multiple_of(v_factor)
 }
 
+/// Calculate plane end offset with overflow checking
+///
+/// Computes `offset + stride * height` using u64 to prevent u32 overflow.
+/// Returns TypeError on arithmetic overflow per W3C WebCodecs spec.
+///
+/// This is used to validate custom layout parameters and prevent buffer overflows
+/// when large offset/stride values (like WPT's "address overflow" case: offset = 2^32 - 2)
+/// would wrap in u32 arithmetic.
+fn calculate_plane_end_checked(offset: u32, stride: u32, height: u32) -> Result<u64> {
+  let stride_u64 = stride as u64;
+  let height_u64 = height as u64;
+  let offset_u64 = offset as u64;
+
+  let plane_size = stride_u64.checked_mul(height_u64).ok_or_else(|| {
+    Error::new(
+      Status::InvalidArg,
+      "TypeError: layout stride * height overflow",
+    )
+  })?;
+
+  offset_u64.checked_add(plane_size).ok_or_else(|| {
+    Error::new(
+      Status::InvalidArg,
+      "TypeError: layout offset + size overflow",
+    )
+  })
+}
+
 /// Per W3C spec: Parse Visible Rect algorithm
 /// Takes default rect, optional override rect, coded dimensions, and format
 /// Returns (left, top, width, height) or error
@@ -1255,8 +1340,15 @@ impl VideoFrame {
       )
     })?;
 
-    // Copy data into the frame
-    Self::copy_data_to_frame(&mut frame, &data, format, width, height)?;
+    // Copy data into the frame (with optional custom layout)
+    Self::copy_data_to_frame(
+      &mut frame,
+      &data,
+      format,
+      width,
+      height,
+      init.layout.as_deref(),
+    )?;
 
     // Set timestamps (convert from microseconds to time_base units)
     // We use microseconds as time_base internally
@@ -1344,11 +1436,51 @@ impl VideoFrame {
     init: Option<VideoFrameConstructorInit>,
   ) -> Result<Self> {
     source.with_inner(|source_inner| {
+      // Check if alpha should be discarded per W3C spec
+      let should_discard_alpha = init
+        .as_ref()
+        .and_then(|i| i.alpha.as_ref())
+        .map(|a| a == "discard")
+        .unwrap_or(false);
+
       // Clone the underlying frame data
       let cloned_frame = source_inner
         .frame
         .try_clone()
         .map_err(|e| Error::new(Status::GenericFailure, format!("Clone failed: {}", e)))?;
+
+      // Handle alpha discard: convert to non-alpha format if needed
+      let (final_frame, final_format) =
+        if should_discard_alpha && source_inner.original_format.has_alpha() {
+          let target_format = source_inner.original_format.without_alpha();
+          let src_av_format = source_inner.original_format.to_av_format();
+          let dst_av_format = target_format.to_av_format();
+
+          // Use Scaler to convert format (drops alpha channel)
+          let scaler = Scaler::new_converter(
+            cloned_frame.width(),
+            cloned_frame.height(),
+            src_av_format,
+            dst_av_format,
+          )
+          .map_err(|e| {
+            Error::new(
+              Status::GenericFailure,
+              format!("Failed to create converter for alpha discard: {}", e),
+            )
+          })?;
+
+          let converted = scaler.scale_alloc(&cloned_frame).map_err(|e| {
+            Error::new(
+              Status::GenericFailure,
+              format!("Failed to convert frame for alpha discard: {}", e),
+            )
+          })?;
+
+          (converted, target_format)
+        } else {
+          (cloned_frame, source_inner.original_format)
+        };
 
       // Apply overrides from init (all fields optional for frame clone)
       let timestamp_us = init
@@ -1370,9 +1502,9 @@ impl VideoFrame {
       let (visible_left, visible_top, visible_width, visible_height) = parse_visible_rect(
         default_rect,
         init.as_ref().and_then(|i| i.visible_rect.as_ref()),
-        cloned_frame.width(),
-        cloned_frame.height(),
-        source_inner.original_format,
+        final_frame.width(),
+        final_frame.height(),
+        final_format,
       )?;
 
       // Handle rotation per W3C spec "Add Rotations" algorithm
@@ -1416,8 +1548,8 @@ impl VideoFrame {
         });
 
       let new_inner = VideoFrameInner {
-        frame: cloned_frame,
-        original_format: source_inner.original_format,
+        frame: final_frame,
+        original_format: final_format,
         timestamp_us,
         duration_us,
         visible_left,
@@ -1794,6 +1926,18 @@ impl VideoFrame {
       .and_then(|o| o.format)
       .unwrap_or(inner.original_format);
 
+    // Check if format conversion is supported
+    // Per WPT: YUV→RGB and RGB→RGB work; RGB→YUV throws NotSupportedError
+    if format != inner.original_format && !inner.original_format.can_convert_to(format) {
+      return throw_not_supported_error(
+        &env,
+        &format!(
+          "Format conversion from {:?} to {:?} is not supported",
+          inner.original_format, format
+        ),
+      );
+    }
+
     // Use rect from options or default to visible rect
     let (width, height) = if let Some(ref opts) = options {
       if let Some(ref rect) = opts.rect {
@@ -1804,12 +1948,14 @@ impl VideoFrame {
           inner.visible_width as f64,
           inner.visible_height as f64,
         );
+        // Validate rect against SOURCE format (original_format), not target format.
+        // Rect alignment must match the source frame's subsampling requirements.
         let (_, _, w, h) = parse_visible_rect(
           default_rect,
           Some(rect),
           inner.frame.width(),
           inner.frame.height(),
-          format,
+          inner.original_format,
         )?;
         (w, h)
       } else {
@@ -1818,6 +1964,36 @@ impl VideoFrame {
     } else {
       (inner.visible_width, inner.visible_height)
     };
+
+    // If custom layout is provided, validate and calculate size from layout
+    if let Some(ref opts) = options
+      && let Some(ref layout) = opts.layout
+    {
+      // Validate the layout (throws TypeError on invalid layout)
+      // Note: validate_copy_layout needs Env for throwing, but returns Result
+      Self::validate_copy_layout(layout, format, width)?;
+
+      // Calculate total size as max(offset + stride * plane_height) across all planes
+      // Use u64 to prevent overflow and checked arithmetic per W3C spec
+      let mut max_end: u64 = 0;
+
+      for (plane_idx, plane_layout) in layout.iter().enumerate() {
+        let plane_height = Self::get_plane_height(format, height, plane_idx as u32);
+        let plane_end =
+          calculate_plane_end_checked(plane_layout.offset, plane_layout.stride, plane_height)?;
+        max_end = max_end.max(plane_end);
+      }
+
+      // Ensure result fits in u32 (reasonable limit for allocation size)
+      if max_end > u32::MAX as u64 {
+        return Err(Error::new(
+          Status::InvalidArg,
+          "TypeError: computed allocation size exceeds maximum",
+        ));
+      }
+
+      return Ok(max_end as u32);
+    }
 
     Ok(Self::calculate_buffer_size(format, width, height))
   }
@@ -1833,7 +2009,17 @@ impl VideoFrame {
     options: Option<VideoFrameCopyToOptions>,
   ) -> Result<Vec<PlaneLayout>> {
     // Get format, rect info and validate destination buffer (brief lock)
-    let (format, rect_x, rect_y, rect_width, rect_height, size) = {
+    let (
+      format,
+      rect_x,
+      rect_y,
+      rect_width,
+      rect_height,
+      size,
+      custom_layout,
+      original_format,
+      needs_conversion,
+    ) = {
       let guard = self
         .inner
         .lock()
@@ -1849,7 +2035,21 @@ impl VideoFrame {
         .and_then(|o| o.format)
         .unwrap_or(inner.original_format);
 
+      // Check if format conversion is supported
+      // Per WPT: YUV→RGB and RGB→RGB work; RGB→YUV throws NotSupportedError
+      let needs_conversion = format != inner.original_format;
+      if needs_conversion && !inner.original_format.can_convert_to(format) {
+        return Err(not_supported_error(&format!(
+          "Format conversion from {:?} to {:?} is not supported",
+          inner.original_format, format
+        )));
+      }
+
+      let original_format = inner.original_format;
+
       // Parse rect (default to visible rect)
+      // Validate rect against SOURCE format (original_format), not target format.
+      // Rect alignment must match the source frame's subsampling requirements.
       let default_rect = (
         inner.visible_left as f64,
         inner.visible_top as f64,
@@ -1862,11 +2062,50 @@ impl VideoFrame {
         rect,
         inner.frame.width(),
         inner.frame.height(),
-        format,
+        original_format,
       )?;
 
-      let size = Self::calculate_buffer_size(format, rect_width, rect_height) as usize;
-      (format, rect_x, rect_y, rect_width, rect_height, size)
+      // Get and validate custom layout if provided
+      let custom_layout = options.as_ref().and_then(|o| o.layout.clone());
+      if let Some(ref layout) = custom_layout {
+        Self::validate_copy_layout(layout, format, rect_width)?;
+      }
+
+      // Calculate actual required size based on layout or default
+      // Use u64 to prevent overflow and checked arithmetic per W3C spec
+      let required_size = if let Some(ref layout) = custom_layout {
+        // For custom layout, need space for all planes at their offsets + sizes
+        let mut max_end: u64 = 0;
+        for (plane_idx, plane_layout) in layout.iter().enumerate() {
+          let plane_height = Self::get_plane_height(format, rect_height, plane_idx as u32);
+          let plane_end =
+            calculate_plane_end_checked(plane_layout.offset, plane_layout.stride, plane_height)?;
+          max_end = max_end.max(plane_end);
+        }
+
+        // Ensure result fits in usize (prevent overflow on 32-bit systems)
+        if max_end > usize::MAX as u64 {
+          return Err(Error::new(
+            Status::InvalidArg,
+            "TypeError: computed buffer size exceeds maximum",
+          ));
+        }
+        max_end as usize
+      } else {
+        Self::calculate_buffer_size(format, rect_width, rect_height) as usize
+      };
+
+      (
+        format,
+        rect_x,
+        rect_y,
+        rect_width,
+        rect_height,
+        required_size,
+        custom_layout,
+        original_format,
+        needs_conversion,
+      )
     };
 
     if destination.len() < size {
@@ -1882,6 +2121,7 @@ impl VideoFrame {
 
     // Clone inner Arc for the blocking thread
     let inner_clone = self.inner.clone();
+    let layout_for_thread = custom_layout.clone();
 
     // Perform the copy in a blocking thread to not block the event loop
     let copied_data = spawn_blocking(move || -> Result<Vec<u8>> {
@@ -1894,18 +2134,79 @@ impl VideoFrame {
         _ => return Err(invalid_state_error("VideoFrame is closed")),
       };
 
-      // Allocate buffer for cropped data
-      let mut temp_buffer = vec![0u8; size];
+      // Calculate buffer size based on custom layout or default
+      let buffer_size = if let Some(ref layout) = layout_for_thread {
+        // For custom layout, need space for all planes at their offsets + sizes
+        let num_planes = Self::get_number_of_planes(format);
+        let (_, v_factor) = get_subsampling_factors(format);
+        let mut max_end = 0usize;
+        for plane_idx in 0..num_planes {
+          let plane_layout = &layout[plane_idx as usize];
+          let plane_height = if plane_idx == 0 || (format.has_alpha() && plane_idx == 3) {
+            rect_height
+          } else {
+            rect_height / v_factor
+          };
+          let plane_end =
+            plane_layout.offset as usize + (plane_layout.stride as usize * plane_height as usize);
+          max_end = max_end.max(plane_end);
+        }
+        max_end
+      } else {
+        size
+      };
 
-      // Copy cropped region row by row for each plane
+      // Perform format conversion if needed
+      let working_frame = if needs_conversion {
+        let src_av_format = original_format.to_av_format();
+        let dst_av_format = format.to_av_format();
+
+        // Use Scaler for format conversion (operates on full frame, then crop)
+        let scaler = Scaler::new_converter(
+          inner.frame.width(),
+          inner.frame.height(),
+          src_av_format,
+          dst_av_format,
+        )
+        .map_err(|e| {
+          Error::new(
+            Status::GenericFailure,
+            format!(
+              "NotSupportedError: Failed to create format converter: {}",
+              e
+            ),
+          )
+        })?;
+
+        scaler.scale_alloc(&inner.frame).map_err(|e| {
+          Error::new(
+            Status::GenericFailure,
+            format!("EncodingError: Format conversion failed: {}", e),
+          )
+        })?
+      } else {
+        // No conversion needed - use the frame directly (borrow is fine here)
+        inner.frame.try_clone().map_err(|e| {
+          Error::new(
+            Status::GenericFailure,
+            format!("Failed to clone frame: {}", e),
+          )
+        })?
+      };
+
+      // Allocate buffer for cropped data
+      let mut temp_buffer = vec![0u8; buffer_size];
+
+      // Copy cropped region row by row for each plane (from converted or original frame)
       Self::copy_cropped_data(
-        &inner.frame,
+        &working_frame,
         format,
         rect_x,
         rect_y,
         rect_width,
         rect_height,
         &mut temp_buffer,
+        layout_for_thread.as_deref(),
       )?;
 
       Ok(temp_buffer)
@@ -1915,14 +2216,114 @@ impl VideoFrame {
 
     // Copy from temp buffer to destination (this is fast since destination is already allocated)
     let dest_buffer = unsafe { destination.as_mut() };
-    dest_buffer[..size].copy_from_slice(&copied_data);
+    dest_buffer[..copied_data.len()].copy_from_slice(&copied_data);
 
-    // Calculate and return plane layouts for the cropped dimensions
-    let layouts = Self::get_plane_layouts(format, rect_width, rect_height);
+    // Return custom layout if provided, otherwise calculate default layout
+    let layouts = if let Some(layout) = custom_layout {
+      layout
+    } else {
+      Self::get_plane_layouts(format, rect_width, rect_height)
+    };
     Ok(layouts)
   }
 
+  /// Calculate minimum stride for a plane given format, width, and plane index
+  fn get_min_plane_stride(format: VideoPixelFormat, width: u32, plane_idx: u32) -> u32 {
+    let bps = format.bytes_per_sample() as u32;
+    let (h_factor, _) = get_subsampling_factors(format);
+
+    match (format, plane_idx) {
+      // RGBA formats: 4 bytes per pixel
+      (
+        VideoPixelFormat::RGBA
+        | VideoPixelFormat::RGBX
+        | VideoPixelFormat::BGRA
+        | VideoPixelFormat::BGRX,
+        0,
+      ) => width * 4,
+      // Y plane and alpha plane: full width
+      (_, 0) => width * bps,
+      // Alpha plane for formats with alpha
+      (
+        VideoPixelFormat::I420A
+        | VideoPixelFormat::I420AP10
+        | VideoPixelFormat::I422A
+        | VideoPixelFormat::I422AP10
+        | VideoPixelFormat::I444A
+        | VideoPixelFormat::I444AP10,
+        3,
+      ) => width * bps,
+      // NV12/NV21 UV plane: interleaved, 2 bytes per sample position
+      (VideoPixelFormat::NV12 | VideoPixelFormat::NV21, 1) => (width / h_factor) * 2,
+      // U/V planes for planar formats: subsampled width
+      _ => (width / h_factor) * bps,
+    }
+  }
+
+  /// Get the height of a specific plane for a given format
+  fn get_plane_height(format: VideoPixelFormat, frame_height: u32, plane_idx: u32) -> u32 {
+    let (_, v_factor) = get_subsampling_factors(format);
+
+    match (format, plane_idx) {
+      // RGBA formats: single plane with full height
+      (
+        VideoPixelFormat::RGBA
+        | VideoPixelFormat::RGBX
+        | VideoPixelFormat::BGRA
+        | VideoPixelFormat::BGRX,
+        0,
+      ) => frame_height,
+      // Y plane (index 0): always full height
+      (_, 0) => frame_height,
+      // Alpha plane (index 3) for formats with alpha: full height
+      (
+        VideoPixelFormat::I420A
+        | VideoPixelFormat::I420AP10
+        | VideoPixelFormat::I422A
+        | VideoPixelFormat::I422AP10
+        | VideoPixelFormat::I444A
+        | VideoPixelFormat::I444AP10,
+        3,
+      ) => frame_height,
+      // UV planes (index 1, 2): subsampled height
+      // NV12/NV21 interleaved UV plane: subsampled height
+      _ => frame_height / v_factor,
+    }
+  }
+
+  /// Validate custom layout for copyTo
+  fn validate_copy_layout(
+    layout: &[PlaneLayout],
+    format: VideoPixelFormat,
+    width: u32,
+  ) -> Result<()> {
+    let num_planes = Self::get_number_of_planes(format);
+
+    if layout.len() != num_planes as usize {
+      return Err(type_error(&format!(
+        "layout must have {} entries for format {:?}, got {}",
+        num_planes,
+        format,
+        layout.len()
+      )));
+    }
+
+    for (i, plane) in layout.iter().enumerate() {
+      let min_stride = Self::get_min_plane_stride(format, width, i as u32);
+      if plane.stride < min_stride {
+        return Err(type_error(&format!(
+          "stride {} for plane {} is less than minimum required stride {}",
+          plane.stride, i, min_stride
+        )));
+      }
+    }
+
+    Ok(())
+  }
+
   /// Copy cropped region from frame to buffer (row-by-row per plane)
+  /// If custom_layout is provided, uses its offset/stride for destination buffer.
+  #[allow(clippy::too_many_arguments)]
   fn copy_cropped_data(
     frame: &Frame,
     format: VideoPixelFormat,
@@ -1931,12 +2332,14 @@ impl VideoFrame {
     rect_width: u32,
     rect_height: u32,
     dest: &mut [u8],
+    custom_layout: Option<&[PlaneLayout]>,
   ) -> Result<()> {
     let (h_factor, v_factor) = get_subsampling_factors(format);
     let bps = format.bytes_per_sample() as u32;
     let num_planes = Self::get_number_of_planes(format);
 
-    let mut dest_offset = 0usize;
+    // Track default offset for when no custom layout is provided
+    let mut default_dest_offset = 0usize;
 
     for plane_idx in 0..num_planes {
       // Determine plane's properties based on format and plane index
@@ -1980,7 +2383,16 @@ impl VideoFrame {
       let plane_src_y = rect_y / plane_v_factor;
       let plane_width = rect_width / plane_h_factor;
       let plane_height = rect_height / plane_v_factor;
-      let bytes_per_row = plane_width * plane_sample_bytes;
+      let default_bytes_per_row = plane_width * plane_sample_bytes;
+
+      // Use custom layout offset/stride if provided, otherwise use calculated defaults
+      let (dest_plane_offset, dest_stride) = match custom_layout {
+        Some(layout) => (
+          layout[plane_idx as usize].offset as usize,
+          layout[plane_idx as usize].stride as usize,
+        ),
+        None => (default_dest_offset, default_bytes_per_row as usize),
+      };
 
       // Get source plane data and stride
       let src_data = frame.data(plane_idx as usize);
@@ -1997,18 +2409,19 @@ impl VideoFrame {
       for row in 0..plane_height {
         let src_row_offset = ((plane_src_y + row) as usize) * src_stride
           + (plane_src_x as usize) * (plane_sample_bytes as usize);
-        let dest_row_offset = dest_offset + (row as usize) * (bytes_per_row as usize);
+        let dest_row_offset = dest_plane_offset + (row as usize) * dest_stride;
 
         unsafe {
           std::ptr::copy_nonoverlapping(
             src_data.add(src_row_offset),
             dest.as_mut_ptr().add(dest_row_offset),
-            bytes_per_row as usize,
+            default_bytes_per_row as usize, // Always copy the actual data width, not the padded stride
           );
         }
       }
 
-      dest_offset += (plane_height * bytes_per_row) as usize;
+      // Update default offset for next plane (only used when no custom layout)
+      default_dest_offset += (plane_height * default_bytes_per_row) as usize;
     }
 
     Ok(())
@@ -2340,18 +2753,50 @@ impl VideoFrame {
     format: VideoPixelFormat,
     width: u32,
     height: u32,
+    layout: Option<&[PlaneLayout]>,
   ) -> Result<()> {
-    let expected_size = Self::calculate_buffer_size(format, width, height) as usize;
+    // Helper to get source offset and stride for a plane
+    let get_src_layout =
+      |plane_idx: usize, default_offset: usize, default_stride: usize| match layout {
+        Some(l) if plane_idx < l.len() => {
+          (l[plane_idx].offset as usize, l[plane_idx].stride as usize)
+        }
+        _ => (default_offset, default_stride),
+      };
 
-    if data.len() < expected_size {
-      return Err(Error::new(
-        Status::GenericFailure,
-        format!(
-          "Input data too small: need {} bytes, got {}",
-          expected_size,
+    // Validate layout and source data size
+    if let Some(l) = layout {
+      Self::validate_copy_layout(l, format, width)?;
+
+      // Calculate required size from custom layout
+      let mut max_end = 0usize;
+      for (plane_idx, plane_layout) in l.iter().enumerate() {
+        let plane_height = Self::get_plane_height(format, height, plane_idx as u32);
+        let plane_end =
+          plane_layout.offset as usize + (plane_layout.stride as usize * plane_height as usize);
+        max_end = max_end.max(plane_end);
+      }
+
+      if data.len() < max_end {
+        return Err(type_error(&format!(
+          "Source data too small for custom layout: need {} bytes, got {}",
+          max_end,
           data.len()
-        ),
-      ));
+        )));
+      }
+    } else {
+      // Default tightly-packed layout check
+      let expected_size = Self::calculate_buffer_size(format, width, height) as usize;
+      if data.len() < expected_size {
+        return Err(Error::new(
+          Status::GenericFailure,
+          format!(
+            "Input data too small: need {} bytes, got {}",
+            expected_size,
+            data.len()
+          ),
+        ));
+      }
     }
 
     // Get all linesizes first to avoid borrow conflicts
@@ -2362,10 +2807,17 @@ impl VideoFrame {
 
     match format {
       VideoPixelFormat::I420 | VideoPixelFormat::I420A => {
-        let y_size = (width * height) as usize;
+        let y_row_bytes = width as usize;
         let u_width = (width / 2) as usize;
         let u_height = (height / 2) as usize;
-        let v_offset = y_size + u_width * u_height;
+        // Default offsets for tightly-packed layout
+        let y_size = y_row_bytes * height as usize;
+        let u_size = u_width * u_height;
+
+        // Get source layout for each plane (custom or default)
+        let (y_src_offset, y_src_stride) = get_src_layout(0, 0, y_row_bytes);
+        let (u_src_offset, u_src_stride) = get_src_layout(1, y_size, u_width);
+        let (v_src_offset, v_src_stride) = get_src_layout(2, y_size + u_size, u_width);
 
         // Copy Y plane
         {
@@ -2373,10 +2825,10 @@ impl VideoFrame {
             .plane_data_mut(0)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get Y plane"))?;
           for row in 0..height as usize {
-            let src_start = row * width as usize;
+            let src_start = y_src_offset + row * y_src_stride;
             let dst_start = row * linesize0;
-            y_plane[dst_start..dst_start + width as usize]
-              .copy_from_slice(&data[src_start..src_start + width as usize]);
+            y_plane[dst_start..dst_start + y_row_bytes]
+              .copy_from_slice(&data[src_start..src_start + y_row_bytes]);
           }
         }
 
@@ -2386,7 +2838,7 @@ impl VideoFrame {
             .plane_data_mut(1)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get U plane"))?;
           for row in 0..u_height {
-            let src_start = y_size + row * u_width;
+            let src_start = u_src_offset + row * u_src_stride;
             let dst_start = row * linesize1;
             u_plane[dst_start..dst_start + u_width]
               .copy_from_slice(&data[src_start..src_start + u_width]);
@@ -2399,7 +2851,7 @@ impl VideoFrame {
             .plane_data_mut(2)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get V plane"))?;
           for row in 0..u_height {
-            let src_start = v_offset + row * u_width;
+            let src_start = v_src_offset + row * v_src_stride;
             let dst_start = row * linesize2;
             v_plane[dst_start..dst_start + u_width]
               .copy_from_slice(&data[src_start..src_start + u_width]);
@@ -2408,23 +2860,28 @@ impl VideoFrame {
 
         // Copy A plane if present
         if format == VideoPixelFormat::I420A {
-          let a_offset = v_offset + u_width * u_height;
+          let (a_src_offset, a_src_stride) = get_src_layout(3, y_size + u_size * 2, y_row_bytes);
           let a_plane = frame
             .plane_data_mut(3)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get A plane"))?;
           for row in 0..height as usize {
-            let src_start = a_offset + row * width as usize;
+            let src_start = a_src_offset + row * a_src_stride;
             let dst_start = row * linesize3;
-            a_plane[dst_start..dst_start + width as usize]
-              .copy_from_slice(&data[src_start..src_start + width as usize]);
+            a_plane[dst_start..dst_start + y_row_bytes]
+              .copy_from_slice(&data[src_start..src_start + y_row_bytes]);
           }
         }
       }
       VideoPixelFormat::NV12 | VideoPixelFormat::NV21 => {
         // NV12: Y plane + interleaved UV
         // NV21: Y plane + interleaved VU (same layout, just U/V swapped)
-        let y_size = (width * height) as usize;
+        let y_row_bytes = width as usize;
+        let uv_row_bytes = width as usize; // Interleaved U+V = width bytes
         let uv_height = (height / 2) as usize;
+        let y_size = y_row_bytes * height as usize;
+
+        let (y_src_offset, y_src_stride) = get_src_layout(0, 0, y_row_bytes);
+        let (uv_src_offset, uv_src_stride) = get_src_layout(1, y_size, uv_row_bytes);
 
         // Copy Y plane
         {
@@ -2432,10 +2889,10 @@ impl VideoFrame {
             .plane_data_mut(0)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get Y plane"))?;
           for row in 0..height as usize {
-            let src_start = row * width as usize;
+            let src_start = y_src_offset + row * y_src_stride;
             let dst_start = row * linesize0;
-            y_plane[dst_start..dst_start + width as usize]
-              .copy_from_slice(&data[src_start..src_start + width as usize]);
+            y_plane[dst_start..dst_start + y_row_bytes]
+              .copy_from_slice(&data[src_start..src_start + y_row_bytes]);
           }
         }
 
@@ -2445,19 +2902,23 @@ impl VideoFrame {
             .plane_data_mut(1)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get UV/VU plane"))?;
           for row in 0..uv_height {
-            let src_start = y_size + row * width as usize;
+            let src_start = uv_src_offset + row * uv_src_stride;
             let dst_start = row * linesize1;
-            uv_plane[dst_start..dst_start + width as usize]
-              .copy_from_slice(&data[src_start..src_start + width as usize]);
+            uv_plane[dst_start..dst_start + uv_row_bytes]
+              .copy_from_slice(&data[src_start..src_start + uv_row_bytes]);
           }
         }
       }
       VideoPixelFormat::I422 | VideoPixelFormat::I422A => {
         // I422: 4:2:2 - Y full resolution, U/V half width, full height
-        let y_size = (width * height) as usize;
+        let y_row_bytes = width as usize;
         let uv_width = (width / 2) as usize;
+        let y_size = y_row_bytes * height as usize;
         let uv_size = uv_width * height as usize;
-        let v_offset = y_size + uv_size;
+
+        let (y_src_offset, y_src_stride) = get_src_layout(0, 0, y_row_bytes);
+        let (u_src_offset, u_src_stride) = get_src_layout(1, y_size, uv_width);
+        let (v_src_offset, v_src_stride) = get_src_layout(2, y_size + uv_size, uv_width);
 
         // Copy Y plane
         {
@@ -2465,10 +2926,10 @@ impl VideoFrame {
             .plane_data_mut(0)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get Y plane"))?;
           for row in 0..height as usize {
-            let src_start = row * width as usize;
+            let src_start = y_src_offset + row * y_src_stride;
             let dst_start = row * linesize0;
-            y_plane[dst_start..dst_start + width as usize]
-              .copy_from_slice(&data[src_start..src_start + width as usize]);
+            y_plane[dst_start..dst_start + y_row_bytes]
+              .copy_from_slice(&data[src_start..src_start + y_row_bytes]);
           }
         }
 
@@ -2478,7 +2939,7 @@ impl VideoFrame {
             .plane_data_mut(1)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get U plane"))?;
           for row in 0..height as usize {
-            let src_start = y_size + row * uv_width;
+            let src_start = u_src_offset + row * u_src_stride;
             let dst_start = row * linesize1;
             u_plane[dst_start..dst_start + uv_width]
               .copy_from_slice(&data[src_start..src_start + uv_width]);
@@ -2491,7 +2952,7 @@ impl VideoFrame {
             .plane_data_mut(2)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get V plane"))?;
           for row in 0..height as usize {
-            let src_start = v_offset + row * uv_width;
+            let src_start = v_src_offset + row * v_src_stride;
             let dst_start = row * linesize2;
             v_plane[dst_start..dst_start + uv_width]
               .copy_from_slice(&data[src_start..src_start + uv_width]);
@@ -2500,23 +2961,26 @@ impl VideoFrame {
 
         // Copy A plane if present
         if format == VideoPixelFormat::I422A {
-          let a_offset = v_offset + uv_size;
+          let (a_src_offset, a_src_stride) = get_src_layout(3, y_size + uv_size * 2, y_row_bytes);
           let a_plane = frame
             .plane_data_mut(3)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get A plane"))?;
           for row in 0..height as usize {
-            let src_start = a_offset + row * width as usize;
+            let src_start = a_src_offset + row * a_src_stride;
             let dst_start = row * linesize3;
-            a_plane[dst_start..dst_start + width as usize]
-              .copy_from_slice(&data[src_start..src_start + width as usize]);
+            a_plane[dst_start..dst_start + y_row_bytes]
+              .copy_from_slice(&data[src_start..src_start + y_row_bytes]);
           }
         }
       }
       VideoPixelFormat::I444 | VideoPixelFormat::I444A => {
         // I444: 4:4:4 - Y, U, V all full resolution
-        let plane_size = (width * height) as usize;
-        let u_offset = plane_size;
-        let v_offset = plane_size * 2;
+        let row_bytes = width as usize;
+        let plane_size = row_bytes * height as usize;
+
+        let (y_src_offset, y_src_stride) = get_src_layout(0, 0, row_bytes);
+        let (u_src_offset, u_src_stride) = get_src_layout(1, plane_size, row_bytes);
+        let (v_src_offset, v_src_stride) = get_src_layout(2, plane_size * 2, row_bytes);
 
         // Copy Y plane
         {
@@ -2524,10 +2988,10 @@ impl VideoFrame {
             .plane_data_mut(0)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get Y plane"))?;
           for row in 0..height as usize {
-            let src_start = row * width as usize;
+            let src_start = y_src_offset + row * y_src_stride;
             let dst_start = row * linesize0;
-            y_plane[dst_start..dst_start + width as usize]
-              .copy_from_slice(&data[src_start..src_start + width as usize]);
+            y_plane[dst_start..dst_start + row_bytes]
+              .copy_from_slice(&data[src_start..src_start + row_bytes]);
           }
         }
 
@@ -2537,10 +3001,10 @@ impl VideoFrame {
             .plane_data_mut(1)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get U plane"))?;
           for row in 0..height as usize {
-            let src_start = u_offset + row * width as usize;
+            let src_start = u_src_offset + row * u_src_stride;
             let dst_start = row * linesize1;
-            u_plane[dst_start..dst_start + width as usize]
-              .copy_from_slice(&data[src_start..src_start + width as usize]);
+            u_plane[dst_start..dst_start + row_bytes]
+              .copy_from_slice(&data[src_start..src_start + row_bytes]);
           }
         }
 
@@ -2550,24 +3014,24 @@ impl VideoFrame {
             .plane_data_mut(2)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get V plane"))?;
           for row in 0..height as usize {
-            let src_start = v_offset + row * width as usize;
+            let src_start = v_src_offset + row * v_src_stride;
             let dst_start = row * linesize2;
-            v_plane[dst_start..dst_start + width as usize]
-              .copy_from_slice(&data[src_start..src_start + width as usize]);
+            v_plane[dst_start..dst_start + row_bytes]
+              .copy_from_slice(&data[src_start..src_start + row_bytes]);
           }
         }
 
         // Copy A plane if present
         if format == VideoPixelFormat::I444A {
-          let a_offset = plane_size * 3;
+          let (a_src_offset, a_src_stride) = get_src_layout(3, plane_size * 3, row_bytes);
           let a_plane = frame
             .plane_data_mut(3)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get A plane"))?;
           for row in 0..height as usize {
-            let src_start = a_offset + row * width as usize;
+            let src_start = a_src_offset + row * a_src_stride;
             let dst_start = row * linesize3;
-            a_plane[dst_start..dst_start + width as usize]
-              .copy_from_slice(&data[src_start..src_start + width as usize]);
+            a_plane[dst_start..dst_start + row_bytes]
+              .copy_from_slice(&data[src_start..src_start + row_bytes]);
           }
         }
       }
@@ -2576,13 +3040,14 @@ impl VideoFrame {
       | VideoPixelFormat::BGRA
       | VideoPixelFormat::BGRX => {
         let row_bytes = (width * 4) as usize;
+        let (src_offset, src_stride) = get_src_layout(0, 0, row_bytes);
 
         // Copy packed RGBA data
         let plane = frame
           .plane_data_mut(0)
           .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get plane"))?;
         for row in 0..height as usize {
-          let src_start = row * row_bytes;
+          let src_start = src_offset + row * src_stride;
           let dst_start = row * linesize0;
           plane[dst_start..dst_start + row_bytes]
             .copy_from_slice(&data[src_start..src_start + row_bytes]);
@@ -2597,7 +3062,10 @@ impl VideoFrame {
         let uv_row_bytes = uv_width * bps;
         let uv_height = (height / 2) as usize;
         let uv_size = uv_row_bytes * uv_height;
-        let v_offset = y_size + uv_size;
+
+        let (y_src_offset, y_src_stride) = get_src_layout(0, 0, y_row_bytes);
+        let (u_src_offset, u_src_stride) = get_src_layout(1, y_size, uv_row_bytes);
+        let (v_src_offset, v_src_stride) = get_src_layout(2, y_size + uv_size, uv_row_bytes);
 
         // Copy Y plane
         {
@@ -2605,7 +3073,7 @@ impl VideoFrame {
             .plane_data_mut(0)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get Y plane"))?;
           for row in 0..height as usize {
-            let src_start = row * y_row_bytes;
+            let src_start = y_src_offset + row * y_src_stride;
             let dst_start = row * linesize0;
             y_plane[dst_start..dst_start + y_row_bytes]
               .copy_from_slice(&data[src_start..src_start + y_row_bytes]);
@@ -2618,7 +3086,7 @@ impl VideoFrame {
             .plane_data_mut(1)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get U plane"))?;
           for row in 0..uv_height {
-            let src_start = y_size + row * uv_row_bytes;
+            let src_start = u_src_offset + row * u_src_stride;
             let dst_start = row * linesize1;
             u_plane[dst_start..dst_start + uv_row_bytes]
               .copy_from_slice(&data[src_start..src_start + uv_row_bytes]);
@@ -2631,7 +3099,7 @@ impl VideoFrame {
             .plane_data_mut(2)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get V plane"))?;
           for row in 0..uv_height {
-            let src_start = v_offset + row * uv_row_bytes;
+            let src_start = v_src_offset + row * v_src_stride;
             let dst_start = row * linesize2;
             v_plane[dst_start..dst_start + uv_row_bytes]
               .copy_from_slice(&data[src_start..src_start + uv_row_bytes]);
@@ -2640,12 +3108,12 @@ impl VideoFrame {
 
         // Copy A plane if present (10-bit alpha)
         if format == VideoPixelFormat::I420AP10 {
-          let a_offset = v_offset + uv_size;
+          let (a_src_offset, a_src_stride) = get_src_layout(3, y_size + uv_size * 2, y_row_bytes);
           let a_plane = frame
             .plane_data_mut(3)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get A plane"))?;
           for row in 0..height as usize {
-            let src_start = a_offset + row * y_row_bytes;
+            let src_start = a_src_offset + row * a_src_stride;
             let dst_start = row * linesize3;
             a_plane[dst_start..dst_start + y_row_bytes]
               .copy_from_slice(&data[src_start..src_start + y_row_bytes]);
@@ -2660,7 +3128,10 @@ impl VideoFrame {
         let uv_width = (width / 2) as usize;
         let uv_row_bytes = uv_width * bps;
         let uv_size = uv_row_bytes * height as usize;
-        let v_offset = y_size + uv_size;
+
+        let (y_src_offset, y_src_stride) = get_src_layout(0, 0, y_row_bytes);
+        let (u_src_offset, u_src_stride) = get_src_layout(1, y_size, uv_row_bytes);
+        let (v_src_offset, v_src_stride) = get_src_layout(2, y_size + uv_size, uv_row_bytes);
 
         // Copy Y plane
         {
@@ -2668,7 +3139,7 @@ impl VideoFrame {
             .plane_data_mut(0)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get Y plane"))?;
           for row in 0..height as usize {
-            let src_start = row * y_row_bytes;
+            let src_start = y_src_offset + row * y_src_stride;
             let dst_start = row * linesize0;
             y_plane[dst_start..dst_start + y_row_bytes]
               .copy_from_slice(&data[src_start..src_start + y_row_bytes]);
@@ -2681,7 +3152,7 @@ impl VideoFrame {
             .plane_data_mut(1)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get U plane"))?;
           for row in 0..height as usize {
-            let src_start = y_size + row * uv_row_bytes;
+            let src_start = u_src_offset + row * u_src_stride;
             let dst_start = row * linesize1;
             u_plane[dst_start..dst_start + uv_row_bytes]
               .copy_from_slice(&data[src_start..src_start + uv_row_bytes]);
@@ -2694,7 +3165,7 @@ impl VideoFrame {
             .plane_data_mut(2)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get V plane"))?;
           for row in 0..height as usize {
-            let src_start = v_offset + row * uv_row_bytes;
+            let src_start = v_src_offset + row * v_src_stride;
             let dst_start = row * linesize2;
             v_plane[dst_start..dst_start + uv_row_bytes]
               .copy_from_slice(&data[src_start..src_start + uv_row_bytes]);
@@ -2703,12 +3174,12 @@ impl VideoFrame {
 
         // Copy A plane if present (10-bit alpha)
         if format == VideoPixelFormat::I422AP10 {
-          let a_offset = v_offset + uv_size;
+          let (a_src_offset, a_src_stride) = get_src_layout(3, y_size + uv_size * 2, y_row_bytes);
           let a_plane = frame
             .plane_data_mut(3)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get A plane"))?;
           for row in 0..height as usize {
-            let src_start = a_offset + row * y_row_bytes;
+            let src_start = a_src_offset + row * a_src_stride;
             let dst_start = row * linesize3;
             a_plane[dst_start..dst_start + y_row_bytes]
               .copy_from_slice(&data[src_start..src_start + y_row_bytes]);
@@ -2720,8 +3191,10 @@ impl VideoFrame {
         let bps = 2usize; // bytes per sample
         let plane_row_bytes = width as usize * bps;
         let plane_size = plane_row_bytes * height as usize;
-        let u_offset = plane_size;
-        let v_offset = plane_size * 2;
+
+        let (y_src_offset, y_src_stride) = get_src_layout(0, 0, plane_row_bytes);
+        let (u_src_offset, u_src_stride) = get_src_layout(1, plane_size, plane_row_bytes);
+        let (v_src_offset, v_src_stride) = get_src_layout(2, plane_size * 2, plane_row_bytes);
 
         // Copy Y plane
         {
@@ -2729,7 +3202,7 @@ impl VideoFrame {
             .plane_data_mut(0)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get Y plane"))?;
           for row in 0..height as usize {
-            let src_start = row * plane_row_bytes;
+            let src_start = y_src_offset + row * y_src_stride;
             let dst_start = row * linesize0;
             y_plane[dst_start..dst_start + plane_row_bytes]
               .copy_from_slice(&data[src_start..src_start + plane_row_bytes]);
@@ -2742,7 +3215,7 @@ impl VideoFrame {
             .plane_data_mut(1)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get U plane"))?;
           for row in 0..height as usize {
-            let src_start = u_offset + row * plane_row_bytes;
+            let src_start = u_src_offset + row * u_src_stride;
             let dst_start = row * linesize1;
             u_plane[dst_start..dst_start + plane_row_bytes]
               .copy_from_slice(&data[src_start..src_start + plane_row_bytes]);
@@ -2755,7 +3228,7 @@ impl VideoFrame {
             .plane_data_mut(2)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get V plane"))?;
           for row in 0..height as usize {
-            let src_start = v_offset + row * plane_row_bytes;
+            let src_start = v_src_offset + row * v_src_stride;
             let dst_start = row * linesize2;
             v_plane[dst_start..dst_start + plane_row_bytes]
               .copy_from_slice(&data[src_start..src_start + plane_row_bytes]);
@@ -2764,12 +3237,12 @@ impl VideoFrame {
 
         // Copy A plane if present (10-bit alpha)
         if format == VideoPixelFormat::I444AP10 {
-          let a_offset = plane_size * 3;
+          let (a_src_offset, a_src_stride) = get_src_layout(3, plane_size * 3, plane_row_bytes);
           let a_plane = frame
             .plane_data_mut(3)
             .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get A plane"))?;
           for row in 0..height as usize {
-            let src_start = a_offset + row * plane_row_bytes;
+            let src_start = a_src_offset + row * a_src_stride;
             let dst_start = row * linesize3;
             a_plane[dst_start..dst_start + plane_row_bytes]
               .copy_from_slice(&data[src_start..src_start + plane_row_bytes]);

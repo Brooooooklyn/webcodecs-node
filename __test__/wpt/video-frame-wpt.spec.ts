@@ -1581,3 +1581,978 @@ test('VideoFrame: I420P10 explicit BT.2020 colorSpace', (t) => {
 
   frame.close()
 })
+
+// ============================================================================
+// Format Mismatch Tests (NotSupportedError)
+// ============================================================================
+
+test('VideoFrame: copyTo throws NotSupportedError on format mismatch', async (t) => {
+  const frame = new VideoFrame(new Uint8Array(32), {
+    format: 'RGBA',
+    codedWidth: 4,
+    codedHeight: 2,
+    timestamp: 0,
+  })
+
+  // Trying to copy to a different format should throw NotSupportedError
+  const error = await t.throwsAsync(frame.copyTo(new Uint8Array(12), { format: 'I420' } as any))
+  t.true(error?.message.includes('NotSupportedError'), 'should throw NotSupportedError')
+  t.true(error?.message.includes('not supported'), 'should mention format conversion not supported')
+
+  frame.close()
+})
+
+test('VideoFrame: allocationSize throws NotSupportedError on format mismatch', (t) => {
+  const frame = new VideoFrame(new Uint8Array(32), {
+    format: 'RGBA',
+    codedWidth: 4,
+    codedHeight: 2,
+    timestamp: 0,
+  })
+
+  // Trying to get allocation size for a different format should throw NotSupportedError
+  try {
+    frame.allocationSize({ format: 'I420' } as any)
+    t.fail('should throw NotSupportedError')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'should be DOMException')
+    t.is((error as DOMException).name, 'NotSupportedError')
+  }
+
+  frame.close()
+})
+
+// ============================================================================
+// Alpha Discard Tests
+// ============================================================================
+
+test('VideoFrame: clone with alpha discard converts I420A to I420', (t) => {
+  const width = 4
+  const height = 2
+  const ySize = width * height
+  const uvSize = (width / 2) * (height / 2)
+  const aSize = width * height
+  const data = new Uint8Array(ySize + uvSize * 2 + aSize)
+
+  const frame = new VideoFrame(data, {
+    format: 'I420A',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 1000,
+  })
+
+  t.is(frame.format, 'I420A')
+  t.is(frame.numberOfPlanes, 4)
+
+  const cloned = new VideoFrame(frame, { alpha: 'discard' })
+
+  t.is(cloned.format, 'I420')
+  t.is(cloned.numberOfPlanes, 3) // No alpha plane
+  t.is(cloned.codedWidth, width)
+  t.is(cloned.codedHeight, height)
+  t.is(cloned.timestamp, 1000)
+
+  frame.close()
+  cloned.close()
+})
+
+test('VideoFrame: clone with alpha discard converts RGBA to RGBX', (t) => {
+  const width = 4
+  const height = 2
+  const data = new Uint8Array(width * height * 4)
+
+  const frame = new VideoFrame(data, {
+    format: 'RGBA',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 1000,
+  })
+
+  t.is(frame.format, 'RGBA')
+
+  const cloned = new VideoFrame(frame, { alpha: 'discard' })
+
+  t.is(cloned.format, 'RGBX')
+  t.is(cloned.codedWidth, width)
+  t.is(cloned.codedHeight, height)
+
+  frame.close()
+  cloned.close()
+})
+
+test('VideoFrame: clone with alpha discard converts BGRA to BGRX', (t) => {
+  const width = 4
+  const height = 2
+  const data = new Uint8Array(width * height * 4)
+
+  const frame = new VideoFrame(data, {
+    format: 'BGRA',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 1000,
+  })
+
+  t.is(frame.format, 'BGRA')
+
+  const cloned = new VideoFrame(frame, { alpha: 'discard' })
+
+  t.is(cloned.format, 'BGRX')
+
+  frame.close()
+  cloned.close()
+})
+
+test('VideoFrame: clone with alpha keep preserves format', (t) => {
+  const width = 4
+  const height = 2
+  const ySize = width * height
+  const uvSize = (width / 2) * (height / 2)
+  const aSize = width * height
+  const data = new Uint8Array(ySize + uvSize * 2 + aSize)
+
+  const frame = new VideoFrame(data, {
+    format: 'I420A',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 1000,
+  })
+
+  const cloned = new VideoFrame(frame, { alpha: 'keep' })
+
+  t.is(cloned.format, 'I420A')
+  t.is(cloned.numberOfPlanes, 4)
+
+  frame.close()
+  cloned.close()
+})
+
+test('VideoFrame: clone with alpha discard on non-alpha format is no-op', (t) => {
+  const width = 4
+  const height = 2
+  const ySize = width * height
+  const uvSize = (width / 2) * (height / 2)
+  const data = new Uint8Array(ySize + uvSize * 2)
+
+  const frame = new VideoFrame(data, {
+    format: 'I420',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 1000,
+  })
+
+  const cloned = new VideoFrame(frame, { alpha: 'discard' })
+
+  t.is(cloned.format, 'I420') // Unchanged
+  t.is(cloned.numberOfPlanes, 3)
+
+  frame.close()
+  cloned.close()
+})
+
+// ============================================================================
+// Custom Layout Tests - copyTo
+// ============================================================================
+
+test('VideoFrame: copyTo respects custom layout stride', async (t) => {
+  const width = 4
+  const height = 2
+  const data = new Uint8Array(width * height * 4) // RGBA
+  for (let i = 0; i < data.length; i++) {
+    data[i] = i
+  }
+
+  const frame = new VideoFrame(data, {
+    format: 'RGBA',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+  })
+
+  // Use padded stride (64 bytes instead of minimum 16)
+  const paddedStride = 64
+  const bufferSize = paddedStride * height
+  const buffer = new Uint8Array(bufferSize)
+
+  const result = await frame.copyTo(buffer, {
+    layout: [{ offset: 0, stride: paddedStride }],
+  })
+
+  t.is(result.length, 1)
+  t.is(result[0].stride, paddedStride)
+  t.is(result[0].offset, 0)
+
+  // Verify data is copied with padding
+  // First row should be at offset 0
+  t.is(buffer[0], data[0])
+  t.is(buffer[15], data[15])
+  // Second row should be at offset 64 (paddedStride)
+  t.is(buffer[64], data[16])
+  t.is(buffer[79], data[31])
+
+  frame.close()
+})
+
+test('VideoFrame: copyTo respects custom layout offset', async (t) => {
+  const width = 4
+  const height = 2
+  const data = new Uint8Array(width * height * 4) // RGBA
+  for (let i = 0; i < data.length; i++) {
+    data[i] = i
+  }
+
+  const frame = new VideoFrame(data, {
+    format: 'RGBA',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+  })
+
+  // Use offset of 32 bytes
+  const offset = 32
+  const stride = 16 // Minimum stride for 4-pixel RGBA row
+  const bufferSize = offset + stride * height
+  const buffer = new Uint8Array(bufferSize)
+
+  const result = await frame.copyTo(buffer, {
+    layout: [{ offset, stride }],
+  })
+
+  t.is(result[0].offset, offset)
+
+  // First row should start at offset 32
+  t.is(buffer[32], data[0])
+  t.is(buffer[47], data[15])
+  // Second row should be at offset 32 + 16 = 48
+  t.is(buffer[48], data[16])
+
+  frame.close()
+})
+
+test('VideoFrame: copyTo with I420 custom layout', async (t) => {
+  const width = 4
+  const height = 4
+  const ySize = width * height
+  const uvSize = (width / 2) * (height / 2)
+  const data = new Uint8Array(ySize + uvSize * 2)
+  for (let i = 0; i < data.length; i++) {
+    data[i] = i
+  }
+
+  const frame = new VideoFrame(data, {
+    format: 'I420',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+  })
+
+  // Custom layout with padded strides
+  const yStride = 8 // Padded from 4
+  const uvStride = 4 // Padded from 2
+  const yOffset = 0
+  const uOffset = yStride * height // 32
+  const vOffset = uOffset + uvStride * (height / 2) // 32 + 8 = 40
+
+  const bufferSize = vOffset + uvStride * (height / 2) // 40 + 8 = 48
+  const buffer = new Uint8Array(bufferSize)
+
+  const result = await frame.copyTo(buffer, {
+    layout: [
+      { offset: yOffset, stride: yStride },
+      { offset: uOffset, stride: uvStride },
+      { offset: vOffset, stride: uvStride },
+    ],
+  })
+
+  t.is(result.length, 3)
+  t.is(result[0].offset, yOffset)
+  t.is(result[0].stride, yStride)
+  t.is(result[1].offset, uOffset)
+  t.is(result[1].stride, uvStride)
+  t.is(result[2].offset, vOffset)
+  t.is(result[2].stride, uvStride)
+
+  frame.close()
+})
+
+test('VideoFrame: copyTo throws TypeError for invalid layout stride', async (t) => {
+  const frame = new VideoFrame(new Uint8Array(32), {
+    format: 'RGBA',
+    codedWidth: 4,
+    codedHeight: 2,
+    timestamp: 0,
+  })
+
+  // Stride too small (minimum is 16 for 4-pixel RGBA row)
+  const error = await t.throwsAsync(
+    frame.copyTo(new Uint8Array(32), {
+      layout: [{ offset: 0, stride: 8 }],
+    }),
+  )
+  t.true(error?.message.includes('stride'), 'error should mention stride')
+
+  frame.close()
+})
+
+test('VideoFrame: copyTo throws TypeError for wrong number of planes in layout', async (t) => {
+  const frame = new VideoFrame(new Uint8Array(32), {
+    format: 'RGBA',
+    codedWidth: 4,
+    codedHeight: 2,
+    timestamp: 0,
+  })
+
+  // RGBA has 1 plane, providing 2 layout entries should fail
+  const error = await t.throwsAsync(
+    frame.copyTo(new Uint8Array(64), {
+      layout: [
+        { offset: 0, stride: 16 },
+        { offset: 32, stride: 16 },
+      ],
+    }),
+  )
+  t.true(error?.message.includes('layout'), 'error should mention layout')
+
+  frame.close()
+})
+
+// ============================================================================
+// Custom Layout Tests - allocationSize
+// ============================================================================
+
+test('VideoFrame: allocationSize with custom layout', (t) => {
+  const frame = new VideoFrame(new Uint8Array(32), {
+    format: 'RGBA',
+    codedWidth: 4,
+    codedHeight: 2,
+    timestamp: 0,
+  })
+
+  // Custom layout with padded stride
+  const paddedStride = 64
+  const size = frame.allocationSize({
+    layout: [{ offset: 0, stride: paddedStride }],
+  })
+
+  // Size should be offset + stride * height = 0 + 64 * 2 = 128
+  t.is(size, paddedStride * 2)
+
+  frame.close()
+})
+
+test('VideoFrame: allocationSize with custom layout offset', (t) => {
+  const frame = new VideoFrame(new Uint8Array(32), {
+    format: 'RGBA',
+    codedWidth: 4,
+    codedHeight: 2,
+    timestamp: 0,
+  })
+
+  const offset = 100
+  const stride = 16
+  const size = frame.allocationSize({
+    layout: [{ offset, stride }],
+  })
+
+  // Size should be offset + stride * height = 100 + 16 * 2 = 132
+  t.is(size, offset + stride * 2)
+
+  frame.close()
+})
+
+test('VideoFrame: allocationSize with I420 custom layout', (t) => {
+  const width = 4
+  const height = 4
+  const ySize = width * height
+  const uvSize = (width / 2) * (height / 2)
+  const data = new Uint8Array(ySize + uvSize * 2)
+
+  const frame = new VideoFrame(data, {
+    format: 'I420',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+  })
+
+  // Custom layout with non-contiguous planes
+  const yStride = 8
+  const uvStride = 4
+  const yOffset = 0
+  const uOffset = 100
+  const vOffset = 200
+
+  const size = frame.allocationSize({
+    layout: [
+      { offset: yOffset, stride: yStride },
+      { offset: uOffset, stride: uvStride },
+      { offset: vOffset, stride: uvStride },
+    ],
+  })
+
+  // Size should be max of all plane ends
+  // Y: 0 + 8 * 4 = 32
+  // U: 100 + 4 * 2 = 108
+  // V: 200 + 4 * 2 = 208
+  t.is(size, 208)
+
+  frame.close()
+})
+
+// ============================================================================
+// Custom Layout Tests - Constructor (from buffer)
+// ============================================================================
+
+test('VideoFrame: construction from buffer with custom layout stride', async (t) => {
+  const width = 4
+  const height = 2
+  const paddedStride = 32 // Padded from minimum 16
+  const data = new Uint8Array(paddedStride * height)
+
+  // Fill with pattern - only fill valid pixel data, not padding
+  for (let row = 0; row < height; row++) {
+    for (let col = 0; col < width * 4; col++) {
+      data[row * paddedStride + col] = row * width * 4 + col
+    }
+  }
+
+  const frame = new VideoFrame(data, {
+    format: 'RGBA',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+    layout: [{ offset: 0, stride: paddedStride }],
+  })
+
+  t.is(frame.format, 'RGBA')
+  t.is(frame.codedWidth, width)
+  t.is(frame.codedHeight, height)
+
+  // Verify data was read correctly with custom stride
+  const dest = new Uint8Array(frame.allocationSize())
+  await frame.copyTo(dest)
+
+  // First pixel of first row
+  t.is(dest[0], 0)
+  // First pixel of second row (should be what was at paddedStride offset in source)
+  t.is(dest[16], data[paddedStride])
+
+  frame.close()
+})
+
+test('VideoFrame: construction from buffer with custom layout offset', async (t) => {
+  const width = 4
+  const height = 2
+  const offset = 64 // Data starts at offset 64
+  const stride = 16 // Minimum stride
+  const data = new Uint8Array(offset + stride * height)
+
+  // Fill with pattern starting at offset
+  for (let i = 0; i < stride * height; i++) {
+    data[offset + i] = i
+  }
+
+  const frame = new VideoFrame(data, {
+    format: 'RGBA',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+    layout: [{ offset, stride }],
+  })
+
+  t.is(frame.format, 'RGBA')
+
+  // Verify data was read from correct offset
+  const dest = new Uint8Array(frame.allocationSize())
+  await frame.copyTo(dest)
+
+  t.is(dest[0], 0) // First byte from source data[offset]
+  t.is(dest[16], 16) // First byte of second row
+
+  frame.close()
+})
+
+test('VideoFrame: construction from I420 buffer with custom layout', async (t) => {
+  const width = 4
+  const height = 4
+
+  // Custom layout: planes are not contiguous
+  const yStride = 8 // Padded
+  const uvStride = 4 // Padded
+  const yOffset = 0
+  const uOffset = 64
+  const vOffset = 128
+
+  const bufferSize = vOffset + uvStride * (height / 2) // 128 + 8 = 136
+  const data = new Uint8Array(bufferSize)
+
+  // Fill Y plane
+  for (let row = 0; row < height; row++) {
+    for (let col = 0; col < width; col++) {
+      data[yOffset + row * yStride + col] = row * width + col
+    }
+  }
+  // Fill U plane
+  for (let row = 0; row < height / 2; row++) {
+    for (let col = 0; col < width / 2; col++) {
+      data[uOffset + row * uvStride + col] = 100 + row * (width / 2) + col
+    }
+  }
+  // Fill V plane
+  for (let row = 0; row < height / 2; row++) {
+    for (let col = 0; col < width / 2; col++) {
+      data[vOffset + row * uvStride + col] = 200 + row * (width / 2) + col
+    }
+  }
+
+  const frame = new VideoFrame(data, {
+    format: 'I420',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+    layout: [
+      { offset: yOffset, stride: yStride },
+      { offset: uOffset, stride: uvStride },
+      { offset: vOffset, stride: uvStride },
+    ],
+  })
+
+  t.is(frame.format, 'I420')
+  t.is(frame.numberOfPlanes, 3)
+
+  // Verify the data was read correctly
+  const dest = new Uint8Array(frame.allocationSize())
+  const layout = await frame.copyTo(dest)
+
+  // Check Y plane first pixel
+  t.is(dest[layout[0].offset], 0)
+  // Check U plane first pixel
+  t.is(dest[layout[1].offset], 100)
+  // Check V plane first pixel
+  t.is(dest[layout[2].offset], 200)
+
+  frame.close()
+})
+
+// ============================================================================
+// Bounds Check Tests - Bug Fixes
+// ============================================================================
+
+test('VideoFrame: copyTo throws TypeError when destination too small for custom layout', async (t) => {
+  const frame = new VideoFrame(new Uint8Array(32), {
+    format: 'RGBA',
+    codedWidth: 4,
+    codedHeight: 2,
+    timestamp: 0,
+  })
+
+  // Custom layout requires 128 bytes (stride 64 * height 2), but we only provide 64
+  const smallBuffer = new Uint8Array(64)
+  const error = await t.throwsAsync(frame.copyTo(smallBuffer, { layout: [{ offset: 0, stride: 64 }] }))
+  t.true(error?.message.includes('TypeError') || error?.message.includes('too small'))
+
+  frame.close()
+})
+
+test('VideoFrame: copyTo throws TypeError when destination too small for custom layout with offset', async (t) => {
+  const frame = new VideoFrame(new Uint8Array(32), {
+    format: 'RGBA',
+    codedWidth: 4,
+    codedHeight: 2,
+    timestamp: 0,
+  })
+
+  // Custom layout: offset 100 + stride 16 * height 2 = 132 bytes needed, but only 100 provided
+  const smallBuffer = new Uint8Array(100)
+  const error = await t.throwsAsync(frame.copyTo(smallBuffer, { layout: [{ offset: 100, stride: 16 }] }))
+  t.true(error?.message.includes('TypeError') || error?.message.includes('too small'))
+
+  frame.close()
+})
+
+test('VideoFrame: constructor throws TypeError when source data too small for custom layout', (t) => {
+  // Layout says data starts at offset 100, but buffer is only 64 bytes
+  const smallBuffer = new Uint8Array(64)
+
+  t.throws(
+    () => {
+      new VideoFrame(smallBuffer, {
+        format: 'RGBA',
+        codedWidth: 4,
+        codedHeight: 2,
+        timestamp: 0,
+        layout: [{ offset: 100, stride: 16 }],
+      })
+    },
+    { message: /too small/ },
+  )
+})
+
+test('VideoFrame: constructor throws TypeError when source data too small for custom stride', (t) => {
+  // Layout: stride 64 * height 2 = 128 bytes needed, but only 64 provided
+  const smallBuffer = new Uint8Array(64)
+
+  t.throws(
+    () => {
+      new VideoFrame(smallBuffer, {
+        format: 'RGBA',
+        codedWidth: 4,
+        codedHeight: 2,
+        timestamp: 0,
+        layout: [{ offset: 0, stride: 64 }],
+      })
+    },
+    { message: /too small/ },
+  )
+})
+
+// ============================================================================
+// Format Conversion Tests (WPT videoFrame-copyTo-rgb.any.js)
+// ============================================================================
+
+test('VideoFrame: allocationSize with format conversion I420 to RGBA', (t) => {
+  const width = 4
+  const height = 4
+  const i420Size = width * height + (width / 2) * (height / 2) * 2 // Y + U + V
+  const data = new Uint8Array(i420Size)
+
+  const frame = new VideoFrame(data, {
+    format: 'I420',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+  })
+
+  // I420 4x4: Y=16, U=4, V=4 = 24 bytes
+  t.is(frame.allocationSize(), 24)
+
+  // RGBA 4x4: 64 bytes
+  t.is(frame.allocationSize({ format: 'RGBA' }), 64)
+
+  frame.close()
+})
+
+test('VideoFrame: copyTo converts I420 to RGBA', async (t) => {
+  const width = 4
+  const height = 4
+  const i420Size = width * height + (width / 2) * (height / 2) * 2
+  const i420Data = new Uint8Array(i420Size)
+
+  // Fill with known YUV values (mid gray: Y=128, U=128, V=128)
+  i420Data.fill(128, 0, width * height) // Y plane
+  i420Data.fill(128, width * height) // U and V planes
+
+  const frame = new VideoFrame(i420Data, {
+    format: 'I420',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+  })
+
+  const rgbaSize = frame.allocationSize({ format: 'RGBA' })
+  t.is(rgbaSize, width * height * 4)
+
+  const rgbaBuffer = new Uint8Array(rgbaSize)
+  const layout = await frame.copyTo(rgbaBuffer, { format: 'RGBA' })
+
+  t.is(layout.length, 1) // RGBA has 1 plane
+  t.is(layout[0].offset, 0)
+  t.is(layout[0].stride, width * 4)
+
+  // Verify pixels are non-zero (actual conversion happened)
+  // Mid gray YUV should convert to approximately gray RGBA
+  let nonZeroCount = 0
+  for (let i = 0; i < rgbaBuffer.length; i += 4) {
+    if (rgbaBuffer[i] !== 0 || rgbaBuffer[i + 1] !== 0 || rgbaBuffer[i + 2] !== 0) {
+      nonZeroCount++
+    }
+    // Alpha should be 255
+    t.is(rgbaBuffer[i + 3], 255)
+  }
+  t.true(nonZeroCount > 0, 'Should have non-zero pixels after conversion')
+
+  frame.close()
+})
+
+test('VideoFrame: copyTo converts I420 to BGRA', async (t) => {
+  const width = 4
+  const height = 4
+  const i420Size = width * height + (width / 2) * (height / 2) * 2
+  const i420Data = new Uint8Array(i420Size)
+  i420Data.fill(128) // mid gray
+
+  const frame = new VideoFrame(i420Data, {
+    format: 'I420',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+  })
+
+  const bgraSize = frame.allocationSize({ format: 'BGRA' })
+  t.is(bgraSize, width * height * 4)
+
+  const bgraBuffer = new Uint8Array(bgraSize)
+  const layout = await frame.copyTo(bgraBuffer, { format: 'BGRA' })
+
+  t.is(layout.length, 1)
+  // Alpha should be 255
+  for (let i = 3; i < bgraBuffer.length; i += 4) {
+    t.is(bgraBuffer[i], 255)
+  }
+
+  frame.close()
+})
+
+test('VideoFrame: copyTo converts NV12 to RGBA', async (t) => {
+  const width = 4
+  const height = 4
+  const nv12Size = width * height + width * (height / 2) // Y plane + interleaved UV
+  const nv12Data = new Uint8Array(nv12Size)
+  nv12Data.fill(128) // mid gray
+
+  const frame = new VideoFrame(nv12Data, {
+    format: 'NV12',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+  })
+
+  const rgbaSize = frame.allocationSize({ format: 'RGBA' })
+  const rgbaBuffer = new Uint8Array(rgbaSize)
+  const layout = await frame.copyTo(rgbaBuffer, { format: 'RGBA' })
+
+  t.is(layout.length, 1)
+  t.is(rgbaBuffer.length, width * height * 4)
+
+  frame.close()
+})
+
+test('VideoFrame: copyTo converts RGBA to BGRA', async (t) => {
+  const width = 4
+  const height = 4
+  const rgbaData = new Uint8Array(width * height * 4)
+
+  // Fill with known RGBA pattern: R=255, G=128, B=64, A=255
+  for (let i = 0; i < rgbaData.length; i += 4) {
+    rgbaData[i] = 255 // R
+    rgbaData[i + 1] = 128 // G
+    rgbaData[i + 2] = 64 // B
+    rgbaData[i + 3] = 255 // A
+  }
+
+  const frame = new VideoFrame(rgbaData, {
+    format: 'RGBA',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+  })
+
+  const bgraBuffer = new Uint8Array(width * height * 4)
+  const layout = await frame.copyTo(bgraBuffer, { format: 'BGRA' })
+
+  t.is(layout.length, 1)
+
+  // Verify BGRA order: B=64, G=128, R=255, A=255
+  for (let i = 0; i < bgraBuffer.length; i += 4) {
+    t.is(bgraBuffer[i], 64, 'B channel')
+    t.is(bgraBuffer[i + 1], 128, 'G channel')
+    t.is(bgraBuffer[i + 2], 255, 'R channel')
+    t.is(bgraBuffer[i + 3], 255, 'A channel')
+  }
+
+  frame.close()
+})
+
+test('VideoFrame: copyTo throws NotSupportedError for RGBA to I420', async (t) => {
+  const frame = new VideoFrame(new Uint8Array(64), {
+    format: 'RGBA',
+    codedWidth: 4,
+    codedHeight: 4,
+    timestamp: 0,
+  })
+
+  const error = await t.throwsAsync(frame.copyTo(new Uint8Array(24), { format: 'I420' }))
+  t.true(error?.message.includes('NotSupportedError'))
+
+  frame.close()
+})
+
+test('VideoFrame: allocationSize throws NotSupportedError for RGBA to I420', (t) => {
+  const frame = new VideoFrame(new Uint8Array(64), {
+    format: 'RGBA',
+    codedWidth: 4,
+    codedHeight: 4,
+    timestamp: 0,
+  })
+
+  try {
+    frame.allocationSize({ format: 'I420' })
+    t.fail('should throw NotSupportedError')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'should be DOMException')
+    t.is((error as DOMException).name, 'NotSupportedError')
+  }
+
+  frame.close()
+})
+
+test('VideoFrame: copyTo with rect and format conversion', async (t) => {
+  const width = 8
+  const height = 8
+  const i420Size = width * height + (width / 2) * (height / 2) * 2
+  const i420Data = new Uint8Array(i420Size)
+  i420Data.fill(128)
+
+  const frame = new VideoFrame(i420Data, {
+    format: 'I420',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+  })
+
+  // Convert and crop to 4x4 RGBA
+  const size = frame.allocationSize({
+    format: 'RGBA',
+    rect: { x: 0, y: 0, width: 4, height: 4 },
+  })
+  t.is(size, 64)
+
+  const buffer = new Uint8Array(size)
+  const layout = await frame.copyTo(buffer, {
+    format: 'RGBA',
+    rect: { x: 0, y: 0, width: 4, height: 4 },
+  })
+
+  t.is(layout.length, 1)
+  t.is(layout[0].stride, 16) // 4 * 4 bytes per pixel
+
+  frame.close()
+})
+
+// ============================================================================
+// Security Tests: Layout Overflow and Rect Validation
+// ============================================================================
+
+test('VideoFrame: allocationSize throws TypeError on layout offset overflow', (t) => {
+  const frame = new VideoFrame(new Uint8Array(64), {
+    format: 'RGBA',
+    codedWidth: 4,
+    codedHeight: 4,
+    timestamp: 0,
+  })
+
+  // WPT "address overflow" case: offset = 2^32 - 2
+  // This would overflow u32 arithmetic but should throw TypeError
+  const error = t.throws(() => {
+    frame.allocationSize({
+      layout: [{ offset: 4294967294, stride: 16 }], // 2^32 - 2
+    })
+  })
+  t.true(error?.message.includes('TypeError'), 'should throw TypeError on overflow')
+
+  frame.close()
+})
+
+test('VideoFrame: copyTo throws TypeError on layout offset overflow', async (t) => {
+  const frame = new VideoFrame(new Uint8Array(64), {
+    format: 'RGBA',
+    codedWidth: 4,
+    codedHeight: 4,
+    timestamp: 0,
+  })
+
+  // Large offset that would overflow u32 arithmetic
+  const error = await t.throwsAsync(
+    frame.copyTo(new Uint8Array(64), {
+      layout: [{ offset: 4294967294, stride: 16 }],
+    }),
+  )
+  t.true(error?.message.includes('TypeError'), 'should throw TypeError on overflow')
+
+  frame.close()
+})
+
+test('VideoFrame: allocationSize throws TypeError on stride * height overflow', (t) => {
+  const frame = new VideoFrame(new Uint8Array(64), {
+    format: 'RGBA',
+    codedWidth: 4,
+    codedHeight: 4,
+    timestamp: 0,
+  })
+
+  // Large stride that would overflow when multiplied by height
+  const error = t.throws(() => {
+    frame.allocationSize({
+      layout: [{ offset: 0, stride: 2147483647 }], // close to i32::MAX
+    })
+  })
+  t.true(error?.message.includes('TypeError'), 'should throw TypeError on overflow')
+
+  frame.close()
+})
+
+test('VideoFrame: copyTo with format conversion validates rect against source format', async (t) => {
+  // I420 requires 2x2 alignment for rect offsets
+  const frame = new VideoFrame(new Uint8Array(24), {
+    format: 'I420',
+    codedWidth: 4,
+    codedHeight: 4,
+    timestamp: 0,
+  })
+
+  // Odd rect offset (x=1) should throw even when converting to RGBA
+  // because the SOURCE format (I420) requires alignment
+  const error = await t.throwsAsync(
+    frame.copyTo(new Uint8Array(16), {
+      format: 'RGBA',
+      rect: { x: 1, y: 0, width: 2, height: 2 }, // x=1 not aligned for I420
+    }),
+  )
+  t.true(error?.message.includes('TypeError'), 'should throw TypeError for unaligned rect')
+
+  frame.close()
+})
+
+test('VideoFrame: allocationSize with format conversion validates rect against source format', (t) => {
+  const frame = new VideoFrame(new Uint8Array(24), {
+    format: 'I420',
+    codedWidth: 4,
+    codedHeight: 4,
+    timestamp: 0,
+  })
+
+  // Odd rect should throw even when asking for RGBA output
+  const error = t.throws(() => {
+    frame.allocationSize({
+      format: 'RGBA',
+      rect: { x: 1, y: 1, width: 2, height: 2 },
+    })
+  })
+  t.true(error?.message.includes('TypeError'), 'should throw TypeError for unaligned rect')
+
+  frame.close()
+})
+
+test('VideoFrame: format conversion with valid aligned rect succeeds', async (t) => {
+  const frame = new VideoFrame(new Uint8Array(24), {
+    format: 'I420',
+    codedWidth: 4,
+    codedHeight: 4,
+    timestamp: 0,
+  })
+
+  // Even rect offsets should work with format conversion
+  const size = frame.allocationSize({
+    format: 'RGBA',
+    rect: { x: 0, y: 0, width: 2, height: 2 },
+  })
+  t.is(size, 16) // 2x2 RGBA = 16 bytes
+
+  const buffer = new Uint8Array(size)
+  const layout = await frame.copyTo(buffer, {
+    format: 'RGBA',
+    rect: { x: 0, y: 0, width: 2, height: 2 },
+  })
+
+  t.is(layout.length, 1)
+
+  frame.close()
+})

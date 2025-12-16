@@ -213,7 +213,7 @@ This implementation is validated against the [W3C Web Platform Tests](https://gi
 
 | Status      | Count | Percentage |
 | ----------- | ----- | ---------- |
-| **Passing** | 522   | 99.1%      |
+| **Passing** | 573   | 99.1%      |
 | **Skipped** | 5     | 0.9%       |
 | **Failing** | 0     | 0%         |
 
@@ -295,6 +295,40 @@ const encoder = new VideoEncoder({
   },
 })
 ```
+
+### VideoFrame Format Conversion
+
+`VideoFrame.copyTo()` and `VideoFrame.allocationSize()` support format conversion per W3C WebCodecs spec:
+
+```typescript
+const frame = new VideoFrame(i420Data, {
+  format: 'I420',
+  codedWidth: 1920,
+  codedHeight: 1080,
+  timestamp: 0,
+})
+
+// Get allocation size for RGBA output
+const rgbaSize = frame.allocationSize({ format: 'RGBA' })
+
+// Copy with format conversion (I420 → RGBA)
+const rgbaBuffer = new Uint8Array(rgbaSize)
+const layout = await frame.copyTo(rgbaBuffer, { format: 'RGBA' })
+
+frame.close()
+```
+
+**Supported conversions:**
+
+| Source Format                | Target Format          | Status               |
+| ---------------------------- | ---------------------- | -------------------- |
+| I420, I422, I444, NV12, NV21 | RGBA, RGBX, BGRA, BGRX | ✅                   |
+| RGBA, RGBX, BGRA, BGRX       | RGBA, RGBX, BGRA, BGRX | ✅                   |
+| RGBA, RGBX, BGRA, BGRX       | I420, I422, I444, NV12 | ❌ NotSupportedError |
+
+Per WPT `videoFrame-copyTo-rgb.any.js`, RGB-to-YUV conversion throws `NotSupportedError`.
+
+Custom layouts with overflow-inducing values (e.g., `offset: 2³²-2`) throw `TypeError` via checked arithmetic. Rect alignment is validated against the source format during conversion.
 
 ### ImageDecoder Options
 
