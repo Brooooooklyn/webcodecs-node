@@ -112,6 +112,8 @@ pub struct AudioEncoderInit {
     FunctionRef<FnArgs<(EncodedAudioChunk, EncodedAudioChunkMetadata)>, UnknownReturnValue>,
   /// Error callback - called when an error occurs
   pub error: ErrorCallback,
+  /// Error callback reference - prevents GC from collecting the error callback
+  pub error_ref: FunctionRef<Error, UnknownReturnValue>,
 }
 
 impl FromNapiValue for AudioEncoderInit {
@@ -148,7 +150,8 @@ impl FromNapiValue for AudioEncoderInit {
       .weak::<true>()
       .build()?;
 
-    let error: ErrorCallback = match obj.get_named_property("error") {
+    // Get error callback as Function first, then create both FunctionRef and ThreadsafeFunction
+    let error_func: Function<Error, UnknownReturnValue> = match obj.get_named_property("error") {
       Ok(cb) => cb,
       Err(_) => {
         env_wrapper.throw_type_error("error callback is required", None)?;
@@ -156,10 +159,21 @@ impl FromNapiValue for AudioEncoderInit {
       }
     };
 
+    // Create FunctionRef to prevent GC from collecting the error callback
+    let error_ref = error_func.create_ref()?;
+
+    // Create ThreadsafeFunction for async calls from worker thread
+    let error: ErrorCallback = error_func
+      .build_threadsafe_function()
+      .callee_handled::<false>()
+      .weak::<true>()
+      .build()?;
+
     Ok(AudioEncoderInit {
       output,
       output_ref,
       error,
+      error_ref,
     })
   }
 }
@@ -287,6 +301,10 @@ pub struct AudioEncoder {
   /// (Rc is !Send but that's OK - the callback runs on the main thread)
   output_callback_ref:
     Rc<FunctionRef<FnArgs<(EncodedAudioChunk, EncodedAudioChunkMetadata)>, UnknownReturnValue>>,
+  /// Error callback reference - prevents GC from collecting the error callback
+  /// (weak ThreadsafeFunction alone can be collected on slow platforms like armv7 QEMU)
+  #[allow(dead_code)]
+  error_callback_ref: Rc<FunctionRef<Error, UnknownReturnValue>>,
   /// Channel sender for worker commands (wrapped in Arc for Weak references in microtasks)
   command_sender: Option<Arc<Sender<EncoderCommand>>>,
   /// Worker thread handle
@@ -384,6 +402,7 @@ impl AudioEncoder {
       event_state,
       dequeue_callback: None,
       output_callback_ref: Rc::new(init.output_ref),
+      error_callback_ref: Rc::new(init.error_ref),
       command_sender: Some(Arc::new(sender)),
       worker_handle: Some(worker_handle),
       reset_flag,
@@ -1083,6 +1102,9 @@ impl AudioEncoder {
 
   /// Report an error via callback and close the encoder
   fn report_error(inner: &mut AudioEncoderInner, error_msg: &str) {
+    // Log the error at warn level for debugging (visible even if JS callback fails)
+    tracing::warn!(target: "webcodecs", codec = "AudioEncoder", error = error_msg, "Codec error reported");
+
     // Create an Error object that will be passed directly to the JS callback
     let error = Error::new(Status::GenericFailure, error_msg);
     inner

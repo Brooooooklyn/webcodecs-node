@@ -32,7 +32,10 @@ function createTestEncoder() {
         decoderConfig = metadata.decoderConfig as VideoDecoderConfig
       }
     },
-    error: (e) => errors.push(e),
+    error: (e) => {
+      console.error('[VideoEncoder] Error callback:', e.message)
+      errors.push(e)
+    },
   })
 
   return { encoder, chunks, errors, getDecoderConfig: () => decoderConfig }
@@ -45,7 +48,10 @@ function createTestDecoder() {
 
   const decoder = new VideoDecoder({
     output: (frame) => frames.push(frame),
-    error: (e) => errors.push(e),
+    error: (e) => {
+      console.error('[VideoDecoder] Error callback:', e.message)
+      errors.push(e)
+    },
   })
 
   return { decoder, frames, errors }
@@ -454,14 +460,15 @@ test('stress: multiple encode-reconfigure cycles', async (t) => {
   for (let i = 0; i < cycles; i++) {
     const { encoder, chunks, errors } = createTestEncoder()
 
-    if (errors.length) {
-      for (const error of errors) {
-        console.error(error)
-      }
-      t.fail()
-    }
-
     encoder.configure(createEncoderConfig('h264', width, height))
+
+    // Log any errors or unexpected state after configure
+    if (errors.length > 0) {
+      t.log(`Cycle ${i}: Error(s) after configure: ${errors.map((e) => e.message).join(', ')}`)
+    }
+    if (encoder.state !== 'configured') {
+      t.log(`Cycle ${i}: Unexpected state after configure: ${encoder.state}`)
+    }
 
     const frame = generateSolidColorI420Frame(width, height, TestColors.yellow, i * 33333)
     encoder.encode(frame, { keyFrame: true })
@@ -480,10 +487,19 @@ test('stress: rapid reconfigure cycles', async (t) => {
   const height = 240
   const cycles = 20
 
-  const { encoder, chunks } = createTestEncoder()
+  const { encoder, chunks, errors } = createTestEncoder()
 
   for (let i = 0; i < cycles; i++) {
     encoder.configure(createEncoderConfig('h264', width, height))
+
+    // Log any errors or unexpected state after configure
+    if (errors.length > 0) {
+      t.log(`Cycle ${i}: Error(s) after configure: ${errors.map((e) => e.message).join(', ')}`)
+      errors.length = 0 // Clear for next iteration
+    }
+    if (encoder.state !== 'configured') {
+      t.log(`Cycle ${i}: Unexpected state after configure: ${encoder.state}`)
+    }
 
     const frame = generateSolidColorI420Frame(width, height, TestColors.cyan, 0)
     encoder.encode(frame, { keyFrame: true })
