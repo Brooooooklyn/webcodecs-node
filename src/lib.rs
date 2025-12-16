@@ -97,12 +97,29 @@ unsafe extern "C" fn ffmpeg_log_callback(
 /// Module initialization - called when the native module is loaded
 #[module_init]
 fn init() {
+  use tracing_subscriber::filter::Targets;
+  use tracing_subscriber::prelude::*;
+  use tracing_subscriber::util::SubscriberInitExt;
+
   // Set FFmpeg log level to allow all messages through to our callback
   // The tracing subscriber will handle actual filtering
   unsafe {
     ffi::avutil::av_log_set_level(ffi::avutil::log_level::INFO);
     ffi::avutil::av_log_set_callback(Some(ffmpeg_log_callback));
   }
+
+  // Usage without the `regex` feature.
+  // <https://github.com/tokio-rs/tracing/issues/1436#issuecomment-918528013>
+  tracing_subscriber::registry()
+    .with(std::env::var("WEBCODECS_LOG").map_or_else(
+      |_| Targets::new(),
+      |env_var| {
+        use std::str::FromStr;
+        Targets::from_str(&env_var).unwrap()
+      },
+    ))
+    .with(tracing_subscriber::fmt::layer())
+    .init();
 }
 
 // Re-export WebCodecs types at crate root
