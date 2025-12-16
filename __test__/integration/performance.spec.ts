@@ -452,14 +452,21 @@ test('stress: multiple encode-reconfigure cycles', async (t) => {
   const cycles = 10
 
   for (let i = 0; i < cycles; i++) {
-    const { encoder, chunks } = createTestEncoder()
+    const { encoder, chunks, errors } = createTestEncoder()
+
+    if (errors.length) {
+      for (const error of errors) {
+        console.error(error)
+      }
+      t.fail()
+    }
+
     encoder.configure(createEncoderConfig('h264', width, height))
 
     const frame = generateSolidColorI420Frame(width, height, TestColors.yellow, i * 33333)
     encoder.encode(frame, { keyFrame: true })
-    frame.close()
-
     await encoder.flush()
+    frame.close()
     t.true(chunks.length > 0, `Cycle ${i} should produce output`)
 
     encoder.close()
