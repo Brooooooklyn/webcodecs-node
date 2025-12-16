@@ -3383,15 +3383,25 @@ fn is_valid_scalability_mode(mode: &str) -> bool {
 }
 
 /// Parse temporal layer count from scalability mode string.
-/// Returns Some(n) for L1Tx modes where x >= 2, None otherwise.
-/// Only L1Tx (single spatial layer) modes are supported for temporal layer metadata.
+/// Returns Some(n) for any mode with n >= 2 temporal layers.
+/// Handles L1Tx, L2Tx, L3Tx, S2Tx, S3Tx, and variants with 'h' or '_KEY' suffixes.
 fn parse_temporal_layer_count(mode: &str) -> Option<u32> {
-  // Only support L1Tx modes (single spatial layer with temporal layers)
-  // Pattern: L1T<n> where n >= 2
-  mode
-    .strip_prefix("L1T")
-    .and_then(|suffix| suffix.parse::<u32>().ok())
-    .filter(|&n| n >= 2)
+  // Strip _KEY suffix if present (e.g., L2T3_KEY -> L2T3)
+  let mode = mode.trim_end_matches("_KEY");
+
+  // L<spatial>T<temporal> or S<spatial>T<temporal>
+  // Examples: L1T2, L2T3, L3T1h, S2T2, S3T3h
+  let prefix = mode.strip_prefix('L').or_else(|| mode.strip_prefix('S'))?;
+  let parts: Vec<&str> = prefix.split('T').collect();
+  if parts.len() != 2 {
+    return None;
+  }
+
+  // Parse temporal layer count, stripping 'h' suffix if present (e.g., "3h" -> 3)
+  let temporal = parts[1].trim_end_matches('h').parse::<u32>().ok()?;
+
+  // Only return if >= 2 temporal layers (L1T1 doesn't need SVC metadata)
+  if temporal >= 2 { Some(temporal) } else { None }
 }
 
 /// Compute temporal layer ID for a given frame index based on temporal layer count.

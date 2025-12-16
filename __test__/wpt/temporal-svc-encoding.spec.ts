@@ -49,12 +49,14 @@ const SVC_ENCODER_CONFIGS: Record<string, Partial<VideoEncoderConfig>> = {
  * @param layers - Number of temporal layers (2 or 3)
  * @param baseLayerDecimator - Expected frame rate reduction for base layer
  * @param codecKey - Key to encoder config
+ * @param scalabilityMode - Optional explicit scalability mode (defaults to L1T{layers})
  */
 async function svcTest(
   t: ExecutionContext,
   layers: number,
   baseLayerDecimator: number,
   codecKey: string,
+  scalabilityMode?: string,
 ): Promise<void> {
   const baseConfig = SVC_ENCODER_CONFIGS[codecKey]
   if (!baseConfig) {
@@ -70,7 +72,7 @@ async function svcTest(
     bitrate: 1_000_000,
     bitrateMode: 'constant',
     framerate: 30,
-    scalabilityMode: `L1T${layers}`,
+    scalabilityMode: scalabilityMode ?? `L1T${layers}`,
   } as VideoEncoderConfig
 
   const w = encoderConfig.width!
@@ -184,4 +186,44 @@ test('SVC L1T2: H.264', async (t) => {
 
 test('SVC L1T3: H.264', async (t) => {
   await svcTest(t, 3, 4, 'h264')
+})
+
+// ============================================================================
+// Multi-Spatial Mode Tests (L2T*, L3T*, S*T*)
+// These modes have temporal layers that should still populate temporalLayerId
+// W3C spec only defines temporalLayerId, not spatialLayerId
+// ============================================================================
+
+test('SVC L2T2: VP9', async (t) => {
+  await svcTest(t, 2, 2, 'vp9', 'L2T2')
+})
+
+test('SVC L2T3: VP9', async (t) => {
+  await svcTest(t, 3, 4, 'vp9', 'L2T3')
+})
+
+test('SVC L3T2: AV1', async (t) => {
+  await svcTest(t, 2, 2, 'av1', 'L3T2')
+})
+
+test('SVC L3T3: AV1', async (t) => {
+  await svcTest(t, 3, 4, 'av1', 'L3T3')
+})
+
+test('SVC S2T2: VP9', async (t) => {
+  await svcTest(t, 2, 2, 'vp9', 'S2T2')
+})
+
+test('SVC S3T3: AV1', async (t) => {
+  await svcTest(t, 3, 4, 'av1', 'S3T3')
+})
+
+// Test 'h' (half-resolution) variant
+test('SVC L2T2h: VP9', async (t) => {
+  await svcTest(t, 2, 2, 'vp9', 'L2T2h')
+})
+
+// Test _KEY variant
+test('SVC L2T3_KEY: AV1', async (t) => {
+  await svcTest(t, 3, 4, 'av1', 'L2T3_KEY')
 })

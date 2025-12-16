@@ -264,11 +264,13 @@ The encoder automatically applies optimal settings for each hardware encoder bas
 
 ## Limitations
 
-### Not Implemented
+### Scalable Video Coding (SVC)
 
-| Feature                      | Status | Notes                                            |
-| ---------------------------- | ------ | ------------------------------------------------ |
-| Multi-spatial SVC (L2T*, S*) | ❌     | Only L1Tx temporal modes populate `metadata.svc` |
+All scalability modes (L1Tx, L2Tx, L3Tx, S2Tx, S3Tx, and variants) are accepted and populate `metadata.svc.temporalLayerId` when temporal layers >= 2.
+
+The W3C WebCodecs spec only defines `temporalLayerId` in `SvcOutputMetadata` - there is no `spatialLayerId` field in the spec. See [W3C WebCodecs §6.7](https://w3c.github.io/webcodecs/#encoded-video-chunk-metadata).
+
+Note: This implementation computes temporal layer IDs algorithmically from frame index per W3C spec. FFmpeg is not configured for actual SVC encoding, so base layer frames are not independently decodable.
 
 ### Error Handling
 
@@ -312,18 +314,40 @@ ImageDecoder supports all W3C spec options:
 
 ## Logging
 
-FFmpeg internal logs are redirected to the Rust `tracing` crate with the `ffmpeg` target. By default, logs are silently discarded unless you configure a tracing subscriber.
+This library uses Rust's `tracing` crate for structured logging. Enable logging via the `WEBCODECS_LOG` environment variable:
 
-To enable FFmpeg logging in your application, you can use any `tracing`-compatible subscriber. For Node.js applications, you can expose this through the native module or use environment-based configuration.
+```bash
+# Enable all logs at info level
+WEBCODECS_LOG=info node your-app.js
 
-Log level mapping:
+# Enable FFmpeg logs at debug level
+WEBCODECS_LOG=ffmpeg=debug node your-app.js
+
+# Enable WebCodecs codec errors at warn, FFmpeg at info
+WEBCODECS_LOG=webcodecs=warn,ffmpeg=info node your-app.js
+
+# Enable trace-level logging for everything
+WEBCODECS_LOG=trace node your-app.js
+```
+
+### Log Targets
+
+| Target      | Description                                                            |
+| ----------- | ---------------------------------------------------------------------- |
+| `ffmpeg`    | FFmpeg internal logs (codec initialization, encoding/decoding details) |
+| `webcodecs` | WebCodecs API logs (codec errors, state transitions)                   |
+
+### FFmpeg Log Level Mapping
+
 | FFmpeg Level | Tracing Level |
 | ------------ | ------------- |
-| ERROR/FATAL | `error` |
-| WARNING | `warn` |
-| INFO | `info` |
-| VERBOSE | `debug` |
-| DEBUG/TRACE | `trace` |
+| ERROR/FATAL  | `error`       |
+| WARNING      | `warn`        |
+| INFO         | `info`        |
+| VERBOSE      | `debug`       |
+| DEBUG/TRACE  | `trace`       |
+
+Without `WEBCODECS_LOG` set, all logs are silently discarded.
 
 ## API Reference
 

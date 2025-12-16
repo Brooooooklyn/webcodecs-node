@@ -84,15 +84,42 @@ cargo clippy       # Lint Rust code
 
 ## Logging
 
-FFmpeg logs are redirected to Rust's `tracing` crate with the `ffmpeg` target:
+Structured logging via Rust's `tracing` crate, configured through the `WEBCODECS_LOG` environment variable.
 
-- FFmpeg ERROR → `tracing::error!(target: "ffmpeg", ...)`
-- FFmpeg WARNING → `tracing::warn!(target: "ffmpeg", ...)`
-- FFmpeg INFO → `tracing::info!(target: "ffmpeg", ...)`
-- FFmpeg VERBOSE → `tracing::debug!(target: "ffmpeg", ...)`
-- FFmpeg DEBUG/TRACE → `tracing::trace!(target: "ffmpeg", ...)`
+### Environment Variable
 
-Users can configure a tracing subscriber to capture these logs. Without a subscriber, logs are silently discarded.
+```bash
+# Format: WEBCODECS_LOG=<target>=<level>,<target>=<level>,...
+WEBCODECS_LOG=info                          # All targets at info
+WEBCODECS_LOG=ffmpeg=debug                  # FFmpeg logs at debug
+WEBCODECS_LOG=webcodecs=warn,ffmpeg=info    # Multiple targets
+WEBCODECS_LOG=trace                         # Everything at trace
+```
+
+### Log Targets
+
+| Target      | Description              | Example Locations                                              |
+| ----------- | ------------------------ | -------------------------------------------------------------- |
+| `ffmpeg`    | FFmpeg internal messages | Codec init, encode/decode operations                           |
+| `webcodecs` | WebCodecs API messages   | Codec errors (`video_encoder.rs:1714`, `audio_decoder.rs:660`) |
+
+### FFmpeg Log Level Mapping
+
+| FFmpeg Level | Tracing Level | Constant                  |
+| ------------ | ------------- | ------------------------- |
+| FATAL/ERROR  | `error`       | `log_level::ERROR` (16)   |
+| WARNING      | `warn`        | `log_level::WARNING` (24) |
+| INFO         | `info`        | `log_level::INFO` (32)    |
+| VERBOSE      | `debug`       | `log_level::VERBOSE` (40) |
+| DEBUG/TRACE  | `trace`       | `log_level::DEBUG` (48)   |
+
+### Implementation
+
+- **Callback**: `ffmpeg_log_callback()` in `src/lib.rs:29-95` intercepts FFmpeg logs
+- **Filter**: `Targets::from_str(&env_var)` parses `WEBCODECS_LOG` (lib.rs:118)
+- **Subscriber**: `tracing_subscriber::fmt::layer()` outputs formatted logs (lib.rs:121)
+
+Without `WEBCODECS_LOG` set, all logs are silently discarded.
 
 ## FFmpeg Linking
 
@@ -428,7 +455,7 @@ src/codec/context.rs:339,362  # Set extradata if provided (non-critical)
 
 ## Known Limitations
 
-1. **Temporal SVC** - L1Tx modes populate `metadata.svc.temporalLayerId`; multi-spatial modes (L2T*, S*) not supported
+1. **Temporal SVC** - All modes with >= 2 temporal layers (L1Tx, L2Tx, L3Tx, SxTx) populate `metadata.svc.temporalLayerId`; W3C spec does not define `spatialLayerId`
 2. **Duration type** - Using i64 instead of u64 due to NAPI-RS constraints
 3. **ImageDecoder GIF animation** - FFmpeg may return only first frame; for full animation use VideoDecoder with GIF codec
 
@@ -489,29 +516,29 @@ These are fundamental limitations that cannot be resolved without upstream NAPI-
 
 ## Spec Compliance Notes
 
-| Feature                      | Spec                    | Implementation            |
-| ---------------------------- | ----------------------- | ------------------------- |
-| VideoFrame.copyTo()          | Promise<PlaneLayout[]>  | ✅ Async                  |
-| AudioData.copyTo()           | void (sync)             | ✅ Sync                   |
-| AudioData.allocationSize()   | options required        | ✅ Required               |
-| Encoder callbacks            | (chunk, metadata?)      | ✅ Spread args            |
-| AudioData constructor        | data in init            | ✅ Inside init            |
-| Enum casing                  | lowercase               | ✅ "key", "unconfigured"  |
-| VideoColorSpace.toJSON()     | toJSON() method         | ✅ Correct capitalization |
-| DOMRectReadOnly.toJSON()     | toJSON() method         | ✅ Correct capitalization |
-| VideoFrame.codedRect         | throws on closed        | ✅ InvalidStateError      |
-| VideoFrame.visibleRect       | throws on closed        | ✅ InvalidStateError      |
-| VideoFrame visibleRect param | cropping support        | ✅ Full W3C compliance    |
-| VideoFrame.copyTo rect       | subregion copy          | ✅ Full W3C compliance    |
-| ImageDecoder.closed          | readonly boolean        | ✅ Implemented            |
-| ImageTrackList.ready         | Promise                 | ✅ Implemented            |
-| ImageTrackList.item()        | indexed access          | ✅ Implemented            |
-| ImageTrackList.selectedIndex | returns -1 if none      | ✅ Implemented            |
-| ImageTrack.selected          | writable property       | ✅ Getter/setter          |
-| SvcOutputMetadata            | temporalLayerId         | ✅ L1Tx modes             |
-| DOMException errors          | instanceof DOMException | ✅ Native DOMException    |
-| VideoEncoder.encode options  | keyFrame forcing        | ✅ Forces I-frame         |
-| EventTarget interface        | addEventListener, etc   | ✅ All codecs             |
-| RGBA colorSpace default      | sRGB for RGB formats    | ✅ BT.709/sRGB            |
-| VP9 short form codec         | "vp9" accepted          | ✅ For compatibility      |
-| AV1 short form codec         | "av01"/"av1" accepted   | ✅ For compatibility      |
+| Feature                      | Spec                    | Implementation              |
+| ---------------------------- | ----------------------- | --------------------------- |
+| VideoFrame.copyTo()          | Promise<PlaneLayout[]>  | ✅ Async                    |
+| AudioData.copyTo()           | void (sync)             | ✅ Sync                     |
+| AudioData.allocationSize()   | options required        | ✅ Required                 |
+| Encoder callbacks            | (chunk, metadata?)      | ✅ Spread args              |
+| AudioData constructor        | data in init            | ✅ Inside init              |
+| Enum casing                  | lowercase               | ✅ "key", "unconfigured"    |
+| VideoColorSpace.toJSON()     | toJSON() method         | ✅ Correct capitalization   |
+| DOMRectReadOnly.toJSON()     | toJSON() method         | ✅ Correct capitalization   |
+| VideoFrame.codedRect         | throws on closed        | ✅ InvalidStateError        |
+| VideoFrame.visibleRect       | throws on closed        | ✅ InvalidStateError        |
+| VideoFrame visibleRect param | cropping support        | ✅ Full W3C compliance      |
+| VideoFrame.copyTo rect       | subregion copy          | ✅ Full W3C compliance      |
+| ImageDecoder.closed          | readonly boolean        | ✅ Implemented              |
+| ImageTrackList.ready         | Promise                 | ✅ Implemented              |
+| ImageTrackList.item()        | indexed access          | ✅ Implemented              |
+| ImageTrackList.selectedIndex | returns -1 if none      | ✅ Implemented              |
+| ImageTrack.selected          | writable property       | ✅ Getter/setter            |
+| SvcOutputMetadata            | temporalLayerId only    | ✅ All multi-temporal modes |
+| DOMException errors          | instanceof DOMException | ✅ Native DOMException      |
+| VideoEncoder.encode options  | keyFrame forcing        | ✅ Forces I-frame           |
+| EventTarget interface        | addEventListener, etc   | ✅ All codecs               |
+| RGBA colorSpace default      | sRGB for RGB formats    | ✅ BT.709/sRGB              |
+| VP9 short form codec         | "vp9" accepted          | ✅ For compatibility        |
+| AV1 short form codec         | "av01"/"av1" accepted   | ✅ For compatibility        |
