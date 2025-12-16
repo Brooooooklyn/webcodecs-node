@@ -10,6 +10,7 @@ WebCodecs API implementation for Node.js using FFmpeg, built with [NAPI-RS](http
 - **Video encoding/decoding** - H.264, H.265, VP8, VP9, AV1
 - **Audio encoding/decoding** - AAC, Opus, MP3, FLAC, Vorbis, PCM variants
 - **Image decoding** - JPEG, PNG, WebP, GIF, BMP, AVIF
+- **Canvas integration** - Create VideoFrames from `@napi-rs/canvas` for graphics and text rendering
 - **Hardware acceleration** - Zero-copy GPU encoding with VideoToolbox (macOS), NVENC (NVIDIA), VAAPI (Linux), QSV (Intel)
 - **Cross-platform** - macOS, Windows, Linux (glibc/musl, x64/arm64/armv7)
 - **Structured logging** - FFmpeg logs redirected to Rust `tracing` crate for easy integration
@@ -22,6 +23,14 @@ npm install @napi-rs/webcodecs
 pnpm add @napi-rs/webcodecs
 # or
 yarn add @napi-rs/webcodecs
+```
+
+### Optional: Canvas Integration
+
+For creating VideoFrames from canvas content, install `@napi-rs/canvas`:
+
+```bash
+npm install @napi-rs/canvas
 ```
 
 ## Quick Start
@@ -156,6 +165,39 @@ console.log(`Image: ${result.image.codedWidth}x${result.image.codedHeight}`)
 result.image.close()
 decoder.close()
 ```
+
+### VideoFrame from Canvas
+
+Create VideoFrames from `@napi-rs/canvas` for graphics, text rendering, or image compositing:
+
+```typescript
+import { VideoFrame } from '@napi-rs/webcodecs'
+import { createCanvas } from '@napi-rs/canvas'
+
+const canvas = createCanvas(1920, 1080)
+const ctx = canvas.getContext('2d')
+
+// Draw graphics
+ctx.fillStyle = '#FF0000'
+ctx.fillRect(0, 0, 1920, 1080)
+ctx.fillStyle = '#FFFFFF'
+ctx.font = '48px sans-serif'
+ctx.fillText('Hello WebCodecs!', 100, 100)
+
+// Create VideoFrame from canvas (timestamp required per W3C spec)
+const frame = new VideoFrame(canvas, {
+  timestamp: 0,
+  duration: 33333, // optional: frame duration in microseconds
+})
+
+console.log(frame.format) // 'RGBA'
+console.log(frame.codedWidth, frame.codedHeight) // 1920, 1080
+
+// Use with VideoEncoder (see Video Encoding section)
+frame.close()
+```
+
+**Note:** Canvas pixel data is copied as RGBA format with sRGB color space.
 
 ## Supported Codecs
 
@@ -389,7 +431,7 @@ This package implements the [W3C WebCodecs API](https://w3c.github.io/webcodecs/
 
 - `VideoEncoder` / `VideoDecoder` - Video encoding and decoding with EventTarget support
 - `AudioEncoder` / `AudioDecoder` - Audio encoding and decoding with EventTarget support
-- `VideoFrame` - Raw video frame data (RGBA formats default to sRGB colorSpace)
+- `VideoFrame` - Raw video frame data (supports buffer data, existing VideoFrame, or `@napi-rs/canvas` Canvas)
 - `AudioData` - Raw audio sample data
 - `EncodedVideoChunk` / `EncodedAudioChunk` - Encoded media data
 - `ImageDecoder` - Static image decoding
