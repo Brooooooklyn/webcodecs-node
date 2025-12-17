@@ -18,7 +18,7 @@ WebCodecs API implementation for Node.js using FFmpeg, built with [NAPI-RS](http
 ## Installation
 
 ```bash
-npm install @napi-rs/webcodecs
+bun add @napi-rs/webcodecs
 # or
 pnpm add @napi-rs/webcodecs
 # or
