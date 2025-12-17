@@ -353,6 +353,15 @@ jobs:
         node:
           - '20'
           - '22'
+          - '24'
+          - 'bun'
+        exclude:
+          - settings:
+              target: aarch64-pc-windows-msvc
+            node: 'bun'
+          - settings:
+              target: x86_64-apple-darwin
+            node: 'bun'
     runs-on: ${{ matrix.settings.host }}
     steps:
       - uses: actions/checkout@v5
@@ -360,10 +369,16 @@ jobs:
         uses: pnpm/action-setup@v4
       - name: Setup node
         uses: actions/setup-node@v6
+        if: ${{ matrix.node != 'bun' }}
         with:
           node-version: ${{ matrix.node }}
           cache: pnpm
           architecture: ${{ matrix.settings.architecture }}
+      - name: Setup bun
+        uses: oven-sh/setup-bun@v2
+        if: ${{ matrix.node == 'bun' }}
+        with:
+          bun-version: latest
       - name: Install dependencies
         run: pnpm install
       - name: Download artifacts
@@ -375,7 +390,12 @@ jobs:
         run: ls -R .
         shell: bash
       - name: Test bindings
+        if: ${{ matrix.node != 'bun' }}
         run: pnpm test
+      - name: Test bindings on bun
+        if: ${{ matrix.node == 'bun' }}
+        continue-on-error: true
+        run: bun --bun run test
   test-linux-binding:
     name: Test ${{ matrix.target }} - node@${{ matrix.node }}
     needs:
