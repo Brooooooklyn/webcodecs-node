@@ -97,7 +97,7 @@ jobs:
 
       - name: Install FFmpeg with codecs via vcpkg
         run: |
-          vcpkg install ffmpeg[avcodec,swresample,swscale,gpl,x264,x265,vpx,aom,opus,mp3lame,vorbis,webp,zlib]:arm64-windows-static
+          vcpkg install ffmpeg[avformat,avcodec,swresample,swscale,gpl,x264,x265,vpx,aom,opus,mp3lame,vorbis,webp,zlib]:arm64-windows-static
 
       - name: List vcpkg installed libraries
         run: |
@@ -396,7 +396,7 @@ jobs:
             --enable-avcodec \
             --enable-swscale \
             --enable-swresample \
-            --disable-avformat \
+            --enable-avformat \
             --disable-avfilter \
             --disable-avdevice \
             --disable-network \

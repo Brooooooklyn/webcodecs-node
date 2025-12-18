@@ -60,18 +60,16 @@ export interface CanvasLike {
   data(): Uint8Array
 }
 
-export type TypedArray =
-  | Int8Array
-  | Uint8Array
-  | Uint8ClampedArray
-  | Int16Array
-  | Uint16Array
-  | Int32Array
-  | Uint32Array
-  | Float32Array
-  | Float64Array
-  | BigInt64Array
-  | BigUint64Array
+// ============================================================================
+// Muxer/Demuxer State Types
+// ============================================================================
+
+/** Demuxer state machine states */
+export type DemuxerState = 'unloaded' | 'ready' | 'demuxing' | 'ended' | 'closed'
+
+/** Muxer state machine states */
+export type MuxerState = 'configuring' | 'muxing' | 'finalized' | 'closed'
+
 /**
  * AudioData - represents uncompressed audio data
  *
@@ -480,6 +478,252 @@ export declare class ImageTrackList {
   item(index: number): ImageTrack | null
 }
 
+/**
+ * MKV Demuxer for reading encoded video and audio from Matroska container
+ *
+ * MKV supports almost any video and audio codec.
+ */
+export declare class MkvDemuxer {
+  constructor(init: MkvDemuxerInit)
+  load(path: string): Promise<void>
+  /**
+   * Load an MKV from a buffer
+   *
+   * This method uses zero-copy buffer loading - the Uint8Array data is passed
+   * directly to the demuxer without an intermediate copy.
+   */
+  loadBuffer(data: Uint8Array): Promise<void>
+  get tracks(): Array<DemuxerTrackInfo>
+  get duration(): number | null
+  get videoDecoderConfig(): DemuxerVideoDecoderConfig | null
+  get audioDecoderConfig(): DemuxerAudioDecoderConfig | null
+  selectVideoTrack(trackIndex: number): void
+  selectAudioTrack(trackIndex: number): void
+  demux(count?: number | undefined | null): void
+  seek(timestampUs: number): void
+  close(): void
+  get state(): DemuxerState
+}
+
+/**
+ * MKV Muxer for combining encoded video and audio into Matroska container
+ *
+ * MKV (Matroska) supports virtually all video and audio codecs.
+ *
+ * Usage:
+ * ```javascript
+ * const muxer = new MkvMuxer();
+ * muxer.addVideoTrack({ codec: 'avc1.42001E', width: 1920, height: 1080 });
+ * muxer.addAudioTrack({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 });
+ *
+ * // Add encoded chunks from VideoEncoder/AudioEncoder
+ * encoder.configure({
+ *   output: (chunk, metadata) => muxer.addVideoChunk(chunk, metadata)
+ * });
+ *
+ * // Finalize and get MKV data
+ * const mkvData = muxer.finalize();
+ * ```
+ */
+export declare class MkvMuxer {
+  /** Create a new MKV muxer */
+  constructor(options?: MkvMuxerOptions | undefined | null)
+  /**
+   * Add a video track to the muxer
+   *
+   * MKV supports H.264, H.265, VP8, VP9, AV1, and many other video codecs.
+   */
+  addVideoTrack(config: MkvVideoTrackConfig): void
+  /**
+   * Add an audio track to the muxer
+   *
+   * MKV supports AAC, Opus, Vorbis, FLAC, MP3, AC3, and many other audio codecs.
+   */
+  addAudioTrack(config: MkvAudioTrackConfig): void
+  /** Add an encoded video chunk to the muxer */
+  addVideoChunk(
+    chunk: import('./standard').EncodedVideoChunk,
+    metadata?: import('./standard').EncodedVideoChunkMetadata,
+  ): void
+  /** Add an encoded audio chunk to the muxer */
+  addAudioChunk(
+    chunk: import('./standard').EncodedAudioChunk,
+    metadata?: import('./standard').EncodedAudioChunkMetadata,
+  ): void
+  /** Flush any buffered data */
+  flush(): void
+  /** Finalize the muxer and return the MKV data */
+  finalize(): Uint8Array
+  /**
+   * Read available data from streaming buffer (streaming mode only)
+   *
+   * Returns available data, or null if no data is ready yet.
+   * Returns empty Uint8Array when streaming is finished.
+   */
+  read(): Uint8Array | null
+  /** Check if muxer is in streaming mode */
+  get isStreaming(): boolean
+  /** Check if streaming is finished (streaming mode only) */
+  get isFinished(): boolean
+  /** Close the muxer and release resources */
+  close(): void
+  /** Get the current state of the muxer */
+  get state(): MuxerState
+}
+
+/**
+ * MP4 Demuxer for reading encoded video and audio from MP4 container
+ *
+ * Usage:
+ * ```javascript
+ * const demuxer = new Mp4Demuxer({
+ *   videoOutput: (chunk) => videoDecoder.decode(chunk),
+ *   audioOutput: (chunk) => audioDecoder.decode(chunk),
+ *   error: (err) => console.error(err)
+ * });
+ *
+ * await demuxer.load('./video.mp4');
+ *
+ * // Get decoder configs
+ * const videoConfig = demuxer.videoDecoderConfig;
+ * const audioConfig = demuxer.audioDecoderConfig;
+ *
+ * // Configure decoders
+ * videoDecoder.configure(videoConfig);
+ * audioDecoder.configure(audioConfig);
+ *
+ * // Start demuxing
+ * demuxer.demux();
+ *
+ * // Seek to 5 seconds
+ * demuxer.seek(5_000_000);
+ *
+ * demuxer.close();
+ * ```
+ */
+export declare class Mp4Demuxer {
+  /** Create a new MP4 demuxer */
+  constructor(init: Mp4DemuxerInit)
+  /** Load an MP4 file from a path */
+  load(path: string): Promise<void>
+  /**
+   * Load an MP4 from a buffer
+   *
+   * This method uses zero-copy buffer loading - the Uint8Array data is passed
+   * directly to the demuxer without an intermediate copy.
+   */
+  loadBuffer(data: Uint8Array): Promise<void>
+  /** Get all tracks */
+  get tracks(): Array<DemuxerTrackInfo>
+  /** Get container duration in microseconds */
+  get duration(): number | null
+  /** Get video decoder configuration for the selected video track */
+  get videoDecoderConfig(): DemuxerVideoDecoderConfig | null
+  /** Get audio decoder configuration for the selected audio track */
+  get audioDecoderConfig(): DemuxerAudioDecoderConfig | null
+  /** Select a video track by index */
+  selectVideoTrack(trackIndex: number): void
+  /** Select an audio track by index */
+  selectAudioTrack(trackIndex: number): void
+  /**
+   * Start demuxing packets
+   *
+   * If count is specified, reads up to that many packets.
+   * Otherwise, reads all packets until end of stream.
+   */
+  demux(count?: number | undefined | null): void
+  /** Seek to a timestamp in microseconds */
+  seek(timestampUs: number): void
+  /** Close the demuxer and release resources */
+  close(): void
+  /** Get the current state of the demuxer */
+  get state(): DemuxerState
+}
+
+/**
+ * MP4 Muxer for combining encoded video and audio into MP4 container
+ *
+ * Usage:
+ * ```javascript
+ * const muxer = new Mp4Muxer({ fastStart: true });
+ * muxer.addVideoTrack({ codec: 'avc1.42001E', width: 1920, height: 1080 });
+ * muxer.addAudioTrack({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2 });
+ *
+ * // Add encoded chunks from VideoEncoder/AudioEncoder
+ * encoder.configure({
+ *   output: (chunk, metadata) => muxer.addVideoChunk(chunk, metadata)
+ * });
+ *
+ * // Finalize and get MP4 data
+ * const mp4Data = muxer.finalize();
+ * ```
+ */
+export declare class Mp4Muxer {
+  /** Create a new MP4 muxer */
+  constructor(options?: Mp4MuxerOptions | undefined | null)
+  /**
+   * Add a video track to the muxer
+   *
+   * Must be called before adding any chunks.
+   */
+  addVideoTrack(config: Mp4VideoTrackConfig): void
+  /**
+   * Add an audio track to the muxer
+   *
+   * Must be called before adding any chunks.
+   */
+  addAudioTrack(config: Mp4AudioTrackConfig): void
+  /**
+   * Add an encoded video chunk to the muxer
+   *
+   * The chunk should come from a VideoEncoder's output callback.
+   * If metadata contains decoderConfig.description, it will be used to update
+   * the codec extradata (useful for extracting avcC/hvcC from the encoder).
+   */
+  addVideoChunk(
+    chunk: import('./standard').EncodedVideoChunk,
+    metadata?: import('./standard').EncodedVideoChunkMetadata,
+  ): void
+  /**
+   * Add an encoded audio chunk to the muxer
+   *
+   * The chunk should come from an AudioEncoder's output callback.
+   */
+  addAudioChunk(
+    chunk: import('./standard').EncodedAudioChunk,
+    metadata?: import('./standard').EncodedAudioChunkMetadata,
+  ): void
+  /** Flush any buffered data */
+  flush(): void
+  /**
+   * Finalize the muxer and return the MP4 data
+   *
+   * After calling this, no more chunks can be added.
+   * Returns the complete MP4 file as a Uint8Array.
+   */
+  finalize(): Uint8Array
+  /**
+   * Read available data from streaming buffer (streaming mode only)
+   *
+   * Returns available data, or null if no data is ready yet.
+   * Returns empty Uint8Array when streaming is finished.
+   */
+  read(): Uint8Array | null
+  /** Check if muxer is in streaming mode */
+  get isStreaming(): boolean
+  /** Check if streaming is finished (streaming mode only) */
+  get isFinished(): boolean
+  /**
+   * Close the muxer and release resources
+   *
+   * This is called automatically when the muxer is garbage collected,
+   * but can be called explicitly to release resources early.
+   */
+  close(): void
+  /** Get the current state of the muxer */
+  get state(): MuxerState
+}
+
 /** Video color space parameters (WebCodecs spec) - as a class per spec */
 export declare class VideoColorSpace {
   /** Create a new VideoColorSpace */
@@ -780,6 +1024,99 @@ export declare class VideoFrame {
   close(): void
 }
 
+/**
+ * WebM Demuxer for reading encoded video and audio from WebM container
+ *
+ * WebM typically contains VP8, VP9, or AV1 video with Opus or Vorbis audio.
+ */
+export declare class WebMDemuxer {
+  constructor(init: WebMDemuxerInit)
+  load(path: string): Promise<void>
+  /**
+   * Load a WebM from a buffer
+   *
+   * This method uses zero-copy buffer loading - the Uint8Array data is passed
+   * directly to the demuxer without an intermediate copy.
+   */
+  loadBuffer(data: Uint8Array): Promise<void>
+  get tracks(): Array<DemuxerTrackInfo>
+  get duration(): number | null
+  get videoDecoderConfig(): DemuxerVideoDecoderConfig | null
+  get audioDecoderConfig(): DemuxerAudioDecoderConfig | null
+  selectVideoTrack(trackIndex: number): void
+  selectAudioTrack(trackIndex: number): void
+  demux(count?: number | undefined | null): void
+  seek(timestampUs: number): void
+  close(): void
+  get state(): DemuxerState
+}
+
+/**
+ * WebM Muxer for combining encoded video and audio into WebM container
+ *
+ * WebM supports VP8, VP9, AV1 video codecs and Opus, Vorbis audio codecs.
+ *
+ * Usage:
+ * ```javascript
+ * const muxer = new WebMMuxer();
+ * muxer.addVideoTrack({ codec: 'vp09.00.10.08', width: 1920, height: 1080 });
+ * muxer.addAudioTrack({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 });
+ *
+ * // Add encoded chunks from VideoEncoder/AudioEncoder
+ * encoder.configure({
+ *   output: (chunk, metadata) => muxer.addVideoChunk(chunk, metadata)
+ * });
+ *
+ * // Finalize and get WebM data
+ * const webmData = muxer.finalize();
+ * ```
+ */
+export declare class WebMMuxer {
+  /** Create a new WebM muxer */
+  constructor(options?: WebMMuxerOptions | undefined | null)
+  /**
+   * Add a video track to the muxer
+   *
+   * WebM supports VP8, VP9, and AV1 video codecs.
+   */
+  addVideoTrack(config: WebMVideoTrackConfig): void
+  /**
+   * Add an audio track to the muxer
+   *
+   * WebM supports Opus and Vorbis audio codecs.
+   */
+  addAudioTrack(config: WebMAudioTrackConfig): void
+  /** Add an encoded video chunk to the muxer */
+  addVideoChunk(
+    chunk: import('./standard').EncodedVideoChunk,
+    metadata?: import('./standard').EncodedVideoChunkMetadata,
+  ): void
+  /** Add an encoded audio chunk to the muxer */
+  addAudioChunk(
+    chunk: import('./standard').EncodedAudioChunk,
+    metadata?: import('./standard').EncodedAudioChunkMetadata,
+  ): void
+  /** Flush any buffered data */
+  flush(): void
+  /** Finalize the muxer and return the WebM data */
+  finalize(): Uint8Array
+  /**
+   * Read available data from streaming buffer (streaming mode only)
+   *
+   * Returns available data, or null if no data is ready yet.
+   * Returns empty Uint8Array when streaming is finished.
+   */
+  read(): Uint8Array | null
+  /** Check if muxer is in streaming mode */
+  get isStreaming(): boolean
+  /** Check if streaming is finished (streaming mode only) */
+  get isFinished(): boolean
+  /** Close the muxer and release resources */
+  close(): void
+  /** Get the current state of the muxer */
+  get state(): MuxerState
+}
+
 /** AAC bitstream format (W3C WebCodecs AAC Registration) */
 export type AacBitstreamFormat = /** Raw AAC frames - metadata in description */
   | 'aac'
@@ -825,6 +1162,18 @@ export interface AudioDecoderAddEventListenerOptions {
   capture?: boolean
   once?: boolean
   passive?: boolean
+}
+
+/** JavaScript-facing audio decoder config type */
+export interface AudioDecoderConfigJs {
+  /** Codec string */
+  codec?: string
+  /** Sample rate */
+  sampleRate?: number
+  /** Number of channels */
+  numberOfChannels?: number
+  /** Codec-specific description */
+  description?: Uint8Array
 }
 
 /** Decoder configuration output (for passing to decoder) */
@@ -925,6 +1274,50 @@ export type ColorSpaceConversion = /** Apply default color space conversion (spe
   /** No color space conversion */
   | 'none'
 
+/** Audio decoder configuration exposed to JavaScript */
+export interface DemuxerAudioDecoderConfig {
+  /** Codec string */
+  codec: string
+  /** Sample rate */
+  sampleRate: number
+  /** Number of channels */
+  numberOfChannels: number
+  /** Codec-specific description data */
+  description?: Uint8Array
+}
+
+/** Track information exposed to JavaScript */
+export interface DemuxerTrackInfo {
+  /** Track index */
+  index: number
+  /** Track type ("video" or "audio") */
+  trackType: string
+  /** Codec string (WebCodecs format) */
+  codec: string
+  /** Duration in microseconds */
+  duration?: number
+  /** Coded width (video only) */
+  codedWidth?: number
+  /** Coded height (video only) */
+  codedHeight?: number
+  /** Sample rate (audio only) */
+  sampleRate?: number
+  /** Number of channels (audio only) */
+  numberOfChannels?: number
+}
+
+/** Video decoder configuration exposed to JavaScript */
+export interface DemuxerVideoDecoderConfig {
+  /** Codec string */
+  codec: string
+  /** Coded width */
+  codedWidth: number
+  /** Coded height */
+  codedHeight: number
+  /** Codec-specific description data (avcC/hvcC) */
+  description?: Uint8Array
+}
+
 /** DOMRectInit for specifying regions */
 export interface DOMRectInit {
   x?: number
@@ -937,6 +1330,12 @@ export interface DOMRectInit {
 export interface EncodedAudioChunkMetadata {
   /** Decoder configuration for this chunk */
   decoderConfig?: AudioDecoderConfigOutput
+}
+
+/** JavaScript-facing metadata type for audio chunks */
+export interface EncodedAudioChunkMetadataJs {
+  /** Decoder configuration from encoder */
+  decoderConfig?: AudioDecoderConfigJS
 }
 
 /** Type of encoded audio chunk */
@@ -953,6 +1352,14 @@ export interface EncodedVideoChunkMetadata {
   svc?: SvcOutputMetadata
   /** Alpha channel side data (when alpha option is "keep") */
   alphaSideData?: Uint8Array
+}
+
+/** JavaScript-facing metadata type for video chunks */
+export interface EncodedVideoChunkMetadataJs {
+  /** Decoder configuration from encoder */
+  decoderConfig?: VideoDecoderConfigJS
+  /** SVC output metadata */
+  svc?: SvcOutputMetadataJS
 }
 
 /** Type of encoded video chunk */
@@ -1030,6 +1437,78 @@ export type LatencyMode = /** Optimize for quality (default) */
   /** Optimize for low latency */
   | 'realtime'
 
+/** Audio track configuration for MKV muxer */
+export interface MkvAudioTrackConfig {
+  /** Codec string (e.g., "mp4a.40.2", "opus", "flac", "vorbis", "ac3") */
+  codec: string
+  /** Sample rate in Hz */
+  sampleRate: number
+  /** Number of audio channels */
+  numberOfChannels: number
+  /** Codec-specific description data */
+  description?: Uint8Array
+}
+
+/** MKV muxer options */
+export interface MkvMuxerOptions {
+  /** Enable live streaming mode */
+  live?: boolean
+  /** Enable streaming output mode */
+  streaming?: StreamingMuxerOptions
+}
+
+/** Video track configuration for MKV muxer */
+export interface MkvVideoTrackConfig {
+  /** Codec string (e.g., "avc1.42001E", "hev1.1.6.L93.B0", "vp09.00.10.08", "av01.0.04M.08") */
+  codec: string
+  /** Video width in pixels */
+  width: number
+  /** Video height in pixels */
+  height: number
+  /** Codec-specific description data */
+  description?: Uint8Array
+}
+
+/** Audio track configuration for MP4 muxer */
+export interface Mp4AudioTrackConfig {
+  /** Codec string (e.g., "mp4a.40.2" for AAC-LC, "opus") */
+  codec: string
+  /** Sample rate in Hz */
+  sampleRate: number
+  /** Number of audio channels */
+  numberOfChannels: number
+  /** Codec-specific description data (esds for AAC, etc.) */
+  description?: Uint8Array
+}
+
+/** MP4 muxer options */
+export interface Mp4MuxerOptions {
+  /**
+   * Move moov atom to beginning for better streaming (default: false)
+   * Note: Not compatible with streaming output mode
+   */
+  fastStart?: boolean
+  /**
+   * Use fragmented MP4 for streaming output
+   * When true, uses frag_keyframe+empty_moov+default_base_moof
+   */
+  fragmented?: boolean
+  /** Enable streaming output mode */
+  streaming?: StreamingMuxerOptions
+}
+
+/** Video track configuration for MP4 muxer */
+export interface Mp4VideoTrackConfig {
+  /** Codec string (e.g., "avc1.42001E", "hev1.1.6.L93.B0", "av01.0.04M.08") */
+  codec: string
+  /** Video width in pixels */
+  width: number
+  /** Video height in pixels */
+  height: number
+  /** Codec-specific description data (avcC/hvcC/av1C from encoder metadata) */
+  description?: Uint8Array
+}
+
 /** Opus application mode (W3C WebCodecs Opus Registration) */
 export type OpusApplication = /** Optimize for VoIP (speech intelligibility) */
   | 'voip'
@@ -1094,9 +1573,21 @@ export interface PlaneLayout {
  */
 export declare function resetHardwareFallbackState(): void
 
+/** Streaming mode options for muxers */
+export interface StreamingMuxerOptions {
+  /** Buffer capacity for streaming output (default: 256KB) */
+  bufferCapacity?: number
+}
+
 /** SVC (Scalable Video Coding) output metadata (W3C WebCodecs spec) */
 export interface SvcOutputMetadata {
   /** Temporal layer ID for this frame */
+  temporalLayerId?: number
+}
+
+/** JavaScript-facing SVC metadata */
+export interface SvcOutputMetadataJs {
+  /** Temporal layer ID */
   temporalLayerId?: number
 }
 
@@ -1117,6 +1608,18 @@ export interface VideoDecoderAddEventListenerOptions {
   capture?: boolean
   once?: boolean
   passive?: boolean
+}
+
+/** JavaScript-facing decoder config type */
+export interface VideoDecoderConfigJs {
+  /** Codec string */
+  codec?: string
+  /** Codec-specific description */
+  description?: Uint8Array
+  /** Coded width */
+  codedWidth?: number
+  /** Coded height */
+  codedHeight?: number
 }
 
 /** Decoder configuration output (for passing to decoder) */
@@ -1325,3 +1828,35 @@ export type VideoTransferCharacteristics = /** BT.709 transfer */
   | 'pq'
   /** Hybrid Log-Gamma (HDR) */
   | 'hlg'
+
+/** Audio track configuration for WebM muxer */
+export interface WebMAudioTrackConfig {
+  /** Codec string (e.g., "opus", "vorbis") */
+  codec: string
+  /** Sample rate in Hz */
+  sampleRate: number
+  /** Number of audio channels */
+  numberOfChannels: number
+  /** Codec-specific description data */
+  description?: Uint8Array
+}
+
+/** WebM muxer options */
+export interface WebMMuxerOptions {
+  /** Enable live streaming mode (cluster-at-a-time output) */
+  live?: boolean
+  /** Enable streaming output mode */
+  streaming?: StreamingMuxerOptions
+}
+
+/** Video track configuration for WebM muxer */
+export interface WebMVideoTrackConfig {
+  /** Codec string (e.g., "vp8", "vp09.00.10.08", "av01.0.04M.08") */
+  codec: string
+  /** Video width in pixels */
+  width: number
+  /** Video height in pixels */
+  height: number
+  /** Codec-specific description data */
+  description?: Uint8Array
+}

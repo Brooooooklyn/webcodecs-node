@@ -4,10 +4,14 @@
 //! ensuring proper resource cleanup and memory safety.
 
 pub mod audio_buffer;
+pub mod avio_context;
 pub mod context;
+pub mod demuxer;
 pub mod frame;
 pub mod hwdevice;
 pub mod hwframes;
+pub mod io_buffer;
+pub mod muxer;
 pub mod packet;
 pub mod resampler;
 pub mod scaler;

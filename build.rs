@@ -354,7 +354,7 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
   codec_lib_paths.insert(0, lib_dir.to_path_buf());
 
   // FFmpeg core libraries - link using full paths
-  let ffmpeg_libs = ["avcodec", "avutil", "swscale", "swresample"];
+  let ffmpeg_libs = ["avformat", "avcodec", "avutil", "swscale", "swresample"];
 
   for lib in &ffmpeg_libs {
     // Try different naming conventions (Unix .a and Windows .lib)

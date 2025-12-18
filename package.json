@@ -55,6 +55,7 @@
     "prepublishOnly": "napi prepublish -t npm",
     "test": "ava",
     "typecheck": "tsc -b tsconfig.json",
+    "preversion": "napi build --platform && git add .",
     "version": "napi version"
   },
   "lint-staged": {

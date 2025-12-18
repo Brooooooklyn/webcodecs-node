@@ -1262,6 +1262,256 @@ pub fn convert_hvcc_extradata_to_annexb(data: &[u8]) -> Option<Vec<u8>> {
 }
 
 // ============================================================================
+// AV1 OBU to av1C Conversion
+// ============================================================================
+
+/// Check if extradata is already in av1C format (AV1CodecConfigurationRecord)
+///
+/// av1C format per ISO/IEC 14496-15 Section 4.2.3.2 starts with:
+/// - marker (1 bit) = 1
+/// - version (7 bits) = 1
+///
+/// Combined = 0x81
+pub fn is_av1c_extradata(data: &[u8]) -> bool {
+  // av1C starts with marker=1 (1 bit) + version=1 (7 bits) = 0x81
+  // Minimum size: 4 bytes header
+  data.len() >= 4 && data[0] == 0x81
+}
+
+/// Read LEB128 variable-length unsigned integer
+///
+/// Returns (value, bytes_consumed) or None if invalid
+fn read_leb128(data: &[u8]) -> Option<(usize, usize)> {
+  let mut value: usize = 0;
+  let mut bytes_read = 0;
+
+  for (i, &byte) in data.iter().take(8).enumerate() {
+    value |= ((byte & 0x7F) as usize) << (i * 7);
+    bytes_read = i + 1;
+    if byte & 0x80 == 0 {
+      break;
+    }
+  }
+
+  if bytes_read == 0 {
+    return None;
+  }
+
+  Some((value, bytes_read))
+}
+
+/// Find the sequence header OBU in raw AV1 OBU data
+///
+/// OBU header format:
+/// - obu_forbidden_bit (1 bit): Must be 0
+/// - obu_type (4 bits): OBU type
+/// - obu_extension_flag (1 bit)
+/// - obu_has_size_field (1 bit)
+/// - obu_reserved_1bit (1 bit)
+///
+/// OBU_SEQUENCE_HEADER = 1
+fn find_sequence_header_obu(data: &[u8]) -> Option<Vec<u8>> {
+  let mut offset = 0;
+
+  while offset < data.len() {
+    let header = data[offset];
+
+    // Check forbidden bit (must be 0)
+    if (header & 0x80) != 0 {
+      return None;
+    }
+
+    let obu_type = (header >> 3) & 0x0F;
+    let has_extension = (header >> 2) & 0x01 != 0;
+    let has_size = (header >> 1) & 0x01 != 0;
+
+    let mut header_size = 1;
+
+    // Skip extension header if present
+    if has_extension {
+      if offset + header_size >= data.len() {
+        return None;
+      }
+      header_size += 1;
+    }
+
+    // Get OBU size
+    let obu_size = if has_size {
+      if offset + header_size >= data.len() {
+        return None;
+      }
+      let (size, bytes_read) = read_leb128(&data[offset + header_size..])?;
+      header_size += bytes_read;
+      size
+    } else {
+      // Size not specified - assume rest of data
+      data.len().saturating_sub(offset + header_size)
+    };
+
+    // Check if this is sequence header (OBU_SEQUENCE_HEADER = 1)
+    if obu_type == 1 {
+      let obu_start = offset;
+      let obu_end = offset + header_size + obu_size;
+      if obu_end <= data.len() {
+        return Some(data[obu_start..obu_end].to_vec());
+      }
+    }
+
+    // Move to next OBU
+    let next_offset = offset.checked_add(header_size)?.checked_add(obu_size)?;
+    if next_offset <= offset {
+      // Prevent infinite loop
+      break;
+    }
+    offset = next_offset;
+  }
+
+  None
+}
+
+/// Get the payload offset within a sequence header OBU
+///
+/// Returns the byte offset where the actual sequence header data starts
+fn get_seq_header_payload_offset(obu_data: &[u8]) -> Option<usize> {
+  if obu_data.is_empty() {
+    return None;
+  }
+
+  let header = obu_data[0];
+  let has_extension = (header >> 2) & 0x01 != 0;
+  let has_size = (header >> 1) & 0x01 != 0;
+
+  let mut offset = 1;
+
+  if has_extension {
+    if offset >= obu_data.len() {
+      return None;
+    }
+    offset += 1;
+  }
+
+  if has_size {
+    if offset >= obu_data.len() {
+      return None;
+    }
+    let (_, bytes_read) = read_leb128(&obu_data[offset..])?;
+    offset += bytes_read;
+  }
+
+  Some(offset)
+}
+
+/// Convert raw AV1 OBU extradata to av1C box format
+///
+/// av1C format (AV1CodecConfigurationRecord) per ISO/IEC 14496-15 Section 4.2.3.2:
+/// ```text
+/// unsigned int (1) marker = 1;
+/// unsigned int (7) version = 1;
+/// unsigned int (3) seq_profile;
+/// unsigned int (5) seq_level_idx_0;
+/// unsigned int (1) seq_tier_0;
+/// unsigned int (1) high_bitdepth;
+/// unsigned int (1) twelve_bit;
+/// unsigned int (1) monochrome;
+/// unsigned int (1) chroma_subsampling_x;
+/// unsigned int (1) chroma_subsampling_y;
+/// unsigned int (2) chroma_sample_position;
+/// unsigned int (3) reserved = 0;
+/// unsigned int (1) initial_presentation_delay_present;
+/// unsigned int (4) initial_presentation_delay_minus_one OR reserved;
+/// unsigned int (8)[] configOBUs;
+/// ```
+///
+/// libaom outputs raw OBUs as extradata, but FFmpeg's WebM/MKV muxers expect av1C format.
+/// rav1e outputs proper av1C format directly.
+pub fn convert_obu_extradata_to_av1c(data: &[u8]) -> Option<Vec<u8>> {
+  if data.is_empty() {
+    return None;
+  }
+
+  // Check if already in av1C format
+  if is_av1c_extradata(data) {
+    return Some(data.to_vec());
+  }
+
+  // Find the sequence header OBU
+  let seq_header_obu = find_sequence_header_obu(data)?;
+
+  // Get the payload offset to parse sequence header fields
+  let payload_offset = get_seq_header_payload_offset(&seq_header_obu)?;
+  let payload = &seq_header_obu[payload_offset..];
+
+  if payload.is_empty() {
+    return None;
+  }
+
+  // Parse first byte of sequence header payload
+  // Bit layout: seq_profile (3) | still_picture (1) | reduced_still_picture_header (1) | ...
+  let first_byte = payload[0];
+  let seq_profile = (first_byte >> 5) & 0x07;
+
+  // For the av1C header, we need profile, level, tier, and color info.
+  // Parsing the full sequence header is complex, so we use reasonable defaults
+  // based on the profile for most common cases.
+  //
+  // The muxer primarily cares about:
+  // 1. The profile (which we extract)
+  // 2. The raw sequence header OBU (which we include)
+  //
+  // Level 4.0 (seq_level_idx = 8) is a safe default for most content.
+
+  let seq_level_idx_0: u8 = 8; // Level 4.0 - common default
+  let seq_tier_0: u8 = 0; // Main tier
+
+  // Color config defaults based on profile:
+  // Profile 0 (Main): 8-bit or 10-bit, 4:2:0
+  // Profile 1 (High): 8-bit or 10-bit, 4:4:4
+  // Profile 2 (Professional): up to 12-bit, any chroma
+  let (high_bitdepth, twelve_bit, monochrome, chroma_x, chroma_y, chroma_pos): (
+    u8,
+    u8,
+    u8,
+    u8,
+    u8,
+    u8,
+  ) = match seq_profile {
+    0 => (0, 0, 0, 1, 1, 0), // Main: 8-bit, 4:2:0
+    1 => (0, 0, 0, 0, 0, 0), // High: 8-bit, 4:4:4
+    2 => (1, 0, 0, 1, 1, 0), // Professional: 10-bit, 4:2:0
+    _ => (0, 0, 0, 1, 1, 0), // Default to Main profile settings
+  };
+
+  // Build av1C box (4 bytes header + configOBUs)
+  let mut result = Vec::with_capacity(4 + seq_header_obu.len());
+
+  // Byte 0: marker (1 bit = 1) + version (7 bits = 1) = 0x81
+  result.push(0x81);
+
+  // Byte 1: seq_profile (3 bits) + seq_level_idx_0 (5 bits)
+  result.push((seq_profile << 5) | (seq_level_idx_0 & 0x1F));
+
+  // Byte 2: seq_tier_0 (1) + high_bitdepth (1) + twelve_bit (1) + monochrome (1) +
+  //         chroma_subsampling_x (1) + chroma_subsampling_y (1) + chroma_sample_position (2)
+  let byte2 = (seq_tier_0 << 7)
+    | (high_bitdepth << 6)
+    | (twelve_bit << 5)
+    | (monochrome << 4)
+    | (chroma_x << 3)
+    | (chroma_y << 2)
+    | (chroma_pos & 0x03);
+  result.push(byte2);
+
+  // Byte 3: reserved (3 bits = 0) + initial_presentation_delay_present (1 bit = 0) +
+  //         initial_presentation_delay_minus_one (4 bits = 0)
+  result.push(0x00);
+
+  // Append the raw sequence header OBU as configOBUs
+  result.extend_from_slice(&seq_header_obu);
+
+  Some(result)
+}
+
+// ============================================================================
 // Codec-Specific Encoder Configurations (W3C WebCodecs Codec Registry)
 // ============================================================================
 
