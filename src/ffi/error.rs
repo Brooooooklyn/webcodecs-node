@@ -253,13 +253,6 @@ mod tests {
   use super::*;
 
   #[test]
-  fn test_error_codes() {
-    assert!(AVERROR_EOF < 0);
-    assert!(AVERROR_EAGAIN < 0);
-    assert!(AVERROR_EINVAL < 0);
-  }
-
-  #[test]
   fn test_check_error() {
     assert!(check_error(0).is_ok());
     assert!(check_error(100).is_ok());

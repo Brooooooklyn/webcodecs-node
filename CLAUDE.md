@@ -19,6 +19,12 @@ WebCodecs API implementation for Node.js using FFmpeg, built with napi-rs (Rust 
 | VideoFrame          | ✅ Complete | All pixel formats, async copyTo, format conversion, Canvas support |
 | AudioData           | ✅ Complete | All sample formats                                                 |
 | ImageDecoder        | ✅ Complete | JPEG, PNG, WebP, GIF, BMP, AVIF                                    |
+| Mp4Demuxer          | ✅ Complete | H.264, H.265, AV1, AAC, Opus                                       |
+| WebMDemuxer         | ✅ Complete | VP8, VP9, AV1, Opus, Vorbis                                        |
+| MkvDemuxer          | ✅ Complete | All codecs                                                         |
+| Mp4Muxer            | ✅ Complete | H.264, H.265, AV1 + AAC, Opus, MP3, FLAC                           |
+| WebMMuxer           | ✅ Complete | VP8, VP9, AV1 + Opus, Vorbis                                       |
+| MkvMuxer            | ✅ Complete | All codecs                                                         |
 | Threading           | ✅ Complete | Non-blocking Drop, proper lifecycle                                |
 | W3C Spec Compliance | ✅ Complete | All APIs aligned                                                   |
 | Type Definitions    | ✅ Complete | ~1,100 lines in index.d.ts                                         |
@@ -60,6 +66,14 @@ src/
 │   ├── encoded_video_chunk.rs
 │   ├── encoded_audio_chunk.rs
 │   ├── image_decoder.rs    # ImageDecoder class
+│   ├── demuxer_base.rs     # Shared demuxer implementation
+│   ├── muxer_base.rs       # Shared muxer implementation
+│   ├── mp4_demuxer.rs      # Mp4Demuxer class
+│   ├── mp4_muxer.rs        # Mp4Muxer class
+│   ├── webm_demuxer.rs     # WebMDemuxer class
+│   ├── webm_muxer.rs       # WebMMuxer class
+│   ├── mkv_demuxer.rs      # MkvDemuxer class
+│   ├── mkv_muxer.rs        # MkvMuxer class
 │   ├── codec_string.rs     # Codec string parsing
 │   └── error.rs            # Native DOMException helpers
 └── lib.rs         # Crate root, module init, re-exports
@@ -212,6 +226,14 @@ Detection order:
 | `src/webcodecs/audio_decoder.rs` | AudioDecoder implementation                  |
 | `src/webcodecs/video_frame.rs`   | VideoFrame with constructor overloading      |
 | `src/webcodecs/audio_data.rs`    | AudioData with sync copyTo()                 |
+| `src/webcodecs/demuxer_base.rs`  | Shared demuxer implementation                |
+| `src/webcodecs/muxer_base.rs`    | Shared muxer implementation                  |
+| `src/webcodecs/mp4_demuxer.rs`   | Mp4Demuxer class                             |
+| `src/webcodecs/mp4_muxer.rs`     | Mp4Muxer class                               |
+| `src/webcodecs/webm_demuxer.rs`  | WebMDemuxer class                            |
+| `src/webcodecs/webm_muxer.rs`    | WebMMuxer class                              |
+| `src/webcodecs/mkv_demuxer.rs`   | MkvDemuxer class                             |
+| `src/webcodecs/mkv_muxer.rs`     | MkvMuxer class                               |
 | `src/webcodecs/error.rs`         | Native DOMException helpers                  |
 | `src/webcodecs/codec_string.rs`  | Codec string parser (avc1, vp09, av01, hev1) |
 | `src/codec/context.rs`           | FFmpeg encoder/decoder context wrapper       |
@@ -341,6 +363,153 @@ frame2.image.close()
 gifDecoder.reset()
 gifDecoder.close()
 ```
+
+## Demuxer Usage
+
+Demuxers extract encoded video/audio chunks from container files (MP4, WebM, MKV).
+
+```typescript
+// Create demuxer with callbacks
+const demuxer = new Mp4Demuxer({
+  videoOutput: (chunk) => videoDecoder.decode(chunk),
+  audioOutput: (chunk) => audioDecoder.decode(chunk),
+  error: (err) => console.error(err),
+})
+
+// Load from file path or buffer
+await demuxer.load('./video.mp4')
+// or: await demuxer.loadBuffer(uint8Array)
+
+// Get decoder configs for VideoDecoder/AudioDecoder
+const videoConfig = demuxer.videoDecoderConfig
+const audioConfig = demuxer.audioDecoderConfig
+
+videoDecoder.configure(videoConfig)
+audioDecoder.configure(audioConfig)
+
+// Get track info
+console.log(demuxer.tracks) // Array of DemuxerTrackInfo
+console.log(demuxer.duration) // Duration in microseconds
+
+// Start demuxing (async, calls callbacks)
+demuxer.demux() // Demux all packets
+demuxer.demux(100) // Demux up to 100 packets
+
+// Seek to timestamp (microseconds)
+demuxer.seek(5_000_000) // Seek to 5 seconds
+
+demuxer.close()
+```
+
+### Demuxer State Machine
+
+```
+unloaded -> ready -> demuxing -> ended
+               |                   |
+               +---> closed <------+
+```
+
+| State    | Description                |
+| -------- | -------------------------- |
+| unloaded | Initial state, call load() |
+| ready    | Loaded, can demux or seek  |
+| demuxing | Currently demuxing packets |
+| ended    | All packets read           |
+| closed   | Resources released         |
+
+## Muxer Usage
+
+Muxers combine encoded video/audio chunks into container files (MP4, WebM, MKV).
+
+```typescript
+// Create muxer with options
+const muxer = new Mp4Muxer({ fastStart: true })
+
+// Add video track
+muxer.addVideoTrack({
+  codec: 'avc1.42001E',
+  width: 1920,
+  height: 1080,
+  description: metadata.decoderConfig?.description,
+})
+
+// Add audio track
+muxer.addAudioTrack({
+  codec: 'mp4a.40.2',
+  sampleRate: 48000,
+  numberOfChannels: 2,
+  description: audioMetadata.decoderConfig?.description,
+})
+
+// Add chunks as they're encoded
+encoder.configure({
+  output: (chunk, metadata) => muxer.addVideoChunk(chunk, metadata),
+})
+
+// Finalize and get output
+await muxer.flush()
+const mp4Data = muxer.finalize() // Uint8Array
+
+fs.writeFileSync('output.mp4', mp4Data)
+muxer.close()
+```
+
+### Streaming Muxer Mode
+
+```typescript
+const muxer = new Mp4Muxer({
+  fragmented: true, // Required for MP4 streaming
+  streaming: { bufferCapacity: 256 * 1024 },
+})
+
+muxer.addVideoTrack({ ... })
+
+// Add chunks as they arrive
+muxer.addVideoChunk(chunk, metadata)
+
+// Read available data incrementally
+while (!muxer.isFinished) {
+  const data = muxer.read()
+  if (data) {
+    stream.write(data)
+  }
+}
+```
+
+### Muxer State Machine
+
+```
+configuring -> muxing -> finalized -> closed
+                 |                      |
+                 +----> closed <--------+
+```
+
+| State       | Description                |
+| ----------- | -------------------------- |
+| configuring | Adding tracks              |
+| muxing      | Writing chunks             |
+| finalized   | Finalized, get output data |
+| closed      | Resources released         |
+
+### Container/Codec Matrix
+
+| Container | Video Codecs                | Audio Codecs                 |
+| --------- | --------------------------- | ---------------------------- |
+| MP4       | H.264, H.265, AV1           | AAC, Opus, MP3, FLAC         |
+| WebM      | VP8, VP9, AV1               | Opus, Vorbis                 |
+| MKV       | H.264, H.265, VP8, VP9, AV1 | AAC, Opus, Vorbis, FLAC, MP3 |
+
+### Muxer Options
+
+| Container | Option     | Description                                     |
+| --------- | ---------- | ----------------------------------------------- |
+| MP4       | fastStart  | Move moov atom to beginning (not for streaming) |
+| MP4       | fragmented | Use fragmented MP4 for streaming                |
+| MP4       | streaming  | Enable streaming output mode                    |
+| WebM      | live       | Enable live streaming mode                      |
+| WebM      | streaming  | Enable streaming output mode                    |
+| MKV       | live       | Enable live streaming mode                      |
+| MKV       | streaming  | Enable streaming output mode                    |
 
 ## Test Structure
 

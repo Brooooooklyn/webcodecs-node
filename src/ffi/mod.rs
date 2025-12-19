@@ -5,6 +5,7 @@
 
 pub mod accessors;
 pub mod avcodec;
+pub mod avformat;
 pub mod avutil;
 pub mod error;
 pub mod hwaccel;

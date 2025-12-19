@@ -1,0 +1,243 @@
+//! WebMDemuxer - WebCodecs-style demuxer for WebM containers
+//!
+//! Provides a JavaScript-friendly API for demuxing WebM container files.
+//! WebM typically contains VP8, VP9, or AV1 video with Opus or Vorbis audio.
+
+use crate::ffi::AVCodecID;
+use crate::webcodecs::demuxer_base::{
+  AudioOutputCallback, DemuxerAudioDecoderConfig, DemuxerFormat, DemuxerInner, DemuxerTrackInfo,
+  DemuxerVideoDecoderConfig, ErrorCallback, VideoOutputCallback, parse_vp9_codec_string,
+  with_demuxer_inner, with_demuxer_inner_mut,
+};
+use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunk;
+use crate::webcodecs::encoded_video_chunk::EncodedVideoChunk;
+use napi::bindgen_prelude::*;
+use napi::threadsafe_function::UnknownReturnValue;
+use napi_derive::napi;
+use std::sync::{Arc, Mutex};
+
+// ============================================================================
+// WebMFormat - Format-specific behavior for WebM containers
+// ============================================================================
+
+/// WebM format implementation
+pub struct WebMFormat;
+
+impl DemuxerFormat for WebMFormat {
+  fn codec_id_to_video_string(codec_id: AVCodecID, extradata: Option<&[u8]>) -> String {
+    match codec_id {
+      AVCodecID::Vp8 => "vp8".to_string(),
+      AVCodecID::Vp9 => parse_vp9_codec_string(extradata),
+      AVCodecID::Av1 => "av01.0.04M.08".to_string(),
+      _ => format!("{:?}", codec_id).to_lowercase(),
+    }
+  }
+
+  fn codec_id_to_audio_string(codec_id: AVCodecID, _extradata: Option<&[u8]>) -> String {
+    match codec_id {
+      AVCodecID::Opus => "opus".to_string(),
+      AVCodecID::Vorbis => "vorbis".to_string(),
+      _ => format!("{:?}", codec_id).to_lowercase(),
+    }
+  }
+}
+
+// ============================================================================
+// WebMDemuxerInit - Initialization options
+// ============================================================================
+
+/// Initialization options for WebMDemuxer
+pub struct WebMDemuxerInit {
+  pub video_output: Option<VideoOutputCallback>,
+  pub audio_output: Option<AudioOutputCallback>,
+  pub error: ErrorCallback,
+}
+
+impl FromNapiValue for WebMDemuxerInit {
+  unsafe fn from_napi_value(
+    env: napi::sys::napi_env,
+    value: napi::sys::napi_value,
+  ) -> Result<Self> {
+    let env_wrapper = Env::from_raw(env);
+    let obj = unsafe { Object::from_napi_value(env, value)? };
+
+    // Get optional video output callback
+    let video_output: Option<VideoOutputCallback> = match obj
+      .get_named_property::<Option<Function<EncodedVideoChunk, UnknownReturnValue>>>("videoOutput")
+    {
+      Ok(Some(func)) => Some(
+        func
+          .build_threadsafe_function()
+          .callee_handled::<false>()
+          .weak::<true>()
+          .build()?,
+      ),
+      _ => None,
+    };
+
+    // Get optional audio output callback
+    let audio_output: Option<AudioOutputCallback> = match obj
+      .get_named_property::<Option<Function<EncodedAudioChunk, UnknownReturnValue>>>("audioOutput")
+    {
+      Ok(Some(func)) => Some(
+        func
+          .build_threadsafe_function()
+          .callee_handled::<false>()
+          .weak::<true>()
+          .build()?,
+      ),
+      _ => None,
+    };
+
+    // Get required error callback
+    let error_func: Function<Error, UnknownReturnValue> = match obj.get_named_property("error") {
+      Ok(cb) => cb,
+      Err(_) => {
+        env_wrapper.throw_type_error("error callback is required", None)?;
+        return Err(Error::new(Status::InvalidArg, "error callback is required"));
+      }
+    };
+
+    let error: ErrorCallback = error_func
+      .build_threadsafe_function()
+      .callee_handled::<false>()
+      .weak::<true>()
+      .build()?;
+
+    Ok(WebMDemuxerInit {
+      video_output,
+      audio_output,
+      error,
+    })
+  }
+}
+
+// ============================================================================
+// WebMDemuxer - NAPI class wrapper
+// ============================================================================
+
+/// WebM Demuxer for reading encoded video and audio from WebM container
+///
+/// WebM typically contains VP8, VP9, or AV1 video with Opus or Vorbis audio.
+#[napi]
+pub struct WebMDemuxer {
+  inner: Arc<Mutex<DemuxerInner<WebMFormat>>>,
+}
+
+#[napi]
+impl WebMDemuxer {
+  #[napi(constructor)]
+  pub fn new(init: WebMDemuxerInit) -> Result<Self> {
+    Ok(Self {
+      inner: Arc::new(Mutex::new(DemuxerInner::new(
+        init.video_output,
+        init.audio_output,
+        init.error,
+      ))),
+    })
+  }
+
+  #[napi]
+  pub async fn load(&self, path: String) -> Result<()> {
+    let inner = self.inner.clone();
+
+    tokio::task::spawn_blocking(move || {
+      let mut guard = inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+      guard.load_file(&path)
+    })
+    .await
+    .map_err(|e| Error::new(Status::GenericFailure, format!("Task error: {}", e)))?
+  }
+
+  /// Load a WebM from a buffer
+  ///
+  /// This method uses zero-copy buffer loading - the Uint8Array data is passed
+  /// directly to the demuxer without an intermediate copy.
+  #[napi]
+  pub async fn load_buffer(&self, data: Uint8Array) -> Result<()> {
+    let inner = self.inner.clone();
+    // Zero-copy: pass Uint8Array directly (it implements BufferSource)
+
+    tokio::task::spawn_blocking(move || {
+      let mut guard = inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+      guard.load_buffer(data)
+    })
+    .await
+    .map_err(|e| Error::new(Status::GenericFailure, format!("Task error: {}", e)))?
+  }
+
+  #[napi(getter)]
+  pub fn tracks(&self) -> Result<Vec<DemuxerTrackInfo>> {
+    let guard = with_demuxer_inner!(self);
+    Ok(guard.get_tracks())
+  }
+
+  #[napi(getter)]
+  pub fn duration(&self) -> Result<Option<i64>> {
+    let guard = with_demuxer_inner!(self);
+    Ok(guard.get_duration())
+  }
+
+  #[napi(getter)]
+  pub fn video_decoder_config(&self) -> Result<Option<DemuxerVideoDecoderConfig>> {
+    let guard = with_demuxer_inner!(self);
+    Ok(guard.get_video_decoder_config())
+  }
+
+  #[napi(getter)]
+  pub fn audio_decoder_config(&self) -> Result<Option<DemuxerAudioDecoderConfig>> {
+    let guard = with_demuxer_inner!(self);
+    Ok(guard.get_audio_decoder_config())
+  }
+
+  #[napi]
+  pub fn select_video_track(&self, track_index: i32) -> Result<()> {
+    let mut guard = with_demuxer_inner_mut!(self);
+    guard.select_video_track(track_index)
+  }
+
+  #[napi]
+  pub fn select_audio_track(&self, track_index: i32) -> Result<()> {
+    let mut guard = with_demuxer_inner_mut!(self);
+    guard.select_audio_track(track_index)
+  }
+
+  #[napi]
+  pub fn demux(&self, count: Option<u32>) -> Result<()> {
+    let inner = self.inner.clone();
+    let max_packets = count.unwrap_or(u32::MAX);
+
+    std::thread::spawn(move || {
+      let mut guard = match inner.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+      };
+      guard.demux_sync(max_packets);
+    });
+
+    Ok(())
+  }
+
+  #[napi]
+  pub fn seek(&self, timestamp_us: i64) -> Result<()> {
+    let mut guard = with_demuxer_inner_mut!(self);
+    guard.seek(timestamp_us)
+  }
+
+  #[napi]
+  pub fn close(&self) -> Result<()> {
+    let mut guard = with_demuxer_inner_mut!(self);
+    guard.close();
+    Ok(())
+  }
+
+  #[napi(getter)]
+  pub fn state(&self) -> Result<String> {
+    let guard = with_demuxer_inner!(self);
+    Ok(guard.state_string().to_string())
+  }
+}

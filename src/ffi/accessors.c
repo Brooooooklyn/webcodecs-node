@@ -728,3 +728,282 @@ int ff_image_fill_arrays(uint8_t* dst_data[4], int dst_linesize[4],
                          int width, int height, int align) {
     return av_image_fill_arrays(dst_data, dst_linesize, src, pix_fmt, width, height, align);
 }
+
+/* ============================================================================
+ * AVFormatContext Accessors (libavformat)
+ * ============================================================================ */
+
+#include <libavformat/avformat.h>
+
+void fffmt_set_pb(AVFormatContext* ctx, AVIOContext* pb) {
+    ctx->pb = pb;
+}
+
+AVIOContext* fffmt_get_pb(AVFormatContext* ctx) {
+    return ctx->pb;
+}
+
+unsigned int fffmt_get_nb_streams(const AVFormatContext* ctx) {
+    return ctx->nb_streams;
+}
+
+AVStream* fffmt_get_stream(AVFormatContext* ctx, unsigned int index) {
+    if (index >= ctx->nb_streams) {
+        return NULL;
+    }
+    return ctx->streams[index];
+}
+
+int64_t fffmt_get_duration(const AVFormatContext* ctx) {
+    return ctx->duration;
+}
+
+int64_t fffmt_get_bit_rate(const AVFormatContext* ctx) {
+    return ctx->bit_rate;
+}
+
+const AVOutputFormat* fffmt_get_oformat(const AVFormatContext* ctx) {
+    return ctx->oformat;
+}
+
+const AVInputFormat* fffmt_get_iformat(const AVFormatContext* ctx) {
+    return ctx->iformat;
+}
+
+int fffmt_get_oformat_flags(const AVFormatContext* ctx) {
+    return ctx->oformat ? ctx->oformat->flags : 0;
+}
+
+/* ============================================================================
+ * AVStream Accessors
+ * ============================================================================ */
+
+int ffstream_get_index(const AVStream* stream) {
+    return stream->index;
+}
+
+AVCodecParameters* ffstream_get_codecpar(AVStream* stream) {
+    return stream->codecpar;
+}
+
+const AVCodecParameters* ffstream_get_codecpar_const(const AVStream* stream) {
+    return stream->codecpar;
+}
+
+void ffstream_get_time_base(const AVStream* stream, int* num, int* den) {
+    *num = stream->time_base.num;
+    *den = stream->time_base.den;
+}
+
+void ffstream_set_time_base(AVStream* stream, int num, int den) {
+    stream->time_base.num = num;
+    stream->time_base.den = den;
+}
+
+void ffstream_get_avg_frame_rate(const AVStream* stream, int* num, int* den) {
+    *num = stream->avg_frame_rate.num;
+    *den = stream->avg_frame_rate.den;
+}
+
+int64_t ffstream_get_duration(const AVStream* stream) {
+    return stream->duration;
+}
+
+int64_t ffstream_get_nb_frames(const AVStream* stream) {
+    return stream->nb_frames;
+}
+
+int64_t ffstream_get_start_time(const AVStream* stream) {
+    return stream->start_time;
+}
+
+/* ============================================================================
+ * AVCodecParameters Accessors
+ * ============================================================================ */
+
+int ffcodecpar_get_codec_type(const AVCodecParameters* par) {
+    return par->codec_type;
+}
+
+void ffcodecpar_set_codec_type(AVCodecParameters* par, int codec_type) {
+    par->codec_type = codec_type;
+}
+
+int ffcodecpar_get_codec_id(const AVCodecParameters* par) {
+    return par->codec_id;
+}
+
+void ffcodecpar_set_codec_id(AVCodecParameters* par, int codec_id) {
+    par->codec_id = codec_id;
+}
+
+unsigned int ffcodecpar_get_codec_tag(const AVCodecParameters* par) {
+    return par->codec_tag;
+}
+
+void ffcodecpar_set_codec_tag(AVCodecParameters* par, unsigned int codec_tag) {
+    par->codec_tag = codec_tag;
+}
+
+int ffcodecpar_get_format(const AVCodecParameters* par) {
+    return par->format;
+}
+
+void ffcodecpar_set_format(AVCodecParameters* par, int format) {
+    par->format = format;
+}
+
+int64_t ffcodecpar_get_bit_rate(const AVCodecParameters* par) {
+    return par->bit_rate;
+}
+
+void ffcodecpar_set_bit_rate(AVCodecParameters* par, int64_t bit_rate) {
+    par->bit_rate = bit_rate;
+}
+
+int ffcodecpar_get_width(const AVCodecParameters* par) {
+    return par->width;
+}
+
+void ffcodecpar_set_width(AVCodecParameters* par, int width) {
+    par->width = width;
+}
+
+int ffcodecpar_get_height(const AVCodecParameters* par) {
+    return par->height;
+}
+
+void ffcodecpar_set_height(AVCodecParameters* par, int height) {
+    par->height = height;
+}
+
+int ffcodecpar_get_sample_rate(const AVCodecParameters* par) {
+    return par->sample_rate;
+}
+
+void ffcodecpar_set_sample_rate(AVCodecParameters* par, int sample_rate) {
+    par->sample_rate = sample_rate;
+}
+
+int ffcodecpar_get_channels(const AVCodecParameters* par) {
+#if LIBAVCODEC_VERSION_MAJOR >= 60
+    return par->ch_layout.nb_channels;
+#elif LIBAVCODEC_VERSION_MAJOR >= 59 && LIBAVCODEC_VERSION_MINOR >= 24
+    return par->ch_layout.nb_channels;
+#else
+    return par->channels;
+#endif
+}
+
+void ffcodecpar_set_channels(AVCodecParameters* par, int channels) {
+#if LIBAVCODEC_VERSION_MAJOR >= 60
+    av_channel_layout_default(&par->ch_layout, channels);
+#elif LIBAVCODEC_VERSION_MAJOR >= 59 && LIBAVCODEC_VERSION_MINOR >= 24
+    av_channel_layout_default(&par->ch_layout, channels);
+#else
+    par->channels = channels;
+    par->channel_layout = av_get_default_channel_layout(channels);
+#endif
+}
+
+int ffcodecpar_get_frame_size(const AVCodecParameters* par) {
+    return par->frame_size;
+}
+
+void ffcodecpar_set_frame_size(AVCodecParameters* par, int frame_size) {
+    par->frame_size = frame_size;
+}
+
+const uint8_t* ffcodecpar_get_extradata(const AVCodecParameters* par) {
+    return par->extradata;
+}
+
+int ffcodecpar_get_extradata_size(const AVCodecParameters* par) {
+    return par->extradata_size;
+}
+
+int ffcodecpar_set_extradata(AVCodecParameters* par, const uint8_t* data, int size) {
+    // Free existing extradata
+    av_freep(&par->extradata);
+    par->extradata_size = 0;
+
+    if (data == NULL || size <= 0) {
+        return 0;
+    }
+
+    // Allocate new extradata with padding
+    par->extradata = av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (par->extradata == NULL) {
+        return AVERROR(ENOMEM);
+    }
+
+    memcpy(par->extradata, data, size);
+    par->extradata_size = size;
+    return 0;
+}
+
+int ffcodecpar_get_color_primaries(const AVCodecParameters* par) {
+    return par->color_primaries;
+}
+
+void ffcodecpar_set_color_primaries(AVCodecParameters* par, int color_primaries) {
+    par->color_primaries = color_primaries;
+}
+
+int ffcodecpar_get_color_trc(const AVCodecParameters* par) {
+    return par->color_trc;
+}
+
+void ffcodecpar_set_color_trc(AVCodecParameters* par, int color_trc) {
+    par->color_trc = color_trc;
+}
+
+int ffcodecpar_get_color_space(const AVCodecParameters* par) {
+    return par->color_space;
+}
+
+void ffcodecpar_set_color_space(AVCodecParameters* par, int color_space) {
+    par->color_space = color_space;
+}
+
+int ffcodecpar_get_color_range(const AVCodecParameters* par) {
+    return par->color_range;
+}
+
+void ffcodecpar_set_color_range(AVCodecParameters* par, int color_range) {
+    par->color_range = color_range;
+}
+
+void ffcodecpar_get_sample_aspect_ratio(const AVCodecParameters* par, int* num, int* den) {
+    *num = par->sample_aspect_ratio.num;
+    *den = par->sample_aspect_ratio.den;
+}
+
+void ffcodecpar_set_sample_aspect_ratio(AVCodecParameters* par, int num, int den) {
+    par->sample_aspect_ratio.num = num;
+    par->sample_aspect_ratio.den = den;
+}
+
+/* ============================================================================
+ * AVIOContext Accessors
+ * ============================================================================ */
+
+void* fffio_get_opaque(AVIOContext* ctx) {
+    return ctx ? ctx->opaque : NULL;
+}
+
+void fffio_set_opaque(AVIOContext* ctx, void* opaque) {
+    if (ctx) {
+        ctx->opaque = opaque;
+    }
+}
+
+int fffio_get_seekable(AVIOContext* ctx) {
+    return ctx ? ctx->seekable : 0;
+}
+
+void fffio_set_seekable(AVIOContext* ctx, int seekable) {
+    if (ctx) {
+        ctx->seekable = seekable;
+    }
+}

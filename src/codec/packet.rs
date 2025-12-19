@@ -6,7 +6,8 @@ use crate::ffi::{
   self, AVPacket,
   accessors::{
     ffpkt_data, ffpkt_dts, ffpkt_duration, ffpkt_flags, ffpkt_pts, ffpkt_set_dts,
-    ffpkt_set_duration, ffpkt_set_flags, ffpkt_set_pts, ffpkt_size,
+    ffpkt_set_duration, ffpkt_set_flags, ffpkt_set_pts, ffpkt_set_stream_index, ffpkt_size,
+    ffpkt_stream_index,
   },
   avcodec::{av_new_packet, av_packet_alloc, av_packet_free, av_packet_ref, av_packet_unref},
   pkt_flag,
@@ -81,6 +82,18 @@ impl Packet {
   #[inline]
   pub fn size(&self) -> i32 {
     unsafe { ffpkt_size(self.as_ptr()) }
+  }
+
+  /// Get stream index
+  #[inline]
+  pub fn stream_index(&self) -> i32 {
+    unsafe { ffpkt_stream_index(self.as_ptr()) }
+  }
+
+  /// Set stream index
+  #[inline]
+  pub fn set_stream_index(&mut self, index: i32) {
+    unsafe { ffpkt_set_stream_index(self.as_mut_ptr(), index) }
   }
 
   /// Check if packet has data

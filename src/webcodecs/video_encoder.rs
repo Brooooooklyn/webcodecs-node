@@ -18,7 +18,8 @@ use crate::webcodecs::{
   AvcBitstreamFormat, EncodedVideoChunk, HardwareAcceleration, HevcBitstreamFormat, LatencyMode,
   VideoColorSpaceInit, VideoEncoderBitrateMode, VideoEncoderConfig, VideoFrame,
   convert_annexb_extradata_to_avcc, convert_annexb_extradata_to_hvcc,
-  extract_avcc_from_avcc_packet, extract_hvcc_from_hvcc_packet,
+  convert_obu_extradata_to_av1c, extract_avcc_from_avcc_packet, extract_hvcc_from_hvcc_packet,
+  is_av1c_extradata,
 };
 use crossbeam::channel::{self, Receiver, Sender};
 use napi::bindgen_prelude::*;
@@ -1110,11 +1111,21 @@ impl VideoEncoder {
         let is_h265 = codec_string.starts_with("hvc1")
           || codec_string.starts_with("hev1")
           || codec_string == "h265";
+        let is_av1 = codec_string.starts_with("av01") || codec_string == "av1";
 
-        // Get extradata and optionally convert to avcC/hvcC format for proper AVCC/HVCC mode
+        // Get extradata and optionally convert to avcC/hvcC/av1C format for container muxing
         let description = guard.context.as_ref().and_then(|ctx| {
           ctx.extradata().and_then(|extradata| {
-            if guard.use_avcc_format {
+            // AV1 always needs av1C format for container muxing (WebM/MKV/MP4)
+            // Check BEFORE use_avcc_format since that flag is only for H.264/H.265
+            if is_av1 {
+              // rav1e produces av1C directly, libaom produces raw OBUs
+              if is_av1c_extradata(extradata) {
+                Some(Uint8Array::from(extradata.to_vec()))
+              } else {
+                convert_obu_extradata_to_av1c(extradata).map(Uint8Array::from)
+              }
+            } else if guard.use_avcc_format {
               // Convert Annex B extradata to avcC/hvcC box format
               if is_h264 {
                 // Check if extradata is already in avcC format (starts with 0x01 = config version)
@@ -1146,7 +1157,12 @@ impl VideoEncoder {
         // try to extract SPS/PPS (and VPS for HEVC) from the packet data itself.
         // VideoToolbox embeds parameter sets inline in the first key frame packet
         // instead of populating the codec context's extradata field.
-        let description = if description.is_none() && guard.use_avcc_format {
+        // For AV1: libaom may embed sequence header in first keyframe instead of extradata.
+        let description = if description.is_none() && is_av1 {
+          chunk
+            .get_data()
+            .and_then(|data| convert_obu_extradata_to_av1c(&data).map(Uint8Array::from))
+        } else if description.is_none() && guard.use_avcc_format {
           if is_h264 {
             chunk
               .get_data()
@@ -1162,13 +1178,13 @@ impl VideoEncoder {
           description
         };
 
-        // Determine if this codec requires description (H.264/H.265 in AVCC mode)
+        // Determine if this codec requires description (H.264/H.265 in AVCC mode, or AV1)
         // For codecs that require description, only send decoderConfig when description is available
-        // For other codecs (VP8, VP9, AV1), description is optional - send decoderConfig immediately
-        let requires_description = guard.use_avcc_format && (is_h264 || is_h265);
+        // AV1 requires av1C description for muxers to work correctly
+        let requires_description = (guard.use_avcc_format && (is_h264 || is_h265)) || is_av1;
 
         if requires_description && description.is_none() {
-          // H.264/H.265 needs description - don't send decoderConfig yet, try again on next key frame
+          // H.264/H.265/AV1 needs description - don't send decoderConfig yet, try again on next key frame
           EncodedVideoChunkMetadata {
             decoder_config: None,
             svc,
@@ -1323,10 +1339,20 @@ impl VideoEncoder {
         let is_h265 = codec_string.starts_with("hvc1")
           || codec_string.starts_with("hev1")
           || codec_string == "h265";
+        let is_av1 = codec_string.starts_with("av01") || codec_string == "av1";
 
-        // Optionally convert to avcC/hvcC format for proper AVCC/HVCC mode
+        // Optionally convert to avcC/hvcC/av1C format for container muxing
         let description = extradata_source.and_then(|extradata| {
-          if guard.use_avcc_format {
+          // AV1 always needs av1C format for container muxing (WebM/MKV/MP4)
+          // Check BEFORE use_avcc_format since that flag is only for H.264/H.265
+          if is_av1 {
+            // rav1e produces av1C directly, libaom produces raw OBUs
+            if is_av1c_extradata(extradata) {
+              Some(Uint8Array::from(extradata.to_vec()))
+            } else {
+              convert_obu_extradata_to_av1c(extradata).map(Uint8Array::from)
+            }
+          } else if guard.use_avcc_format {
             // Convert Annex B extradata to avcC/hvcC box format
             if is_h264 {
               // Check if extradata is already in avcC format (starts with 0x01 = config version)
@@ -1357,7 +1383,12 @@ impl VideoEncoder {
         // try to extract SPS/PPS (and VPS for HEVC) from the packet data itself.
         // VideoToolbox embeds parameter sets inline in the first key frame packet
         // instead of populating the codec context's extradata field.
-        let description = if description.is_none() && guard.use_avcc_format {
+        // For AV1: libaom may embed sequence header in first keyframe instead of extradata.
+        let description = if description.is_none() && is_av1 {
+          chunk
+            .get_data()
+            .and_then(|data| convert_obu_extradata_to_av1c(&data).map(Uint8Array::from))
+        } else if description.is_none() && guard.use_avcc_format {
           if is_h264 {
             chunk
               .get_data()
@@ -1373,13 +1404,13 @@ impl VideoEncoder {
           description
         };
 
-        // Determine if this codec requires description (H.264/H.265 in AVCC mode)
+        // Determine if this codec requires description (H.264/H.265 in AVCC mode, or AV1)
         // For codecs that require description, only send decoderConfig when description is available
-        // For other codecs (VP8, VP9, AV1), description is optional - send decoderConfig immediately
-        let requires_description = guard.use_avcc_format && (is_h264 || is_h265);
+        // AV1 requires av1C description for muxers to work correctly
+        let requires_description = (guard.use_avcc_format && (is_h264 || is_h265)) || is_av1;
 
         if requires_description && description.is_none() {
-          // H.264/H.265 needs description - don't send decoderConfig yet, try again on next key frame
+          // H.264/H.265/AV1 needs description - don't send decoderConfig yet, try again on next key frame
           EncodedVideoChunkMetadata {
             decoder_config: None,
             svc,
@@ -2216,12 +2247,14 @@ impl VideoEncoder {
       return Ok(());
     }
 
-    // Calculate if GLOBAL_HEADER flag is needed for AVCC/HVCC format
+    // Calculate if GLOBAL_HEADER flag is needed for AVCC/HVCC/av1C format
     // This needs to be determined early since it's used in fallback paths
     // AVCC/HVCC is the W3C default - only disable when Annex B is explicitly requested
+    // AV1 always needs global header for container muxing (av1C box required by WebM/MKV)
     let needs_global_header = {
       let is_h264 = codec.starts_with("avc1") || codec.starts_with("avc3") || codec == "h264";
       let is_h265 = codec.starts_with("hvc1") || codec.starts_with("hev1") || codec == "h265";
+      let is_av1 = codec.starts_with("av01") || codec == "av1";
 
       if is_h264 {
         // For H.264: need global header unless Annex B is explicitly requested (W3C default is AVCC)
@@ -2235,6 +2268,9 @@ impl VideoEncoder {
           config.hevc.as_ref().and_then(|hevc| hevc.format),
           Some(HevcBitstreamFormat::Annexb)
         )
+      } else if is_av1 {
+        // For AV1: always need global header for container muxing (av1C box)
+        true
       } else {
         false
       }

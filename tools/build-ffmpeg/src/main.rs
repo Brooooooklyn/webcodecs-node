@@ -1744,8 +1744,8 @@ Cflags: -I${{includedir}}
       "--enable-avutil".to_string(),
       "--enable-swscale".to_string(),
       "--enable-swresample".to_string(),
-      // Disabled libraries
-      "--disable-avformat".to_string(),
+      // Container format library (muxer/demuxer)
+      "--enable-avformat".to_string(),
       "--disable-avfilter".to_string(),
       "--disable-avdevice".to_string(),
       "--disable-network".to_string(),

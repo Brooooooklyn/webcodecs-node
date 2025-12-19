@@ -203,6 +203,48 @@ impl AVCodecID {
   pub fn as_raw(&self) -> c_int {
     *self as c_int
   }
+
+  /// Create from raw FFmpeg codec ID value
+  ///
+  /// Returns the codec ID if it matches a known value, otherwise None.
+  pub fn from_raw(raw: c_int) -> Self {
+    match raw {
+      0 => Self::None,
+      7 => Self::Mjpeg,
+      27 => Self::H264,
+      61 => Self::Png,
+      78 => Self::Bmp,
+      97 => Self::Gif,
+      139 => Self::Vp8,
+      167 => Self::Vp9,
+      171 => Self::Webp,
+      173 => Self::Hevc,
+      225 => Self::Av1,
+      65536 => Self::PcmS16le,
+      65537 => Self::PcmS16be,
+      65538 => Self::PcmU16le,
+      65539 => Self::PcmU16be,
+      65540 => Self::PcmS8,
+      65541 => Self::PcmU8,
+      65544 => Self::PcmS32le,
+      65545 => Self::PcmS32be,
+      65557 => Self::PcmF32le,
+      65558 => Self::PcmF32be,
+      65559 => Self::PcmF64le,
+      65560 => Self::PcmF64be,
+      65566 => Self::PcmS24le,
+      65567 => Self::PcmS24be,
+      86016 => Self::Mp2,
+      86017 => Self::Mp3,
+      86018 => Self::Aac,
+      86019 => Self::Ac3,
+      86021 => Self::Vorbis,
+      86028 => Self::Flac,
+      86032 => Self::Alac,
+      86076 => Self::Opus,
+      _ => Self::None,
+    }
+  }
 }
 
 // ============================================================================
@@ -500,6 +542,25 @@ impl AVSampleFormat {
       Self::S32p => Some("s32-planar"),
       Self::Fltp => Some("f32-planar"),
       _ => None,
+    }
+  }
+
+  /// Create from raw FFmpeg sample format value
+  pub fn from_raw(value: c_int) -> Self {
+    match value {
+      0 => Self::U8,
+      1 => Self::S16,
+      2 => Self::S32,
+      3 => Self::Flt,
+      4 => Self::Dbl,
+      5 => Self::U8p,
+      6 => Self::S16p,
+      7 => Self::S32p,
+      8 => Self::Fltp,
+      9 => Self::Dblp,
+      10 => Self::S64,
+      11 => Self::S64p,
+      _ => Self::None,
     }
   }
 }

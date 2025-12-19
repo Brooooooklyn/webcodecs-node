@@ -2,8 +2,11 @@
 //!
 //! These functions provide access to FFmpeg struct fields via the thin C accessor library.
 
+use super::avformat::{
+  AVCodecParameters, AVFormatContext, AVIOContext, AVInputFormat, AVOutputFormat, AVStream,
+};
 use super::types::*;
-use std::os::raw::c_int;
+use std::os::raw::{c_int, c_uint};
 
 unsafe extern "C" {
   // ========================================================================
@@ -233,6 +236,80 @@ unsafe extern "C" {
     sample_fmt: c_int,
     align: c_int,
   ) -> c_int;
+
+  // ========================================================================
+  // AVFormatContext Accessors (libavformat)
+  // ========================================================================
+
+  pub fn fffmt_set_pb(ctx: *mut AVFormatContext, pb: *mut AVIOContext);
+  pub fn fffmt_get_pb(ctx: *mut AVFormatContext) -> *mut AVIOContext;
+  pub fn fffmt_get_nb_streams(ctx: *const AVFormatContext) -> c_uint;
+  pub fn fffmt_get_stream(ctx: *mut AVFormatContext, index: c_uint) -> *mut AVStream;
+  pub fn fffmt_get_duration(ctx: *const AVFormatContext) -> i64;
+  pub fn fffmt_get_bit_rate(ctx: *const AVFormatContext) -> i64;
+  pub fn fffmt_get_oformat(ctx: *const AVFormatContext) -> *const AVOutputFormat;
+  pub fn fffmt_get_iformat(ctx: *const AVFormatContext) -> *const AVInputFormat;
+  pub fn fffmt_get_oformat_flags(ctx: *const AVFormatContext) -> c_int;
+
+  // ========================================================================
+  // AVStream Accessors
+  // ========================================================================
+
+  pub fn ffstream_get_index(stream: *const AVStream) -> c_int;
+  pub fn ffstream_get_codecpar(stream: *mut AVStream) -> *mut AVCodecParameters;
+  pub fn ffstream_get_codecpar_const(stream: *const AVStream) -> *const AVCodecParameters;
+  pub fn ffstream_get_time_base(stream: *const AVStream, num: *mut c_int, den: *mut c_int);
+  pub fn ffstream_set_time_base(stream: *mut AVStream, num: c_int, den: c_int);
+  pub fn ffstream_get_avg_frame_rate(stream: *const AVStream, num: *mut c_int, den: *mut c_int);
+  pub fn ffstream_get_duration(stream: *const AVStream) -> i64;
+  pub fn ffstream_get_nb_frames(stream: *const AVStream) -> i64;
+  pub fn ffstream_get_start_time(stream: *const AVStream) -> i64;
+
+  // ========================================================================
+  // AVCodecParameters Accessors
+  // ========================================================================
+
+  pub fn ffcodecpar_get_codec_type(par: *const AVCodecParameters) -> c_int;
+  pub fn ffcodecpar_set_codec_type(par: *mut AVCodecParameters, codec_type: c_int);
+  pub fn ffcodecpar_get_codec_id(par: *const AVCodecParameters) -> c_int;
+  pub fn ffcodecpar_set_codec_id(par: *mut AVCodecParameters, codec_id: c_int);
+  pub fn ffcodecpar_get_codec_tag(par: *const AVCodecParameters) -> c_uint;
+  pub fn ffcodecpar_set_codec_tag(par: *mut AVCodecParameters, codec_tag: c_uint);
+  pub fn ffcodecpar_get_format(par: *const AVCodecParameters) -> c_int;
+  pub fn ffcodecpar_set_format(par: *mut AVCodecParameters, format: c_int);
+  pub fn ffcodecpar_get_bit_rate(par: *const AVCodecParameters) -> i64;
+  pub fn ffcodecpar_set_bit_rate(par: *mut AVCodecParameters, bit_rate: i64);
+  pub fn ffcodecpar_get_width(par: *const AVCodecParameters) -> c_int;
+  pub fn ffcodecpar_set_width(par: *mut AVCodecParameters, width: c_int);
+  pub fn ffcodecpar_get_height(par: *const AVCodecParameters) -> c_int;
+  pub fn ffcodecpar_set_height(par: *mut AVCodecParameters, height: c_int);
+  pub fn ffcodecpar_get_sample_rate(par: *const AVCodecParameters) -> c_int;
+  pub fn ffcodecpar_set_sample_rate(par: *mut AVCodecParameters, sample_rate: c_int);
+  pub fn ffcodecpar_get_channels(par: *const AVCodecParameters) -> c_int;
+  pub fn ffcodecpar_set_channels(par: *mut AVCodecParameters, channels: c_int);
+  pub fn ffcodecpar_get_frame_size(par: *const AVCodecParameters) -> c_int;
+  pub fn ffcodecpar_set_frame_size(par: *mut AVCodecParameters, frame_size: c_int);
+  pub fn ffcodecpar_get_extradata(par: *const AVCodecParameters) -> *const u8;
+  pub fn ffcodecpar_get_extradata_size(par: *const AVCodecParameters) -> c_int;
+  pub fn ffcodecpar_set_extradata(
+    par: *mut AVCodecParameters,
+    data: *const u8,
+    size: c_int,
+  ) -> c_int;
+  pub fn ffcodecpar_get_color_primaries(par: *const AVCodecParameters) -> c_int;
+  pub fn ffcodecpar_set_color_primaries(par: *mut AVCodecParameters, color_primaries: c_int);
+  pub fn ffcodecpar_get_color_trc(par: *const AVCodecParameters) -> c_int;
+  pub fn ffcodecpar_set_color_trc(par: *mut AVCodecParameters, color_trc: c_int);
+  pub fn ffcodecpar_get_color_space(par: *const AVCodecParameters) -> c_int;
+  pub fn ffcodecpar_set_color_space(par: *mut AVCodecParameters, color_space: c_int);
+  pub fn ffcodecpar_get_color_range(par: *const AVCodecParameters) -> c_int;
+  pub fn ffcodecpar_set_color_range(par: *mut AVCodecParameters, color_range: c_int);
+  pub fn ffcodecpar_get_sample_aspect_ratio(
+    par: *const AVCodecParameters,
+    num: *mut c_int,
+    den: *mut c_int,
+  );
+  pub fn ffcodecpar_set_sample_aspect_ratio(par: *mut AVCodecParameters, num: c_int, den: c_int);
 }
 
 // ============================================================================
