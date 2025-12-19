@@ -106,17 +106,17 @@ pub struct StoredAudioTrackInfo {
 /// JavaScript-facing metadata type for video chunks
 #[napi(object)]
 #[derive(Default)]
-pub struct EncodedVideoChunkMetadataJS {
+pub struct EncodedVideoChunkMetadataJs {
   /// Decoder configuration from encoder
-  pub decoder_config: Option<VideoDecoderConfigJS>,
+  pub decoder_config: Option<VideoDecoderConfigJs>,
   /// SVC output metadata
-  pub svc: Option<SvcOutputMetadataJS>,
+  pub svc: Option<SvcOutputMetadataJs>,
 }
 
 /// JavaScript-facing decoder config type
 #[napi(object)]
 #[derive(Default)]
-pub struct VideoDecoderConfigJS {
+pub struct VideoDecoderConfigJs {
   /// Codec string
   pub codec: Option<String>,
   /// Codec-specific description
@@ -130,7 +130,7 @@ pub struct VideoDecoderConfigJS {
 /// JavaScript-facing SVC metadata
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
-pub struct SvcOutputMetadataJS {
+pub struct SvcOutputMetadataJs {
   /// Temporal layer ID
   pub temporal_layer_id: Option<u32>,
 }
@@ -138,15 +138,15 @@ pub struct SvcOutputMetadataJS {
 /// JavaScript-facing metadata type for audio chunks
 #[napi(object)]
 #[derive(Default)]
-pub struct EncodedAudioChunkMetadataJS {
+pub struct EncodedAudioChunkMetadataJs {
   /// Decoder configuration from encoder
-  pub decoder_config: Option<AudioDecoderConfigJS>,
+  pub decoder_config: Option<AudioDecoderConfigJs>,
 }
 
 /// JavaScript-facing audio decoder config type
 #[napi(object)]
 #[derive(Default)]
-pub struct AudioDecoderConfigJS {
+pub struct AudioDecoderConfigJs {
   /// Codec string
   pub codec: Option<String>,
   /// Sample rate
@@ -410,7 +410,7 @@ impl<F: MuxerFormat> MuxerInner<F> {
   pub fn add_video_chunk(
     &mut self,
     chunk: &EncodedVideoChunk,
-    metadata: Option<&EncodedVideoChunkMetadataJS>,
+    metadata: Option<&EncodedVideoChunkMetadataJs>,
   ) -> Result<()> {
     // Ensure we have a video track
     let video_index = self
@@ -503,7 +503,7 @@ impl<F: MuxerFormat> MuxerInner<F> {
   pub fn add_audio_chunk(
     &mut self,
     chunk: &EncodedAudioChunk,
-    metadata: Option<&EncodedAudioChunkMetadataJS>,
+    metadata: Option<&EncodedAudioChunkMetadataJs>,
   ) -> Result<()> {
     // Ensure we have an audio track
     let audio_index = self

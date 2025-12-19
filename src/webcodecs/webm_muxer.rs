@@ -9,7 +9,7 @@ use crate::webcodecs::codec_string::parse_codec_string;
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunk;
 use crate::webcodecs::encoded_video_chunk::EncodedVideoChunk;
 use crate::webcodecs::muxer_base::{
-  EncodedAudioChunkMetadataJS, EncodedVideoChunkMetadataJS, GenericAudioTrackConfig,
+  EncodedAudioChunkMetadataJs, EncodedVideoChunkMetadataJs, GenericAudioTrackConfig,
   GenericVideoTrackConfig, MuxerFormat, MuxerInner, StreamingMuxerOptions, lock_muxer_inner,
   lock_muxer_inner_mut,
 };
@@ -223,26 +223,22 @@ impl WebMMuxer {
   }
 
   /// Add an encoded video chunk to the muxer
-  #[napi(
-    ts_args_type = "chunk: import('./standard').EncodedVideoChunk, metadata?: import('./standard').EncodedVideoChunkMetadata"
-  )]
+  #[napi]
   pub fn add_video_chunk(
     &self,
     chunk: &EncodedVideoChunk,
-    metadata: Option<EncodedVideoChunkMetadataJS>,
+    metadata: Option<EncodedVideoChunkMetadataJs>,
   ) -> Result<()> {
     lock_muxer_inner_mut!(self => _guard, inner);
     inner.add_video_chunk(chunk, metadata.as_ref())
   }
 
   /// Add an encoded audio chunk to the muxer
-  #[napi(
-    ts_args_type = "chunk: import('./standard').EncodedAudioChunk, metadata?: import('./standard').EncodedAudioChunkMetadata"
-  )]
+  #[napi]
   pub fn add_audio_chunk(
     &self,
     chunk: &EncodedAudioChunk,
-    metadata: Option<EncodedAudioChunkMetadataJS>,
+    metadata: Option<EncodedAudioChunkMetadataJs>,
   ) -> Result<()> {
     lock_muxer_inner_mut!(self => _guard, inner);
     inner.add_audio_chunk(chunk, metadata.as_ref())

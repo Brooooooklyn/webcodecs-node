@@ -256,10 +256,7 @@ impl AudioData {
   /// Create a new AudioData (W3C WebCodecs spec)
   /// Per spec, the constructor takes a single init object containing all parameters including data
   #[napi(constructor)]
-  pub fn new(
-    env: Env,
-    #[napi(ts_arg_type = "import('./standard').AudioDataInit")] init: AudioDataInit,
-  ) -> Result<Self> {
+  pub fn new(env: Env, init: AudioDataInit) -> Result<Self> {
     // Validate zero values
     if init.sample_rate == 0.0 {
       env.throw_type_error("sampleRate must be greater than 0", None)?;
@@ -604,9 +601,7 @@ impl AudioData {
   /// Copy audio data to a buffer (W3C WebCodecs spec)
   /// Note: Per spec, this is SYNCHRONOUS and returns undefined
   /// Accepts AllowSharedBufferSource (any TypedArray, DataView, or ArrayBuffer)
-  #[napi(
-    ts_args_type = "destination: import('./standard').AllowSharedBufferSource, options: AudioDataCopyToOptions"
-  )]
+  #[napi(ts_args_type = "destination: AllowSharedBufferSource, options: AudioDataCopyToOptions")]
   pub fn copy_to(
     &self,
     env: Env,

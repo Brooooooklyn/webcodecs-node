@@ -9,6 +9,7 @@ WebCodecs API implementation for Node.js using FFmpeg, built with [NAPI-RS](http
 - **W3C WebCodecs API compliant** - Full implementation of the WebCodecs specification with native `DOMException` errors
 - **Video encoding/decoding** - H.264, H.265, VP8, VP9, AV1
 - **Audio encoding/decoding** - AAC, Opus, MP3, FLAC, Vorbis, PCM variants
+- **Container muxing/demuxing** - MP4, WebM, MKV containers with seeking support
 - **Image decoding** - JPEG, PNG, WebP, GIF, BMP, AVIF
 - **Canvas integration** - Create VideoFrames from `@napi-rs/canvas` for graphics and text rendering
 - **Hardware acceleration** - Zero-copy GPU encoding with VideoToolbox (macOS), NVENC (NVIDIA), VAAPI (Linux), QSV (Intel)
@@ -166,6 +167,141 @@ result.image.close()
 decoder.close()
 ```
 
+### Container Demuxing
+
+Read encoded video/audio from MP4, WebM, or MKV containers:
+
+```typescript
+import { Mp4Demuxer, VideoDecoder, AudioDecoder } from '@napi-rs/webcodecs'
+
+// Create decoder instances
+const videoDecoder = new VideoDecoder({
+  output: (frame) => {
+    console.log(`Decoded frame: ${frame.timestamp}`)
+    frame.close()
+  },
+  error: (e) => console.error(e),
+})
+
+const audioDecoder = new AudioDecoder({
+  output: (data) => {
+    console.log(`Decoded audio: ${data.timestamp}`)
+    data.close()
+  },
+  error: (e) => console.error(e),
+})
+
+// Create demuxer with callbacks
+const demuxer = new Mp4Demuxer({
+  videoOutput: (chunk) => videoDecoder.decode(chunk),
+  audioOutput: (chunk) => audioDecoder.decode(chunk),
+  error: (e) => console.error(e),
+})
+
+// Load from file or buffer
+await demuxer.load('./video.mp4')
+// or: await demuxer.loadBuffer(uint8Array)
+
+// Configure decoders with extracted configs
+videoDecoder.configure(demuxer.videoDecoderConfig)
+audioDecoder.configure(demuxer.audioDecoderConfig)
+
+// Get track info
+console.log(demuxer.tracks) // Array of track info
+console.log(demuxer.duration) // Duration in microseconds
+
+// Demux all packets (calls callbacks)
+demuxer.demux()
+
+// Or demux in batches
+demuxer.demux(100) // Demux up to 100 packets
+
+// Seek to timestamp (microseconds)
+demuxer.seek(5_000_000) // Seek to 5 seconds
+
+demuxer.close()
+```
+
+### Container Muxing
+
+Write encoded video/audio to MP4, WebM, or MKV containers:
+
+```typescript
+import { Mp4Muxer, VideoEncoder, AudioEncoder } from '@napi-rs/webcodecs'
+import { writeFileSync } from 'fs'
+
+// Create muxer
+const muxer = new Mp4Muxer({ fastStart: true })
+
+// Track description will be set from encoder metadata
+let videoDescription: Uint8Array | undefined
+
+// Create encoder that feeds into muxer
+const videoEncoder = new VideoEncoder({
+  output: (chunk, metadata) => {
+    // Capture codec description from first keyframe
+    if (metadata?.decoderConfig?.description) {
+      videoDescription = metadata.decoderConfig.description
+    }
+    muxer.addVideoChunk(chunk, metadata)
+  },
+  error: (e) => console.error(e),
+})
+
+videoEncoder.configure({
+  codec: 'avc1.42001E',
+  width: 1920,
+  height: 1080,
+  bitrate: 5_000_000,
+})
+
+// Add tracks before adding chunks
+muxer.addVideoTrack({
+  codec: 'avc1.42001E',
+  width: 1920,
+  height: 1080,
+})
+
+// Encode frames...
+// videoEncoder.encode(frame)
+
+await videoEncoder.flush()
+
+// Finalize and write output
+const mp4Data = muxer.finalize()
+writeFileSync('output.mp4', mp4Data)
+muxer.close()
+```
+
+#### Streaming Muxer Mode
+
+For live streaming or large files, use streaming mode:
+
+```typescript
+import { Mp4Muxer } from '@napi-rs/webcodecs'
+
+const muxer = new Mp4Muxer({
+  fragmented: true, // Required for MP4 streaming
+  streaming: { bufferCapacity: 256 * 1024 },
+})
+
+muxer.addVideoTrack({ codec: 'avc1.42001E', width: 1920, height: 1080 })
+
+// Add chunks as they arrive
+muxer.addVideoChunk(chunk, metadata)
+
+// Read available data incrementally
+const data = muxer.read()
+if (data) {
+  stream.write(data)
+}
+
+// Check when finished
+if (muxer.isFinished) {
+  stream.end()
+}
+```
+
 ### VideoFrame from Canvas
 
 Create VideoFrames from `@napi-rs/canvas` for graphics, text rendering, or image compositing:
@@ -234,6 +370,14 @@ frame.close()
 | GIF    | `image/gif`  | ✅       |
 | BMP    | `image/bmp`  | ✅       |
 | AVIF   | `image/avif` | ✅       |
+
+### Containers
+
+| Container | Video Codecs                | Audio Codecs                 | Demuxer       | Muxer       |
+| --------- | --------------------------- | ---------------------------- | ------------- | ----------- |
+| MP4       | H.264, H.265, AV1           | AAC, Opus, MP3, FLAC         | `Mp4Demuxer`  | `Mp4Muxer`  |
+| WebM      | VP8, VP9, AV1               | Opus, Vorbis                 | `WebMDemuxer` | `WebMMuxer` |
+| MKV       | H.264, H.265, VP8, VP9, AV1 | AAC, Opus, Vorbis, FLAC, MP3 | `MkvDemuxer`  | `MkvMuxer`  |
 
 ## Platform Support
 
@@ -436,6 +580,8 @@ This package implements the [W3C WebCodecs API](https://w3c.github.io/webcodecs/
 - `EncodedVideoChunk` / `EncodedAudioChunk` - Encoded media data
 - `ImageDecoder` - Static image decoding
 - `VideoColorSpace` - Color space information
+- `Mp4Demuxer` / `WebMDemuxer` / `MkvDemuxer` - Container demuxing with seeking
+- `Mp4Muxer` / `WebMMuxer` / `MkvMuxer` - Container muxing with streaming support
 
 All encoders and decoders implement the `EventTarget` interface with `addEventListener()`, `removeEventListener()`, and `dispatchEvent()`.
 

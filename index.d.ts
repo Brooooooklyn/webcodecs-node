@@ -33,19 +33,6 @@ export {
   AllowSharedBufferSource,
 } from './standard'
 
-export type TypedArray =
-  | Int8Array
-  | Uint8Array
-  | Uint8ClampedArray
-  | Int16Array
-  | Uint16Array
-  | Int32Array
-  | Uint32Array
-  | Float32Array
-  | Float64Array
-  | BigInt64Array
-  | BigUint64Array
-
 /**
  * Interface for Canvas-like objects compatible with VideoFrame constructor.
  * Compatible with @napi-rs/canvas Canvas class.
@@ -69,53 +56,6 @@ export type DemuxerState = 'unloaded' | 'ready' | 'demuxing' | 'ended' | 'closed
 
 /** Muxer state */
 export type MuxerState = 'configuring' | 'muxing' | 'finalized' | 'closed'
-
-/** Track type for demuxer */
-export type DemuxerTrackType = 'video' | 'audio' | 'subtitle' | 'data'
-
-/** Track info from demuxer */
-export interface DemuxerTrackInfo {
-  /** Track index */
-  index: number
-  /** Track type */
-  trackType: DemuxerTrackType
-  /** Codec string */
-  codec?: string
-  /** Coded width (video only) */
-  codedWidth?: number
-  /** Coded height (video only) */
-  codedHeight?: number
-  /** Sample rate (audio only) */
-  sampleRate?: number
-  /** Number of channels (audio only) */
-  numberOfChannels?: number
-  /** Duration in microseconds */
-  duration?: number
-}
-
-/** Video decoder config from demuxer */
-export interface DemuxerVideoDecoderConfig {
-  /** Codec string */
-  codec: string
-  /** Coded width */
-  codedWidth: number
-  /** Coded height */
-  codedHeight: number
-  /** Codec description (e.g., avcC for H.264) */
-  description?: Uint8Array
-}
-
-/** Audio decoder config from demuxer */
-export interface DemuxerAudioDecoderConfig {
-  /** Codec string */
-  codec: string
-  /** Sample rate */
-  sampleRate: number
-  /** Number of channels */
-  numberOfChannels: number
-  /** Codec description */
-  description?: Uint8Array
-}
 
 /** Init options for Mp4Demuxer */
 export interface Mp4DemuxerInit {
@@ -197,180 +137,6 @@ export interface MkvMuxerInit {
   streaming?: { bufferCapacity?: number }
 }
 
-/**
- * MP4 Demuxer - reads encoded video/audio from MP4 containers
- */
-export declare class Mp4Demuxer {
-  constructor(init: Mp4DemuxerInit)
-  /** Load from file path */
-  load(path: string): Promise<void>
-  /** Load from buffer */
-  loadBuffer(data: Uint8Array): Promise<void>
-  /** Get all tracks */
-  get tracks(): DemuxerTrackInfo[]
-  /** Get container duration in microseconds */
-  get duration(): number | null
-  /** Get video decoder configuration */
-  get videoDecoderConfig(): DemuxerVideoDecoderConfig | null
-  /** Get audio decoder configuration */
-  get audioDecoderConfig(): DemuxerAudioDecoderConfig | null
-  /** Select video track by index */
-  selectVideoTrack(trackIndex: number): void
-  /** Select audio track by index */
-  selectAudioTrack(trackIndex: number): void
-  /** Start demuxing (optional packet count limit) */
-  demux(count?: number): void
-  /** Seek to timestamp in microseconds */
-  seek(timestampUs: number): void
-  /** Close and release resources */
-  close(): void
-  /** Get current state */
-  get state(): DemuxerState
-}
-
-/**
- * WebM Demuxer - reads encoded video/audio from WebM containers
- */
-export declare class WebMDemuxer {
-  constructor(init: WebMDemuxerInit)
-  /** Load from file path */
-  load(path: string): Promise<void>
-  /** Load from buffer */
-  loadBuffer(data: Uint8Array): Promise<void>
-  /** Get all tracks */
-  get tracks(): DemuxerTrackInfo[]
-  /** Get container duration in microseconds */
-  get duration(): number | null
-  /** Get video decoder configuration */
-  get videoDecoderConfig(): DemuxerVideoDecoderConfig | null
-  /** Get audio decoder configuration */
-  get audioDecoderConfig(): DemuxerAudioDecoderConfig | null
-  /** Select video track by index */
-  selectVideoTrack(trackIndex: number): void
-  /** Select audio track by index */
-  selectAudioTrack(trackIndex: number): void
-  /** Start demuxing (optional packet count limit) */
-  demux(count?: number): void
-  /** Seek to timestamp in microseconds */
-  seek(timestampUs: number): void
-  /** Close and release resources */
-  close(): void
-  /** Get current state */
-  get state(): DemuxerState
-}
-
-/**
- * MKV Demuxer - reads encoded video/audio from MKV containers
- */
-export declare class MkvDemuxer {
-  constructor(init: MkvDemuxerInit)
-  /** Load from file path */
-  load(path: string): Promise<void>
-  /** Load from buffer */
-  loadBuffer(data: Uint8Array): Promise<void>
-  /** Get all tracks */
-  get tracks(): DemuxerTrackInfo[]
-  /** Get container duration in microseconds */
-  get duration(): number | null
-  /** Get video decoder configuration */
-  get videoDecoderConfig(): DemuxerVideoDecoderConfig | null
-  /** Get audio decoder configuration */
-  get audioDecoderConfig(): DemuxerAudioDecoderConfig | null
-  /** Select video track by index */
-  selectVideoTrack(trackIndex: number): void
-  /** Select audio track by index */
-  selectAudioTrack(trackIndex: number): void
-  /** Start demuxing (optional packet count limit) */
-  demux(count?: number): void
-  /** Seek to timestamp in microseconds */
-  seek(timestampUs: number): void
-  /** Close and release resources */
-  close(): void
-  /** Get current state */
-  get state(): DemuxerState
-}
-
-/**
- * MP4 Muxer - writes encoded video/audio to MP4 containers
- */
-export declare class Mp4Muxer {
-  constructor(init?: Mp4MuxerInit)
-  /** Add video track */
-  addVideoTrack(config: MuxerVideoTrackConfig): void
-  /** Add audio track */
-  addAudioTrack(config: MuxerAudioTrackConfig): void
-  /** Add encoded video chunk */
-  addVideoChunk(chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadata): void
-  /** Add encoded audio chunk */
-  addAudioChunk(chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadata): void
-  /** Flush pending data */
-  flush(): Promise<void>
-  /** Finalize and get output data */
-  finalize(): Uint8Array
-  /** Read available data (streaming mode) */
-  read(): Uint8Array | null
-  /** Check if finished (streaming mode) */
-  get isFinished(): boolean
-  /** Close and release resources */
-  close(): void
-  /** Get current state */
-  get state(): MuxerState
-}
-
-/**
- * WebM Muxer - writes encoded video/audio to WebM containers
- */
-export declare class WebMMuxer {
-  constructor(init?: WebMMuxerInit)
-  /** Add video track */
-  addVideoTrack(config: MuxerVideoTrackConfig): void
-  /** Add audio track */
-  addAudioTrack(config: MuxerAudioTrackConfig): void
-  /** Add encoded video chunk */
-  addVideoChunk(chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadata): void
-  /** Add encoded audio chunk */
-  addAudioChunk(chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadata): void
-  /** Flush pending data */
-  flush(): Promise<void>
-  /** Finalize and get output data */
-  finalize(): Uint8Array
-  /** Read available data (streaming mode) */
-  read(): Uint8Array | null
-  /** Check if finished (streaming mode) */
-  get isFinished(): boolean
-  /** Close and release resources */
-  close(): void
-  /** Get current state */
-  get state(): MuxerState
-}
-
-/**
- * MKV Muxer - writes encoded video/audio to MKV containers
- */
-export declare class MkvMuxer {
-  constructor(init?: MkvMuxerInit)
-  /** Add video track */
-  addVideoTrack(config: MuxerVideoTrackConfig): void
-  /** Add audio track */
-  addAudioTrack(config: MuxerAudioTrackConfig): void
-  /** Add encoded video chunk */
-  addVideoChunk(chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadata): void
-  /** Add encoded audio chunk */
-  addAudioChunk(chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadata): void
-  /** Flush pending data */
-  flush(): Promise<void>
-  /** Finalize and get output data */
-  finalize(): Uint8Array
-  /** Read available data (streaming mode) */
-  read(): Uint8Array | null
-  /** Check if finished (streaming mode) */
-  get isFinished(): boolean
-  /** Close and release resources */
-  close(): void
-  /** Get current state */
-  get state(): MuxerState
-}
-
 export type TypedArray =
   | Int8Array
   | Uint8Array
@@ -393,7 +159,7 @@ export declare class AudioData {
    * Create a new AudioData (W3C WebCodecs spec)
    * Per spec, the constructor takes a single init object containing all parameters including data
    */
-  constructor(init: import('./standard').AudioDataInit)
+  constructor(init: AudioDataInit)
   /** Get sample format */
   get format(): AudioSampleFormat | null
   /**
@@ -439,7 +205,7 @@ export declare class AudioData {
    * Note: Per spec, this is SYNCHRONOUS and returns undefined
    * Accepts AllowSharedBufferSource (any TypedArray, DataView, or ArrayBuffer)
    */
-  copyTo(destination: import('./standard').AllowSharedBufferSource, options: AudioDataCopyToOptions): void
+  copyTo(destination: AllowSharedBufferSource, options: AudioDataCopyToOptions): void
   /** Create a copy of this AudioData */
   clone(): AudioData
   /** Close and release resources */
@@ -487,7 +253,7 @@ export declare class AudioDecoder {
    * The dequeue event fires when decodeQueueSize decreases,
    * allowing backpressure management.
    */
-  set ondequeue(callback?: (() => unknown) | undefined | null)
+  set ondequeue(callback: (() => unknown) | undefined | null)
   /** Get the dequeue event handler (per WebCodecs spec) */
   get ondequeue(): (() => unknown) | null
   /** Configure the decoder */
@@ -575,7 +341,7 @@ export declare class AudioEncoder {
    * The dequeue event fires when encodeQueueSize decreases,
    * allowing backpressure management.
    */
-  set ondequeue(callback?: (() => unknown) | undefined | null)
+  set ondequeue(callback: (() => unknown) | undefined | null)
   /** Get the dequeue event handler (per WebCodecs spec) */
   get ondequeue(): (() => unknown) | null
   /** Configure the encoder */
@@ -661,7 +427,7 @@ export declare class DOMRectReadOnly {
  */
 export declare class EncodedAudioChunk {
   /** Create a new EncodedAudioChunk */
-  constructor(init: import('./standard').EncodedAudioChunkInit)
+  constructor(init: EncodedAudioChunkInit)
   /** Get the chunk type */
   get type(): EncodedAudioChunkType
   /** Get the timestamp in microseconds */
@@ -674,7 +440,7 @@ export declare class EncodedAudioChunk {
    * Copy the encoded data to a BufferSource
    * W3C spec: throws TypeError if destination is too small
    */
-  copyTo(destination: import('./standard').BufferSource): void
+  copyTo(destination: BufferSource): void
 }
 
 /**
@@ -684,7 +450,7 @@ export declare class EncodedAudioChunk {
  */
 export declare class EncodedVideoChunk {
   /** Create a new EncodedVideoChunk */
-  constructor(init: import('./standard').EncodedVideoChunkInit)
+  constructor(init: EncodedVideoChunkInit)
   /** Get the chunk type */
   get type(): EncodedVideoChunkType
   /** Get the timestamp in microseconds */
@@ -697,7 +463,7 @@ export declare class EncodedVideoChunk {
    * Copy the encoded data to a BufferSource
    * W3C spec: throws TypeError if destination is too small
    */
-  copyTo(destination: import('./standard').BufferSource): void
+  copyTo(destination: BufferSource): void
 }
 
 /**
@@ -854,15 +620,9 @@ export declare class MkvMuxer {
    */
   addAudioTrack(config: MkvAudioTrackConfig): void
   /** Add an encoded video chunk to the muxer */
-  addVideoChunk(
-    chunk: import('./standard').EncodedVideoChunk,
-    metadata?: import('./standard').EncodedVideoChunkMetadata,
-  ): void
+  addVideoChunk(chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadataJs | undefined | null): void
   /** Add an encoded audio chunk to the muxer */
-  addAudioChunk(
-    chunk: import('./standard').EncodedAudioChunk,
-    metadata?: import('./standard').EncodedAudioChunkMetadata,
-  ): void
+  addAudioChunk(chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadataJs | undefined | null): void
   /** Flush any buffered data */
   flush(): void
   /** Finalize the muxer and return the MKV data */
@@ -993,19 +753,13 @@ export declare class Mp4Muxer {
    * If metadata contains decoderConfig.description, it will be used to update
    * the codec extradata (useful for extracting avcC/hvcC from the encoder).
    */
-  addVideoChunk(
-    chunk: import('./standard').EncodedVideoChunk,
-    metadata?: import('./standard').EncodedVideoChunkMetadata,
-  ): void
+  addVideoChunk(chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadataJs | undefined | null): void
   /**
    * Add an encoded audio chunk to the muxer
    *
    * The chunk should come from an AudioEncoder's output callback.
    */
-  addAudioChunk(
-    chunk: import('./standard').EncodedAudioChunk,
-    metadata?: import('./standard').EncodedAudioChunkMetadata,
-  ): void
+  addAudioChunk(chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadataJs | undefined | null): void
   /** Flush any buffered data */
   flush(): void
   /**
@@ -1040,7 +794,7 @@ export declare class Mp4Muxer {
 /** Video color space parameters (WebCodecs spec) - as a class per spec */
 export declare class VideoColorSpace {
   /** Create a new VideoColorSpace */
-  constructor(init?: import('./standard').VideoColorSpaceInit)
+  constructor(init?: VideoColorSpaceInit | undefined | null)
   /** Get color primaries */
   get primaries(): VideoColorPrimaries | null
   /** Get transfer characteristics */
@@ -1096,7 +850,7 @@ export declare class VideoDecoder {
    * The dequeue event fires when decodeQueueSize decreases,
    * allowing backpressure management.
    */
-  set ondequeue(callback?: (() => unknown) | undefined | null)
+  set ondequeue(callback: (() => unknown) | undefined | null)
   /** Get the dequeue event handler (per WebCodecs spec) */
   get ondequeue(): (() => unknown) | null
   /**
@@ -1195,7 +949,7 @@ export declare class VideoEncoder {
    * The dequeue event fires when encodeQueueSize decreases,
    * allowing backpressure management.
    */
-  set ondequeue(callback?: (() => unknown) | undefined | null)
+  set ondequeue(callback: (() => unknown) | undefined | null)
   /** Get the dequeue event handler (per WebCodecs spec) */
   get ondequeue(): (() => unknown) | null
   /** Configure the encoder */
@@ -1400,15 +1154,9 @@ export declare class WebMMuxer {
    */
   addAudioTrack(config: WebMAudioTrackConfig): void
   /** Add an encoded video chunk to the muxer */
-  addVideoChunk(
-    chunk: import('./standard').EncodedVideoChunk,
-    metadata?: import('./standard').EncodedVideoChunkMetadata,
-  ): void
+  addVideoChunk(chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadataJs | undefined | null): void
   /** Add an encoded audio chunk to the muxer */
-  addAudioChunk(
-    chunk: import('./standard').EncodedAudioChunk,
-    metadata?: import('./standard').EncodedAudioChunkMetadata,
-  ): void
+  addAudioChunk(chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadataJs | undefined | null): void
   /** Flush any buffered data */
   flush(): void
   /** Finalize the muxer and return the WebM data */
@@ -1648,7 +1396,7 @@ export interface EncodedAudioChunkMetadata {
 /** JavaScript-facing metadata type for audio chunks */
 export interface EncodedAudioChunkMetadataJs {
   /** Decoder configuration from encoder */
-  decoderConfig?: AudioDecoderConfigJS
+  decoderConfig?: AudioDecoderConfigJs
 }
 
 /** Type of encoded audio chunk */
@@ -1670,9 +1418,9 @@ export interface EncodedVideoChunkMetadata {
 /** JavaScript-facing metadata type for video chunks */
 export interface EncodedVideoChunkMetadataJs {
   /** Decoder configuration from encoder */
-  decoderConfig?: VideoDecoderConfigJS
+  decoderConfig?: VideoDecoderConfigJs
   /** SVC output metadata */
-  svc?: SvcOutputMetadataJS
+  svc?: SvcOutputMetadataJs
 }
 
 /** Type of encoded video chunk */

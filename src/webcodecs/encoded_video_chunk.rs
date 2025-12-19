@@ -208,9 +208,7 @@ pub struct EncodedVideoChunk {
 impl EncodedVideoChunk {
   /// Create a new EncodedVideoChunk
   #[napi(constructor)]
-  pub fn new(
-    #[napi(ts_arg_type = "import('./standard').EncodedVideoChunkInit")] init: EncodedVideoChunkInit,
-  ) -> Result<Self> {
+  pub fn new(init: EncodedVideoChunkInit) -> Result<Self> {
     let inner = EncodedVideoChunkInner {
       data: init.data,
       chunk_type: init.chunk_type,
@@ -292,7 +290,7 @@ impl EncodedVideoChunk {
 
   /// Copy the encoded data to a BufferSource
   /// W3C spec: throws TypeError if destination is too small
-  #[napi(ts_args_type = "destination: import('./standard').BufferSource")]
+  #[napi(ts_args_type = "destination: BufferSource")]
   pub fn copy_to(&self, env: Env, destination: Unknown) -> Result<()> {
     self.with_inner(|inner| {
       // Try to get it as a TypedArray first (most common case)
