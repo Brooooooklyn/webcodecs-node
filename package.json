@@ -1,6 +1,6 @@
 {
   "name": "@napi-rs/webcodecs",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "WebCodecs API implementation for Node.js using FFmpeg",
   "keywords": [
     "N-API",
