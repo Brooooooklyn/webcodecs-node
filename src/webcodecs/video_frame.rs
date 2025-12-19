@@ -479,11 +479,7 @@ pub struct VideoColorSpace {
 impl VideoColorSpace {
   /// Create a new VideoColorSpace
   #[napi(constructor)]
-  pub fn new(
-    #[napi(ts_arg_type = "import('./standard').VideoColorSpaceInit")] init: Option<
-      VideoColorSpaceInit,
-    >,
-  ) -> Self {
+  pub fn new(init: Option<VideoColorSpaceInit>) -> Self {
     match init {
       Some(init) => VideoColorSpace {
         primaries: init.primaries,

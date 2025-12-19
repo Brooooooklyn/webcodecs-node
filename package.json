@@ -54,7 +54,7 @@
     "lint": "oxlint --type-aware",
     "prepublishOnly": "napi prepublish -t npm",
     "test": "ava",
-    "typecheck": "tsc -b tsconfig.json",
+    "typecheck": "tsc -b tsconfig.json && tsc ./index.d.ts",
     "preversion": "napi build --platform && git add .",
     "version": "napi version"
   },

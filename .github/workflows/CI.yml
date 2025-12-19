@@ -44,8 +44,14 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: ESLint
+      - name: Lint
         run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Format
+        run: pnpm oxfmt --check
 
       - name: Cargo fmt
         run: cargo fmt -- --check
