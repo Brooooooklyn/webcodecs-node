@@ -1749,6 +1749,8 @@ Cflags: -I${{includedir}}
     let pkgconfig_dir = self.prefix.join("lib").join("pkgconfig");
     fs::create_dir_all(&pkgconfig_dir)?;
 
+    // Use libc++ for zig builds, libstdc++ for GCC builds
+    let cxx_lib = if self.use_zig { "-lc++" } else { "-lstdc++" };
     let hwy_pc = format!(
       r#"prefix={}
 exec_prefix=${{prefix}}
@@ -1759,10 +1761,10 @@ Name: libhwy
 Description: Highway SIMD library
 Version: {}
 Libs: -L${{libdir}} -lhwy
-Libs.private: -lstdc++ -lm
+Libs.private: {} -lm
 Cflags: -I${{includedir}}
 "#,
-      prefix_str, HIGHWAY_BRANCH
+      prefix_str, HIGHWAY_BRANCH, cxx_lib
     );
     fs::write(pkgconfig_dir.join("libhwy.pc"), hwy_pc)?;
     self.log("Generated libhwy.pc");
@@ -1969,6 +1971,8 @@ Cflags: -I${{includedir}}
     let jxl_version = LIBJXL_BRANCH.trim_start_matches('v');
 
     // libjxl.pc
+    // Use libc++ for zig builds, libstdc++ for GCC builds
+    let cxx_lib = if self.use_zig { "-lc++" } else { "-lstdc++" };
     let jxl_pc = format!(
       r#"prefix={}
 exec_prefix=${{prefix}}
@@ -1980,14 +1984,15 @@ Description: JPEG XL image format reference implementation
 Version: {}
 Requires: libjxl_threads libhwy libbrotlidec libbrotlienc lcms2
 Libs: -L${{libdir}} -ljxl
-Libs.private: -lstdc++ -lm
+Libs.private: {} -lm
 Cflags: -I${{includedir}}
 "#,
-      prefix_str, jxl_version
+      prefix_str, jxl_version, cxx_lib
     );
     fs::write(pkgconfig_dir.join("libjxl.pc"), jxl_pc)?;
 
     // libjxl_threads.pc
+    // Note: cxx_lib already defined above for libjxl.pc
     let jxl_threads_pc = format!(
       r#"prefix={}
 exec_prefix=${{prefix}}
@@ -1998,10 +2003,10 @@ Name: libjxl_threads
 Description: JPEG XL threading library
 Version: {}
 Libs: -L${{libdir}} -ljxl_threads
-Libs.private: -lpthread
+Libs.private: {} -lpthread
 Cflags: -I${{includedir}}
 "#,
-      prefix_str, jxl_version
+      prefix_str, jxl_version, cxx_lib
     );
     fs::write(pkgconfig_dir.join("libjxl_threads.pc"), jxl_threads_pc)?;
 
