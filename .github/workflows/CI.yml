@@ -95,7 +95,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             build: pnpm build --target x86_64-unknown-linux-gnu --use-napi-cross
             download_ffmpeg: true
-          - host: ubuntu-latest
+          - host: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             build: pnpm build --target aarch64-unknown-linux-gnu --use-napi-cross
             download_ffmpeg: true
@@ -238,6 +238,14 @@ jobs:
 
           echo "FFMPEG_DIR=$(pwd)/ffmpeg-build" >> $GITHUB_ENV
         shell: bash
+      - name: Setup libc++ static library
+        if: ${{ endsWith(matrix.settings.target, 'unknown-linux-gnu') }}
+        run: |
+          sudo apt install -y libc++-dev libc++abi-dev
+          # prevent dynamic linking to libc++
+          sudo rm /usr/lib/llvm-18/lib/libc++abi.so
+          sudo rm /usr/lib/llvm-18/lib/libc++.so
+          sudo rm /usr/lib/llvm-18/lib/libunwind.so
       - name: Install dependencies
         run: pnpm install
       - name: Build
@@ -491,12 +499,18 @@ jobs:
         shell: bash
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
-        if: ${{ contains(matrix.target, 'armv7') }}
+        if: ${{ contains(matrix.target, 'armv7') || (contains(matrix.target, 'aarch64') && contains(matrix.target, 'musl')) }}
         with:
           platforms: all
       - run: docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
-        if: ${{ contains(matrix.target, 'armv7') }}
-      - name: Test bindings
+        if: ${{ contains(matrix.target, 'armv7') || (contains(matrix.target, 'aarch64') && contains(matrix.target, 'musl')) }}
+      # Run tests natively on ARM64 runner for aarch64-gnu (no Docker needed)
+      - name: Test bindings (native ARM64)
+        if: ${{ matrix.target == 'aarch64-unknown-linux-gnu' }}
+        run: npm run test
+      # Run tests in Docker for other targets (musl, armv7, x86_64)
+      - name: Test bindings (Docker)
+        if: ${{ matrix.target != 'aarch64-unknown-linux-gnu' }}
         uses: addnab/docker-run-action@v3
         with:
           image: ${{ steps.docker.outputs.IMAGE }}

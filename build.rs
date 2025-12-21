@@ -664,7 +664,14 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
   if linked_x265 {
     match target_os {
       "macos" => println!("cargo:rustc-link-lib=c++"),
-      "linux" => println!("cargo:rustc-link-lib=stdc++"),
+      "linux" => {
+        if target_arch == "arm" {
+          println!("cargo:rustc-link-lib=stdc++");
+        } else {
+          println!("cargo:rustc-link-search=/usr/lib/llvm-18/lib");
+          println!("cargo:rustc-link-lib=c++");
+        }
+      }
       "windows" => {
         // MSVC uses msvcrt automatically, but we need to ensure C++ runtime is linked
         // For static linking with MSVC, the runtime is usually already included
