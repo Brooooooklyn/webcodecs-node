@@ -10,7 +10,7 @@ WebCodecs API implementation for Node.js using FFmpeg, built with [NAPI-RS](http
 - **Video encoding/decoding** - H.264, H.265, VP8, VP9, AV1
 - **Audio encoding/decoding** - AAC, Opus, MP3, FLAC, Vorbis, PCM variants
 - **Container muxing/demuxing** - MP4, WebM, MKV containers with seeking support
-- **Image decoding** - JPEG, PNG, WebP, GIF, BMP, AVIF
+- **Image decoding** - JPEG, PNG, WebP, GIF, BMP, AVIF, JPEG XL
 - **Canvas integration** - Create VideoFrames from `@napi-rs/canvas` for graphics and text rendering
 - **Hardware acceleration** - Zero-copy GPU encoding with VideoToolbox (macOS), NVENC (NVIDIA), VAAPI (Linux), QSV (Intel)
 - **Cross-platform** - macOS, Windows, Linux (glibc/musl, x64/arm64/armv7)
@@ -362,14 +362,15 @@ frame.close()
 
 ### Image
 
-| Format | MIME Type    | Decoding |
-| ------ | ------------ | -------- |
-| JPEG   | `image/jpeg` | ✅       |
-| PNG    | `image/png`  | ✅       |
-| WebP   | `image/webp` | ✅       |
-| GIF    | `image/gif`  | ✅       |
-| BMP    | `image/bmp`  | ✅       |
-| AVIF   | `image/avif` | ✅       |
+| Format  | MIME Type    | Decoding | Notes                          |
+| ------- | ------------ | -------- | ------------------------------ |
+| JPEG    | `image/jpeg` | ✅       |                                |
+| PNG     | `image/png`  | ✅       |                                |
+| WebP    | `image/webp` | ✅       |                                |
+| GIF     | `image/gif`  | ✅       |                                |
+| BMP     | `image/bmp`  | ✅       |                                |
+| AVIF    | `image/avif` | ✅       |                                |
+| JPEG XL | `image/jxl`  | ✅       | Not available on Windows arm64 |
 
 ### Containers
 

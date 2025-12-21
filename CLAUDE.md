@@ -18,7 +18,7 @@ WebCodecs API implementation for Node.js using FFmpeg, built with napi-rs (Rust 
 | AudioDecoder        | ✅ Complete | All codecs with resampling + EventTarget                           |
 | VideoFrame          | ✅ Complete | All pixel formats, async copyTo, format conversion, Canvas support |
 | AudioData           | ✅ Complete | All sample formats                                                 |
-| ImageDecoder        | ✅ Complete | JPEG, PNG, WebP, GIF, BMP, AVIF                                    |
+| ImageDecoder        | ✅ Complete | JPEG, PNG, WebP, GIF, BMP, AVIF, JPEG XL                           |
 | Mp4Demuxer          | ✅ Complete | H.264, H.265, AV1, AAC, Opus                                       |
 | WebMDemuxer         | ✅ Complete | VP8, VP9, AV1, Opus, Vorbis                                        |
 | MkvDemuxer          | ✅ Complete | All codecs                                                         |
@@ -146,6 +146,11 @@ Required static libraries:
 - AV1 libs (platform-specific):
   - **Windows x64 MSVC:** `rav1e.lib` (encoder) + `dav1d.lib` (decoder)
   - **Other platforms:** `libaom.a` (encoder + decoder)
+- JPEG XL libs (not on Windows arm64):
+  - `libjxl.a`, `libjxl_threads.a` - JPEG XL core and threading
+  - `libhwy.a` - Highway SIMD library
+  - `libbrotlienc.a`, `libbrotlidec.a`, `libbrotlicommon.a` - Brotli compression
+  - `liblcms2.a` - Little CMS 2 color management
 
 Detection order:
 
@@ -154,6 +159,39 @@ Detection order:
 3. Common paths (`/opt/homebrew`, `/usr/local`, etc.)
 4. Bundled in `ffmpeg/{platform}/`
 5. Auto-download from GitHub Releases (Linux/Windows CI builds)
+6. macOS: Download static libs (dav1d, libjxl + deps) from GitHub Releases (Homebrew only provides .dylib)
+
+## JPEG XL (libjxl) Build
+
+JPEG XL support requires libjxl v0.11.1 and its dependencies:
+
+| Library | Version | Purpose                          | Build System |
+| ------- | ------- | -------------------------------- | ------------ |
+| highway | 1.3.0   | SIMD library for vectorized ops  | CMake        |
+| brotli  | 1.1.0   | Compression (required by JXL)    | CMake        |
+| lcms2   | 2.16    | Little CMS 2 color management    | autotools    |
+| libjxl  | 0.11.1  | JPEG XL reference implementation | CMake        |
+
+**Build order matters:** highway → brotli → lcms2 → libjxl
+
+### Platform-Specific Build Details
+
+| Platform      | Method                                        | Notes                             |
+| ------------- | --------------------------------------------- | --------------------------------- |
+| macOS         | Pre-built static libs downloaded from release | Homebrew only provides .dylib     |
+| Windows x64   | vcpkg `libjxl:x64-windows-static`             | Built with MSVC                   |
+| Windows arm64 | ❌ Not supported                              | vcpkg FFmpeg lacks jxl feature    |
+| Linux (all)   | Built from source via `tools/build-ffmpeg`    | Uses zig cc for cross-compilation |
+
+### C++ Runtime Linking (Linux)
+
+libjxl and highway are C++ libraries, requiring careful C++ runtime handling:
+
+- **x64/arm64 glibc:** Links `libc++.a` and `libc++abi.a` statically
+- **arm64:** Also links `libclang_rt.builtins-aarch64.a` for LLVM outline atomics
+- **armv7/musl:** Falls back to `libstdc++` (GCC toolchain)
+
+The build system uses explicit full paths to static libraries to avoid dynamic linking conflicts with the NAPI-RS cross-compilation toolchain.
 
 ## Implemented WebCodecs API
 
@@ -333,10 +371,10 @@ const canvasFrame = new VideoFrame(canvas, { timestamp: 0 })
 ## ImageDecoder Usage
 
 ```typescript
-// Decode static image (PNG, JPEG, BMP)
+// Decode static image (PNG, JPEG, BMP, JPEG XL)
 const decoder = new ImageDecoder({
   data: imageBytes, // Uint8Array or ReadableStream
-  type: 'image/png',
+  type: 'image/png', // or 'image/jxl' for JPEG XL
 })
 
 const result = await decoder.decode()
@@ -638,6 +676,7 @@ src/codec/context.rs:339,362  # Set extradata if provided (non-critical)
 1. **Temporal SVC** - All modes with >= 2 temporal layers (L1Tx, L2Tx, L3Tx, SxTx) populate `metadata.svc.temporalLayerId`; W3C spec does not define `spatialLayerId`
 2. **Duration type** - Using i64 instead of u64 due to NAPI-RS constraints
 3. **ImageDecoder GIF animation** - FFmpeg may return only first frame; for full animation use VideoDecoder with GIF codec
+4. **JPEG XL on Windows arm64** - Not available because vcpkg's pre-built FFmpeg doesn't include libjxl support
 
 ## NAPI-RS Limitations
 
@@ -680,19 +719,22 @@ These are fundamental limitations that cannot be resolved without upstream NAPI-
 
 **9 build targets** with full CI coverage:
 
-| Target                        | OS      | AV1 Encoder | AV1 Decoder |
-| ----------------------------- | ------- | ----------- | ----------- |
-| x86_64-apple-darwin           | macOS   | libaom      | libaom      |
-| aarch64-apple-darwin          | macOS   | libaom      | libaom      |
-| x86_64-pc-windows-msvc        | Windows | rav1e       | dav1d       |
-| aarch64-pc-windows-msvc       | Windows | libaom      | libaom      |
-| x86_64-unknown-linux-gnu      | Linux   | libaom      | libaom      |
-| aarch64-unknown-linux-gnu     | Linux   | libaom      | libaom      |
-| x86_64-unknown-linux-musl     | Linux   | libaom      | libaom      |
-| aarch64-unknown-linux-musl    | Linux   | libaom      | libaom      |
-| armv7-unknown-linux-gnueabihf | Linux   | libaom      | libaom      |
+| Target                        | OS      | AV1 Encoder | AV1 Decoder | JPEG XL |
+| ----------------------------- | ------- | ----------- | ----------- | ------- |
+| x86_64-apple-darwin           | macOS   | libaom      | libaom      | ✅      |
+| aarch64-apple-darwin          | macOS   | libaom      | libaom      | ✅      |
+| x86_64-pc-windows-msvc        | Windows | rav1e       | dav1d       | ✅      |
+| aarch64-pc-windows-msvc       | Windows | libaom      | libaom      | ❌      |
+| x86_64-unknown-linux-gnu      | Linux   | libaom      | libaom      | ✅      |
+| aarch64-unknown-linux-gnu     | Linux   | libaom      | libaom      | ✅      |
+| x86_64-unknown-linux-musl     | Linux   | libaom      | libaom      | ✅      |
+| aarch64-unknown-linux-musl    | Linux   | libaom      | libaom      | ✅      |
+| armv7-unknown-linux-gnueabihf | Linux   | libaom      | libaom      | ✅      |
 
-**Note:** Windows x64 MSVC uses rav1e + dav1d due to libaom crash issues (CVE-2025-8879).
+**Notes:**
+
+- Windows x64 MSVC uses rav1e + dav1d due to libaom crash issues (CVE-2025-8879).
+- Windows arm64 MSVC lacks JPEG XL support because vcpkg's pre-built FFmpeg doesn't include libjxl.
 
 ## Spec Compliance Notes
 
