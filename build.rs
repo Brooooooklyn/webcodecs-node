@@ -721,6 +721,23 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
           println!("cargo:warning=Using libc++ from: {}", libcpp);
           println!("cargo:rustc-link-arg={}", libcpp);
           println!("cargo:rustc-link-arg={}", libcppabi);
+
+          // On aarch64, LLVM uses outline atomics by default for compatibility with
+          // older ARM64 CPUs without LSE (Large System Extensions). This generates
+          // calls to helper functions like __aarch64_ldadd4_acq_rel.
+          // Modern GCC's libatomic (10+) provides these symbols for ABI compatibility.
+          if target_arch == "aarch64" {
+            let libatomic_path = format!("{}/libatomic.a", multiarch_dir);
+            if Path::new(&libatomic_path).exists() {
+              println!("cargo:warning=Using libatomic from: {}", libatomic_path);
+              println!("cargo:rustc-link-arg={}", libatomic_path);
+            } else {
+              panic!(
+                "libatomic.a not found at {}. Install libatomic1 package.",
+                libatomic_path
+              );
+            }
+          }
         }
       }
       "windows" => {

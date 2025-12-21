@@ -56,6 +56,9 @@ jobs:
       - name: Cargo fmt
         run: cargo fmt -- --check
 
+      - name: Setup libc++ static library
+        run: sudo apt install -y libc++-dev libc++abi-dev
+
       - name: Clippy
         run: cargo clippy
 
@@ -241,18 +244,19 @@ jobs:
       - name: Setup libc++ static library
         if: ${{ endsWith(matrix.settings.target, 'unknown-linux-gnu') }}
         run: |
-          sudo apt install -y libc++-dev libc++abi-dev
+          sudo apt install -y libc++-dev libc++abi-dev libgcc-9-dev-arm64-cross
           # prevent dynamic linking to libc++
           sudo rm /usr/lib/llvm-18/lib/libc++abi.so
           sudo rm /usr/lib/llvm-18/lib/libc++.so
           sudo rm /usr/lib/llvm-18/lib/libunwind.so
-      - name: remove .so files on arm64 host
+      - name: Remove .so files and move libatomic.a on arm64 host
         if: matrix.settings.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo rm /usr/lib/aarch64-linux-gnu/libc++abi.so
           sudo rm /usr/lib/aarch64-linux-gnu/libc++.so
           sudo rm /usr/lib/aarch64-linux-gnu/libunwind.so
-      - name: remove .so files on x86_64 host
+          sudo mv /usr/lib/gcc-cross/aarch64-linux-gnu/9/libatomic.a /usr/lib/aarch64-linux-gnu/libatomic.a
+      - name: Remove .so files on x86_64 host
         if: matrix.settings.target == 'x86_64-unknown-linux-gnu'
         run: |
           sudo rm /usr/lib/x86_64-linux-gnu/libc++abi.so
