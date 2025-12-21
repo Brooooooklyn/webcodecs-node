@@ -4,7 +4,8 @@
 //! 1. NAPI-RS setup
 //! 2. Compiling the C accessor library via `cc`
 //! 3. Static linking of FFmpeg libraries
-//! 4. Downloading pre-built FFmpeg from GitHub Releases (Linux only)
+//! 4. Downloading pre-built FFmpeg from GitHub Releases (Linux/Windows)
+//! 5. Downloading pre-built static libs from GitHub Releases (macOS)
 
 use std::env;
 use std::fs;
@@ -24,17 +25,34 @@ fn main() {
   }
 
   // Get target information
-  let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-  let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+  let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS not set");
+  let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH not set");
+  let target_env = env::var("CARGO_CFG_TARGET_ENV").expect("CARGO_CFG_TARGET_ENV not set");
+
+  // For macOS: download static libs (dav1d, libjxl) if not already present
+  // These are needed because Homebrew only provides dynamic .dylib files
+  let macos_static_libs_dir = if target_os == "macos" {
+    download_static_libs_for_macos(&target_arch)
+  } else {
+    None
+  };
 
   // Get FFmpeg directory
-  let ffmpeg_dir = get_ffmpeg_dir(&target_os, &target_arch);
+  let ffmpeg_dir = get_ffmpeg_dir(&target_os, &target_arch, &target_env);
+
+  // Add macOS static libs to search path if downloaded
+  if let Some(ref static_libs_path) = macos_static_libs_dir {
+    println!(
+      "cargo:rustc-link-search={}",
+      static_libs_path.join("lib").display()
+    );
+  }
 
   // Compile C accessor library
-  compile_accessors(&ffmpeg_dir, &target_os);
+  compile_accessors(&ffmpeg_dir, &target_os, &target_arch, &target_env);
 
   // Link FFmpeg libraries
-  link_ffmpeg(&ffmpeg_dir, &target_os);
+  link_ffmpeg(&ffmpeg_dir, &target_os, macos_static_libs_dir.as_ref());
 
   // Re-run if these files change
   println!("cargo:rerun-if-changed=src/ffi/accessors.c");
@@ -47,7 +65,7 @@ fn main() {
 }
 
 /// Get FFmpeg installation directory
-fn get_ffmpeg_dir(target_os: &str, target_arch: &str) -> PathBuf {
+fn get_ffmpeg_dir(target_os: &str, target_arch: &str, target_env: &str) -> PathBuf {
   // 1. Check for custom FFMPEG_DIR environment variable
   if let Ok(dir) = env::var("FFMPEG_DIR") {
     return PathBuf::from(dir);
@@ -106,8 +124,7 @@ fn get_ffmpeg_dir(target_os: &str, target_arch: &str) -> PathBuf {
   }
 
   // 5. Try downloading from GitHub Releases (Linux and Windows)
-  let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
-  if let Some(downloaded) = download_ffmpeg_from_release(target_os, target_arch, &target_env) {
+  if let Some(downloaded) = download_ffmpeg_from_release(target_os, target_arch, target_env) {
     return downloaded;
   }
 
@@ -271,6 +288,142 @@ fn download_ffmpeg_from_release(
   }
 }
 
+/// Download macOS static libs (dav1d, libjxl + deps) if not already present
+///
+/// These are needed because Homebrew only provides dynamic .dylib files,
+/// but FFmpeg's libavcodec.a has undefined symbols for dav1d/jxl that
+/// need to be resolved by linking static .a files.
+fn download_static_libs_for_macos(target_arch: &str) -> Option<PathBuf> {
+  // Skip if FFMPEG_SKIP_DOWNLOAD is set
+  if env::var("FFMPEG_SKIP_DOWNLOAD").unwrap_or_default() == "1" {
+    return None;
+  }
+
+  // Check if static libs already exist in Homebrew paths
+  let brew_prefix = env::var("HOMEBREW_PREFIX").unwrap_or_else(|_| {
+    if target_arch == "aarch64" {
+      "/opt/homebrew".to_string()
+    } else {
+      "/usr/local".to_string()
+    }
+  });
+  let brew_lib = PathBuf::from(&brew_prefix).join("lib");
+
+  // Check for required static libs (all libs needed for libjxl support)
+  let required_libs = [
+    "libdav1d.a",
+    "libjxl.a",
+    "libjxl_threads.a",
+    "libhwy.a",
+    "libbrotlienc.a",
+    "libbrotlidec.a",
+    "libbrotlicommon.a",
+    "liblcms2.a",
+  ];
+  let all_exist = required_libs.iter().all(|lib| brew_lib.join(lib).exists());
+
+  if all_exist {
+    println!(
+      "cargo:warning=Static libs already exist in {}",
+      brew_lib.display()
+    );
+    return None; // No download needed
+  }
+
+  // Map architecture to target triple
+  let target = match target_arch {
+    "x86_64" => "x86_64-apple-darwin",
+    "aarch64" => "aarch64-apple-darwin",
+    _ => return None,
+  };
+
+  let repo =
+    env::var("FFMPEG_GITHUB_REPO").unwrap_or_else(|_| "Brooooooklyn/webcodecs-node".to_string());
+
+  // Determine release tag
+  let release_tag = match env::var("FFMPEG_RELEASE_TAG") {
+    Ok(tag) => tag,
+    Err(_) => find_latest_ffmpeg_release(&repo)?,
+  };
+
+  let archive_name = format!("static-libs-{}.tar.gz", target);
+  let download_url = format!(
+    "https://github.com/{}/releases/download/{}/{}",
+    repo, release_tag, archive_name
+  );
+
+  // Download to OUT_DIR
+  let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+  let static_libs_dir = out_dir.join("static-libs");
+  let archive_path = out_dir.join(&archive_name);
+
+  // Skip if already extracted - check for libjxl.a
+  let lib_check = static_libs_dir.join("lib").join("libjxl.a");
+  if lib_check.exists() {
+    println!(
+      "cargo:warning=Using cached static libs at {}",
+      static_libs_dir.display()
+    );
+    return Some(static_libs_dir);
+  }
+
+  println!(
+    "cargo:warning=Downloading macOS static libs from {}",
+    download_url
+  );
+
+  // Download using curl
+  let status = Command::new("curl")
+    .args(["-L", "-f", "-o"])
+    .arg(&archive_path)
+    .arg(&download_url)
+    .status();
+
+  match status {
+    Ok(s) if s.success() => {}
+    _ => {
+      println!(
+        "cargo:warning=Failed to download static libs from {}",
+        download_url
+      );
+      println!(
+        "cargo:warning=You may need to build dav1d/libjxl manually or run the FFmpeg build workflow"
+      );
+      return None;
+    }
+  }
+
+  // Create extraction directory
+  if let Err(e) = fs::create_dir_all(&static_libs_dir) {
+    println!("cargo:warning=Failed to create directory: {}", e);
+    return None;
+  }
+
+  // Extract archive using tar
+  let extract_status = Command::new("tar")
+    .arg("xzf")
+    .arg(&archive_path)
+    .arg("-C")
+    .arg(&static_libs_dir)
+    .status();
+
+  match extract_status {
+    Ok(s) if s.success() => {
+      // Clean up archive
+      let _ = fs::remove_file(&archive_path);
+      println!(
+        "cargo:warning=Static libs extracted to {}",
+        static_libs_dir.display()
+      );
+      Some(static_libs_dir)
+    }
+    _ => {
+      println!("cargo:warning=Failed to extract static libs archive");
+      None
+    }
+  }
+}
+
 /// Find the latest ffmpeg-* release tag from GitHub
 fn find_latest_ffmpeg_release(repo: &str) -> Option<String> {
   // Use GitHub API to list releases
@@ -307,7 +460,7 @@ fn find_latest_ffmpeg_release(repo: &str) -> Option<String> {
 }
 
 /// Compile the C accessor library
-fn compile_accessors(ffmpeg_dir: &Path, target_os: &str) {
+fn compile_accessors(ffmpeg_dir: &Path, target_os: &str, target_arch: &str, target_env: &str) {
   let include_dir = ffmpeg_dir.join("include");
 
   let mut build = cc::Build::new();
@@ -324,7 +477,12 @@ fn compile_accessors(ffmpeg_dir: &Path, target_os: &str) {
     "linux" => {
       build
         .flag_if_supported("-static")
-        .cpp_link_stdlib_static(true);
+        .cpp_link_stdlib_static(true)
+        .cpp_set_stdlib(if target_arch == "arm" || target_env == "musl" {
+          "stdc++"
+        } else {
+          "c++"
+        });
     }
     _ => {}
   }
@@ -336,22 +494,26 @@ fn compile_accessors(ffmpeg_dir: &Path, target_os: &str) {
 }
 
 /// Link FFmpeg libraries (static only)
-fn link_ffmpeg(ffmpeg_dir: &Path, target_os: &str) {
+fn link_ffmpeg(ffmpeg_dir: &Path, target_os: &str, extra_lib_dir: Option<&PathBuf>) {
   let lib_dir = ffmpeg_dir.join("lib");
 
   // Always use static linking - panic if static libs not found
-  link_static_ffmpeg(&lib_dir, target_os);
+  link_static_ffmpeg(&lib_dir, target_os, extra_lib_dir);
 
   // Platform-specific system libraries
   link_platform_libraries(target_os);
 }
 
 /// Link FFmpeg statically using full paths to .a files
-fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
+fn link_static_ffmpeg(lib_dir: &Path, target_os: &str, extra_lib_dir: Option<&PathBuf>) {
   // Get codec library paths, with lib_dir as highest priority
   let mut codec_lib_paths = get_codec_library_paths(target_os);
   // Insert lib_dir at the front so downloaded/bundled FFmpeg libs are found first
   codec_lib_paths.insert(0, lib_dir.to_path_buf());
+  // Add extra lib dir (e.g., downloaded macOS static libs) if provided
+  if let Some(extra_dir) = extra_lib_dir {
+    codec_lib_paths.insert(1, extra_dir.join("lib"));
+  }
 
   // FFmpeg core libraries - link using full paths
   let ffmpeg_libs = ["avformat", "avcodec", "avutil", "swscale", "swresample"];
@@ -397,6 +559,10 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
   let is_windows_msvc_x64 =
     target_os == "windows" && target_arch == "x86_64" && target_env == "msvc";
 
+  // Windows arm64 uses vcpkg's pre-built FFmpeg which doesn't include libjxl
+  let is_windows_msvc_arm64 =
+    target_os == "windows" && target_arch == "aarch64" && target_env == "msvc";
+
   // Work around duplicate Rust runtime symbols when linking rav1e.lib on Windows MSVC.
   // rav1e is a Rust staticlib that includes rust_eh_personality, which conflicts with
   // our own Rust runtime. /FORCE:MULTIPLE tells MSVC linker to accept duplicate symbols.
@@ -422,6 +588,17 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
     ("webpmux", false),   // WebP muxer
     ("webpdemux", false), // WebP demuxer
     ("sharpyuv", false),  // WebP YUV conversion
+    // JPEG XL support - built on all platforms via build-ffmpeg tool
+    // Link order matters: jxl depends on jxl_threads, hwy, brotli, lcms2
+    // Note: Windows arm64 uses vcpkg's pre-built FFmpeg which doesn't include libjxl
+    ("jxl", !is_windows_msvc_arm64),          // libjxl core
+    ("jxl_threads", !is_windows_msvc_arm64),  // libjxl threading
+    ("jxl_cms", false),                       // libjxl color management - optional
+    ("hwy", !is_windows_msvc_arm64),          // Highway SIMD library
+    ("brotlienc", !is_windows_msvc_arm64),    // Brotli encoder
+    ("brotlidec", !is_windows_msvc_arm64),    // Brotli decoder
+    ("brotlicommon", !is_windows_msvc_arm64), // Brotli common
+    ("lcms2", !is_windows_msvc_arm64),        // Little CMS 2
     // Text/subtitle libraries
     ("aribb24", false), // ARIB STD-B24 decoder
     // Other optional libraries
@@ -442,6 +619,7 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
   ];
 
   let mut linked_x265 = false;
+  let mut linked_jxl = false;
 
   // On Linux, we need --whole-archive for codec libraries because FFmpeg uses
   // function pointer tables to reference codecs. Without --whole-archive, the
@@ -457,6 +635,9 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
       codec_paths.push(path);
       if *lib == "x265" {
         linked_x265 = true;
+      }
+      if *lib == "jxl" {
+        linked_jxl = true;
       }
     } else if *required {
       panic!(
@@ -499,10 +680,88 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
   }
 
   // x265 requires C++ runtime
-  if linked_x265 {
+  // Note: FFmpeg static libs are built with zig (libc++) but final linking uses
+  // NAPI-RS GCC cross-toolchain which only has libstdc++. This works because
+  // the C++ symbols needed are ABI-compatible for static linking.
+  if linked_x265 || linked_jxl {
     match target_os {
       "macos" => println!("cargo:rustc-link-lib=c++"),
-      "linux" => println!("cargo:rustc-link-lib=stdc++"),
+      "linux" => {
+        if target_arch == "arm" || target_env == "musl" {
+          println!("cargo:rustc-link-lib=stdc++");
+        } else {
+          // Link libc++ and its ABI dependency statically using explicit full paths.
+          // We can't use rustc-link-lib because the napi-rs cross-compilation toolchain
+          // has its own sysroot and doesn't respect our -L paths.
+          // Using rustc-link-arg with full paths bypasses library search entirely.
+          //
+          // Try multiarch path first (what cross toolchains expect), then LLVM path
+          let multiarch_dir = if target_arch == "x86_64" {
+            "/usr/lib/x86_64-linux-gnu"
+          } else {
+            "/usr/lib/aarch64-linux-gnu"
+          };
+          let llvm_dir = "/usr/lib/llvm-18/lib";
+
+          // Find libc++.a
+          let libcpp_multiarch = format!("{}/libc++.a", multiarch_dir);
+          let libcpp_llvm = format!("{}/libc++.a", llvm_dir);
+          let libcpp = if Path::new(&libcpp_multiarch).exists() {
+            &libcpp_multiarch
+          } else if Path::new(&libcpp_llvm).exists() {
+            &libcpp_llvm
+          } else {
+            panic!(
+              "libc++.a not found at {} or {}. Install libc++-dev package.",
+              libcpp_multiarch, libcpp_llvm
+            );
+          };
+
+          // Find libc++abi.a
+          let libcppabi_multiarch = format!("{}/libc++abi.a", multiarch_dir);
+          let libcppabi_llvm = format!("{}/libc++abi.a", llvm_dir);
+          let libcppabi = if Path::new(&libcppabi_multiarch).exists() {
+            &libcppabi_multiarch
+          } else if Path::new(&libcppabi_llvm).exists() {
+            &libcppabi_llvm
+          } else {
+            panic!(
+              "libc++abi.a not found at {} or {}. Install libc++abi-dev package.",
+              libcppabi_multiarch, libcppabi_llvm
+            );
+          };
+
+          println!("cargo:warning=Using libc++ from: {}", libcpp);
+          println!("cargo:rustc-link-arg={}", libcpp);
+          println!("cargo:rustc-link-arg={}", libcppabi);
+
+          // On aarch64, LLVM uses outline atomics by default for compatibility with
+          // older ARM64 CPUs without LSE (Large System Extensions). This generates
+          // calls to helper functions like __aarch64_ldadd4_acq_rel.
+          //
+          // IMPORTANT: GCC's libatomic does NOT provide these symbols!
+          // - GCC libatomic uses: __atomic_fetch_add_4 (C11 atomics API)
+          // - LLVM generates: __aarch64_ldadd4_acq_rel (LLVM outline atomics)
+          // These are incompatible ABIs. We MUST use LLVM's libclang_rt.builtins.
+          if target_arch == "aarch64" {
+            let clang_rt_path =
+              "/usr/lib/llvm-18/lib/clang/18/lib/linux/libclang_rt.builtins-aarch64.a";
+            if Path::new(clang_rt_path).exists() {
+              println!(
+                "cargo:warning=Using compiler-rt builtins from: {}",
+                clang_rt_path
+              );
+              println!("cargo:rustc-link-arg={}", clang_rt_path);
+            } else {
+              panic!(
+                "libclang_rt.builtins-aarch64.a not found at {}. \
+                 Install libclang-rt-18-dev package.",
+                clang_rt_path
+              );
+            }
+          }
+        }
+      }
       "windows" => {
         // MSVC uses msvcrt automatically, but we need to ensure C++ runtime is linked
         // For static linking with MSVC, the runtime is usually already included
