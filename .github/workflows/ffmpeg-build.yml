@@ -75,10 +75,11 @@ jobs:
           path: ffmpeg-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
-  # Build Windows arm64 using vcpkg (libaom for AV1)
+  # Build Windows arm64 from source with libaom (libaom works fine on ARM64, unlike x64)
+  # Uses native ARM64 runner for native compilation
   build-ffmpeg-windows-arm64:
     name: Build aarch64-pc-windows-msvc
-    runs-on: windows-latest
+    runs-on: windows-11-arm
     permissions:
       id-token: write
       attestations: write
@@ -90,45 +91,275 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Visual Studio environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          update: true
+          path-type: inherit
+          install: >-
+            make
+            diffutils
+            pkg-config
+
+      # Note: NASM is not needed for ARM64 (it's x86/x64 only)
+      # FFmpeg ARM64 uses gas-preprocessor for ARM assembly
+
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgGitCommitId: '74e6536215718009aae747d86d84b78376bf9e09'
 
-      - name: Install FFmpeg with codecs via vcpkg
-        # Note: vcpkg's FFmpeg port doesn't support jxl feature
-        # libjxl would require building FFmpeg from source like we do for x64
+      - name: Install codec dependencies (without FFmpeg)
         run: |
-          vcpkg install ffmpeg[avformat,avcodec,swresample,swscale,gpl,x264,x265,vpx,aom,opus,mp3lame,vorbis,webp,zlib]:arm64-windows-static
+          vcpkg install `
+            x264:arm64-windows-static `
+            x265:arm64-windows-static `
+            libvpx:arm64-windows-static `
+            aom:arm64-windows-static `
+            dav1d:arm64-windows-static `
+            opus:arm64-windows-static `
+            mp3lame:arm64-windows-static `
+            libogg:arm64-windows-static `
+            libvorbis:arm64-windows-static `
+            libwebp:arm64-windows-static `
+            zlib:arm64-windows-static `
+            libjxl:arm64-windows-static
 
       - name: List vcpkg installed libraries
         run: |
           Write-Host "=== All installed .lib files in vcpkg ==="
           Get-ChildItem "$env:VCPKG_ROOT/installed/arm64-windows-static/lib/*.lib" | ForEach-Object { $_.Name }
 
-      - name: Prepare output directory
+      - name: Clone FFmpeg
+        run: |
+          git clone --depth=1 -b ${{ env.FFMPEG_VERSION }} https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+
+      - name: Build FFmpeg with MSVC toolchain
+        shell: msys2 {0}
+        run: |
+          # Convert paths to Windows mixed-style (D:/a/...) for MSVC compatibility
+          VCPKG_ROOT_WIN=$(cygpath -m "$VCPKG_ROOT")
+          VCPKG_INSTALLED="$VCPKG_ROOT_WIN/installed/arm64-windows-static"
+          PREFIX=$(cygpath -m "$(pwd)/ffmpeg-aarch64-pc-windows-msvc")
+
+          # MSYS-style paths for shell operations
+          VCPKG_ROOT_MSYS=$(cygpath "$VCPKG_ROOT")
+          VCPKG_INSTALLED_MSYS="$VCPKG_ROOT_MSYS/installed/arm64-windows-static"
+
+          # Create pkg-config directory
+          PKGCONFIG_DIR=$(cygpath -m "$(pwd)/pkgconfig")
+          PKGCONFIG_DIR_MSYS=$(pwd)/pkgconfig
+          mkdir -p "$PKGCONFIG_DIR_MSYS"
+
+          echo "=== Path debug ==="
+          echo "VCPKG_INSTALLED (Windows): $VCPKG_INSTALLED"
+          echo "VCPKG_INSTALLED (MSYS): $VCPKG_INSTALLED_MSYS"
+          echo "PKGCONFIG_DIR (Windows): $PKGCONFIG_DIR"
+
+          # List actual library files to verify names
+          echo "=== vcpkg lib files ==="
+          ls -la "$VCPKG_INSTALLED_MSYS/lib/"*.lib 2>/dev/null | head -30 || echo "No .lib files found"
+
+          # Helper function to create pkg-config files
+          create_pc() {
+            local file="$1" prefix="$2" name="$3" desc="$4" version="$5" cflags="$6" libs="$7"
+            {
+              printf 'prefix=%s\n' "$prefix"
+              printf 'libdir=${prefix}/lib\n'
+              printf 'includedir=${prefix}/include\n'
+              printf '\n'
+              printf 'Name: %s\n' "$name"
+              printf 'Description: %s\n' "$desc"
+              printf 'Version: %s\n' "$version"
+              printf 'Libs: -L${libdir} %s\n' "$libs"
+              printf 'Cflags: %s\n' "$cflags"
+            } > "$file"
+          }
+
+          # x264
+          create_pc "$PKGCONFIG_DIR_MSYS/x264.pc" "$VCPKG_INSTALLED" "x264" "x264 H.264 encoder" "0.164" '-I${includedir}' '-lx264'
+
+          # x265
+          create_pc "$PKGCONFIG_DIR_MSYS/x265.pc" "$VCPKG_INSTALLED" "x265" "x265 HEVC encoder" "3.5" '-I${includedir}' '-lx265'
+
+          # vpx
+          create_pc "$PKGCONFIG_DIR_MSYS/vpx.pc" "$VCPKG_INSTALLED" "vpx" "WebM VP8/VP9 codec" "1.13.0" '-I${includedir}' '-lvpx'
+
+          # aom (libaom works fine on ARM64, unlike x64 where it crashes)
+          create_pc "$PKGCONFIG_DIR_MSYS/aom.pc" "$VCPKG_INSTALLED" "aom" "AV1 codec library" "3.8.0" '-I${includedir}' '-laom'
+
+          # dav1d AV1 decoder
+          create_pc "$PKGCONFIG_DIR_MSYS/dav1d.pc" "$VCPKG_INSTALLED" "dav1d" "dav1d AV1 decoder" "1.5.1" '-I${includedir}' '-ldav1d'
+
+          # opus
+          create_pc "$PKGCONFIG_DIR_MSYS/opus.pc" "$VCPKG_INSTALLED" "opus" "Opus audio codec" "1.4" '-I${includedir}/opus' '-lopus'
+
+          # libmp3lame
+          create_pc "$PKGCONFIG_DIR_MSYS/libmp3lame.pc" "$VCPKG_INSTALLED" "libmp3lame" "LAME MP3 encoder" "3.100" '-I${includedir}' '-lmp3lame -lmpghip'
+
+          # ogg
+          create_pc "$PKGCONFIG_DIR_MSYS/ogg.pc" "$VCPKG_INSTALLED" "ogg" "Ogg bitstream library" "1.3.5" '-I${includedir}' '-logg'
+
+          # vorbis
+          create_pc "$PKGCONFIG_DIR_MSYS/vorbis.pc" "$VCPKG_INSTALLED" "vorbis" "Vorbis audio codec" "1.3.7" '-I${includedir}' '-lvorbis -logg'
+
+          # vorbisenc
+          create_pc "$PKGCONFIG_DIR_MSYS/vorbisenc.pc" "$VCPKG_INSTALLED" "vorbisenc" "Vorbis encoder" "1.3.7" '-I${includedir}' '-lvorbisenc -lvorbis -logg'
+
+          # vorbisfile
+          create_pc "$PKGCONFIG_DIR_MSYS/vorbisfile.pc" "$VCPKG_INSTALLED" "vorbisfile" "Vorbis file decoder" "1.3.7" '-I${includedir}' '-lvorbisfile -lvorbis -logg'
+
+          # libwebp
+          create_pc "$PKGCONFIG_DIR_MSYS/libwebp.pc" "$VCPKG_INSTALLED" "libwebp" "WebP image codec" "1.3.2" '-I${includedir}' '-lwebp -lsharpyuv'
+
+          # zlib
+          create_pc "$PKGCONFIG_DIR_MSYS/zlib.pc" "$VCPKG_INSTALLED" "zlib" "zlib compression library" "1.3" '-I${includedir}' '-lz'
+
+          # libjxl JPEG XL
+          create_pc "$PKGCONFIG_DIR_MSYS/libjxl.pc" "$VCPKG_INSTALLED" "libjxl" "JPEG XL image codec" "0.11.1" '-I${includedir}' '-ljxl -ljxl_threads -ljxl_cms -lhwy -lbrotlidec -lbrotlienc -lbrotlicommon -llcms2'
+          create_pc "$PKGCONFIG_DIR_MSYS/libjxl_threads.pc" "$VCPKG_INSTALLED" "libjxl_threads" "JPEG XL threading" "0.11.1" '-I${includedir}' '-ljxl_threads'
+
+          # Set up pkg-config path
+          export PKG_CONFIG_PATH="$PKGCONFIG_DIR_MSYS"
+
+          # Create library copies with names FFmpeg's configure expects
+          echo "=== Creating library copies for FFmpeg configure checks ==="
+          cd "$VCPKG_INSTALLED_MSYS/lib"
+          [ -f libmp3lame-static.lib ] && [ ! -f mp3lame.lib ] && cp libmp3lame-static.lib mp3lame.lib && echo "Created mp3lame.lib"
+          [ -f libmpghip-static.lib ] && [ ! -f mpghip.lib ] && cp libmpghip-static.lib mpghip.lib && echo "Created mpghip.lib"
+          [ -f libx264.lib ] && [ ! -f x264.lib ] && cp libx264.lib x264.lib && echo "Created x264.lib"
+          [ -f x265-static.lib ] && [ ! -f x265.lib ] && cp x265-static.lib x265.lib && echo "Created x265.lib"
+          [ -f libwebp.lib ] && [ ! -f webp.lib ] && cp libwebp.lib webp.lib && echo "Created webp.lib"
+          [ -f libsharpyuv.lib ] && [ ! -f sharpyuv.lib ] && cp libsharpyuv.lib sharpyuv.lib && echo "Created sharpyuv.lib"
+          [ -f zlib.lib ] && [ ! -f z.lib ] && cp zlib.lib z.lib && echo "Created z.lib"
+          ls -la *.lib | head -30
+          cd -
+
+          # Debug: test pkg-config
+          echo "=== Testing pkg-config ==="
+          pkg-config --exists x264 && echo "x264: found" || echo "x264: not found"
+          pkg-config --exists aom && echo "aom: found" || echo "aom: not found"
+          pkg-config --exists libjxl && echo "libjxl: found" || echo "libjxl: not found"
+
+          cd ffmpeg-src
+
+          # Configure FFmpeg with MSVC toolchain for ARM64
+          # Key differences from x64:
+          # - --arch=aarch64 for ARM64
+          # - --disable-x86asm (no x86 assembly on ARM)
+          # - --enable-libaom instead of --enable-librav1e (libaom works on ARM64)
+          ./configure \
+            --prefix="$PREFIX" \
+            --toolchain=msvc \
+            --arch=aarch64 \
+            --disable-inline-asm \
+            --disable-x86asm \
+            --enable-w32threads \
+            --enable-pic \
+            --enable-runtime-cpudetect \
+            --enable-static \
+            --disable-shared \
+            --enable-gpl \
+            --enable-version3 \
+            --disable-autodetect \
+            --enable-avcodec \
+            --enable-swscale \
+            --enable-swresample \
+            --enable-avformat \
+            --disable-avfilter \
+            --disable-avdevice \
+            --disable-network \
+            --disable-programs \
+            --disable-doc \
+            --enable-libx264 \
+            --enable-libx265 \
+            --enable-libvpx \
+            --enable-libaom \
+            --enable-libdav1d \
+            --enable-libopus \
+            --enable-libmp3lame \
+            --enable-libvorbis \
+            --enable-libwebp \
+            --enable-libjxl \
+            --enable-zlib \
+            --extra-cflags="-I$VCPKG_INSTALLED/include" \
+            --extra-ldflags="-libpath:$VCPKG_INSTALLED/lib" \
+            --extra-libs="libx264.lib x265-static.lib vpx.lib aom.lib dav1d.lib opus.lib libmp3lame-static.lib libmpghip-static.lib vorbis.lib vorbisenc.lib ogg.lib libwebp.lib libsharpyuv.lib jxl.lib jxl_threads.lib jxl_cms.lib hwy.lib brotlidec.lib brotlienc.lib brotlicommon.lib lcms2.lib zlib.lib" \
+            --pkg-config-flags="--static"
+
+          make -j$(nproc)
+          make install
+
+      - name: Upload FFmpeg config.log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-config-log-arm64
+          path: ffmpeg-src/ffbuild/config.log
+          if-no-files-found: ignore
+
+      - name: Copy codec libs to output
+        shell: pwsh
         run: |
           $prefix = "ffmpeg-aarch64-pc-windows-msvc"
-          New-Item -ItemType Directory -Force -Path "$prefix/lib"
-          New-Item -ItemType Directory -Force -Path "$prefix/include"
 
-          # Copy libraries
-          Copy-Item -Path "$env:VCPKG_ROOT/installed/arm64-windows-static/lib/*.lib" -Destination "$prefix/lib/" -Force
+          # Copy vcpkg codec libs that FFmpeg depends on
+          Write-Host "=== Copying codec libraries ==="
+          $vcpkgLibDir = "$env:VCPKG_ROOT/installed/arm64-windows-static/lib"
+          $codecLibs = @(
+            "libx264.lib",
+            "x265-static.lib",
+            "vpx.lib",
+            "aom.lib",
+            "dav1d.lib",
+            "opus.lib",
+            "libmp3lame-static.lib",
+            "libmpghip-static.lib",
+            "vorbis.lib",
+            "vorbisenc.lib",
+            "vorbisfile.lib",
+            "ogg.lib",
+            "libwebp.lib",
+            "libwebpdecoder.lib",
+            "libwebpdemux.lib",
+            "libwebpmux.lib",
+            "libsharpyuv.lib",
+            "jxl.lib",
+            "jxl_threads.lib",
+            "jxl_cms.lib",
+            "hwy.lib",
+            "brotlidec.lib",
+            "brotlienc.lib",
+            "brotlicommon.lib",
+            "lcms2.lib",
+            "zlib.lib"
+          )
+          foreach ($lib in $codecLibs) {
+            $srcPath = "$vcpkgLibDir/$lib"
+            if (Test-Path $srcPath) {
+              Copy-Item -Path $srcPath -Destination "$prefix/lib/" -Force
+              Write-Host "  Copied: $lib"
+            } else {
+              Write-Host "  WARNING: $lib not found at $srcPath"
+            }
+          }
 
-          # Copy headers
-          Copy-Item -Path "$env:VCPKG_ROOT/installed/arm64-windows-static/include/libav*" -Destination "$prefix/include/" -Recurse -Force
-          Copy-Item -Path "$env:VCPKG_ROOT/installed/arm64-windows-static/include/libsw*" -Destination "$prefix/include/" -Recurse -Force
-
-          # Copy codec headers if present
-          $codecHeaders = @("x264.h", "x264_config.h", "x265.h", "x265_config.h", "vpx", "aom", "opus", "lame", "vorbis", "ogg", "webp")
+          # Copy vcpkg codec headers
+          $vcpkgIncDir = "$env:VCPKG_ROOT/installed/arm64-windows-static/include"
+          $codecHeaders = @("x264.h", "x264_config.h", "x265.h", "x265_config.h", "vpx", "aom", "opus", "lame", "vorbis", "ogg", "webp", "jxl", "hwy", "brotli", "lcms2.h")
           foreach ($header in $codecHeaders) {
-            $srcPath = "$env:VCPKG_ROOT/installed/arm64-windows-static/include/$header"
+            $srcPath = "$vcpkgIncDir/$header"
             if (Test-Path $srcPath) {
               Copy-Item -Path $srcPath -Destination "$prefix/include/" -Recurse -Force
             }
           }
 
-          # List output
           Write-Host "=== Libraries ==="
           Get-ChildItem "$prefix/lib/"
           Write-Host "=== Headers ==="

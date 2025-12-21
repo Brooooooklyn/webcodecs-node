@@ -559,10 +559,6 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str, extra_lib_dir: Option<&Pa
   let is_windows_msvc_x64 =
     target_os == "windows" && target_arch == "x86_64" && target_env == "msvc";
 
-  // Windows arm64 uses vcpkg's pre-built FFmpeg which doesn't include libjxl
-  let is_windows_msvc_arm64 =
-    target_os == "windows" && target_arch == "aarch64" && target_env == "msvc";
-
   // Work around duplicate Rust runtime symbols when linking rav1e.lib on Windows MSVC.
   // rav1e is a Rust staticlib that includes rust_eh_personality, which conflicts with
   // our own Rust runtime. /FORCE:MULTIPLE tells MSVC linker to accept duplicate symbols.
@@ -590,15 +586,14 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str, extra_lib_dir: Option<&Pa
     ("sharpyuv", false),  // WebP YUV conversion
     // JPEG XL support - built on all platforms via build-ffmpeg tool
     // Link order matters: jxl depends on jxl_threads, hwy, brotli, lcms2
-    // Note: Windows arm64 uses vcpkg's pre-built FFmpeg which doesn't include libjxl
-    ("jxl", !is_windows_msvc_arm64),          // libjxl core
-    ("jxl_threads", !is_windows_msvc_arm64),  // libjxl threading
-    ("jxl_cms", false),                       // libjxl color management - optional
-    ("hwy", !is_windows_msvc_arm64),          // Highway SIMD library
-    ("brotlienc", !is_windows_msvc_arm64),    // Brotli encoder
-    ("brotlidec", !is_windows_msvc_arm64),    // Brotli decoder
-    ("brotlicommon", !is_windows_msvc_arm64), // Brotli common
-    ("lcms2", !is_windows_msvc_arm64),        // Little CMS 2
+    ("jxl", true),          // libjxl core
+    ("jxl_threads", true),  // libjxl threading
+    ("jxl_cms", false),     // libjxl color management - optional
+    ("hwy", true),          // Highway SIMD library
+    ("brotlienc", true),    // Brotli encoder
+    ("brotlidec", true),    // Brotli decoder
+    ("brotlicommon", true), // Brotli common
+    ("lcms2", true),        // Little CMS 2
     // Text/subtitle libraries
     ("aribb24", false), // ARIB STD-B24 decoder
     // Other optional libraries
