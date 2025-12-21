@@ -647,13 +647,12 @@ jobs:
           cmake --install _build
           cd ..
 
-          # lcms2 (color management for libjxl)
+          # lcms2 (color management for libjxl) - uses autotools, not cmake
           git clone --depth 1 --branch lcms2.16 https://github.com/mm2/Little-CMS.git
           cd Little-CMS
-          cmake -B _build -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
-            -DBUILD_SHARED_LIBS=OFF
-          cmake --build _build -j$JOBS
-          cmake --install _build
+          ./configure --prefix=$PREFIX --enable-static --disable-shared --with-pic
+          make -j$JOBS
+          make install
           cd ..
 
           # libjxl (JPEG XL)
@@ -742,13 +741,12 @@ jobs:
           cmake --install _build
           cd ..
 
-          # lcms2 (color management for libjxl)
+          # lcms2 (color management for libjxl) - uses autotools, not cmake
           git clone --depth 1 --branch lcms2.16 https://github.com/mm2/Little-CMS.git
           cd Little-CMS
-          cmake -B _build -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
-            -DBUILD_SHARED_LIBS=OFF
-          cmake --build _build -j$JOBS
-          cmake --install _build
+          ./configure --prefix=$PREFIX --enable-static --disable-shared --with-pic
+          make -j$JOBS
+          make install
           cd ..
 
           # libjxl (JPEG XL)

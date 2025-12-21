@@ -168,17 +168,21 @@ impl BuildContext {
       .unwrap_or_default();
 
     // Create CC wrapper that transforms arch flags to zig-compatible format
-    // Use set -- to rebuild positional parameters to preserve quoting for args with spaces
+    // Uses shift to consume args from front while building new list at back
     let cc_wrapper = wrapper_dir.join("cc");
     let cc_content = format!(
       r#"#!/bin/sh
 # Zig CC wrapper - transforms arch flags to zig-compatible format
 # Also filters out -target/--target flags that cmake/configure might add
-# Uses set -- to rebuild args to preserve quoting for arguments with spaces
-set --
+# Uses shift-based approach to preserve quoting for arguments with spaces
 cpu_features=""
+n=$#
+i=0
 skip_next=0
-for arg; do
+while [ $i -lt $n ]; do
+  i=$((i + 1))
+  arg="$1"
+  shift
   if [ "$skip_next" = "1" ]; then
     skip_next=0
     continue
@@ -236,17 +240,21 @@ exec zig cc {} "$@"
     self.make_executable(&cc_wrapper)?;
 
     // Create CXX wrapper with same logic
-    // Use set -- to rebuild positional parameters to preserve quoting for args with spaces
+    // Uses shift to consume args from front while building new list at back
     let cxx_wrapper = wrapper_dir.join("c++");
     let cxx_content = format!(
       r#"#!/bin/sh
 # Zig C++ wrapper - transforms arch flags to zig-compatible format
 # Also filters out -target/--target flags that cmake/configure might add
-# Uses set -- to rebuild args to preserve quoting for arguments with spaces
-set --
+# Uses shift-based approach to preserve quoting for arguments with spaces
 cpu_features=""
+n=$#
+i=0
 skip_next=0
-for arg; do
+while [ $i -lt $n ]; do
+  i=$((i + 1))
+  arg="$1"
+  shift
   if [ "$skip_next" = "1" ]; then
     skip_next=0
     continue
