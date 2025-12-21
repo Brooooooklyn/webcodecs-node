@@ -138,6 +138,29 @@ unsafe extern "C" {
   /// Increase packet size, correctly zeroing padding
   pub fn av_grow_packet(pkt: *mut AVPacket, grow_by: c_int) -> c_int;
 
+  /// Get side data from a packet
+  ///
+  /// # Arguments
+  /// * `pkt` - packet to get side data from
+  /// * `type_` - type of side data to get
+  /// * `size` - pointer to store size of side data
+  ///
+  /// # Returns
+  /// Pointer to side data, or NULL if not found
+  pub fn av_packet_get_side_data(pkt: *const AVPacket, type_: c_int, size: *mut usize)
+  -> *const u8;
+
+  /// Allocate new side data for a packet
+  ///
+  /// # Arguments
+  /// * `pkt` - packet to add side data to
+  /// * `type_` - type of side data
+  /// * `size` - size of side data in bytes
+  ///
+  /// # Returns
+  /// Pointer to newly allocated side data, or NULL on failure
+  pub fn av_packet_new_side_data(pkt: *mut AVPacket, type_: c_int, size: usize) -> *mut u8;
+
   // ========================================================================
   // Codec Parameters
   // ========================================================================

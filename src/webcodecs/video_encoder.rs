@@ -5,7 +5,7 @@
 
 use crate::codec::{
   BitrateMode as CodecBitrateMode, CodecContext, EncoderConfig, EncoderCreationResult, Frame,
-  HwDeviceContext, HwFrameConfig, HwFrameContext, Scaler,
+  HwDeviceContext, HwFrameConfig, HwFrameContext, Packet, Scaler,
 };
 use crate::ffi::{AVCodecID, AVHWDeviceType, AVPictureType, AVPixelFormat};
 use crate::webcodecs::error::DOMExceptionName;
@@ -15,8 +15,8 @@ use crate::webcodecs::hw_fallback::{
 };
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
 use crate::webcodecs::{
-  AvcBitstreamFormat, EncodedVideoChunk, HardwareAcceleration, HevcBitstreamFormat, LatencyMode,
-  VideoColorSpaceInit, VideoEncoderBitrateMode, VideoEncoderConfig, VideoFrame,
+  AlphaOption, AvcBitstreamFormat, EncodedVideoChunk, HardwareAcceleration, HevcBitstreamFormat,
+  LatencyMode, VideoColorSpaceInit, VideoEncoderBitrateMode, VideoEncoderConfig, VideoFrame,
   convert_annexb_extradata_to_avcc, convert_annexb_extradata_to_hvcc,
   convert_obu_extradata_to_av1c, extract_avcc_from_avcc_packet, extract_hvcc_from_hvcc_packet,
   is_av1c_extradata,
@@ -407,6 +407,13 @@ struct VideoEncoderInner {
   // ========================================================================
   /// Color space from the first input frame (used in decoderConfig metadata)
   input_color_space: Option<VideoColorSpaceInit>,
+
+  // ========================================================================
+  // Alpha channel support
+  // ========================================================================
+  /// Whether to preserve alpha channel (YUVA420P instead of YUV420P)
+  /// True when config.alpha == "keep" and codec supports alpha (VP9)
+  use_alpha: bool,
 }
 
 /// Get the preferred hardware device type for the current platform
@@ -546,6 +553,8 @@ impl VideoEncoder {
       use_avcc_format: false,
       // Input colorSpace tracking
       input_color_space: None,
+      // Alpha channel support (set during configure)
+      use_alpha: false,
     };
 
     let inner = Arc::new(Mutex::new(inner));
@@ -691,10 +700,17 @@ impl VideoEncoder {
       }
     };
 
+    // Determine target pixel format based on alpha config
+    let target_format = if guard.use_alpha {
+      AVPixelFormat::Yuva420p
+    } else {
+      AVPixelFormat::Yuv420p
+    };
+
     // Check if frame needs conversion
     let frame_format = frame.format();
     let needs_conversion =
-      frame_format != AVPixelFormat::Yuv420p || frame.width() != width || frame.height() != height;
+      frame_format != target_format || frame.width() != width || frame.height() != height;
 
     // Convert frame if needed
     let mut frame_to_encode = if needs_conversion {
@@ -706,7 +722,7 @@ impl VideoEncoder {
           frame_format,
           width,
           height,
-          AVPixelFormat::Yuv420p,
+          target_format,
           crate::codec::scaler::ScaleAlgorithm::Bilinear,
         ) {
           Ok(scaler) => guard.scaler = Some(scaler),
@@ -815,6 +831,9 @@ impl VideoEncoder {
                     create_svc_metadata(guard.temporal_layer_count, guard.output_frame_count);
                   guard.output_frame_count += 1;
 
+                  // Extract alpha side data for VP9 alpha support
+                  let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
+
                   let metadata = if !guard.extradata_sent && packet.is_key() {
                     guard.extradata_sent = true;
                     EncodedVideoChunkMetadata {
@@ -837,13 +856,13 @@ impl VideoEncoder {
                         flip: if buffered_flip { Some(true) } else { None },
                       }),
                       svc,
-                      alpha_side_data: None,
+                      alpha_side_data,
                     }
                   } else {
                     EncodedVideoChunkMetadata {
                       decoder_config: None,
                       svc,
-                      alpha_side_data: None,
+                      alpha_side_data,
                     }
                   };
                   // During flush, queue chunks for synchronous delivery in resolver
@@ -983,6 +1002,9 @@ impl VideoEncoder {
                       create_svc_metadata(guard.temporal_layer_count, guard.output_frame_count);
                     guard.output_frame_count += 1;
 
+                    // Extract alpha side data for VP9 alpha support
+                    let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
+
                     let metadata = if !guard.extradata_sent && packet.is_key() {
                       guard.extradata_sent = true;
                       EncodedVideoChunkMetadata {
@@ -1005,13 +1027,13 @@ impl VideoEncoder {
                           flip: if buffered_flip { Some(true) } else { None },
                         }),
                         svc,
-                        alpha_side_data: None,
+                        alpha_side_data,
                       }
                     } else {
                       EncodedVideoChunkMetadata {
                         decoder_config: None,
                         svc,
-                        alpha_side_data: None,
+                        alpha_side_data,
                       }
                     };
                     // During flush, queue chunks for synchronous delivery in resolver
@@ -1099,6 +1121,9 @@ impl VideoEncoder {
       // Create SVC metadata if temporal layers are configured
       let svc = create_svc_metadata(guard.temporal_layer_count, guard.output_frame_count);
       guard.output_frame_count += 1;
+
+      // Extract alpha side data for VP9 alpha support
+      let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
 
       // Create metadata
       // Note: extradata must be fetched AFTER encoding, as FFmpeg only sets it after first encode
@@ -1188,7 +1213,7 @@ impl VideoEncoder {
           EncodedVideoChunkMetadata {
             decoder_config: None,
             svc,
-            alpha_side_data: None,
+            alpha_side_data,
           }
         } else {
           // Either we have description, or this codec doesn't require it
@@ -1210,14 +1235,14 @@ impl VideoEncoder {
               flip: if flip { Some(true) } else { None },
             }),
             svc,
-            alpha_side_data: None,
+            alpha_side_data,
           }
         }
       } else {
         EncodedVideoChunkMetadata {
           decoder_config: None,
           svc,
-          alpha_side_data: None,
+          alpha_side_data,
         }
       };
 
@@ -1309,6 +1334,9 @@ impl VideoEncoder {
       // Create SVC metadata if temporal layers are configured
       let svc = create_svc_metadata(guard.temporal_layer_count, guard.output_frame_count);
       guard.output_frame_count += 1;
+
+      // Extract alpha side data for VP9 alpha support
+      let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
 
       // Create metadata (include decoder_config if not sent yet and this is a key frame)
       let metadata = if !guard.extradata_sent && packet.is_key() {
@@ -1414,7 +1442,7 @@ impl VideoEncoder {
           EncodedVideoChunkMetadata {
             decoder_config: None,
             svc,
-            alpha_side_data: None,
+            alpha_side_data,
           }
         } else {
           // Either we have description, or this codec doesn't require it
@@ -1432,14 +1460,14 @@ impl VideoEncoder {
               flip: None,
             }),
             svc,
-            alpha_side_data: None,
+            alpha_side_data,
           }
         }
       } else {
         EncodedVideoChunkMetadata {
           decoder_config: None,
           svc,
-          alpha_side_data: None,
+          alpha_side_data,
         }
       };
 
@@ -1489,10 +1517,16 @@ impl VideoEncoder {
             _ => (60, 2),
           };
 
+          let pixel_format = if guard.use_alpha {
+            AVPixelFormat::Yuva420p
+          } else {
+            AVPixelFormat::Yuv420p
+          };
+
           let encoder_config = EncoderConfig {
             width: config.width.unwrap_or(0),
             height: config.height.unwrap_or(0),
-            pixel_format: AVPixelFormat::Yuv420p,
+            pixel_format,
             bitrate: config.bitrate.unwrap_or(5_000_000.0) as u64,
             framerate_num: config.framerate.unwrap_or(30.0) as u32,
             framerate_den: 1,
@@ -1594,10 +1628,19 @@ impl VideoEncoder {
       _ => (60, 2),
     };
 
+    // Determine if alpha channel should be preserved (only VP9 supports alpha)
+    let is_vp9 = codec_string.starts_with("vp09") || codec_string == "vp9";
+    let use_alpha = is_vp9 && matches!(config.alpha, Some(AlphaOption::Keep));
+    let pixel_format = if use_alpha {
+      AVPixelFormat::Yuva420p
+    } else {
+      AVPixelFormat::Yuv420p
+    };
+
     let encoder_config = EncoderConfig {
       width: config.width.unwrap_or(0),
       height: config.height.unwrap_or(0),
-      pixel_format: AVPixelFormat::Yuv420p,
+      pixel_format,
       bitrate: config.bitrate.unwrap_or(5_000_000.0) as u64,
       framerate_num: config.framerate.unwrap_or(30.0) as u32,
       framerate_den: 1,
@@ -1611,6 +1654,9 @@ impl VideoEncoder {
       rc_buffer_size: None,
       crf: None,
     };
+
+    // Update use_alpha in guard
+    guard.use_alpha = use_alpha;
 
     // Determine if AVCC/HVCC format is needed (for create_software_encoder helper)
     let is_h264 = codec_string.starts_with("avc1")
@@ -1845,10 +1891,17 @@ impl VideoEncoder {
       _ => (60, 2),
     };
 
+    // Use the same pixel format (with or without alpha) as the original encoder
+    let pixel_format = if inner.use_alpha {
+      AVPixelFormat::Yuva420p
+    } else {
+      AVPixelFormat::Yuv420p
+    };
+
     let encoder_config = EncoderConfig {
       width: config.width.unwrap_or(0),
       height: config.height.unwrap_or(0),
-      pixel_format: AVPixelFormat::Yuv420p,
+      pixel_format,
       bitrate: config.bitrate.unwrap_or(5_000_000.0) as u64,
       framerate_num: config.framerate.unwrap_or(30.0) as u32,
       framerate_den: 1,
@@ -2341,11 +2394,21 @@ impl VideoEncoder {
       _ => (60, 2),                           // Quality mode: larger GOP with B-frames
     };
 
+    // Determine if alpha channel should be preserved
+    // Only VP9 supports alpha encoding (YUVA420P pixel format)
+    let is_vp9 = codec.starts_with("vp09") || codec == "vp9";
+    let use_alpha = is_vp9 && matches!(config.alpha, Some(AlphaOption::Keep));
+    let pixel_format = if use_alpha {
+      AVPixelFormat::Yuva420p
+    } else {
+      AVPixelFormat::Yuv420p
+    };
+
     // Configure encoder
     let encoder_config = EncoderConfig {
       width,
       height,
-      pixel_format: AVPixelFormat::Yuv420p, // Most encoders need YUV420p
+      pixel_format,
       bitrate: config.bitrate.unwrap_or(5_000_000.0) as u64,
       framerate_num: config.framerate.unwrap_or(30.0) as u32,
       framerate_den: 1,
@@ -2501,6 +2564,9 @@ impl VideoEncoder {
         false // Other codecs don't need conversion
       }
     });
+
+    // Alpha channel support - track if we're encoding with alpha
+    inner.use_alpha = use_alpha;
 
     // Create new channel and worker if needed (after reconfiguration)
     if self.command_sender.is_none() {
@@ -3480,6 +3546,62 @@ fn create_svc_metadata(layer_count: Option<u32>, frame_idx: u64) -> Option<SvcOu
   layer_count.map(|layers| SvcOutputMetadata {
     temporal_layer_id: Some(compute_temporal_layer_id(frame_idx, layers)),
   })
+}
+
+/// Extract alpha side data from a packet (for VP9 alpha support)
+///
+/// Returns the Matroska BlockAdditional side data if present.
+/// This is used for VP9 alpha encoded videos where the alpha channel
+/// is stored in WebM BlockAdditions.
+///
+/// FFmpeg's AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL format:
+/// - First 8 bytes: BlockAddId (64-bit big-endian)
+/// - Remaining bytes: Actual BlockAdditional data
+///
+/// For VP9 alpha, BlockAddId must be 1 (MATROSKA_BLOCK_ADD_ID_TYPE_OPAQUE)
+fn extract_alpha_side_data(packet: &Packet, use_alpha: bool) -> Option<Uint8Array> {
+  if !use_alpha {
+    return None;
+  }
+
+  let alpha_data = packet.get_matroska_blockadditional()?;
+
+  // Must have at least 8 bytes for BlockAddId
+  if alpha_data.len() < 8 {
+    return None;
+  }
+
+  // Read BlockAddId (64-bit big-endian)
+  let block_add_id = u64::from_be_bytes([
+    alpha_data[0],
+    alpha_data[1],
+    alpha_data[2],
+    alpha_data[3],
+    alpha_data[4],
+    alpha_data[5],
+    alpha_data[6],
+    alpha_data[7],
+  ]);
+
+  // VP9 alpha uses BlockAddId = 1 (MATROSKA_BLOCK_ADD_ID_TYPE_OPAQUE)
+  // If BlockAddId is not 1, this might not be alpha data
+  if block_add_id != 1 {
+    tracing::warn!(
+      target: "webcodecs",
+      "Unexpected BlockAddId {} for VP9 alpha, expected 1",
+      block_add_id
+    );
+    // Still return the data, but log a warning
+  }
+
+  // If size is exactly 8 bytes, there's no actual alpha data
+  if alpha_data.len() == 8 {
+    return None;
+  }
+
+  // Return the complete data (BlockAddId + actual data)
+  // This matches FFmpeg's expected format
+  Some(Uint8Array::from(alpha_data.to_vec()))
 }
 
 /// Check if dimensions are within valid range

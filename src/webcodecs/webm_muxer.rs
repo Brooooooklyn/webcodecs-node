@@ -111,6 +111,8 @@ pub struct WebMVideoTrackConfig {
   pub height: u32,
   /// Codec-specific description data
   pub description: Option<Uint8Array>,
+  /// Whether the video has alpha channel (VP9 alpha support)
+  pub alpha: Option<bool>,
 }
 
 /// Audio track configuration for WebM muxer
@@ -195,6 +197,7 @@ impl WebMMuxer {
       width: config.width,
       height: config.height,
       extradata: config.description.as_ref().map(|d| d.to_vec()),
+      has_alpha: config.alpha.unwrap_or(false),
     };
 
     inner.add_video_track(generic_config)

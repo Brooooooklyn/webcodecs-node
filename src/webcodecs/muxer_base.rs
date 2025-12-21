@@ -111,6 +111,10 @@ pub struct EncodedVideoChunkMetadataJs {
   pub decoder_config: Option<VideoDecoderConfigJs>,
   /// SVC output metadata
   pub svc: Option<SvcOutputMetadataJs>,
+  /// Alpha channel side data (for VP9 alpha support)
+  /// This contains the encoded alpha channel data that should be written
+  /// as BlockAdditions in WebM/MKV containers.
+  pub alpha_side_data: Option<Uint8Array>,
 }
 
 /// JavaScript-facing decoder config type
@@ -180,6 +184,8 @@ pub struct GenericVideoTrackConfig {
   pub width: u32,
   pub height: u32,
   pub extradata: Option<Vec<u8>>,
+  /// Whether this track has alpha channel (VP9 alpha support)
+  pub has_alpha: bool,
 }
 
 /// Generic audio track configuration passed to base implementation
@@ -318,12 +324,19 @@ impl<F: MuxerFormat> MuxerInner<F> {
       ));
     }
 
+    // Use YUVA420P for VP9 with alpha, otherwise use YUV420P
+    let pixel_format = if config.has_alpha && config.codec_id == AVCodecID::Vp9 {
+      AVPixelFormat::Yuva420p
+    } else {
+      AVPixelFormat::Yuv420p
+    };
+
     // Create video stream config
     let stream_config = VideoStreamConfig {
       codec_id: config.codec_id,
       width: config.width,
       height: config.height,
-      pixel_format: AVPixelFormat::Yuv420p,
+      pixel_format,
       time_base: AVRational::MICROSECONDS,
       bitrate: None,
       extradata: config.extradata,
@@ -484,6 +497,17 @@ impl<F: MuxerFormat> MuxerInner<F> {
         // Update extradata dynamically if available
         if let Err(e) = self.muxer.update_video_extradata(&desc_data) {
           tracing::warn!(target: "webcodecs", "Failed to update video extradata: {}", e);
+        }
+      }
+    }
+
+    // Handle alpha side data for VP9 alpha support
+    // This adds the alpha channel data as BlockAdditional side data
+    if let Some(alpha_data) = metadata.and_then(|m| m.alpha_side_data.as_ref()) {
+      let alpha_bytes = alpha_data.to_vec();
+      if !alpha_bytes.is_empty() {
+        if let Err(e) = packet.add_matroska_blockadditional(&alpha_bytes) {
+          tracing::warn!(target: "webcodecs", "Failed to add alpha side data: {}", e);
         }
       }
     }

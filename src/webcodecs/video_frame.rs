@@ -1555,10 +1555,33 @@ impl VideoFrame {
       ));
     }
 
+    // Check if alpha should be discarded per W3C spec
+    // When alpha is "discard", we must set all alpha bytes to 255 (opaque)
+    // per W3C spec: "When alpha is 'discard', the alpha plane should be discarded
+    // and replaced with an opaque alpha value (255)."
+    let should_discard_alpha = init.alpha.as_ref().map(|a| a == "discard").unwrap_or(false);
+
+    let format = if should_discard_alpha {
+      VideoPixelFormat::RGBX // Opaque format
+    } else {
+      VideoPixelFormat::RGBA // Keep alpha channel
+    };
+
+    // If discarding alpha, create a new buffer with all alpha bytes set to 255
+    let processed_data: Vec<u8> = if should_discard_alpha {
+      let mut data = pixel_data.to_vec();
+      // Set all alpha bytes (every 4th byte, starting at index 3) to 255
+      for i in (3..data.len()).step_by(4) {
+        data[i] = 255; // Opaque alpha
+      }
+      data
+    } else {
+      pixel_data.to_vec()
+    };
+
     // Build init with Canvas-derived values, preserving user-provided options
-    // Format is always RGBA from Canvas.data()
     let canvas_init = VideoFrameConstructorInit {
-      format: Some(VideoPixelFormat::RGBA),
+      format: Some(format),
       coded_width: Some(width),
       coded_height: Some(height),
       timestamp: Some(timestamp),
@@ -1575,8 +1598,8 @@ impl VideoFrame {
       alpha: init.alpha,
     };
 
-    // Delegate to new_from_buffer with pixel data
-    Self::new_from_buffer(env, pixel_data, Some(canvas_init))
+    // Delegate to new_from_buffer with processed pixel data
+    Self::new_from_buffer(env, &processed_data, Some(canvas_init))
   }
 
   /// Internal: Create VideoFrame from another VideoFrame (image source constructor form)

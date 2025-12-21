@@ -1421,6 +1421,12 @@ export interface EncodedVideoChunkMetadataJs {
   decoderConfig?: VideoDecoderConfigJs
   /** SVC output metadata */
   svc?: SvcOutputMetadataJs
+  /**
+   * Alpha channel side data (for VP9 alpha support)
+   * This contains the encoded alpha channel data that should be written
+   * as BlockAdditions in WebM/MKV containers.
+   */
+  alphaSideData?: Uint8Array
 }
 
 /** Type of encoded video chunk */
@@ -1920,4 +1926,6 @@ export interface WebMVideoTrackConfig {
   height: number
   /** Codec-specific description data */
   description?: Uint8Array
+  /** Whether the video has alpha channel (VP9 alpha support) */
+  alpha?: boolean
 }

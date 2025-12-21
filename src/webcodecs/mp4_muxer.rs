@@ -237,6 +237,7 @@ impl Mp4Muxer {
       width: config.width,
       height: config.height,
       extradata: config.description.as_ref().map(|d| d.to_vec()),
+      has_alpha: false, // MP4 doesn't support VP9 alpha
     };
 
     inner.add_video_track(generic_config)
