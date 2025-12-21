@@ -1513,7 +1513,7 @@ impl VideoFrame {
       .get_named_property("data")
       .map_err(|_| Error::new(Status::GenericFailure, "Failed to get Canvas.data method"))?;
 
-    let pixel_data: &[u8] = {
+    let pixel_data: &mut [u8] = {
       let mut result: napi::sys::napi_value = std::ptr::null_mut();
       let status = unsafe {
         napi::sys::napi_call_function(
@@ -1568,15 +1568,11 @@ impl VideoFrame {
     };
 
     // If discarding alpha, create a new buffer with all alpha bytes set to 255
-    let processed_data: Vec<u8> = if should_discard_alpha {
-      let mut data = pixel_data.to_vec();
+    if should_discard_alpha {
       // Set all alpha bytes (every 4th byte, starting at index 3) to 255
-      for i in (3..data.len()).step_by(4) {
-        data[i] = 255; // Opaque alpha
+      for i in (3..pixel_data.len()).step_by(4) {
+        pixel_data[i] = 255; // Opaque alpha
       }
-      data
-    } else {
-      pixel_data.to_vec()
     };
 
     // Build init with Canvas-derived values, preserving user-provided options
@@ -1599,7 +1595,7 @@ impl VideoFrame {
     };
 
     // Delegate to new_from_buffer with processed pixel data
-    Self::new_from_buffer(env, &processed_data, Some(canvas_init))
+    Self::new_from_buffer(env, &pixel_data, Some(canvas_init))
   }
 
   /// Internal: Create VideoFrame from another VideoFrame (image source constructor form)
