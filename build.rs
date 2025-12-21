@@ -679,8 +679,12 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
         if target_arch == "arm" || target_env == "musl" {
           println!("cargo:rustc-link-lib=stdc++");
         } else {
+          // Link libc++ and its ABI dependency statically
+          // Order matters: c++ depends on c++abi for low-level ABI support
+          // (exception handling, RTTI, std::string implementation, etc.)
           println!("cargo:rustc-link-search=/usr/lib/llvm-18/lib");
           println!("cargo:rustc-link-lib=static=c++");
+          println!("cargo:rustc-link-lib=static=c++abi");
         }
       }
       "windows" => {

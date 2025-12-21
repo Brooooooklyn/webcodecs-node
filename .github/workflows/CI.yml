@@ -246,6 +246,19 @@ jobs:
           sudo rm /usr/lib/llvm-18/lib/libc++abi.so
           sudo rm /usr/lib/llvm-18/lib/libc++.so
           sudo rm /usr/lib/llvm-18/lib/libunwind.so
+      - name: remove .so files on arm64 host
+        if: matrix.settings.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo rm /usr/lib/aarch64-linux-gnu/libc++abi.so
+          sudo rm /usr/lib/aarch64-linux-gnu/libc++.so
+          sudo rm /usr/lib/aarch64-linux-gnu/libunwind.so
+      - name: remove .so files on x86_64 host
+        if: matrix.settings.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          sudo rm /usr/lib/x86_64-linux-gnu/libc++abi.so
+          sudo rm /usr/lib/x86_64-linux-gnu/libc++.so
+          sudo rm /usr/lib/x86_64-linux-gnu/libunwind.so
+
       - name: Install dependencies
         run: pnpm install
       - name: Build
