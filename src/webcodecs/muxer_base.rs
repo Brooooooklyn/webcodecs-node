@@ -505,10 +505,10 @@ impl<F: MuxerFormat> MuxerInner<F> {
     // This adds the alpha channel data as BlockAdditional side data
     if let Some(alpha_data) = metadata.and_then(|m| m.alpha_side_data.as_ref()) {
       let alpha_bytes = alpha_data.to_vec();
-      if !alpha_bytes.is_empty() {
-        if let Err(e) = packet.add_matroska_blockadditional(&alpha_bytes) {
-          tracing::warn!(target: "webcodecs", "Failed to add alpha side data: {}", e);
-        }
+      if !alpha_bytes.is_empty()
+        && let Err(e) = packet.add_matroska_blockadditional(&alpha_bytes)
+      {
+        tracing::warn!(target: "webcodecs", "Failed to add alpha side data: {}", e);
       }
     }
 
