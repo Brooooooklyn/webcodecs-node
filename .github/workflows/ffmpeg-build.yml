@@ -96,6 +96,8 @@ jobs:
           vcpkgGitCommitId: '74e6536215718009aae747d86d84b78376bf9e09'
 
       - name: Install FFmpeg with codecs via vcpkg
+        # Note: vcpkg's FFmpeg port doesn't support jxl feature
+        # libjxl would require building FFmpeg from source like we do for x64
         run: |
           vcpkg install ffmpeg[avformat,avcodec,swresample,swscale,gpl,x264,x265,vpx,aom,opus,mp3lame,vorbis,webp,zlib]:arm64-windows-static
 
@@ -212,7 +214,8 @@ jobs:
             libogg:x64-windows-static `
             libvorbis:x64-windows-static `
             libwebp:x64-windows-static `
-            zlib:x64-windows-static
+            zlib:x64-windows-static `
+            libjxl:x64-windows-static
 
       - name: List vcpkg installed libraries
         run: |
@@ -326,6 +329,10 @@ jobs:
           # dav1d AV1 decoder
           create_pc "$PKGCONFIG_DIR_MSYS/dav1d.pc" "$VCPKG_INSTALLED" "dav1d" "dav1d AV1 decoder" "1.5.1" '-I${includedir}' '-ldav1d'
 
+          # libjxl JPEG XL (needs brotli, highway, lcms2)
+          create_pc "$PKGCONFIG_DIR_MSYS/libjxl.pc" "$VCPKG_INSTALLED" "libjxl" "JPEG XL image codec" "0.11.1" '-I${includedir}' '-ljxl -ljxl_threads -lhwy -lbrotlidec -lbrotlienc -lbrotlicommon -llcms2'
+          create_pc "$PKGCONFIG_DIR_MSYS/libjxl_threads.pc" "$VCPKG_INSTALLED" "libjxl_threads" "JPEG XL threading" "0.11.1" '-I${includedir}' '-ljxl_threads'
+
           # Set up pkg-config path (use MSYS path for pkg-config tool)
           export PKG_CONFIG_PATH="$PKGCONFIG_DIR_MSYS"
 
@@ -411,10 +418,11 @@ jobs:
             --enable-libmp3lame \
             --enable-libvorbis \
             --enable-libwebp \
+            --enable-libjxl \
             --enable-zlib \
             --extra-cflags="-I$VCPKG_INSTALLED/include -I$RAV1E_DIR/include -I$RAV1E_DIR/include/rav1e" \
             --extra-ldflags="-libpath:$VCPKG_INSTALLED/lib -libpath:$RAV1E_DIR/lib" \
-            --extra-libs="libx264.lib x265-static.lib vpx.lib rav1e.lib dav1d.lib opus.lib libmp3lame-static.lib libmpghip-static.lib vorbis.lib vorbisenc.lib ogg.lib libwebp.lib libsharpyuv.lib zlib.lib ws2_32.lib userenv.lib ntdll.lib bcrypt.lib" \
+            --extra-libs="libx264.lib x265-static.lib vpx.lib rav1e.lib dav1d.lib opus.lib libmp3lame-static.lib libmpghip-static.lib vorbis.lib vorbisenc.lib ogg.lib libwebp.lib libsharpyuv.lib jxl.lib jxl_threads.lib hwy.lib brotlidec.lib brotlienc.lib brotlicommon.lib lcms2.lib zlib.lib ws2_32.lib userenv.lib ntdll.lib bcrypt.lib" \
             --pkg-config-flags="--static"
 
           make -j$(nproc)
@@ -458,6 +466,13 @@ jobs:
             "libwebpdemux.lib",
             "libwebpmux.lib",
             "libsharpyuv.lib",
+            "jxl.lib",
+            "jxl_threads.lib",
+            "hwy.lib",
+            "brotlidec.lib",
+            "brotlienc.lib",
+            "brotlicommon.lib",
+            "lcms2.lib",
             "zlib.lib"
           )
           foreach ($lib in $codecLibs) {
@@ -472,7 +487,7 @@ jobs:
 
           # Copy vcpkg codec headers
           $vcpkgIncDir = "$env:VCPKG_ROOT/installed/x64-windows-static/include"
-          $codecHeaders = @("x264.h", "x264_config.h", "x265.h", "x265_config.h", "vpx", "opus", "lame", "vorbis", "ogg", "webp")
+          $codecHeaders = @("x264.h", "x264_config.h", "x265.h", "x265_config.h", "vpx", "opus", "lame", "vorbis", "ogg", "webp", "jxl", "hwy", "brotli", "lcms2.h")
           foreach ($header in $codecHeaders) {
             $srcPath = "$vcpkgIncDir/$header"
             if (Test-Path $srcPath) {
@@ -575,12 +590,205 @@ jobs:
           path: ffmpeg-armv7-unknown-linux-gnueabihf.tar.gz
           if-no-files-found: error
 
+  # Build macOS x64 static libs (dav1d, libjxl + deps)
+  # These are needed because Homebrew only provides dynamic .dylib files
+  build-static-libs-macos-x64:
+    name: Build static-libs x86_64-apple-darwin
+    runs-on: macos-15-intel
+    permissions:
+      id-token: write
+      attestations: write
+      contents: read
+
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '10.13'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: brew install meson ninja nasm cmake
+
+      - name: Build static libraries
+        run: |
+          set -ex
+          PREFIX=$(pwd)/static-libs-x86_64-apple-darwin
+          mkdir -p $PREFIX/{lib,include,lib/pkgconfig}
+          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+          export CFLAGS="-I$PREFIX/include -O2 -mmacosx-version-min=10.13"
+          export CXXFLAGS="-I$PREFIX/include -O2 -mmacosx-version-min=10.13"
+          export LDFLAGS="-L$PREFIX/lib"
+          JOBS=$(sysctl -n hw.ncpu)
+
+          # dav1d (AV1 decoder)
+          git clone --depth 1 --branch 1.5.2 https://code.videolan.org/videolan/dav1d.git
+          cd dav1d
+          meson setup build --default-library=static --buildtype=release \
+            -Denable_tools=false -Denable_tests=false --prefix=$PREFIX
+          ninja -C build && ninja -C build install
+          cd ..
+
+          # highway (SIMD for libjxl)
+          git clone --depth 1 --branch 1.3.0 https://github.com/google/highway.git
+          cd highway
+          cmake -B _build -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
+            -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF \
+            -DHWY_ENABLE_EXAMPLES=OFF -DHWY_ENABLE_TESTS=OFF
+          cmake --build _build -j$JOBS
+          cmake --install _build
+          cd ..
+
+          # brotli (compression for libjxl)
+          git clone --depth 1 --branch v1.1.0 https://github.com/google/brotli.git
+          cd brotli
+          cmake -B _build -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
+            -DBUILD_SHARED_LIBS=OFF -DBROTLI_DISABLE_TESTS=ON
+          cmake --build _build -j$JOBS
+          cmake --install _build
+          cd ..
+
+          # lcms2 (color management for libjxl)
+          git clone --depth 1 --branch lcms2.16 https://github.com/mm2/Little-CMS.git
+          cd Little-CMS
+          cmake -B _build -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
+            -DBUILD_SHARED_LIBS=OFF
+          cmake --build _build -j$JOBS
+          cmake --install _build
+          cd ..
+
+          # libjxl (JPEG XL)
+          git clone --depth 1 --branch v0.11.1 https://github.com/libjxl/libjxl.git
+          cd libjxl
+          cmake -B _build -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
+            -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF \
+            -DJPEGXL_ENABLE_TOOLS=OFF -DJPEGXL_ENABLE_BENCHMARK=OFF \
+            -DJPEGXL_ENABLE_EXAMPLES=OFF -DJPEGXL_ENABLE_MANPAGES=OFF \
+            -DJPEGXL_ENABLE_DOXYGEN=OFF -DJPEGXL_ENABLE_JNI=OFF \
+            -DJPEGXL_ENABLE_JPEGLI=OFF \
+            -DJPEGXL_FORCE_SYSTEM_HWY=ON -DJPEGXL_FORCE_SYSTEM_BROTLI=ON \
+            -DJPEGXL_FORCE_SYSTEM_LCMS2=ON
+          cmake --build _build -j$JOBS
+          cmake --install _build
+          cd ..
+
+      - name: Create tarball
+        run: tar -czvf static-libs-x86_64-apple-darwin.tar.gz -C ./static-libs-x86_64-apple-darwin .
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: static-libs-x86_64-apple-darwin.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-libs-x86_64-apple-darwin
+          path: static-libs-x86_64-apple-darwin.tar.gz
+          if-no-files-found: error
+
+  # Build macOS arm64 static libs (dav1d, libjxl + deps)
+  build-static-libs-macos-arm64:
+    name: Build static-libs aarch64-apple-darwin
+    runs-on: macos-latest
+    permissions:
+      id-token: write
+      attestations: write
+      contents: read
+
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: brew install meson ninja nasm cmake
+
+      - name: Build static libraries
+        run: |
+          set -ex
+          PREFIX=$(pwd)/static-libs-aarch64-apple-darwin
+          mkdir -p $PREFIX/{lib,include,lib/pkgconfig}
+          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+          export CFLAGS="-I$PREFIX/include -O2 -mmacosx-version-min=11.0"
+          export CXXFLAGS="-I$PREFIX/include -O2 -mmacosx-version-min=11.0"
+          export LDFLAGS="-L$PREFIX/lib"
+          JOBS=$(sysctl -n hw.ncpu)
+
+          # dav1d (AV1 decoder)
+          git clone --depth 1 --branch 1.5.2 https://code.videolan.org/videolan/dav1d.git
+          cd dav1d
+          meson setup build --default-library=static --buildtype=release \
+            -Denable_tools=false -Denable_tests=false --prefix=$PREFIX
+          ninja -C build && ninja -C build install
+          cd ..
+
+          # highway (SIMD for libjxl)
+          git clone --depth 1 --branch 1.3.0 https://github.com/google/highway.git
+          cd highway
+          cmake -B _build -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF \
+            -DHWY_ENABLE_EXAMPLES=OFF -DHWY_ENABLE_TESTS=OFF
+          cmake --build _build -j$JOBS
+          cmake --install _build
+          cd ..
+
+          # brotli (compression for libjxl)
+          git clone --depth 1 --branch v1.1.0 https://github.com/google/brotli.git
+          cd brotli
+          cmake -B _build -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DBUILD_SHARED_LIBS=OFF -DBROTLI_DISABLE_TESTS=ON
+          cmake --build _build -j$JOBS
+          cmake --install _build
+          cd ..
+
+          # lcms2 (color management for libjxl)
+          git clone --depth 1 --branch lcms2.16 https://github.com/mm2/Little-CMS.git
+          cd Little-CMS
+          cmake -B _build -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DBUILD_SHARED_LIBS=OFF
+          cmake --build _build -j$JOBS
+          cmake --install _build
+          cd ..
+
+          # libjxl (JPEG XL)
+          git clone --depth 1 --branch v0.11.1 https://github.com/libjxl/libjxl.git
+          cd libjxl
+          cmake -B _build -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF \
+            -DJPEGXL_ENABLE_TOOLS=OFF -DJPEGXL_ENABLE_BENCHMARK=OFF \
+            -DJPEGXL_ENABLE_EXAMPLES=OFF -DJPEGXL_ENABLE_MANPAGES=OFF \
+            -DJPEGXL_ENABLE_DOXYGEN=OFF -DJPEGXL_ENABLE_JNI=OFF \
+            -DJPEGXL_ENABLE_JPEGLI=OFF \
+            -DJPEGXL_FORCE_SYSTEM_HWY=ON -DJPEGXL_FORCE_SYSTEM_BROTLI=ON \
+            -DJPEGXL_FORCE_SYSTEM_LCMS2=ON
+          cmake --build _build -j$JOBS
+          cmake --install _build
+          cd ..
+
+      - name: Create tarball
+        run: tar -czvf static-libs-aarch64-apple-darwin.tar.gz -C ./static-libs-aarch64-apple-darwin .
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: static-libs-aarch64-apple-darwin.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-libs-aarch64-apple-darwin
+          path: static-libs-aarch64-apple-darwin.tar.gz
+          if-no-files-found: error
+
   create-release:
     needs:
       - build-ffmpeg
       - build-ffmpeg-armv7
       - build-ffmpeg-windows-arm64
       - build-ffmpeg-windows-x64
+      - build-static-libs-macos-x64
+      - build-static-libs-macos-arm64
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -610,7 +818,7 @@ jobs:
             - FFmpeg: avcodec, avutil, swscale, swresample
             - Video: x264, x265, libvpx, libaom (Linux/arm64), rav1e (Windows x64)
             - Audio: opus, mp3lame, vorbis
-            - Image: libwebp
+            - Image: libwebp, libjxl
 
             ## Targets
 
@@ -624,6 +832,14 @@ jobs:
             ### Windows (MSVC)
             - x86_64-pc-windows-msvc (uses rav1e for AV1 encoding)
             - aarch64-pc-windows-msvc (uses libaom for AV1 encoding)
+
+            ### macOS (Static Libs Only)
+            - x86_64-apple-darwin (dav1d, libjxl + deps)
+            - aarch64-apple-darwin (dav1d, libjxl + deps)
+
+            Note: macOS builds use Homebrew FFmpeg. These archives contain only
+            the static libraries (dav1d, libjxl, highway, brotli, lcms2) that
+            Homebrew doesn't provide as static builds.
 
             ## Verification
 

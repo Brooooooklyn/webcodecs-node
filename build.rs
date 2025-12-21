@@ -4,7 +4,8 @@
 //! 1. NAPI-RS setup
 //! 2. Compiling the C accessor library via `cc`
 //! 3. Static linking of FFmpeg libraries
-//! 4. Downloading pre-built FFmpeg from GitHub Releases (Linux only)
+//! 4. Downloading pre-built FFmpeg from GitHub Releases (Linux/Windows)
+//! 5. Downloading pre-built static libs from GitHub Releases (macOS)
 
 use std::env;
 use std::fs;
@@ -27,8 +28,24 @@ fn main() {
   let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
   let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 
+  // For macOS: download static libs (dav1d, libjxl) if not already present
+  // These are needed because Homebrew only provides dynamic .dylib files
+  let macos_static_libs_dir = if target_os == "macos" {
+    download_static_libs_for_macos(&target_arch)
+  } else {
+    None
+  };
+
   // Get FFmpeg directory
   let ffmpeg_dir = get_ffmpeg_dir(&target_os, &target_arch);
+
+  // Add macOS static libs to search path if downloaded
+  if let Some(ref static_libs_path) = macos_static_libs_dir {
+    println!(
+      "cargo:rustc-link-search={}",
+      static_libs_path.join("lib").display()
+    );
+  }
 
   // Compile C accessor library
   compile_accessors(&ffmpeg_dir, &target_os);
@@ -271,6 +288,133 @@ fn download_ffmpeg_from_release(
   }
 }
 
+/// Download macOS static libs (dav1d, libjxl + deps) if not already present
+///
+/// These are needed because Homebrew only provides dynamic .dylib files,
+/// but FFmpeg's libavcodec.a has undefined symbols for dav1d/jxl that
+/// need to be resolved by linking static .a files.
+fn download_static_libs_for_macos(target_arch: &str) -> Option<PathBuf> {
+  // Skip if FFMPEG_SKIP_DOWNLOAD is set
+  if env::var("FFMPEG_SKIP_DOWNLOAD").unwrap_or_default() == "1" {
+    return None;
+  }
+
+  // Check if static libs already exist in Homebrew paths
+  let brew_prefix = env::var("HOMEBREW_PREFIX").unwrap_or_else(|_| {
+    if target_arch == "aarch64" {
+      "/opt/homebrew".to_string()
+    } else {
+      "/usr/local".to_string()
+    }
+  });
+  let brew_lib = PathBuf::from(&brew_prefix).join("lib");
+
+  // Check for required static libs
+  let required_libs = ["libdav1d.a", "libjxl.a", "libhwy.a"];
+  let all_exist = required_libs.iter().all(|lib| brew_lib.join(lib).exists());
+
+  if all_exist {
+    println!(
+      "cargo:warning=Static libs already exist in {}",
+      brew_lib.display()
+    );
+    return None; // No download needed
+  }
+
+  // Map architecture to target triple
+  let target = match target_arch {
+    "x86_64" => "x86_64-apple-darwin",
+    "aarch64" => "aarch64-apple-darwin",
+    _ => return None,
+  };
+
+  let repo =
+    env::var("FFMPEG_GITHUB_REPO").unwrap_or_else(|_| "Brooooooklyn/webcodecs-node".to_string());
+
+  // Determine release tag
+  let release_tag = match env::var("FFMPEG_RELEASE_TAG") {
+    Ok(tag) => tag,
+    Err(_) => find_latest_ffmpeg_release(&repo)?,
+  };
+
+  let archive_name = format!("static-libs-{}.tar.gz", target);
+  let download_url = format!(
+    "https://github.com/{}/releases/download/{}/{}",
+    repo, release_tag, archive_name
+  );
+
+  // Download to OUT_DIR
+  let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+  let static_libs_dir = out_dir.join("static-libs");
+  let archive_path = out_dir.join(&archive_name);
+
+  // Skip if already extracted - check for libjxl.a
+  let lib_check = static_libs_dir.join("lib").join("libjxl.a");
+  if lib_check.exists() {
+    println!(
+      "cargo:warning=Using cached static libs at {}",
+      static_libs_dir.display()
+    );
+    return Some(static_libs_dir);
+  }
+
+  println!(
+    "cargo:warning=Downloading macOS static libs from {}",
+    download_url
+  );
+
+  // Download using curl
+  let status = Command::new("curl")
+    .args(["-L", "-f", "-o"])
+    .arg(&archive_path)
+    .arg(&download_url)
+    .status();
+
+  match status {
+    Ok(s) if s.success() => {}
+    _ => {
+      println!(
+        "cargo:warning=Failed to download static libs from {}",
+        download_url
+      );
+      println!(
+        "cargo:warning=You may need to build dav1d/libjxl manually or run the FFmpeg build workflow"
+      );
+      return None;
+    }
+  }
+
+  // Create extraction directory
+  if let Err(e) = fs::create_dir_all(&static_libs_dir) {
+    println!("cargo:warning=Failed to create directory: {}", e);
+    return None;
+  }
+
+  // Extract archive using tar
+  let extract_status = Command::new("tar")
+    .arg("xzf")
+    .arg(&archive_path)
+    .arg("-C")
+    .arg(&static_libs_dir)
+    .status();
+
+  match extract_status {
+    Ok(s) if s.success() => {
+      // Clean up archive
+      let _ = fs::remove_file(&archive_path);
+      println!(
+        "cargo:warning=Static libs extracted to {}",
+        static_libs_dir.display()
+      );
+      Some(static_libs_dir)
+    }
+    _ => {
+      println!("cargo:warning=Failed to extract static libs archive");
+      None
+    }
+  }
+}
+
 /// Find the latest ffmpeg-* release tag from GitHub
 fn find_latest_ffmpeg_release(repo: &str) -> Option<String> {
   // Use GitHub API to list releases
@@ -397,6 +541,10 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
   let is_windows_msvc_x64 =
     target_os == "windows" && target_arch == "x86_64" && target_env == "msvc";
 
+  // Windows arm64 uses vcpkg's pre-built FFmpeg which doesn't include libjxl
+  let is_windows_msvc_arm64 =
+    target_os == "windows" && target_arch == "aarch64" && target_env == "msvc";
+
   // Work around duplicate Rust runtime symbols when linking rav1e.lib on Windows MSVC.
   // rav1e is a Rust staticlib that includes rust_eh_personality, which conflicts with
   // our own Rust runtime. /FORCE:MULTIPLE tells MSVC linker to accept duplicate symbols.
@@ -422,6 +570,17 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
     ("webpmux", false),   // WebP muxer
     ("webpdemux", false), // WebP demuxer
     ("sharpyuv", false),  // WebP YUV conversion
+    // JPEG XL support - built on all platforms via build-ffmpeg tool
+    // Link order matters: jxl depends on jxl_threads, hwy, brotli, lcms2
+    // Note: Windows arm64 uses vcpkg's pre-built FFmpeg which doesn't include libjxl
+    ("jxl", !is_windows_msvc_arm64),          // libjxl core
+    ("jxl_threads", !is_windows_msvc_arm64),  // libjxl threading
+    ("jxl_cms", false),                       // libjxl color management - optional
+    ("hwy", !is_windows_msvc_arm64),          // Highway SIMD library
+    ("brotlienc", !is_windows_msvc_arm64),    // Brotli encoder
+    ("brotlidec", !is_windows_msvc_arm64),    // Brotli decoder
+    ("brotlicommon", !is_windows_msvc_arm64), // Brotli common
+    ("lcms2", !is_windows_msvc_arm64),        // Little CMS 2
     // Text/subtitle libraries
     ("aribb24", false), // ARIB STD-B24 decoder
     // Other optional libraries

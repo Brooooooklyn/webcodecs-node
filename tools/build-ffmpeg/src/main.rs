@@ -32,6 +32,15 @@ const NV_CODEC_HEADERS_BRANCH: &str = "n13.0.19.0";
 const FFMPEG_REPO: &str = "https://github.com/FFmpeg/FFmpeg.git";
 const ZLIB_REPO: &str = "https://github.com/madler/zlib.git";
 const ZLIB_VERSION: &str = "v1.3.1";
+// JPEG XL and dependencies
+const HIGHWAY_REPO: &str = "https://github.com/google/highway.git";
+const HIGHWAY_BRANCH: &str = "1.3.0";
+const BROTLI_REPO: &str = "https://github.com/google/brotli.git";
+const BROTLI_BRANCH: &str = "v1.1.0";
+const LCMS2_REPO: &str = "https://github.com/mm2/Little-CMS.git";
+const LCMS2_BRANCH: &str = "lcms2.16";
+const LIBJXL_REPO: &str = "https://github.com/libjxl/libjxl.git";
+const LIBJXL_BRANCH: &str = "v0.11.1";
 
 /// Build context containing all configuration
 struct BuildContext {
@@ -159,15 +168,17 @@ impl BuildContext {
       .unwrap_or_default();
 
     // Create CC wrapper that transforms arch flags to zig-compatible format
+    // Use set -- to rebuild positional parameters to preserve quoting for args with spaces
     let cc_wrapper = wrapper_dir.join("cc");
     let cc_content = format!(
       r#"#!/bin/sh
 # Zig CC wrapper - transforms arch flags to zig-compatible format
 # Also filters out -target/--target flags that cmake/configure might add
-args=""
+# Uses set -- to rebuild args to preserve quoting for arguments with spaces
+set --
 cpu_features=""
 skip_next=0
-for arg in "$@"; do
+for arg; do
   if [ "$skip_next" = "1" ]; then
     skip_next=0
     continue
@@ -208,16 +219,16 @@ for arg in "$@"; do
         *+sha3*) cpu_features="${{cpu_features}}+sha3" ;;
       esac
       ;; # Don't pass the original flag
-    *) args="$args $arg" ;;
+    *) set -- "$@" "$arg" ;;
   esac
 done
 # Add extracted features via -mcpu if any were found
 if [ -n "$cpu_features" ]; then
-  args="-mcpu=generic$cpu_features $args"
+  set -- "-mcpu=generic$cpu_features" "$@"
 fi
 # Disable UBSan - zig enables it by default but we don't link the runtime
-args="-fno-sanitize=undefined $args"
-exec zig cc {} $args
+set -- "-fno-sanitize=undefined" "$@"
+exec zig cc {} "$@"
 "#,
       target_arg
     );
@@ -225,15 +236,17 @@ exec zig cc {} $args
     self.make_executable(&cc_wrapper)?;
 
     // Create CXX wrapper with same logic
+    // Use set -- to rebuild positional parameters to preserve quoting for args with spaces
     let cxx_wrapper = wrapper_dir.join("c++");
     let cxx_content = format!(
       r#"#!/bin/sh
 # Zig C++ wrapper - transforms arch flags to zig-compatible format
 # Also filters out -target/--target flags that cmake/configure might add
-args=""
+# Uses set -- to rebuild args to preserve quoting for arguments with spaces
+set --
 cpu_features=""
 skip_next=0
-for arg in "$@"; do
+for arg; do
   if [ "$skip_next" = "1" ]; then
     skip_next=0
     continue
@@ -274,16 +287,16 @@ for arg in "$@"; do
         *+sha3*) cpu_features="${{cpu_features}}+sha3" ;;
       esac
       ;; # Don't pass the original flag
-    *) args="$args $arg" ;;
+    *) set -- "$@" "$arg" ;;
   esac
 done
 # Add extracted features via -mcpu if any were found
 if [ -n "$cpu_features" ]; then
-  args="-mcpu=generic$cpu_features $args"
+  set -- "-mcpu=generic$cpu_features" "$@"
 fi
 # Disable UBSan - zig enables it by default but we don't link the runtime
-args="-fno-sanitize=undefined $args"
-exec zig c++ {} $args
+set -- "-fno-sanitize=undefined" "$@"
+exec zig c++ {} "$@"
 "#,
       target_arg
     );
@@ -1695,6 +1708,322 @@ Cflags: -I${{includedir}}
     Ok(())
   }
 
+  /// Build highway SIMD library (required by libjxl)
+  fn build_highway(&self) -> io::Result<()> {
+    self.info("Building highway (SIMD library)...");
+
+    let source = self.source_dir.join("highway");
+    self.git_clone(HIGHWAY_REPO, Some(HIGHWAY_BRANCH), &source)?;
+
+    let build_dir = source.join("build");
+    fs::create_dir_all(&build_dir)?;
+
+    let prefix_str = self.prefix.to_string_lossy().to_string();
+
+    let mut args = vec![
+      format!("-DCMAKE_INSTALL_PREFIX={}", prefix_str),
+      "-DBUILD_SHARED_LIBS=OFF".to_string(),
+      "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".to_string(),
+      "-DHWY_ENABLE_TESTS=OFF".to_string(),
+      "-DHWY_ENABLE_EXAMPLES=OFF".to_string(),
+      "-DHWY_ENABLE_CONTRIB=OFF".to_string(),
+    ];
+
+    // Add cross-compilation hints for CMake
+    args.extend(self.cmake_cross_args());
+
+    let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    self.run_cmake(&source, &build_dir, &args_refs)?;
+    self.run_cmake_build(&build_dir)?;
+    self.run_cmake_install(&build_dir)?;
+
+    // Ensure libhwy.pc exists with correct content
+    let pkgconfig_dir = self.prefix.join("lib").join("pkgconfig");
+    fs::create_dir_all(&pkgconfig_dir)?;
+
+    let hwy_pc = format!(
+      r#"prefix={}
+exec_prefix=${{prefix}}
+libdir=${{exec_prefix}}/lib
+includedir=${{prefix}}/include
+
+Name: libhwy
+Description: Highway SIMD library
+Version: {}
+Libs: -L${{libdir}} -lhwy
+Libs.private: -lstdc++ -lm
+Cflags: -I${{includedir}}
+"#,
+      prefix_str, HIGHWAY_BRANCH
+    );
+    fs::write(pkgconfig_dir.join("libhwy.pc"), hwy_pc)?;
+    self.log("Generated libhwy.pc");
+
+    self.info("highway built successfully");
+    Ok(())
+  }
+
+  /// Build brotli compression library (required by libjxl)
+  fn build_brotli(&self) -> io::Result<()> {
+    self.info("Building brotli...");
+
+    let source = self.source_dir.join("brotli");
+    self.git_clone(BROTLI_REPO, Some(BROTLI_BRANCH), &source)?;
+
+    let build_dir = source.join("build");
+    fs::create_dir_all(&build_dir)?;
+
+    let prefix_str = self.prefix.to_string_lossy().to_string();
+
+    let mut args = vec![
+      format!("-DCMAKE_INSTALL_PREFIX={}", prefix_str),
+      "-DBUILD_SHARED_LIBS=OFF".to_string(),
+      "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".to_string(),
+      "-DBROTLI_DISABLE_TESTS=ON".to_string(),
+    ];
+
+    // Add cross-compilation hints for CMake
+    args.extend(self.cmake_cross_args());
+
+    let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    self.run_cmake(&source, &build_dir, &args_refs)?;
+    self.run_cmake_build(&build_dir)?;
+    self.run_cmake_install(&build_dir)?;
+
+    // Generate .pc files for brotli components
+    let pkgconfig_dir = self.prefix.join("lib").join("pkgconfig");
+    fs::create_dir_all(&pkgconfig_dir)?;
+
+    let brotli_version = BROTLI_BRANCH.trim_start_matches('v');
+
+    // libbrotlicommon.pc
+    let brotlicommon_pc = format!(
+      r#"prefix={}
+exec_prefix=${{prefix}}
+libdir=${{exec_prefix}}/lib
+includedir=${{prefix}}/include
+
+Name: libbrotlicommon
+Description: Brotli common dictionary library
+Version: {}
+Libs: -L${{libdir}} -lbrotlicommon
+Cflags: -I${{includedir}}
+"#,
+      prefix_str, brotli_version
+    );
+    fs::write(pkgconfig_dir.join("libbrotlicommon.pc"), brotlicommon_pc)?;
+
+    // libbrotlidec.pc
+    let brotlidec_pc = format!(
+      r#"prefix={}
+exec_prefix=${{prefix}}
+libdir=${{exec_prefix}}/lib
+includedir=${{prefix}}/include
+
+Name: libbrotlidec
+Description: Brotli decoder library
+Version: {}
+Requires: libbrotlicommon
+Libs: -L${{libdir}} -lbrotlidec
+Cflags: -I${{includedir}}
+"#,
+      prefix_str, brotli_version
+    );
+    fs::write(pkgconfig_dir.join("libbrotlidec.pc"), brotlidec_pc)?;
+
+    // libbrotlienc.pc
+    let brotlienc_pc = format!(
+      r#"prefix={}
+exec_prefix=${{prefix}}
+libdir=${{exec_prefix}}/lib
+includedir=${{prefix}}/include
+
+Name: libbrotlienc
+Description: Brotli encoder library
+Version: {}
+Requires: libbrotlicommon
+Libs: -L${{libdir}} -lbrotlienc
+Libs.private: -lm
+Cflags: -I${{includedir}}
+"#,
+      prefix_str, brotli_version
+    );
+    fs::write(pkgconfig_dir.join("libbrotlienc.pc"), brotlienc_pc)?;
+
+    self.log("Generated brotli .pc files");
+    self.info("brotli built successfully");
+    Ok(())
+  }
+
+  /// Build Little CMS 2 (required by libjxl for color management)
+  fn build_lcms2(&self) -> io::Result<()> {
+    self.info("Building lcms2...");
+
+    let source = self.source_dir.join("lcms2");
+    self.git_clone(LCMS2_REPO, Some(LCMS2_BRANCH), &source)?;
+
+    let prefix_str = self.prefix.to_string_lossy().to_string();
+    let mut args = vec![
+      format!("--prefix={}", prefix_str),
+      "--enable-static".to_string(),
+      "--disable-shared".to_string(),
+      "--with-pic".to_string(),
+    ];
+
+    // Cross-compilation: set --host for autoconf target detection
+    if let Some(target) = &self.target {
+      args.push(format!("--host={}", target));
+    }
+
+    let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    self.run_configure(&source, &args_refs)?;
+    self.run_make(&source)?;
+    self.run_make_install(&source)?;
+
+    // Ensure lcms2.pc exists with correct content
+    let pkgconfig_dir = self.prefix.join("lib").join("pkgconfig");
+    fs::create_dir_all(&pkgconfig_dir)?;
+    let lcms2_version = LCMS2_BRANCH.trim_start_matches("lcms");
+
+    let lcms2_pc = format!(
+      r#"prefix={}
+exec_prefix=${{prefix}}
+libdir=${{exec_prefix}}/lib
+includedir=${{prefix}}/include
+
+Name: lcms2
+Description: Little CMS color management library
+Version: {}
+Libs: -L${{libdir}} -llcms2
+Libs.private: -lm -lpthread
+Cflags: -I${{includedir}}
+"#,
+      prefix_str, lcms2_version
+    );
+    fs::write(pkgconfig_dir.join("lcms2.pc"), lcms2_pc)?;
+    self.log("Generated lcms2.pc");
+
+    self.info("lcms2 built successfully");
+    Ok(())
+  }
+
+  /// Build libjxl (JPEG XL reference implementation)
+  fn build_libjxl(&self) -> io::Result<()> {
+    self.info("Building libjxl...");
+
+    let source = self.source_dir.join("libjxl");
+    self.git_clone(LIBJXL_REPO, Some(LIBJXL_BRANCH), &source)?;
+
+    let build_dir = source.join("build");
+    fs::create_dir_all(&build_dir)?;
+
+    let prefix_str = self.prefix.to_string_lossy().to_string();
+
+    let mut args = vec![
+      format!("-DCMAKE_INSTALL_PREFIX={}", prefix_str),
+      "-DBUILD_SHARED_LIBS=OFF".to_string(),
+      "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".to_string(),
+      // Use system dependencies we already built
+      "-DJPEGXL_FORCE_SYSTEM_HWY=ON".to_string(),
+      "-DJPEGXL_FORCE_SYSTEM_BROTLI=ON".to_string(),
+      "-DJPEGXL_FORCE_SYSTEM_LCMS2=ON".to_string(),
+      // Disable features we don't need
+      "-DJPEGXL_ENABLE_BENCHMARK=OFF".to_string(),
+      "-DJPEGXL_ENABLE_DOXYGEN=OFF".to_string(),
+      "-DJPEGXL_ENABLE_EXAMPLES=OFF".to_string(),
+      "-DJPEGXL_ENABLE_FUZZERS=OFF".to_string(),
+      "-DJPEGXL_ENABLE_JNI=OFF".to_string(),
+      "-DJPEGXL_ENABLE_MANPAGES=OFF".to_string(),
+      "-DJPEGXL_ENABLE_OPENEXR=OFF".to_string(),
+      "-DJPEGXL_ENABLE_PLUGINS=OFF".to_string(),
+      "-DJPEGXL_ENABLE_SJPEG=OFF".to_string(),
+      "-DJPEGXL_ENABLE_SKCMS=OFF".to_string(),
+      "-DJPEGXL_ENABLE_TCMALLOC=OFF".to_string(),
+      "-DJPEGXL_ENABLE_TOOLS=OFF".to_string(),
+      "-DJPEGXL_ENABLE_VIEWERS=OFF".to_string(),
+      "-DJPEGXL_ENABLE_JPEGLI=OFF".to_string(),
+      "-DBUILD_TESTING=OFF".to_string(),
+      // Point to our built dependencies
+      format!("-DCMAKE_PREFIX_PATH={}", prefix_str),
+    ];
+
+    // Add cross-compilation hints for CMake
+    args.extend(self.cmake_cross_args());
+
+    let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    self.run_cmake(&source, &build_dir, &args_refs)?;
+    self.run_cmake_build(&build_dir)?;
+    self.run_cmake_install(&build_dir)?;
+
+    // Generate .pc files for libjxl components
+    let pkgconfig_dir = self.prefix.join("lib").join("pkgconfig");
+    fs::create_dir_all(&pkgconfig_dir)?;
+    let jxl_version = LIBJXL_BRANCH.trim_start_matches('v');
+
+    // libjxl.pc
+    let jxl_pc = format!(
+      r#"prefix={}
+exec_prefix=${{prefix}}
+libdir=${{exec_prefix}}/lib
+includedir=${{prefix}}/include
+
+Name: libjxl
+Description: JPEG XL image format reference implementation
+Version: {}
+Requires: libjxl_threads libhwy libbrotlidec libbrotlienc lcms2
+Libs: -L${{libdir}} -ljxl
+Libs.private: -lstdc++ -lm
+Cflags: -I${{includedir}}
+"#,
+      prefix_str, jxl_version
+    );
+    fs::write(pkgconfig_dir.join("libjxl.pc"), jxl_pc)?;
+
+    // libjxl_threads.pc
+    let jxl_threads_pc = format!(
+      r#"prefix={}
+exec_prefix=${{prefix}}
+libdir=${{exec_prefix}}/lib
+includedir=${{prefix}}/include
+
+Name: libjxl_threads
+Description: JPEG XL threading library
+Version: {}
+Libs: -L${{libdir}} -ljxl_threads
+Libs.private: -lpthread
+Cflags: -I${{includedir}}
+"#,
+      prefix_str, jxl_version
+    );
+    fs::write(pkgconfig_dir.join("libjxl_threads.pc"), jxl_threads_pc)?;
+
+    // libjxl_cms.pc (optional, may not be built)
+    let jxl_cms_lib = self.prefix.join("lib").join("libjxl_cms.a");
+    if jxl_cms_lib.exists() {
+      let jxl_cms_pc = format!(
+        r#"prefix={}
+exec_prefix=${{prefix}}
+libdir=${{exec_prefix}}/lib
+includedir=${{prefix}}/include
+
+Name: libjxl_cms
+Description: JPEG XL color management library
+Version: {}
+Requires: lcms2
+Libs: -L${{libdir}} -ljxl_cms
+Cflags: -I${{includedir}}
+"#,
+        prefix_str, jxl_version
+      );
+      fs::write(pkgconfig_dir.join("libjxl_cms.pc"), jxl_cms_pc)?;
+      self.log("Generated libjxl_cms.pc");
+    }
+
+    self.log("Generated libjxl .pc files");
+    self.info("libjxl built successfully");
+    Ok(())
+  }
+
   /// Install NVIDIA codec headers (for NVENC/NVDEC support)
   fn install_nv_codec_headers(&self) -> io::Result<()> {
     self.info("Installing nv-codec-headers...");
@@ -1760,6 +2089,7 @@ Cflags: -I${{includedir}}
       "--enable-libvorbis".to_string(),
       // Image codecs
       "--enable-libwebp".to_string(),
+      "--enable-libjxl".to_string(),
       // Core dependencies
       "--enable-zlib".to_string(), // Required for PNG decoder
       // Include/lib paths
@@ -1949,6 +2279,11 @@ Cflags: -I${{includedir}}
       self.build_ogg()?; // Must be before vorbis
       self.build_vorbis()?;
       self.build_webp()?;
+      // libjxl dependency chain (order matters)
+      self.build_highway()?; // SIMD library (no deps)
+      self.build_brotli()?; // Compression (no deps)
+      self.build_lcms2()?; // Color management (no deps)
+      self.build_libjxl()?; // JPEG XL (depends on highway, brotli, lcms2)
     }
 
     // Build FFmpeg
