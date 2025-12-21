@@ -469,13 +469,11 @@ fn compile_accessors(ffmpeg_dir: &Path, target_os: &str, target_arch: &str, targ
       build
         .flag_if_supported("-static")
         .cpp_link_stdlib_static(true)
-        .cpp_set_stdlib(
-          if target_os == "linux" && (target_arch == "arm" || target_env == "musl") {
-            "stdc++"
-          } else {
-            "c++"
-          },
-        );
+        .cpp_set_stdlib(if target_arch == "arm" || target_env == "musl" {
+          "stdc++"
+        } else {
+          "c++"
+        });
     }
     _ => {}
   }
@@ -679,12 +677,50 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
         if target_arch == "arm" || target_env == "musl" {
           println!("cargo:rustc-link-lib=stdc++");
         } else {
-          // Link libc++ and its ABI dependency statically
-          // Order matters: c++ depends on c++abi for low-level ABI support
-          // (exception handling, RTTI, std::string implementation, etc.)
-          println!("cargo:rustc-link-search=/usr/lib/llvm-18/lib");
-          println!("cargo:rustc-link-lib=static=c++");
-          println!("cargo:rustc-link-lib=static=c++abi");
+          // Link libc++ and its ABI dependency statically using explicit full paths.
+          // We can't use rustc-link-lib because the napi-rs cross-compilation toolchain
+          // has its own sysroot and doesn't respect our -L paths.
+          // Using rustc-link-arg with full paths bypasses library search entirely.
+          //
+          // Try multiarch path first (what cross toolchains expect), then LLVM path
+          let multiarch_dir = if target_arch == "x86_64" {
+            "/usr/lib/x86_64-linux-gnu"
+          } else {
+            "/usr/lib/aarch64-linux-gnu"
+          };
+          let llvm_dir = "/usr/lib/llvm-18/lib";
+
+          // Find libc++.a
+          let libcpp_multiarch = format!("{}/libc++.a", multiarch_dir);
+          let libcpp_llvm = format!("{}/libc++.a", llvm_dir);
+          let libcpp = if Path::new(&libcpp_multiarch).exists() {
+            &libcpp_multiarch
+          } else if Path::new(&libcpp_llvm).exists() {
+            &libcpp_llvm
+          } else {
+            panic!(
+              "libc++.a not found at {} or {}. Install libc++-dev package.",
+              libcpp_multiarch, libcpp_llvm
+            );
+          };
+
+          // Find libc++abi.a
+          let libcppabi_multiarch = format!("{}/libc++abi.a", multiarch_dir);
+          let libcppabi_llvm = format!("{}/libc++abi.a", llvm_dir);
+          let libcppabi = if Path::new(&libcppabi_multiarch).exists() {
+            &libcppabi_multiarch
+          } else if Path::new(&libcppabi_llvm).exists() {
+            &libcppabi_llvm
+          } else {
+            panic!(
+              "libc++abi.a not found at {} or {}. Install libc++abi-dev package.",
+              libcppabi_multiarch, libcppabi_llvm
+            );
+          };
+
+          println!("cargo:warning=Using libc++ from: {}", libcpp);
+          println!("cargo:rustc-link-arg={}", libcpp);
+          println!("cargo:rustc-link-arg={}", libcppabi);
         }
       }
       "windows" => {
