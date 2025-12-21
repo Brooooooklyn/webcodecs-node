@@ -606,9 +606,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup cmake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.x'
+
       - name: Install build dependencies
         run: |
-          brew install meson ninja nasm cmake llvm@20
+          brew install meson ninja nasm llvm@20
           echo "$(brew --prefix llvm@20)/bin" >> $GITHUB_PATH
 
       - name: Build static libraries
@@ -705,9 +710,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup cmake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.x'
+
       - name: Install build dependencies
         run: |
-          brew install meson ninja nasm cmake llvm@20
+          brew install meson ninja nasm llvm@20
           echo "$(brew --prefix llvm@20)/bin" >> $GITHUB_PATH
 
       - name: Build static libraries
