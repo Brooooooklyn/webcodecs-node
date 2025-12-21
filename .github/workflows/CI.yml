@@ -241,27 +241,29 @@ jobs:
 
           echo "FFMPEG_DIR=$(pwd)/ffmpeg-build" >> $GITHUB_ENV
         shell: bash
-      - name: Setup libc++ static library
+      - name: Setup libc++ and compiler-rt static libraries
         if: ${{ endsWith(matrix.settings.target, 'unknown-linux-gnu') }}
         run: |
-          sudo apt install -y libc++-dev libc++abi-dev libgcc-9-dev-arm64-cross
+          # Install libc++ for C++ runtime and libclang-rt for aarch64 outline atomics
+          # Note: GCC's libatomic does NOT work - it uses __atomic_* symbols,
+          # but LLVM generates __aarch64_* symbols (incompatible ABIs)
+          sudo apt install -y libc++-dev libc++abi-dev libclang-rt-18-dev
           # prevent dynamic linking to libc++
-          sudo rm /usr/lib/llvm-18/lib/libc++abi.so
-          sudo rm /usr/lib/llvm-18/lib/libc++.so
-          sudo rm /usr/lib/llvm-18/lib/libunwind.so
-      - name: Remove .so files and move libatomic.a on arm64 host
+          sudo rm -f /usr/lib/llvm-18/lib/libc++abi.so
+          sudo rm -f /usr/lib/llvm-18/lib/libc++.so
+          sudo rm -f /usr/lib/llvm-18/lib/libunwind.so
+      - name: Remove .so files on arm64 host
         if: matrix.settings.target == 'aarch64-unknown-linux-gnu'
         run: |
-          sudo rm /usr/lib/aarch64-linux-gnu/libc++abi.so
-          sudo rm /usr/lib/aarch64-linux-gnu/libc++.so
-          sudo rm /usr/lib/aarch64-linux-gnu/libunwind.so
-          sudo mv /usr/lib/gcc-cross/aarch64-linux-gnu/9/libatomic.a /usr/lib/aarch64-linux-gnu/libatomic.a
+          sudo rm -f /usr/lib/aarch64-linux-gnu/libc++abi.so
+          sudo rm -f /usr/lib/aarch64-linux-gnu/libc++.so
+          sudo rm -f /usr/lib/aarch64-linux-gnu/libunwind.so
       - name: Remove .so files on x86_64 host
         if: matrix.settings.target == 'x86_64-unknown-linux-gnu'
         run: |
-          sudo rm /usr/lib/x86_64-linux-gnu/libc++abi.so
-          sudo rm /usr/lib/x86_64-linux-gnu/libc++.so
-          sudo rm /usr/lib/x86_64-linux-gnu/libunwind.so
+          sudo rm -f /usr/lib/x86_64-linux-gnu/libc++abi.so
+          sudo rm -f /usr/lib/x86_64-linux-gnu/libc++.so
+          sudo rm -f /usr/lib/x86_64-linux-gnu/libunwind.so
 
       - name: Install dependencies
         run: pnpm install

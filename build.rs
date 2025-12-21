@@ -52,7 +52,7 @@ fn main() {
   compile_accessors(&ffmpeg_dir, &target_os, &target_arch, &target_env);
 
   // Link FFmpeg libraries
-  link_ffmpeg(&ffmpeg_dir, &target_os);
+  link_ffmpeg(&ffmpeg_dir, &target_os, macos_static_libs_dir.as_ref());
 
   // Re-run if these files change
   println!("cargo:rerun-if-changed=src/ffi/accessors.c");
@@ -309,8 +309,17 @@ fn download_static_libs_for_macos(target_arch: &str) -> Option<PathBuf> {
   });
   let brew_lib = PathBuf::from(&brew_prefix).join("lib");
 
-  // Check for required static libs
-  let required_libs = ["libdav1d.a", "libjxl.a", "libhwy.a"];
+  // Check for required static libs (all libs needed for libjxl support)
+  let required_libs = [
+    "libdav1d.a",
+    "libjxl.a",
+    "libjxl_threads.a",
+    "libhwy.a",
+    "libbrotlienc.a",
+    "libbrotlidec.a",
+    "libbrotlicommon.a",
+    "liblcms2.a",
+  ];
   let all_exist = required_libs.iter().all(|lib| brew_lib.join(lib).exists());
 
   if all_exist {
@@ -485,22 +494,26 @@ fn compile_accessors(ffmpeg_dir: &Path, target_os: &str, target_arch: &str, targ
 }
 
 /// Link FFmpeg libraries (static only)
-fn link_ffmpeg(ffmpeg_dir: &Path, target_os: &str) {
+fn link_ffmpeg(ffmpeg_dir: &Path, target_os: &str, extra_lib_dir: Option<&PathBuf>) {
   let lib_dir = ffmpeg_dir.join("lib");
 
   // Always use static linking - panic if static libs not found
-  link_static_ffmpeg(&lib_dir, target_os);
+  link_static_ffmpeg(&lib_dir, target_os, extra_lib_dir);
 
   // Platform-specific system libraries
   link_platform_libraries(target_os);
 }
 
 /// Link FFmpeg statically using full paths to .a files
-fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
+fn link_static_ffmpeg(lib_dir: &Path, target_os: &str, extra_lib_dir: Option<&PathBuf>) {
   // Get codec library paths, with lib_dir as highest priority
   let mut codec_lib_paths = get_codec_library_paths(target_os);
   // Insert lib_dir at the front so downloaded/bundled FFmpeg libs are found first
   codec_lib_paths.insert(0, lib_dir.to_path_buf());
+  // Add extra lib dir (e.g., downloaded macOS static libs) if provided
+  if let Some(extra_dir) = extra_lib_dir {
+    codec_lib_paths.insert(1, extra_dir.join("lib"));
+  }
 
   // FFmpeg core libraries - link using full paths
   let ffmpeg_libs = ["avformat", "avcodec", "avutil", "swscale", "swresample"];
@@ -725,16 +738,25 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
           // On aarch64, LLVM uses outline atomics by default for compatibility with
           // older ARM64 CPUs without LSE (Large System Extensions). This generates
           // calls to helper functions like __aarch64_ldadd4_acq_rel.
-          // Modern GCC's libatomic (10+) provides these symbols for ABI compatibility.
+          //
+          // IMPORTANT: GCC's libatomic does NOT provide these symbols!
+          // - GCC libatomic uses: __atomic_fetch_add_4 (C11 atomics API)
+          // - LLVM generates: __aarch64_ldadd4_acq_rel (LLVM outline atomics)
+          // These are incompatible ABIs. We MUST use LLVM's libclang_rt.builtins.
           if target_arch == "aarch64" {
-            let libatomic_path = format!("{}/libatomic.a", multiarch_dir);
-            if Path::new(&libatomic_path).exists() {
-              println!("cargo:warning=Using libatomic from: {}", libatomic_path);
-              println!("cargo:rustc-link-arg={}", libatomic_path);
+            let clang_rt_path =
+              "/usr/lib/llvm-18/lib/clang/18/lib/linux/libclang_rt.builtins-aarch64.a";
+            if Path::new(clang_rt_path).exists() {
+              println!(
+                "cargo:warning=Using compiler-rt builtins from: {}",
+                clang_rt_path
+              );
+              println!("cargo:rustc-link-arg={}", clang_rt_path);
             } else {
               panic!(
-                "libatomic.a not found at {}. Install libatomic1 package.",
-                libatomic_path
+                "libclang_rt.builtins-aarch64.a not found at {}. \
+                 Install libclang-rt-18-dev package.",
+                clang_rt_path
               );
             }
           }
