@@ -1,83 +1,82 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
+  <head>
+    <title>VP9 With Alpha Channel Test</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+      }
 
-<head>
-  <title>VP9 With Alpha Channel Test</title>
-  <style>
-    body {
-      font-family: system-ui, sans-serif;
-    }
+      h1 {
+        color: #333;
+      }
 
-    h1 {
-      color: #333;
-    }
+      .main {
+        display: flex;
+        flex-direction: column;
+        gap: 20px;
+        flex-wrap: wrap;
+        max-width: 1100px;
+        margin-inline: auto;
+        margin-bottom: 220px;
+      }
 
-    .main {
-      display: flex;
-      flex-direction: column;
-      gap: 20px;
-      flex-wrap: wrap;
-      max-width: 1100px;
-      margin-inline: auto;
-      margin-bottom: 220px;
-    }
+      .video-box {
+        display: flex;
+        gap: 20px;
+        justify-content: center;
+        padding: 30px 10px;
+        background: repeating-conic-gradient(#ccc 0% 25%, white 0% 50%) 50% / 20px 20px;
+        background-repeat: round;
+      }
 
-    .video-box {
-      display: flex;
-      gap: 20px;
-      justify-content: center;
-      padding: 30px 10px;
-      background: repeating-conic-gradient(#ccc 0% 25%, white 0% 50%) 50% / 20px 20px;
-      background-repeat: round;
-    }
+      .video-box h3 {
+        margin: 0 0 10px;
+        background: rgba(255, 255, 255, 0.8);
+        padding: 5px;
+        border-radius: 4px;
+      }
 
-    .video-box h3 {
-      margin: 0 0 10px;
-      background: rgba(255, 255, 255, 0.8);
-      padding: 5px;
-      border-radius: 4px;
-    }
+      video {
+        max-width: 400px;
+        display: block;
+      }
 
-    video {
-      max-width: 400px;
-      display: block;
-    }
+      .note {
+        background: rgba(255, 255, 255, 0.9);
+        padding: 10px;
+        border-radius: 8px;
+      }
 
-    .note {
-      background: rgba(255, 255, 255, 0.9);
-      padding: 10px;
-      border-radius: 8px;
-    }
+      h1,
+      h3,
+      h3 + p {
+        margin-bottom: 0;
+      }
+    </style>
+  </head>
 
-    h1, h3, h3 + p {
-      margin-bottom: 0;
-    }
-  </style>
-</head>
-
-<body>
-  <main class="main">
-    <h1>📺 VP9 With Alpha Channel</h1>
-    <div class="note">
-      <h3>🎉 Using `@napi-rs/webcodecs`, you can generate videos with alpha channels from Canvas or Lottie in Node.js.</h3>
-      <p>
-        Checkerboard background shows through if alpha channel works correctly.
-      </p>
-    </div>
-
-    <div class="video-box">
-      <div class="video-item">
-        <h3>canvas.webm</h3>
-        <video src="canvas.webm" preload="auto" autoplay loop muted controls></video>
+  <body>
+    <main class="main">
+      <h1>📺 VP9 With Alpha Channel</h1>
+      <div class="note">
+        <h3>
+          🎉 Using `@napi-rs/webcodecs`, you can generate videos with alpha channels from Canvas or Lottie in Node.js.
+        </h3>
+        <p>Checkerboard background shows through if alpha channel works correctly.</p>
       </div>
 
-      <div class="video-item">
-        <h3>lottie.webm</h3>
-        <video src="lottie.webm" preload="auto" autoplay loop muted controls></video>
+      <div class="video-box">
+        <div class="video-item">
+          <h3>canvas.webm</h3>
+          <video src="canvas.webm" preload="auto" autoplay loop muted controls></video>
+        </div>
+
+        <div class="video-item">
+          <h3>lottie.webm</h3>
+          <video src="lottie.webm" preload="auto" autoplay loop muted controls></video>
+        </div>
       </div>
-    </div>
-  </main>
-
-</body>
-
+    </main>
+  </body>
 </html>
