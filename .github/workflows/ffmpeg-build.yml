@@ -329,8 +329,8 @@ jobs:
           # dav1d AV1 decoder
           create_pc "$PKGCONFIG_DIR_MSYS/dav1d.pc" "$VCPKG_INSTALLED" "dav1d" "dav1d AV1 decoder" "1.5.1" '-I${includedir}' '-ldav1d'
 
-          # libjxl JPEG XL (needs brotli, highway, lcms2)
-          create_pc "$PKGCONFIG_DIR_MSYS/libjxl.pc" "$VCPKG_INSTALLED" "libjxl" "JPEG XL image codec" "0.11.1" '-I${includedir}' '-ljxl -ljxl_threads -lhwy -lbrotlidec -lbrotlienc -lbrotlicommon -llcms2'
+          # libjxl JPEG XL (needs brotli, highway, lcms2, jxl_cms)
+          create_pc "$PKGCONFIG_DIR_MSYS/libjxl.pc" "$VCPKG_INSTALLED" "libjxl" "JPEG XL image codec" "0.11.1" '-I${includedir}' '-ljxl -ljxl_threads -ljxl_cms -lhwy -lbrotlidec -lbrotlienc -lbrotlicommon -llcms2'
           create_pc "$PKGCONFIG_DIR_MSYS/libjxl_threads.pc" "$VCPKG_INSTALLED" "libjxl_threads" "JPEG XL threading" "0.11.1" '-I${includedir}' '-ljxl_threads'
 
           # Set up pkg-config path (use MSYS path for pkg-config tool)
@@ -422,7 +422,7 @@ jobs:
             --enable-zlib \
             --extra-cflags="-I$VCPKG_INSTALLED/include -I$RAV1E_DIR/include -I$RAV1E_DIR/include/rav1e" \
             --extra-ldflags="-libpath:$VCPKG_INSTALLED/lib -libpath:$RAV1E_DIR/lib" \
-            --extra-libs="libx264.lib x265-static.lib vpx.lib rav1e.lib dav1d.lib opus.lib libmp3lame-static.lib libmpghip-static.lib vorbis.lib vorbisenc.lib ogg.lib libwebp.lib libsharpyuv.lib jxl.lib jxl_threads.lib hwy.lib brotlidec.lib brotlienc.lib brotlicommon.lib lcms2.lib zlib.lib ws2_32.lib userenv.lib ntdll.lib bcrypt.lib" \
+            --extra-libs="libx264.lib x265-static.lib vpx.lib rav1e.lib dav1d.lib opus.lib libmp3lame-static.lib libmpghip-static.lib vorbis.lib vorbisenc.lib ogg.lib libwebp.lib libsharpyuv.lib jxl.lib jxl_threads.lib jxl_cms.lib hwy.lib brotlidec.lib brotlienc.lib brotlicommon.lib lcms2.lib zlib.lib ws2_32.lib userenv.lib ntdll.lib bcrypt.lib" \
             --pkg-config-flags="--static"
 
           make -j$(nproc)
@@ -468,6 +468,7 @@ jobs:
             "libsharpyuv.lib",
             "jxl.lib",
             "jxl_threads.lib",
+            "jxl_cms.lib",
             "hwy.lib",
             "brotlidec.lib",
             "brotlienc.lib",

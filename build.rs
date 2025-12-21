@@ -658,17 +658,13 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
   }
 
   // x265 requires C++ runtime
+  // Note: FFmpeg static libs are built with zig (libc++) but final linking uses
+  // NAPI-RS GCC cross-toolchain which only has libstdc++. This works because
+  // the C++ symbols needed are ABI-compatible for static linking.
   if linked_x265 {
     match target_os {
       "macos" => println!("cargo:rustc-link-lib=c++"),
-      "linux" => {
-        // arm (armv7) uses GCC (libstdc++), all other Linux uses zig (libc++)
-        if target_arch == "arm" {
-          println!("cargo:rustc-link-lib=stdc++");
-        } else {
-          println!("cargo:rustc-link-lib=c++");
-        }
-      }
+      "linux" => println!("cargo:rustc-link-lib=stdc++"),
       "windows" => {
         // MSVC uses msvcrt automatically, but we need to ensure C++ runtime is linked
         // For static linking with MSVC, the runtime is usually already included
