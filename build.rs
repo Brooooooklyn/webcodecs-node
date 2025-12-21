@@ -25,8 +25,9 @@ fn main() {
   }
 
   // Get target information
-  let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-  let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+  let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS not set");
+  let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH not set");
+  let target_env = env::var("CARGO_CFG_TARGET_ENV").expect("CARGO_CFG_TARGET_ENV not set");
 
   // For macOS: download static libs (dav1d, libjxl) if not already present
   // These are needed because Homebrew only provides dynamic .dylib files
@@ -37,7 +38,7 @@ fn main() {
   };
 
   // Get FFmpeg directory
-  let ffmpeg_dir = get_ffmpeg_dir(&target_os, &target_arch);
+  let ffmpeg_dir = get_ffmpeg_dir(&target_os, &target_arch, &target_env);
 
   // Add macOS static libs to search path if downloaded
   if let Some(ref static_libs_path) = macos_static_libs_dir {
@@ -48,7 +49,7 @@ fn main() {
   }
 
   // Compile C accessor library
-  compile_accessors(&ffmpeg_dir, &target_os);
+  compile_accessors(&ffmpeg_dir, &target_os, &target_arch, &target_env);
 
   // Link FFmpeg libraries
   link_ffmpeg(&ffmpeg_dir, &target_os);
@@ -64,7 +65,7 @@ fn main() {
 }
 
 /// Get FFmpeg installation directory
-fn get_ffmpeg_dir(target_os: &str, target_arch: &str) -> PathBuf {
+fn get_ffmpeg_dir(target_os: &str, target_arch: &str, target_env: &str) -> PathBuf {
   // 1. Check for custom FFMPEG_DIR environment variable
   if let Ok(dir) = env::var("FFMPEG_DIR") {
     return PathBuf::from(dir);
@@ -123,8 +124,7 @@ fn get_ffmpeg_dir(target_os: &str, target_arch: &str) -> PathBuf {
   }
 
   // 5. Try downloading from GitHub Releases (Linux and Windows)
-  let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
-  if let Some(downloaded) = download_ffmpeg_from_release(target_os, target_arch, &target_env) {
+  if let Some(downloaded) = download_ffmpeg_from_release(target_os, target_arch, target_env) {
     return downloaded;
   }
 
@@ -451,7 +451,7 @@ fn find_latest_ffmpeg_release(repo: &str) -> Option<String> {
 }
 
 /// Compile the C accessor library
-fn compile_accessors(ffmpeg_dir: &Path, target_os: &str) {
+fn compile_accessors(ffmpeg_dir: &Path, target_os: &str, target_arch: &str, target_env: &str) {
   let include_dir = ffmpeg_dir.join("include");
 
   let mut build = cc::Build::new();
@@ -468,7 +468,14 @@ fn compile_accessors(ffmpeg_dir: &Path, target_os: &str) {
     "linux" => {
       build
         .flag_if_supported("-static")
-        .cpp_link_stdlib_static(true);
+        .cpp_link_stdlib_static(true)
+        .cpp_set_stdlib(
+          if target_os == "linux" && (target_arch == "arm" || target_env == "musl") {
+            "stdc++"
+          } else {
+            "c++"
+          },
+        );
     }
     _ => {}
   }
@@ -601,6 +608,7 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
   ];
 
   let mut linked_x265 = false;
+  let mut linked_jxl = false;
 
   // On Linux, we need --whole-archive for codec libraries because FFmpeg uses
   // function pointer tables to reference codecs. Without --whole-archive, the
@@ -616,6 +624,9 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
       codec_paths.push(path);
       if *lib == "x265" {
         linked_x265 = true;
+      }
+      if *lib == "jxl" {
+        linked_jxl = true;
       }
     } else if *required {
       panic!(
@@ -661,15 +672,15 @@ fn link_static_ffmpeg(lib_dir: &Path, target_os: &str) {
   // Note: FFmpeg static libs are built with zig (libc++) but final linking uses
   // NAPI-RS GCC cross-toolchain which only has libstdc++. This works because
   // the C++ symbols needed are ABI-compatible for static linking.
-  if linked_x265 {
+  if linked_x265 || linked_jxl {
     match target_os {
       "macos" => println!("cargo:rustc-link-lib=c++"),
       "linux" => {
-        if target_arch == "arm" {
+        if target_arch == "arm" || target_env == "musl" {
           println!("cargo:rustc-link-lib=stdc++");
         } else {
           println!("cargo:rustc-link-search=/usr/lib/llvm-18/lib");
-          println!("cargo:rustc-link-lib=c++");
+          println!("cargo:rustc-link-lib=static=c++");
         }
       }
       "windows" => {

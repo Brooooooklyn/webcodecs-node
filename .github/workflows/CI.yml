@@ -499,18 +499,12 @@ jobs:
         shell: bash
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
-        if: ${{ contains(matrix.target, 'armv7') || (contains(matrix.target, 'aarch64') && contains(matrix.target, 'musl')) }}
+        if: ${{ contains(matrix.target, 'armv7') }}
         with:
           platforms: all
       - run: docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
-        if: ${{ contains(matrix.target, 'armv7') || (contains(matrix.target, 'aarch64') && contains(matrix.target, 'musl')) }}
-      # Run tests natively on ARM64 runner for aarch64-gnu (no Docker needed)
-      - name: Test bindings (native ARM64)
-        if: ${{ matrix.target == 'aarch64-unknown-linux-gnu' }}
-        run: npm run test
-      # Run tests in Docker for other targets (musl, armv7, x86_64)
-      - name: Test bindings (Docker)
-        if: ${{ matrix.target != 'aarch64-unknown-linux-gnu' }}
+        if: ${{ contains(matrix.target, 'armv7') }}
+      - name: Test bindings
         uses: addnab/docker-run-action@v3
         with:
           image: ${{ steps.docker.outputs.IMAGE }}
