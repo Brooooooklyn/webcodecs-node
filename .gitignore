@@ -197,3 +197,4 @@ specs/
 ffmpeg-src/
 ffmpeg-build/
 /wpt/
+/example/*.webm
