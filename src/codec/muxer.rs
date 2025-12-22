@@ -510,7 +510,7 @@ impl MuxerContext {
   ///
   /// This can be used to update codec-specific parameters (avcC, hvcC, av1C)
   /// when they become available from encoder metadata.
-  pub fn update_video_extradata(&mut self, extradata: &[u8]) -> Result<(), CodecError> {
+  pub fn update_video_extradata(&mut self, extradata: &mut [u8]) -> Result<(), CodecError> {
     let video_idx = self
       .video_stream_index
       .ok_or_else(|| CodecError::InvalidState("No video stream to update".to_string()))?;

@@ -423,7 +423,7 @@ impl<F: MuxerFormat> MuxerInner<F> {
   pub fn add_video_chunk(
     &mut self,
     chunk: &EncodedVideoChunk,
-    metadata: Option<&EncodedVideoChunkMetadataJs>,
+    mut metadata: Option<&mut EncodedVideoChunkMetadataJs>,
   ) -> Result<()> {
     // Ensure we have a video track
     let video_index = self
@@ -489,13 +489,14 @@ impl<F: MuxerFormat> MuxerInner<F> {
 
     // Handle metadata - extract description if present
     if let Some(description) = metadata
-      .and_then(|m| m.decoder_config.as_ref())
-      .and_then(|c| c.description.as_ref())
+      .as_mut()
+      .and_then(|m| m.decoder_config.as_mut())
+      .and_then(|c| c.description.as_mut())
     {
-      let desc_data = description.to_vec();
+      let desc_data = unsafe { description.as_mut() };
       if !desc_data.is_empty() {
         // Update extradata dynamically if available
-        if let Err(e) = self.muxer.update_video_extradata(&desc_data) {
+        if let Err(e) = self.muxer.update_video_extradata(desc_data) {
           tracing::warn!(target: "webcodecs", "Failed to update video extradata: {}", e);
         }
       }
@@ -503,10 +504,10 @@ impl<F: MuxerFormat> MuxerInner<F> {
 
     // Handle alpha side data for VP9 alpha support
     // This adds the alpha channel data as BlockAdditional side data
-    if let Some(alpha_data) = metadata.and_then(|m| m.alpha_side_data.as_ref()) {
-      let alpha_bytes = alpha_data.to_vec();
+    if let Some(alpha_data) = metadata.as_mut().and_then(|m| m.alpha_side_data.as_mut()) {
+      let alpha_bytes = unsafe { alpha_data.as_mut() };
       if !alpha_bytes.is_empty()
-        && let Err(e) = packet.add_matroska_blockadditional(&alpha_bytes)
+        && let Err(e) = packet.add_matroska_blockadditional(alpha_bytes)
       {
         tracing::warn!(target: "webcodecs", "Failed to add alpha side data: {}", e);
       }

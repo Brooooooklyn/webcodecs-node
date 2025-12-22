@@ -201,7 +201,7 @@ impl Packet {
   /// Add Matroska BlockAdditional side data (used for VP9 alpha)
   ///
   /// This is used to attach alpha channel data to a packet for VP9 alpha.
-  pub fn add_matroska_blockadditional(&mut self, data: &[u8]) -> Result<(), CodecError> {
+  pub fn add_matroska_blockadditional(&mut self, data: &mut [u8]) -> Result<(), CodecError> {
     let side_data = unsafe {
       av_packet_new_side_data(
         self.as_mut_ptr(),
@@ -212,9 +212,7 @@ impl Packet {
     if side_data.is_null() {
       return Err(CodecError::AllocationFailed("packet side data"));
     }
-    unsafe {
-      std::ptr::copy_nonoverlapping(data.as_ptr(), side_data, data.len());
-    }
+    data.copy_from_slice(unsafe { std::slice::from_raw_parts(side_data, data.len()) });
     Ok(())
   }
 

@@ -229,10 +229,10 @@ impl MkvMuxer {
   pub fn add_video_chunk(
     &self,
     chunk: &EncodedVideoChunk,
-    metadata: Option<EncodedVideoChunkMetadataJs>,
+    mut metadata: Option<EncodedVideoChunkMetadataJs>,
   ) -> Result<()> {
     lock_muxer_inner_mut!(self => _guard, inner);
-    inner.add_video_chunk(chunk, metadata.as_ref())
+    inner.add_video_chunk(chunk, metadata.as_mut())
   }
 
   /// Add an encoded audio chunk to the muxer
