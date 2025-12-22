@@ -676,7 +676,6 @@ src/codec/context.rs:339,362  # Set extradata if provided (non-critical)
 1. **Temporal SVC** - All modes with >= 2 temporal layers (L1Tx, L2Tx, L3Tx, SxTx) populate `metadata.svc.temporalLayerId`; W3C spec does not define `spatialLayerId`
 2. **Duration type** - Using i64 instead of u64 due to NAPI-RS constraints
 3. **ImageDecoder GIF animation** - FFmpeg may return only first frame; for full animation use VideoDecoder with GIF codec
-4. **JPEG XL on Windows arm64** - Not available because vcpkg's pre-built FFmpeg doesn't include libjxl support
 
 ## NAPI-RS Limitations
 
@@ -724,17 +723,14 @@ These are fundamental limitations that cannot be resolved without upstream NAPI-
 | x86_64-apple-darwin           | macOS   | libaom      | libaom      | ✅      |
 | aarch64-apple-darwin          | macOS   | libaom      | libaom      | ✅      |
 | x86_64-pc-windows-msvc        | Windows | rav1e       | dav1d       | ✅      |
-| aarch64-pc-windows-msvc       | Windows | libaom      | libaom      | ❌      |
+| aarch64-pc-windows-msvc       | Windows | libaom      | dav1d       | ✅      |
 | x86_64-unknown-linux-gnu      | Linux   | libaom      | libaom      | ✅      |
 | aarch64-unknown-linux-gnu     | Linux   | libaom      | libaom      | ✅      |
 | x86_64-unknown-linux-musl     | Linux   | libaom      | libaom      | ✅      |
 | aarch64-unknown-linux-musl    | Linux   | libaom      | libaom      | ✅      |
 | armv7-unknown-linux-gnueabihf | Linux   | libaom      | libaom      | ✅      |
 
-**Notes:**
-
-- Windows x64 MSVC uses rav1e + dav1d due to libaom crash issues (CVE-2025-8879).
-- Windows arm64 MSVC lacks JPEG XL support because vcpkg's pre-built FFmpeg doesn't include libjxl.
+**Note:** Windows x64 MSVC uses rav1e + dav1d due to libaom crash issues (CVE-2025-8879).
 
 ## Spec Compliance Notes
 
