@@ -106,9 +106,18 @@ jobs:
             make
             diffutils
             pkg-config
+            perl
+            gcc
 
-      # Note: NASM is not needed for ARM64 (it's x86/x64 only)
-      # FFmpeg ARM64 uses gas-preprocessor for ARM assembly
+      # Download gas-preprocessor.pl for ARM64 NEON assembly support
+      # This allows FFmpeg to use armasm64.exe via a GNU-style interface
+      - name: Download gas-preprocessor.pl
+        shell: pwsh
+        run: |
+          $url = "https://raw.githubusercontent.com/FFmpeg/gas-preprocessor/master/gas-preprocessor.pl"
+          Invoke-WebRequest -Uri $url -OutFile "gas-preprocessor.pl"
+          Copy-Item "gas-preprocessor.pl" -Destination "C:/msys64/usr/bin/"
+          Write-Host "gas-preprocessor.pl installed to MSYS2 bin directory"
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -252,13 +261,17 @@ jobs:
           # Configure FFmpeg with MSVC toolchain for ARM64
           # Key differences from x64:
           # - --arch=aarch64 for ARM64
-          # - --disable-asm (MSVC doesn't support gas-preprocessor for ARM assembly)
+          # - Uses gas-preprocessor.pl + armasm64 for ARM64 NEON assembly
           # - --enable-libaom instead of --enable-librav1e (libaom works on ARM64)
+
+          # Set up assembler for ARM64 NEON support via gas-preprocessor.pl
+          # This translates GNU-style assembly to armasm64 format
+          export AS="gas-preprocessor.pl -arch aarch64 -as-type armasm -- armasm64"
+
           ./configure \
             --prefix="$PREFIX" \
             --toolchain=msvc \
             --arch=aarch64 \
-            --disable-asm \
             --enable-w32threads \
             --enable-pic \
             --enable-runtime-cpudetect \
