@@ -1595,7 +1595,7 @@ impl VideoFrame {
     };
 
     // Delegate to new_from_buffer with processed pixel data
-    Self::new_from_buffer(env, &pixel_data, Some(canvas_init))
+    Self::new_from_buffer(env, pixel_data, Some(canvas_init))
   }
 
   /// Internal: Create VideoFrame from another VideoFrame (image source constructor form)

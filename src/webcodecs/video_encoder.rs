@@ -1629,8 +1629,8 @@ impl VideoEncoder {
     };
 
     // Determine if alpha channel should be preserved (only VP9 supports alpha)
-    let is_vp9 = codec_string.starts_with("vp09") || codec_string == "vp9";
-    let use_alpha = is_vp9 && matches!(config.alpha, Some(AlphaOption::Keep));
+    // Use parsed codec_id rather than string matching to handle all valid VP9 codec string formats
+    let use_alpha = codec_id == AVCodecID::Vp9 && matches!(config.alpha, Some(AlphaOption::Keep));
     let pixel_format = if use_alpha {
       AVPixelFormat::Yuva420p
     } else {
@@ -2396,8 +2396,8 @@ impl VideoEncoder {
 
     // Determine if alpha channel should be preserved
     // Only VP9 supports alpha encoding (YUVA420P pixel format)
-    let is_vp9 = codec.starts_with("vp09") || codec == "vp9";
-    let use_alpha = is_vp9 && matches!(config.alpha, Some(AlphaOption::Keep));
+    // Use parsed codec_id rather than string matching to handle all valid VP9 codec string formats
+    let use_alpha = codec_id == AVCodecID::Vp9 && matches!(config.alpha, Some(AlphaOption::Keep));
     let pixel_format = if use_alpha {
       AVPixelFormat::Yuva420p
     } else {
