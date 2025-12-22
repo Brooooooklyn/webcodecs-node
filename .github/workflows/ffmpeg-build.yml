@@ -252,14 +252,13 @@ jobs:
           # Configure FFmpeg with MSVC toolchain for ARM64
           # Key differences from x64:
           # - --arch=aarch64 for ARM64
-          # - --disable-x86asm (no x86 assembly on ARM)
+          # - --disable-asm (MSVC doesn't support gas-preprocessor for ARM assembly)
           # - --enable-libaom instead of --enable-librav1e (libaom works on ARM64)
           ./configure \
             --prefix="$PREFIX" \
             --toolchain=msvc \
             --arch=aarch64 \
-            --disable-inline-asm \
-            --disable-x86asm \
+            --disable-asm \
             --enable-w32threads \
             --enable-pic \
             --enable-runtime-cpudetect \
