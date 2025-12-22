@@ -288,10 +288,10 @@ impl Mp4Muxer {
   pub fn add_video_chunk(
     &self,
     chunk: &EncodedVideoChunk,
-    mut metadata: Option<EncodedVideoChunkMetadataJs>,
+    metadata: Option<EncodedVideoChunkMetadataJs>,
   ) -> Result<()> {
     lock_muxer_inner_mut!(self => _guard, inner);
-    inner.add_video_chunk(chunk, metadata.as_mut())
+    inner.add_video_chunk(chunk, metadata.as_ref())
   }
 
   /// Add an encoded audio chunk to the muxer
