@@ -109,16 +109,6 @@ jobs:
             perl
             gcc
 
-      # Download gas-preprocessor.pl for ARM64 NEON assembly support
-      # This allows FFmpeg to use armasm64.exe via a GNU-style interface
-      - name: Download gas-preprocessor.pl
-        shell: pwsh
-        run: |
-          $url = "https://raw.githubusercontent.com/FFmpeg/gas-preprocessor/master/gas-preprocessor.pl"
-          Invoke-WebRequest -Uri $url -OutFile "gas-preprocessor.pl"
-          Copy-Item "gas-preprocessor.pl" -Destination "C:/msys64/usr/bin/"
-          Write-Host "gas-preprocessor.pl installed to MSYS2 bin directory"
-
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
         with:
@@ -152,6 +142,14 @@ jobs:
       - name: Build FFmpeg with MSVC toolchain
         shell: msys2 {0}
         run: |
+          # Download gas-preprocessor.pl for ARM64 NEON assembly support
+          # This translates GNU-style ARM assembly to armasm64 format
+          echo "=== Downloading gas-preprocessor.pl ==="
+          curl -L -o /usr/bin/gas-preprocessor.pl \
+            "https://raw.githubusercontent.com/FFmpeg/gas-preprocessor/master/gas-preprocessor.pl"
+          chmod +x /usr/bin/gas-preprocessor.pl
+          echo "gas-preprocessor.pl installed to $(which gas-preprocessor.pl)"
+
           # Convert paths to Windows mixed-style (D:/a/...) for MSVC compatibility
           VCPKG_ROOT_WIN=$(cygpath -m "$VCPKG_ROOT")
           VCPKG_INSTALLED="$VCPKG_ROOT_WIN/installed/arm64-windows-static"
