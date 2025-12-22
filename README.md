@@ -362,15 +362,15 @@ frame.close()
 
 ### Image
 
-| Format  | MIME Type    | Decoding | Notes                          |
-| ------- | ------------ | -------- | ------------------------------ |
-| JPEG    | `image/jpeg` | ✅       |                                |
-| PNG     | `image/png`  | ✅       |                                |
-| WebP    | `image/webp` | ✅       |                                |
-| GIF     | `image/gif`  | ✅       |                                |
-| BMP     | `image/bmp`  | ✅       |                                |
-| AVIF    | `image/avif` | ✅       |                                |
-| JPEG XL | `image/jxl`  | ✅       | Not available on Windows arm64 |
+| Format  | MIME Type    | Decoding |
+| ------- | ------------ | -------- |
+| JPEG    | `image/jpeg` | ✅       |
+| PNG     | `image/png`  | ✅       |
+| WebP    | `image/webp` | ✅       |
+| GIF     | `image/gif`  | ✅       |
+| BMP     | `image/bmp`  | ✅       |
+| AVIF    | `image/avif` | ✅       |
+| JPEG XL | `image/jxl`  | ✅       |
 
 ### Containers
 
