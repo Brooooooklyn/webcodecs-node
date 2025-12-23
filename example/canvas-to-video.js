@@ -76,6 +76,7 @@ async function main() {
     output: (chunk, meta) => {
       videoChunks.push(chunk)
       videoMetadatas.push(meta)
+      console.log('✅ alphaSideData', meta.alphaSideData?.length)
 
       const count = videoChunks.length
       if (count % 30 === 0 || count === totalFrames) {
@@ -165,7 +166,9 @@ async function main() {
       // Whether to preserve the alpha channel in the canvas.
       // discard: The alpha channel is discarded, and the frame is treated as fully opaque.
       // keep(default): The alpha channel is preserved.
-      // alpha: 'discard',
+      alpha: 'keep',
+      // You can set some or all frames to be transparent.
+      // alpha: frameIndex <= 50 ? 'discard' : 'keep',
     })
 
     // Encode the frame (request keyframe every 1 second)

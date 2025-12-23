@@ -41,6 +41,7 @@ async function main() {
     output: (chunk, meta) => {
       videoChunks.push(chunk)
       videoMetadatas.push(meta)
+      console.log('✅ alphaSideData', meta.alphaSideData?.length)
 
       const count = videoChunks.length
       if (count % 30 === 0 || count === totalFrames) {
