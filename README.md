@@ -7,7 +7,8 @@ WebCodecs API implementation for Node.js using FFmpeg, built with [NAPI-RS](http
 ## Features
 
 - **W3C WebCodecs API compliant** - Full implementation of the WebCodecs specification with native `DOMException` errors
-- **Video encoding/decoding** - H.264, H.265, VP8, VP9, AV1
+- **Video encoding/decoding** - H.264, H.265, VP8, VP9 (with Alpha), AV1
+- **Encoding Alpha channel** - VP9 encoding/decoding with Alpha support(See [canvas-to-video.js](example/canvas-to-video.js) example and [video.html](example/video.html))
 - **Audio encoding/decoding** - AAC, Opus, MP3, FLAC, Vorbis, PCM variants
 - **Container muxing/demuxing** - MP4, WebM, MKV containers with seeking support
 - **Image decoding** - JPEG, PNG, WebP, GIF, BMP, AVIF, JPEG XL
@@ -339,15 +340,21 @@ frame.close()
 
 ### Video
 
-| Codec | Codec String            | Encoding | Decoding |
-| ----- | ----------------------- | -------- | -------- |
-| H.264 | `avc1.*`                | ✅       | ✅       |
-| H.265 | `hev1.*`, `hvc1.*`      | ✅       | ✅       |
-| VP8   | `vp8`                   | ✅       | ✅       |
-| VP9   | `vp09.*`, `vp9`         | ✅       | ✅       |
-| AV1   | `av01.*`, `av01`, `av1` | ✅       | ✅       |
+| Codec | Codec String            | Encoding | Encoding Alpha | Decoding | Decoding Alpha |
+| ----- | ----------------------- | -------- | -------------- | -------- | -------------- |
+| H.264 | `avc1.*`                | ✅       | 🙅🏻‍♀️             | ✅       | 🙅🏻‍♀️             |
+| H.265 | `hev1.*`, `hvc1.*`      | ✅       | ❓             | ✅       | ❓             |
+| VP8   | `vp8`                   | ✅       | 🙅🏻‍♀️             | ✅       | 🙅🏻‍♀️             |
+| VP9   | `vp09.*`, `vp9`         | ✅       | ✅             | ✅       | ✅             |
+| AV1   | `av01.*`, `av01`, `av1` | ✅       | 🙅🏻‍♀️             | ✅       | 🙅🏻‍♀️             |
 
-**Note:** Short form codec strings (`vp9`, `av01`, `av1`) are accepted for compatibility with browser implementations.
+**Note:** Short form codec strings (`vp9`, `av01`, `av1`) are accepted for compatibility with browser implementations. VP9 encoding and decoding now supports Alpha channel (transparency).
+
+**Legend:**
+
+- ✅ Feature supported
+- 🙅🏻‍♀️ Feature not supported by codec format
+- ❓ Feature supported by codec format but not yet implemented
 
 ### Audio
 

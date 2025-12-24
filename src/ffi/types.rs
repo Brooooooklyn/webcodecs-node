@@ -836,3 +836,64 @@ pub mod channel_layout {
     }
   }
 }
+
+/// Packet side data types
+/// These are used for attaching additional data to AVPacket
+pub mod pkt_side_data_type {
+  use std::os::raw::c_int;
+
+  /// An AV_PKT_DATA_PALETTE side data packet contains exactly AVPALETTE_SIZE
+  /// bytes worth of palette. This side data signals that a new palette is
+  /// present.
+  pub const AV_PKT_DATA_PALETTE: c_int = 0;
+
+  /// The AV_PKT_DATA_NEW_EXTRADATA is used to notify the codec or the format
+  /// that the extradata buffer was changed and the receiving side should
+  /// act upon it appropriately. The new extradata is embedded in the side
+  /// data buffer and should be immediately used for processing the current
+  /// frame or packet.
+  pub const AV_PKT_DATA_NEW_EXTRADATA: c_int = 1;
+
+  /// An AV_PKT_DATA_PARAM_CHANGE side data packet is laid out as follows:
+  /// @code
+  /// u32le param_flags
+  /// if (param_flags & AV_SIDE_DATA_PARAM_CHANGE_CHANNEL_COUNT)
+  ///     s32le channel_count
+  /// if (param_flags & AV_SIDE_DATA_PARAM_CHANGE_CHANNEL_LAYOUT)
+  ///     u64le channel_layout
+  /// if (param_flags & AV_SIDE_DATA_PARAM_CHANGE_SAMPLE_RATE)
+  ///     s32le sample_rate
+  /// if (param_flags & AV_SIDE_DATA_PARAM_CHANGE_DIMENSIONS)
+  ///     s32le width
+  ///     s32le height
+  /// @endcode
+  pub const AV_PKT_DATA_PARAM_CHANGE: c_int = 2;
+
+  /// An AV_PKT_DATA_H263_MB_INFO side data packet contains a number of
+  /// structures with info about macroblocks relevant to splitting the
+  /// packet into smaller packets on macroblock edges (e.g. as for RFC 2190).
+  pub const AV_PKT_DATA_H263_MB_INFO: c_int = 3;
+
+  /// AV_PKT_DATA_QUALITY_STATS - quality statistics from encoder
+  pub const AV_PKT_DATA_QUALITY_STATS: c_int = 8;
+
+  /// This side data contains Matroska BlockAdditional data. It is used to
+  /// store additional data needed for proper playback of VP9 alpha encoded
+  /// videos. The data is a raw byte buffer.
+  ///
+  /// For VP9 alpha, this contains the encoded alpha channel data that must
+  /// be written to WebM/MKV BlockAdditions element.
+  /// Format: 8-byte BlockAddId (big-endian) followed by the actual alpha data.
+  pub const AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL: c_int = 15;
+
+  /// The optional first identifier line of a WebVTT cue
+  pub const AV_PKT_DATA_WEBVTT_IDENTIFIER: c_int = 16;
+
+  /// The optional settings (rendering instructions) that immediately
+  /// follow the timestamp specifier of a WebVTT cue.
+  pub const AV_PKT_DATA_WEBVTT_SETTINGS: c_int = 17;
+
+  /// An AV_PKT_DATA_ALPHA_MODE side data contains the alpha mode value.
+  /// This is used to signal alpha channel information in VP9 encoded videos.
+  pub const AV_PKT_DATA_ALPHA_MODE: c_int = 22;
+}

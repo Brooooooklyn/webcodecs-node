@@ -249,7 +249,7 @@ The build system uses explicit full paths to static libraries to avoid dynamic l
 
 ### Supported Codecs
 
-- **Video**: H.264 (avc1), H.265 (hev1/hvc1), VP8, VP9 (vp09, vp9), AV1 (av01, av1)
+- **Video**: H.264 (avc1), H.265 (hev1/hvc1), VP8, VP9 (with Alpha support) (vp09, vp9), AV1 (av01, av1)
 - **Audio**: AAC (mp4a.40.2), Opus, MP3, FLAC, Vorbis, ALAC, PCM variants
 
 **Note:** Short form codec strings `vp9` and `av01`/`av1` are accepted for compatibility with browser implementations, though W3C WPT considers them ambiguous.

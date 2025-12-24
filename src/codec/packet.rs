@@ -9,8 +9,11 @@ use crate::ffi::{
     ffpkt_set_duration, ffpkt_set_flags, ffpkt_set_pts, ffpkt_set_stream_index, ffpkt_size,
     ffpkt_stream_index,
   },
-  avcodec::{av_new_packet, av_packet_alloc, av_packet_free, av_packet_ref, av_packet_unref},
-  pkt_flag,
+  avcodec::{
+    av_new_packet, av_packet_alloc, av_packet_free, av_packet_get_side_data,
+    av_packet_new_side_data, av_packet_ref, av_packet_unref,
+  },
+  pkt_flag, pkt_side_data_type,
 };
 use std::ptr::NonNull;
 
@@ -168,6 +171,52 @@ impl Packet {
   #[inline]
   pub fn is_corrupt(&self) -> bool {
     (self.flags() & pkt_flag::CORRUPT) != 0
+  }
+
+  // ========================================================================
+  // Side Data
+  // ========================================================================
+
+  /// Get Matroska BlockAdditional side data (used for VP9 alpha)
+  ///
+  /// Returns the alpha channel data if present, or None otherwise.
+  /// This is used for VP9 alpha encoded videos where the alpha channel
+  /// is stored separately in WebM BlockAdditions.
+  pub fn get_matroska_blockadditional(&self) -> Option<&[u8]> {
+    let mut size: usize = 0;
+    let data = unsafe {
+      av_packet_get_side_data(
+        self.as_ptr(),
+        pkt_side_data_type::AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL, // 15
+        &mut size,
+      )
+    };
+    if data.is_null() || size == 0 {
+      None
+    } else {
+      Some(unsafe { std::slice::from_raw_parts(data, size) })
+    }
+  }
+
+  /// Add Matroska BlockAdditional side data (used for VP9 alpha)
+  ///
+  /// This is used to attach alpha channel data to a packet for VP9 alpha.
+  pub fn add_matroska_blockadditional(&mut self, data: &[u8]) -> Result<(), CodecError> {
+    let side_data = unsafe {
+      av_packet_new_side_data(
+        self.as_mut_ptr(),
+        pkt_side_data_type::AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL, // 15
+        data.len(),
+      )
+    };
+    if side_data.is_null() {
+      return Err(CodecError::AllocationFailed("packet side data"));
+    }
+    // Copy FROM input data TO the newly allocated side data buffer
+    unsafe {
+      std::slice::from_raw_parts_mut(side_data, data.len()).copy_from_slice(data);
+    }
+    Ok(())
   }
 
   // ========================================================================

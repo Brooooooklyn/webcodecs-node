@@ -7,3 +7,4 @@ target
 **/*.tsx
 **/*.json
 pnpm-lock.yaml
+example/*.json
