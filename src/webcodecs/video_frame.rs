@@ -13,6 +13,7 @@ use crate::webcodecs::error::{
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use parking_lot::RwLock;
 use std::sync::{Arc, Mutex};
 
 /// Video pixel format (WebCodecs spec)
@@ -1024,7 +1025,8 @@ pub struct VideoFrameRect {
 
 /// Internal state for VideoFrame
 struct VideoFrameInner {
-  frame: Frame,
+  /// The underlying FFmpeg frame, wrapped in Arc<RwLock> for shared access
+  frame: Arc<RwLock<Frame>>,
   /// Original pixel format (preserved since FFmpeg may convert RGBX→RGBA, etc.)
   original_format: VideoPixelFormat,
   timestamp_us: i64,
@@ -1427,7 +1429,7 @@ impl VideoFrame {
     };
 
     let inner = VideoFrameInner {
-      frame,
+      frame: frame.into_shared(),
       original_format: format,
       timestamp_us: timestamp,
       duration_us: init.duration,
@@ -1611,23 +1613,21 @@ impl VideoFrame {
         .map(|a| a == "discard")
         .unwrap_or(false);
 
-      // Clone the underlying frame data
-      let cloned_frame = source_inner
-        .frame
-        .try_clone()
-        .map_err(|e| Error::new(Status::GenericFailure, format!("Clone failed: {}", e)))?;
-
       // Handle alpha discard: convert to non-alpha format if needed
+      // Otherwise, share the Arc (no pixel data copy)
       let (final_frame, final_format) =
         if should_discard_alpha && source_inner.original_format.has_alpha() {
           let target_format = source_inner.original_format.without_alpha();
           let src_av_format = source_inner.original_format.to_av_format();
           let dst_av_format = target_format.to_av_format();
 
+          // Need to read from source frame for conversion
+          let source_frame_guard = source_inner.frame.read();
+
           // Use Scaler to convert format (drops alpha channel)
           let scaler = Scaler::new_converter(
-            cloned_frame.width(),
-            cloned_frame.height(),
+            source_frame_guard.width(),
+            source_frame_guard.height(),
             src_av_format,
             dst_av_format,
           )
@@ -1638,17 +1638,22 @@ impl VideoFrame {
             )
           })?;
 
-          let converted = scaler.scale_alloc(&cloned_frame).map_err(|e| {
+          let converted = scaler.scale_alloc(&source_frame_guard).map_err(|e| {
             Error::new(
               Status::GenericFailure,
               format!("Failed to convert frame for alpha discard: {}", e),
             )
           })?;
 
-          (converted, target_format)
+          // Conversion creates a new frame, wrap it in Arc
+          (converted.into_shared(), target_format)
         } else {
-          (cloned_frame, source_inner.original_format)
+          // No conversion needed - share the same underlying frame data via Arc clone
+          (source_inner.frame.clone(), source_inner.original_format)
         };
+
+      // Get frame dimensions from the Arc (need read lock for converted, already have it for shared)
+      let frame_guard = final_frame.read();
 
       // Apply overrides from init (all fields optional for frame clone)
       let timestamp_us = init
@@ -1670,10 +1675,13 @@ impl VideoFrame {
       let (visible_left, visible_top, visible_width, visible_height) = parse_visible_rect(
         default_rect,
         init.as_ref().and_then(|i| i.visible_rect.as_ref()),
-        final_frame.width(),
-        final_frame.height(),
+        frame_guard.width(),
+        frame_guard.height(),
         final_format,
       )?;
+
+      // Drop the read guard before we move final_frame into the new struct
+      drop(frame_guard);
 
       // Handle rotation per W3C spec "Add Rotations" algorithm
       let init_rotation = parse_rotation(init.as_ref().and_then(|i| i.rotation).unwrap_or(0.0));
@@ -1746,6 +1754,43 @@ impl VideoFrame {
       VideoPixelFormat::from_av_format(frame.format()).unwrap_or(VideoPixelFormat::I420);
 
     let inner = VideoFrameInner {
+      frame: frame.into_shared(),
+      original_format,
+      timestamp_us,
+      duration_us,
+      visible_left: 0,
+      visible_top: 0,
+      visible_width: width,
+      visible_height: height,
+      display_width: width,
+      display_height: height,
+      rotation: 0.0,
+      flip: false,
+      color_space: VideoColorSpace::default(),
+      closed: false,
+    };
+
+    Self {
+      inner: Arc::new(Mutex::new(Some(inner))),
+    }
+  }
+
+  /// Create a VideoFrame from an Arc<RwLock<Frame>> (for sharing frame data)
+  pub fn from_internal_arc(
+    frame: Arc<RwLock<Frame>>,
+    timestamp_us: i64,
+    duration_us: Option<i64>,
+  ) -> Self {
+    let (width, height, original_format) = {
+      let guard = frame.read();
+      let width = guard.width();
+      let height = guard.height();
+      let format =
+        VideoPixelFormat::from_av_format(guard.format()).unwrap_or(VideoPixelFormat::I420);
+      (width, height, format)
+    };
+
+    let inner = VideoFrameInner {
       frame,
       original_format,
       timestamp_us,
@@ -1812,7 +1857,7 @@ impl VideoFrame {
     };
 
     let inner = VideoFrameInner {
-      frame,
+      frame: frame.into_shared(),
       original_format,
       timestamp_us,
       duration_us,
@@ -1856,7 +1901,52 @@ impl VideoFrame {
     };
 
     let inner = VideoFrameInner {
-      frame,
+      frame: frame.into_shared(),
+      original_format,
+      timestamp_us,
+      duration_us,
+      visible_left: 0,
+      visible_top: 0,
+      visible_width: width,
+      visible_height: height,
+      display_width: width,
+      display_height: height,
+      rotation: 0.0,
+      flip: false,
+      color_space,
+      closed: false,
+    };
+
+    Self {
+      inner: Arc::new(Mutex::new(Some(inner))),
+    }
+  }
+
+  /// Create a VideoFrame from a shared Arc<RwLock<Frame>> with color space control
+  ///
+  /// This constructor allows sharing the same frame data via Arc cloning,
+  /// avoiding expensive pixel copies. Used by ImageDecoder cache.
+  pub fn from_internal_arc_with_color_space(
+    frame_arc: Arc<RwLock<Frame>>,
+    timestamp_us: i64,
+    duration_us: Option<i64>,
+    extract_color_space: bool,
+  ) -> Self {
+    let frame_guard = frame_arc.read();
+    let width = frame_guard.width();
+    let height = frame_guard.height();
+    let original_format =
+      VideoPixelFormat::from_av_format(frame_guard.format()).unwrap_or(VideoPixelFormat::I420);
+
+    let color_space = if extract_color_space {
+      color_space_from_frame(&frame_guard)
+    } else {
+      VideoColorSpace::default()
+    };
+    drop(frame_guard);
+
+    let inner = VideoFrameInner {
+      frame: frame_arc,
       original_format,
       timestamp_us,
       duration_us,
@@ -1900,7 +1990,7 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) if !inner.closed => Ok(inner.frame.width()),
+      Some(inner) if !inner.closed => Ok(inner.frame.read().width()),
       _ => Ok(0),
     }
   }
@@ -1914,7 +2004,7 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) if !inner.closed => Ok(inner.frame.height()),
+      Some(inner) if !inner.closed => Ok(inner.frame.read().height()),
       _ => Ok(0),
     }
   }
@@ -1958,12 +2048,15 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) if !inner.closed => Ok(DOMRectReadOnly {
-        x: 0.0,
-        y: 0.0,
-        width: inner.frame.width() as f64,
-        height: inner.frame.height() as f64,
-      }),
+      Some(inner) if !inner.closed => {
+        let frame_guard = inner.frame.read();
+        Ok(DOMRectReadOnly {
+          x: 0.0,
+          y: 0.0,
+          width: frame_guard.width() as f64,
+          height: frame_guard.height() as f64,
+        })
+      }
       _ => throw_invalid_state_error(&env, "VideoFrame is closed"),
     }
   }
@@ -2118,11 +2211,12 @@ impl VideoFrame {
         );
         // Validate rect against SOURCE format (original_format), not target format.
         // Rect alignment must match the source frame's subsampling requirements.
+        let frame_guard = inner.frame.read();
         let (_, _, w, h) = parse_visible_rect(
           default_rect,
           Some(rect),
-          inner.frame.width(),
-          inner.frame.height(),
+          frame_guard.width(),
+          frame_guard.height(),
           inner.original_format,
         )?;
         (w, h)
@@ -2225,13 +2319,15 @@ impl VideoFrame {
         inner.visible_height as f64,
       );
       let rect = options.as_ref().and_then(|o| o.rect.as_ref());
+      let frame_guard = inner.frame.read();
       let (rect_x, rect_y, rect_width, rect_height) = parse_visible_rect(
         default_rect,
         rect,
-        inner.frame.width(),
-        inner.frame.height(),
+        frame_guard.width(),
+        frame_guard.height(),
         original_format,
       )?;
+      drop(frame_guard);
 
       // Get and validate custom layout if provided
       let custom_layout = options.as_ref().and_then(|o| o.layout.clone());
@@ -2324,15 +2420,21 @@ impl VideoFrame {
         size
       };
 
-      // Perform format conversion if needed
-      let working_frame = if needs_conversion {
+      // Acquire read lock on the frame for the duration of the copy operation
+      let frame_guard = inner.frame.read();
+
+      // Allocate buffer for cropped data
+      let mut temp_buffer = vec![0u8; buffer_size];
+
+      // Perform format conversion and copy, or copy directly
+      if needs_conversion {
         let src_av_format = original_format.to_av_format();
         let dst_av_format = format.to_av_format();
 
         // Use Scaler for format conversion (operates on full frame, then crop)
         let scaler = Scaler::new_converter(
-          inner.frame.width(),
-          inner.frame.height(),
+          frame_guard.width(),
+          frame_guard.height(),
           src_av_format,
           dst_av_format,
         )
@@ -2346,36 +2448,39 @@ impl VideoFrame {
           )
         })?;
 
-        scaler.scale_alloc(&inner.frame).map_err(|e| {
+        // scale_alloc creates a new frame with converted data
+        let converted = scaler.scale_alloc(&frame_guard).map_err(|e| {
           Error::new(
             Status::GenericFailure,
             format!("EncodingError: Format conversion failed: {}", e),
           )
-        })?
+        })?;
+        drop(frame_guard);
+
+        // Copy cropped region from converted frame
+        Self::copy_cropped_data(
+          &converted,
+          format,
+          rect_x,
+          rect_y,
+          rect_width,
+          rect_height,
+          &mut temp_buffer,
+          layout_for_thread.as_deref(),
+        )?;
       } else {
-        // No conversion needed - use the frame directly (borrow is fine here)
-        inner.frame.try_clone().map_err(|e| {
-          Error::new(
-            Status::GenericFailure,
-            format!("Failed to clone frame: {}", e),
-          )
-        })?
+        // No conversion needed - use the read-locked frame directly (zero-copy read)
+        Self::copy_cropped_data(
+          &frame_guard,
+          format,
+          rect_x,
+          rect_y,
+          rect_width,
+          rect_height,
+          &mut temp_buffer,
+          layout_for_thread.as_deref(),
+        )?;
       };
-
-      // Allocate buffer for cropped data
-      let mut temp_buffer = vec![0u8; buffer_size];
-
-      // Copy cropped region row by row for each plane (from converted or original frame)
-      Self::copy_cropped_data(
-        &working_frame,
-        format,
-        rect_x,
-        rect_y,
-        rect_width,
-        rect_height,
-        &mut temp_buffer,
-        layout_for_thread.as_deref(),
-      )?;
 
       Ok(temp_buffer)
     })
@@ -2762,6 +2867,9 @@ impl VideoFrame {
   }
 
   /// Clone this VideoFrame
+  ///
+  /// This creates a new VideoFrame that shares the underlying pixel data with the original.
+  /// Both frames will reference the same Arc<RwLock<Frame>>, so no pixel data is copied.
   #[napi(js_name = "clone")]
   pub fn clone_frame(&self, env: Env) -> Result<VideoFrame> {
     // Check closed state and throw native DOMException
@@ -2774,13 +2882,9 @@ impl VideoFrame {
       _ => return throw_invalid_state_error(&env, "VideoFrame is closed"),
     };
 
-    let cloned_frame = inner
-      .frame
-      .try_clone()
-      .map_err(|e| Error::new(Status::GenericFailure, format!("Clone failed: {}", e)))?;
-
+    // Clone the Arc - shares the same underlying Frame (no pixel data copy)
     let new_inner = VideoFrameInner {
-      frame: cloned_frame,
+      frame: inner.frame.clone(),
       original_format: inner.original_format,
       timestamp_us: inner.timestamp_us,
       duration_us: inner.duration_us,
@@ -2826,13 +2930,26 @@ impl VideoFrame {
   // Internal helpers (crate-visible only)
   // ========================================================================
 
-  /// Borrow internal frame for encoding (crate internal use)
+  /// Get a clone of the Arc<RwLock<Frame>> for sharing with other components.
+  ///
+  /// This is the preferred way to pass frame data to encoders/other consumers
+  /// that need to share the frame without deep copying.
+  pub(crate) fn frame_arc(&self) -> Result<Arc<RwLock<Frame>>> {
+    self.with_inner(|inner| Ok(inner.frame.clone()))
+  }
+
+  /// Borrow internal frame for read access (crate internal use)
+  ///
+  /// Acquires a read lock on the internal frame and calls the closure with it.
   #[allow(dead_code)]
   pub(crate) fn with_frame<F, R>(&self, f: F) -> Result<R>
   where
     F: FnOnce(&Frame) -> R,
   {
-    self.with_inner(|inner| Ok(f(&inner.frame)))
+    self.with_inner(|inner| {
+      let frame_guard = inner.frame.read();
+      Ok(f(&frame_guard))
+    })
   }
 
   fn with_inner<F, R>(&self, f: F) -> Result<R>

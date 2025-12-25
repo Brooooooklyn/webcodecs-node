@@ -1523,11 +1523,11 @@ impl AudioEncoder {
         }
       }
 
-      // Get frame from AudioData
-      let frame = match data.with_frame(|f| f.try_clone()) {
+      // Get frame from AudioData (deep copy for encoder mutation)
+      let frame = match data.with_frame(|f| f.deep_clone()) {
         Ok(Ok(f)) => f,
         Ok(Err(e)) => {
-          Self::report_error(&mut inner, &format!("Failed to clone frame: {}", e));
+          Self::report_error(&mut inner, &format!("Failed to copy frame: {}", e));
           return Ok(());
         }
         Err(e) => {

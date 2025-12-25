@@ -30,6 +30,9 @@ thiserror = "2"
 # Concurrent data structures
 crossbeam = "0.8"
 
+# Better RwLock implementation (no poisoning, better perf)
+parking_lot = "0.12"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = [

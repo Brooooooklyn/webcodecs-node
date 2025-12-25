@@ -3,7 +3,7 @@
 //! Provides image decoding functionality using FFmpeg.
 //! See: <https://developer.mozilla.org/en-US/docs/Web/API/ImageDecoder>
 
-use crate::codec::{CodecContext, DecoderConfig, Packet, ScaleAlgorithm, Scaler};
+use crate::codec::{CodecContext, DecoderConfig, Frame, Packet, ScaleAlgorithm, Scaler};
 use crate::ffi::AVCodecID;
 use crate::webcodecs::VideoFrame;
 use crate::webcodecs::error::{invalid_state_error, throw_invalid_state_error};
@@ -11,6 +11,7 @@ use futures::stream::{StreamExt, TryStreamExt};
 use napi::bindgen_prelude::*;
 use napi::tokio::sync::Notify;
 use napi_derive::napi;
+use parking_lot::RwLock as ParkingLotRwLock;
 use std::sync::{
   Arc, Mutex,
   atomic::{AtomicBool, Ordering},
@@ -407,7 +408,8 @@ struct ImageDecoderInner {
   /// Whether decoder is closed
   closed: bool,
   /// Cached decoded frames (for animated images, populated on first decode)
-  cached_frames: Option<Vec<crate::codec::Frame>>,
+  /// Cached decoded frames wrapped in Arc for efficient sharing
+  cached_frames: Option<Vec<Arc<ParkingLotRwLock<Frame>>>>,
   /// Color space conversion mode (W3C spec)
   color_space_conversion: ColorSpaceConversion,
   /// Desired width for scaling (W3C spec - must be paired with desired_height)
@@ -789,7 +791,10 @@ impl ImageDecoder {
             track.frame_count = frames.len() as u32;
           }
 
-          inner.cached_frames = Some(frames);
+          // Wrap frames in Arc for efficient sharing from cache
+          let shared_frames: Vec<Arc<ParkingLotRwLock<Frame>>> =
+            frames.into_iter().map(|f| f.into_shared()).collect();
+          inner.cached_frames = Some(shared_frames);
         }
 
         // Get reference to cached frames
@@ -819,20 +824,14 @@ impl ImageDecoder {
           ));
         }
 
-        // Clone the requested frame
-        let frame = frames[frame_index].try_clone().map_err(|e| {
-          Error::new(
-            Status::GenericFailure,
-            format!("Failed to clone frame: {}", e),
-          )
-        })?;
-
-        let pts = frame.pts();
+        // Clone the Arc to share the frame data (no pixel copy needed)
+        let frame_arc = frames[frame_index].clone();
+        let pts = frame_arc.read().pts();
 
         // Per Chromium behavior: "default" extracts color space, "none" ignores it
         let extract_color_space = inner.color_space_conversion == ColorSpaceConversion::Default;
         let video_frame =
-          VideoFrame::from_internal_with_color_space(frame, pts, None, extract_color_space);
+          VideoFrame::from_internal_arc_with_color_space(frame_arc, pts, None, extract_color_space);
 
         Ok(ImageDecodeResult {
           image: video_frame,
@@ -1049,8 +1048,10 @@ fn pre_parse_and_cache_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<(
     track.frame_count = frames.len() as u32;
   }
 
-  // Cache the decoded frames
-  inner_guard.cached_frames = Some(frames);
+  // Wrap frames in Arc for efficient sharing from cache
+  let shared_frames: Vec<Arc<ParkingLotRwLock<Frame>>> =
+    frames.into_iter().map(|f| f.into_shared()).collect();
+  inner_guard.cached_frames = Some(shared_frames);
   inner_guard.context = Some(context);
 
   // Signal ready

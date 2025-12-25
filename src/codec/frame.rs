@@ -41,9 +41,14 @@ use crate::ffi::{
     ffframe_set_sample_rate,
     ffframe_set_width,
   },
-  avutil::{av_frame_alloc, av_frame_clone, av_frame_free, av_frame_get_buffer, av_frame_unref},
+  avutil::{
+    av_frame_alloc, av_frame_copy, av_frame_copy_props, av_frame_free, av_frame_get_buffer,
+    av_frame_unref,
+  },
 };
+use parking_lot::RwLock;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 use super::CodecError;
 
@@ -759,12 +764,44 @@ impl Frame {
     unsafe { av_frame_unref(self.as_mut_ptr()) }
   }
 
-  /// Clone the frame (creates a new reference to the same data)
-  pub fn try_clone(&self) -> Result<Self, CodecError> {
-    let ptr = unsafe { av_frame_clone(self.as_ptr()) };
-    NonNull::new(ptr)
-      .map(|ptr| Self { ptr })
-      .ok_or(CodecError::AllocationFailed("frame clone"))
+  /// Deep clone frame data (clones all pixel/audio data, not just reference).
+  ///
+  /// Use this when you need an independent clone that can be mutated
+  /// without affecting the original frame. This is more expensive than
+  /// Arc-based sharing but provides complete isolation.
+  pub fn deep_clone(&self) -> Result<Self, CodecError> {
+    // Create a new frame with the same dimensions/format
+    let mut new_frame = if self.is_video() {
+      Frame::new_video(self.width(), self.height(), self.format())?
+    } else if self.is_audio() {
+      Frame::new_audio(
+        self.nb_samples(),
+        self.channels(),
+        self.sample_rate(),
+        self.sample_format(),
+      )?
+    } else {
+      return Err(CodecError::InvalidConfig("Frame has no data".into()));
+    };
+
+    // Copy frame data (pixel/audio samples)
+    let ret = unsafe { av_frame_copy(new_frame.as_mut_ptr(), self.as_ptr()) };
+    ffi::check_error(ret)?;
+
+    // Copy frame properties (pts, duration, color info, etc.)
+    let ret = unsafe { av_frame_copy_props(new_frame.as_mut_ptr(), self.as_ptr()) };
+    ffi::check_error(ret)?;
+
+    Ok(new_frame)
+  }
+
+  /// Wrap this frame in Arc<RwLock<>> for shared access.
+  ///
+  /// This is the preferred way to share a frame between multiple owners.
+  /// Use RwLock::read() for concurrent read access, RwLock::write() for
+  /// exclusive mutable access.
+  pub fn into_shared(self) -> Arc<RwLock<Self>> {
+    Arc::new(RwLock::new(self))
   }
 }
 

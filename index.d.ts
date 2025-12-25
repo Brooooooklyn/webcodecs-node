@@ -1079,7 +1079,12 @@ export declare class VideoFrame {
    * Options can specify target format and rect for cropped copy.
    */
   copyTo(destination: Uint8Array, options?: VideoFrameCopyToOptions | undefined | null): Promise<Array<PlaneLayout>>
-  /** Clone this VideoFrame */
+  /**
+   * Clone this VideoFrame
+   *
+   * This creates a new VideoFrame that shares the underlying pixel data with the original.
+   * Both frames will reference the same Arc<RwLock<Frame>>, so no pixel data is copied.
+   */
   clone(): VideoFrame
   /**
    * Close and release resources
