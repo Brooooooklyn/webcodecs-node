@@ -747,3 +747,263 @@ test('AudioDecoder: corrupt data triggers error', async (t) => {
   const error = await gotError
   t.true(error instanceof Error)
 })
+
+// ============================================================================
+// H.264 SEI Recovery Point Tests
+// WPT: videoDecoder-h264-sei.https.any.js
+// Tests that H.264 SEI recovery point frames are treated as keyframes.
+// ============================================================================
+
+// H.264 SEI test data (from videoDecoder-codec-specific-setup.js)
+const H264_SEI_AVC_DATA = {
+  src: 'h264_sei.mp4',
+  config: {
+    codec: 'avc1.64000b',
+    descriptionOffset: 11989,
+    descriptionSize: 46,
+    codedWidth: 320,
+    codedHeight: 240,
+  },
+  chunks: [
+    { offset: 48, size: 4229, key: true },
+    { offset: 4277, size: 1114, key: false },
+    { offset: 5391, size: 320, key: false },
+    { offset: 5711, size: 188, key: false },
+    { offset: 5899, size: 173, key: false },
+    { offset: 6072, size: 3694, key: true }, // SEI recovery point
+    { offset: 9766, size: 936, key: false },
+    { offset: 10702, size: 345, key: false },
+    { offset: 11047, size: 213, key: false },
+    { offset: 11260, size: 210, key: false },
+  ],
+}
+
+const H264_SEI_ANNEXB_DATA = {
+  src: 'h264_sei.annexb',
+  config: {
+    codec: 'avc1.64000b',
+    codedWidth: 320,
+    codedHeight: 240,
+  },
+  chunks: [
+    { offset: 0, size: 4264, key: true },
+    { offset: 4264, size: 1112, key: false },
+    { offset: 5376, size: 318, key: false },
+    { offset: 5694, size: 186, key: false },
+    { offset: 5880, size: 171, key: false },
+    { offset: 6051, size: 3729, key: true }, // SEI recovery point
+    { offset: 9780, size: 934, key: false },
+    { offset: 10714, size: 343, key: false },
+    { offset: 11057, size: 211, key: false },
+    { offset: 11268, size: 208, key: false },
+  ],
+}
+
+test('VideoDecoder: H.264 SEI recovery point frames treated as keyframes (AVC)', async (t) => {
+  let fileData: Buffer
+  try {
+    fileData = readFileSync(join(fixturesPath, H264_SEI_AVC_DATA.src))
+  } catch {
+    t.pass('H.264 SEI AVC fixture not available')
+    return
+  }
+
+  const support = await VideoDecoder.isConfigSupported({
+    codec: H264_SEI_AVC_DATA.config.codec,
+  })
+
+  if (!support.supported) {
+    t.pass('H.264 not supported on this platform')
+    return
+  }
+
+  // Extract description from file
+  const description = new Uint8Array(
+    fileData.buffer,
+    fileData.byteOffset + H264_SEI_AVC_DATA.config.descriptionOffset,
+    H264_SEI_AVC_DATA.config.descriptionSize,
+  )
+
+  let outputs = 0
+  const decoder = new VideoDecoder({
+    output: (frame) => {
+      outputs++
+      t.is(frame.timestamp, 5, 'timestamp matches chunk 5')
+      frame.close()
+    },
+    error: (e) => {
+      t.fail(`Decoder error: ${e.message}`)
+    },
+  })
+
+  decoder.configure({
+    codec: H264_SEI_AVC_DATA.config.codec,
+    codedWidth: H264_SEI_AVC_DATA.config.codedWidth,
+    codedHeight: H264_SEI_AVC_DATA.config.codedHeight,
+    description,
+  })
+
+  // Decode chunk 5 (SEI recovery point) - should work as keyframe
+  const chunkInfo = H264_SEI_AVC_DATA.chunks[5]
+  const chunkData = new Uint8Array(fileData.buffer, fileData.byteOffset + chunkInfo.offset, chunkInfo.size)
+
+  const chunk = new EncodedVideoChunk({
+    type: chunkInfo.key ? 'key' : 'delta',
+    timestamp: 5,
+    duration: 1,
+    data: chunkData,
+  })
+
+  decoder.decode(chunk)
+
+  await decoder.flush()
+  decoder.close()
+
+  t.is(outputs, 1, 'SEI recovery point frame decoded as keyframe')
+})
+
+test('VideoDecoder: H.264 SEI recovery point frames treated as keyframes (Annex B)', async (t) => {
+  let fileData: Buffer
+  try {
+    fileData = readFileSync(join(fixturesPath, H264_SEI_ANNEXB_DATA.src))
+  } catch {
+    t.pass('H.264 SEI Annex B fixture not available')
+    return
+  }
+
+  const support = await VideoDecoder.isConfigSupported({
+    codec: H264_SEI_ANNEXB_DATA.config.codec,
+  })
+
+  if (!support.supported) {
+    t.pass('H.264 not supported on this platform')
+    return
+  }
+
+  let outputs = 0
+  const decoder = new VideoDecoder({
+    output: (frame) => {
+      outputs++
+      t.is(frame.timestamp, 5, 'timestamp matches chunk 5')
+      frame.close()
+    },
+    error: (e) => {
+      t.fail(`Decoder error: ${e.message}`)
+    },
+  })
+
+  decoder.configure({
+    codec: H264_SEI_ANNEXB_DATA.config.codec,
+    codedWidth: H264_SEI_ANNEXB_DATA.config.codedWidth,
+    codedHeight: H264_SEI_ANNEXB_DATA.config.codedHeight,
+  })
+
+  // Decode chunk 5 (SEI recovery point) - should work as keyframe
+  const chunkInfo = H264_SEI_ANNEXB_DATA.chunks[5]
+  const chunkData = new Uint8Array(fileData.buffer, fileData.byteOffset + chunkInfo.offset, chunkInfo.size)
+
+  const chunk = new EncodedVideoChunk({
+    type: chunkInfo.key ? 'key' : 'delta',
+    timestamp: 5,
+    duration: 1,
+    data: chunkData,
+  })
+
+  decoder.decode(chunk)
+
+  await decoder.flush()
+  decoder.close()
+
+  t.is(outputs, 1, 'SEI recovery point frame decoded as keyframe')
+})
+
+// ============================================================================
+// H.264 Interlaced Content Tests
+// WPT: videoDecoder-interlaced-h264.https.any.js
+// Tests decoding of interlaced H.264 content.
+// ============================================================================
+
+const H264_INTERLACED_AVC_DATA = {
+  src: 'h264_interlaced.mp4',
+  config: {
+    codec: 'avc1.64000b',
+    descriptionOffset: 7501,
+    descriptionSize: 47,
+    codedWidth: 320,
+    codedHeight: 240,
+  },
+  chunks: [
+    { offset: 48, size: 4091 },
+    { offset: 4139, size: 949 },
+    { offset: 5088, size: 260 },
+    { offset: 5348, size: 134 },
+    { offset: 5482, size: 111 },
+    { offset: 5593, size: 660 },
+    { offset: 6253, size: 197 },
+    { offset: 6450, size: 96 },
+    { offset: 6546, size: 159 },
+    { offset: 6705, size: 277 },
+  ],
+}
+
+test('VideoDecoder: decoding H.264 interlaced content', async (t) => {
+  let fileData: Buffer
+  try {
+    fileData = readFileSync(join(fixturesPath, H264_INTERLACED_AVC_DATA.src))
+  } catch {
+    t.pass('H.264 interlaced fixture not available')
+    return
+  }
+
+  const support = await VideoDecoder.isConfigSupported({
+    codec: H264_INTERLACED_AVC_DATA.config.codec,
+  })
+
+  if (!support.supported) {
+    t.pass('H.264 not supported on this platform')
+    return
+  }
+
+  // Extract description from file
+  const description = new Uint8Array(
+    fileData.buffer,
+    fileData.byteOffset + H264_INTERLACED_AVC_DATA.config.descriptionOffset,
+    H264_INTERLACED_AVC_DATA.config.descriptionSize,
+  )
+
+  let outputs = 0
+  const decoder = new VideoDecoder({
+    output: (frame) => {
+      outputs++
+      t.is(frame.timestamp, 0, 'timestamp is 0')
+      frame.close()
+    },
+    error: (e) => {
+      t.fail(`Decoder error: ${e.message}`)
+    },
+  })
+
+  decoder.configure({
+    codec: H264_INTERLACED_AVC_DATA.config.codec,
+    codedWidth: H264_INTERLACED_AVC_DATA.config.codedWidth,
+    codedHeight: H264_INTERLACED_AVC_DATA.config.codedHeight,
+    description,
+  })
+
+  // Decode first chunk (keyframe)
+  const chunkInfo = H264_INTERLACED_AVC_DATA.chunks[0]
+  const chunkData = new Uint8Array(fileData.buffer, fileData.byteOffset + chunkInfo.offset, chunkInfo.size)
+
+  const chunk = new EncodedVideoChunk({
+    type: 'key',
+    timestamp: 0,
+    data: chunkData,
+  })
+
+  decoder.decode(chunk)
+
+  await decoder.flush()
+  decoder.close()
+
+  t.is(outputs, 1, 'interlaced content decoded')
+})
