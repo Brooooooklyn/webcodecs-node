@@ -6,18 +6,19 @@ This directory contains tests ported from the [W3C Web Platform Tests](https://g
 
 | Status      | Count |
 | ----------- | ----- |
-| **Passing** | 573   |
-| **Skipped** | 5     |
+| **Passing** | 608   |
+| **Skipped** | 6     |
 | **Failing** | 0     |
-| **Total**   | 578   |
+| **Total**   | 614   |
 
 ## Test Files Overview
 
 ### VideoFrame Tests
 
-| File                      | Tests       | Status       | Notes                                                |
-| ------------------------- | ----------- | ------------ | ---------------------------------------------------- |
-| `video-frame-wpt.spec.ts` | 116 passing | **Complete** | All pixel formats, format conversion, security (WPT) |
+| File                              | Tests       | Status       | Notes                                                |
+| --------------------------------- | ----------- | ------------ | ---------------------------------------------------- |
+| `video-frame-wpt.spec.ts`         | 116 passing | **Complete** | All pixel formats, format conversion, security (WPT) |
+| `video-frame-orientation.spec.ts` | 6 passing   | **Complete** | Rotation, flip properties and combinations           |
 
 **Format Conversion (WPT `videoFrame-copyTo-rgb.any.js`):**
 
@@ -68,10 +69,13 @@ This directory contains tests ported from the [W3C Web Platform Tests](https://g
 
 ### VideoEncoder Tests
 
-| File                             | Tests      | Status       | Notes                           |
-| -------------------------------- | ---------- | ------------ | ------------------------------- |
-| `video-encoder-behavior.spec.ts` | 23 passing | **Complete** | Encode, flush, reset, callbacks |
-| `video-encoder-config.spec.ts`   | 42 passing | **Complete** | isConfigSupported, configure    |
+| File                                 | Tests                | Status       | Notes                              |
+| ------------------------------------ | -------------------- | ------------ | ---------------------------------- |
+| `video-encoder-behavior.spec.ts`     | 25 passing           | **Complete** | Encode, flush, reset, callbacks    |
+| `video-encoder-config.spec.ts`       | 42 passing           | **Complete** | isConfigSupported, configure       |
+| `video-encoder-orientation.spec.ts`  | 4 passing, 1 skipped | **Complete** | Rotation, flip in encoded output   |
+| `video-encoder-content-hint.spec.ts` | 7 passing            | **Complete** | contentHint config preservation    |
+| `per-frame-qp-encoding.spec.ts`      | 13 passing           | **Complete** | bitrateMode: 'quantizer', codec QP |
 
 **Supported Video Codecs (Encoding):**
 
@@ -83,11 +87,11 @@ This directory contains tests ported from the [W3C Web Platform Tests](https://g
 
 ### VideoDecoder Tests
 
-| File                             | Tests      | Status       | Notes                           |
-| -------------------------------- | ---------- | ------------ | ------------------------------- |
-| `video-decoder-behavior.spec.ts` | 16 passing | **Complete** | Decode, flush, reset, callbacks |
-| `video-decoder-config.spec.ts`   | 17 passing | **Complete** | isConfigSupported, configure    |
-| `codec-specific-decoder.spec.ts` | 21 passing | **Complete** | H.264, VP8, VP9, AV1 specifics  |
+| File                             | Tests      | Status       | Notes                                 |
+| -------------------------------- | ---------- | ------------ | ------------------------------------- |
+| `video-decoder-behavior.spec.ts` | 16 passing | **Complete** | Decode, flush, reset, callbacks       |
+| `video-decoder-config.spec.ts`   | 17 passing | **Complete** | isConfigSupported, configure          |
+| `codec-specific-decoder.spec.ts` | 24 passing | **Complete** | H.264, VP8, VP9, AV1, SEI, interlaced |
 
 ### AudioEncoder Tests
 
@@ -189,19 +193,27 @@ These tests require browser APIs not available in Node.js:
 - `*.crossAgentCluster.*` - Cross-agent tests
 - `idlharness.https.any.js` - WebIDL validation
 
-### Orientation Tests (Pending W3C WPT Tests)
+### Orientation Tests
 
-VideoFrame `rotation` and `flip` properties are now implemented. Tests pending:
+VideoFrame `rotation` and `flip` properties are fully implemented:
 
-- `videoFrame-orientation.any.js`
-- `video-encoder-orientation.https.any.js`
-- `videoDecoder-codec-specific-orientation.https.any.js`
+- `videoFrame-orientation.any.js` → `video-frame-orientation.spec.ts` ✅
+- `video-encoder-orientation.https.any.js` → `video-encoder-orientation.spec.ts` ✅
+- `videoDecoder-codec-specific-orientation.https.any.js` - Decoder orientation not yet ported
+
+### Per-Frame QP and Content Hint Tests
+
+- `per-frame-qp-encoding.https.any.js` → `per-frame-qp-encoding.spec.ts` ✅
+- `video-encoder-content-hint.https.any.js` → `video-encoder-content-hint.spec.ts` ✅
+
+### H.264 Specific Tests
+
+- `videoDecoder-h264-sei.https.any.js` → `codec-specific-decoder.spec.ts` ✅
+- `videoDecoder-interlaced-h264.https.any.js` → `codec-specific-decoder.spec.ts` ✅
 
 ### Other Missing Tests
 
-- `per-frame-qp-encoding.https.any.js` - Per-frame quantizer options
-- `transfering.https.any.js` - Transfer ownership (partially applicable)
-- `video-encoder-content-hint.https.any.js` - Content hints
+- `transfering.https.any.js` - Transfer ownership (browser-only, partially applicable)
 
 ---
 

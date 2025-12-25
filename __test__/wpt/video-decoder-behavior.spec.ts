@@ -2,9 +2,13 @@
  * VideoDecoder Behavior Tests (WPT)
  *
  * Ported from W3C Web Platform Tests:
- * https://github.com/web-platform-tests/wpt
+ * - wpt/webcodecs/video-decoder.https.any.js (constructor, closed/unconfigured operations)
+ * - wpt/webcodecs/videoDecoder-codec-specific.https.any.js (decode behavior patterns)
  *
  * Tests core VideoDecoder behavior including decode, flush, reset, queue management.
+ *
+ * Note: The WPT video-decoder.https.any.js focuses on config validation which is
+ * covered in video-decoder-config.spec.ts. This file tests actual decode operations.
  */
 
 import test from 'ava'
@@ -68,6 +72,7 @@ async function createEncodedChunks(
 
 // ============================================================================
 // Construction Tests
+// WPT: "Test VideoDecoder construction" (video-decoder.https.any.js)
 // ============================================================================
 
 test('VideoDecoder: construction with valid init', async (t) => {
