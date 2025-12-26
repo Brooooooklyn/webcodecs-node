@@ -97,6 +97,7 @@ unsafe extern "C" {
   pub fn ffframe_set_colorspace(frame: *mut AVFrame, colorspace: c_int);
   pub fn ffframe_set_color_range(frame: *mut AVFrame, color_range: c_int);
   pub fn ffframe_set_sample_aspect_ratio(frame: *mut AVFrame, num: c_int, den: c_int);
+  pub fn ffframe_set_quality(frame: *mut AVFrame, quality: c_int);
   pub fn ffframe_set_data(frame: *mut AVFrame, plane: c_int, data: *mut u8);
   pub fn ffframe_set_linesize(frame: *mut AVFrame, plane: c_int, linesize: c_int);
 
@@ -117,6 +118,7 @@ unsafe extern "C" {
   pub fn ffframe_get_color_trc(frame: *const AVFrame) -> c_int;
   pub fn ffframe_get_colorspace(frame: *const AVFrame) -> c_int;
   pub fn ffframe_get_color_range(frame: *const AVFrame) -> c_int;
+  pub fn ffframe_get_quality(frame: *const AVFrame) -> c_int;
 
   // ========================================================================
   // AVFrame Audio Setters

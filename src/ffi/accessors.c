@@ -267,6 +267,10 @@ void ffframe_set_sample_aspect_ratio(AVFrame* frame, int num, int den) {
     frame->sample_aspect_ratio.den = den;
 }
 
+void ffframe_set_quality(AVFrame* frame, int quality) {
+    frame->quality = quality;
+}
+
 /* ============================================================================
  * AVFrame Getters
  * ============================================================================ */
@@ -327,6 +331,10 @@ int ffframe_get_colorspace(const AVFrame* frame) {
 
 int ffframe_get_color_range(const AVFrame* frame) {
     return frame->color_range;
+}
+
+int ffframe_get_quality(const AVFrame* frame) {
+    return frame->quality;
 }
 
 /* ============================================================================

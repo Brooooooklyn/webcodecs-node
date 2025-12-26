@@ -416,6 +416,13 @@ struct VideoEncoderInner {
   /// Whether to preserve alpha channel (YUVA420P instead of YUV420P)
   /// True when config.alpha == "keep" and codec supports alpha (VP9)
   use_alpha: bool,
+
+  // ========================================================================
+  // Codec identification (for per-frame QP handling)
+  // ========================================================================
+  /// Codec ID for the current encoder configuration
+  /// Used to determine codec-specific quantizer mapping
+  codec_id: Option<AVCodecID>,
 }
 
 /// Get the preferred hardware device type for the current platform
@@ -557,6 +564,8 @@ impl VideoEncoder {
       input_color_space: None,
       // Alpha channel support (set during configure)
       use_alpha: false,
+      // Codec identification (set during configure)
+      codec_id: None,
     };
 
     let inner = Arc::new(Mutex::new(inner));
@@ -788,6 +797,15 @@ impl VideoEncoder {
     // Force keyframe if requested via encode options (W3C WebCodecs spec)
     if options.as_ref().is_some_and(|o| o.key_frame == Some(true)) {
       frame_to_encode.set_pict_type(AVPictureType::I);
+    }
+
+    // Apply per-frame quantizer if specified in encode options
+    // This allows W3C WebCodecs per-frame QP control with bitrateMode: 'quantizer'
+    if let Some(codec_id) = guard.codec_id {
+      if let Some(quantizer) = extract_per_frame_quantizer(options.as_ref(), codec_id) {
+        let quality = quantizer_to_ffmpeg_quality(quantizer, codec_id);
+        frame_to_encode.set_quality(quality);
+      }
     }
 
     // Upload frame to GPU if hardware frame context is available
@@ -1671,8 +1689,9 @@ impl VideoEncoder {
       crf: None,
     };
 
-    // Update use_alpha in guard
+    // Update use_alpha and codec_id in guard
     guard.use_alpha = use_alpha;
+    guard.codec_id = Some(codec_id);
 
     // Determine if AVCC/HVCC format is needed (for create_software_encoder helper)
     let is_h264 = codec_string.starts_with("avc1")
@@ -2584,6 +2603,7 @@ impl VideoEncoder {
 
     // Alpha channel support - track if we're encoding with alpha
     inner.use_alpha = use_alpha;
+    inner.codec_id = Some(codec_id);
 
     // Create new channel and worker if needed (after reconfiguration)
     if self.command_sender.is_none() {
@@ -3620,6 +3640,42 @@ fn extract_alpha_side_data(packet: &Packet, use_alpha: bool) -> Option<Uint8Arra
 /// Check if dimensions are within valid range
 fn are_dimensions_valid(width: u32, height: u32) -> bool {
   width <= MAX_DIMENSION && height <= MAX_DIMENSION
+}
+
+/// FFmpeg's FF_QP2LAMBDA constant (from libavutil/internal.h)
+/// Used to convert QP values to the quality field expected by FFmpeg encoders
+const FF_QP2LAMBDA: i32 = 118;
+
+/// Extract per-frame quantizer value from encode options based on codec type
+/// Returns the quantizer value for the codec, or None if not specified
+fn extract_per_frame_quantizer(
+  options: Option<&VideoEncoderEncodeOptions>,
+  codec_id: AVCodecID,
+) -> Option<u16> {
+  let opts = options?;
+
+  match codec_id {
+    AVCodecID::H264 => opts.avc.as_ref().and_then(|avc| avc.quantizer),
+    AVCodecID::Hevc => opts.hevc.as_ref().and_then(|hevc| hevc.quantizer),
+    AVCodecID::Vp9 => opts.vp9.as_ref().and_then(|vp9| vp9.quantizer),
+    AVCodecID::Av1 => opts.av1.as_ref().and_then(|av1| av1.quantizer),
+    _ => None,
+  }
+}
+
+/// Convert WebCodecs quantizer value to FFmpeg quality value
+///
+/// Per W3C WebCodecs Codec Registry:
+/// - VP9/AV1: quantizer index is 0-255 (q_index scale per codec spec)
+/// - AVC/HEVC: quantizer is 0-51 (QP scale per codec spec)
+///
+/// FFmpeg expects quality = value * FF_QP2LAMBDA for per-frame quality control.
+fn quantizer_to_ffmpeg_quality(quantizer: u16, _codec_id: AVCodecID) -> i32 {
+  // All codecs: multiply by FF_QP2LAMBDA for FFmpeg's quality field
+  // The quantizer value is already in the correct scale per W3C spec:
+  // - VP9/AV1: 0-255 (q_index, passed directly per W3C spec change)
+  // - AVC/HEVC: 0-51 (QP value, passed directly)
+  quantizer as i32 * FF_QP2LAMBDA
 }
 
 /// Parse WebCodecs codec string to FFmpeg codec ID
