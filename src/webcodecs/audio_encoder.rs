@@ -666,7 +666,7 @@ impl AudioEncoder {
       for packet in packets {
         let output_timestamp = guard.timestamp_queue.pop_front();
         let chunk = EncodedAudioChunk::from_packet_with_adts(
-          &packet,
+          packet,
           Some(duration_us),
           output_timestamp,
           adts_params,
@@ -833,7 +833,7 @@ impl AudioEncoder {
           for packet in packets {
             let output_timestamp = guard.timestamp_queue.pop_front();
             let chunk = EncodedAudioChunk::from_packet_with_adts(
-              &packet,
+              packet,
               Some(duration_us),
               output_timestamp,
               adts_params,
@@ -903,7 +903,7 @@ impl AudioEncoder {
       for packet in packets {
         let output_timestamp = guard.timestamp_queue.pop_front();
         let chunk =
-          EncodedAudioChunk::from_packet_with_adts(&packet, None, output_timestamp, adts_params);
+          EncodedAudioChunk::from_packet_with_adts(packet, None, output_timestamp, adts_params);
         // Create decoderConfig: FLAC on every chunk, others only on first chunk
         let decoder_config = if is_flac {
           // FLAC: Always include decoderConfig with fresh extradata
@@ -1523,11 +1523,17 @@ impl AudioEncoder {
         }
       }
 
-      // Get frame from AudioData (deep copy for encoder mutation)
-      let frame = match data.with_frame(|f| f.deep_clone()) {
+      // Get frame from AudioData using shallow_clone to share audio buffers via FFmpeg's
+      // atomic reference counting. This avoids copying audio sample data (can be 100s of KB).
+      //
+      // This is safe because:
+      // - Resampling: convert_alloc() takes &Frame (read-only) and creates a new output frame
+      // - No resampling: avcodec_send_frame() takes const AVFrame* (read-only)
+      // - FFmpeg's AVBufferRef handles concurrent access safely with atomic refcounting
+      let frame = match data.with_frame(|f| f.shallow_clone()) {
         Ok(Ok(f)) => f,
         Ok(Err(e)) => {
-          Self::report_error(&mut inner, &format!("Failed to copy frame: {}", e));
+          Self::report_error(&mut inner, &format!("Failed to reference frame: {}", e));
           return Ok(());
         }
         Err(e) => {
@@ -1536,7 +1542,7 @@ impl AudioEncoder {
         }
       };
 
-      // Resample if needed
+      // Resample if needed (creates new frame) or pass through (shared via refcount)
       let frame_to_send = if let Some(ref mut resampler) = inner.resampler {
         match resampler.convert_alloc(&frame) {
           Ok(f) => f,
@@ -2033,10 +2039,10 @@ impl AudioEncoder {
         // Call the listener with no arguments (like dequeue callback)
         match &entry.callback {
           EventListenerCallbackType::Weak(tsf) => {
-            tsf.call((), ThreadsafeFunctionCallMode::Blocking);
+            tsf.call((), ThreadsafeFunctionCallMode::NonBlocking);
           }
           EventListenerCallbackType::Strong(tsf) => {
-            tsf.call((), ThreadsafeFunctionCallMode::Blocking);
+            tsf.call((), ThreadsafeFunctionCallMode::NonBlocking);
           }
         }
         if entry.once {

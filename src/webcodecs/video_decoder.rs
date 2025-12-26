@@ -5,6 +5,7 @@
 
 use crate::codec::{CodecContext, DecoderConfig, Frame, Packet};
 use crate::ffi::{AVCodecID, AVHWDeviceType};
+use crate::webcodecs::encoded_video_chunk::InternalSlice;
 use crate::webcodecs::error::{
   DOMExceptionName, throw_data_error, throw_invalid_state_error, throw_type_error_unit,
 };
@@ -21,6 +22,7 @@ use napi::threadsafe_function::{
   ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
 };
 use napi_derive::napi;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -513,11 +515,7 @@ impl VideoDecoder {
 
     let timestamp = encoded_chunk.timestamp_us;
     let duration = encoded_chunk.duration_us;
-    let raw_data = encoded_chunk.data.clone();
     let is_keyframe = encoded_chunk.chunk_type == crate::webcodecs::EncodedVideoChunkType::Key;
-
-    // Drop the chunk read guard before decoding
-    drop(chunk_read_guard);
 
     // Convert AVCC/HVCC format to Annex B if needed for H.264/H.265
     // FFmpeg's decoder expects Annex B format (start code prefixed NALUs)
@@ -529,8 +527,8 @@ impl VideoDecoder {
         || codec.starts_with("hvc1")
         || codec.starts_with("hev1");
 
-      if is_avc_codec && is_avcc_format(&raw_data) {
-        let mut converted = convert_avcc_to_annexb(&raw_data);
+      if is_avc_codec && is_avcc_format(encoded_chunk.data.as_slice()) {
+        let mut converted = convert_avcc_to_annexb(encoded_chunk.data.as_slice());
 
         // Prepend SPS/PPS/VPS from extradata to keyframes
         // This is needed because FFmpeg may not properly use extradata for H.264/H.265
@@ -544,9 +542,9 @@ impl VideoDecoder {
           with_extradata.append(&mut converted);
           converted = with_extradata;
         }
-        converted
+        Cow::Owned(converted)
       } else {
-        raw_data
+        Cow::Borrowed(encoded_chunk.data.as_slice())
       }
     };
 
@@ -622,6 +620,8 @@ impl VideoDecoder {
       }
     };
 
+    // Drop the chunk read guard now that decoding has completed
+    drop(chunk_read_guard);
     guard.frame_count += 1;
 
     // Decrement queue size and fire dequeue event (only if queue was not empty)
@@ -697,7 +697,7 @@ impl VideoDecoder {
       } else {
         guard
           .output_callback
-          .call(video_frame, ThreadsafeFunctionCallMode::Blocking);
+          .call(video_frame, ThreadsafeFunctionCallMode::NonBlocking);
       }
     }
   }
@@ -773,12 +773,11 @@ impl VideoDecoder {
         .as_ref()
         .ok()
         .and_then(|d| d.as_ref())
-        .map(|c| (c.timestamp_us, c.duration_us, c.data.clone()))
+        .map(|c| (c.timestamp_us, c.duration_us, &c.data))
       {
         Some(d) => d,
         None => continue, // Skip closed chunks
       };
-      drop(chunk_read_guard);
 
       // Convert AVCC/HVCC format to Annex B if needed for H.264/H.265
       let data = {
@@ -788,10 +787,10 @@ impl VideoDecoder {
           || codec.starts_with("hvc1")
           || codec.starts_with("hev1");
 
-        if is_avc_codec && is_avcc_format(&raw_data) {
-          convert_avcc_to_annexb(&raw_data)
+        if is_avc_codec && is_avcc_format(raw_data.as_slice()) {
+          Cow::Owned(convert_avcc_to_annexb(raw_data.as_slice()))
         } else {
-          raw_data
+          Cow::Borrowed(raw_data.as_slice())
         }
       };
 
@@ -805,6 +804,9 @@ impl VideoDecoder {
         Ok(f) => f,
         Err(_) => continue, // Skip failed chunks during re-decode
       };
+
+      // Drop the chunk read guard now that decoding has completed
+      drop(chunk_read_guard);
 
       // Mark first output produced on success
       if !frames.is_empty() && !guard.first_output_produced {
@@ -826,7 +828,7 @@ impl VideoDecoder {
         } else {
           guard
             .output_callback
-            .call(video_frame, ThreadsafeFunctionCallMode::Blocking);
+            .call(video_frame, ThreadsafeFunctionCallMode::NonBlocking);
         }
       }
     }
@@ -1965,10 +1967,10 @@ impl VideoDecoder {
         // Call the listener with no arguments (like dequeue callback)
         match &entry.callback {
           EventListenerCallbackType::Weak(tsf) => {
-            tsf.call((), ThreadsafeFunctionCallMode::Blocking);
+            tsf.call((), ThreadsafeFunctionCallMode::NonBlocking);
           }
           EventListenerCallbackType::Strong(tsf) => {
-            tsf.call((), ThreadsafeFunctionCallMode::Blocking);
+            tsf.call((), ThreadsafeFunctionCallMode::NonBlocking);
           }
         }
         if entry.once {

@@ -443,7 +443,7 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
               chunk_type,
               timestamp,
               duration,
-              data: packet.to_vec(),
+              data: Either::B(packet),
             };
 
             match EncodedVideoChunk::new(init) {
@@ -477,7 +477,7 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
               chunk_type: EncodedAudioChunkType::Key, // Audio packets are typically keyframes
               timestamp,
               duration,
-              data: packet.to_vec(),
+              data: Either::B(packet),
             };
 
             match EncodedAudioChunk::new(init) {

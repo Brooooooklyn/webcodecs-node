@@ -90,7 +90,7 @@ pub struct EncodedVideoChunkInit {
   /// Duration in microseconds (optional)
   pub duration: Option<i64>,
   /// Encoded data (BufferSource per spec)
-  pub data: Vec<u8>,
+  pub data: Either<Vec<u8>, Packet>,
 }
 
 impl FromNapiValue for EncodedVideoChunkInit {
@@ -133,12 +133,11 @@ impl FromNapiValue for EncodedVideoChunkInit {
 
     // Validate data - required field, accept BufferSource (ArrayBuffer, TypedArray, DataView)
     // Try different buffer types in order of preference
-    let data: Vec<u8> = if let Ok(Some(buffer)) = obj.get::<Buffer>("data") {
+    // per W3C spec, chunk data should be independent of the original data, so data copy is not avoidable here
+    let data = if let Ok(Some(buffer)) = obj.get::<&[u8]>("data") {
       buffer.to_vec()
-    } else if let Ok(Some(array)) = obj.get::<Uint8Array>("data") {
-      array.to_vec()
     } else if let Ok(Some(array_buffer)) = obj.get::<ArrayBuffer>("data") {
-      array_buffer.to_vec()
+      Uint8ArraySlice::from_arraybuffer(&array_buffer, 0, array_buffer.len())?.to_vec()
     } else {
       // Check if data property exists but is undefined/null
       let has_data = obj.has_named_property("data")?;
@@ -154,11 +153,10 @@ impl FromNapiValue for EncodedVideoChunkInit {
 
         if let (Some(len), Ok(Some(buffer))) = (byte_length, data_obj.get::<ArrayBuffer>("buffer"))
         {
-          let full_data = buffer.to_vec();
           let offset = byte_offset as usize;
           let length = len as usize;
-          if offset + length <= full_data.len() {
-            full_data[offset..offset + length].to_vec()
+          if offset + length <= buffer.len() {
+            Uint8ArraySlice::from_arraybuffer(&buffer, offset, length)?.to_vec()
           } else {
             env_wrapper.throw_type_error("data must be a valid BufferSource", None)?;
             return Err(Error::new(
@@ -183,18 +181,55 @@ impl FromNapiValue for EncodedVideoChunkInit {
       chunk_type,
       timestamp,
       duration,
-      data,
+      data: Either::A(data),
     })
+  }
+}
+
+pub(crate) trait InternalSlice {
+  fn len(&self) -> usize;
+  fn as_slice(&self) -> &[u8];
+}
+
+impl InternalSlice for Either<Vec<u8>, Packet> {
+  fn len(&self) -> usize {
+    match self {
+      Either::A(data) => data.len(),
+      Either::B(packet) => packet.as_slice().len(),
+    }
+  }
+
+  fn as_slice(&self) -> &[u8] {
+    match self {
+      Either::A(data) => data.as_slice(),
+      Either::B(packet) => packet.as_slice(),
+    }
   }
 }
 
 /// Internal state for EncodedVideoChunk
 pub(crate) struct EncodedVideoChunkInner {
-  pub(crate) data: Vec<u8>,
+  pub(crate) data: Either<Vec<u8>, Packet>,
   pub(crate) chunk_type: EncodedVideoChunkType,
   pub(crate) timestamp_us: i64,
   pub(crate) duration_us: Option<i64>,
 }
+
+// SAFETY: EncodedVideoChunkInner can be safely sent and shared between threads.
+//
+// The `data` field is Either<Vec<u8>, Packet>:
+// - Vec<u8>: Owned bytes, trivially Send + Sync
+// - Packet: Wraps AVPacket with exclusive ownership. The underlying data buffer
+//   uses FFmpeg's AVBufferRef with atomic reference counting (see Packet's Send impl).
+//
+// When Packet is accessed concurrently via shallow_clone():
+// - Each clone gets its own AVPacket struct pointing to shared buffer
+// - Buffer refcount is atomically managed by FFmpeg
+// - Only as_slice() reads are performed (no mutation of buffer contents)
+//
+// The other fields (chunk_type, timestamp_us, duration_us) are plain data types.
+unsafe impl Send for EncodedVideoChunkInner {}
+unsafe impl Sync for EncodedVideoChunkInner {}
 
 /// EncodedVideoChunk - represents encoded video data
 ///
@@ -221,16 +256,10 @@ impl EncodedVideoChunk {
     })
   }
 
-  /// Create from internal Packet (for encoder output)
-  /// If explicit_timestamp is provided, it overrides the packet's PTS (for timestamp preservation)
-  pub fn from_packet(packet: &Packet, explicit_timestamp: Option<i64>) -> Self {
-    Self::from_packet_with_format(packet, explicit_timestamp, false)
-  }
-
   /// Create from internal Packet with optional AVCC conversion
   /// If use_avcc is true, converts from Annex B to AVCC format (length-prefixed NALUs)
   pub fn from_packet_with_format(
-    packet: &Packet,
+    packet: Packet,
     explicit_timestamp: Option<i64>,
     use_avcc: bool,
   ) -> Self {
@@ -240,20 +269,22 @@ impl EncodedVideoChunk {
       EncodedVideoChunkType::Delta
     };
 
-    let raw_data = packet.to_vec();
+    let packet_pts = packet.pts();
+    let packet_duration = packet.duration();
+
     let data = if use_avcc {
-      convert_annexb_to_avcc(&raw_data)
+      Either::A(convert_annexb_to_avcc(packet.as_slice()))
     } else {
-      raw_data
+      Either::B(packet)
     };
 
     let inner = EncodedVideoChunkInner {
       data,
       chunk_type,
       // Use explicit timestamp if provided, otherwise fall back to packet PTS
-      timestamp_us: explicit_timestamp.unwrap_or_else(|| packet.pts()),
-      duration_us: if packet.duration() > 0 {
-        Some(packet.duration())
+      timestamp_us: explicit_timestamp.unwrap_or(packet_pts),
+      duration_us: if packet_duration > 0 {
+        Some(packet_duration)
       } else {
         None
       },
@@ -319,7 +350,7 @@ impl EncodedVideoChunk {
           // Copy data to the view's portion of the buffer using slice-based access
           let dest_slice = unsafe { buffer.as_mut() };
           let offset = byte_offset as usize;
-          dest_slice[offset..offset + inner.data.len()].copy_from_slice(&inner.data);
+          dest_slice[offset..offset + inner.data.len()].copy_from_slice(inner.data.as_slice());
         } else {
           // It's likely an ArrayBuffer directly
           let byte_length: Option<u32> = typed_array.get("byteLength").ok().flatten();
@@ -339,7 +370,7 @@ impl EncodedVideoChunk {
             // Get the ArrayBuffer and use slice-based access
             let mut array_buffer = ArrayBuffer::from_unknown(destination)?;
             let dest_slice = unsafe { array_buffer.as_mut() };
-            dest_slice[..inner.data.len()].copy_from_slice(&inner.data);
+            dest_slice[..inner.data.len()].copy_from_slice(inner.data.as_slice());
           } else {
             return Err(Error::new(Status::InvalidArg, "Invalid BufferSource"));
           }
@@ -359,8 +390,48 @@ impl EncodedVideoChunk {
   }
 
   /// Get a copy of the raw data (internal use only, for extracting SPS/PPS)
-  pub(crate) fn get_data(&self) -> Option<Vec<u8>> {
-    self.with_inner(|inner| Ok(inner.data.clone())).ok()
+  pub(crate) fn get_data_optional<R, F: FnOnce(&[u8]) -> Option<R>>(&self, f: F) -> Option<R> {
+    self
+      .with_inner(|inner| Ok(f(inner.data.as_slice())))
+      .ok()
+      .and_then(std::convert::identity)
+  }
+
+  /// Get a packet for muxing, using shallow_clone if already a Packet (zero-copy),
+  /// or creating a new packet with copy_data_from if Vec<u8>.
+  ///
+  /// This optimizes the common case where encoder output goes directly to muxer:
+  /// - Encoder creates EncodedVideoChunk with Either::B(Packet)
+  /// - Muxer calls this to get a packet reference (shallow clone, ~100 bytes copied)
+  /// - No megabyte-scale data copy needed
+  pub(crate) fn get_packet_for_muxing(&self) -> Result<Packet> {
+    self.with_inner(|inner| match &inner.data {
+      Either::A(vec) => {
+        // Vec<u8> case: must copy data into new packet
+        let mut packet = Packet::new().map_err(|e| {
+          Error::new(
+            Status::GenericFailure,
+            format!("Failed to create packet: {}", e),
+          )
+        })?;
+        packet.copy_data_from(vec).map_err(|e| {
+          Error::new(
+            Status::GenericFailure,
+            format!("Failed to copy data to packet: {}", e),
+          )
+        })?;
+        Ok(packet)
+      }
+      Either::B(packet) => {
+        // Already a Packet: shallow clone shares buffer via FFmpeg's refcount
+        packet.shallow_clone().map_err(|e| {
+          Error::new(
+            Status::GenericFailure,
+            format!("Failed to reference packet: {}", e),
+          )
+        })
+      }
+    })
   }
 
   fn with_inner<F, R>(&self, f: F) -> Result<R>

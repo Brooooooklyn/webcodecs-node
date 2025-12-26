@@ -43,7 +43,7 @@ use crate::ffi::{
   },
   avutil::{
     av_frame_alloc, av_frame_copy, av_frame_copy_props, av_frame_free, av_frame_get_buffer,
-    av_frame_unref,
+    av_frame_ref, av_frame_unref,
   },
 };
 use parking_lot::RwLock;
@@ -790,6 +790,33 @@ impl Frame {
 
     // Copy frame properties (pts, duration, color info, etc.)
     let ret = unsafe { av_frame_copy_props(new_frame.as_mut_ptr(), self.as_ptr()) };
+    ffi::check_error(ret)?;
+
+    Ok(new_frame)
+  }
+
+  /// Create a shallow clone that shares pixel buffers via FFmpeg's AVBufferRef.
+  ///
+  /// This uses `av_frame_ref()` to create a new AVFrame struct that references
+  /// the same underlying pixel buffers with atomic reference counting.
+  ///
+  /// The new Frame can be freely mutated (pts, pict_type, color info, etc.)
+  /// without affecting the original, while sharing pixel data (zero copy).
+  ///
+  /// # Thread Safety
+  /// FFmpeg's AVBufferRef uses atomic reference counting:
+  /// - Increment: `memory_order_relaxed` (safe for concurrent creation)
+  /// - Decrement: `memory_order_acq_rel` (ensures visibility before free)
+  ///
+  /// The buffer is freed only when all references are dropped.
+  ///
+  /// # Performance
+  /// This copies only ~200 bytes (AVFrame struct) vs 3-12 MB for deep_clone.
+  /// At 60fps 4K, this saves ~744 MB/s of memory bandwidth.
+  pub fn shallow_clone(&self) -> Result<Self, CodecError> {
+    let mut new_frame = Self::new()?;
+
+    let ret = unsafe { av_frame_ref(new_frame.as_mut_ptr(), self.as_ptr()) };
     ffi::check_error(ret)?;
 
     Ok(new_frame)

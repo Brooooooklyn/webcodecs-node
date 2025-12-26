@@ -5,6 +5,7 @@
 
 use crate::codec::{AudioDecoderConfig as InternalAudioDecoderConfig, CodecContext, Frame, Packet};
 use crate::ffi::AVCodecID;
+use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunkInner;
 use crate::webcodecs::error::{DOMExceptionName, throw_invalid_state_error, throw_type_error_unit};
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
 use crate::webcodecs::{AudioData, AudioDecoderConfig, AudioDecoderSupport, EncodedAudioChunk};
@@ -96,7 +97,10 @@ pub struct AudioDecoderEventListenerOptions {
 /// Commands sent to the worker thread
 enum DecoderCommand {
   /// Decode an audio chunk
-  Decode { data: Vec<u8>, timestamp: i64 },
+  Decode {
+    chunk: Arc<RwLock<Option<EncodedAudioChunkInner>>>,
+    timestamp: i64,
+  },
   /// Flush the decoder and send result back via response channel
   Flush(Sender<Result<()>>),
   /// Reconfigure the decoder with a new configuration
@@ -363,8 +367,8 @@ impl AudioDecoder {
       }
 
       match command {
-        DecoderCommand::Decode { data, timestamp } => {
-          Self::process_decode(&inner, &event_state, data, timestamp);
+        DecoderCommand::Decode { chunk, timestamp } => {
+          Self::process_decode(&inner, &event_state, chunk, timestamp);
         }
         DecoderCommand::Flush(response_sender) => {
           let result = Self::process_flush(&inner, &event_state);
@@ -381,7 +385,7 @@ impl AudioDecoder {
   fn process_decode(
     inner: &Arc<Mutex<AudioDecoderInner>>,
     event_state: &Arc<RwLock<EventListenerState>>,
-    data: Vec<u8>,
+    chunk: Arc<RwLock<Option<EncodedAudioChunkInner>>>,
     timestamp: i64,
   ) {
     let mut guard = match inner.lock() {
@@ -401,6 +405,37 @@ impl AudioDecoder {
       // Don't call report_error() - that would set state to Closed and invoke error callback
       return;
     }
+
+    let inner_lock = match chunk.read() {
+      Ok(lock) => lock,
+      Err(_) => {
+        let old_size = guard.decode_queue_size;
+        guard.decode_queue_size = old_size.saturating_sub(1);
+        if old_size > 0 {
+          let _ = Self::fire_dequeue_event(event_state);
+        }
+        Self::report_error(&mut guard, "Failed to read chunk: lock poisoned");
+        return;
+      }
+    };
+
+    let inner = match inner_lock.as_ref() {
+      Some(inner) => inner,
+      None => {
+        let old_size = guard.decode_queue_size;
+        guard.decode_queue_size = old_size.saturating_sub(1);
+        if old_size > 0 {
+          let _ = Self::fire_dequeue_event(event_state);
+        }
+        Self::report_error(&mut guard, "Failed to read chunk: chunk is closed");
+        return;
+      }
+    };
+
+    let data = match &inner.data {
+      Either::A(data) => data.as_slice(),
+      Either::B(packet) => packet.as_slice(),
+    };
 
     // W3C spec: Empty data should trigger EncodingError
     if data.is_empty() {
@@ -437,7 +472,7 @@ impl AudioDecoder {
     };
 
     // Decode using the internal implementation
-    let frames = match decode_audio_chunk_data(context, &data, timestamp) {
+    let frames = match decode_audio_chunk_data(context, data, timestamp) {
       Ok(f) => f,
       Err(e) => {
         let old_size = guard.decode_queue_size;
@@ -449,6 +484,8 @@ impl AudioDecoder {
         return;
       }
     };
+
+    drop(inner_lock);
 
     guard.frame_count += 1;
 
@@ -947,7 +984,7 @@ impl AudioDecoder {
   #[napi]
   pub fn decode(&self, env: Env, chunk: &EncodedAudioChunk) -> Result<()> {
     // Extract data and timestamp on main thread (brief lock)
-    let (data, timestamp) = {
+    let (chunk, timestamp) = {
       let mut inner = self
         .inner
         .lock()
@@ -961,14 +998,6 @@ impl AudioDecoder {
         return throw_invalid_state_error(&env, "Cannot decode with an unconfigured codec");
       }
 
-      // Get chunk data
-      let data = match chunk.get_data_vec() {
-        Ok(d) => d,
-        Err(e) => {
-          Self::report_error(&mut inner, &format!("Failed to get chunk data: {}", e));
-          return Ok(());
-        }
-      };
       let timestamp = match chunk.get_timestamp() {
         Ok(ts) => ts,
         Err(e) => {
@@ -980,7 +1009,7 @@ impl AudioDecoder {
       // Increment queue size (pending operation)
       inner.decode_queue_size += 1;
 
-      (data, timestamp)
+      (Arc::clone(&chunk.inner), timestamp)
     };
 
     // Send decode command to worker thread (deferred to microtask for W3C spec compliance)
@@ -995,7 +1024,7 @@ impl AudioDecoder {
         if !reset_flag.load(Ordering::SeqCst) {
           // Only send if decoder hasn't been closed (weak reference can still upgrade)
           if let Some(sender) = weak_sender.upgrade() {
-            let _ = sender.send(DecoderCommand::Decode { data, timestamp });
+            let _ = sender.send(DecoderCommand::Decode { chunk, timestamp });
           }
         }
         Ok(())
