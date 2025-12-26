@@ -116,7 +116,7 @@ pub struct VideoEncoderEncodeOptionsForHevc {
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
 pub struct VideoEncoderEncodeOptionsForVp9 {
-  /// Per-frame quantizer (0-63, lower = higher quality)
+  /// Per-frame quantizer (0-255, lower = higher quality)
   pub quantizer: Option<u16>,
 }
 
@@ -124,7 +124,7 @@ pub struct VideoEncoderEncodeOptionsForVp9 {
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
 pub struct VideoEncoderEncodeOptionsForAv1 {
-  /// Per-frame quantizer (0-63, lower = higher quality)
+  /// Per-frame quantizer (0-255, lower = higher quality)
   pub quantizer: Option<u16>,
 }
 
@@ -416,6 +416,13 @@ struct VideoEncoderInner {
   /// Whether to preserve alpha channel (YUVA420P instead of YUV420P)
   /// True when config.alpha == "keep" and codec supports alpha (VP9)
   use_alpha: bool,
+
+  // ========================================================================
+  // Codec identification (for per-frame QP handling)
+  // ========================================================================
+  /// Codec ID for the current encoder configuration
+  /// Used to determine codec-specific quantizer mapping
+  codec_id: Option<AVCodecID>,
 }
 
 /// Get the preferred hardware device type for the current platform
@@ -557,6 +564,8 @@ impl VideoEncoder {
       input_color_space: None,
       // Alpha channel support (set during configure)
       use_alpha: false,
+      // Codec identification (set during configure)
+      codec_id: None,
     };
 
     let inner = Arc::new(Mutex::new(inner));
@@ -788,6 +797,32 @@ impl VideoEncoder {
     // Force keyframe if requested via encode options (W3C WebCodecs spec)
     if options.as_ref().is_some_and(|o| o.key_frame == Some(true)) {
       frame_to_encode.set_pict_type(AVPictureType::I);
+    }
+
+    // Apply per-frame quantizer if specified in encode options.
+    // This enables W3C WebCodecs per-frame QP control with bitrateMode: 'quantizer'.
+    //
+    // For VP9/AV1: Use qmin/qmax on the codec context (FFmpeg's libvpx/libaom mechanism)
+    //   - WebCodecs API provides 0-255 (q_index), converted to encoder's 0-63 range
+    //   - Set qmin=qmax to force exact quantizer value for the frame
+    //
+    // For H.264/HEVC: Use frame->quality (FFmpeg's x264/x265 mechanism)
+    //   - WebCodecs API provides 0-51 (QP), multiplied by FF_QP2LAMBDA
+    if let Some(codec_id) = guard.codec_id
+      && let Some(quantizer) = extract_per_frame_quantizer(options.as_ref(), codec_id)
+    {
+      if codec_uses_q_index(codec_id) {
+        // VP9/AV1: Convert 0-255 to 0-63 and set qmin=qmax on context
+        let q = q_index_to_quantizer(quantizer);
+        if let Some(ctx) = guard.context.as_mut() {
+          ctx.set_qmin(q);
+          ctx.set_qmax(q);
+        }
+      } else {
+        // H.264/HEVC: Use frame quality mechanism
+        let quality = quantizer_to_ffmpeg_quality(quantizer);
+        frame_to_encode.set_quality(quality);
+      }
     }
 
     // Upload frame to GPU if hardware frame context is available
@@ -1671,8 +1706,9 @@ impl VideoEncoder {
       crf: None,
     };
 
-    // Update use_alpha in guard
+    // Update use_alpha and codec_id in guard
     guard.use_alpha = use_alpha;
+    guard.codec_id = Some(codec_id);
 
     // Determine if AVCC/HVCC format is needed (for create_software_encoder helper)
     let is_h264 = codec_string.starts_with("avc1")
@@ -2584,6 +2620,7 @@ impl VideoEncoder {
 
     // Alpha channel support - track if we're encoding with alpha
     inner.use_alpha = use_alpha;
+    inner.codec_id = Some(codec_id);
 
     // Create new channel and worker if needed (after reconfiguration)
     if self.command_sender.is_none() {
@@ -3620,6 +3657,71 @@ fn extract_alpha_side_data(packet: &Packet, use_alpha: bool) -> Option<Uint8Arra
 /// Check if dimensions are within valid range
 fn are_dimensions_valid(width: u32, height: u32) -> bool {
   width <= MAX_DIMENSION && height <= MAX_DIMENSION
+}
+
+/// FFmpeg's FF_QP2LAMBDA constant (from libavutil/internal.h)
+/// Used to convert QP values to the quality field expected by FFmpeg encoders
+const FF_QP2LAMBDA: i32 = 118;
+
+/// Extract per-frame quantizer value from encode options based on codec type
+/// Returns the quantizer value for the codec, or None if not specified
+fn extract_per_frame_quantizer(
+  options: Option<&VideoEncoderEncodeOptions>,
+  codec_id: AVCodecID,
+) -> Option<u16> {
+  let opts = options?;
+
+  match codec_id {
+    AVCodecID::H264 => opts.avc.as_ref().and_then(|avc| avc.quantizer),
+    AVCodecID::Hevc => opts.hevc.as_ref().and_then(|hevc| hevc.quantizer),
+    AVCodecID::Vp9 => opts.vp9.as_ref().and_then(|vp9| vp9.quantizer),
+    AVCodecID::Av1 => opts.av1.as_ref().and_then(|av1| av1.quantizer),
+    _ => None,
+  }
+}
+
+/// Convert WebCodecs q_index (0-255) to encoder quantizer (0-63) for VP9/AV1.
+///
+/// This matches Chromium's QIndexToQuantizer function from:
+/// https://chromium-review.googlesource.com/c/chromium/src/+/7204065
+///
+/// The W3C WebCodecs spec uses the bitstream q_index range (0-255) for the public API,
+/// but libvpx and libaom encoders use an internal quantizer range of 0-63.
+/// The conversion is simply q_index / 4.
+#[inline]
+fn q_index_to_quantizer(q_index: u16) -> i32 {
+  // Clamp to valid range and convert
+  let clamped = q_index.min(255);
+  (clamped / 4) as i32
+}
+
+/// Convert encoder quantizer (0-63) to WebCodecs q_index (0-255) for VP9/AV1.
+///
+/// This matches Chromium's QuantizerToQIndex function.
+/// Inverse of q_index_to_quantizer.
+#[inline]
+#[allow(dead_code)]
+fn quantizer_to_q_index(quantizer: i32) -> u16 {
+  let clamped = quantizer.clamp(0, 63);
+  (clamped * 4) as u16
+}
+
+/// Convert WebCodecs quantizer value to FFmpeg quality value for H.264/HEVC.
+///
+/// Per W3C WebCodecs Codec Registry:
+/// - AVC/HEVC: quantizer is 0-51 (QP scale per codec spec)
+///
+/// FFmpeg expects quality = value * FF_QP2LAMBDA for per-frame quality control.
+/// Note: This is only used for H.264/HEVC. VP9/AV1 use qmin/qmax instead.
+fn quantizer_to_ffmpeg_quality(quantizer: u16) -> i32 {
+  // Clamp to valid H.264/HEVC QP range (0-51) before conversion
+  let clamped = quantizer.min(51);
+  clamped as i32 * FF_QP2LAMBDA
+}
+
+/// Check if codec uses q_index range (0-255) vs QP range (0-51)
+fn codec_uses_q_index(codec_id: AVCodecID) -> bool {
+  matches!(codec_id, AVCodecID::Vp9 | AVCodecID::Av1)
 }
 
 /// Parse WebCodecs codec string to FFmpeg codec ID

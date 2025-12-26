@@ -23,6 +23,7 @@ use crate::ffi::{
     ffframe_get_nb_samples,
     ffframe_get_pict_type,
     ffframe_get_pts,
+    ffframe_get_quality,
     ffframe_get_sample_rate,
     ffframe_get_width,
     ffframe_linesize,
@@ -38,6 +39,7 @@ use crate::ffi::{
     ffframe_set_nb_samples,
     ffframe_set_pict_type,
     ffframe_set_pts,
+    ffframe_set_quality,
     ffframe_set_sample_rate,
     ffframe_set_width,
   },
@@ -262,6 +264,25 @@ impl Frame {
       AVPictureType::Bi => 7,
     };
     unsafe { ffframe_set_pict_type(self.as_mut_ptr(), t) }
+  }
+
+  /// Get quality (for per-frame QP control during encoding)
+  /// The value is encoder-specific and typically multiplied by FF_QP2LAMBDA.
+  #[inline]
+  pub fn quality(&self) -> i32 {
+    unsafe { ffframe_get_quality(self.as_ptr()) }
+  }
+
+  /// Set quality for per-frame QP control during encoding.
+  ///
+  /// The value should be `QP * FF_QP2LAMBDA` where FF_QP2LAMBDA is 118 in FFmpeg.
+  ///
+  /// Note: This per-frame quality field is only used by H.264/HEVC encoders (x264/x265).
+  /// For these codecs, QP is 0-51 per W3C WebCodecs spec.
+  /// VP9/AV1 encoders use qmin/qmax on the codec context instead.
+  #[inline]
+  pub fn set_quality(&mut self, quality: i32) {
+    unsafe { ffframe_set_quality(self.as_mut_ptr(), quality) }
   }
 
   // ========================================================================

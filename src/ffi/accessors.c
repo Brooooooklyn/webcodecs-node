@@ -49,6 +49,22 @@ void ffctx_set_rc_buffer_size(AVCodecContext* ctx, int rc_buffer_size) {
     ctx->rc_buffer_size = rc_buffer_size;
 }
 
+void ffctx_set_qmin(AVCodecContext* ctx, int qmin) {
+    ctx->qmin = qmin;
+}
+
+void ffctx_set_qmax(AVCodecContext* ctx, int qmax) {
+    ctx->qmax = qmax;
+}
+
+int ffctx_get_qmin(const AVCodecContext* ctx) {
+    return ctx->qmin;
+}
+
+int ffctx_get_qmax(const AVCodecContext* ctx) {
+    return ctx->qmax;
+}
+
 void ffctx_set_gop_size(AVCodecContext* ctx, int gop_size) {
     ctx->gop_size = gop_size;
 }
@@ -267,6 +283,10 @@ void ffframe_set_sample_aspect_ratio(AVFrame* frame, int num, int den) {
     frame->sample_aspect_ratio.den = den;
 }
 
+void ffframe_set_quality(AVFrame* frame, int quality) {
+    frame->quality = quality;
+}
+
 /* ============================================================================
  * AVFrame Getters
  * ============================================================================ */
@@ -327,6 +347,10 @@ int ffframe_get_colorspace(const AVFrame* frame) {
 
 int ffframe_get_color_range(const AVFrame* frame) {
     return frame->color_range;
+}
+
+int ffframe_get_quality(const AVFrame* frame) {
+    return frame->quality;
 }
 
 /* ============================================================================

@@ -676,6 +676,7 @@ src/codec/context.rs:339,362  # Set extradata if provided (non-critical)
 1. **Temporal SVC** - All modes with >= 2 temporal layers (L1Tx, L2Tx, L3Tx, SxTx) populate `metadata.svc.temporalLayerId`; W3C spec does not define `spatialLayerId`
 2. **Duration type** - Using i64 instead of u64 due to NAPI-RS constraints
 3. **ImageDecoder GIF animation** - FFmpeg may return only first frame; for full animation use VideoDecoder with GIF codec
+4. **AV1 per-frame quantizer** - Per-frame QP control (`av1: { quantizer }` in encode options) has no effect with FFmpeg's libaom wrapper. FFmpeg only sets qmin/qmax during encoder initialization, unlike libvpx which supports dynamic qmax updates. VP9 per-frame quantizer works correctly. See [Chromium CL 7204065](https://chromium-review.googlesource.com/c/chromium/src/+/7204065) for context.
 
 ## NAPI-RS Limitations
 
