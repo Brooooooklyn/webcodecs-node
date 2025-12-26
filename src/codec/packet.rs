@@ -11,7 +11,7 @@ use crate::ffi::{
   },
   avcodec::{
     av_new_packet, av_packet_alloc, av_packet_free, av_packet_get_side_data,
-    av_packet_new_side_data, av_packet_ref, av_packet_unref,
+    av_packet_new_side_data, av_packet_unref,
   },
   pkt_flag, pkt_side_data_type,
 };
@@ -228,14 +228,6 @@ impl Packet {
     unsafe { av_packet_unref(self.as_mut_ptr()) }
   }
 
-  /// Create a new reference to this packet's data
-  pub fn try_clone(&self) -> Result<Self, CodecError> {
-    let new_pkt = Self::new()?;
-    let ret = unsafe { av_packet_ref(new_pkt.ptr.as_ptr(), self.as_ptr()) };
-    ffi::check_error(ret)?;
-    Ok(new_pkt)
-  }
-
   /// Copy packet data to a new Vec
   pub fn to_vec(&self) -> Vec<u8> {
     self.as_slice().to_vec()
@@ -288,12 +280,6 @@ impl std::fmt::Debug for Packet {
       .field("dts", &self.dts())
       .field("is_key", &self.is_key())
       .finish()
-  }
-}
-
-impl Clone for Packet {
-  fn clone(&self) -> Self {
-    self.try_clone().expect("Failed to clone packet")
   }
 }
 

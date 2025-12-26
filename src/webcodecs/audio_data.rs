@@ -10,6 +10,7 @@ use crate::webcodecs::error::{
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use parking_lot::RwLock as ParkingLotRwLock;
 use std::sync::{Arc, Mutex};
 
 /// Audio sample format (WebCodecs spec)
@@ -235,7 +236,8 @@ pub struct AudioDataCopyToOptions {
 
 /// Internal state for AudioData
 struct AudioDataInner {
-  frame: Frame,
+  /// Shared reference to the frame data (via Arc for Rust-level sharing)
+  frame: Arc<ParkingLotRwLock<Frame>>,
   format: AudioSampleFormat,
   timestamp_us: i64,
   closed: bool,
@@ -334,7 +336,7 @@ impl AudioData {
     frame.set_pts(init.timestamp);
 
     let inner = AudioDataInner {
-      frame,
+      frame: frame.into_shared(),
       format: init.format,
       timestamp_us: init.timestamp,
       closed: false,
@@ -352,7 +354,7 @@ impl AudioData {
     let format = AudioSampleFormat::from_av_format(av_format).unwrap_or(AudioSampleFormat::F32);
 
     let inner = AudioDataInner {
-      frame,
+      frame: frame.into_shared(),
       format,
       timestamp_us,
       closed: false,
@@ -440,7 +442,7 @@ impl AudioData {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match &*inner {
-      Some(i) => Ok(i.frame.sample_rate() as f64),
+      Some(i) => Ok(i.frame.read().sample_rate() as f64),
       None => Ok(0.0), // Return 0 after close per W3C spec
     }
   }
@@ -455,7 +457,7 @@ impl AudioData {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match &*inner {
-      Some(i) => Ok(i.frame.nb_samples()),
+      Some(i) => Ok(i.frame.read().nb_samples()),
       None => Ok(0), // Return 0 after close per W3C spec
     }
   }
@@ -470,7 +472,7 @@ impl AudioData {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match &*inner {
-      Some(i) => Ok(i.frame.channels()),
+      Some(i) => Ok(i.frame.read().channels()),
       None => Ok(0), // Return 0 after close per W3C spec
     }
   }
@@ -486,8 +488,9 @@ impl AudioData {
 
     match &*inner {
       Some(i) => {
-        let frames = i.frame.nb_samples() as i64;
-        let sample_rate = i.frame.sample_rate() as i64;
+        let frame_guard = i.frame.read();
+        let frames = frame_guard.nb_samples() as i64;
+        let sample_rate = frame_guard.sample_rate() as i64;
         if sample_rate > 0 {
           Ok((frames * 1_000_000) / sample_rate)
         } else {
@@ -530,7 +533,7 @@ impl AudioData {
     match &*inner {
       Some(i) => {
         if i.format.is_planar() {
-          Ok(i.frame.channels())
+          Ok(i.frame.read().channels())
         } else {
           Ok(1)
         }
@@ -559,9 +562,12 @@ impl AudioData {
 
     let format = options.format.unwrap_or(inner.format);
 
+    // Acquire read lock on the shared frame
+    let frame_guard = inner.frame.read();
+
     // Validate planeIndex (throws RangeError per W3C spec)
     let num_planes = if format.is_planar() {
-      inner.frame.channels()
+      frame_guard.channels()
     } else {
       1
     };
@@ -585,7 +591,7 @@ impl AudioData {
     let frame_offset = options.frame_offset.unwrap_or(0);
     let num_frames = options
       .frame_count
-      .unwrap_or(inner.frame.nb_samples() - frame_offset);
+      .unwrap_or(frame_guard.nb_samples() - frame_offset);
 
     let bytes_per_sample = format.bytes_per_sample() as u32;
 
@@ -594,7 +600,7 @@ impl AudioData {
       Ok(num_frames * bytes_per_sample)
     } else {
       // Interleaved: all channels in one buffer
-      Ok(num_frames * inner.frame.channels() * bytes_per_sample)
+      Ok(num_frames * frame_guard.channels() * bytes_per_sample)
     }
   }
 
@@ -621,12 +627,16 @@ impl AudioData {
     let format = options.format.unwrap_or(inner.format);
     let plane_index = options.plane_index as usize;
     let frame_offset = options.frame_offset.unwrap_or(0) as usize;
+
+    // Acquire read lock on the shared frame
+    let frame_guard = inner.frame.read();
+
     let num_frames = options
       .frame_count
-      .unwrap_or(inner.frame.nb_samples() - frame_offset as u32) as usize;
+      .unwrap_or(frame_guard.nb_samples() - frame_offset as u32) as usize;
 
     let bytes_per_sample = format.bytes_per_sample();
-    let channels = inner.frame.channels() as usize;
+    let channels = frame_guard.channels() as usize;
 
     // Validate planeIndex (throws RangeError per W3C spec)
     let num_planes = if format.is_planar() { channels } else { 1 };
@@ -700,13 +710,13 @@ impl AudioData {
       // Get source data
       if inner.format.is_planar() {
         // Source is planar too
-        if let Some(src) = inner.frame.audio_channel_data(plane_index) {
+        if let Some(src) = frame_guard.audio_channel_data(plane_index) {
           let src_offset = frame_offset * bytes_per_sample;
           dest_slice[..copy_size].copy_from_slice(&src[src_offset..src_offset + copy_size]);
         }
       } else {
         // Source is interleaved, need to extract one channel
-        if let Some(src) = inner.frame.audio_channel_data(0) {
+        if let Some(src) = frame_guard.audio_channel_data(0) {
           for i in 0..num_frames {
             let src_offset = ((frame_offset + i) * channels + plane_index) * bytes_per_sample;
             let dst_offset = i * bytes_per_sample;
@@ -737,7 +747,7 @@ impl AudioData {
         // Source is planar, need to interleave
         for i in 0..num_frames {
           for ch in 0..channels {
-            if let Some(src) = inner.frame.audio_channel_data(ch) {
+            if let Some(src) = frame_guard.audio_channel_data(ch) {
               let src_offset = (frame_offset + i) * bytes_per_sample;
               let dst_offset = (i * channels + ch) * bytes_per_sample;
               dest_slice[dst_offset..dst_offset + bytes_per_sample]
@@ -747,7 +757,7 @@ impl AudioData {
         }
       } else {
         // Both interleaved
-        if let Some(src) = inner.frame.audio_channel_data(0) {
+        if let Some(src) = frame_guard.audio_channel_data(0) {
           let src_offset = frame_offset * channels * bytes_per_sample;
           dest_slice[..copy_size].copy_from_slice(&src[src_offset..src_offset + copy_size]);
         }
@@ -770,12 +780,8 @@ impl AudioData {
       None => return throw_invalid_state_error(&env, "AudioData is closed"),
     };
 
-    let cloned_frame = inner.frame.try_clone().map_err(|e| {
-      Error::new(
-        Status::GenericFailure,
-        format!("Failed to clone frame: {}", e),
-      )
-    })?;
+    // Clone the Arc to share the underlying frame data (no pixel copy)
+    let cloned_frame = inner.frame.clone();
 
     Ok(AudioData {
       inner: Arc::new(Mutex::new(Some(AudioDataInner {
@@ -815,7 +821,10 @@ impl AudioData {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match &*inner {
-      Some(i) if !i.closed => Ok(f(&i.frame)),
+      Some(i) if !i.closed => {
+        let frame_guard = i.frame.read();
+        Ok(f(&frame_guard))
+      }
       Some(_) => Err(invalid_state_error("AudioData is closed")),
       None => Err(invalid_state_error("AudioData is closed")),
     }
@@ -832,13 +841,16 @@ impl AudioData {
       .as_ref()
       .ok_or_else(|| invalid_state_error("AudioData is closed"))?;
 
-    let num_frames = inner.frame.nb_samples() as usize;
-    let channels = inner.frame.channels() as usize;
+    // Acquire read lock on the shared frame
+    let frame_guard = inner.frame.read();
+
+    let num_frames = frame_guard.nb_samples() as usize;
+    let channels = frame_guard.channels() as usize;
     let bytes_per_sample = inner.format.bytes_per_sample();
     let total_size = num_frames * channels * bytes_per_sample;
 
     let mut buffer = vec![0u8; total_size];
-    inner.frame.copy_audio_to_buffer(&mut buffer).map_err(|e| {
+    frame_guard.copy_audio_to_buffer(&mut buffer).map_err(|e| {
       Error::new(
         Status::GenericFailure,
         format!("Failed to copy audio: {}", e),
@@ -854,12 +866,13 @@ impl std::fmt::Debug for AudioData {
     if let Ok(inner) = self.inner.lock()
       && let Some(ref i) = *inner
     {
+      let frame_guard = i.frame.read();
       return f
         .debug_struct("AudioData")
         .field("format", &i.format)
-        .field("sample_rate", &i.frame.sample_rate())
-        .field("number_of_frames", &i.frame.nb_samples())
-        .field("number_of_channels", &i.frame.channels())
+        .field("sample_rate", &frame_guard.sample_rate())
+        .field("number_of_frames", &frame_guard.nb_samples())
+        .field("number_of_channels", &frame_guard.channels())
         .field("timestamp", &i.timestamp_us)
         .finish();
     }

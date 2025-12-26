@@ -27,6 +27,7 @@ use napi::threadsafe_function::{
   ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
 };
 use napi_derive::napi;
+use parking_lot::RwLock as ParkingLotRwLock;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -176,7 +177,8 @@ type ErrorCallback = ThreadsafeFunction<Error, UnknownReturnValue, Error, Status
 enum EncoderCommand {
   /// Encode a video frame
   Encode {
-    frame: Frame,
+    /// Shared reference to the frame data (via Arc for Rust-level sharing)
+    frame: Arc<ParkingLotRwLock<Frame>>,
     timestamp: i64,
     options: Option<VideoEncoderEncodeOptions>,
     /// Rotation from input VideoFrame (for metadata output)
@@ -656,7 +658,7 @@ impl VideoEncoder {
   fn process_encode(
     inner: &Arc<Mutex<VideoEncoderInner>>,
     event_state: &Arc<RwLock<EventListenerState>>,
-    frame: Frame,
+    frame_arc: Arc<ParkingLotRwLock<Frame>>,
     timestamp: i64,
     options: Option<VideoEncoderEncodeOptions>,
     rotation: f64,
@@ -707,18 +709,22 @@ impl VideoEncoder {
       AVPixelFormat::Yuv420p
     };
 
-    // Check if frame needs conversion
-    let frame_format = frame.format();
-    let needs_conversion =
-      frame_format != target_format || frame.width() != width || frame.height() != height;
+    // Acquire read lock on the shared frame
+    let frame_guard = frame_arc.read();
 
-    // Convert frame if needed
+    // Check if frame needs conversion
+    let frame_format = frame_guard.format();
+    let needs_conversion = frame_format != target_format
+      || frame_guard.width() != width
+      || frame_guard.height() != height;
+
+    // Convert frame if needed, or deep copy if we need to mutate it
     let mut frame_to_encode = if needs_conversion {
       // Create scaler if needed
       if guard.scaler.is_none() {
         match Scaler::new(
-          frame.width(),
-          frame.height(),
+          frame_guard.width(),
+          frame_guard.height(),
           frame_format,
           width,
           height,
@@ -727,6 +733,7 @@ impl VideoEncoder {
         ) {
           Ok(scaler) => guard.scaler = Some(scaler),
           Err(e) => {
+            drop(frame_guard);
             let old_size = guard.encode_queue_size;
             guard.encode_queue_size = old_size.saturating_sub(1);
             if old_size > 0 {
@@ -739,9 +746,10 @@ impl VideoEncoder {
       }
 
       let scaler = guard.scaler.as_ref().unwrap();
-      match scaler.scale_alloc(&frame) {
+      match scaler.scale_alloc(&frame_guard) {
         Ok(scaled) => scaled,
         Err(e) => {
+          drop(frame_guard);
           let old_size = guard.encode_queue_size;
           guard.encode_queue_size = old_size.saturating_sub(1);
           if old_size > 0 {
@@ -752,8 +760,24 @@ impl VideoEncoder {
         }
       }
     } else {
-      frame
+      // No conversion needed, but we need an owned frame for mutation (set_pts, set_pict_type)
+      match frame_guard.deep_clone() {
+        Ok(copied) => copied,
+        Err(e) => {
+          drop(frame_guard);
+          let old_size = guard.encode_queue_size;
+          guard.encode_queue_size = old_size.saturating_sub(1);
+          if old_size > 0 {
+            let _ = Self::fire_dequeue_event(event_state);
+          }
+          Self::report_error(&mut guard, &format!("Failed to copy frame: {}", e));
+          return;
+        }
+      }
     };
+
+    // Release the read lock now that we have an owned frame
+    drop(frame_guard);
 
     // Set frame PTS
     frame_to_encode.set_pts(timestamp);
@@ -800,7 +824,7 @@ impl VideoEncoder {
           && guard.hw_preference == HardwareAcceleration::NoPreference
         {
           // Buffer current frame for re-encoding
-          if let Ok(cloned) = frame_to_encode.try_clone() {
+          if let Ok(cloned) = frame_to_encode.deep_clone() {
             guard
               .pending_frames
               .push((cloned, timestamp, options.clone(), rotation, flip));
@@ -939,8 +963,8 @@ impl VideoEncoder {
 
     if packets.is_empty() && guard.is_hardware && !guard.first_output_produced {
       // Buffer the frame for potential re-encoding on fallback
-      // Use try_clone since Frame doesn't implement Clone
-      if let Ok(cloned_frame) = frame_to_encode.try_clone() {
+      // Use deep_clone to create an owned copy for re-encoding
+      if let Ok(cloned_frame) = frame_to_encode.deep_clone() {
         guard
           .pending_frames
           .push((cloned_frame, timestamp, options.clone(), rotation, flip));
@@ -2064,13 +2088,13 @@ impl VideoEncoder {
         }
       }
     } else {
-      // Already NV12, clone for upload
-      match frame.try_clone() {
-        Ok(cloned) => cloned,
+      // Already NV12, deep copy for upload
+      match frame.deep_clone() {
+        Ok(copied) => copied,
         Err(e) => {
           guard.use_hw_frames = false;
           eprintln!(
-            "Warning: Frame clone failed, falling back to CPU frames: {}",
+            "Warning: Frame copy failed, falling back to CPU frames: {}",
             e
           );
           return None;
@@ -2602,8 +2626,8 @@ impl VideoEncoder {
       return throw_type_error_unit(&env, "Cannot encode a closed VideoFrame");
     }
 
-    // Clone frame and get timestamp on main thread (brief lock)
-    let (internal_frame, timestamp, rotation, flip) = {
+    // Get Arc reference to frame and metadata on main thread (no pixel copy)
+    let (frame_arc, timestamp, rotation, flip) = {
       let mut inner = self
         .inner
         .lock()
@@ -2617,13 +2641,9 @@ impl VideoEncoder {
         return throw_invalid_state_error(&env, "Cannot encode with an unconfigured codec");
       }
 
-      // Clone frame data from VideoFrame
-      let internal_frame = match frame.with_frame(|f| f.try_clone()) {
-        Ok(Ok(f)) => f,
-        Ok(Err(e)) => {
-          Self::report_error(&mut inner, &format!("Failed to clone frame: {}", e));
-          return Ok(());
-        }
+      // Get Arc reference to frame data (shares via Rust Arc, no pixel copy)
+      let frame_arc = match frame.frame_arc() {
+        Ok(arc) => arc,
         Err(e) => {
           Self::report_error(&mut inner, &format!("Failed to access frame: {}", e));
           return Ok(());
@@ -2653,7 +2673,7 @@ impl VideoEncoder {
       // Increment queue size (pending operation)
       inner.encode_queue_size += 1;
 
-      (internal_frame, timestamp, rotation, flip)
+      (frame_arc, timestamp, rotation, flip)
     };
 
     // Send encode command to worker thread via microtask for W3C spec FIFO ordering
@@ -2668,7 +2688,7 @@ impl VideoEncoder {
           && let Some(sender) = weak_sender.upgrade()
         {
           let _ = sender.send(EncoderCommand::Encode {
-            frame: internal_frame,
+            frame: frame_arc,
             timestamp,
             options,
             rotation,
