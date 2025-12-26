@@ -116,7 +116,7 @@ pub struct VideoEncoderEncodeOptionsForHevc {
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
 pub struct VideoEncoderEncodeOptionsForVp9 {
-  /// Per-frame quantizer (0-63, lower = higher quality)
+  /// Per-frame quantizer (0-255, lower = higher quality)
   pub quantizer: Option<u16>,
 }
 
@@ -124,7 +124,7 @@ pub struct VideoEncoderEncodeOptionsForVp9 {
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
 pub struct VideoEncoderEncodeOptionsForAv1 {
-  /// Per-frame quantizer (0-63, lower = higher quality)
+  /// Per-frame quantizer (0-255, lower = higher quality)
   pub quantizer: Option<u16>,
 }
 

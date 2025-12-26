@@ -70,7 +70,7 @@ pub struct EncoderConfig {
   pub rc_max_rate: Option<u64>,
   /// Rate control buffer size in bits
   pub rc_buffer_size: Option<u32>,
-  /// CRF/CQ value for quantizer mode (0-51 for x264/x265, 0-63 for VP9/AV1)
+  /// CRF/CQ value for quantizer mode (0-51 for x264/x265, 0-255 for VP9/AV1)
   pub crf: Option<u32>,
 }
 

@@ -1753,7 +1753,7 @@ export interface VideoEncoderEncodeOptions {
 
 /** AV1 encode options (W3C WebCodecs AV1 Registration) */
 export interface VideoEncoderEncodeOptionsForAv1 {
-  /** Per-frame quantizer (0-63, lower = higher quality) */
+  /** Per-frame quantizer (0-255, lower = higher quality) */
   quantizer?: number
 }
 
@@ -1771,7 +1771,7 @@ export interface VideoEncoderEncodeOptionsForHevc {
 
 /** VP9 encode options (W3C WebCodecs VP9 Registration) */
 export interface VideoEncoderEncodeOptionsForVp9 {
-  /** Per-frame quantizer (0-63, lower = higher quality) */
+  /** Per-frame quantizer (0-255, lower = higher quality) */
   quantizer?: number
 }
 
