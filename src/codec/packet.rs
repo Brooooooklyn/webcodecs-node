@@ -11,7 +11,7 @@ use crate::ffi::{
   },
   avcodec::{
     av_new_packet, av_packet_alloc, av_packet_free, av_packet_get_side_data,
-    av_packet_new_side_data, av_packet_unref,
+    av_packet_new_side_data, av_packet_ref, av_packet_unref,
   },
   pkt_flag, pkt_side_data_type,
 };
@@ -228,9 +228,30 @@ impl Packet {
     unsafe { av_packet_unref(self.as_mut_ptr()) }
   }
 
-  /// Copy packet data to a new Vec
-  pub fn to_vec(&self) -> Vec<u8> {
-    self.as_slice().to_vec()
+  /// Create a shallow clone that shares the data buffer via FFmpeg's AVBufferRef.
+  ///
+  /// This uses `av_packet_ref()` to create a new AVPacket struct that references
+  /// the same underlying data buffer with atomic reference counting.
+  ///
+  /// The new Packet can have its metadata freely modified (pts, dts, duration,
+  /// stream_index, flags) without affecting the original, while sharing the
+  /// actual encoded data (zero copy).
+  ///
+  /// # Thread Safety
+  /// FFmpeg's AVBufferRef uses atomic reference counting:
+  /// - Increment: `memory_order_relaxed` (safe for concurrent creation)
+  /// - Decrement: `memory_order_acq_rel` (ensures visibility before free)
+  ///
+  /// The buffer is freed only when all references are dropped.
+  ///
+  /// # Performance
+  /// This copies only ~100 bytes (AVPacket struct) vs potentially megabytes
+  /// for a deep copy of the packet data.
+  pub fn shallow_clone(&self) -> Result<Self, CodecError> {
+    let new_packet = Self::new()?;
+    let ret = unsafe { av_packet_ref(new_packet.ptr.as_ptr(), self.as_ptr()) };
+    ffi::check_error(ret)?;
+    Ok(new_packet)
   }
 
   /// Allocate packet buffer and copy data from a slice
@@ -269,7 +290,20 @@ impl Drop for Packet {
   }
 }
 
-// Packet data can be sent between threads
+// SAFETY: Packet can be safely sent between threads.
+//
+// Packet wraps *mut AVPacket with exclusive ownership (NonNull).
+// The underlying data buffer uses FFmpeg's AVBufferRef with atomic reference counting:
+// - Buffer refcount increment uses memory_order_relaxed
+// - Buffer refcount decrement uses memory_order_acq_rel
+// - Buffer is only freed when refcount reaches zero
+//
+// When a Packet is moved between threads:
+// 1. Ownership transfer is atomic (Rust's move semantics)
+// 2. If data is ref-counted (from encoder/demuxer), the buffer stays valid
+// 3. The AVPacket struct itself (~100 bytes) is copied, not the data
+//
+// This enables zero-copy packet sharing via shallow_clone() across threads.
 unsafe impl Send for Packet {}
 
 impl std::fmt::Debug for Packet {

@@ -760,9 +760,12 @@ impl VideoEncoder {
         }
       }
     } else {
-      // No conversion needed, but we need an owned frame for mutation (set_pts, set_pict_type)
-      match frame_guard.deep_clone() {
-        Ok(copied) => copied,
+      // No conversion needed - use shallow clone to share pixel buffers via FFmpeg's
+      // atomic reference counting. This avoids copying 3-12 MB per frame.
+      // We get an owned AVFrame struct for mutation (set_pts, set_pict_type) while
+      // the underlying pixel data is shared read-only.
+      match frame_guard.shallow_clone() {
+        Ok(shallow) => shallow,
         Err(e) => {
           drop(frame_guard);
           let old_size = guard.encode_queue_size;
@@ -770,7 +773,7 @@ impl VideoEncoder {
           if old_size > 0 {
             let _ = Self::fire_dequeue_event(event_state);
           }
-          Self::report_error(&mut guard, &format!("Failed to copy frame: {}", e));
+          Self::report_error(&mut guard, &format!("Failed to reference frame: {}", e));
           return;
         }
       }
@@ -823,11 +826,12 @@ impl VideoEncoder {
           && !guard.first_output_produced
           && guard.hw_preference == HardwareAcceleration::NoPreference
         {
-          // Buffer current frame for re-encoding
-          if let Ok(cloned) = frame_to_encode.deep_clone() {
+          // Buffer current frame for re-encoding using shallow clone (shares pixel buffer
+          // via FFmpeg's atomic refcount). Safe because re-encoding only reads pixels.
+          if let Ok(shallow) = frame_to_encode.shallow_clone() {
             guard
               .pending_frames
-              .push((cloned, timestamp, options.clone(), rotation, flip));
+              .push((shallow, timestamp, options.clone(), rotation, flip));
           }
           let pending_frames = std::mem::take(&mut guard.pending_frames);
 
@@ -843,9 +847,12 @@ impl VideoEncoder {
                 && let Ok(pkts) = ctx.encode(Some(&frame_to_reencode))
               {
                 for packet in pkts {
+                  // Extract alpha side data for VP9 alpha support
+                  let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
+                  let packet_is_key = packet.is_key();
                   // Use buffered_ts (the original input timestamp) instead of packet.pts()
                   let chunk = EncodedVideoChunk::from_packet_with_format(
-                    &packet,
+                    packet,
                     Some(buffered_ts),
                     guard.use_avcc_format,
                   );
@@ -855,10 +862,7 @@ impl VideoEncoder {
                     create_svc_metadata(guard.temporal_layer_count, guard.output_frame_count);
                   guard.output_frame_count += 1;
 
-                  // Extract alpha side data for VP9 alpha support
-                  let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
-
-                  let metadata = if !guard.extradata_sent && packet.is_key() {
+                  let metadata = if !guard.extradata_sent && packet_is_key {
                     guard.extradata_sent = true;
                     EncodedVideoChunkMetadata {
                       decoder_config: Some(VideoDecoderConfigOutput {
@@ -889,14 +893,12 @@ impl VideoEncoder {
                       alpha_side_data,
                     }
                   };
-                  // During flush, queue chunks for synchronous delivery in resolver
-                  // Otherwise, use Blocking callback for immediate delivery
                   if guard.inside_flush {
                     guard.pending_chunks.push((chunk, metadata));
                   } else {
                     guard.output_callback.call(
                       (chunk, metadata).into(),
-                      ThreadsafeFunctionCallMode::Blocking,
+                      ThreadsafeFunctionCallMode::NonBlocking,
                     );
                   }
                   guard.first_output_produced = true;
@@ -962,12 +964,12 @@ impl VideoEncoder {
     // produce output for the first few frames - this is expected behavior.
 
     if packets.is_empty() && guard.is_hardware && !guard.first_output_produced {
-      // Buffer the frame for potential re-encoding on fallback
-      // Use deep_clone to create an owned copy for re-encoding
-      if let Ok(cloned_frame) = frame_to_encode.deep_clone() {
+      // Buffer the frame for potential re-encoding on fallback using shallow clone
+      // (shares pixel buffer via FFmpeg's atomic refcount - safe for read-only re-encoding)
+      if let Ok(shallow) = frame_to_encode.shallow_clone() {
         guard
           .pending_frames
-          .push((cloned_frame, timestamp, options.clone(), rotation, flip));
+          .push((shallow, timestamp, options.clone(), rotation, flip));
       }
       guard.silent_encode_count += 1;
 
@@ -1014,9 +1016,13 @@ impl VideoEncoder {
                 {
                   // Process any output packets from re-encoding
                   for packet in pkts {
+                    // Extract alpha side data for VP9 alpha support
+                    let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
+                    let packet_is_key = packet.is_key();
+
                     // Use buffered_ts (the original input timestamp) instead of packet.pts()
                     let chunk = EncodedVideoChunk::from_packet_with_format(
-                      &packet,
+                      packet,
                       Some(buffered_ts),
                       guard.use_avcc_format,
                     );
@@ -1026,10 +1032,7 @@ impl VideoEncoder {
                       create_svc_metadata(guard.temporal_layer_count, guard.output_frame_count);
                     guard.output_frame_count += 1;
 
-                    // Extract alpha side data for VP9 alpha support
-                    let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
-
-                    let metadata = if !guard.extradata_sent && packet.is_key() {
+                    let metadata = if !guard.extradata_sent && packet_is_key {
                       guard.extradata_sent = true;
                       EncodedVideoChunkMetadata {
                         decoder_config: Some(VideoDecoderConfigOutput {
@@ -1067,7 +1070,7 @@ impl VideoEncoder {
                     } else {
                       guard.output_callback.call(
                         (chunk, metadata).into(),
-                        ThreadsafeFunctionCallMode::Blocking,
+                        ThreadsafeFunctionCallMode::NonBlocking,
                       );
                     }
                     guard.first_output_produced = true;
@@ -1136,23 +1139,22 @@ impl VideoEncoder {
       // Pop timestamp from queue to preserve original input timestamp
       // (FFmpeg may modify PTS internally during encoding)
       let output_timestamp = guard.timestamp_queue.pop_front();
-      let chunk = EncodedVideoChunk::from_packet_with_format(
-        &packet,
-        output_timestamp,
-        guard.use_avcc_format,
-      );
+
+      // Extract alpha side data for VP9 alpha support
+      let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
+      let packet_is_key = packet.is_key();
+
+      let chunk =
+        EncodedVideoChunk::from_packet_with_format(packet, output_timestamp, guard.use_avcc_format);
 
       // Create SVC metadata if temporal layers are configured
       let svc = create_svc_metadata(guard.temporal_layer_count, guard.output_frame_count);
       guard.output_frame_count += 1;
 
-      // Extract alpha side data for VP9 alpha support
-      let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
-
       // Create metadata
       // Note: extradata must be fetched AFTER encoding, as FFmpeg only sets it after first encode
       // Only include decoder_config if we actually have extradata (for codecs that need it)
-      let metadata = if !guard.extradata_sent && packet.is_key() {
+      let metadata = if !guard.extradata_sent && packet_is_key {
         // Check codec type for format conversion
         let is_h264 = codec_string.starts_with("avc1")
           || codec_string.starts_with("avc3")
@@ -1208,18 +1210,14 @@ impl VideoEncoder {
         // instead of populating the codec context's extradata field.
         // For AV1: libaom may embed sequence header in first keyframe instead of extradata.
         let description = if description.is_none() && is_av1 {
-          chunk
-            .get_data()
-            .and_then(|data| convert_obu_extradata_to_av1c(&data).map(Uint8Array::from))
+          chunk.get_data_optional(|data| convert_obu_extradata_to_av1c(data).map(Uint8Array::from))
         } else if description.is_none() && guard.use_avcc_format {
           if is_h264 {
             chunk
-              .get_data()
-              .and_then(|data| extract_avcc_from_avcc_packet(&data).map(Uint8Array::from))
+              .get_data_optional(|data| extract_avcc_from_avcc_packet(data).map(Uint8Array::from))
           } else if is_h265 {
             chunk
-              .get_data()
-              .and_then(|data| extract_hvcc_from_hvcc_packet(&data).map(Uint8Array::from))
+              .get_data_optional(|data| extract_hvcc_from_hvcc_packet(data).map(Uint8Array::from))
           } else {
             description
           }
@@ -1277,7 +1275,7 @@ impl VideoEncoder {
       } else {
         guard.output_callback.call(
           (chunk, metadata).into(),
-          ThreadsafeFunctionCallMode::Blocking,
+          ThreadsafeFunctionCallMode::NonBlocking,
         );
       }
     }
@@ -1349,21 +1347,19 @@ impl VideoEncoder {
     for packet in packets {
       // Pop timestamp from queue to preserve original input timestamp
       let output_timestamp = guard.timestamp_queue.pop_front();
-      let chunk = EncodedVideoChunk::from_packet_with_format(
-        &packet,
-        output_timestamp,
-        guard.use_avcc_format,
-      );
+      // Extract alpha side data for VP9 alpha support
+      let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
+      let packet_is_key = packet.is_key();
+
+      let chunk =
+        EncodedVideoChunk::from_packet_with_format(packet, output_timestamp, guard.use_avcc_format);
 
       // Create SVC metadata if temporal layers are configured
       let svc = create_svc_metadata(guard.temporal_layer_count, guard.output_frame_count);
       guard.output_frame_count += 1;
 
-      // Extract alpha side data for VP9 alpha support
-      let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
-
       // Create metadata (include decoder_config if not sent yet and this is a key frame)
-      let metadata = if !guard.extradata_sent && packet.is_key() {
+      let metadata = if !guard.extradata_sent && packet_is_key {
         // Get config values for metadata
         let (codec_string, width, height, display_width, display_height) = guard
           .config
@@ -1437,18 +1433,14 @@ impl VideoEncoder {
         // instead of populating the codec context's extradata field.
         // For AV1: libaom may embed sequence header in first keyframe instead of extradata.
         let description = if description.is_none() && is_av1 {
-          chunk
-            .get_data()
-            .and_then(|data| convert_obu_extradata_to_av1c(&data).map(Uint8Array::from))
+          chunk.get_data_optional(|data| convert_obu_extradata_to_av1c(data).map(Uint8Array::from))
         } else if description.is_none() && guard.use_avcc_format {
           if is_h264 {
             chunk
-              .get_data()
-              .and_then(|data| extract_avcc_from_avcc_packet(&data).map(Uint8Array::from))
+              .get_data_optional(|data| extract_avcc_from_avcc_packet(data).map(Uint8Array::from))
           } else if is_h265 {
             chunk
-              .get_data()
-              .and_then(|data| extract_hvcc_from_hvcc_packet(&data).map(Uint8Array::from))
+              .get_data_optional(|data| extract_hvcc_from_hvcc_packet(data).map(Uint8Array::from))
           } else {
             description
           }
@@ -1818,7 +1810,7 @@ impl VideoEncoder {
     let error = Error::new(Status::GenericFailure, error_msg);
     inner
       .error_callback
-      .call(error, ThreadsafeFunctionCallMode::Blocking);
+      .call(error, ThreadsafeFunctionCallMode::NonBlocking);
     inner.state = CodecState::Closed;
   }
 
@@ -2088,13 +2080,14 @@ impl VideoEncoder {
         }
       }
     } else {
-      // Already NV12, deep copy for upload
-      match frame.deep_clone() {
-        Ok(copied) => copied,
+      // Already NV12 - use shallow clone to share pixel buffers via FFmpeg's
+      // atomic reference counting. av_hwframe_transfer_data only reads the source.
+      match frame.shallow_clone() {
+        Ok(shallow) => shallow,
         Err(e) => {
           guard.use_hw_frames = false;
           eprintln!(
-            "Warning: Frame copy failed, falling back to CPU frames: {}",
+            "Warning: Frame reference failed, falling back to CPU frames: {}",
             e
           );
           return None;
@@ -3114,10 +3107,10 @@ impl VideoEncoder {
         // Call the listener with no arguments (like dequeue callback)
         match &entry.callback {
           EventListenerCallbackType::Weak(tsf) => {
-            tsf.call((), ThreadsafeFunctionCallMode::Blocking);
+            tsf.call((), ThreadsafeFunctionCallMode::NonBlocking);
           }
           EventListenerCallbackType::Strong(tsf) => {
-            tsf.call((), ThreadsafeFunctionCallMode::Blocking);
+            tsf.call((), ThreadsafeFunctionCallMode::NonBlocking);
           }
         }
         if entry.once {

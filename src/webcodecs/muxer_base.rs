@@ -3,7 +3,6 @@
 //! This module provides common functionality for Mp4Muxer, WebMMuxer, and MkvMuxer
 //! to eliminate code duplication across the three implementations.
 
-use crate::codec::Packet;
 use crate::codec::io_buffer::StreamingBufferHandle;
 use crate::codec::muxer::{
   AudioStreamConfig, ContainerFormat, MuxerContext, MuxerOptions, MuxerOutput, VideoStreamConfig,
@@ -445,25 +444,11 @@ impl<F: MuxerFormat> MuxerInner<F> {
     let chunk_type = chunk.chunk_type()?;
     let timestamp = chunk.timestamp()?;
     let duration = chunk.duration()?;
-    let data = chunk
-      .get_data()
-      .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get chunk data"))?;
 
-    // Create packet
-    let mut packet = Packet::new().map_err(|e| {
-      Error::new(
-        Status::GenericFailure,
-        format!("Failed to create packet: {}", e),
-      )
-    })?;
-
-    // Copy data to packet
-    packet.copy_data_from(&data).map_err(|e| {
-      Error::new(
-        Status::GenericFailure,
-        format!("Failed to copy data to packet: {}", e),
-      )
-    })?;
+    // Get packet using optimized path:
+    // - If chunk has Packet (from encoder): shallow_clone shares buffer (zero-copy)
+    // - If chunk has Vec<u8> (from JS): copy data into new packet
+    let mut packet = chunk.get_packet_for_muxing()?;
 
     // Set packet properties
     packet.set_stream_index(video_index);
@@ -549,28 +534,11 @@ impl<F: MuxerFormat> MuxerInner<F> {
     // Get chunk data
     let timestamp = chunk.timestamp()?;
     let duration = chunk.duration()?;
-    let data = chunk.get_data_vec().map_err(|e| {
-      Error::new(
-        Status::GenericFailure,
-        format!("Failed to get chunk data: {}", e),
-      )
-    })?;
 
-    // Create packet
-    let mut packet = Packet::new().map_err(|e| {
-      Error::new(
-        Status::GenericFailure,
-        format!("Failed to create packet: {}", e),
-      )
-    })?;
-
-    // Copy data to packet
-    packet.copy_data_from(&data).map_err(|e| {
-      Error::new(
-        Status::GenericFailure,
-        format!("Failed to copy data to packet: {}", e),
-      )
-    })?;
+    // Get packet using optimized path:
+    // - If chunk has Packet (from encoder): shallow_clone shares buffer (zero-copy)
+    // - If chunk has Vec<u8> (from JS): copy data into new packet
+    let mut packet = chunk.get_packet_for_muxing()?;
 
     // Set packet properties
     packet.set_stream_index(audio_index);
