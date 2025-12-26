@@ -540,6 +540,31 @@ ImageDecoder supports all W3C spec options:
 
 - **ImageDecoder GIF animation**: FFmpeg may return only the first frame. Use `VideoDecoder` with GIF codec for full animation.
 
+### Per-Frame Quantizer Control
+
+Per-frame quantizer control is available for VP9 and AV1 when using `bitrateMode: 'quantizer'`:
+
+```typescript
+encoder.configure({
+  codec: 'vp09.00.10.08',
+  width: 1920,
+  height: 1080,
+  bitrateMode: 'quantizer',
+})
+
+// Per-frame QP control (0-255 range per W3C WebCodecs spec)
+encoder.encode(frame, { vp9: { quantizer: 128 } })
+```
+
+| Codec | Per-Frame QP | Notes                                                        |
+| ----- | ------------ | ------------------------------------------------------------ |
+| VP9   | ✅ Works     | Uses FFmpeg's dynamic qmax update mechanism                  |
+| AV1   | ❌ No effect | FFmpeg's libaom wrapper doesn't support dynamic qmax updates |
+| H.264 | ✅ Works     | Uses FFmpeg's frame quality mechanism (0-51 range)           |
+| H.265 | ✅ Works     | Uses FFmpeg's frame quality mechanism (0-51 range)           |
+
+**Note:** The 0-255 quantizer range for VP9/AV1 aligns with [Chromium's WebCodecs implementation](https://chromium-review.googlesource.com/c/chromium/src/+/7204065). Internally, values are converted to the 0-63 encoder range using `q_index / 4`.
+
 ## Logging
 
 This library uses Rust's `tracing` crate for structured logging. Enable logging via the `WEBCODECS_LOG` environment variable:

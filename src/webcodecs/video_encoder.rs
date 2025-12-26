@@ -799,11 +799,28 @@ impl VideoEncoder {
       frame_to_encode.set_pict_type(AVPictureType::I);
     }
 
-    // Apply per-frame quantizer if specified in encode options
-    // This allows W3C WebCodecs per-frame QP control with bitrateMode: 'quantizer'
-    if let Some(codec_id) = guard.codec_id {
-      if let Some(quantizer) = extract_per_frame_quantizer(options.as_ref(), codec_id) {
-        let quality = quantizer_to_ffmpeg_quality(quantizer, codec_id);
+    // Apply per-frame quantizer if specified in encode options.
+    // This enables W3C WebCodecs per-frame QP control with bitrateMode: 'quantizer'.
+    //
+    // For VP9/AV1: Use qmin/qmax on the codec context (FFmpeg's libvpx/libaom mechanism)
+    //   - WebCodecs API provides 0-255 (q_index), converted to encoder's 0-63 range
+    //   - Set qmin=qmax to force exact quantizer value for the frame
+    //
+    // For H.264/HEVC: Use frame->quality (FFmpeg's x264/x265 mechanism)
+    //   - WebCodecs API provides 0-51 (QP), multiplied by FF_QP2LAMBDA
+    if let Some(codec_id) = guard.codec_id
+      && let Some(quantizer) = extract_per_frame_quantizer(options.as_ref(), codec_id)
+    {
+      if codec_uses_q_index(codec_id) {
+        // VP9/AV1: Convert 0-255 to 0-63 and set qmin=qmax on context
+        let q = q_index_to_quantizer(quantizer);
+        if let Some(ctx) = guard.context.as_mut() {
+          ctx.set_qmin(q);
+          ctx.set_qmax(q);
+        }
+      } else {
+        // H.264/HEVC: Use frame quality mechanism
+        let quality = quantizer_to_ffmpeg_quality(quantizer);
         frame_to_encode.set_quality(quality);
       }
     }
@@ -3663,19 +3680,48 @@ fn extract_per_frame_quantizer(
   }
 }
 
-/// Convert WebCodecs quantizer value to FFmpeg quality value
+/// Convert WebCodecs q_index (0-255) to encoder quantizer (0-63) for VP9/AV1.
+///
+/// This matches Chromium's QIndexToQuantizer function from:
+/// https://chromium-review.googlesource.com/c/chromium/src/+/7204065
+///
+/// The W3C WebCodecs spec uses the bitstream q_index range (0-255) for the public API,
+/// but libvpx and libaom encoders use an internal quantizer range of 0-63.
+/// The conversion is simply q_index / 4.
+#[inline]
+fn q_index_to_quantizer(q_index: u16) -> i32 {
+  // Clamp to valid range and convert
+  let clamped = q_index.min(255);
+  (clamped / 4) as i32
+}
+
+/// Convert encoder quantizer (0-63) to WebCodecs q_index (0-255) for VP9/AV1.
+///
+/// This matches Chromium's QuantizerToQIndex function.
+/// Inverse of q_index_to_quantizer.
+#[inline]
+#[allow(dead_code)]
+fn quantizer_to_q_index(quantizer: i32) -> u16 {
+  let clamped = quantizer.clamp(0, 63);
+  (clamped * 4) as u16
+}
+
+/// Convert WebCodecs quantizer value to FFmpeg quality value for H.264/HEVC.
 ///
 /// Per W3C WebCodecs Codec Registry:
-/// - VP9/AV1: quantizer index is 0-255 (q_index scale per codec spec)
 /// - AVC/HEVC: quantizer is 0-51 (QP scale per codec spec)
 ///
 /// FFmpeg expects quality = value * FF_QP2LAMBDA for per-frame quality control.
-fn quantizer_to_ffmpeg_quality(quantizer: u16, _codec_id: AVCodecID) -> i32 {
-  // All codecs: multiply by FF_QP2LAMBDA for FFmpeg's quality field
-  // The quantizer value is already in the correct scale per W3C spec:
-  // - VP9/AV1: 0-255 (q_index, passed directly per W3C spec change)
-  // - AVC/HEVC: 0-51 (QP value, passed directly)
-  quantizer as i32 * FF_QP2LAMBDA
+/// Note: This is only used for H.264/HEVC. VP9/AV1 use qmin/qmax instead.
+fn quantizer_to_ffmpeg_quality(quantizer: u16) -> i32 {
+  // Clamp to valid H.264/HEVC QP range (0-51) before conversion
+  let clamped = quantizer.min(51);
+  clamped as i32 * FF_QP2LAMBDA
+}
+
+/// Check if codec uses q_index range (0-255) vs QP range (0-51)
+fn codec_uses_q_index(codec_id: AVCodecID) -> bool {
+  matches!(codec_id, AVCodecID::Vp9 | AVCodecID::Av1)
 }
 
 /// Parse WebCodecs codec string to FFmpeg codec ID

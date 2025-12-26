@@ -21,6 +21,10 @@ unsafe extern "C" {
   pub fn ffctx_set_bit_rate(ctx: *mut AVCodecContext, bit_rate: i64);
   pub fn ffctx_set_rc_max_rate(ctx: *mut AVCodecContext, rc_max_rate: i64);
   pub fn ffctx_set_rc_buffer_size(ctx: *mut AVCodecContext, rc_buffer_size: c_int);
+  pub fn ffctx_set_qmin(ctx: *mut AVCodecContext, qmin: c_int);
+  pub fn ffctx_set_qmax(ctx: *mut AVCodecContext, qmax: c_int);
+  pub fn ffctx_get_qmin(ctx: *const AVCodecContext) -> c_int;
+  pub fn ffctx_get_qmax(ctx: *const AVCodecContext) -> c_int;
   pub fn ffctx_set_gop_size(ctx: *mut AVCodecContext, gop_size: c_int);
   pub fn ffctx_set_max_b_frames(ctx: *mut AVCodecContext, max_b_frames: c_int);
   pub fn ffctx_set_time_base(ctx: *mut AVCodecContext, num: c_int, den: c_int);

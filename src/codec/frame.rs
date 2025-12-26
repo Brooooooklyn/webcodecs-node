@@ -274,10 +274,12 @@ impl Frame {
   }
 
   /// Set quality for per-frame QP control during encoding.
-  /// The value should be quantizer * FF_QP2LAMBDA where:
-  /// - VP9/AV1: quantizer is 0-255 (q_index per W3C WebCodecs spec)
-  /// - AVC/HEVC: quantizer is 0-51 (QP value per W3C WebCodecs spec)
-  /// FF_QP2LAMBDA is 118 in FFmpeg.
+  ///
+  /// The value should be `QP * FF_QP2LAMBDA` where FF_QP2LAMBDA is 118 in FFmpeg.
+  ///
+  /// Note: This per-frame quality field is only used by H.264/HEVC encoders (x264/x265).
+  /// For these codecs, QP is 0-51 per W3C WebCodecs spec.
+  /// VP9/AV1 encoders use qmin/qmax on the codec context instead.
   #[inline]
   pub fn set_quality(&mut self, quality: i32) {
     unsafe { ffframe_set_quality(self.as_mut_ptr(), quality) }

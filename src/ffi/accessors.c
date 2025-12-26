@@ -49,6 +49,22 @@ void ffctx_set_rc_buffer_size(AVCodecContext* ctx, int rc_buffer_size) {
     ctx->rc_buffer_size = rc_buffer_size;
 }
 
+void ffctx_set_qmin(AVCodecContext* ctx, int qmin) {
+    ctx->qmin = qmin;
+}
+
+void ffctx_set_qmax(AVCodecContext* ctx, int qmax) {
+    ctx->qmax = qmax;
+}
+
+int ffctx_get_qmin(const AVCodecContext* ctx) {
+    return ctx->qmin;
+}
+
+int ffctx_get_qmax(const AVCodecContext* ctx) {
+    return ctx->qmax;
+}
+
 void ffctx_set_gop_size(AVCodecContext* ctx, int gop_size) {
     ctx->gop_size = gop_size;
 }

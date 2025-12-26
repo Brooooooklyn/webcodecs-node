@@ -6,10 +6,11 @@ use crate::ffi::{
   self, AVCodec, AVCodecContext, AVCodecID, AVHWDeviceType, AVPixelFormat,
   accessors::{
     codec_flag, ffctx_get_extradata, ffctx_get_extradata_size, ffctx_get_flags,
-    ffctx_get_frame_size, ffctx_get_height, ffctx_get_pix_fmt, ffctx_get_sample_rate,
-    ffctx_get_width, ffctx_set_bit_rate, ffctx_set_channels, ffctx_set_flags, ffctx_set_framerate,
-    ffctx_set_gop_size, ffctx_set_height, ffctx_set_hw_device_ctx, ffctx_set_level,
-    ffctx_set_max_b_frames, ffctx_set_pix_fmt, ffctx_set_profile, ffctx_set_rc_buffer_size,
+    ffctx_get_frame_size, ffctx_get_height, ffctx_get_pix_fmt, ffctx_get_qmax, ffctx_get_qmin,
+    ffctx_get_sample_rate, ffctx_get_width, ffctx_set_bit_rate, ffctx_set_channels,
+    ffctx_set_flags, ffctx_set_framerate, ffctx_set_gop_size, ffctx_set_height,
+    ffctx_set_hw_device_ctx, ffctx_set_level, ffctx_set_max_b_frames, ffctx_set_pix_fmt,
+    ffctx_set_profile, ffctx_set_qmax, ffctx_set_qmin, ffctx_set_rc_buffer_size,
     ffctx_set_rc_max_rate, ffctx_set_sample_fmt, ffctx_set_sample_rate, ffctx_set_thread_count,
     ffctx_set_time_base, ffctx_set_width,
   },
@@ -296,6 +297,12 @@ impl CodecContext {
           ffctx_set_bit_rate(ctx, 0);
           let crf_value = config.crf.unwrap_or(23) as i64; // Default CRF 23
 
+          // Set qmin=0 to allow per-frame quantizer control via qmax.
+          // This enables WebCodecs per-frame QP control for VP9/AV1 encoders.
+          // FFmpeg's libvpx/libaom wrappers dynamically update qmax per-frame.
+          ffctx_set_qmin(self.ptr.as_ptr(), 0);
+          ffctx_set_qmax(self.ptr.as_ptr(), 63); // Full range for VP9/AV1
+
           // Set CRF via av_opt_set_int (works for x264, x265)
           let crf_key = CString::new("crf").expect("CString::new failed");
           av_opt_set_int(
@@ -381,6 +388,39 @@ impl CodecContext {
       let current_flags = ffctx_get_flags(ctx);
       ffctx_set_flags(ctx, current_flags | codec_flag::GLOBAL_HEADER);
     }
+  }
+
+  /// Set minimum quantizer value for rate control.
+  ///
+  /// For VP9/AV1, this should be in the 0-63 range (internal encoder range).
+  /// The WebCodecs API uses 0-255 (q_index), which must be converted before calling this.
+  pub fn set_qmin(&mut self, qmin: i32) {
+    unsafe {
+      ffctx_set_qmin(self.ptr.as_ptr(), qmin);
+    }
+  }
+
+  /// Set maximum quantizer value for rate control.
+  ///
+  /// For VP9/AV1, this should be in the 0-63 range (internal encoder range).
+  /// The WebCodecs API uses 0-255 (q_index), which must be converted before calling this.
+  ///
+  /// For per-frame quantizer control with VP9, set this before each encode call.
+  /// FFmpeg's libvpx wrapper will detect the change and update the encoder config.
+  pub fn set_qmax(&mut self, qmax: i32) {
+    unsafe {
+      ffctx_set_qmax(self.ptr.as_ptr(), qmax);
+    }
+  }
+
+  /// Get current minimum quantizer value.
+  pub fn qmin(&self) -> i32 {
+    unsafe { ffctx_get_qmin(self.ptr.as_ptr()) }
+  }
+
+  /// Get current maximum quantizer value.
+  pub fn qmax(&self) -> i32 {
+    unsafe { ffctx_get_qmax(self.ptr.as_ptr()) }
   }
 
   /// Apply hardware encoder-specific options based on the encoder name and latency mode
