@@ -275,22 +275,23 @@ impl CodecContext {
       // Rate control based on bitrate mode
       match config.bitrate_mode {
         BitrateMode::Constant => {
-          // CBR: Set bitrate and optionally rc_max_rate equal to bitrate
+          // CBR: Set bitrate, rc_max_rate, and rc_buffer_size equal to bitrate
+          // VBV buffer is required for x264/x265 to properly enforce bitrate
           ffctx_set_bit_rate(ctx, config.bitrate as i64);
           let rc_max = config.rc_max_rate.unwrap_or(config.bitrate);
           ffctx_set_rc_max_rate(ctx, rc_max as i64);
-          if let Some(buf_size) = config.rc_buffer_size {
-            ffctx_set_rc_buffer_size(ctx, buf_size as i32);
-          }
+          // Default buffer size to bitrate (1 second of video) if not specified
+          let buf_size = config.rc_buffer_size.unwrap_or(config.bitrate as u32);
+          ffctx_set_rc_buffer_size(ctx, buf_size as i32);
         }
         BitrateMode::Variable => {
           // VBR: Set bitrate with higher rc_max_rate
           ffctx_set_bit_rate(ctx, config.bitrate as i64);
           let rc_max = config.rc_max_rate.unwrap_or(config.bitrate * 2);
           ffctx_set_rc_max_rate(ctx, rc_max as i64);
-          if let Some(buf_size) = config.rc_buffer_size {
-            ffctx_set_rc_buffer_size(ctx, buf_size as i32);
-          }
+          // Default buffer size to 2x bitrate for VBR (allows more variance)
+          let buf_size = config.rc_buffer_size.unwrap_or(config.bitrate as u32 * 2);
+          ffctx_set_rc_buffer_size(ctx, buf_size as i32);
         }
         BitrateMode::Quantizer => {
           // CRF/CQ mode: Set bitrate to 0 and use CRF option
@@ -546,6 +547,111 @@ impl CodecContext {
         }
       }
       // Note: Unknown hardware encoders get no special options (safe default)
+    }
+  }
+
+  /// Apply software encoder-specific options based on latency mode
+  ///
+  /// Aligned with Chromium's WebCodecs implementation:
+  /// - Chromium uses constant cpu-used for VP8/VP9 (latencyMode only affects frame drop)
+  /// - Chromium uses OpenH264 for H.264 (not x264), so we use FFmpeg defaults
+  /// - Only AV1 varies cpu-used based on latencyMode
+  ///
+  /// ## libx264/libx265
+  /// - No preset/tune changes (Chromium philosophy: latencyMode affects frame drop, not speed)
+  /// - Uses FFmpeg defaults (medium preset)
+  ///
+  /// ## libvpx-vp8
+  /// - cpu-used=-6 (constant, same as Chromium)
+  /// - deadline=realtime (always)
+  ///
+  /// ## libvpx-vp9
+  /// - cpu-used=7 (constant, same as Chromium)
+  /// - deadline=realtime (always)
+  /// - row-mt=1 (enable row-level multi-threading)
+  ///
+  /// ## libaom-av1
+  /// - cpu-used=9 (realtime) / 7 (quality) - Chromium values
+  /// - usage=realtime for realtime mode
+  /// - row-mt=1 (enable row-level multi-threading)
+  pub fn apply_sw_encoder_options(&mut self, encoder_name: &str, realtime: bool) {
+    unsafe {
+      let ctx = self.ptr.as_ptr() as *mut std::ffi::c_void;
+
+      // libx264 (H.264) - Chromium uses OpenH264 with simple rate control
+      // We use constant fast preset + zerolatency tune (not dependent on latencyMode)
+      // to get OpenH264-like behavior: simple rate control that respects bitrate
+      // The zerolatency tune is essential for proper rate control with varying timestamps
+      if encoder_name == "libx264" {
+        av_opt_set(
+          ctx,
+          c"preset".as_ptr(),
+          c"superfast".as_ptr(),
+          opt_flag::SEARCH_CHILDREN,
+        );
+        // zerolatency tune is essential for proper rate control with decoded frames
+        // It disables lookahead and ensures immediate bitrate adherence
+        av_opt_set(
+          ctx,
+          c"tune".as_ptr(),
+          c"zerolatency".as_ptr(),
+          opt_flag::SEARCH_CHILDREN,
+        );
+      }
+      // libx265 (H.265/HEVC) - Similar philosophy
+      // Use ultrafast preset which has low latency settings built-in
+      // Note: tune=zerolatency causes conflicts (lookahead=0 vs bframes)
+      // so we just use ultrafast which is fast enough for real-time
+      else if encoder_name == "libx265" {
+        av_opt_set(
+          ctx,
+          c"preset".as_ptr(),
+          c"ultrafast".as_ptr(),
+          opt_flag::SEARCH_CHILDREN,
+        );
+      }
+      // libvpx-vp8 - Chromium uses cpu-used=-6 constant
+      else if encoder_name == "libvpx-vp8" {
+        av_opt_set_int(ctx, c"cpu-used".as_ptr(), -6, opt_flag::SEARCH_CHILDREN);
+        av_opt_set(
+          ctx,
+          c"deadline".as_ptr(),
+          c"realtime".as_ptr(),
+          opt_flag::SEARCH_CHILDREN,
+        );
+      }
+      // libvpx-vp9 - Chromium uses cpu-used=7 constant
+      else if encoder_name == "libvpx-vp9" {
+        av_opt_set_int(ctx, c"cpu-used".as_ptr(), 7, opt_flag::SEARCH_CHILDREN);
+        av_opt_set(
+          ctx,
+          c"deadline".as_ptr(),
+          c"realtime".as_ptr(),
+          opt_flag::SEARCH_CHILDREN,
+        );
+        av_opt_set_int(ctx, c"row-mt".as_ptr(), 1, opt_flag::SEARCH_CHILDREN);
+      }
+      // libaom-av1 - Chromium DOES vary cpu-used by latencyMode
+      else if encoder_name == "libaom-av1" {
+        // Chromium uses cpu-used=9 for realtime, 7 for quality
+        let cpu_speed = if realtime { 9 } else { 7 };
+        av_opt_set_int(
+          ctx,
+          c"cpu-used".as_ptr(),
+          cpu_speed,
+          opt_flag::SEARCH_CHILDREN,
+        );
+        if realtime {
+          av_opt_set(
+            ctx,
+            c"usage".as_ptr(),
+            c"realtime".as_ptr(),
+            opt_flag::SEARCH_CHILDREN,
+          );
+        }
+        av_opt_set_int(ctx, c"row-mt".as_ptr(), 1, opt_flag::SEARCH_CHILDREN);
+      }
+      // Note: rav1e doesn't have equivalent options through FFmpeg interface
     }
   }
 

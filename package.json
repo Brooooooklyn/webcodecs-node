@@ -43,13 +43,12 @@
   ],
   "scripts": {
     "artifacts": "napi artifacts",
-    "bench": "node --import @oxc-node/core/register benchmark/bench.ts",
-    "build": "napi build --platform --release",
-    "build:debug": "napi build --platform",
-    "format": "run-p format:rs format:toml format:oxfmt format:prettier",
+    "bench": "node --import @oxc-node/core/register benchmark/compare.ts",
+    "build": "oxnode ./build.ts --platform --release",
+    "build:debug": "oxnode ./build.ts --platform",
+    "format": "run-p format:rs format:oxfmt format:prettier",
     "format:prettier": "prettier . \"!**/*.{js,jsx,ts,tsx}\" -w",
     "format:oxfmt": "oxfmt",
-    "format:toml": "taplo format",
     "format:rs": "cargo fmt",
     "lint": "oxlint --type-aware",
     "prepublishOnly": "napi prepublish -t npm",
@@ -60,39 +59,40 @@
   },
   "lint-staged": {
     "*.@(js|ts|tsx)": [
-      "oxlint --fix",
-      "oxfmt"
+      "oxlint --fix"
     ],
-    "*.@(yml|yaml|md|json)": [
+    "*.@(yml|yaml|md)": [
       "prettier --write"
     ],
-    "*.toml": [
-      "taplo format"
+    "*.@(js|ts|tsx|toml|json)": [
+      "oxfmt"
     ]
   },
   "devDependencies": {
     "@emnapi/core": "^1.7.1",
     "@emnapi/runtime": "^1.7.1",
-    "@napi-rs/canvas": "^0.1.86",
+    "@napi-rs/canvas": "^0.1.87",
     "@napi-rs/cli": "^3.5.0",
     "@napi-rs/wasm-runtime": "^1.1.0",
     "@oxc-node/core": "^0.0.35",
+    "@oxc-node/cli": "^0.0.35",
     "@taplo/cli": "^0.7.0",
     "@tybys/wasm-util": "^0.10.1",
-    "@types/node": "^25.0.2",
+    "@types/node": "^25.0.3",
     "ava": "^6.4.1",
     "chalk": "^5.6.2",
     "emnapi": "^1.7.1",
     "husky": "^9.1.7",
     "lint-staged": "^16.2.7",
-    "mediabunny": "1.26.0",
+    "mediabunny": "1.27.2",
     "npm-run-all2": "^8.0.4",
-    "oxfmt": "^0.18.0",
-    "oxlint": "^1.33.0",
-    "oxlint-tsgolint": "^0.9.1",
+    "oxfmt": "^0.20.0",
+    "oxlint": "^1.35.0",
+    "oxlint-tsgolint": "^0.10.0",
     "prettier": "^3.7.4",
     "tinybench": "^6.0.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "webcodecs-polyfill": "^1.0.1"
   },
   "peerDependencies": {
     "@napi-rs/canvas": ">=0.1.0"
@@ -118,7 +118,7 @@
       "armv7-unknown-linux-gnueabihf"
     ]
   },
-  "packageManager": "pnpm@10.26.0",
+  "packageManager": "pnpm@10.26.2",
   "prettier": {
     "arrowParens": "always",
     "printWidth": 120,
@@ -149,5 +149,18 @@
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "node-av",
+      "@seydx/node-av-darwin-arm64",
+      "@seydx/node-av-darwin-x64",
+      "@seydx/node-av-linux-arm64",
+      "@seydx/node-av-linux-x64",
+      "@seydx/node-av-win32-arm64-mingw",
+      "@seydx/node-av-win32-arm64-msvc",
+      "@seydx/node-av-win32-x64-mingw",
+      "@seydx/node-av-win32-x64-msvc"
+    ]
   }
 }

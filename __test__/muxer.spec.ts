@@ -118,7 +118,7 @@ test('Mp4Muxer: muxes video chunks and produces valid MP4', async (t) => {
     muxer.addVideoChunk(videoChunks[i], videoMetadatas[i])
   }
 
-  await muxer.flush()
+  muxer.flush()
   const mp4Data = muxer.finalize()
   muxer.close()
 
@@ -197,7 +197,7 @@ test('WebMMuxer: muxes VP9 video chunks', async (t) => {
     muxer.addVideoChunk(videoChunks[i], videoMetadatas[i])
   }
 
-  await muxer.flush()
+  muxer.flush()
   const webmData = muxer.finalize()
   muxer.close()
 
@@ -266,7 +266,7 @@ test('WebMMuxer: muxes Opus audio chunks', async (t) => {
     muxer.addAudioChunk(audioChunks[i], audioMetadatas[i])
   }
 
-  await muxer.flush()
+  muxer.flush()
   const webmData = muxer.finalize()
   muxer.close()
 
@@ -351,7 +351,7 @@ test('WebMMuxer: muxes VP9 video and Opus audio combined', async (t) => {
     muxer.addAudioChunk(audioChunks[i], audioMetadatas[i])
   }
 
-  await muxer.flush()
+  muxer.flush()
   const webmData = muxer.finalize()
   muxer.close()
 
@@ -401,7 +401,7 @@ test('WebMMuxer: muxes VP8 video chunks', async (t) => {
     muxer.addVideoChunk(videoChunks[i], videoMetadatas[i])
   }
 
-  await muxer.flush()
+  muxer.flush()
   const webmData = muxer.finalize()
   muxer.close()
 
@@ -453,7 +453,7 @@ test('WebMMuxer: muxes AV1 video chunks', async (t) => {
     muxer.addVideoChunk(videoChunks[i], videoMetadatas[i])
   }
 
-  await muxer.flush()
+  muxer.flush()
   const webmData = muxer.finalize()
   muxer.close()
 
@@ -529,7 +529,7 @@ test('MkvMuxer: muxes H.264 video chunks', async (t) => {
     muxer.addVideoChunk(videoChunks[i], videoMetadatas[i])
   }
 
-  await muxer.flush()
+  muxer.flush()
   const mkvData = muxer.finalize()
   muxer.close()
 
@@ -626,7 +626,7 @@ test('MkvMuxer: muxes AAC audio chunks', async (t) => {
     muxer.addAudioChunk(audioChunks[i], audioMetadatas[i])
   }
 
-  await muxer.flush()
+  muxer.flush()
   const mkvData = muxer.finalize()
   muxer.close()
 
@@ -676,7 +676,7 @@ test('MkvMuxer: muxes Opus audio chunks', async (t) => {
     muxer.addAudioChunk(audioChunks[i], audioMetadatas[i])
   }
 
-  await muxer.flush()
+  muxer.flush()
   const mkvData = muxer.finalize()
   muxer.close()
 
@@ -765,7 +765,7 @@ test('MkvMuxer: muxes H.264 video and AAC audio combined', async (t) => {
     muxer.addAudioChunk(audioChunks[i], audioMetadatas[i])
   }
 
-  await muxer.flush()
+  muxer.flush()
   const mkvData = muxer.finalize()
   muxer.close()
 
@@ -815,7 +815,7 @@ test('MkvMuxer: muxes VP9 video chunks', async (t) => {
     muxer.addVideoChunk(videoChunks[i], videoMetadatas[i])
   }
 
-  await muxer.flush()
+  muxer.flush()
   const mkvData = muxer.finalize()
   muxer.close()
 
@@ -867,7 +867,7 @@ test('MkvMuxer: muxes AV1 video chunks', async (t) => {
     muxer.addVideoChunk(videoChunks[i], videoMetadatas[i])
   }
 
-  await muxer.flush()
+  muxer.flush()
   const mkvData = muxer.finalize()
   muxer.close()
 
@@ -967,7 +967,7 @@ test('Mp4Muxer: muxes both video and audio', async (t) => {
     muxer.addAudioChunk(audioChunks[i], audioMetadatas[i])
   }
 
-  await muxer.flush()
+  muxer.flush()
   const mp4Data = muxer.finalize()
   muxer.close()
 

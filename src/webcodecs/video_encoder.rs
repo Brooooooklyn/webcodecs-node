@@ -1563,9 +1563,11 @@ impl VideoEncoder {
             None => CodecBitrateMode::Constant,
           };
 
-          let (gop_size, max_b_frames) = match config.latency_mode {
-            Some(LatencyMode::Realtime) => (10, 0),
-            _ => (60, 2),
+          let realtime = matches!(config.latency_mode, Some(LatencyMode::Realtime));
+          let (gop_size, max_b_frames) = if realtime {
+            (10, 0) // Low latency: small GOP, no B-frames
+          } else {
+            (60, 2) // Quality mode: larger GOP with B-frames
           };
 
           let pixel_format = if guard.use_alpha {
@@ -1592,11 +1594,17 @@ impl VideoEncoder {
             crf: None,
           };
 
-          if new_context.configure_encoder(&encoder_config).is_ok() && new_context.open().is_ok() {
-            // Drop old context and replace with new one
-            guard.context = Some(new_context);
-            guard.extradata_sent = false;
-            guard.frame_count = 0;
+          if new_context.configure_encoder(&encoder_config).is_ok() {
+            // Apply software encoder options (preset/tune) for realtime mode
+            if !result.is_hardware {
+              new_context.apply_sw_encoder_options(&result.encoder_name, realtime);
+            }
+            if new_context.open().is_ok() {
+              // Drop old context and replace with new one
+              guard.context = Some(new_context);
+              guard.extradata_sent = false;
+              guard.frame_count = 0;
+            }
           }
         }
       }
@@ -1674,9 +1682,11 @@ impl VideoEncoder {
       None => CodecBitrateMode::Constant,
     };
 
-    let (gop_size, max_b_frames) = match config.latency_mode {
-      Some(LatencyMode::Realtime) => (10, 0),
-      _ => (60, 2),
+    let realtime = matches!(config.latency_mode, Some(LatencyMode::Realtime));
+    let (gop_size, max_b_frames) = if realtime {
+      (10, 0) // Low latency: small GOP, no B-frames
+    } else {
+      (60, 2) // Quality mode: larger GOP with B-frames
     };
 
     // Determine if alpha channel should be preserved (only VP9 supports alpha)
@@ -1739,7 +1749,12 @@ impl VideoEncoder {
         Err(e) => {
           // For no-preference, try software fallback if HW failed at creation
           if guard.hw_preference == HardwareAcceleration::NoPreference && hw_type.is_some() {
-            match Self::create_software_encoder(codec_id, &encoder_config, use_avcc_format) {
+            match Self::create_software_encoder(
+              codec_id,
+              &encoder_config,
+              use_avcc_format,
+              realtime,
+            ) {
               Ok((ctx, name)) => (ctx, false, name),
               Err(e2) => {
                 Self::report_error(
@@ -1763,7 +1778,7 @@ impl VideoEncoder {
     if let Err(e) = context.configure_encoder(&encoder_config) {
       // Fallback to software if HW configure fails
       if guard.hw_preference == HardwareAcceleration::NoPreference && is_hardware {
-        match Self::create_software_encoder(codec_id, &encoder_config, use_avcc_format) {
+        match Self::create_software_encoder(codec_id, &encoder_config, use_avcc_format, realtime) {
           Ok((ctx, name)) => {
             context = ctx;
             is_hardware = false;
@@ -1793,7 +1808,8 @@ impl VideoEncoder {
       if let Err(e) = context.open() {
         // Fallback to software if HW open fails
         if guard.hw_preference == HardwareAcceleration::NoPreference && is_hardware {
-          match Self::create_software_encoder(codec_id, &encoder_config, use_avcc_format) {
+          match Self::create_software_encoder(codec_id, &encoder_config, use_avcc_format, realtime)
+          {
             Ok((ctx, name)) => {
               context = ctx;
               is_hardware = false;
@@ -1995,6 +2011,7 @@ impl VideoEncoder {
     codec_id: AVCodecID,
     encoder_config: &EncoderConfig,
     needs_global_header: bool,
+    realtime: bool,
   ) -> Result<(CodecContext, String)> {
     let result = CodecContext::new_encoder_with_hw_info(codec_id, None).map_err(|e| {
       Error::new(
@@ -2011,6 +2028,9 @@ impl VideoEncoder {
         format!("Failed to configure software encoder: {}", e),
       )
     })?;
+
+    // Apply software encoder options (preset=ultrafast, tune=zerolatency for H.264/H.265)
+    context.apply_sw_encoder_options(&result.encoder_name, realtime);
 
     // Set GLOBAL_HEADER for AVCC/HVCC format output
     if needs_global_header {
@@ -2442,9 +2462,11 @@ impl VideoEncoder {
     };
 
     // Parse latency mode: "realtime" = low latency, "quality" = default quality mode
-    let (gop_size, max_b_frames) = match config.latency_mode {
-      Some(LatencyMode::Realtime) => (10, 0), // Low latency: small GOP, no B-frames
-      _ => (60, 2),                           // Quality mode: larger GOP with B-frames
+    let realtime = matches!(config.latency_mode, Some(LatencyMode::Realtime));
+    let (gop_size, max_b_frames) = if realtime {
+      (10, 0) // Low latency: small GOP, no B-frames
+    } else {
+      (60, 2) // Quality mode: larger GOP with B-frames
     };
 
     // Determine if alpha channel should be preserved
@@ -2479,7 +2501,12 @@ impl VideoEncoder {
     if let Err(e) = context.configure_encoder(&encoder_config) {
       // For no-preference, try software fallback if hardware configure fails
       if hw_preference == HardwareAcceleration::NoPreference && is_hardware {
-        match Self::create_software_encoder(codec_id, &encoder_config, needs_global_header) {
+        match Self::create_software_encoder(
+          codec_id,
+          &encoder_config,
+          needs_global_header,
+          realtime,
+        ) {
           Ok((sw_ctx, sw_name)) => {
             context = sw_ctx;
             is_hardware = false;
@@ -2502,12 +2529,14 @@ impl VideoEncoder {
       }
     }
 
-    // Apply hardware encoder-specific options based on latency mode
-    // This sets sensible defaults for each hardware encoder (VideoToolbox, NVENC, VAAPI, QSV)
-    // based on whether the user requested realtime (low-latency) or quality mode
+    // Apply encoder-specific options based on latency mode
     if is_hardware {
-      let realtime = matches!(config.latency_mode, Some(LatencyMode::Realtime));
+      // Hardware encoders: VideoToolbox, NVENC, VAAPI, QSV
       context.apply_hw_encoder_options(&encoder_name, realtime);
+    } else {
+      // Software encoders: libx264, libx265, libvpx, libaom
+      // Sets preset=ultrafast, tune=zerolatency for H.264/H.265 in realtime mode
+      context.apply_sw_encoder_options(&encoder_name, realtime);
     }
 
     // Set GLOBAL_HEADER flag for AVCC/HVCC format output
@@ -2520,7 +2549,12 @@ impl VideoEncoder {
     if let Err(e) = context.open() {
       // For no-preference, try software fallback if hardware open fails
       if hw_preference == HardwareAcceleration::NoPreference && is_hardware {
-        match Self::create_software_encoder(codec_id, &encoder_config, needs_global_header) {
+        match Self::create_software_encoder(
+          codec_id,
+          &encoder_config,
+          needs_global_header,
+          realtime,
+        ) {
           Ok((sw_ctx, sw_name)) => {
             context = sw_ctx;
             is_hardware = false;
