@@ -1595,8 +1595,12 @@ impl VideoEncoder {
           };
 
           if new_context.configure_encoder(&encoder_config).is_ok() {
-            // Apply software encoder options (preset/tune) for realtime mode
-            if !result.is_hardware {
+            // Apply encoder-specific options based on latency mode
+            if result.is_hardware {
+              // Hardware encoders: VideoToolbox, NVENC, VAAPI, QSV
+              new_context.apply_hw_encoder_options(&result.encoder_name, realtime);
+            } else {
+              // Software encoders: libx264, libx265, libvpx, libaom
               new_context.apply_sw_encoder_options(&result.encoder_name, realtime);
             }
             if new_context.open().is_ok() {

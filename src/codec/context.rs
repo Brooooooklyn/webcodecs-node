@@ -554,12 +554,17 @@ impl CodecContext {
   ///
   /// Aligned with Chromium's WebCodecs implementation:
   /// - Chromium uses constant cpu-used for VP8/VP9 (latencyMode only affects frame drop)
-  /// - Chromium uses OpenH264 for H.264 (not x264), so we use FFmpeg defaults
+  /// - Chromium uses OpenH264 for H.264 (not x264), so we use constant fast settings
   /// - Only AV1 varies cpu-used based on latencyMode
   ///
-  /// ## libx264/libx265
-  /// - No preset/tune changes (Chromium philosophy: latencyMode affects frame drop, not speed)
-  /// - Uses FFmpeg defaults (medium preset)
+  /// ## libx264
+  /// - preset=superfast + tune=zerolatency (constant, not latencyMode-dependent)
+  /// - Chromium philosophy: latencyMode affects frame drop behavior, not encoder speed
+  /// - zerolatency tune ensures proper rate control with varying frame timestamps
+  ///
+  /// ## libx265
+  /// - preset=ultrafast (constant, not latencyMode-dependent)
+  /// - Note: tune=zerolatency causes conflicts with bframes, so we use ultrafast only
   ///
   /// ## libvpx-vp8
   /// - cpu-used=-6 (constant, same as Chromium)

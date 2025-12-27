@@ -40,9 +40,9 @@ console.log(chalk.gray(`  Video: small_buck_bunny.mp4`))
 // Run napi-rs benchmark
 console.log(chalk.cyan('\nRunning @napi-rs/webcodecs benchmark...'))
 const napiStart = performance.now()
-const napiOutput = execSync('node benchmark/bench-napi.ts', {
+const napiOutput = execSync('node --import @oxc-node/core/register benchmark/bench-napi.ts', {
   encoding: 'utf-8',
-  stdio: ['pipe', 'pipe', 'pipe'],
+  stdio: ['pipe', 'pipe', 'inherit'], // inherit stderr for error visibility
   cwd: process.cwd(),
 })
 const napiTime = performance.now() - napiStart
@@ -52,9 +52,9 @@ console.log(chalk.green(`  Done in ${(napiTime / 1000).toFixed(2)}s`))
 // Run polyfill benchmark
 console.log(chalk.cyan('Running webcodecs-polyfill benchmark...'))
 const polyStart = performance.now()
-const polyOutput = execSync('node benchmark/bench-polyfill.ts', {
+const polyOutput = execSync('node --import @oxc-node/core/register benchmark/bench-polyfill.ts', {
   encoding: 'utf-8',
-  stdio: ['pipe', 'pipe', 'pipe'],
+  stdio: ['pipe', 'pipe', 'inherit'], // inherit stderr for error visibility
   cwd: process.cwd(),
 })
 const polyTime = performance.now() - polyStart
