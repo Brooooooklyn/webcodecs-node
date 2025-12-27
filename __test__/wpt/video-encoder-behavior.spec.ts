@@ -693,7 +693,7 @@ test('VideoEncoder: new flush after reset in callback', async (t) => {
 
   // Wait for the second flush
   if (flushInCallbackDone) {
-    await flushInCallbackDone
+    await (flushInCallbackDone as Promise<void>)
   }
 
   // We should have outputs from both encodes

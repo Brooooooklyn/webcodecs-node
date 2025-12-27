@@ -403,7 +403,7 @@ async function generateWebMWithVP9(): Promise<Uint8Array> {
     muxer.addVideoChunk(videoChunks[i], videoMetadatas[i])
   }
 
-  await muxer.flush()
+  muxer.flush()
   const data = muxer.finalize()
   muxer.close()
   return data
@@ -481,7 +481,7 @@ async function generateWebMWithVP9AndOpus(): Promise<Uint8Array> {
     muxer.addAudioChunk(audioChunks[i], audioMetadatas[i])
   }
 
-  await muxer.flush()
+  muxer.flush()
   const data = muxer.finalize()
   muxer.close()
   return data
@@ -762,7 +762,7 @@ async function generateMkvWithH264(): Promise<Uint8Array> {
     muxer.addVideoChunk(videoChunks[i], videoMetadatas[i])
   }
 
-  await muxer.flush()
+  muxer.flush()
   const data = muxer.finalize()
   muxer.close()
   return data
@@ -845,7 +845,7 @@ async function generateMkvWithH264AndAAC(): Promise<Uint8Array> {
     muxer.addAudioChunk(audioChunks[i], audioMetadatas[i])
   }
 
-  await muxer.flush()
+  muxer.flush()
   const data = muxer.finalize()
   muxer.close()
   return data
