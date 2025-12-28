@@ -5,10 +5,10 @@
 
 use crate::ffi::AVCodecID;
 use crate::webcodecs::demuxer_base::{
-  AudioOutputCallback, DemuxerAudioDecoderConfig, DemuxerFormat, DemuxerInner, DemuxerTrackInfo,
-  DemuxerVideoDecoderConfig, ErrorCallback, VideoOutputCallback, parse_aac_codec_string,
-  parse_h264_codec_string, parse_hevc_codec_string, parse_vp9_codec_string, with_demuxer_inner,
-  with_demuxer_inner_mut,
+  AudioOutputCallback, DemuxerAudioDecoderConfig, DemuxerChunk, DemuxerFormat, DemuxerInner,
+  DemuxerTrackInfo, DemuxerVideoDecoderConfig, ErrorCallback, VideoOutputCallback,
+  parse_aac_codec_string, parse_h264_codec_string, parse_hevc_codec_string, parse_vp9_codec_string,
+  with_demuxer_inner, with_demuxer_inner_mut,
 };
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunk;
 use crate::webcodecs::encoded_video_chunk::EncodedVideoChunk;
@@ -150,9 +150,34 @@ impl FromNapiValue for Mp4DemuxerInit {
 ///
 /// demuxer.close();
 /// ```
-#[napi]
+#[napi(async_iterator)]
 pub struct Mp4Demuxer {
   inner: Arc<Mutex<DemuxerInner<Mp4Format>>>,
+}
+
+impl AsyncGenerator for Mp4Demuxer {
+  type Yield = DemuxerChunk;
+  type Next = ();
+  type Return = ();
+
+  fn next(
+    &mut self,
+    _value: Option<Self::Next>,
+  ) -> impl Future<Output = Result<Option<Self::Yield>>> + Send + 'static {
+    let inner = self.inner.clone();
+
+    async move {
+      // Use spawn_blocking for the FFmpeg read operation (blocking I/O)
+      tokio::task::spawn_blocking(move || {
+        let mut guard = inner
+          .lock()
+          .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+        guard.read_next_chunk()
+      })
+      .await
+      .map_err(|e| Error::new(Status::GenericFailure, format!("Task error: {}", e)))?
+    }
+  }
 }
 
 #[napi]
@@ -263,6 +288,33 @@ impl Mp4Demuxer {
     });
 
     Ok(())
+  }
+
+  /// Demux packets asynchronously (awaitable version of demux)
+  ///
+  /// If count is specified, reads up to that many packets.
+  /// Otherwise, reads all packets until end of stream.
+  /// Returns a Promise that resolves when demuxing is complete.
+  ///
+  /// This method is useful when you want to wait for demuxing to finish
+  /// before proceeding with other operations.
+  ///
+  /// Note: For streaming use cases, prefer the async iterator pattern:
+  /// `for await (const chunk of demuxer) { ... }`
+  #[napi]
+  pub async fn demux_async(&self, count: Option<u32>) -> Result<()> {
+    let inner = self.inner.clone();
+    let max_packets = count.unwrap_or(u32::MAX);
+
+    tokio::task::spawn_blocking(move || {
+      let mut guard = inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+      guard.demux_sync(max_packets);
+      Ok(())
+    })
+    .await
+    .map_err(|e| Error::new(Status::GenericFailure, format!("Task error: {}", e)))?
   }
 
   /// Seek to a timestamp in microseconds

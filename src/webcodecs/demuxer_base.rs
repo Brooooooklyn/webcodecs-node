@@ -162,6 +162,50 @@ pub struct DemuxerAudioDecoderConfig {
   pub description: Option<Uint8Array>,
 }
 
+/// Chunk type for async iteration
+///
+/// This type is used as the yield value for demuxer async iteration.
+/// It contains either a video chunk or an audio chunk, indicated by `chunk_type`.
+pub struct DemuxerChunk {
+  /// Chunk type: "video" or "audio"
+  pub chunk_type: String,
+  /// Video chunk (present when chunk_type is "video")
+  pub video_chunk: Option<EncodedVideoChunk>,
+  /// Audio chunk (present when chunk_type is "audio")
+  pub audio_chunk: Option<EncodedAudioChunk>,
+}
+
+impl ToNapiValue for DemuxerChunk {
+  unsafe fn to_napi_value(env: napi::sys::napi_env, val: Self) -> Result<napi::sys::napi_value> {
+    use napi::sys;
+
+    // Create empty object
+    let mut raw_obj: sys::napi_value = std::ptr::null_mut();
+    let status = unsafe { sys::napi_create_object(env, &mut raw_obj) };
+    if status != sys::Status::napi_ok {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "Failed to create object",
+      ));
+    }
+
+    let mut obj = unsafe { Object::from_napi_value(env, raw_obj)? };
+
+    // Set fields
+    obj.set("chunkType", val.chunk_type)?;
+
+    if let Some(video_chunk) = val.video_chunk {
+      obj.set("videoChunk", video_chunk)?;
+    }
+
+    if let Some(audio_chunk) = val.audio_chunk {
+      obj.set("audioChunk", audio_chunk)?;
+    }
+
+    unsafe { Object::to_napi_value(env, obj) }
+  }
+}
+
 // ============================================================================
 // DemuxerFormat Trait - Format-specific behavior
 // ============================================================================
@@ -563,6 +607,145 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
     }
 
     Ok(())
+  }
+
+  /// Read the next chunk from the demuxer for async iteration
+  ///
+  /// Returns `Ok(Some(chunk))` for video/audio packets, `Ok(None)` for EOF,
+  /// or `Err` for errors. Packets from unselected tracks are skipped.
+  ///
+  /// This is a blocking operation and should be called from a blocking context
+  /// (e.g., `tokio::task::spawn_blocking`).
+  pub fn read_next_chunk(&mut self) -> Result<Option<DemuxerChunk>> {
+    if self.state != DemuxerState::Ready
+      && self.state != DemuxerState::Demuxing
+      && self.state != DemuxerState::EndOfStream
+    {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "Demuxer is not ready. Call load() first.",
+      ));
+    }
+
+    // If we've reached end of stream, return None
+    if self.state == DemuxerState::EndOfStream {
+      return Ok(None);
+    }
+
+    let video_index = self.selected_video_track;
+    let audio_index = self.selected_audio_track;
+
+    // Get stream time bases for timestamp conversion
+    let video_time_base = video_index.and_then(|idx| {
+      self
+        .demuxer
+        .as_ref()
+        .and_then(|d| d.get_stream(idx).map(|s| s.time_base))
+    });
+    let audio_time_base = audio_index.and_then(|idx| {
+      self
+        .demuxer
+        .as_ref()
+        .and_then(|d| d.get_stream(idx).map(|s| s.time_base))
+    });
+
+    self.state = DemuxerState::Demuxing;
+
+    loop {
+      let demuxer = match self.demuxer.as_mut() {
+        Some(d) => d,
+        None => {
+          self.state = DemuxerState::EndOfStream;
+          return Ok(None);
+        }
+      };
+
+      match demuxer.read_packet() {
+        Ok(Some((packet, stream_index))) => {
+          if Some(stream_index) == video_index {
+            // Process video packet
+            let timestamp = convert_timestamp(packet.pts(), video_time_base);
+            let duration = if packet.duration() > 0 {
+              Some(convert_timestamp(packet.duration(), video_time_base))
+            } else {
+              None
+            };
+
+            let chunk_type = if packet.is_key() {
+              EncodedVideoChunkType::Key
+            } else {
+              EncodedVideoChunkType::Delta
+            };
+
+            let init = EncodedVideoChunkInit {
+              chunk_type,
+              timestamp,
+              duration,
+              data: Either::B(packet),
+            };
+
+            match EncodedVideoChunk::new(init) {
+              Ok(chunk) => {
+                return Ok(Some(DemuxerChunk {
+                  chunk_type: "video".to_string(),
+                  video_chunk: Some(chunk),
+                  audio_chunk: None,
+                }));
+              }
+              Err(e) => {
+                return Err(Error::new(
+                  Status::GenericFailure,
+                  format!("Failed to create video chunk: {}", e),
+                ));
+              }
+            }
+          } else if Some(stream_index) == audio_index {
+            // Process audio packet
+            let timestamp = convert_timestamp(packet.pts(), audio_time_base);
+            let duration = if packet.duration() > 0 {
+              Some(convert_timestamp(packet.duration(), audio_time_base))
+            } else {
+              None
+            };
+
+            let init = EncodedAudioChunkInit {
+              chunk_type: EncodedAudioChunkType::Key,
+              timestamp,
+              duration,
+              data: Either::B(packet),
+            };
+
+            match EncodedAudioChunk::new(init) {
+              Ok(chunk) => {
+                return Ok(Some(DemuxerChunk {
+                  chunk_type: "audio".to_string(),
+                  video_chunk: None,
+                  audio_chunk: Some(chunk),
+                }));
+              }
+              Err(e) => {
+                return Err(Error::new(
+                  Status::GenericFailure,
+                  format!("Failed to create audio chunk: {}", e),
+                ));
+              }
+            }
+          }
+          // Continue loop to skip packets from unselected tracks
+        }
+        Ok(None) => {
+          // End of stream
+          self.state = DemuxerState::EndOfStream;
+          return Ok(None);
+        }
+        Err(e) => {
+          return Err(Error::new(
+            Status::GenericFailure,
+            format!("Demuxer error: {}", e),
+          ));
+        }
+      }
+    }
   }
 
   /// Close the demuxer and release resources

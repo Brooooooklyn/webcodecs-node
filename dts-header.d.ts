@@ -136,3 +136,57 @@ export interface MkvMuxerInit {
   /** Enable streaming output mode */
   streaming?: { bufferCapacity?: number }
 }
+
+// ============================================================================
+// Async Iterator Types
+// ============================================================================
+
+/**
+ * Chunk yielded by demuxer async iterator.
+ *
+ * Contains either a video or audio chunk. Use the `chunkType` property
+ * to determine which type of chunk is present.
+ *
+ * @example
+ * ```typescript
+ * for await (const chunk of demuxer) {
+ *   if (chunk.chunkType === 'video') {
+ *     videoDecoder.decode(chunk.videoChunk!)
+ *   } else {
+ *     audioDecoder.decode(chunk.audioChunk!)
+ *   }
+ * }
+ * ```
+ */
+export interface DemuxerChunk {
+  /** Type of chunk: 'video' or 'audio' */
+  chunkType: 'video' | 'audio'
+  /** Video chunk (present when chunkType is 'video') */
+  videoChunk?: EncodedVideoChunk
+  /** Audio chunk (present when chunkType is 'audio') */
+  audioChunk?: EncodedAudioChunk
+}
+
+/**
+ * Adds async iterator support to Mp4Demuxer.
+ * Declaration merging allows using `for await...of` with the demuxer.
+ */
+export interface Mp4Demuxer {
+  [Symbol.asyncIterator](): AsyncGenerator<DemuxerChunk, void, void>
+}
+
+/**
+ * Adds async iterator support to WebMDemuxer.
+ * Declaration merging allows using `for await...of` with the demuxer.
+ */
+export interface WebMDemuxer {
+  [Symbol.asyncIterator](): AsyncGenerator<DemuxerChunk, void, void>
+}
+
+/**
+ * Adds async iterator support to MkvDemuxer.
+ * Declaration merging allows using `for await...of` with the demuxer.
+ */
+export interface MkvDemuxer {
+  [Symbol.asyncIterator](): AsyncGenerator<DemuxerChunk, void, void>
+}
