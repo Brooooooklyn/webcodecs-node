@@ -188,6 +188,13 @@ async function runFullCycleTest(
   await encoder.flush()
   await decoder.flush()
 
+  // Yield to event loop to let any pending NonBlocking callbacks complete.
+  // Decoder output callbacks use NonBlocking mode (ThreadsafeFunction) which
+  // schedules callbacks in libuv's Poll phase. The flush promise resolves in
+  // the microtask phase, so we need setImmediate (Check phase) to ensure all
+  // pending frame callbacks have run before asserting.
+  await new Promise((resolve) => setImmediate(resolve))
+
   encoder.close()
   decoder.close()
 
