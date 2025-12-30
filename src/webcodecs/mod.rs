@@ -72,7 +72,9 @@ pub use video_frame::{
 };
 pub use webm_muxer::{WebMAudioTrackConfig, WebMMuxer, WebMMuxerOptions, WebMVideoTrackConfig};
 // Demuxer types
-pub use demuxer_base::{DemuxerAudioDecoderConfig, DemuxerTrackInfo, DemuxerVideoDecoderConfig};
+pub use demuxer_base::{
+  DemuxerAudioDecoderConfig, DemuxerChunk, DemuxerTrackInfo, DemuxerVideoDecoderConfig,
+};
 pub use mkv_demuxer::{MkvDemuxer, MkvDemuxerInit};
 pub use mp4_demuxer::{Mp4Demuxer, Mp4DemuxerInit};
 pub use muxer_base::StreamingMuxerOptions;

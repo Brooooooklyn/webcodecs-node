@@ -1077,3 +1077,201 @@ runTest('MkvDemuxer: error on loading twice without close', async (t) => {
 
   demuxer.close()
 })
+
+// ============================================================================
+// Async Iterator Tests
+// ============================================================================
+
+runTest('Mp4Demuxer: async iterator with for-await-of', async (t) => {
+  const demuxer = new Mp4Demuxer({
+    error: (e: Error) => t.fail(`Error: ${e.message}`),
+  })
+
+  await demuxer.load(path.join(FIXTURES_DIR, 'small_buck_bunny.mp4'))
+
+  const chunks: Array<{ chunkType: string }> = []
+  let count = 0
+
+  for await (const chunk of demuxer) {
+    chunks.push({ chunkType: chunk.chunkType })
+    count++
+    // Limit to first 10 chunks to avoid long test
+    if (count >= 10) break
+  }
+
+  t.true(chunks.length > 0, 'Should have iterated over chunks')
+  t.true(chunks.every((c) => c.chunkType === 'video' || c.chunkType === 'audio'), 'All chunks should be video or audio')
+
+  demuxer.close()
+})
+
+runTest('Mp4Demuxer: async iterator yields DemuxerChunk with correct structure', async (t) => {
+  const demuxer = new Mp4Demuxer({
+    error: (e: Error) => t.fail(`Error: ${e.message}`),
+  })
+
+  await demuxer.load(path.join(FIXTURES_DIR, 'small_buck_bunny.mp4'))
+
+  for await (const chunk of demuxer) {
+    t.truthy(chunk.chunkType, 'Chunk should have chunkType')
+    t.true(chunk.chunkType === 'video' || chunk.chunkType === 'audio', 'chunkType should be video or audio')
+
+    if (chunk.chunkType === 'video') {
+      t.truthy(chunk.videoChunk, 'Video chunk should have videoChunk property')
+      t.true(chunk.videoChunk!.byteLength > 0, 'Video chunk should have data')
+    } else {
+      t.truthy(chunk.audioChunk, 'Audio chunk should have audioChunk property')
+      t.true(chunk.audioChunk!.byteLength > 0, 'Audio chunk should have data')
+    }
+
+    // Only check first chunk
+    break
+  }
+
+  demuxer.close()
+})
+
+runTest('Mp4Demuxer: demuxAsync completes all packets', async (t) => {
+  const videoChunks: EncodedVideoChunk[] = []
+  const audioChunks: EncodedAudioChunk[] = []
+
+  const demuxer = new Mp4Demuxer({
+    videoOutput: (chunk: EncodedVideoChunk) => videoChunks.push(chunk),
+    audioOutput: (chunk: EncodedAudioChunk) => audioChunks.push(chunk),
+    error: (e: Error) => t.fail(`Error: ${e.message}`),
+  })
+
+  await demuxer.load(path.join(FIXTURES_DIR, 'small_buck_bunny.mp4'))
+
+  // Use demuxAsync instead of demux() + setTimeout
+  await demuxer.demuxAsync(20)
+
+  t.true(videoChunks.length > 0 || audioChunks.length > 0, 'Should have demuxed chunks')
+
+  demuxer.close()
+})
+
+runTest('Mp4Demuxer: demuxAsync with no count demuxes all', async (t) => {
+  const videoChunks: EncodedVideoChunk[] = []
+
+  const demuxer = new Mp4Demuxer({
+    videoOutput: (chunk: EncodedVideoChunk) => videoChunks.push(chunk),
+    error: (e: Error) => t.fail(`Error: ${e.message}`),
+  })
+
+  await demuxer.load(path.join(FIXTURES_DIR, 'small_buck_bunny.mp4'))
+
+  // Demux all packets
+  await demuxer.demuxAsync()
+
+  t.true(videoChunks.length > 0, 'Should have demuxed all video chunks')
+  t.is(demuxer.state, 'ended', 'State should be ended after demuxing all')
+
+  demuxer.close()
+})
+
+runTest('WebMDemuxer: async iterator with for-await-of', async (t) => {
+  const webmData = await generateWebMWithVP9()
+
+  const demuxer = new WebMDemuxer({
+    error: (e: Error) => t.fail(`Error: ${e.message}`),
+  })
+
+  await demuxer.loadBuffer(webmData)
+
+  const chunks: Array<{ chunkType: string }> = []
+
+  for await (const chunk of demuxer) {
+    chunks.push({ chunkType: chunk.chunkType })
+  }
+
+  t.true(chunks.length > 0, 'Should have iterated over chunks')
+  t.true(chunks.every((c) => c.chunkType === 'video'), 'All chunks should be video (VP9 only)')
+
+  demuxer.close()
+})
+
+runTest('WebMDemuxer: demuxAsync completes', async (t) => {
+  const webmData = await generateWebMWithVP9()
+  const videoChunks: EncodedVideoChunk[] = []
+
+  const demuxer = new WebMDemuxer({
+    videoOutput: (chunk: EncodedVideoChunk) => videoChunks.push(chunk),
+    error: (e: Error) => t.fail(`Error: ${e.message}`),
+  })
+
+  await demuxer.loadBuffer(webmData)
+
+  await demuxer.demuxAsync()
+
+  t.true(videoChunks.length > 0, 'Should have demuxed chunks')
+  t.is(demuxer.state, 'ended', 'State should be ended')
+
+  demuxer.close()
+})
+
+runTest('MkvDemuxer: async iterator with for-await-of', async (t) => {
+  const mkvData = await generateMkvWithH264()
+
+  const demuxer = new MkvDemuxer({
+    error: (e: Error) => t.fail(`Error: ${e.message}`),
+  })
+
+  await demuxer.loadBuffer(mkvData)
+
+  const chunks: Array<{ chunkType: string }> = []
+
+  for await (const chunk of demuxer) {
+    chunks.push({ chunkType: chunk.chunkType })
+  }
+
+  t.true(chunks.length > 0, 'Should have iterated over chunks')
+  t.true(chunks.every((c) => c.chunkType === 'video'), 'All chunks should be video (H.264 only)')
+
+  demuxer.close()
+})
+
+runTest('MkvDemuxer: async iterator with video and audio', async (t) => {
+  const mkvData = await generateMkvWithH264AndAAC()
+
+  const demuxer = new MkvDemuxer({
+    error: (e: Error) => t.fail(`Error: ${e.message}`),
+  })
+
+  await demuxer.loadBuffer(mkvData)
+
+  const videoChunks: EncodedVideoChunk[] = []
+  const audioChunks: EncodedAudioChunk[] = []
+
+  for await (const chunk of demuxer) {
+    if (chunk.chunkType === 'video' && chunk.videoChunk) {
+      videoChunks.push(chunk.videoChunk)
+    } else if (chunk.chunkType === 'audio' && chunk.audioChunk) {
+      audioChunks.push(chunk.audioChunk)
+    }
+  }
+
+  t.true(videoChunks.length > 0, 'Should have video chunks')
+  t.true(audioChunks.length > 0, 'Should have audio chunks')
+
+  demuxer.close()
+})
+
+runTest('MkvDemuxer: demuxAsync completes', async (t) => {
+  const mkvData = await generateMkvWithH264()
+  const videoChunks: EncodedVideoChunk[] = []
+
+  const demuxer = new MkvDemuxer({
+    videoOutput: (chunk: EncodedVideoChunk) => videoChunks.push(chunk),
+    error: (e: Error) => t.fail(`Error: ${e.message}`),
+  })
+
+  await demuxer.loadBuffer(mkvData)
+
+  await demuxer.demuxAsync()
+
+  t.true(videoChunks.length > 0, 'Should have demuxed chunks')
+  t.is(demuxer.state, 'ended', 'State should be ended')
+
+  demuxer.close()
+})

@@ -47,18 +47,11 @@ const demuxer = new NapiWebCodecs.Mp4Demuxer({
 
 await demuxer.loadBuffer(videoData)
 
-// Wait until ready
-while (demuxer.state === 'unloaded') {
-  await new Promise((r) => setTimeout(r, 10))
-}
-
 videoConfig = demuxer.videoDecoderConfig
 results.resolution = `${videoConfig.codedWidth}x${videoConfig.codedHeight}`
 
-while (demuxer.state !== 'ended' && demuxer.state !== 'closed') {
-  demuxer.demux(100)
-  await new Promise((r) => setTimeout(r, 1))
-}
+// Demux all packets using async API
+await demuxer.demuxAsync()
 demuxer.close()
 
 results.totalFrames = chunks.length

@@ -5,9 +5,9 @@
 
 use crate::ffi::AVCodecID;
 use crate::webcodecs::demuxer_base::{
-  AudioOutputCallback, DemuxerAudioDecoderConfig, DemuxerFormat, DemuxerInner, DemuxerTrackInfo,
-  DemuxerVideoDecoderConfig, ErrorCallback, VideoOutputCallback, parse_vp9_codec_string,
-  with_demuxer_inner, with_demuxer_inner_mut,
+  AudioOutputCallback, DemuxerAudioDecoderConfig, DemuxerChunk, DemuxerFormat, DemuxerInner,
+  DemuxerTrackInfo, DemuxerVideoDecoderConfig, ErrorCallback, VideoOutputCallback,
+  parse_vp9_codec_string, with_demuxer_inner, with_demuxer_inner_mut,
 };
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunk;
 use crate::webcodecs::encoded_video_chunk::EncodedVideoChunk;
@@ -119,9 +119,33 @@ impl FromNapiValue for WebMDemuxerInit {
 /// WebM Demuxer for reading encoded video and audio from WebM container
 ///
 /// WebM typically contains VP8, VP9, or AV1 video with Opus or Vorbis audio.
-#[napi]
+#[napi(async_iterator)]
 pub struct WebMDemuxer {
   inner: Arc<Mutex<DemuxerInner<WebMFormat>>>,
+}
+
+impl AsyncGenerator for WebMDemuxer {
+  type Yield = DemuxerChunk;
+  type Next = ();
+  type Return = ();
+
+  fn next(
+    &mut self,
+    _value: Option<Self::Next>,
+  ) -> impl std::future::Future<Output = Result<Option<Self::Yield>>> + Send + 'static {
+    let inner = self.inner.clone();
+
+    async move {
+      tokio::task::spawn_blocking(move || {
+        let mut guard = inner
+          .lock()
+          .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+        guard.read_next_chunk()
+      })
+      .await
+      .map_err(|e| Error::new(Status::GenericFailure, format!("Task error: {}", e)))?
+    }
+  }
 }
 
 #[napi]
@@ -220,6 +244,23 @@ impl WebMDemuxer {
     });
 
     Ok(())
+  }
+
+  /// Demux packets asynchronously (awaitable version of demux)
+  #[napi]
+  pub async fn demux_async(&self, count: Option<u32>) -> Result<()> {
+    let inner = self.inner.clone();
+    let max_packets = count.unwrap_or(u32::MAX);
+
+    tokio::task::spawn_blocking(move || {
+      let mut guard = inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+      guard.demux_sync(max_packets);
+      Ok(())
+    })
+    .await
+    .map_err(|e| Error::new(Status::GenericFailure, format!("Task error: {}", e)))?
   }
 
   #[napi]

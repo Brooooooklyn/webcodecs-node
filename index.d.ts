@@ -137,6 +137,60 @@ export interface MkvMuxerInit {
   streaming?: { bufferCapacity?: number }
 }
 
+// ============================================================================
+// Async Iterator Types
+// ============================================================================
+
+/**
+ * Chunk yielded by demuxer async iterator.
+ *
+ * Contains either a video or audio chunk. Use the `chunkType` property
+ * to determine which type of chunk is present.
+ *
+ * @example
+ * ```typescript
+ * for await (const chunk of demuxer) {
+ *   if (chunk.chunkType === 'video') {
+ *     videoDecoder.decode(chunk.videoChunk!)
+ *   } else {
+ *     audioDecoder.decode(chunk.audioChunk!)
+ *   }
+ * }
+ * ```
+ */
+export interface DemuxerChunk {
+  /** Type of chunk: 'video' or 'audio' */
+  chunkType: 'video' | 'audio'
+  /** Video chunk (present when chunkType is 'video') */
+  videoChunk?: EncodedVideoChunk
+  /** Audio chunk (present when chunkType is 'audio') */
+  audioChunk?: EncodedAudioChunk
+}
+
+/**
+ * Adds async iterator support to Mp4Demuxer.
+ * Declaration merging allows using `for await...of` with the demuxer.
+ */
+export interface Mp4Demuxer {
+  [Symbol.asyncIterator](): AsyncGenerator<DemuxerChunk, void, void>
+}
+
+/**
+ * Adds async iterator support to WebMDemuxer.
+ * Declaration merging allows using `for await...of` with the demuxer.
+ */
+export interface WebMDemuxer {
+  [Symbol.asyncIterator](): AsyncGenerator<DemuxerChunk, void, void>
+}
+
+/**
+ * Adds async iterator support to MkvDemuxer.
+ * Declaration merging allows using `for await...of` with the demuxer.
+ */
+export interface MkvDemuxer {
+  [Symbol.asyncIterator](): AsyncGenerator<DemuxerChunk, void, void>
+}
+
 export type TypedArray =
   | Int8Array
   | Uint8Array
@@ -561,6 +615,11 @@ export declare class ImageTrackList {
  * MKV Demuxer for reading encoded video and audio from Matroska container
  *
  * MKV supports almost any video and audio codec.
+ *
+ * This type implements JavaScript's async iterable protocol.
+ * It can be used with `for await...of` loops.
+ *
+ * @see https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Iteration_protocols#the_async_iterator_and_async_iterable_protocols
  */
 export declare class MkvDemuxer {
   constructor(init: MkvDemuxerInit)
@@ -579,6 +638,8 @@ export declare class MkvDemuxer {
   selectVideoTrack(trackIndex: number): void
   selectAudioTrack(trackIndex: number): void
   demux(count?: number | undefined | null): void
+  /** Demux packets asynchronously (awaitable version of demux) */
+  demuxAsync(count?: number | undefined | null): Promise<void>
   seek(timestampUs: number): void
   close(): void
   get state(): string
@@ -673,6 +734,11 @@ export declare class MkvMuxer {
  *
  * demuxer.close();
  * ```
+ *
+ * This type implements JavaScript's async iterable protocol.
+ * It can be used with `for await...of` loops.
+ *
+ * @see https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Iteration_protocols#the_async_iterator_and_async_iterable_protocols
  */
 export declare class Mp4Demuxer {
   /** Create a new MP4 demuxer */
@@ -705,6 +771,20 @@ export declare class Mp4Demuxer {
    * Otherwise, reads all packets until end of stream.
    */
   demux(count?: number | undefined | null): void
+  /**
+   * Demux packets asynchronously (awaitable version of demux)
+   *
+   * If count is specified, reads up to that many packets.
+   * Otherwise, reads all packets until end of stream.
+   * Returns a Promise that resolves when demuxing is complete.
+   *
+   * This method is useful when you want to wait for demuxing to finish
+   * before proceeding with other operations.
+   *
+   * Note: For streaming use cases, prefer the async iterator pattern:
+   * `for await (const chunk of demuxer) { ... }`
+   */
+  demuxAsync(count?: number | undefined | null): Promise<void>
   /** Seek to a timestamp in microseconds */
   seek(timestampUs: number): void
   /** Close the demuxer and release resources */
@@ -1100,6 +1180,11 @@ export declare class VideoFrame {
  * WebM Demuxer for reading encoded video and audio from WebM container
  *
  * WebM typically contains VP8, VP9, or AV1 video with Opus or Vorbis audio.
+ *
+ * This type implements JavaScript's async iterable protocol.
+ * It can be used with `for await...of` loops.
+ *
+ * @see https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Iteration_protocols#the_async_iterator_and_async_iterable_protocols
  */
 export declare class WebMDemuxer {
   constructor(init: WebMDemuxerInit)
@@ -1118,6 +1203,8 @@ export declare class WebMDemuxer {
   selectVideoTrack(trackIndex: number): void
   selectAudioTrack(trackIndex: number): void
   demux(count?: number | undefined | null): void
+  /** Demux packets asynchronously (awaitable version of demux) */
+  demuxAsync(count?: number | undefined | null): Promise<void>
   seek(timestampUs: number): void
   close(): void
   get state(): string
