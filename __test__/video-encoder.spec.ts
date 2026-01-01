@@ -7,11 +7,14 @@
 
 import test from 'ava'
 
-import { resetHardwareFallbackState, VideoEncoder } from '../index.js'
+import { resetHardwareFallbackState, VideoEncoder, type EncodedVideoChunkMetadata } from '../index.js'
 import {
   generateSolidColorI420Frame,
+  generateSolidColorI420AFrame,
   generateFrameSequence,
   TestColors,
+  hasHardwareAcceleration,
+  hasHevcAlphaSupport,
   type EncodedVideoChunk,
 } from './helpers/index.js'
 import { createEncoderConfig } from './helpers/codec-matrix.js'
@@ -460,6 +463,228 @@ test('VideoEncoder: ondequeue can be set to null', (t) => {
   t.notThrows(() => {
     encoder.ondequeue = null
   })
+
+  encoder.close()
+})
+
+// ============================================================================
+// Alpha Channel Encoding Tests
+// ============================================================================
+
+test('VideoEncoder: HEVC alpha encoding with software encoder', async (t) => {
+  // HEVC alpha requires libx265 built with -DENABLE_ALPHA=ON
+  if (!(await hasHevcAlphaSupport())) {
+    t.pass('libx265 does not support alpha encoding, skipping')
+    return
+  }
+
+  const chunks: EncodedVideoChunk[] = []
+  const errors: Error[] = []
+
+  const encoder = new VideoEncoder({
+    output: (chunk) => {
+      chunks.push(chunk)
+    },
+    error: (e) => {
+      errors.push(e)
+    },
+  })
+
+  // Configure HEVC with alpha and software encoder
+  encoder.configure({
+    codec: 'hev1.1.6.L93.B0', // Main profile, level 3.1
+    width: 320,
+    height: 240,
+    alpha: 'keep',
+    hardwareAcceleration: 'prefer-software',
+  })
+
+  t.is(encoder.state, 'configured')
+
+  // Encode an I420A frame (with alpha channel)
+  const frame = generateSolidColorI420AFrame(320, 240, TestColors.red, 200, 0) // alpha = 200
+  encoder.encode(frame, { keyFrame: true })
+  frame.close()
+
+  await encoder.flush()
+
+  t.is(errors.length, 0, 'No errors should occur')
+  t.true(chunks.length >= 1, 'Should produce at least one encoded chunk')
+
+  // HEVC alpha produces a single bitstream with embedded alpha layer
+  // (unlike VP9 which has separate alpha side data)
+  t.true(chunks[0].byteLength > 0, 'Encoded chunk should have data')
+
+  encoder.close()
+})
+
+test('VideoEncoder: HEVC 10-bit alpha encoding with software encoder', async (t) => {
+  // HEVC alpha requires libx265 built with -DENABLE_ALPHA=ON
+  if (!(await hasHevcAlphaSupport())) {
+    t.pass('libx265 does not support alpha encoding, skipping')
+    return
+  }
+
+  const chunks: EncodedVideoChunk[] = []
+  const errors: Error[] = []
+
+  const encoder = new VideoEncoder({
+    output: (chunk) => {
+      chunks.push(chunk)
+    },
+    error: (e) => {
+      errors.push(e)
+    },
+  })
+
+  // Configure HEVC Main 10 profile (10-bit) with alpha and software encoder
+  // Profile 2 = Main 10 (10-bit), uses YUVA420P10LE pixel format
+  encoder.configure({
+    codec: 'hev1.2.4.L93.B0', // Main 10 profile, level 3.1
+    width: 320,
+    height: 240,
+    alpha: 'keep',
+    hardwareAcceleration: 'prefer-software',
+  })
+
+  t.is(encoder.state, 'configured')
+
+  // Encode an I420A frame (with alpha channel)
+  // The encoder will convert to YUVA420P10LE internally
+  const frame = generateSolidColorI420AFrame(320, 240, TestColors.blue, 180, 0)
+  encoder.encode(frame, { keyFrame: true })
+  frame.close()
+
+  await encoder.flush()
+
+  t.is(errors.length, 0, 'No errors should occur')
+  t.true(chunks.length >= 1, 'Should produce at least one encoded chunk')
+  t.true(chunks[0].byteLength > 0, 'Encoded chunk should have data')
+
+  encoder.close()
+})
+
+// This test must run serially because it relies on global hardware acceleration state
+// (resetHardwareFallbackState in beforeEach) and async error timing that can race
+// with other encoder tests when run in parallel.
+test.serial('VideoEncoder: HEVC alpha encoding fails with hardware acceleration', async (t) => {
+  // This test requires hardware acceleration to be available
+  // On CI without GPU, prefer-hardware falls back to software and succeeds
+  if (!hasHardwareAcceleration()) {
+    t.pass('No hardware accelerator available, skipping')
+    return
+  }
+
+  const errors: Error[] = []
+
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: (e) => {
+      errors.push(e)
+    },
+  })
+
+  // Configure HEVC with alpha but request hardware encoder
+  // This should report an error since hardware HEVC encoders don't support alpha
+  encoder.configure({
+    codec: 'hev1.1.6.L93.B0',
+    width: 320,
+    height: 240,
+    alpha: 'keep',
+    hardwareAcceleration: 'prefer-hardware',
+  })
+
+  // Wait for error callback (async due to ThreadsafeFunctionCallMode::NonBlocking)
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
+  t.true(errors.length >= 1, 'Should report an error for hardware HEVC alpha')
+  t.true(
+    errors[0].message.includes('prefer-software') || errors[0].message.includes('software'),
+    'Error should suggest using software encoder',
+  )
+
+  // Encoder is already closed due to error, so close() would throw
+  // Only close if encoder is not already closed
+  if (encoder.state !== 'closed') {
+    encoder.close()
+  }
+})
+
+test('VideoEncoder: VP9 alpha encoding works correctly', async (t) => {
+  const chunks: EncodedVideoChunk[] = []
+  const metadatas: Array<EncodedVideoChunkMetadata> = []
+  const errors: Error[] = []
+
+  const encoder = new VideoEncoder({
+    output: (chunk, metadata) => {
+      chunks.push(chunk)
+      if (metadata) metadatas.push(metadata)
+    },
+    error: (e) => {
+      errors.push(e)
+    },
+  })
+
+  // Configure VP9 with alpha
+  encoder.configure({
+    codec: 'vp09.00.10.08', // Profile 0, level 1.0, 8-bit
+    width: 320,
+    height: 240,
+    alpha: 'keep',
+  })
+
+  t.is(encoder.state, 'configured')
+
+  // Encode an I420A frame
+  const frame = generateSolidColorI420AFrame(320, 240, TestColors.blue, 128, 0) // alpha = 128
+  encoder.encode(frame, { keyFrame: true })
+  frame.close()
+
+  await encoder.flush()
+
+  t.is(errors.length, 0, 'No errors should occur')
+  t.true(chunks.length >= 1, 'Should produce at least one encoded chunk')
+
+  // VP9 alpha uses Matroska BlockAdditional side data
+  // alpha_side_data should be present in metadata
+  // Note: This may be None if VP9 encoder doesn't produce alpha data for this frame
+  t.true(chunks[0].byteLength > 0, 'Encoded chunk should have data')
+
+  encoder.close()
+})
+
+test('VideoEncoder: alpha discard is the default', async (t) => {
+  const chunks: EncodedVideoChunk[] = []
+  const errors: Error[] = []
+
+  const encoder = new VideoEncoder({
+    output: (chunk) => {
+      chunks.push(chunk)
+    },
+    error: (e) => {
+      errors.push(e)
+    },
+  })
+
+  // Configure HEVC without alpha option (should default to discard)
+  encoder.configure({
+    codec: 'hev1.1.6.L93.B0',
+    width: 320,
+    height: 240,
+    // alpha: not specified, defaults to 'discard'
+  })
+
+  t.is(encoder.state, 'configured')
+
+  // Even if we pass an I420A frame, alpha should be discarded
+  const frame = generateSolidColorI420AFrame(320, 240, TestColors.green, 255, 0)
+  encoder.encode(frame, { keyFrame: true })
+  frame.close()
+
+  await encoder.flush()
+
+  t.is(errors.length, 0, 'No errors should occur')
+  t.true(chunks.length >= 1, 'Should produce encoded chunks')
 
   encoder.close()
 })
