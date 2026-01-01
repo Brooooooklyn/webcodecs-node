@@ -1014,6 +1014,7 @@ Cflags: -I${{includedir}}{}
         format!("-DCMAKE_INSTALL_PREFIX={}", prefix),
         "-DENABLE_SHARED=OFF".to_string(),
         "-DENABLE_CLI=OFF".to_string(),
+        "-DENABLE_ALPHA=ON".to_string(), // Enable alpha channel encoding support
         "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".to_string(),
         if is_armv7 {
           "-DENABLE_ASSEMBLY=OFF".to_string()

@@ -114,11 +114,10 @@ jobs:
         with:
           vcpkgGitCommitId: '74e6536215718009aae747d86d84b78376bf9e09'
 
-      - name: Install codec dependencies (without FFmpeg)
+      - name: Install codec dependencies (without FFmpeg, x265 built separately for alpha)
         run: |
           vcpkg install `
             x264:arm64-windows-static `
-            x265:arm64-windows-static `
             libvpx:arm64-windows-static `
             aom:arm64-windows-static `
             dav1d:arm64-windows-static `
@@ -129,6 +128,68 @@ jobs:
             libwebp:arm64-windows-static `
             zlib:arm64-windows-static `
             libjxl:arm64-windows-static
+
+      - name: Build x265 with alpha support
+        shell: pwsh
+        run: |
+          # Build x265 from source with ENABLE_ALPHA=ON
+          # vcpkg's x265 doesn't have alpha support enabled
+          $VCPKG_INSTALLED = "$env:VCPKG_ROOT/installed/arm64-windows-static"
+
+          git clone --depth 1 --branch Release_4.1 https://bitbucket.org/multicoreware/x265_git.git
+          cd x265_git
+          # Fetch tags for version detection (shallow clone doesn't include them)
+          git fetch --depth=1 origin '+refs/tags/Release_4.1:refs/tags/Release_4.1'
+
+          # Build 12-bit lib
+          cmake -B build-12bit -S source -G "Visual Studio 17 2022" -A ARM64 `
+            -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
+            -DENABLE_SHARED=OFF `
+            -DENABLE_CLI=OFF `
+            -DENABLE_ALPHA=ON `
+            -DHIGH_BIT_DEPTH=ON `
+            -DEXPORT_C_API=OFF `
+            -DMAIN12=ON
+          cmake --build build-12bit --config Release --parallel
+
+          # Build 10-bit lib
+          cmake -B build-10bit -S source -G "Visual Studio 17 2022" -A ARM64 `
+            -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
+            -DENABLE_SHARED=OFF `
+            -DENABLE_CLI=OFF `
+            -DENABLE_ALPHA=ON `
+            -DHIGH_BIT_DEPTH=ON `
+            -DEXPORT_C_API=OFF
+          cmake --build build-10bit --config Release --parallel
+
+          # Build 8-bit main lib with linked 10/12-bit
+          # Use absolute paths for EXTRA_LIB since linker resolves paths from build directory
+          $x265Dir = (Get-Location).Path -replace '\\','/'
+          $lib10bit = "$x265Dir/build-10bit/Release/x265-static.lib"
+          $lib12bit = "$x265Dir/build-12bit/Release/x265-static.lib"
+          Write-Host "EXTRA_LIB: $lib10bit;$lib12bit"
+          cmake -B build-main -S source -G "Visual Studio 17 2022" -A ARM64 `
+            -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
+            -DENABLE_SHARED=OFF `
+            -DENABLE_CLI=OFF `
+            -DENABLE_ALPHA=ON `
+            "-DEXTRA_LIB=$lib10bit;$lib12bit" `
+            -DLINKED_10BIT=ON `
+            -DLINKED_12BIT=ON
+          cmake --build build-main --config Release --parallel
+
+          # Combine all libs into single static archive using lib.exe (MSVC)
+          lib.exe /OUT:x265-combined.lib `
+            build-main/Release/x265-static.lib `
+            build-10bit/Release/x265-static.lib `
+            build-12bit/Release/x265-static.lib
+
+          # Install to vcpkg directory so FFmpeg can find it
+          Copy-Item -Force x265-combined.lib "$VCPKG_INSTALLED/lib/x265-static.lib"
+          Copy-Item -Force source/x265.h "$VCPKG_INSTALLED/include/"
+          Copy-Item -Force build-main/x265_config.h "$VCPKG_INSTALLED/include/"
+
+          Write-Host "x265 with alpha support installed to $VCPKG_INSTALLED"
 
       - name: List vcpkg installed libraries
         run: |
@@ -443,11 +504,10 @@ jobs:
         with:
           vcpkgGitCommitId: '74e6536215718009aae747d86d84b78376bf9e09'
 
-      - name: Install codec dependencies (without FFmpeg)
+      - name: Install codec dependencies (without FFmpeg, x265 built separately for alpha)
         run: |
           vcpkg install `
             x264:x64-windows-static `
-            x265:x64-windows-static `
             libvpx:x64-windows-static `
             dav1d:x64-windows-static `
             opus:x64-windows-static `
@@ -457,6 +517,68 @@ jobs:
             libwebp:x64-windows-static `
             zlib:x64-windows-static `
             libjxl:x64-windows-static
+
+      - name: Build x265 with alpha support
+        shell: pwsh
+        run: |
+          # Build x265 from source with ENABLE_ALPHA=ON
+          # vcpkg's x265 doesn't have alpha support enabled
+          $VCPKG_INSTALLED = "$env:VCPKG_ROOT/installed/x64-windows-static"
+
+          git clone --depth 1 --branch Release_4.1 https://bitbucket.org/multicoreware/x265_git.git
+          cd x265_git
+          # Fetch tags for version detection (shallow clone doesn't include them)
+          git fetch --depth=1 origin '+refs/tags/Release_4.1:refs/tags/Release_4.1'
+
+          # Build 12-bit lib
+          cmake -B build-12bit -S source -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
+            -DENABLE_SHARED=OFF `
+            -DENABLE_CLI=OFF `
+            -DENABLE_ALPHA=ON `
+            -DHIGH_BIT_DEPTH=ON `
+            -DEXPORT_C_API=OFF `
+            -DMAIN12=ON
+          cmake --build build-12bit --config Release --parallel
+
+          # Build 10-bit lib
+          cmake -B build-10bit -S source -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
+            -DENABLE_SHARED=OFF `
+            -DENABLE_CLI=OFF `
+            -DENABLE_ALPHA=ON `
+            -DHIGH_BIT_DEPTH=ON `
+            -DEXPORT_C_API=OFF
+          cmake --build build-10bit --config Release --parallel
+
+          # Build 8-bit main lib with linked 10/12-bit
+          # Use absolute paths for EXTRA_LIB since linker resolves paths from build directory
+          $x265Dir = (Get-Location).Path -replace '\\','/'
+          $lib10bit = "$x265Dir/build-10bit/Release/x265-static.lib"
+          $lib12bit = "$x265Dir/build-12bit/Release/x265-static.lib"
+          Write-Host "EXTRA_LIB: $lib10bit;$lib12bit"
+          cmake -B build-main -S source -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
+            -DENABLE_SHARED=OFF `
+            -DENABLE_CLI=OFF `
+            -DENABLE_ALPHA=ON `
+            "-DEXTRA_LIB=$lib10bit;$lib12bit" `
+            -DLINKED_10BIT=ON `
+            -DLINKED_12BIT=ON
+          cmake --build build-main --config Release --parallel
+
+          # Combine all libs into single static archive using lib.exe (MSVC)
+          lib.exe /OUT:x265-combined.lib `
+            build-main/Release/x265-static.lib `
+            build-10bit/Release/x265-static.lib `
+            build-12bit/Release/x265-static.lib
+
+          # Install to vcpkg directory so FFmpeg can find it
+          Copy-Item -Force x265-combined.lib "$VCPKG_INSTALLED/lib/x265-static.lib"
+          Copy-Item -Force source/x265.h "$VCPKG_INSTALLED/include/"
+          Copy-Item -Force build-main/x265_config.h "$VCPKG_INSTALLED/include/"
+
+          Write-Host "x265 with alpha support installed to $VCPKG_INSTALLED"
 
       - name: List vcpkg installed libraries
         run: |
@@ -832,8 +954,9 @@ jobs:
           path: ffmpeg-armv7-unknown-linux-gnueabihf.tar.gz
           if-no-files-found: error
 
-  # Build macOS x64 static libs (dav1d, libjxl + deps)
+  # Build macOS x64 static libs (dav1d, libjxl + deps, x265 with alpha)
   # These are needed because Homebrew only provides dynamic .dylib files
+  # x265 is built from source with ENABLE_ALPHA=ON for HEVC alpha encoding
   build-static-libs-macos-x64:
     name: Build static-libs x86_64-apple-darwin
     runs-on: macos-15-intel
@@ -922,6 +1045,84 @@ jobs:
           cmake --install _build
           cd ..
 
+          # x265 (HEVC encoder with alpha support)
+          # Build multi-lib x265 with ENABLE_ALPHA=ON for HEVC alpha encoding
+          git clone --depth 1 --branch Release_4.1 https://bitbucket.org/multicoreware/x265_git.git
+          cd x265_git/build
+
+          # Build 12-bit lib (no C API export - will be linked into main)
+          mkdir -p build-12bit && cd build-12bit
+          cmake ../../source \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
+            -DCMAKE_INSTALL_PREFIX=$PREFIX \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DENABLE_SHARED=OFF \
+            -DENABLE_CLI=OFF \
+            -DENABLE_ALPHA=ON \
+            -DHIGH_BIT_DEPTH=ON \
+            -DEXPORT_C_API=OFF \
+            -DMAIN12=ON
+          make -j$JOBS
+          cd ..
+
+          # Build 10-bit lib (no C API export - will be linked into main)
+          mkdir -p build-10bit && cd build-10bit
+          cmake ../../source \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
+            -DCMAKE_INSTALL_PREFIX=$PREFIX \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DENABLE_SHARED=OFF \
+            -DENABLE_CLI=OFF \
+            -DENABLE_ALPHA=ON \
+            -DHIGH_BIT_DEPTH=ON \
+            -DEXPORT_C_API=OFF
+          make -j$JOBS
+          cd ..
+
+          # Build 8-bit main lib with linked 10/12-bit libs
+          mkdir -p build-main && cd build-main
+          cmake ../../source \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
+            -DCMAKE_INSTALL_PREFIX=$PREFIX \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DENABLE_SHARED=OFF \
+            -DENABLE_CLI=OFF \
+            -DENABLE_ALPHA=ON \
+            -DEXTRA_LIB="../build-10bit/libx265.a;../build-12bit/libx265.a" \
+            -DLINKED_10BIT=ON \
+            -DLINKED_12BIT=ON
+          make -j$JOBS
+          cd ..
+
+          # Combine all libs into single static archive using libtool (macOS)
+          libtool -static -o libx265.a \
+            build-main/libx265.a \
+            build-10bit/libx265.a \
+            build-12bit/libx265.a
+
+          # Install combined lib and headers
+          cp libx265.a $PREFIX/lib/
+          cp ../source/x265.h $PREFIX/include/ 2>/dev/null || true
+          cp build-main/x265_config.h $PREFIX/include/ 2>/dev/null || true
+
+          # Create pkg-config file for x265
+          # Libs.private needed for static linking (x265 is C++)
+          printf '%s\n' \
+            'prefix=${pcfiledir}/../..' \
+            'exec_prefix=${prefix}' \
+            'libdir=${prefix}/lib' \
+            'includedir=${prefix}/include' \
+            '' \
+            'Name: x265' \
+            'Description: H.265/HEVC video encoder with alpha support' \
+            'Version: 4.1' \
+            'Libs: -L${libdir} -lx265' \
+            'Libs.private: -lc++' \
+            'Cflags: -I${includedir}' \
+            > $PREFIX/lib/pkgconfig/x265.pc
+
+          cd ../..
+
       - name: Create tarball
         run: tar -czvf static-libs-x86_64-apple-darwin.tar.gz -C ./static-libs-x86_64-apple-darwin .
 
@@ -937,7 +1138,9 @@ jobs:
           path: static-libs-x86_64-apple-darwin.tar.gz
           if-no-files-found: error
 
-  # Build macOS arm64 static libs (dav1d, libjxl + deps)
+  # Build macOS arm64 static libs (dav1d, libjxl + deps, x265 with alpha)
+  # These are needed because Homebrew only provides dynamic .dylib files
+  # x265 is built from source with ENABLE_ALPHA=ON for HEVC alpha encoding
   build-static-libs-macos-arm64:
     name: Build static-libs aarch64-apple-darwin
     runs-on: macos-latest
@@ -1025,6 +1228,84 @@ jobs:
           cmake --build _build -j$JOBS
           cmake --install _build
           cd ..
+
+          # x265 (HEVC encoder with alpha support)
+          # Build multi-lib x265 with ENABLE_ALPHA=ON for HEVC alpha encoding
+          git clone --depth 1 --branch Release_4.1 https://bitbucket.org/multicoreware/x265_git.git
+          cd x265_git/build
+
+          # Build 12-bit lib (no C API export - will be linked into main)
+          mkdir -p build-12bit && cd build-12bit
+          cmake ../../source \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DCMAKE_INSTALL_PREFIX=$PREFIX \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DENABLE_SHARED=OFF \
+            -DENABLE_CLI=OFF \
+            -DENABLE_ALPHA=ON \
+            -DHIGH_BIT_DEPTH=ON \
+            -DEXPORT_C_API=OFF \
+            -DMAIN12=ON
+          make -j$JOBS
+          cd ..
+
+          # Build 10-bit lib (no C API export - will be linked into main)
+          mkdir -p build-10bit && cd build-10bit
+          cmake ../../source \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DCMAKE_INSTALL_PREFIX=$PREFIX \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DENABLE_SHARED=OFF \
+            -DENABLE_CLI=OFF \
+            -DENABLE_ALPHA=ON \
+            -DHIGH_BIT_DEPTH=ON \
+            -DEXPORT_C_API=OFF
+          make -j$JOBS
+          cd ..
+
+          # Build 8-bit main lib with linked 10/12-bit libs
+          mkdir -p build-main && cd build-main
+          cmake ../../source \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DCMAKE_INSTALL_PREFIX=$PREFIX \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DENABLE_SHARED=OFF \
+            -DENABLE_CLI=OFF \
+            -DENABLE_ALPHA=ON \
+            -DEXTRA_LIB="../build-10bit/libx265.a;../build-12bit/libx265.a" \
+            -DLINKED_10BIT=ON \
+            -DLINKED_12BIT=ON
+          make -j$JOBS
+          cd ..
+
+          # Combine all libs into single static archive using libtool (macOS)
+          libtool -static -o libx265.a \
+            build-main/libx265.a \
+            build-10bit/libx265.a \
+            build-12bit/libx265.a
+
+          # Install combined lib and headers
+          cp libx265.a $PREFIX/lib/
+          cp ../source/x265.h $PREFIX/include/ 2>/dev/null || true
+          cp build-main/x265_config.h $PREFIX/include/ 2>/dev/null || true
+
+          # Create pkg-config file for x265
+          # Libs.private needed for static linking (x265 is C++)
+          printf '%s\n' \
+            'prefix=${pcfiledir}/../..' \
+            'exec_prefix=${prefix}' \
+            'libdir=${prefix}/lib' \
+            'includedir=${prefix}/include' \
+            '' \
+            'Name: x265' \
+            'Description: H.265/HEVC video encoder with alpha support' \
+            'Version: 4.1' \
+            'Libs: -L${libdir} -lx265' \
+            'Libs.private: -lc++' \
+            'Cflags: -I${includedir}' \
+            > $PREFIX/lib/pkgconfig/x265.pc
+
+          cd ../..
 
       - name: Create tarball
         run: tar -czvf static-libs-aarch64-apple-darwin.tar.gz -C ./static-libs-aarch64-apple-darwin .
