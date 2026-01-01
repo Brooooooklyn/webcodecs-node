@@ -138,8 +138,10 @@ jobs:
 
           git clone --depth 1 --branch Release_4.1 https://bitbucket.org/multicoreware/x265_git.git
           cd x265_git
-          # Fetch tags for version detection (shallow clone doesn't include them)
-          git fetch --depth=1 origin '+refs/tags/Release_4.1:refs/tags/Release_4.1'
+          # Create a local tag for version detection
+          # git describe --abbrev=0 --tags needs a tag reachable from HEAD
+          # Shallow clone doesn't have the tag in history, so we create one locally
+          git tag 4.1
 
           # Build 12-bit lib
           cmake -B build-12bit -S source -G "Visual Studio 17 2022" -A ARM64 `
@@ -527,8 +529,10 @@ jobs:
 
           git clone --depth 1 --branch Release_4.1 https://bitbucket.org/multicoreware/x265_git.git
           cd x265_git
-          # Fetch tags for version detection (shallow clone doesn't include them)
-          git fetch --depth=1 origin '+refs/tags/Release_4.1:refs/tags/Release_4.1'
+          # Create a local tag for version detection
+          # git describe --abbrev=0 --tags needs a tag reachable from HEAD
+          # Shallow clone doesn't have the tag in history, so we create one locally
+          git tag 4.1
 
           # Build 12-bit lib
           cmake -B build-12bit -S source -G "Visual Studio 17 2022" -A x64 `
