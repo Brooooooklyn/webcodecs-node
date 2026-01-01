@@ -144,8 +144,14 @@ jobs:
           git tag 4.1
 
           # Build 12-bit lib
-          cmake -B build-12bit -S source -G "Visual Studio 17 2022" -A ARM64 `
+          # Use ClangCL for ARM64 NEON assembly support
+          # NOWINBASEINTERLOCK skips winbase.h interlocked wrappers that conflict with ClangCL intrinsics
+          # /MT uses static CRT to match vcpkg's static triplet (avoids __imp_fwrite link errors)
+          cmake -B build-12bit -S source -G "Visual Studio 17 2022" -A ARM64 -T ClangCL `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY="MultiThreaded" `
+            -DCMAKE_C_FLAGS="-DNOWINBASEINTERLOCK" `
+            -DCMAKE_CXX_FLAGS="-DNOWINBASEINTERLOCK" `
             -DENABLE_SHARED=OFF `
             -DENABLE_CLI=OFF `
             -DENABLE_ALPHA=ON `
@@ -155,8 +161,11 @@ jobs:
           cmake --build build-12bit --config Release --parallel
 
           # Build 10-bit lib
-          cmake -B build-10bit -S source -G "Visual Studio 17 2022" -A ARM64 `
+          cmake -B build-10bit -S source -G "Visual Studio 17 2022" -A ARM64 -T ClangCL `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY="MultiThreaded" `
+            -DCMAKE_C_FLAGS="-DNOWINBASEINTERLOCK" `
+            -DCMAKE_CXX_FLAGS="-DNOWINBASEINTERLOCK" `
             -DENABLE_SHARED=OFF `
             -DENABLE_CLI=OFF `
             -DENABLE_ALPHA=ON `
@@ -170,8 +179,11 @@ jobs:
           $lib10bit = "$x265Dir/build-10bit/Release/x265-static.lib"
           $lib12bit = "$x265Dir/build-12bit/Release/x265-static.lib"
           Write-Host "EXTRA_LIB: $lib10bit;$lib12bit"
-          cmake -B build-main -S source -G "Visual Studio 17 2022" -A ARM64 `
+          cmake -B build-main -S source -G "Visual Studio 17 2022" -A ARM64 -T ClangCL `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY="MultiThreaded" `
+            -DCMAKE_C_FLAGS="-DNOWINBASEINTERLOCK" `
+            -DCMAKE_CXX_FLAGS="-DNOWINBASEINTERLOCK" `
             -DENABLE_SHARED=OFF `
             -DENABLE_CLI=OFF `
             -DENABLE_ALPHA=ON `
@@ -191,7 +203,30 @@ jobs:
           Copy-Item -Force source/x265.h "$VCPKG_INSTALLED/include/"
           Copy-Item -Force build-main/x265_config.h "$VCPKG_INSTALLED/include/"
 
+          # Create pkg-config file for x265 (vcpkg's x265.pc was overwritten)
+          # Convert path to forward slashes for pkg-config compatibility
+          $pkgconfigDir = "$VCPKG_INSTALLED/lib/pkgconfig"
+          $prefixUnix = $VCPKG_INSTALLED -replace '\\','/'
+          New-Item -ItemType Directory -Force -Path $pkgconfigDir | Out-Null
+          $x265pc = @(
+            "prefix=$prefixUnix"
+            'exec_prefix=${prefix}'
+            'libdir=${prefix}/lib'
+            'includedir=${prefix}/include'
+            ''
+            'Name: x265'
+            'Description: H.265/HEVC video encoder with alpha support'
+            'Version: 4.1'
+            'Libs: -L${libdir} -lx265-static'
+            'Libs.private: -lstdc++'
+            'Cflags: -I${includedir}'
+          ) -join "`n"
+          # Use ASCII encoding to avoid UTF-8 BOM which breaks pkg-config
+          [System.IO.File]::WriteAllText("$pkgconfigDir/x265.pc", $x265pc)
+
           Write-Host "x265 with alpha support installed to $VCPKG_INSTALLED"
+          Write-Host "x265.pc content:"
+          Get-Content "$pkgconfigDir/x265.pc"
 
       - name: List vcpkg installed libraries
         run: |
@@ -255,8 +290,8 @@ jobs:
           # x264
           create_pc "$PKGCONFIG_DIR_MSYS/x264.pc" "$VCPKG_INSTALLED" "x264" "x264 H.264 encoder" "0.164" '-I${includedir}' '-lx264'
 
-          # x265
-          create_pc "$PKGCONFIG_DIR_MSYS/x265.pc" "$VCPKG_INSTALLED" "x265" "x265 HEVC encoder" "3.5" '-I${includedir}' '-lx265'
+          # x265 - needs ucrt.lib and vcruntime.lib for CRT symbols (__imp_fwrite, __imp_round, etc.)
+          create_pc "$PKGCONFIG_DIR_MSYS/x265.pc" "$VCPKG_INSTALLED" "x265" "x265 HEVC encoder" "4.1" '-I${includedir}' '-lx265 -lucrt -lvcruntime'
 
           # vpx
           create_pc "$PKGCONFIG_DIR_MSYS/vpx.pc" "$VCPKG_INSTALLED" "vpx" "WebM VP8/VP9 codec" "1.13.0" '-I${includedir}' '-lvpx'
@@ -535,8 +570,10 @@ jobs:
           git tag 4.1
 
           # Build 12-bit lib
+          # CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded uses /MT (static CRT) to match vcpkg's static triplet
           cmake -B build-12bit -S source -G "Visual Studio 17 2022" -A x64 `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY="MultiThreaded" `
             -DENABLE_SHARED=OFF `
             -DENABLE_CLI=OFF `
             -DENABLE_ALPHA=ON `
@@ -548,6 +585,7 @@ jobs:
           # Build 10-bit lib
           cmake -B build-10bit -S source -G "Visual Studio 17 2022" -A x64 `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY="MultiThreaded" `
             -DENABLE_SHARED=OFF `
             -DENABLE_CLI=OFF `
             -DENABLE_ALPHA=ON `
@@ -563,6 +601,7 @@ jobs:
           Write-Host "EXTRA_LIB: $lib10bit;$lib12bit"
           cmake -B build-main -S source -G "Visual Studio 17 2022" -A x64 `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY="MultiThreaded" `
             -DENABLE_SHARED=OFF `
             -DENABLE_CLI=OFF `
             -DENABLE_ALPHA=ON `
@@ -582,7 +621,30 @@ jobs:
           Copy-Item -Force source/x265.h "$VCPKG_INSTALLED/include/"
           Copy-Item -Force build-main/x265_config.h "$VCPKG_INSTALLED/include/"
 
+          # Create pkg-config file for x265 (vcpkg's x265.pc was overwritten)
+          # Convert path to forward slashes for pkg-config compatibility
+          $pkgconfigDir = "$VCPKG_INSTALLED/lib/pkgconfig"
+          $prefixUnix = $VCPKG_INSTALLED -replace '\\','/'
+          New-Item -ItemType Directory -Force -Path $pkgconfigDir | Out-Null
+          $x265pc = @(
+            "prefix=$prefixUnix"
+            'exec_prefix=${prefix}'
+            'libdir=${prefix}/lib'
+            'includedir=${prefix}/include'
+            ''
+            'Name: x265'
+            'Description: H.265/HEVC video encoder with alpha support'
+            'Version: 4.1'
+            'Libs: -L${libdir} -lx265-static'
+            'Libs.private: -lstdc++'
+            'Cflags: -I${includedir}'
+          ) -join "`n"
+          # Use ASCII encoding to avoid UTF-8 BOM which breaks pkg-config
+          [System.IO.File]::WriteAllText("$pkgconfigDir/x265.pc", $x265pc)
+
           Write-Host "x265 with alpha support installed to $VCPKG_INSTALLED"
+          Write-Host "x265.pc content:"
+          Get-Content "$pkgconfigDir/x265.pc"
 
       - name: List vcpkg installed libraries
         run: |
@@ -663,8 +725,8 @@ jobs:
           # x264
           create_pc "$PKGCONFIG_DIR_MSYS/x264.pc" "$VCPKG_INSTALLED" "x264" "x264 H.264 encoder" "0.164" '-I${includedir}' '-lx264'
 
-          # x265
-          create_pc "$PKGCONFIG_DIR_MSYS/x265.pc" "$VCPKG_INSTALLED" "x265" "x265 HEVC encoder" "3.5" '-I${includedir}' '-lx265'
+          # x265 - needs ucrt.lib and vcruntime.lib for CRT symbols (__imp_fwrite, __imp_round, etc.)
+          create_pc "$PKGCONFIG_DIR_MSYS/x265.pc" "$VCPKG_INSTALLED" "x265" "x265 HEVC encoder" "4.1" '-I${includedir}' '-lx265 -lucrt -lvcruntime'
 
           # vpx
           create_pc "$PKGCONFIG_DIR_MSYS/vpx.pc" "$VCPKG_INSTALLED" "vpx" "WebM VP8/VP9 codec" "1.13.0" '-I${includedir}' '-lvpx'
