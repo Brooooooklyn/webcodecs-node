@@ -63,17 +63,14 @@
     ],
     "*.@(yml|yaml|md)": [
       "prettier --write"
-    ],
-    "*.@(js|ts|tsx|toml|json)": [
-      "oxfmt"
     ]
   },
   "devDependencies": {
     "@emnapi/core": "^1.7.1",
     "@emnapi/runtime": "^1.7.1",
-    "@napi-rs/canvas": "^0.1.87",
-    "@napi-rs/cli": "^3.5.0",
-    "@napi-rs/wasm-runtime": "^1.1.0",
+    "@napi-rs/canvas": "^0.1.88",
+    "@napi-rs/cli": "^3.5.1",
+    "@napi-rs/wasm-runtime": "^1.1.1",
     "@oxc-node/core": "^0.0.35",
     "@oxc-node/cli": "^0.0.35",
     "@taplo/cli": "^0.7.0",
@@ -84,10 +81,10 @@
     "emnapi": "^1.7.1",
     "husky": "^9.1.7",
     "lint-staged": "^16.2.7",
-    "mediabunny": "1.27.2",
+    "mediabunny": "1.27.3",
     "npm-run-all2": "^8.0.4",
-    "oxfmt": "^0.20.0",
-    "oxlint": "^1.35.0",
+    "oxfmt": "^0.21.0",
+    "oxlint": "^1.36.0",
     "oxlint-tsgolint": "^0.10.0",
     "prettier": "^3.7.4",
     "tinybench": "^6.0.0",
@@ -118,7 +115,7 @@
       "armv7-unknown-linux-gnueabihf"
     ]
   },
-  "packageManager": "pnpm@10.26.2",
+  "packageManager": "pnpm@10.27.0",
   "prettier": {
     "arrowParens": "always",
     "printWidth": 120,
