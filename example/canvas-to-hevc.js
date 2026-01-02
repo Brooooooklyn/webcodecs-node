@@ -62,9 +62,8 @@ async function main() {
     height,
     bitrate: 2_000_000, // 2 Mbps
     framerate: fps,
-    // TODO: When using `prefer-hardware`, (hevc_videotoolbox) failed to produce output (silent failure after 3 frames)
-    hardwareAcceleration: 'prefer-software', // 'no-preference' | 'prefer-hardware' | 'prefer-software'
-    // latencyMode: 'quality', // 'quality' | 'realtime', when set realtime, has_b_frames = 0
+    hardwareAcceleration: 'prefer-hardware', // 'no-preference' | 'prefer-hardware' | 'prefer-software'
+    latencyMode: 'quality', // 'quality' | 'realtime', when set realtime, has_b_frames = 0
   })
 
   console.log('\nRendering and encoding frames...')
