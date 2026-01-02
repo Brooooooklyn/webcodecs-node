@@ -283,22 +283,31 @@ impl EncodedVideoChunk {
     let packet_dts = packet.dts();
     let packet_duration = packet.duration();
 
-    // Extract DTS if it differs from PTS (indicates B-frames)
+    // Extract DTS and original PTS for proper B-frame support
     // AV_NOPTS_VALUE is i64::MIN in FFmpeg
     const AV_NOPTS_VALUE: i64 = i64::MIN;
 
-    let dts_us = if packet_dts != AV_NOPTS_VALUE && packet_dts != packet_pts {
+    // Always store DTS if valid (even if equal to PTS)
+    // This ensures consistent handling in muxer for all frames
+    let dts_us = if packet_dts != AV_NOPTS_VALUE {
       Some(packet_dts)
     } else {
       None
     };
 
-    // Store original PTS when DTS is present (B-frames)
+    // Always store original PTS when DTS is valid
+    // This allows muxer to reconstruct correct PTS/DTS relationship
     let original_pts = if dts_us.is_some() {
       Some(packet_pts)
     } else {
       None
     };
+
+    // Debug: print packet timestamps
+    eprintln!(
+      "DEBUG EncodedVideoChunk: packet_pts={}, packet_dts={}, explicit_ts={:?}, dts_us={:?}, original_pts={:?}",
+      packet_pts, packet_dts, explicit_timestamp, dts_us, original_pts
+    );
 
     let data = if use_avcc {
       Either::A(convert_annexb_to_avcc(packet.as_slice()))
