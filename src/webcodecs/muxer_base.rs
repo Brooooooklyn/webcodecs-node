@@ -347,7 +347,6 @@ impl<F: MuxerFormat> MuxerInner<F> {
     };
 
     // Calculate time_base for precise timing
-    // Chrome uses: timescale = fps * fps * 64 (e.g., 30fps -> 57600)
     // This provides enough precision for frame-accurate timing
     let time_base = if config.framerate > 0.0 {
       let fps = config.framerate;
@@ -572,7 +571,7 @@ impl<F: MuxerFormat> MuxerInner<F> {
     packet.set_duration(dur);
 
     // Debug output
-    eprintln!("MUXER: pts={}, dts={}, dur={}", pts, dts, dur);
+    // eprintln!("MUXER: pts={}, dts={}, dur={}", pts, dts, dur);
 
     // Set keyframe flag
     if chunk_type == EncodedVideoChunkType::Key {

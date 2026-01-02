@@ -304,10 +304,10 @@ impl EncodedVideoChunk {
     };
 
     // Debug: print packet timestamps
-    eprintln!(
-      "DEBUG EncodedVideoChunk: packet_pts={}, packet_dts={}, explicit_ts={:?}, dts_us={:?}, original_pts={:?}",
-      packet_pts, packet_dts, explicit_timestamp, dts_us, original_pts
-    );
+    // eprintln!(
+    //   "DEBUG EncodedVideoChunk: packet_pts={}, packet_dts={}, explicit_ts={:?}, dts_us={:?}, original_pts={:?}",
+    //   packet_pts, packet_dts, explicit_timestamp, dts_us, original_pts
+    // );
 
     let data = if use_avcc {
       Either::A(convert_annexb_to_avcc(packet.as_slice()))

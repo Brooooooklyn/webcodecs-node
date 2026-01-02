@@ -2,7 +2,7 @@ import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { createCanvas } from '@napi-rs/canvas'
-import { VideoEncoder, VideoFrame, Mp4Muxer, EncodedVideoChunk } from '../index.js'
+import { VideoEncoder, VideoFrame, Mp4Muxer } from '../index.js'
 import { drawRoundedSquare, easeInOutCubic } from './canvas-utils.js'
 
 const __dirname = new URL('.', import.meta.url).pathname
@@ -62,7 +62,9 @@ async function main() {
     height,
     bitrate: 2_000_000, // 2 Mbps
     framerate: fps,
-    // latencyMode: 'realtime', // When set realtime, has_b_frames = 0
+    // TODO: When using `prefer-hardware`, (hevc_videotoolbox) failed to produce output (silent failure after 3 frames)
+    hardwareAcceleration: 'prefer-software', // 'no-preference' | 'prefer-hardware' | 'prefer-software'
+    // latencyMode: 'quality', // 'quality' | 'realtime', when set realtime, has_b_frames = 0
   })
 
   console.log('\nRendering and encoding frames...')
@@ -159,8 +161,6 @@ async function main() {
     width,
     height,
     description,
-    framerateNum: fps,
-    framerateDen: 1,
   })
 
   console.log('Muxing chunks...')
