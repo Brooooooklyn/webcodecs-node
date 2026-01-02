@@ -1624,6 +1624,8 @@ export interface MkvVideoTrackConfig {
   width: number
   /** Video height in pixels */
   height: number
+  /** Frame rate (frames per second) */
+  framerate?: number
   /** Codec-specific description data */
   description?: Uint8Array
 }
@@ -1664,6 +1666,8 @@ export interface Mp4VideoTrackConfig {
   width: number
   /** Video height in pixels */
   height: number
+  /** Frame rate (frames per second) */
+  framerate?: number
   /** Codec-specific description data (avcC/hvcC/av1C from encoder metadata) */
   description?: Uint8Array
 }
@@ -2016,6 +2020,8 @@ export interface WebMVideoTrackConfig {
   width: number
   /** Video height in pixels */
   height: number
+  /** Frame rate (frames per second) */
+  framerate?: number
   /** Codec-specific description data */
   description?: Uint8Array
   /** Whether the video has alpha channel (VP9 alpha support) */

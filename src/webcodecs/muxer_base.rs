@@ -88,6 +88,7 @@ pub struct StoredVideoTrackInfo {
   pub codec: String,
   pub width: u32,
   pub height: u32,
+  pub framerate: f64,
 }
 
 /// Stored audio track info (extracted from config)
@@ -182,6 +183,7 @@ pub struct GenericVideoTrackConfig {
   pub codec_id: AVCodecID,
   pub width: u32,
   pub height: u32,
+  pub framerate: f64,
   pub extradata: Option<Vec<u8>>,
   /// Whether this track has alpha channel (VP9 alpha support)
   pub has_alpha: bool,
@@ -252,6 +254,14 @@ pub struct MuxerInner<F: MuxerFormat> {
   last_video_pts: i64,
   /// Last audio PTS written (to ensure monotonically increasing)
   last_audio_pts: i64,
+  /// Video frame counter (for precise PTS calculation)
+  video_frame_count: u64,
+  /// Ticks per video frame in stream time base (set after header written)
+  /// For 30fps with timescale=57600: ticks_per_frame = 1920
+  video_ticks_per_frame: Option<u64>,
+  /// PTS offset for B-frame videos (set from first frame's PTS-DTS difference)
+  /// Used to normalize PTS to start from 0
+  video_pts_offset: Option<i64>,
   /// Phantom data for format type
   _format: PhantomData<F>,
 }
@@ -276,6 +286,9 @@ impl<F: MuxerFormat> MuxerInner<F> {
       muxer_options: options,
       last_video_pts: -1,
       last_audio_pts: -1,
+      video_frame_count: 0,
+      video_ticks_per_frame: None,
+      video_pts_offset: None,
       _format: PhantomData,
     })
   }
@@ -303,6 +316,9 @@ impl<F: MuxerFormat> MuxerInner<F> {
       muxer_options: options,
       last_video_pts: -1,
       last_audio_pts: -1,
+      video_frame_count: 0,
+      video_ticks_per_frame: None,
+      video_pts_offset: None,
       _format: PhantomData,
     })
   }
@@ -352,6 +368,7 @@ impl<F: MuxerFormat> MuxerInner<F> {
       codec: config.codec,
       width: config.width,
       height: config.height,
+      framerate: config.framerate,
     });
 
     Ok(())
@@ -414,6 +431,17 @@ impl<F: MuxerFormat> MuxerInner<F> {
           )
         })?;
       self.state = MuxerState::Muxing;
+
+      // Calculate ticks per frame for precise PTS calculation
+      // This avoids floating point cumulative errors
+      if let (Some(tb), Some(track_info)) = (self.muxer.video_time_base(), &self.video_track_info) {
+        // ticks_per_frame = time_base_den / fps
+        // For 30fps with tb=1/57600: ticks_per_frame = 57600 / 30 = 1920
+        let fps = track_info.framerate;
+        if fps > 0.0 {
+          self.video_ticks_per_frame = Some((tb.den as f64 / fps).round() as u64);
+        }
+      }
     }
     Ok(())
   }
@@ -444,6 +472,10 @@ impl<F: MuxerFormat> MuxerInner<F> {
     let chunk_type = chunk.chunk_type()?;
     let timestamp = chunk.timestamp()?;
     let duration = chunk.duration()?;
+    // Get internal DTS if available (for B-frame support)
+    let chunk_dts = chunk.dts()?;
+    // Get original PTS from encoder (for B-frame support)
+    let chunk_original_pts = chunk.original_pts()?;
 
     // Get packet using optimized path:
     // - If chunk has Packet (from encoder): shallow_clone shares buffer (zero-copy)
@@ -453,19 +485,102 @@ impl<F: MuxerFormat> MuxerInner<F> {
     // Set packet properties
     packet.set_stream_index(video_index);
 
-    // Ensure monotonically increasing PTS (video time base is microseconds)
-    let pts = if timestamp <= self.last_video_pts {
-      self.last_video_pts + 1
+    // Calculate PTS based on frame counter for precise timing (no floating point errors)
+    // This is critical for smooth playback - using frame index * ticks_per_frame
+    // instead of converting from microseconds avoids cumulative rounding errors
+    let (pts, dts, dur) = if let Some(ticks_per_frame) = self.video_ticks_per_frame {
+      let frame_idx = self.video_frame_count;
+      self.video_frame_count += 1;
+
+      // For B-frames: frames arrive in decode order (DTS order) from encoder,
+      // but we need correct PTS for display order.
+      //
+      // When we have original_pts and chunk_dts from the encoder:
+      // - Both are in encoder time_base (1/1000000 microseconds)
+      // - We compute their DIFFERENCE (which represents B-frame reordering)
+      // - Scale this difference to our target timebase
+      // - DTS = frame_count * ticks_per_frame (monotonic decode order)
+      // - PTS = DTS + scaled_difference - first_frame_offset (normalized to start from 0)
+
+      let dts = (frame_idx * ticks_per_frame) as i64;
+
+      let pts = if let (Some(orig_pts), Some(orig_dts)) = (chunk_original_pts, chunk_dts) {
+        // B-frames present: use original PTS/DTS relationship from encoder
+        // The difference (orig_pts - orig_dts) tells us how much ahead the display time is
+        // relative to decode time. This difference needs to be scaled to our timebase.
+
+        // Both orig_pts and orig_dts are in encoder time_base (microseconds)
+        // Scale the difference to our video timebase
+        if let Some(dst_tb) = self.muxer.video_time_base() {
+          use crate::ffi::AVRational;
+          let src_tb = AVRational::MICROSECONDS;
+          use crate::ffi::avutil::av_rescale_q;
+
+          // Scale the pts-dts offset to destination timebase
+          let pts_dts_offset_us = orig_pts - orig_dts;
+          let scaled_offset = unsafe { av_rescale_q(pts_dts_offset_us, src_tb, dst_tb) };
+
+          // Raw PTS = DTS + offset
+          let raw_pts = dts + scaled_offset;
+
+          // For the first frame (which is an I-frame), record its PTS as the offset
+          // We'll subtract this from both PTS and DTS to normalize the timeline
+          // This makes the first frame's PTS = 0, matching FFmpeg's behavior
+          if self.video_pts_offset.is_none() {
+            self.video_pts_offset = Some(raw_pts);
+          }
+
+          // Subtract the offset from PTS (DTS will also be adjusted below)
+          raw_pts - self.video_pts_offset.unwrap_or(0)
+        } else {
+          dts // Fallback
+        }
+      } else {
+        // No B-frames: use frame counter for both (precise timing)
+        dts
+      };
+
+      // Adjust DTS by the same offset to maintain correct PTS-DTS relationship
+      let adjusted_dts = if self.video_pts_offset.is_some() {
+        dts - self.video_pts_offset.unwrap_or(0)
+      } else {
+        dts
+      };
+
+      (pts, adjusted_dts, ticks_per_frame as i64)
     } else {
-      timestamp
+      // Fallback: convert from microseconds (may have precision loss)
+      let pts = if timestamp <= self.last_video_pts {
+        self.last_video_pts + 1
+      } else {
+        timestamp
+      };
+      self.last_video_pts = pts;
+
+      // Convert timestamps from microseconds to stream time base
+      if let Some(dst_tb) = self.muxer.video_time_base() {
+        use crate::ffi::AVRational;
+        let src_tb = AVRational::MICROSECONDS; // 1/1000000
+        use crate::ffi::avutil::av_rescale_q;
+        let scaled_pts = unsafe { av_rescale_q(pts, src_tb, dst_tb) };
+        let scaled_dts = if let Some(orig_dts) = chunk_dts {
+          unsafe { av_rescale_q(orig_dts, src_tb, dst_tb) }
+        } else {
+          scaled_pts
+        };
+        let scaled_dur = duration
+          .map(|d| unsafe { av_rescale_q(d, src_tb, dst_tb) })
+          .unwrap_or(0);
+        (scaled_pts, scaled_dts, scaled_dur)
+      } else {
+        let dts = chunk_dts.unwrap_or(pts);
+        (pts, dts, duration.unwrap_or(0))
+      }
     };
-    self.last_video_pts = pts;
 
     packet.set_pts(pts);
-    packet.set_dts(pts);
-    if let Some(dur) = duration {
-      packet.set_duration(dur);
-    }
+    packet.set_dts(dts);
+    packet.set_duration(dur);
 
     // Set keyframe flag
     if chunk_type == EncodedVideoChunkType::Key {
