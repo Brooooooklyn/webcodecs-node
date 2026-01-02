@@ -268,7 +268,11 @@ impl FromNapiValue for VideoEncoderInit {
 }
 
 /// Threshold for detecting silent encoder failure (no output after N frames)
-const SILENT_FAILURE_THRESHOLD: u32 = 3;
+/// This value should be larger than max_b_frames + 1 because B-frame encoders
+/// need to buffer frames before producing output (not a real failure).
+/// For HEVC with B-pyramid (has_b_frames=2), we need at least 4 frames.
+/// Using 5 to be safe across different encoders and configurations.
+const SILENT_FAILURE_THRESHOLD: u32 = 5;
 
 /// Type alias for weak event listener callback (allows Node.js process to exit)
 type WeakEventListenerCallback =
