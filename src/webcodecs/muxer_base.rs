@@ -346,13 +346,24 @@ impl<F: MuxerFormat> MuxerInner<F> {
       AVPixelFormat::Yuv420p
     };
 
+    // Calculate time_base for precise timing
+    // Chrome uses: timescale = fps * fps * 64 (e.g., 30fps -> 57600)
+    // This provides enough precision for frame-accurate timing
+    let time_base = if config.framerate > 0.0 {
+      let fps = config.framerate;
+      let timescale = (fps * fps * 64.0).round() as i32;
+      AVRational::new(1, timescale)
+    } else {
+      AVRational::MICROSECONDS
+    };
+
     // Create video stream config
     let stream_config = VideoStreamConfig {
       codec_id: config.codec_id,
       width: config.width,
       height: config.height,
       pixel_format,
-      time_base: AVRational::MICROSECONDS,
+      time_base,
       bitrate: None,
       extradata: config.extradata,
     };
