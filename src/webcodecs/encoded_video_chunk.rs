@@ -295,9 +295,10 @@ impl EncodedVideoChunk {
       None
     };
 
-    // Always store original PTS when DTS is valid
+    // Always store original PTS if valid (independent of DTS)
     // This allows muxer to reconstruct correct PTS/DTS relationship
-    let original_pts = if dts_us.is_some() {
+    // and preserves PTS information even when DTS is not available
+    let original_pts = if packet_pts != AV_NOPTS_VALUE {
       Some(packet_pts)
     } else {
       None
