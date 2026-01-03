@@ -61,9 +61,6 @@
   "lint-staged": {
     "*.@(js|ts|tsx)": [
       "oxlint --fix"
-    ],
-    "*.@(yml|yaml|md)": [
-      "prettier --write"
     ]
   },
   "devDependencies": {
