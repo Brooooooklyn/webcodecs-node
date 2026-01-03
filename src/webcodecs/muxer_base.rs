@@ -259,8 +259,8 @@ pub struct MuxerInner<F: MuxerFormat> {
   /// Ticks per video frame in stream time base (set after header written)
   /// For 30fps with timescale=57600: ticks_per_frame = 1920
   video_ticks_per_frame: Option<u64>,
-  /// PTS offset for B-frame videos (set from first frame's PTS-DTS difference)
-  /// Used to normalize PTS to start from 0
+  /// PTS offset for B-frame videos (set from first frame's scaled PTS)
+  /// Used to normalize PTS timeline so the first frame starts at PTS=0
   video_pts_offset: Option<i64>,
   /// Phantom data for format type
   _format: PhantomData<F>,
@@ -448,7 +448,11 @@ impl<F: MuxerFormat> MuxerInner<F> {
         // ticks_per_frame = time_base_den / fps
         // For 30fps with tb=1/57600: ticks_per_frame = 57600 / 30 = 1920
         let fps = track_info.framerate;
-        if fps > 0.0 {
+        // Use minimum fps threshold to avoid extremely large tick values from division
+        // 1.0 fps is a reasonable lower bound for any practical video
+        // Also check is_finite() to guard against NaN/Infinity
+        const MIN_FPS: f64 = 1.0;
+        if fps.is_finite() && fps >= MIN_FPS {
           self.video_ticks_per_frame = Some((tb.den as f64 / fps).round() as u64);
         }
       }
@@ -511,10 +515,9 @@ impl<F: MuxerFormat> MuxerInner<F> {
         let scaled_pts = unsafe { av_rescale_q(orig_pts, src_tb, dst_tb) };
         let scaled_dts = unsafe { av_rescale_q(orig_dts, src_tb, dst_tb) };
 
-        // For the first frame, record the DTS offset to normalize timeline
-        // (first frame's DTS will become 0 or negative depending on B-frame depth)
+        // For the first frame, record the PTS offset to normalize timeline
+        // This ensures the output video starts at PTS=0
         if self.video_pts_offset.is_none() {
-          // Use scaled_pts of first frame as offset so first PTS = 0
           self.video_pts_offset = Some(scaled_pts);
         }
 

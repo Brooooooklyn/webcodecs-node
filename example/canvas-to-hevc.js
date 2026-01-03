@@ -1,11 +1,12 @@
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
+import { fileURLToPath } from 'node:url'
 import { createCanvas } from '@napi-rs/canvas'
 import { VideoEncoder, VideoFrame, Mp4Muxer } from '../index.js'
 import { drawRoundedSquare, easeInOutCubic } from './canvas-utils.js'
 
-const __dirname = new URL('.', import.meta.url).pathname
+const __dirname = fileURLToPath(new URL('.', import.meta.url))
 
 async function main() {
   const startTime = performance.now()
