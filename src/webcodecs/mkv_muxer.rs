@@ -110,6 +110,8 @@ pub struct MkvVideoTrackConfig {
   pub width: u32,
   /// Video height in pixels
   pub height: u32,
+  /// Frame rate (frames per second)
+  pub framerate: Option<f64>,
   /// Codec-specific description data
   pub description: Option<Uint8Array>,
 }
@@ -195,6 +197,7 @@ impl MkvMuxer {
       codec_id,
       width: config.width,
       height: config.height,
+      framerate: config.framerate.unwrap_or(30.0),
       extradata: config.description.as_ref().map(|d| d.to_vec()),
       has_alpha: false, // TODO: Add alpha support for MKV if needed
     };

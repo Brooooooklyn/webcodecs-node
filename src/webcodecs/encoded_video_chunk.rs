@@ -213,6 +213,14 @@ pub(crate) struct EncodedVideoChunkInner {
   pub(crate) chunk_type: EncodedVideoChunkType,
   pub(crate) timestamp_us: i64,
   pub(crate) duration_us: Option<i64>,
+  /// Internal decode timestamp (DTS) for B-frame support.
+  /// Not exposed via WebCodecs API, but used internally for correct muxing.
+  /// When None, DTS equals PTS (no B-frames or unknown).
+  pub(crate) dts_us: Option<i64>,
+  /// Original PTS from encoder packet (in encoder time_base units).
+  /// Used alongside dts_us for correct B-frame muxing.
+  /// When Some, muxer should use this pair instead of timestamp_us.
+  pub(crate) original_pts: Option<i64>,
 }
 
 // SAFETY: EncodedVideoChunkInner can be safely sent and shared between threads.
@@ -249,6 +257,8 @@ impl EncodedVideoChunk {
       chunk_type: init.chunk_type,
       timestamp_us: init.timestamp,
       duration_us: init.duration,
+      dts_us: None,       // No DTS info from JS API
+      original_pts: None, // No original PTS from JS API
     };
 
     Ok(Self {
@@ -270,7 +280,35 @@ impl EncodedVideoChunk {
     };
 
     let packet_pts = packet.pts();
+    let packet_dts = packet.dts();
     let packet_duration = packet.duration();
+
+    // Extract DTS and original PTS for proper B-frame support
+    // AV_NOPTS_VALUE is i64::MIN in FFmpeg
+    const AV_NOPTS_VALUE: i64 = i64::MIN;
+
+    // Always store DTS if valid (even if equal to PTS)
+    // This ensures consistent handling in muxer for all frames
+    let dts_us = if packet_dts != AV_NOPTS_VALUE {
+      Some(packet_dts)
+    } else {
+      None
+    };
+
+    // Always store original PTS if valid (independent of DTS)
+    // This allows muxer to reconstruct correct PTS/DTS relationship
+    // and preserves PTS information even when DTS is not available
+    let original_pts = if packet_pts != AV_NOPTS_VALUE {
+      Some(packet_pts)
+    } else {
+      None
+    };
+
+    // Debug: print packet timestamps
+    // eprintln!(
+    //   "DEBUG EncodedVideoChunk: packet_pts={}, packet_dts={}, explicit_ts={:?}, dts_us={:?}, original_pts={:?}",
+    //   packet_pts, packet_dts, explicit_timestamp, dts_us, original_pts
+    // );
 
     let data = if use_avcc {
       Either::A(convert_annexb_to_avcc(packet.as_slice()))
@@ -288,6 +326,8 @@ impl EncodedVideoChunk {
       } else {
         None
       },
+      dts_us,
+      original_pts,
     };
 
     Self {
@@ -311,6 +351,20 @@ impl EncodedVideoChunk {
   #[napi(getter)]
   pub fn duration(&self) -> Result<Option<i64>> {
     self.with_inner(|inner| Ok(inner.duration_us))
+  }
+
+  /// Get the internal decode timestamp (DTS) in microseconds.
+  /// This is NOT part of the WebCodecs API, but used internally for B-frame support.
+  /// Returns None if DTS equals PTS (no B-frames).
+  pub(crate) fn dts(&self) -> Result<Option<i64>> {
+    self.with_inner(|inner| Ok(inner.dts_us))
+  }
+
+  /// Get the original PTS from encoder packet (in encoder time_base units).
+  /// This is NOT part of the WebCodecs API, but used internally for B-frame support.
+  /// Returns None if no B-frames or chunk was created from JS API.
+  pub(crate) fn original_pts(&self) -> Result<Option<i64>> {
+    self.with_inner(|inner| Ok(inner.original_pts))
   }
 
   /// Get the byte length of the encoded data
