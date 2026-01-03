@@ -27,7 +27,10 @@
       }
 
       body {
-        font-family: 'Inter', system-ui, -apple-system, sans-serif;
+        font-family:
+          system-ui,
+          -apple-system,
+          sans-serif;
         background: var(--bg);
         color: var(--text);
         line-height: 1.6;
@@ -97,11 +100,8 @@
 
       /* Checkerboard pattern for transparency */
       .checkerboard {
-        background: repeating-conic-gradient(
-            var(--checkerboard-light) 0% 25%,
-            var(--checkerboard-dark) 0% 50%
-          )
-          50% / 16px 16px;
+        background: repeating-conic-gradient(var(--checkerboard-light) 0% 25%, var(--checkerboard-dark) 0% 50%) 50% /
+          16px 16px;
         border-radius: 0.75rem;
         padding: 1rem;
         display: flex;
@@ -273,16 +273,18 @@
 
       .progress-fill {
         height: 100%;
+        width: 100%;
         background: linear-gradient(90deg, var(--primary), #a855f7);
-        border-radius: 9999px;
-        width: 0%;
-        transition: width 0.3s ease;
+        border-radius: 999px;
+        transform: scaleX(0);
+        transform-origin: left;
+        transition: transform 0.15s ease-out;
+        will-change: transform;
       }
 
       /* video preview */
       .generated-preview {
         height: 100%;
-        /* display: none; */
       }
 
       .generated-preview.visible {
@@ -323,6 +325,40 @@
         margin-top: 0;
       }
 
+      /* Select inputs */
+      .form-group {
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
+      }
+
+      .form-group label {
+        font-size: 0.75rem;
+        color: var(--text-muted);
+        font-weight: 500;
+      }
+
+      .form-select {
+        padding: 0.5rem 0.75rem;
+        border-radius: 0.375rem;
+        border: 1px solid var(--border);
+        background: var(--bg);
+        color: var(--text);
+        font-size: 0.85rem;
+        cursor: pointer;
+        transition: border-color 0.2s ease;
+      }
+
+      .form-select:hover {
+        border-color: var(--primary);
+      }
+
+      .form-select:focus {
+        outline: none;
+        border-color: var(--primary);
+        box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
+      }
+
       /* Info box */
       .info-box {
         background: rgba(99, 102, 241, 0.08);
@@ -333,7 +369,7 @@
       }
 
       .info-box p {
-        color: var(--text   );
+        color: var(--text);
         font-size: 0.9rem;
       }
 
@@ -409,8 +445,23 @@
             </div>
             <div class="controls-box">
               <div class="canvas-controls">
-                <button id="generateBtn" class="btn btn-success"><span>🎥</span> 生成 HEVC 视频</button>
-                <button id="downloadBtn" class="btn btn-primary" disabled><span>⬇️</span> 下载视频</button>
+                <div class="form-group">
+                  <label for="latencyMode">Latency Mode</label>
+                  <select id="latencyMode" class="form-select">
+                    <option value="quality" selected>Quality</option>
+                    <option value="realtime">Realtime</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label for="hardwareAcceleration">Hardware Acceleration</label>
+                  <select id="hardwareAcceleration" class="form-select">
+                    <option value="prefer-hardware" selected>Prefer Hardware</option>
+                    <option value="prefer-software">Prefer Software</option>
+                    <option value="no-preference">No Preference</option>
+                  </select>
+                </div>
+                <button id="generateBtn" class="btn btn-success"><span>🎥</span> Generate HEVC Video</button>
+                <button id="downloadBtn" class="btn btn-primary" disabled><span>⬇️</span> Download Video</button>
               </div>
               <div id="progressContainer" class="progress-container">
                 <div class="progress-label">
@@ -471,9 +522,23 @@
 
     <script type="module">
       import * as Mediabunny from 'https://cdn.jsdelivr.net/npm/mediabunny@1.27.3/+esm'
+      import { drawRoundedSquare, easeInOutCubic } from './canvas-utils.js'
 
-      // Helper function to draw a frame to canvas
-      function drawFrameToCanvas(ctx, frameIndex, width, height, fps, totalFrames) {
+      // Animation parameters (shared between preview and encoding)
+      const width = 400
+      const height = 400
+      const fps = 30
+      const durationSeconds = 3
+      const totalFrames = fps * durationSeconds
+      const baseSize = 150
+      const maxSize = 250
+
+      /**
+       * Calculate animation state for a given frame
+       * @param {number} frameIndex - Current frame index
+       * @returns {Object} Animation state including size, cornerRadius, color, rotation, and center position
+       */
+      function calculateAnimationState(frameIndex) {
         const progress = frameIndex / (totalFrames - 1)
         const loopProgress = progress < 0.5 ? progress * 2 : 2 - progress * 2
         const easedProgress = easeInOutCubic(loopProgress)
@@ -486,59 +551,50 @@
         const lightness = 50 + 10 * easedProgress
         const color = `hsl(${hue}, ${saturation}%, ${lightness}%)`
 
-        ctx.clearRect(0, 0, width, height)
-
         const rotation = (easedProgress * Math.PI) / 6
         const centerX = width / 2
         const centerY = height / 2
+
+        return { currentSize, cornerRadius, color, rotation, centerX, centerY, easedProgress }
+      }
+
+      /**
+       * Draw an animated frame to a canvas context
+       * @param {CanvasRenderingContext2D} ctx - Canvas context
+       * @param {number} frameIndex - Current frame index
+       * @param {boolean} withGlow - Whether to draw the glow effect (default: true)
+       */
+      function drawAnimatedFrame(ctx, frameIndex, withGlow = true) {
+        const { currentSize, cornerRadius, color, rotation, centerX, centerY, easedProgress } =
+          calculateAnimationState(frameIndex)
+
+        ctx.clearRect(0, 0, width, height)
 
         ctx.save()
         ctx.translate(centerX, centerY)
         ctx.rotate(rotation)
         ctx.translate(-centerX, -centerY)
 
-        // Draw shape
-        const halfSize = currentSize / 2
-        const x = centerX - halfSize
-        const y = centerY - halfSize
-        const radius = Math.min(cornerRadius, halfSize)
+        drawRoundedSquare(ctx, centerX, centerY, currentSize, cornerRadius, color)
 
-        ctx.beginPath()
-        ctx.moveTo(x + radius, y)
-        ctx.lineTo(x + currentSize - radius, y)
-        ctx.quadraticCurveTo(x + currentSize, y, x + currentSize, y + radius)
-        ctx.lineTo(x + currentSize, y + currentSize - radius)
-        ctx.quadraticCurveTo(
-          x + currentSize,
-          y + currentSize,
-          x + currentSize - radius,
-          y + currentSize
-        )
-        ctx.lineTo(x + radius, y + currentSize)
-        ctx.quadraticCurveTo(x, y + currentSize, x, y + currentSize - radius)
-        ctx.lineTo(x, y + radius)
-        ctx.quadraticCurveTo(x, y, x + radius, y)
-        ctx.closePath()
-        ctx.fillStyle = color
-        ctx.fill()
-
-        ctx.shadowColor = color
-        ctx.shadowBlur = 20 * easedProgress
-        ctx.fill()
-        ctx.shadowBlur = 0
+        if (withGlow) {
+          ctx.shadowColor = color
+          ctx.shadowBlur = 20 * easedProgress
+          drawRoundedSquare(ctx, centerX, centerY, currentSize * 0.95, cornerRadius * 0.95, color)
+          ctx.shadowBlur = 0
+        }
 
         ctx.restore()
       }
 
+      // Helper function to draw a frame to canvas (used by encoder)
+      function drawFrameToCanvas(ctx, frameIndex) {
+        drawAnimatedFrame(ctx, frameIndex, true)
+      }
+
       // Encode video using native WebCodecs API
-      async function encodeVideoWithWebCodecs(
-        canvas,
-        width,
-        height,
-        fps,
-        totalFrames,
-        onProgress
-      ) {
+      async function encodeVideoWithWebCodecs(canvas, width, height, fps, totalFrames, onProgress, options = {}) {
+        const { latencyMode = 'quality', hardwareAcceleration = 'prefer-hardware' } = options
         const videoChunks = []
         const videoMetadatas = []
 
@@ -547,6 +603,11 @@
           output: (chunk, metadata) => {
             videoChunks.push(chunk)
             videoMetadatas.push(metadata)
+            // Update progress based on actual encoded chunks
+            if (onProgress) {
+              const pct = Math.round((videoChunks.length / totalFrames) * 100)
+              onProgress(pct)
+            }
           },
           error: (e) => {
             throw new Error(`Encoder error: ${e.message}`)
@@ -555,24 +616,24 @@
 
         // Configure encoder for HEVC
         encoder.configure({
-          codec: 'hev1.1.6.L93.B0', // Safari not support
-        //   codec: 'hvc1.1.6.L93.B0', // Safari compatible hvc1
+          codec: 'hvc1.1.6.L93.B0',
           width,
           height,
           bitrate: 2_000_000, // 2 Mbps
           framerate: fps,
-          latencyMode: 'realtime',
-          hevc: {
-            format: 'hevc', // Use HEVC format with parameter sets in description (for MP4)
-          },
+          latencyMode,
+          hardwareAcceleration,
         })
 
         const ctx = canvas.getContext('2d', { alpha: true })
 
+        // Helper to yield to browser for UI updates
+        const yieldToBrowser = () => new Promise((resolve) => requestAnimationFrame(resolve))
+
         // Encode all frames
         for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
           // Draw frame to canvas
-          drawFrameToCanvas(ctx, frameIndex, width, height, fps, totalFrames)
+          drawFrameToCanvas(ctx, frameIndex)
 
           // Create a VideoFrame from the canvas
           const frameDurationUs = Math.round(1_000_000 / fps)
@@ -589,10 +650,9 @@
           // Close the frame to release resources
           frame.close()
 
-          // Update progress
-          if (onProgress) {
-            const pct = Math.round(((frameIndex + 1) / totalFrames) * 100)
-            onProgress(pct)
+          // Yield every few frames to allow UI to update with encoding progress
+          if (frameIndex % 5 === 0) {
+            await yieldToBrowser()
           }
         }
 
@@ -636,42 +696,6 @@
         return output.target.buffer
       }
 
-      // Canvas utility functions (same as canvas-utils.js)
-      function drawRoundedSquare(ctx, centerX, centerY, size, cornerRadius, color) {
-        const halfSize = size / 2
-        const x = centerX - halfSize
-        const y = centerY - halfSize
-        const radius = Math.min(cornerRadius, halfSize)
-
-        ctx.beginPath()
-        ctx.moveTo(x + radius, y)
-        ctx.lineTo(x + size - radius, y)
-        ctx.quadraticCurveTo(x + size, y, x + size, y + radius)
-        ctx.lineTo(x + size, y + size - radius)
-        ctx.quadraticCurveTo(x + size, y + size, x + size - radius, y + size)
-        ctx.lineTo(x + radius, y + size)
-        ctx.quadraticCurveTo(x, y + size, x, y + size - radius)
-        ctx.lineTo(x, y + radius)
-        ctx.quadraticCurveTo(x, y, x + radius, y)
-        ctx.closePath()
-
-        ctx.fillStyle = color
-        ctx.fill()
-      }
-
-      function easeInOutCubic(t) {
-        return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2
-      }
-
-      // Animation parameters
-      const width = 400
-      const height = 400
-      const fps = 30
-      const durationSeconds = 3
-      const totalFrames = fps * durationSeconds
-      const baseSize = 150
-      const maxSize = 250
-
       // DOM elements
       const canvas = document.getElementById('animationCanvas')
       const ctx = canvas.getContext('2d', { alpha: true })
@@ -683,45 +707,18 @@
       const progressFill = document.getElementById('progressFill')
       const generatedPreview = document.getElementById('generatedPreview')
       const generatedVideo = document.getElementById('generatedVideo')
+      const latencyModeSelect = document.getElementById('latencyMode')
+      const hardwareAccelerationSelect = document.getElementById('hardwareAcceleration')
 
       let animationId = null
       let isAnimating = true
       let generatedBlob = null
+      let generatedBlobUrl = null
       let isGenerating = false
 
-      // Draw a single frame
+      // Draw a single frame (used by preview animation)
       function drawFrame(frameIndex) {
-        const progress = frameIndex / (totalFrames - 1)
-        const loopProgress = progress < 0.5 ? progress * 2 : 2 - progress * 2
-        const easedProgress = easeInOutCubic(loopProgress)
-
-        const currentSize = baseSize + (maxSize - baseSize) * easedProgress
-        const cornerRadius = (currentSize / 2) * easedProgress
-
-        const hue = 220 + 60 * easedProgress
-        const saturation = 70 + 20 * easedProgress
-        const lightness = 50 + 10 * easedProgress
-        const color = `hsl(${hue}, ${saturation}%, ${lightness}%)`
-
-        ctx.clearRect(0, 0, width, height)
-
-        const rotation = (easedProgress * Math.PI) / 6
-        const centerX = width / 2
-        const centerY = height / 2
-
-        ctx.save()
-        ctx.translate(centerX, centerY)
-        ctx.rotate(rotation)
-        ctx.translate(-centerX, -centerY)
-
-        drawRoundedSquare(ctx, centerX, centerY, currentSize, cornerRadius, color)
-
-        ctx.shadowColor = color
-        ctx.shadowBlur = 20 * easedProgress
-        drawRoundedSquare(ctx, centerX, centerY, currentSize * 0.95, cornerRadius * 0.95, color)
-        ctx.shadowBlur = 0
-
-        ctx.restore()
+        drawAnimatedFrame(ctx, frameIndex, true)
       }
 
       // Animation loop
@@ -745,21 +742,27 @@
       generateBtn.addEventListener('click', async () => {
         if (isGenerating) return
 
+        // Cancel any running animation before starting generation
+        if (animationId !== null) {
+          cancelAnimationFrame(animationId)
+          animationId = null
+        }
+
         const generateStartTime = performance.now()
         isGenerating = true
         isAnimating = false
         generateBtn.disabled = true
         downloadBtn.disabled = true
         progressContainer.classList.add('visible')
-        progressText.textContent = '正在初始化编码器...'
-        progressFill.style.width = '0%'
+        progressText.textContent = 'Initializing encoder...'
+        progressFill.style.transform = 'scaleX(0)'
         progressPercent.textContent = '0%'
 
         try {
           // Create an offscreen canvas for encoding
           const offscreenCanvas = new OffscreenCanvas(width, height)
 
-          progressText.textContent = '正在编码帧...'
+          progressText.textContent = 'Encoding frames...'
 
           // Encode video using native WebCodecs API
           const { videoChunks, videoMetadatas } = await encodeVideoWithWebCodecs(
@@ -769,30 +772,40 @@
             fps,
             totalFrames,
             (pct) => {
-              progressFill.style.width = `${pct}%`
+              progressFill.style.transform = `scaleX(${pct / 100})`
               progressPercent.textContent = `${pct}%`
-            }
+            },
+            {
+              latencyMode: latencyModeSelect.value,
+              hardwareAcceleration: hardwareAccelerationSelect.value,
+            },
           )
 
-          progressText.textContent = '正在封装视频...'
+          progressText.textContent = 'Muxing video...'
 
           // Mux encoded chunks into MP4 using Mediabunny
           const buffer = await muxVideoToMP4(videoChunks, videoMetadatas, width, height)
 
           const endTime = performance.now()
           const duration = ((endTime - generateStartTime) / 1000).toFixed(2)
+
+          // Revoke previous blob URL to prevent memory leaks
+          if (generatedBlobUrl) {
+            URL.revokeObjectURL(generatedBlobUrl)
+          }
+
           generatedBlob = new Blob([buffer], { type: 'video/mp4' })
-          const url = URL.createObjectURL(generatedBlob)
+          generatedBlobUrl = URL.createObjectURL(generatedBlob)
 
-          generatedVideo.src = url
+          generatedVideo.src = generatedBlobUrl
 
-          progressText.textContent = `🚀 生成完成! (${(buffer.byteLength / 1024 / 1024).toFixed(2)} MB, 用时 ${duration}s)`
+          progressText.textContent = `🚀 Complete! (${(buffer.byteLength / 1024 / 1024).toFixed(2)} MB in ${duration}s)`
 
           generateBtn.disabled = false
           downloadBtn.disabled = false
         } catch (error) {
           console.error('Error generating video:', error)
-          progressText.textContent = `❌ 错误: ${error.message}`
+          progressText.textContent = `❌ Error: ${error.message}`
           generateBtn.disabled = false
         }
 
@@ -808,11 +821,11 @@
         const match = userAgent.match(/(?:Chrome|Firefox|Safari|Edge|Opera|OPR|Edg)\/(\d+)/i)
         if (match) {
           const browser = match[0].split('/')[0].toLowerCase()
+          if (browser.includes('edg') || browser.includes('edge')) return 'edge'
+          if (browser.includes('opr') || browser.includes('opera')) return 'opera'
           if (browser.includes('chrome')) return 'chrome'
           if (browser.includes('firefox')) return 'firefox'
           if (browser.includes('safari')) return 'safari'
-          if (browser.includes('edg') || browser.includes('edge')) return 'edge'
-          if (browser.includes('opr') || browser.includes('opera')) return 'opera'
           return browser.replace(/\s+/g, '-')
         }
 
