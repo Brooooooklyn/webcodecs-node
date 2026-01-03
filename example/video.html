@@ -1,82 +1,892 @@
 <!doctype html>
-<html>
+<html lang="en">
   <head>
-    <title>VP9 With Alpha Channel Test</title>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebCodecs Video Demo - Canvas Animation & Video Generation</title>
     <style>
+      :root {
+        --primary: #6366f1;
+        --primary-dark: #4f46e5;
+        --success: #10b981;
+        --warning: #f59e0b;
+        --bg: #ffffff;
+        --bg-card: #f8f9fa;
+        --bg-hover: #e9ecef;
+        --text: #1a1a1a;
+        --text-muted: #6c757d;
+        --border: #dee2e6;
+        --checkerboard-light: #e9ecef;
+        --checkerboard-dark: #ced4da;
+      }
+
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
       body {
-        font-family: system-ui, sans-serif;
+        font-family:
+          system-ui,
+          -apple-system,
+          sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        line-height: 1.6;
+        min-height: 100vh;
       }
 
-      h1 {
-        color: #333;
+      .container {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 2rem;
       }
 
-      .main {
+      /* Header */
+      header {
+        text-align: center;
+        margin-bottom: 2rem;
+      }
+
+      header h1 {
+        font-size: 2.5rem;
+        font-weight: bold;
+        margin-bottom: 0.5rem;
+        color: var(--primary);
+      }
+
+      header p {
+        color: var(--text-muted);
+        font-size: 1.1rem;
+      }
+
+      /* Section titles */
+      .section-title {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        font-size: 1.25rem;
+        font-weight: 600;
+        margin-bottom: 1.5rem;
+        color: var(--text);
+      }
+
+      .section-title .icon {
+        font-size: 1.5rem;
+      }
+
+      /* Cards */
+      .card {
+        background: var(--bg-card);
+        border-radius: 1rem;
+        border: 1px solid var(--border);
+        padding: 1.5rem;
+        margin-bottom: 2rem;
+      }
+
+      /* Grid layout */
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+        gap: 1.5rem;
+      }
+
+      @media (max-width: 860px) {
+        .grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      /* Checkerboard pattern for transparency */
+      .checkerboard {
+        background: repeating-conic-gradient(var(--checkerboard-light) 0% 25%, var(--checkerboard-dark) 0% 50%) 50% /
+          16px 16px;
+        border-radius: 0.75rem;
+        padding: 1rem;
+        display: flex;
+        justify-content: center;
+        height: 100%;
+      }
+
+      /* Video items */
+      .video-item {
+        background: var(--bg-card);
+        border-radius: 1rem;
+        border: 1px solid var(--border);
+        overflow: hidden;
+      }
+
+      .video-item-header {
+        padding: 1rem 1.25rem;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+
+      .video-item-header h3 {
+        font-size: 1rem;
+        font-weight: 600;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+      }
+
+      .badge {
+        font-size: 0.7rem;
+        padding: 0.25rem 0.5rem;
+        border-radius: 9999px;
+        font-weight: 500;
+        text-transform: uppercase;
+      }
+
+      .badge-webm {
+        background: rgba(16, 185, 129, 0.2);
+        color: #34d399;
+      }
+
+      .badge-mp4 {
+        background: rgba(99, 102, 241, 0.2);
+        color: #818cf8;
+      }
+
+      .badge-generated {
+        background: rgba(245, 158, 11, 0.2);
+        color: #fbbf24;
+      }
+
+      .video-container {
+        padding: 1rem;
+      }
+
+      video,
+      canvas {
+        width: 100%;
+        max-width: 400px;
+        height: auto;
+        display: block;
+        margin: 0 auto;
+      }
+
+      /* Canvas Animation Section */
+      .canvas-section {
+        margin-bottom: 2rem;
+      }
+
+      .canvas-layout {
+        display: grid;
+        grid-template-columns: 1fr 1fr 0.5fr;
+        gap: 2rem;
+      }
+
+      @media (max-width: 1200px) {
+        .canvas-layout {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .canvas-controls {
         display: flex;
         flex-direction: column;
-        gap: 20px;
-        flex-wrap: wrap;
-        max-width: 1100px;
-        margin-inline: auto;
-        margin-bottom: 220px;
-      }
-
-      .video-box {
-        display: flex;
-        gap: 20px;
+        gap: 0.75rem;
+        margin-top: 1rem;
         justify-content: center;
-        padding: 30px 10px;
-        background: repeating-conic-gradient(#ccc 0% 25%, white 0% 50%) 50% / 20px 20px;
-        background-repeat: round;
       }
 
-      .video-box h3 {
-        margin: 0 0 10px;
-        background: rgba(255, 255, 255, 0.8);
-        padding: 5px;
-        border-radius: 4px;
+      /* Buttons */
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.5rem;
+        padding: 0.75rem 1.25rem;
+        border-radius: 0.5rem;
+        font-size: 0.9rem;
+        font-weight: bold;
+        cursor: pointer;
+        border: none;
+        transition: all 0.2s ease;
       }
 
-      video {
-        max-width: 400px;
+      .btn-primary {
+        background: var(--primary);
+        color: white;
+      }
+
+      .btn-primary:hover:not(:disabled) {
+        background: var(--primary-dark);
+        transform: translateY(-1px);
+      }
+
+      .btn-success {
+        background: var(--success);
+        color: white;
+      }
+
+      .btn-success:hover:not(:disabled) {
+        background: #059669;
+        transform: translateY(-1px);
+      }
+
+      .btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+
+      /* Progress bar */
+      .progress-container {
+        margin-top: 1rem;
+        display: none;
+      }
+
+      .progress-container.visible {
         display: block;
       }
 
-      .note {
-        background: rgba(255, 255, 255, 0.9);
-        padding: 10px;
-        border-radius: 8px;
+      .progress-label {
+        font-size: 0.85rem;
+        color: var(--text-muted);
+        margin-bottom: 0.5rem;
       }
 
-      h1,
-      h3,
-      h3 + p {
-        margin-bottom: 0;
+      .progress-bar-wrapper {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+      }
+
+      .progress-bar {
+        flex: 1;
+        height: 8px;
+        background: var(--border);
+        border-radius: 9999px;
+        overflow: hidden;
+      }
+
+      .progress-percent {
+        font-size: 0.85rem;
+        color: var(--text-muted);
+        min-width: 3rem;
+        text-align: right;
+      }
+
+      .progress-fill {
+        height: 100%;
+        width: 100%;
+        background: linear-gradient(90deg, var(--primary), #a855f7);
+        border-radius: 999px;
+        transform: scaleX(0);
+        transform-origin: left;
+        transition: transform 0.15s ease-out;
+        will-change: transform;
+      }
+
+      /* video preview */
+      .generated-preview {
+        height: 100%;
+      }
+
+      .generated-preview.visible {
+        display: block;
+      }
+
+      .controls-box {
+        margin-top: 60px;
+      }
+
+      .canvas-preview-container,
+      .generated-preview-container,
+      .controls-box {
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+      }
+
+      .canvas-preview-container h3,
+      .generated-preview-container h3,
+      .controls-box h3 {
+        font-size: 1rem;
+        margin-bottom: 0.75rem;
+        color: var(--text);
+      }
+
+      .canvas-controls {
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+      }
+
+      .controls-box .canvas-controls {
+        margin-top: 0;
+      }
+
+      .controls-box .progress-container {
+        margin-top: 0;
+      }
+
+      /* Select inputs */
+      .form-group {
+        display: flex;
+        flex-direction: column;
+        gap: 0.25rem;
+      }
+
+      .form-group label {
+        font-size: 0.75rem;
+        color: var(--text-muted);
+        font-weight: 500;
+      }
+
+      .form-select {
+        padding: 0.5rem 0.75rem;
+        border-radius: 0.375rem;
+        border: 1px solid var(--border);
+        background: var(--bg);
+        color: var(--text);
+        font-size: 0.85rem;
+        cursor: pointer;
+        transition: border-color 0.2s ease;
+      }
+
+      .form-select:hover {
+        border-color: var(--primary);
+      }
+
+      .form-select:focus {
+        outline: none;
+        border-color: var(--primary);
+        box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
+      }
+
+      /* Info box */
+      .info-box {
+        background: rgba(99, 102, 241, 0.08);
+        border: 1px solid rgba(99, 102, 241, 0.2);
+        border-radius: 0.75rem;
+        padding: 1rem 1.25rem;
+        margin: 2rem auto;
+      }
+
+      .info-box p {
+        color: var(--text);
+        font-size: 0.9rem;
+      }
+
+      .info-box strong {
+        color: var(--text);
+      }
+
+      /* Footer */
+      footer {
+        text-align: center;
+        padding: 2rem;
+        color: var(--text-muted);
+        font-size: 0.85rem;
+        border-top: 1px solid var(--border);
+        margin-top: 2rem;
+      }
+
+      footer a {
+        color: var(--primary);
+        text-decoration: none;
+      }
+
+      footer a:hover {
+        text-decoration: underline;
+      }
+
+      /* Spinner */
+      .spinner {
+        width: 16px;
+        height: 16px;
+        border: 2px solid transparent;
+        border-top-color: currentColor;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
       }
     </style>
   </head>
 
   <body>
-    <main class="main">
-      <h1>📺 VP9 With Alpha Channel</h1>
-      <div class="note">
-        <h3>
-          🎉 Using `@napi-rs/webcodecs`, you can generate videos with alpha channels from Canvas or Lottie in Node.js.
-        </h3>
-        <p>Checkerboard background shows through if alpha channel works correctly.</p>
-      </div>
+    <div class="container">
+      <header>
+        <h1>🎬 WebCodecs Video Demo</h1>
+        <p>Canvas Animation & Browser-based Video Generation</p>
+      </header>
 
-      <div class="video-box">
-        <div class="video-item">
-          <h3>canvas.webm</h3>
-          <video src="https://webcodecs.skia.rs/canvas.webm" preload="auto" autoplay loop muted controls></video>
+      <!-- Live Canvas Animation -->
+      <section class="canvas-section">
+        <h2 class="section-title">
+          <span class="icon">🎨</span>
+          Live Canvas
+        </h2>
+        <div class="card">
+          <div class="canvas-layout">
+            <div class="canvas-preview-container">
+              <h3>Canvas Animation</h3>
+              <div class="checkerboard">
+                <canvas id="animationCanvas" width="400" height="400"></canvas>
+              </div>
+            </div>
+            <div class="generated-preview-container">
+              <h3>Video Preview</h3>
+              <div id="generatedPreview" class="generated-preview">
+                <div class="checkerboard">
+                  <video id="generatedVideo" autoplay controls loop muted></video>
+                </div>
+              </div>
+            </div>
+            <div class="controls-box">
+              <div class="canvas-controls">
+                <div class="form-group">
+                  <label for="latencyMode">Latency Mode</label>
+                  <select id="latencyMode" class="form-select">
+                    <option value="quality" selected>Quality</option>
+                    <option value="realtime">Realtime</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label for="hardwareAcceleration">Hardware Acceleration</label>
+                  <select id="hardwareAcceleration" class="form-select">
+                    <option value="prefer-hardware" selected>Prefer Hardware</option>
+                    <option value="prefer-software">Prefer Software</option>
+                    <option value="no-preference">No Preference</option>
+                  </select>
+                </div>
+                <button id="generateBtn" class="btn btn-success"><span>🎥</span> Generate HEVC Video</button>
+                <button id="downloadBtn" class="btn btn-primary" disabled><span>⬇️</span> Download Video</button>
+              </div>
+              <div id="progressContainer" class="progress-container">
+                <div class="progress-label">
+                  <span id="progressText">Encoding frames...</span>
+                </div>
+                <div class="progress-bar-wrapper">
+                  <div class="progress-bar">
+                    <div id="progressFill" class="progress-fill"></div>
+                  </div>
+                  <span id="progressPercent" class="progress-percent">0%</span>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
+      </section>
 
-        <div class="video-item">
-          <h3>lottie.webm</h3>
-          <video src="https://webcodecs.skia.rs/lottie.webm" preload="auto" autoplay loop muted controls></video>
+      <!-- Pre-generated Videos -->
+      <section>
+        <h2 class="section-title">
+          <span class="icon">📺</span>
+          Pre-generated Videos (Node.js)
+        </h2>
+        <div class="grid">
+          <div class="video-item">
+            <div class="video-item-header">
+              <h3><span>🌈</span> canvas.webm</h3>
+              <span class="badge badge-webm">VP9 + Alpha</span>
+            </div>
+            <div class="video-container">
+              <div class="checkerboard">
+                <video src="./canvas.webm" preload="auto" autoplay loop muted controls></video>
+              </div>
+            </div>
+          </div>
+
+          <div class="video-item">
+            <div class="video-item-header">
+              <h3><span>🎬</span> canvas-hevc.mp4</h3>
+              <span class="badge badge-mp4">HEVC/H.265</span>
+            </div>
+            <div class="video-container">
+              <div class="checkerboard">
+                <video src="./canvas-hevc.mp4" preload="auto" autoplay loop muted controls></video>
+              </div>
+            </div>
+          </div>
         </div>
-      </div>
-    </main>
+      </section>
+    </div>
+
+    <footer>
+      Built with
+      <a href="https://github.com/Brooooooklyn/webcodecs-node" target="_blank">@napi-rs/webcodecs</a>
+      &
+      <a href="https://mediabunny.dev" target="_blank">Mediabunny</a>
+    </footer>
+
+    <script type="module">
+      import * as Mediabunny from 'https://cdn.jsdelivr.net/npm/mediabunny@1.27.3/+esm'
+      import { drawRoundedSquare, easeInOutCubic } from './canvas-utils.js'
+
+      // Animation parameters (shared between preview and encoding)
+      const width = 400
+      const height = 400
+      const fps = 30
+      const durationSeconds = 3
+      const totalFrames = fps * durationSeconds
+      const baseSize = 150
+      const maxSize = 250
+
+      /**
+       * Calculate animation state for a given frame
+       * @param {number} frameIndex - Current frame index
+       * @returns {Object} Animation state including size, cornerRadius, color, rotation, and center position
+       */
+      function calculateAnimationState(frameIndex) {
+        const progress = frameIndex / (totalFrames - 1)
+        const loopProgress = progress < 0.5 ? progress * 2 : 2 - progress * 2
+        const easedProgress = easeInOutCubic(loopProgress)
+
+        const currentSize = baseSize + (maxSize - baseSize) * easedProgress
+        const cornerRadius = (currentSize / 2) * easedProgress
+
+        const hue = 220 + 60 * easedProgress
+        const saturation = 70 + 20 * easedProgress
+        const lightness = 50 + 10 * easedProgress
+        const color = `hsl(${hue}, ${saturation}%, ${lightness}%)`
+
+        const rotation = (easedProgress * Math.PI) / 6
+        const centerX = width / 2
+        const centerY = height / 2
+
+        return { currentSize, cornerRadius, color, rotation, centerX, centerY, easedProgress }
+      }
+
+      /**
+       * Draw an animated frame to a canvas context
+       * @param {CanvasRenderingContext2D} ctx - Canvas context
+       * @param {number} frameIndex - Current frame index
+       * @param {boolean} withGlow - Whether to draw the glow effect (default: true)
+       */
+      function drawAnimatedFrame(ctx, frameIndex, withGlow = true) {
+        const { currentSize, cornerRadius, color, rotation, centerX, centerY, easedProgress } =
+          calculateAnimationState(frameIndex)
+
+        ctx.clearRect(0, 0, width, height)
+
+        ctx.save()
+        ctx.translate(centerX, centerY)
+        ctx.rotate(rotation)
+        ctx.translate(-centerX, -centerY)
+
+        drawRoundedSquare(ctx, centerX, centerY, currentSize, cornerRadius, color)
+
+        if (withGlow) {
+          ctx.shadowColor = color
+          ctx.shadowBlur = 20 * easedProgress
+          drawRoundedSquare(ctx, centerX, centerY, currentSize * 0.95, cornerRadius * 0.95, color)
+          ctx.shadowBlur = 0
+        }
+
+        ctx.restore()
+      }
+
+      // Helper function to draw a frame to canvas (used by encoder)
+      function drawFrameToCanvas(ctx, frameIndex) {
+        drawAnimatedFrame(ctx, frameIndex, true)
+      }
+
+      // Encode video using native WebCodecs API
+      async function encodeVideoWithWebCodecs(canvas, width, height, fps, totalFrames, onProgress, options = {}) {
+        const { latencyMode = 'quality', hardwareAcceleration = 'prefer-hardware' } = options
+        const videoChunks = []
+        const videoMetadatas = []
+
+        // Create video encoder using native WebCodecs API
+        const encoder = new VideoEncoder({
+          output: (chunk, metadata) => {
+            videoChunks.push(chunk)
+            videoMetadatas.push(metadata)
+            // Update progress based on actual encoded chunks
+            if (onProgress) {
+              const pct = Math.round((videoChunks.length / totalFrames) * 100)
+              onProgress(pct)
+            }
+          },
+          error: (e) => {
+            throw new Error(`Encoder error: ${e.message}`)
+          },
+        })
+
+        // Configure encoder for HEVC
+        encoder.configure({
+          codec: 'hvc1.1.6.L93.B0',
+          width,
+          height,
+          bitrate: 2_000_000, // 2 Mbps
+          framerate: fps,
+          latencyMode,
+          hardwareAcceleration,
+        })
+
+        const ctx = canvas.getContext('2d', { alpha: true })
+
+        // Helper to yield to browser for UI updates
+        const yieldToBrowser = () => new Promise((resolve) => requestAnimationFrame(resolve))
+
+        // Encode all frames
+        for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
+          // Draw frame to canvas
+          drawFrameToCanvas(ctx, frameIndex)
+
+          // Create a VideoFrame from the canvas
+          const frameDurationUs = Math.round(1_000_000 / fps)
+          const timestamp = frameIndex * frameDurationUs
+          const frame = new VideoFrame(canvas, {
+            timestamp,
+            duration: frameDurationUs,
+          })
+
+          // Encode the frame (request keyframe every 1 second)
+          const isKeyFrame = frameIndex % fps === 0
+          encoder.encode(frame, { keyFrame: isKeyFrame })
+
+          // Close the frame to release resources
+          frame.close()
+
+          // Yield every few frames to allow UI to update with encoding progress
+          if (frameIndex % 5 === 0) {
+            await yieldToBrowser()
+          }
+        }
+
+        // Flush the encoder to ensure all frames are processed
+        await encoder.flush()
+        encoder.close()
+
+        return { videoChunks, videoMetadatas }
+      }
+
+      // Mux encoded chunks into MP4 using Mediabunny
+      async function muxVideoToMP4(videoChunks, videoMetadatas, width, height) {
+        const { Output, BufferTarget, Mp4OutputFormat, EncodedVideoPacketSource, EncodedPacket } = Mediabunny
+
+        const output = new Output({
+          format: new Mp4OutputFormat(),
+          target: new BufferTarget(),
+        })
+
+        // Create a source that accepts encoded packets
+        const videoSource = new EncodedVideoPacketSource('hevc')
+        output.addVideoTrack(videoSource)
+
+        await output.start()
+
+        // Convert WebCodecs EncodedVideoChunk to Mediabunny EncodedPacket and add to source
+        // The first chunk should include metadata with decoderConfig
+        for (let i = 0; i < videoChunks.length; i++) {
+          const chunk = videoChunks[i]
+          const metadata = videoMetadatas[i]
+
+          // Convert EncodedVideoChunk to EncodedPacket
+          const packet = EncodedPacket.fromEncodedChunk(chunk)
+
+          // Add packet with metadata (especially important for the first chunk)
+          await videoSource.add(packet, metadata)
+        }
+
+        await output.finalize()
+
+        return output.target.buffer
+      }
+
+      // DOM elements
+      const canvas = document.getElementById('animationCanvas')
+      const ctx = canvas.getContext('2d', { alpha: true })
+      const generateBtn = document.getElementById('generateBtn')
+      const downloadBtn = document.getElementById('downloadBtn')
+      const progressContainer = document.getElementById('progressContainer')
+      const progressText = document.getElementById('progressText')
+      const progressPercent = document.getElementById('progressPercent')
+      const progressFill = document.getElementById('progressFill')
+      const generatedPreview = document.getElementById('generatedPreview')
+      const generatedVideo = document.getElementById('generatedVideo')
+      const latencyModeSelect = document.getElementById('latencyMode')
+      const hardwareAccelerationSelect = document.getElementById('hardwareAcceleration')
+
+      let animationId = null
+      let isAnimating = true
+      let generatedBlob = null
+      let generatedBlobUrl = null
+      let isGenerating = false
+
+      // Draw a single frame (used by preview animation)
+      function drawFrame(frameIndex) {
+        drawAnimatedFrame(ctx, frameIndex, true)
+      }
+
+      // Animation loop
+      let startTime = null
+      function animate(timestamp) {
+        if (!startTime) startTime = timestamp
+        const elapsed = timestamp - startTime
+        const frameIndex = Math.floor((elapsed / 1000) * fps) % totalFrames
+
+        drawFrame(frameIndex)
+
+        if (isAnimating && !isGenerating) {
+          animationId = requestAnimationFrame(animate)
+        }
+      }
+
+      // Start animation automatically
+      animate(performance.now())
+
+      // Generate HEVC video
+      generateBtn.addEventListener('click', async () => {
+        if (isGenerating) return
+
+        // Cancel any running animation before starting generation
+        if (animationId !== null) {
+          cancelAnimationFrame(animationId)
+          animationId = null
+        }
+
+        const generateStartTime = performance.now()
+        isGenerating = true
+        isAnimating = false
+        generateBtn.disabled = true
+        downloadBtn.disabled = true
+        progressContainer.classList.add('visible')
+        progressText.textContent = 'Initializing encoder...'
+        progressFill.style.transform = 'scaleX(0)'
+        progressPercent.textContent = '0%'
+
+        try {
+          // Create an offscreen canvas for encoding
+          const offscreenCanvas = new OffscreenCanvas(width, height)
+
+          progressText.textContent = 'Encoding frames...'
+
+          // Encode video using native WebCodecs API
+          const { videoChunks, videoMetadatas } = await encodeVideoWithWebCodecs(
+            offscreenCanvas,
+            width,
+            height,
+            fps,
+            totalFrames,
+            (pct) => {
+              progressFill.style.transform = `scaleX(${pct / 100})`
+              progressPercent.textContent = `${pct}%`
+            },
+            {
+              latencyMode: latencyModeSelect.value,
+              hardwareAcceleration: hardwareAccelerationSelect.value,
+            },
+          )
+
+          progressText.textContent = 'Muxing video...'
+
+          // Mux encoded chunks into MP4 using Mediabunny
+          const buffer = await muxVideoToMP4(videoChunks, videoMetadatas, width, height)
+
+          const endTime = performance.now()
+          const duration = ((endTime - generateStartTime) / 1000).toFixed(2)
+
+          // Revoke previous blob URL to prevent memory leaks
+          if (generatedBlobUrl) {
+            URL.revokeObjectURL(generatedBlobUrl)
+          }
+
+          generatedBlob = new Blob([buffer], { type: 'video/mp4' })
+          generatedBlobUrl = URL.createObjectURL(generatedBlob)
+
+          generatedVideo.src = generatedBlobUrl
+
+          progressText.textContent = `🚀 Complete! (${(buffer.byteLength / 1024 / 1024).toFixed(2)} MB in ${duration}s)`
+
+          generateBtn.disabled = false
+          downloadBtn.disabled = false
+        } catch (error) {
+          console.error('Error generating video:', error)
+          progressText.textContent = `❌ Error: ${error.message}`
+          generateBtn.disabled = false
+        }
+
+        isGenerating = false
+        isAnimating = true
+        startTime = null
+        animate(performance.now())
+      })
+
+      // Detect browser name using modern API or fallback
+      function getBrowserName() {
+        const userAgent = navigator.userAgent
+        const match = userAgent.match(/(?:Chrome|Firefox|Safari|Edge|Opera|OPR|Edg)\/(\d+)/i)
+        if (match) {
+          const browser = match[0].split('/')[0].toLowerCase()
+          if (browser.includes('edg') || browser.includes('edge')) return 'edge'
+          if (browser.includes('opr') || browser.includes('opera')) return 'opera'
+          if (browser.includes('chrome')) return 'chrome'
+          if (browser.includes('firefox')) return 'firefox'
+          if (browser.includes('safari')) return 'safari'
+          return browser.replace(/\s+/g, '-')
+        }
+
+        return 'browser'
+      }
+
+      // Download video with file picker dialog
+      downloadBtn.addEventListener('click', async () => {
+        if (!generatedBlob) return
+
+        try {
+          // Try to use File System Access API (modern browsers)
+          if ('showSaveFilePicker' in window) {
+            const browserName = getBrowserName()
+            const fileHandle = await window.showSaveFilePicker({
+              suggestedName: `canvas-hevc-${browserName}.mp4`,
+              types: [
+                {
+                  description: 'MP4 Video',
+                  accept: {
+                    'video/mp4': ['.mp4'],
+                  },
+                },
+              ],
+            })
+
+            const writable = await fileHandle.createWritable()
+            await writable.write(generatedBlob)
+            await writable.close()
+          } else {
+            // Fallback to traditional download for browsers that don't support File System Access API
+            const url = URL.createObjectURL(generatedBlob)
+            const a = document.createElement('a')
+            a.href = url
+            const browserName = getBrowserName()
+            a.download = `canvas-hevc-${browserName}.mp4`
+            document.body.appendChild(a)
+            a.click()
+            document.body.removeChild(a)
+            URL.revokeObjectURL(url)
+          }
+        } catch (error) {
+          // User cancelled the dialog or error occurred
+          if (error.name !== 'AbortError') {
+            console.error('Download error:', error)
+            // Fallback to traditional download on error
+            const url = URL.createObjectURL(generatedBlob)
+            const a = document.createElement('a')
+            a.href = url
+            const browserName = getBrowserName()
+            a.download = `canvas-hevc-${browserName}.mp4`
+            document.body.appendChild(a)
+            a.click()
+            document.body.removeChild(a)
+            URL.revokeObjectURL(url)
+          }
+        }
+      })
+
+      // Draw initial frame
+      drawFrame(0)
+    </script>
   </body>
 </html>
