@@ -7,8 +7,8 @@ WebCodecs API implementation for Node.js using FFmpeg, built with [NAPI-RS](http
 ## Features
 
 - **W3C WebCodecs API compliant** - Full implementation of the WebCodecs specification with native `DOMException` errors
-- **Video encoding/decoding** - H.264, H.265, VP8, VP9 (with Alpha), AV1
-- **Encoding Alpha channel** - VP9 encoding/decoding with Alpha support(See [canvas-to-video.js](example/canvas-to-video.js) example and [video.html](example/video.html))
+- **Video encoding/decoding** - H.264, H.265 (with Alpha), VP8, VP9 (with Alpha), AV1
+- **Encoding Alpha channel** - VP9 and HEVC alpha encoding/decoding with transparency support (See [canvas-to-video.js](example/canvas-to-video.js) example and [video.html](example/video.html))
 - **Audio encoding/decoding** - AAC, Opus, MP3, FLAC, Vorbis, PCM variants
 - **Container muxing/demuxing** - MP4, WebM, MKV containers with seeking support
 - **Image decoding** - JPEG, PNG, WebP, GIF, BMP, AVIF, JPEG XL
@@ -343,12 +343,18 @@ frame.close()
 | Codec | Codec String            | Encoding | Encoding Alpha | Decoding | Decoding Alpha |
 | ----- | ----------------------- | -------- | -------------- | -------- | -------------- |
 | H.264 | `avc1.*`                | ✅       | 🙅🏻‍♀️             | ✅       | 🙅🏻‍♀️             |
-| H.265 | `hev1.*`, `hvc1.*`      | ✅       | ❓             | ✅       | ❓             |
+| H.265 | `hev1.*`, `hvc1.*`      | ✅       | ✅¹            | ✅       | ✅             |
 | VP8   | `vp8`                   | ✅       | 🙅🏻‍♀️             | ✅       | 🙅🏻‍♀️             |
 | VP9   | `vp09.*`, `vp9`         | ✅       | ✅             | ✅       | ✅             |
 | AV1   | `av01.*`, `av01`, `av1` | ✅       | 🙅🏻‍♀️             | ✅       | 🙅🏻‍♀️             |
 
-**Note:** Short form codec strings (`vp9`, `av01`, `av1`) are accepted for compatibility with browser implementations. VP9 encoding and decoding now supports Alpha channel (transparency).
+**Note:** Short form codec strings (`vp9`, `av01`, `av1`) are accepted for compatibility with browser implementations.
+
+¹ **HEVC Alpha Encoding Limitations:**
+
+- Requires software encoder (libx265) - set `hardwareAcceleration: 'prefer-software'`
+- Hardware encoders (VideoToolbox, NVENC, VAAPI, QSV) do not support alpha
+- Only YUVA420P (8-bit) and YUVA420P10 (10-bit Main 10 profile) pixel formats supported
 
 **Legend:**
 
@@ -448,13 +454,62 @@ encoder.configure({
   hardwareAcceleration: 'prefer-hardware', // 'no-preference' | 'prefer-hardware' | 'prefer-software'
   // Latency mode affects encoder tuning
   latencyMode: 'realtime', // 'quality' | 'realtime'
+  // Alpha channel preservation (VP9 and HEVC only)
+  alpha: 'discard', // 'keep' | 'discard' (default: 'discard')
 })
 ```
 
 - `latencyMode: 'realtime'` - Enables low-latency encoder options (smaller GOP, no B-frames, fast presets)
 - `latencyMode: 'quality'` - Enables quality-focused options (larger GOP, B-frames, lookahead)
+- `alpha: 'keep'` - Preserves alpha channel (VP9 and HEVC only). For HEVC, requires `hardwareAcceleration: 'prefer-software'`
 
 The encoder automatically applies optimal settings for each hardware encoder based on the latency mode.
+
+### Alpha Channel Encoding
+
+Encode video with transparency using VP9 or HEVC:
+
+```typescript
+import { VideoEncoder, VideoFrame } from '@napi-rs/webcodecs'
+
+const encoder = new VideoEncoder({
+  output: (chunk, metadata) => {
+    console.log(`Alpha chunk: ${chunk.byteLength} bytes`)
+  },
+  error: (e) => console.error(e),
+})
+
+// VP9 alpha - works with hardware or software
+encoder.configure({
+  codec: 'vp09.00.10.08',
+  width: 1920,
+  height: 1080,
+  alpha: 'keep',
+})
+
+// HEVC alpha - requires software encoder
+encoder.configure({
+  codec: 'hev1.1.6.L93.B0',
+  width: 1920,
+  height: 1080,
+  alpha: 'keep',
+  hardwareAcceleration: 'prefer-software', // Required for HEVC alpha
+})
+
+// Create frame with alpha channel (I420A format)
+const width = 1920
+const height = 1080
+const frameData = new Uint8Array(width * height * 1.5 + width * height) // Y + U + V + A
+const frame = new VideoFrame(frameData, {
+  format: 'I420A',
+  codedWidth: width,
+  codedHeight: height,
+  timestamp: 0,
+})
+
+encoder.encode(frame)
+frame.close()
+```
 
 ## Limitations
 

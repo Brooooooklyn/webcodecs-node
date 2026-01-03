@@ -414,8 +414,11 @@ struct VideoEncoderInner {
   // Alpha channel support
   // ========================================================================
   /// Whether to preserve alpha channel (YUVA420P instead of YUV420P)
-  /// True when config.alpha == "keep" and codec supports alpha (VP9)
+  /// True when config.alpha == "keep" and codec supports alpha (VP9, HEVC)
   use_alpha: bool,
+  /// Pixel format for encoding (YUV420P, YUVA420P, or YUVA420P10LE for 10-bit HEVC alpha)
+  /// Stored during configure to ensure consistent format across encode, flush, and fallback paths
+  pixel_format: AVPixelFormat,
 
   // ========================================================================
   // Codec identification (for per-frame QP handling)
@@ -564,6 +567,7 @@ impl VideoEncoder {
       input_color_space: None,
       // Alpha channel support (set during configure)
       use_alpha: false,
+      pixel_format: AVPixelFormat::Yuv420p,
       // Codec identification (set during configure)
       codec_id: None,
     };
@@ -711,12 +715,8 @@ impl VideoEncoder {
       }
     };
 
-    // Determine target pixel format based on alpha config
-    let target_format = if guard.use_alpha {
-      AVPixelFormat::Yuva420p
-    } else {
-      AVPixelFormat::Yuv420p
-    };
+    // Use the stored pixel format (correctly handles 10-bit HEVC alpha)
+    let target_format = guard.pixel_format;
 
     // Acquire read lock on the shared frame
     let frame_guard = frame_arc.read();
@@ -882,8 +882,12 @@ impl VideoEncoder {
                 && let Ok(pkts) = ctx.encode(Some(&frame_to_reencode))
               {
                 for packet in pkts {
-                  // Extract alpha side data for VP9 alpha support
-                  let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
+                  // Extract alpha side data for VP9 only (HEVC alpha is embedded in bitstream)
+                  let alpha_side_data = if guard.codec_id == Some(AVCodecID::Vp9) {
+                    extract_alpha_side_data(&packet, guard.use_alpha)
+                  } else {
+                    None
+                  };
                   let packet_is_key = packet.is_key();
                   // Use buffered_ts (the original input timestamp) instead of packet.pts()
                   let chunk = EncodedVideoChunk::from_packet_with_format(
@@ -1051,8 +1055,12 @@ impl VideoEncoder {
                 {
                   // Process any output packets from re-encoding
                   for packet in pkts {
-                    // Extract alpha side data for VP9 alpha support
-                    let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
+                    // Extract alpha side data for VP9 only (HEVC alpha is embedded in bitstream)
+                    let alpha_side_data = if guard.codec_id == Some(AVCodecID::Vp9) {
+                      extract_alpha_side_data(&packet, guard.use_alpha)
+                    } else {
+                      None
+                    };
                     let packet_is_key = packet.is_key();
 
                     // Use buffered_ts (the original input timestamp) instead of packet.pts()
@@ -1175,8 +1183,12 @@ impl VideoEncoder {
       // (FFmpeg may modify PTS internally during encoding)
       let output_timestamp = guard.timestamp_queue.pop_front();
 
-      // Extract alpha side data for VP9 alpha support
-      let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
+      // Extract alpha side data for VP9 only (HEVC alpha is embedded in bitstream)
+      let alpha_side_data = if guard.codec_id == Some(AVCodecID::Vp9) {
+        extract_alpha_side_data(&packet, guard.use_alpha)
+      } else {
+        None
+      };
       let packet_is_key = packet.is_key();
 
       let chunk =
@@ -1382,8 +1394,12 @@ impl VideoEncoder {
     for packet in packets {
       // Pop timestamp from queue to preserve original input timestamp
       let output_timestamp = guard.timestamp_queue.pop_front();
-      // Extract alpha side data for VP9 alpha support
-      let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
+      // Extract alpha side data for VP9 only (HEVC alpha is embedded in bitstream)
+      let alpha_side_data = if guard.codec_id == Some(AVCodecID::Vp9) {
+        extract_alpha_side_data(&packet, guard.use_alpha)
+      } else {
+        None
+      };
       let packet_is_key = packet.is_key();
 
       let chunk =
@@ -1570,11 +1586,8 @@ impl VideoEncoder {
             (60, 2) // Quality mode: larger GOP with B-frames
           };
 
-          let pixel_format = if guard.use_alpha {
-            AVPixelFormat::Yuva420p
-          } else {
-            AVPixelFormat::Yuv420p
-          };
+          // Use the stored pixel format (correctly handles 10-bit HEVC alpha)
+          let pixel_format = guard.pixel_format;
 
           let encoder_config = EncoderConfig {
             width: config.width.unwrap_or(0),
@@ -1665,8 +1678,14 @@ impl VideoEncoder {
       }
     };
 
+    // Determine hardware acceleration preference from NEW config (not cached value)
+    // This is important for HEVC alpha check - we need to use the new config's preference
+    let hw_preference = config
+      .hardware_acceleration
+      .unwrap_or(HardwareAcceleration::NoPreference);
+
     // Determine hardware type based on preference
-    let hw_type = match guard.hw_preference {
+    let hw_type = match hw_preference {
       HardwareAcceleration::PreferHardware => Some(get_platform_hw_type()),
       HardwareAcceleration::NoPreference => {
         if is_hw_encoding_disabled() {
@@ -1693,11 +1712,20 @@ impl VideoEncoder {
       (60, 2) // Quality mode: larger GOP with B-frames
     };
 
-    // Determine if alpha channel should be preserved (only VP9 supports alpha)
-    // Use parsed codec_id rather than string matching to handle all valid VP9 codec string formats
-    let use_alpha = codec_id == AVCodecID::Vp9 && matches!(config.alpha, Some(AlphaOption::Keep));
+    // Determine if alpha channel should be preserved
+    // VP9 and HEVC (x265) support alpha encoding
+    let use_alpha = (codec_id == AVCodecID::Vp9 || codec_id == AVCodecID::Hevc)
+      && matches!(config.alpha, Some(AlphaOption::Keep));
+
+    // NOTE: HEVC alpha check moved after encoder creation to allow no-preference fallback
+
+    // Select pixel format based on alpha and bit depth
     let pixel_format = if use_alpha {
-      AVPixelFormat::Yuva420p
+      if codec_id == AVCodecID::Hevc && is_hevc_10bit(&codec_string) {
+        AVPixelFormat::Yuva420p10le // 10-bit HEVC with alpha
+      } else {
+        AVPixelFormat::Yuva420p // 8-bit VP9/HEVC with alpha
+      }
     } else {
       AVPixelFormat::Yuv420p
     };
@@ -1720,9 +1748,8 @@ impl VideoEncoder {
       crf: None,
     };
 
-    // Update use_alpha and codec_id in guard
-    guard.use_alpha = use_alpha;
-    guard.codec_id = Some(codec_id);
+    // NOTE: guard.use_alpha, guard.pixel_format, guard.codec_id are updated AFTER all
+    // validation checks pass (after HEVC alpha check) to avoid state corruption on failure
 
     // Determine if AVCC/HVCC format is needed (for create_software_encoder helper)
     let is_h264 = codec_string.starts_with("avc1")
@@ -1752,7 +1779,7 @@ impl VideoEncoder {
         Ok(r) => (r.context, r.is_hardware, r.encoder_name),
         Err(e) => {
           // For no-preference, try software fallback if HW failed at creation
-          if guard.hw_preference == HardwareAcceleration::NoPreference && hw_type.is_some() {
+          if hw_preference == HardwareAcceleration::NoPreference && hw_type.is_some() {
             match Self::create_software_encoder(
               codec_id,
               &encoder_config,
@@ -1781,7 +1808,7 @@ impl VideoEncoder {
     // Configure encoder (with fallback for HW failures)
     if let Err(e) = context.configure_encoder(&encoder_config) {
       // Fallback to software if HW configure fails
-      if guard.hw_preference == HardwareAcceleration::NoPreference && is_hardware {
+      if hw_preference == HardwareAcceleration::NoPreference && is_hardware {
         match Self::create_software_encoder(codec_id, &encoder_config, use_avcc_format, realtime) {
           Ok((ctx, name)) => {
             context = ctx;
@@ -1811,7 +1838,7 @@ impl VideoEncoder {
 
       if let Err(e) = context.open() {
         // Fallback to software if HW open fails
-        if guard.hw_preference == HardwareAcceleration::NoPreference && is_hardware {
+        if hw_preference == HardwareAcceleration::NoPreference && is_hardware {
           match Self::create_software_encoder(codec_id, &encoder_config, use_avcc_format, realtime)
           {
             Ok((ctx, name)) => {
@@ -1837,12 +1864,29 @@ impl VideoEncoder {
       }
     }
 
+    // HEVC alpha requires software encoder - hardware encoders don't support alpha
+    // Check after encoder creation so that no-preference fallback can succeed
+    if use_alpha && codec_id == AVCodecID::Hevc && is_hardware {
+      Self::report_error(
+        &mut guard,
+        "NotSupportedError: HEVC alpha encoding requires software encoder. Set hardwareAcceleration to 'prefer-software'",
+      );
+      return;
+    }
+
+    // Update use_alpha, pixel_format, and codec_id AFTER all validation checks pass
+    // This prevents state corruption if reconfigure fails partway through
+    guard.use_alpha = use_alpha;
+    guard.pixel_format = pixel_format;
+    guard.codec_id = Some(codec_id);
+
     // Update inner state
     guard.context = Some(context);
     guard.config = Some(config.clone());
     guard.is_hardware = is_hardware;
     guard.encoder_name = encoder_name;
     guard.use_avcc_format = use_avcc_format;
+    guard.hw_preference = hw_preference;
 
     // Parse temporal layer count from scalabilityMode
     guard.temporal_layer_count = config
@@ -1963,12 +2007,8 @@ impl VideoEncoder {
       _ => (60, 2),
     };
 
-    // Use the same pixel format (with or without alpha) as the original encoder
-    let pixel_format = if inner.use_alpha {
-      AVPixelFormat::Yuva420p
-    } else {
-      AVPixelFormat::Yuv420p
-    };
+    // Use the stored pixel format (correctly handles 10-bit HEVC alpha)
+    let pixel_format = inner.pixel_format;
 
     let encoder_config = EncoderConfig {
       width: config.width.unwrap_or(0),
@@ -2474,11 +2514,20 @@ impl VideoEncoder {
     };
 
     // Determine if alpha channel should be preserved
-    // Only VP9 supports alpha encoding (YUVA420P pixel format)
-    // Use parsed codec_id rather than string matching to handle all valid VP9 codec string formats
-    let use_alpha = codec_id == AVCodecID::Vp9 && matches!(config.alpha, Some(AlphaOption::Keep));
+    // VP9 and HEVC (x265) support alpha encoding
+    let use_alpha = (codec_id == AVCodecID::Vp9 || codec_id == AVCodecID::Hevc)
+      && matches!(config.alpha, Some(AlphaOption::Keep));
+
+    // NOTE: HEVC alpha check moved after all fallbacks (configure/open) to allow
+    // no-preference to fall back to software when hardware fails with YUVA420P
+
+    // Select pixel format based on alpha and bit depth
     let pixel_format = if use_alpha {
-      AVPixelFormat::Yuva420p
+      if codec_id == AVCodecID::Hevc && is_hevc_10bit(&codec) {
+        AVPixelFormat::Yuva420p10le // 10-bit HEVC with alpha
+      } else {
+        AVPixelFormat::Yuva420p // 8-bit VP9/HEVC with alpha
+      }
     } else {
       AVPixelFormat::Yuv420p
     };
@@ -2581,6 +2630,16 @@ impl VideoEncoder {
       }
     }
 
+    // HEVC alpha requires software encoder - hardware encoders don't support alpha
+    // Check after all fallbacks so that no-preference can successfully fall back to software
+    if use_alpha && codec_id == AVCodecID::Hevc && is_hardware {
+      Self::report_error(
+        &mut inner,
+        "NotSupportedError: HEVC alpha encoding requires software encoder. Set hardwareAcceleration to 'prefer-software'",
+      );
+      return Ok(());
+    }
+
     // Try to create hardware frame context for zero-copy GPU encoding
     // This is optional - if it fails, we fall back to CPU frames (current behavior)
     let (hw_device_ctx, hw_frame_ctx, use_hw_frames) = if is_hardware {
@@ -2658,6 +2717,7 @@ impl VideoEncoder {
 
     // Alpha channel support - track if we're encoding with alpha
     inner.use_alpha = use_alpha;
+    inner.pixel_format = pixel_format;
     inner.codec_id = Some(codec_id);
 
     // Create new channel and worker if needed (after reconfiguration)
@@ -3760,6 +3820,26 @@ fn quantizer_to_ffmpeg_quality(quantizer: u16) -> i32 {
 /// Check if codec uses q_index range (0-255) vs QP range (0-51)
 fn codec_uses_q_index(codec_id: AVCodecID) -> bool {
   matches!(codec_id, AVCodecID::Vp9 | AVCodecID::Av1)
+}
+
+/// Check if HEVC codec string specifies 10-bit profile (Main 10)
+/// Returns true if profile is 2 (Main 10), false otherwise
+fn is_hevc_10bit(codec: &str) -> bool {
+  // HEVC codec string format: hev1.P.T.Lxxx or hvc1.P.T.Lxxx
+  // Profile 2 = Main 10 (10-bit)
+  let codec_lower = codec.to_lowercase();
+  if !codec_lower.starts_with("hev1.") && !codec_lower.starts_with("hvc1.") {
+    return false; // Short form (h265, hevc) defaults to 8-bit
+  }
+
+  // Use codec_lower for split to ensure consistency with prefix check
+  let parts: Vec<&str> = codec_lower.split('.').collect();
+  if parts.len() >= 2
+    && let Ok(profile) = parts[1].parse::<u8>()
+  {
+    return profile == 2; // Profile 2 = Main 10
+  }
+  false
 }
 
 /// Parse WebCodecs codec string to FFmpeg codec ID
