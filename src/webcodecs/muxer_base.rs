@@ -346,20 +346,19 @@ impl<F: MuxerFormat> MuxerInner<F> {
       AVPixelFormat::Yuv420p
     };
 
-    // Calculate time_base for precise timing
-    // This provides enough precision for frame-accurate timing
-    // Formula: timescale = fps^2 * 64 to ensure sufficient precision
-    // For 30fps: timescale = 900 * 64 = 57600, time_base = 1/57600
+    // Calculate time_base for precise timing using FFmpeg's algorithm:
+    // Start with fps as timescale, then double until >= 10000
+    // This ensures millisecond-level precision while keeping timescale reasonable
+    // For 30fps: 30 -> 60 -> 120 -> 240 -> 480 -> 960 -> 1920 -> 3840 -> 7680 -> 15360
     let time_base = if config.framerate > 0.0 && config.framerate.is_finite() {
       let fps = config.framerate;
-      // Use minimum fps threshold to avoid extremely small timescale values
-      // 1.0 fps is a reasonable lower bound for any practical video
       const MIN_FPS: f64 = 1.0;
       if fps >= MIN_FPS {
-        let timescale = (fps * fps * 64.0).round() as i32;
-        // Clamp timescale to valid range: [1, i32::MAX]
-        // This prevents division by zero and integer overflow
-        let timescale = timescale.max(1).min(i32::MAX);
+        // FFmpeg's algorithm: double until >= 10000
+        let mut timescale = fps.round() as i32;
+        while timescale < 10000 {
+          timescale *= 2;
+        }
         AVRational::new(1, timescale)
       } else {
         // Fallback to microseconds for very low framerates
