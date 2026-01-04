@@ -446,6 +446,13 @@
             <div class="controls-box">
               <div class="canvas-controls">
                 <div class="form-group">
+                  <label for="formatSelect">Format</label>
+                  <select id="formatSelect" class="form-select">
+                    <option value="hevc" selected>HEVC / MP4</option>
+                    <option value="vp9">VP9 / WebM</option>
+                  </select>
+                </div>
+                <div class="form-group">
                   <label for="latencyMode">Latency Mode</label>
                   <select id="latencyMode" class="form-select">
                     <option value="quality" selected>Quality</option>
@@ -460,7 +467,7 @@
                     <option value="no-preference">No Preference</option>
                   </select>
                 </div>
-                <button id="generateBtn" class="btn btn-success"><span>🎥</span> Generate HEVC Video</button>
+                <button id="generateBtn" class="btn btn-success"><span>🎥</span> Generate Video</button>
                 <button id="downloadBtn" class="btn btn-primary" disabled><span>⬇️</span> Download Video</button>
               </div>
               <div id="progressContainer" class="progress-container">
@@ -523,6 +530,28 @@
     <script type="module">
       import * as Mediabunny from 'https://cdn.jsdelivr.net/npm/mediabunny@1.27.3/+esm'
       import { drawRoundedSquare, easeInOutCubic } from './canvas-utils.js'
+
+      // Format configurations - easy to extend with new formats
+      const FORMAT_CONFIGS = {
+        hevc: {
+          label: 'HEVC / MP4',
+          codecString: 'hvc1.1.6.L93.B0',
+          muxerCodec: 'hevc',
+          muxerFormat: 'mp4',
+          mimeType: 'video/mp4',
+          extension: 'mp4',
+          description: 'MP4 Video',
+        },
+        vp9: {
+          label: 'VP9 / WebM',
+          codecString: 'vp09.00.10.08',
+          muxerCodec: 'vp9',
+          muxerFormat: 'webm',
+          mimeType: 'video/webm',
+          extension: 'webm',
+          description: 'WebM Video',
+        },
+      }
 
       // Animation parameters (shared between preview and encoding)
       const width = 400
@@ -594,7 +623,7 @@
 
       // Encode video using native WebCodecs API
       async function encodeVideoWithWebCodecs(canvas, width, height, fps, totalFrames, onProgress, options = {}) {
-        const { latencyMode = 'quality', hardwareAcceleration = 'prefer-hardware' } = options
+        const { latencyMode = 'quality', hardwareAcceleration = 'prefer-hardware', formatConfig } = options
         const videoChunks = []
         const videoMetadatas = []
 
@@ -614,9 +643,9 @@
           },
         })
 
-        // Configure encoder for HEVC
+        // Configure encoder using format config
         encoder.configure({
-          codec: 'hvc1.1.6.L93.B0',
+          codec: formatConfig.codecString,
           width,
           height,
           bitrate: 2_000_000, // 2 Mbps
@@ -663,23 +692,26 @@
         return { videoChunks, videoMetadatas }
       }
 
-      // Mux encoded chunks into MP4 using Mediabunny
-      async function muxVideoToMP4(videoChunks, videoMetadatas, width, height) {
-        const { Output, BufferTarget, Mp4OutputFormat, EncodedVideoPacketSource, EncodedPacket } = Mediabunny
+      // Mux encoded chunks using Mediabunny based on format config
+      async function muxVideo(videoChunks, videoMetadatas, formatConfig) {
+        const { Output, BufferTarget, Mp4OutputFormat, WebMOutputFormat, EncodedVideoPacketSource, EncodedPacket } =
+          Mediabunny
+
+        // Create output format based on config
+        const outputFormat = formatConfig.muxerFormat === 'webm' ? new WebMOutputFormat() : new Mp4OutputFormat()
 
         const output = new Output({
-          format: new Mp4OutputFormat(),
+          format: outputFormat,
           target: new BufferTarget(),
         })
 
         // Create a source that accepts encoded packets
-        const videoSource = new EncodedVideoPacketSource('hevc')
+        const videoSource = new EncodedVideoPacketSource(formatConfig.muxerCodec)
         output.addVideoTrack(videoSource)
 
         await output.start()
 
         // Convert WebCodecs EncodedVideoChunk to Mediabunny EncodedPacket and add to source
-        // The first chunk should include metadata with decoderConfig
         for (let i = 0; i < videoChunks.length; i++) {
           const chunk = videoChunks[i]
           const metadata = videoMetadatas[i]
@@ -709,6 +741,7 @@
       const generatedVideo = document.getElementById('generatedVideo')
       const latencyModeSelect = document.getElementById('latencyMode')
       const hardwareAccelerationSelect = document.getElementById('hardwareAcceleration')
+      const formatSelect = document.getElementById('formatSelect')
 
       let animationId = null
       let isAnimating = true
@@ -762,7 +795,10 @@
           // Create an offscreen canvas for encoding
           const offscreenCanvas = new OffscreenCanvas(width, height)
 
-          progressText.textContent = 'Encoding frames...'
+          // Get format configuration
+          const formatKey = formatSelect.value
+          const formatConfig = FORMAT_CONFIGS[formatKey]
+          progressText.textContent = `Encoding frames (${formatConfig.label})...`
 
           // Encode video using native WebCodecs API
           const { videoChunks, videoMetadatas } = await encodeVideoWithWebCodecs(
@@ -778,13 +814,14 @@
             {
               latencyMode: latencyModeSelect.value,
               hardwareAcceleration: hardwareAccelerationSelect.value,
+              formatConfig,
             },
           )
 
           progressText.textContent = 'Muxing video...'
 
-          // Mux encoded chunks into MP4 using Mediabunny
-          const buffer = await muxVideoToMP4(videoChunks, videoMetadatas, width, height)
+          // Mux encoded chunks using unified muxer
+          const buffer = await muxVideo(videoChunks, videoMetadatas, formatConfig)
 
           const endTime = performance.now()
           const duration = ((endTime - generateStartTime) / 1000).toFixed(2)
@@ -794,7 +831,8 @@
             URL.revokeObjectURL(generatedBlobUrl)
           }
 
-          generatedBlob = new Blob([buffer], { type: 'video/mp4' })
+          generatedBlob = new Blob([buffer], { type: formatConfig.mimeType })
+          generatedBlob.formatConfig = formatConfig // Store config for download
           generatedBlobUrl = URL.createObjectURL(generatedBlob)
 
           generatedVideo.src = generatedBlobUrl
@@ -836,17 +874,20 @@
       downloadBtn.addEventListener('click', async () => {
         if (!generatedBlob) return
 
+        const { muxerCodec, mimeType, extension, description } = generatedBlob.formatConfig
+        const browserName = getBrowserName()
+        const filename = `canvas-${muxerCodec}-${browserName}.${extension}`
+
         try {
           // Try to use File System Access API (modern browsers)
           if ('showSaveFilePicker' in window) {
-            const browserName = getBrowserName()
             const fileHandle = await window.showSaveFilePicker({
-              suggestedName: `canvas-hevc-${browserName}.mp4`,
+              suggestedName: filename,
               types: [
                 {
-                  description: 'MP4 Video',
+                  description,
                   accept: {
-                    'video/mp4': ['.mp4'],
+                    [mimeType]: [`.${extension}`],
                   },
                 },
               ],
@@ -860,8 +901,7 @@
             const url = URL.createObjectURL(generatedBlob)
             const a = document.createElement('a')
             a.href = url
-            const browserName = getBrowserName()
-            a.download = `canvas-hevc-${browserName}.mp4`
+            a.download = filename
             document.body.appendChild(a)
             a.click()
             document.body.removeChild(a)
@@ -875,8 +915,7 @@
             const url = URL.createObjectURL(generatedBlob)
             const a = document.createElement('a')
             a.href = url
-            const browserName = getBrowserName()
-            a.download = `canvas-hevc-${browserName}.mp4`
+            a.download = filename
             document.body.appendChild(a)
             a.click()
             document.body.removeChild(a)
