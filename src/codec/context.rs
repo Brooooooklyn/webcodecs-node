@@ -3,12 +3,12 @@
 //! Provides encoding and decoding functionality with RAII cleanup.
 
 use crate::ffi::{
-  self, AVCodec, AVCodecContext, AVCodecID, AVHWDeviceType, AVPixelFormat,
+  self, AVCodec, AVCodecContext, AVCodecID, AVHWDeviceType, AVPixelFormat, AVRational,
   accessors::{
     codec_flag, ffctx_get_extradata, ffctx_get_extradata_size, ffctx_get_flags,
     ffctx_get_frame_size, ffctx_get_height, ffctx_get_pix_fmt, ffctx_get_qmax, ffctx_get_qmin,
-    ffctx_get_sample_rate, ffctx_get_width, ffctx_set_bit_rate, ffctx_set_channels,
-    ffctx_set_flags, ffctx_set_framerate, ffctx_set_gop_size, ffctx_set_height,
+    ffctx_get_sample_rate, ffctx_get_time_base, ffctx_get_width, ffctx_set_bit_rate,
+    ffctx_set_channels, ffctx_set_flags, ffctx_set_framerate, ffctx_set_gop_size, ffctx_set_height,
     ffctx_set_hw_device_ctx, ffctx_set_level, ffctx_set_max_b_frames, ffctx_set_pix_fmt,
     ffctx_set_profile, ffctx_set_qmax, ffctx_set_qmin, ffctx_set_rc_buffer_size,
     ffctx_set_rc_max_rate, ffctx_set_sample_fmt, ffctx_set_sample_rate, ffctx_set_thread_count,
@@ -956,6 +956,16 @@ impl CodecContext {
       } else {
         Some(std::slice::from_raw_parts(ptr, size as usize))
       }
+    }
+  }
+
+  /// Get configured time base
+  pub fn time_base(&self) -> AVRational {
+    unsafe {
+      let mut num: i32 = 0;
+      let mut den: i32 = 0;
+      ffctx_get_time_base(self.as_ptr(), &mut num, &mut den);
+      AVRational::new(num, den)
     }
   }
 }

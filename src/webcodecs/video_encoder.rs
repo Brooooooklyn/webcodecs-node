@@ -7,7 +7,9 @@ use crate::codec::{
   BitrateMode as CodecBitrateMode, CodecContext, EncoderConfig, EncoderCreationResult, Frame,
   HwDeviceContext, HwFrameConfig, HwFrameContext, Packet, Scaler,
 };
-use crate::ffi::{AVCodecID, AVHWDeviceType, AVPictureType, AVPixelFormat};
+use crate::ffi::{
+  AVCodecID, AVHWDeviceType, AVPictureType, AVPixelFormat, AVRational, avutil::av_rescale_q,
+};
 use crate::webcodecs::error::DOMExceptionName;
 use crate::webcodecs::error::{throw_invalid_state_error, throw_type_error_unit};
 use crate::webcodecs::hw_fallback::{
@@ -795,8 +797,15 @@ impl VideoEncoder {
     // Release the read lock now that we have an owned frame
     drop(frame_guard);
 
-    // Set frame PTS
-    frame_to_encode.set_pts(timestamp);
+    // Set frame PTS - convert from microseconds to encoder time_base units
+    // FFmpeg expects frame->pts in time_base units, not microseconds
+    let encoder_time_base = guard.context.as_ref().map(|ctx| ctx.time_base());
+    let pts_in_timebase = if let Some(tb) = encoder_time_base {
+      unsafe { av_rescale_q(timestamp, AVRational::MICROSECONDS, tb) }
+    } else {
+      timestamp // fallback to microseconds if no context
+    };
+    frame_to_encode.set_pts(pts_in_timebase);
 
     // Force keyframe if requested via encode options (W3C WebCodecs spec)
     if options.as_ref().is_some_and(|o| o.key_frame == Some(true)) {
@@ -876,15 +885,23 @@ impl VideoEncoder {
 
           if Self::fallback_to_software(&mut guard) {
             // Re-encode all buffered frames with software encoder
+            let sw_encoder_time_base = guard.context.as_ref().map(|ctx| ctx.time_base());
             for (buffered_frame, buffered_ts, _buffered_opts, buffered_rotation, buffered_flip) in
               pending_frames
             {
               let mut frame_to_reencode = buffered_frame;
-              frame_to_reencode.set_pts(buffered_ts);
+              // Convert microseconds to encoder time_base units
+              let pts_in_timebase = if let Some(tb) = sw_encoder_time_base {
+                unsafe { av_rescale_q(buffered_ts, AVRational::MICROSECONDS, tb) }
+              } else {
+                buffered_ts
+              };
+              frame_to_reencode.set_pts(pts_in_timebase);
 
               if let Some(ctx) = guard.context.as_mut()
                 && let Ok(pkts) = ctx.encode(Some(&frame_to_reencode))
               {
+                let enc_tb = ctx.time_base();
                 for packet in pkts {
                   // Extract alpha side data for VP9 alpha support
                   let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
@@ -894,6 +911,7 @@ impl VideoEncoder {
                     packet,
                     Some(buffered_ts),
                     guard.use_avcc_format,
+                    enc_tb,
                   );
 
                   // Create SVC metadata if temporal layers are configured
@@ -1044,15 +1062,23 @@ impl VideoEncoder {
 
             if Self::fallback_to_software(&mut guard) {
               // Re-encode all buffered frames with software encoder
+              let sw_encoder_time_base = guard.context.as_ref().map(|ctx| ctx.time_base());
               for (buffered_frame, buffered_ts, _buffered_opts, buffered_rotation, buffered_flip) in
                 pending_frames
               {
                 let mut frame_to_reencode = buffered_frame;
-                frame_to_reencode.set_pts(buffered_ts);
+                // Convert microseconds to encoder time_base units
+                let pts_in_timebase = if let Some(tb) = sw_encoder_time_base {
+                  unsafe { av_rescale_q(buffered_ts, AVRational::MICROSECONDS, tb) }
+                } else {
+                  buffered_ts
+                };
+                frame_to_reencode.set_pts(pts_in_timebase);
 
                 if let Some(ctx) = guard.context.as_mut()
                   && let Ok(pkts) = ctx.encode(Some(&frame_to_reencode))
                 {
+                  let enc_tb = ctx.time_base();
                   // Process any output packets from re-encoding
                   for packet in pkts {
                     // Extract alpha side data for VP9 alpha support
@@ -1064,6 +1090,7 @@ impl VideoEncoder {
                       packet,
                       Some(buffered_ts),
                       guard.use_avcc_format,
+                      enc_tb,
                     );
 
                     // Create SVC metadata if temporal layers are configured
@@ -1173,6 +1200,13 @@ impl VideoEncoder {
       let _ = Self::fire_dequeue_event(event_state);
     }
 
+    // Get encoder time base for timestamp conversion
+    let encoder_time_base = guard
+      .context
+      .as_ref()
+      .map(|ctx| ctx.time_base())
+      .unwrap_or(AVRational::MICROSECONDS);
+
     // Process output packets - call callback for each
     for packet in packets {
       // Pop timestamp from queue to preserve original input timestamp
@@ -1183,8 +1217,12 @@ impl VideoEncoder {
       let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
       let packet_is_key = packet.is_key();
 
-      let chunk =
-        EncodedVideoChunk::from_packet_with_format(packet, output_timestamp, guard.use_avcc_format);
+      let chunk = EncodedVideoChunk::from_packet_with_format(
+        packet,
+        output_timestamp,
+        guard.use_avcc_format,
+        encoder_time_base,
+      );
 
       // Create SVC metadata if temporal layers are configured
       let svc = create_svc_metadata(guard.temporal_layer_count, guard.output_frame_count);
@@ -1383,6 +1421,13 @@ impl VideoEncoder {
     };
 
     // Queue remaining packets for synchronous delivery in resolver
+    // Get encoder time base for timestamp conversion
+    let encoder_time_base = guard
+      .context
+      .as_ref()
+      .map(|ctx| ctx.time_base())
+      .unwrap_or(AVRational::MICROSECONDS);
+
     for packet in packets {
       // Pop timestamp from queue to preserve original input timestamp
       let output_timestamp = guard.timestamp_queue.pop_front();
@@ -1390,8 +1435,12 @@ impl VideoEncoder {
       let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
       let packet_is_key = packet.is_key();
 
-      let chunk =
-        EncodedVideoChunk::from_packet_with_format(packet, output_timestamp, guard.use_avcc_format);
+      let chunk = EncodedVideoChunk::from_packet_with_format(
+        packet,
+        output_timestamp,
+        guard.use_avcc_format,
+        encoder_time_base,
+      );
 
       // Create SVC metadata if temporal layers are configured
       let svc = create_svc_metadata(guard.temporal_layer_count, guard.output_frame_count);
