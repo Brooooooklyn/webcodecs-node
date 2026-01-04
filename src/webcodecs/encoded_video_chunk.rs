@@ -4,6 +4,7 @@
 //! See: https://developer.mozilla.org/en-US/docs/Web/API/EncodedVideoChunk
 
 use crate::codec::Packet;
+use crate::ffi::{AVRational, avutil::av_rescale_q};
 use crate::webcodecs::error::{enforce_range_long_long, enforce_range_long_long_optional};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -268,10 +269,15 @@ impl EncodedVideoChunk {
 
   /// Create from internal Packet with optional AVCC conversion
   /// If use_avcc is true, converts from Annex B to AVCC format (length-prefixed NALUs)
+  ///
+  /// The encoder_time_base parameter is the encoder's time_base (e.g., 1/30 for 30fps).
+  /// Packet timestamps (pts, dts, duration) are in encoder time_base units and must be
+  /// converted to microseconds for the WebCodecs API.
   pub fn from_packet_with_format(
     packet: Packet,
     explicit_timestamp: Option<i64>,
     use_avcc: bool,
+    encoder_time_base: AVRational,
   ) -> Self {
     let chunk_type = if packet.is_key() {
       EncodedVideoChunkType::Key
@@ -283,32 +289,40 @@ impl EncodedVideoChunk {
     let packet_dts = packet.dts();
     let packet_duration = packet.duration();
 
+    // Target time base is microseconds (1/1000000)
+    let dst_tb = AVRational::MICROSECONDS;
+
     // Extract DTS and original PTS for proper B-frame support
     // AV_NOPTS_VALUE is i64::MIN in FFmpeg
     const AV_NOPTS_VALUE: i64 = i64::MIN;
 
+    // Convert DTS from encoder time_base to microseconds
     // Always store DTS if valid (even if equal to PTS)
     // This ensures consistent handling in muxer for all frames
     let dts_us = if packet_dts != AV_NOPTS_VALUE {
-      Some(packet_dts)
+      Some(unsafe { av_rescale_q(packet_dts, encoder_time_base, dst_tb) })
     } else {
       None
     };
 
+    // Convert PTS from encoder time_base to microseconds
     // Always store original PTS if valid (independent of DTS)
     // This allows muxer to reconstruct correct PTS/DTS relationship
-    // and preserves PTS information even when DTS is not available
     let original_pts = if packet_pts != AV_NOPTS_VALUE {
-      Some(packet_pts)
+      Some(unsafe { av_rescale_q(packet_pts, encoder_time_base, dst_tb) })
     } else {
       None
     };
 
-    // Debug: print packet timestamps
-    // eprintln!(
-    //   "DEBUG EncodedVideoChunk: packet_pts={}, packet_dts={}, explicit_ts={:?}, dts_us={:?}, original_pts={:?}",
-    //   packet_pts, packet_dts, explicit_timestamp, dts_us, original_pts
-    // );
+    // Convert packet PTS to microseconds for fallback timestamp
+    let pts_us = unsafe { av_rescale_q(packet_pts, encoder_time_base, dst_tb) };
+
+    // Convert duration from encoder time_base to microseconds
+    let duration_us = if packet_duration > 0 {
+      Some(unsafe { av_rescale_q(packet_duration, encoder_time_base, dst_tb) })
+    } else {
+      None
+    };
 
     let data = if use_avcc {
       Either::A(convert_annexb_to_avcc(packet.as_slice()))
@@ -319,13 +333,10 @@ impl EncodedVideoChunk {
     let inner = EncodedVideoChunkInner {
       data,
       chunk_type,
-      // Use explicit timestamp if provided, otherwise fall back to packet PTS
-      timestamp_us: explicit_timestamp.unwrap_or(packet_pts),
-      duration_us: if packet_duration > 0 {
-        Some(packet_duration)
-      } else {
-        None
-      },
+      // Use explicit timestamp if provided (already in microseconds),
+      // otherwise fall back to packet PTS (converted to microseconds above)
+      timestamp_us: explicit_timestamp.unwrap_or(pts_us),
+      duration_us,
       dts_us,
       original_pts,
     };
