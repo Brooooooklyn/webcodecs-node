@@ -465,6 +465,13 @@ impl CodecContext {
         }
         // Disable software fallback for consistent hardware behavior
         av_opt_set_int(ctx, c"allow_sw".as_ptr(), 0, opt_flag::SEARCH_CHILDREN);
+        // In quality mode, enable B-frames for better compression
+        // VideoToolbox defaults to 0 B-frames, so we explicitly set it
+        // Note: We use ffctx_set_max_b_frames directly because FFmpeg's vtenc_configure_encoder
+        // checks avctx->max_b_frames > 0 to set has_b_frames, and this must be > 0 for B-frames.
+        if !realtime {
+          ffctx_set_max_b_frames(self.ptr.as_ptr(), 2);
+        }
       }
       // NVENC (NVIDIA)
       else if encoder_name.contains("nvenc") {
