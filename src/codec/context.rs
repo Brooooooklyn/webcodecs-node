@@ -348,8 +348,18 @@ impl CodecContext {
       );
 
       // GOP settings
-      ffctx_set_gop_size(ctx, config.gop_size as i32);
-      ffctx_set_max_b_frames(ctx, config.max_b_frames as i32);
+      // When None, pass -1 to let encoder use its own default:
+      // - libx264: gop_size=250, max_b_frames=3 (superfast preset)
+      // - libx265: gop_size=250, max_b_frames=3, b-adapt=0 (ultrafast preset)
+      // - VideoToolbox: uses hardware defaults
+      // When Some(value), use the specified value.
+      // Note: FFmpeg's default is gop_size=12, max_b_frames=0, which is not ideal
+      // for quality mode, so we use -1 to let encoders use their optimized defaults.
+      // The actual bframes value depends on the preset set in apply_sw_encoder_options().
+      let gop_size = config.gop_size.map(|v| v as i32).unwrap_or(-1);
+      let max_b_frames = config.max_b_frames.map(|v| v as i32).unwrap_or(-1);
+      ffctx_set_gop_size(ctx, gop_size);
+      ffctx_set_max_b_frames(ctx, max_b_frames);
 
       // Threading
       if config.thread_count > 0 {
@@ -364,17 +374,9 @@ impl CodecContext {
         ffctx_set_level(ctx, level);
       }
 
-      // Configure x265 via x265-params:
-      // - preset=medium: Ensures consistent quality across platforms
-      // - log-level=error: Suppress verbose x265 logging
-      // - qpmax=40: Limit maximum QP to prevent extreme quality degradation
-      //   (default is 69, which allows very low quality in edge cases like single-frame encoding)
-      av_opt_set(
-        ctx as *mut std::ffi::c_void,
-        c"x265-params".as_ptr(),
-        c"preset=medium:log-level=error:qpmax=40".as_ptr(),
-        opt_flag::SEARCH_CHILDREN,
-      );
+      // Note: Encoder-specific options (preset, tune, x265-params, etc.)
+      // should be set via apply_sw_encoder_options() or apply_hw_encoder_options()
+      // after configure_encoder() and before open().
     }
 
     Ok(())
@@ -607,11 +609,26 @@ impl CodecContext {
       // Use ultrafast preset which has low latency settings built-in
       // Note: tune=zerolatency causes conflicts (lookahead=0 vs bframes)
       // so we just use ultrafast which is fast enough for real-time
+      //
+      // IMPORTANT: preset must be set via -preset option, NOT in x265-params!
+      // Setting preset in x265-params doesn't properly apply all preset defaults.
+      // ultrafast preset defaults: bframes=3, b-adapt=0, lookahead=5
+      //
+      // x265-params is only for additional parameters:
+      // - log-level=error: Suppress verbose x265 logging to stderr
+      // - qpmax=40: Limit maximum QP to prevent extreme quality degradation
+      //   (x265 default is 69, which can produce very low quality in edge cases)
       else if encoder_name == "libx265" {
         av_opt_set(
           ctx,
           c"preset".as_ptr(),
           c"ultrafast".as_ptr(),
+          opt_flag::SEARCH_CHILDREN,
+        );
+        av_opt_set(
+          ctx,
+          c"x265-params".as_ptr(),
+          c"log-level=error:qpmax=40".as_ptr(),
           opt_flag::SEARCH_CHILDREN,
         );
       }

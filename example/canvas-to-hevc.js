@@ -61,9 +61,9 @@ async function main() {
     codec: 'hvc1.1.6.L93.B0', // Safari compatible hvc1
     width,
     height,
-    bitrate: 2_000_000, // 2 Mbps
+    bitrate: 600_000, // 600 Kbps
     framerate: fps,
-    hardwareAcceleration: 'prefer-hardware', // 'no-preference' | 'prefer-hardware' | 'prefer-software'
+    hardwareAcceleration: 'prefer-software', // 'no-preference' | 'prefer-hardware' | 'prefer-software'
     latencyMode: 'quality', // 'quality' | 'realtime', when set realtime, has_b_frames = 0
   })
 
