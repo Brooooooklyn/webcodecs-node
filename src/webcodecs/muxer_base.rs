@@ -259,9 +259,6 @@ pub struct MuxerInner<F: MuxerFormat> {
   /// Ticks per video frame in stream time base (set after header written)
   /// For 30fps with timescale=57600: ticks_per_frame = 1920
   video_ticks_per_frame: Option<u64>,
-  /// PTS offset for B-frame videos (set from first frame's scaled PTS)
-  /// Used to normalize PTS timeline so the first frame starts at PTS=0
-  video_pts_offset: Option<i64>,
   /// Phantom data for format type
   _format: PhantomData<F>,
 }
@@ -288,7 +285,6 @@ impl<F: MuxerFormat> MuxerInner<F> {
       last_audio_pts: -1,
       video_frame_count: 0,
       video_ticks_per_frame: None,
-      video_pts_offset: None,
       _format: PhantomData,
     })
   }
@@ -318,7 +314,6 @@ impl<F: MuxerFormat> MuxerInner<F> {
       last_audio_pts: -1,
       video_frame_count: 0,
       video_ticks_per_frame: None,
-      video_pts_offset: None,
       _format: PhantomData,
     })
   }
@@ -527,15 +522,14 @@ impl<F: MuxerFormat> MuxerInner<F> {
         let scaled_pts = unsafe { av_rescale_q(orig_pts, src_tb, dst_tb) };
         let scaled_dts = unsafe { av_rescale_q(orig_dts, src_tb, dst_tb) };
 
-        // For the first frame, record the PTS offset to normalize timeline
-        // This ensures the output video starts at PTS=0
-        if self.video_pts_offset.is_none() {
-          self.video_pts_offset = Some(scaled_pts);
-        }
-
-        let offset = self.video_pts_offset.unwrap_or(0);
-        let final_pts = scaled_pts - offset;
-        let final_dts = scaled_dts - offset;
+        // For B-frame videos, don't apply any offset - let FFmpeg handle negative DTS
+        // FFmpeg's MP4 muxer will automatically create an edit list (edts atom) when
+        // it detects negative DTS, which tells players the correct start time.
+        //
+        // If we manually shift timestamps to make DTS >= 0, we lose the original
+        // timing relationship and start_time won't be 0.
+        let final_pts = scaled_pts;
+        let final_dts = scaled_dts;
 
         // Calculate duration from ticks_per_frame or from chunk duration
         let dur = if let Some(tpf) = self.video_ticks_per_frame {
