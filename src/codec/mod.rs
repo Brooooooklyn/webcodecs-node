@@ -54,10 +54,22 @@ pub struct EncoderConfig {
   pub framerate_num: u32,
   /// Frames per second (denominator)
   pub framerate_den: u32,
-  /// Group of pictures size (keyframe interval)
-  pub gop_size: u32,
-  /// Maximum B-frames between non-B frames
-  pub max_b_frames: u32,
+  /// Group of pictures size (keyframe interval).
+  /// - Some(value): Use the specified GOP size
+  /// - None: Let the encoder use its own default (passes -1 to FFmpeg)
+  ///
+  /// Note: FFmpeg's default is 12, but when None is passed, we use -1 which
+  /// allows encoders like libx264 (default 250) and libx265 (default 250)
+  /// to use their optimized defaults.
+  pub gop_size: Option<u32>,
+  /// Maximum B-frames between non-B frames.
+  /// - Some(value): Use the specified max B-frames
+  /// - None: Let the encoder use its own default (passes -1 to FFmpeg)
+  ///
+  /// Note: FFmpeg's default is 0, but when None is passed, we use -1 which
+  /// allows encoders like libx264 (default 3) and libx265 (default 4)
+  /// to use their optimized defaults.
+  pub max_b_frames: Option<u32>,
   /// Number of threads (0 for auto)
   pub thread_count: u32,
   /// Codec profile (codec-specific)
@@ -83,9 +95,9 @@ impl Default for EncoderConfig {
       bitrate: 5_000_000, // 5 Mbps
       framerate_num: 30,
       framerate_den: 1,
-      gop_size: 60, // 2 seconds at 30fps
-      max_b_frames: 2,
-      thread_count: 0, // Auto
+      gop_size: None,     // Use encoder's default (e.g., 250 for x264/x265)
+      max_b_frames: None, // Use encoder's default (e.g., 3 for x264, 4 for x265)
+      thread_count: 0,    // Auto
       profile: None,
       level: None,
       bitrate_mode: BitrateMode::default(),

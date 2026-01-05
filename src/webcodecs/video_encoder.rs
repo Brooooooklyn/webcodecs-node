@@ -431,6 +431,38 @@ struct VideoEncoderInner {
   codec_id: Option<AVCodecID>,
 }
 
+/// Get default GOP settings based on latency mode.
+///
+/// Returns `(gop_size, max_b_frames)` as `Option<u32>`:
+/// - Realtime mode: `Some(10), Some(0)` - Small GOP, no B-frames for low latency
+/// - Quality mode: `None, None` - Let encoder use its optimized defaults
+///
+/// ## Why None for quality mode?
+///
+/// FFmpeg's AVCodecContext defaults are `gop_size=12, max_b_frames=0`, which are
+/// designed for video conferencing, not quality encoding. When we pass `None`,
+/// the codec layer translates this to `-1`, which causes FFmpeg to skip setting
+/// these values, allowing encoders to use their own optimized defaults:
+///
+/// | Encoder      | Default gop_size | Default max_b_frames |
+/// |--------------|------------------|----------------------|
+/// | libx264      | 250              | 3                    |
+/// | libx265      | 250              | 4                    |
+/// | VideoToolbox | (hardware)       | (hardware)           |
+/// | NVENC        | (hardware)       | (hardware)           |
+///
+/// ## Why explicit values for realtime mode?
+///
+/// - Small GOP (10): Ensures frequent keyframes for seeking/recovery
+/// - No B-frames (0): Eliminates encoding latency (B-frames require future frames)
+fn get_default_gop_settings(realtime: bool) -> (Option<u32>, Option<u32>) {
+  if realtime {
+    (Some(10), Some(0)) // Low latency: small GOP, no B-frames
+  } else {
+    (None, None) // Quality mode: let encoder use its optimized defaults
+  }
+}
+
 /// Get the preferred hardware device type for the current platform
 fn get_platform_hw_type() -> AVHWDeviceType {
   #[cfg(target_os = "macos")]
@@ -1617,11 +1649,7 @@ impl VideoEncoder {
           };
 
           let realtime = matches!(config.latency_mode, Some(LatencyMode::Realtime));
-          let (gop_size, max_b_frames) = if realtime {
-            (10, 0) // Low latency: small GOP, no B-frames
-          } else {
-            (60, 2) // Quality mode: larger GOP with B-frames
-          };
+          let (gop_size, max_b_frames) = get_default_gop_settings(realtime);
 
           let pixel_format = if guard.use_alpha {
             AVPixelFormat::Yuva420p
@@ -1740,11 +1768,7 @@ impl VideoEncoder {
     };
 
     let realtime = matches!(config.latency_mode, Some(LatencyMode::Realtime));
-    let (gop_size, max_b_frames) = if realtime {
-      (10, 0) // Low latency: small GOP, no B-frames
-    } else {
-      (60, 2) // Quality mode: larger GOP with B-frames
-    };
+    let (gop_size, max_b_frames) = get_default_gop_settings(realtime);
 
     // Determine if alpha channel should be preserved (only VP9 supports alpha)
     // Use parsed codec_id rather than string matching to handle all valid VP9 codec string formats
@@ -2011,10 +2035,8 @@ impl VideoEncoder {
       None => CodecBitrateMode::Constant,
     };
 
-    let (gop_size, max_b_frames) = match config.latency_mode {
-      Some(LatencyMode::Realtime) => (10, 0),
-      _ => (60, 2),
-    };
+    let realtime = matches!(config.latency_mode, Some(LatencyMode::Realtime));
+    let (gop_size, max_b_frames) = get_default_gop_settings(realtime);
 
     // Use the same pixel format (with or without alpha) as the original encoder
     let pixel_format = if inner.use_alpha {
@@ -2520,11 +2542,7 @@ impl VideoEncoder {
 
     // Parse latency mode: "realtime" = low latency, "quality" = default quality mode
     let realtime = matches!(config.latency_mode, Some(LatencyMode::Realtime));
-    let (gop_size, max_b_frames) = if realtime {
-      (10, 0) // Low latency: small GOP, no B-frames
-    } else {
-      (60, 2) // Quality mode: larger GOP with B-frames
-    };
+    let (gop_size, max_b_frames) = get_default_gop_settings(realtime);
 
     // Determine if alpha channel should be preserved
     // Only VP9 supports alpha encoding (YUVA420P pixel format)
