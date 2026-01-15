@@ -63,7 +63,7 @@ async function main() {
     height,
     bitrate: 600_000, // 600 Kbps
     framerate: fps,
-    hardwareAcceleration: 'prefer-software', // 'no-preference' | 'prefer-hardware' | 'prefer-software'
+    hardwareAcceleration: 'prefer-hardware', // 'no-preference' | 'prefer-hardware' | 'prefer-software'
     latencyMode: 'quality', // 'quality' | 'realtime', when set realtime, has_b_frames = 0
   })
 
@@ -148,8 +148,7 @@ async function main() {
   console.log(`\nCollected ${videoChunks.length} chunks`)
 
   // Now create the MP4 muxer (MP4 container supports HEVC)
-  const muxer = new Mp4Muxer()
-  // const muxer = new Mp4Muxer({ fastStart: true }) // segmentation fault on HEVC
+  const muxer = new Mp4Muxer({ fastStart: true })
 
   // Get codec description from the first keyframe's metadata
   const description = videoMetadatas[0]?.decoderConfig?.description

@@ -107,7 +107,7 @@ impl CustomIOContext {
       return Err("Failed to allocate AVIOContext".to_string());
     }
 
-    // Set seekable flag for buffer mode (required for faststart in MP4)
+    // Set seekable flag for buffer mode (required for future faststart support in MP4)
     // BufferWrite mode supports seeking (and reading back), StreamingWrite does not
     if needs_read {
       unsafe { fffio_set_seekable(ptr, AVIO_SEEKABLE_NORMAL) };

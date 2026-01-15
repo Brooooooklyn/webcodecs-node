@@ -248,8 +248,11 @@ pub struct MuxerInner<F: MuxerFormat> {
   pub streaming_handle: Option<StreamingBufferHandle>,
   /// Whether streaming mode is enabled
   pub is_streaming: bool,
-  /// Format-specific options holder
+  /// Format-specific options holder (without fast_start - that's handled separately)
   pub muxer_options: MuxerOptions,
+  /// Whether to apply fastStart post-processing (MP4 only)
+  /// We handle this ourselves because FFmpeg's faststart doesn't work with custom I/O
+  apply_faststart: bool,
   /// Last video PTS written (to ensure monotonically increasing)
   last_video_pts: i64,
   /// Last audio PTS written (to ensure monotonically increasing)
@@ -273,6 +276,16 @@ impl<F: MuxerFormat> MuxerInner<F> {
       )
     })?;
 
+    // Extract fast_start option - we handle this ourselves via post-processing
+    // because FFmpeg's faststart doesn't work with custom I/O contexts
+    let apply_faststart = options.fast_start && F::FORMAT == ContainerFormat::Mp4;
+
+    // Create options for FFmpeg without fast_start (we'll apply it in post-processing)
+    let ffmpeg_options = MuxerOptions {
+      fast_start: false, // Never pass to FFmpeg - we handle it ourselves
+      ..options
+    };
+
     Ok(Self {
       muxer,
       state: MuxerState::ConfiguringTracks,
@@ -280,7 +293,8 @@ impl<F: MuxerFormat> MuxerInner<F> {
       audio_track_info: None,
       streaming_handle: None,
       is_streaming: false,
-      muxer_options: options,
+      muxer_options: ffmpeg_options,
+      apply_faststart,
       last_video_pts: -1,
       last_audio_pts: -1,
       video_frame_count: 0,
@@ -302,6 +316,13 @@ impl<F: MuxerFormat> MuxerInner<F> {
     // Get the streaming handle
     let streaming_handle = muxer.get_streaming_handle();
 
+    // Note: fastStart is not supported in streaming mode - it requires the complete
+    // file to rearrange atoms. Use fragmented MP4 for streaming instead.
+    let ffmpeg_options = MuxerOptions {
+      fast_start: false, // Not supported in streaming mode
+      ..options
+    };
+
     Ok(Self {
       muxer,
       state: MuxerState::ConfiguringTracks,
@@ -309,7 +330,8 @@ impl<F: MuxerFormat> MuxerInner<F> {
       audio_track_info: None,
       streaming_handle,
       is_streaming: true,
-      muxer_options: options,
+      muxer_options: ffmpeg_options,
+      apply_faststart: false, // Never apply in streaming mode
       last_video_pts: -1,
       last_audio_pts: -1,
       video_frame_count: 0,
@@ -506,6 +528,9 @@ impl<F: MuxerFormat> MuxerInner<F> {
     // Set packet properties
     packet.set_stream_index(video_index);
 
+    // Track whether we have B-frames (encoder provides both original_pts and dts)
+    let has_b_frames = chunk_original_pts.is_some() && chunk_dts.is_some();
+
     // Calculate PTS/DTS for the packet
     // For B-frames: use original_pts and dts_us from encoder (already correct)
     // For non-B-frames: use frame counter for precise timing
@@ -575,12 +600,46 @@ impl<F: MuxerFormat> MuxerInner<F> {
       }
     };
 
+    tracing::trace!(target: "ffmpeg", "video packet: pts={}, dts={}, dur={}", pts, dts, dur);
     packet.set_pts(pts);
-    packet.set_dts(dts);
-    packet.set_duration(dur);
 
-    // Debug output
-    // eprintln!("MUXER: pts={}, dts={}, dur={}", pts, dts, dur);
+    // Container-specific DTS handling:
+    // - MP4: Supports separate PTS/DTS with negative DTS, use encoder's DTS directly.
+    //        However, FFmpeg requires PTS >= DTS, so we adjust PTS if needed.
+    // - MKV/WebM with B-frames: MKV requires both monotonic DTS AND PTS >= DTS.
+    //   With B-frames arriving in decode order, we can't satisfy both without reordering.
+    //   Solution: Use sequential timestamps for both PTS and DTS, losing B-frame display order.
+    // - MKV/WebM without B-frames: DTS = PTS (already monotonically increasing)
+    if F::FORMAT == ContainerFormat::Mp4 {
+      // FFmpeg requires PTS >= DTS for all packets. For B-frames, this may not hold.
+      // Adjust PTS to ensure the constraint is satisfied.
+      if pts < dts {
+        packet.set_pts(dts);
+        tracing::trace!(target: "ffmpeg", "adjusted pts from {} to {} to satisfy pts >= dts", pts, dts);
+      }
+      packet.set_dts(dts);
+    } else if has_b_frames {
+      // For MKV/WebM with B-frames, use sequential timestamps for both PTS and DTS.
+      // This ensures:
+      // 1. DTS is monotonically increasing
+      // 2. PTS >= DTS (PTS == DTS)
+      // Trade-off: B-frames display at decode time, not original display time.
+      // This is acceptable for MKV/WebM where B-frame timing is less critical.
+      let sequential_ts = if let Some(tpf) = self.video_ticks_per_frame {
+        (self.video_frame_count as i64) * (tpf as i64)
+      } else {
+        // If no ticks_per_frame, use frame count with default 33ms (~30fps)
+        (self.video_frame_count as i64) * 33
+      };
+      self.video_frame_count += 1;
+      // Override PTS to match DTS for MKV B-frame compatibility
+      packet.set_pts(sequential_ts);
+      packet.set_dts(sequential_ts);
+    } else {
+      // No B-frames: DTS = PTS is already correct and monotonically increasing
+      packet.set_dts(dts);
+    }
+    packet.set_duration(dur);
 
     // Set keyframe flag
     if chunk_type == EncodedVideoChunkType::Key {
@@ -675,7 +734,7 @@ impl<F: MuxerFormat> MuxerInner<F> {
     self.last_audio_pts = pts;
 
     packet.set_pts(pts);
-    packet.set_dts(pts);
+    packet.set_dts(pts); // Audio has no B-frames, DTS always equals PTS
 
     if let Some(dur) = duration {
       let duration_in_samples = dur * sample_rate / 1_000_000;
@@ -760,10 +819,17 @@ impl<F: MuxerFormat> MuxerInner<F> {
     }
 
     // In buffer mode, return the complete buffer
-    let data = self
+    let mut data = self
       .muxer
       .take_buffer()
       .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get output buffer"))?;
+
+    // Apply fastStart post-processing if requested (MP4 only)
+    // This moves the moov atom to the beginning of the file for faster streaming playback.
+    // We do this ourselves because FFmpeg's faststart option doesn't work with custom I/O.
+    if self.apply_faststart {
+      data = crate::codec::mp4_faststart::apply_faststart(data);
+    }
 
     Ok(data)
   }

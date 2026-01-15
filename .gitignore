@@ -198,3 +198,4 @@ ffmpeg-src/
 ffmpeg-build/
 /wpt/
 /example/*.webm
+/example/*.mp4
