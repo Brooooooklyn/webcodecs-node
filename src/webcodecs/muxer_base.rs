@@ -511,6 +511,11 @@ impl<F: MuxerFormat> MuxerInner<F> {
       ));
     }
 
+    // Always increment frame counter at start to ensure it stays in sync
+    // regardless of which code path is taken (B-frame, non-B-frame, or fallback).
+    // This fixes issues when mixing encoder chunks (with DTS) and JS API chunks (without DTS).
+    self.video_frame_count += 1;
+
     // Get chunk data and metadata
     let chunk_type = chunk.chunk_type()?;
     let timestamp = chunk.timestamp()?;
@@ -572,8 +577,8 @@ impl<F: MuxerFormat> MuxerInner<F> {
       }
     } else if let Some(ticks_per_frame) = self.video_ticks_per_frame {
       // No B-frames: use frame counter for precise timing
-      let frame_idx = self.video_frame_count;
-      self.video_frame_count += 1;
+      // Use (video_frame_count - 1) since we already incremented at function start
+      let frame_idx = self.video_frame_count - 1;
       let pts = (frame_idx * ticks_per_frame) as i64;
       (pts, pts, ticks_per_frame as i64)
     } else {
@@ -625,13 +630,15 @@ impl<F: MuxerFormat> MuxerInner<F> {
       // 2. PTS >= DTS (PTS == DTS)
       // Trade-off: B-frames display at decode time, not original display time.
       // This is acceptable for MKV/WebM where B-frame timing is less critical.
+      // Use (video_frame_count - 1) since we already incremented at function start
+      let frame_idx = self.video_frame_count - 1;
       let sequential_ts = if let Some(tpf) = self.video_ticks_per_frame {
-        (self.video_frame_count as i64) * (tpf as i64)
+        (frame_idx as i64) * (tpf as i64)
       } else {
-        // If no ticks_per_frame, use frame count with default 33ms (~30fps)
-        (self.video_frame_count as i64) * 33
+        // If no ticks_per_frame, use frame count with default ~33333µs (~30fps)
+        // Time base is microseconds when ticks_per_frame is None
+        (frame_idx as i64) * 33333
       };
-      self.video_frame_count += 1;
       // Override PTS to match DTS for MKV B-frame compatibility
       packet.set_pts(sequential_ts);
       packet.set_dts(sequential_ts);
