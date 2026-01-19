@@ -655,25 +655,60 @@ pub fn is_avcc_format(data: &[u8]) -> bool {
   // Check if data[3] is part of length or a NAL header
   // If 00 00 01 XX where XX is a valid NAL header AND length doesn't make sense, it's Annex B
   if data[0] == 0 && data[1] == 0 && data[2] == 1 {
-    // This could be 3-byte Annex B (00 00 01 <NAL>) or AVCC with length 0x000001XX
-    // Check if interpreting as AVCC makes sense:
-    // - The 5th byte (data[4]) should be a valid NAL header
-    // - The length (0x000001XX) should match data structure
+    // This could be 3-byte Annex B (00 00 01 <NAL>) or AVCC/HVCC with length 0x000001XX
+    //
+    // CRITICAL: Check if the length exactly matches data size FIRST, before NAL header checks.
+    // This is the strongest signal for AVCC/HVCC format - length prefixes are exact.
+    // WebCodecs chunks contain complete access units, so length + 4 == data.len() is definitive.
+    if nal_len + 4 == data.len() {
+      return true; // Length matches exactly - definitely AVCC/HVCC format
+    }
 
+    // For multi-NAL chunks, try parsing multiple NALs
+    let mut offset = 0;
+    let mut valid_multi_nal = true;
+    while offset + 4 <= data.len() {
+      let len = u32::from_be_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+      ]) as usize;
+      if len == 0 || offset + 4 + len > data.len() {
+        valid_multi_nal = false;
+        break;
+      }
+      offset += 4 + len;
+    }
+    if valid_multi_nal && offset == data.len() {
+      return true; // All NALs parsed perfectly - definitely AVCC/HVCC format
+    }
+
+    // Length doesn't match exactly - fall back to NAL header heuristics
     let nal_header_if_annexb = data[3]; // NAL header if this is Annex B
-    let nal_header_if_avcc = data[4]; // NAL header if this is AVCC
+    let nal_header_if_avcc = data[4]; // NAL header if this is AVCC/HVCC
 
     // Check if Annex B interpretation is valid (data[3] is valid NAL header)
+    // For H.264: forbidden_bit=0, type 1-23
     let annexb_forbidden_bit = (nal_header_if_annexb >> 7) & 1;
-    let annexb_nal_type = nal_header_if_annexb & 0x1F;
-    let annexb_valid = annexb_forbidden_bit == 0 && annexb_nal_type <= 23 && annexb_nal_type > 0;
+    let annexb_h264_nal_type = nal_header_if_annexb & 0x1F;
+    let annexb_h264_valid = annexb_forbidden_bit == 0 && (1..=23).contains(&annexb_h264_nal_type);
+    // For HEVC: forbidden_bit=0, type 0-40 (in 6 bits at position 1-6)
+    let annexb_hevc_nal_type = (nal_header_if_annexb >> 1) & 0x3F;
+    let annexb_hevc_valid = annexb_forbidden_bit == 0 && annexb_hevc_nal_type <= 40;
+    let annexb_valid = annexb_h264_valid || annexb_hevc_valid;
 
-    // Check if AVCC interpretation is valid (data[4] is valid NAL header)
+    // Check if AVCC/HVCC interpretation is valid (data[4] is valid NAL header)
+    // For H.264: forbidden_bit=0, type 1-23
     let avcc_forbidden_bit = (nal_header_if_avcc >> 7) & 1;
-    let avcc_nal_type = nal_header_if_avcc & 0x1F;
-    let avcc_valid = avcc_forbidden_bit == 0 && avcc_nal_type <= 23 && avcc_nal_type > 0;
+    let avcc_h264_nal_type = nal_header_if_avcc & 0x1F;
+    let avcc_h264_valid = avcc_forbidden_bit == 0 && (1..=23).contains(&avcc_h264_nal_type);
+    // For HEVC: forbidden_bit=0, type 0-40
+    let avcc_hevc_nal_type = (nal_header_if_avcc >> 1) & 0x3F;
+    let avcc_hevc_valid = avcc_forbidden_bit == 0 && avcc_hevc_nal_type <= 40;
+    let avcc_valid = avcc_h264_valid || avcc_hevc_valid;
 
-    // If only AVCC interpretation is valid, it's AVCC
+    // If only AVCC/HVCC interpretation is valid, it's AVCC/HVCC
     if avcc_valid && !annexb_valid {
       return true;
     }
@@ -681,35 +716,8 @@ pub fn is_avcc_format(data: &[u8]) -> bool {
     if annexb_valid && !avcc_valid {
       return false;
     }
-    // If both are valid, prefer AVCC if length exactly matches data
-    if avcc_valid && annexb_valid {
-      // AVCC is more likely if the length exactly consumes remaining data
-      // For a single NAL chunk: nal_len + 4 == data.len()
-      if nal_len + 4 == data.len() {
-        return true;
-      }
-      // For multi-NAL chunk, try parsing multiple NALs
-      let mut offset = 0;
-      let mut valid_multi_nal = true;
-      while offset + 4 <= data.len() {
-        let len = u32::from_be_bytes([
-          data[offset],
-          data[offset + 1],
-          data[offset + 2],
-          data[offset + 3],
-        ]) as usize;
-        if len == 0 || offset + 4 + len > data.len() {
-          valid_multi_nal = false;
-          break;
-        }
-        offset += 4 + len;
-      }
-      if valid_multi_nal && offset == data.len() {
-        return true;
-      }
-      // Default to Annex B for ambiguous cases
-      return false;
-    }
+    // Default to Annex B for remaining ambiguous cases (both valid or neither valid)
+    return false;
   }
 
   // For non-ambiguous cases, check if the 5th byte is a valid NAL header

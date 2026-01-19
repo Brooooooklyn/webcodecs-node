@@ -8,11 +8,11 @@ use crate::ffi::{
     codec_flag, ffctx_get_extradata, ffctx_get_extradata_size, ffctx_get_flags,
     ffctx_get_frame_size, ffctx_get_height, ffctx_get_pix_fmt, ffctx_get_qmax, ffctx_get_qmin,
     ffctx_get_sample_rate, ffctx_get_time_base, ffctx_get_width, ffctx_set_bit_rate,
-    ffctx_set_channels, ffctx_set_flags, ffctx_set_framerate, ffctx_set_gop_size, ffctx_set_height,
-    ffctx_set_hw_device_ctx, ffctx_set_level, ffctx_set_max_b_frames, ffctx_set_pix_fmt,
-    ffctx_set_profile, ffctx_set_qmax, ffctx_set_qmin, ffctx_set_rc_buffer_size,
-    ffctx_set_rc_max_rate, ffctx_set_sample_fmt, ffctx_set_sample_rate, ffctx_set_thread_count,
-    ffctx_set_time_base, ffctx_set_width,
+    ffctx_set_channels, ffctx_set_flags, ffctx_set_framerate, ffctx_set_gop_size,
+    ffctx_set_has_b_frames, ffctx_set_height, ffctx_set_hw_device_ctx, ffctx_set_level,
+    ffctx_set_max_b_frames, ffctx_set_pix_fmt, ffctx_set_profile, ffctx_set_qmax, ffctx_set_qmin,
+    ffctx_set_rc_buffer_size, ffctx_set_rc_max_rate, ffctx_set_sample_fmt, ffctx_set_sample_rate,
+    ffctx_set_thread_count, ffctx_set_time_base, ffctx_set_width,
   },
   avcodec::{
     avcodec_alloc_context3, avcodec_find_decoder, avcodec_find_encoder,
@@ -53,6 +53,17 @@ pub struct DecoderCreationResult {
 pub enum CodecType {
   Encoder,
   Decoder,
+}
+
+/// Result of a receive operation indicating the actual state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiveResult<T> {
+  /// Successfully received data
+  Ok(T),
+  /// Decoder needs more input (EAGAIN)
+  NeedMoreInput,
+  /// End of stream reached (EOF)
+  EndOfStream,
 }
 
 /// Safe wrapper around AVCodecContext
@@ -762,11 +773,36 @@ impl CodecContext {
         ffctx_set_thread_count(ctx, 0);
       }
 
+      // Set decoder flags
+      let mut flags = 0;
+
       // Low-latency mode (for optimizeForLatency in WebCodecs)
-      // AV_CODEC_FLAG_LOW_DELAY = (1 << 19) = 524288
       // Forces low delay output to reduce buffering
       if config.low_latency {
-        ffi::accessors::ffctx_set_flags(ctx, 1 << 19);
+        flags |= ffi::accessors::codec_flag::LOW_DELAY;
+      }
+
+      // Output even potentially corrupted frames
+      // This ensures we get all frames even if the decoder thinks some are invalid
+      // Important for B-frame content where frame ordering can be complex
+      flags |= ffi::accessors::codec_flag::OUTPUT_CORRUPT;
+
+      if flags != 0 {
+        ffi::accessors::ffctx_set_flags(ctx, flags);
+      }
+
+      // Set flags2: SHOW_ALL ensures all frames are output including B-frames
+      // that might otherwise be held back due to recovery state
+      let flags2 = ffi::accessors::codec_flag2::SHOW_ALL;
+      ffi::accessors::ffctx_set_flags2(ctx, flags2);
+
+      // For H.264 and HEVC, set has_b_frames BEFORE opening the codec
+      // This tells the decoder to allocate a proper reorder buffer for B-frames.
+      // Without this, the decoder may drop frames when reordering is needed.
+      // The value 2 matches what avformat typically sets based on SPS analysis.
+      // Note: This MUST be set before avcodec_open2() for proper buffer allocation.
+      if matches!(config.codec_id, AVCodecID::H264 | AVCodecID::Hevc) {
+        ffctx_set_has_b_frames(ctx, 2);
       }
 
       // TODO: Set extradata if provided
@@ -859,37 +895,70 @@ impl CodecContext {
   /// Returns Ok(true) if packet was accepted, Ok(false) if decoder needs output drained first
   pub fn send_packet(&mut self, packet: Option<&Packet>) -> CodecResult<bool> {
     let pkt_ptr = packet.map(|p| p.as_ptr()).unwrap_or(std::ptr::null());
+    let size = packet.map(|p| p.size()).unwrap_or(0);
+    tracing::debug!("send_packet: ptr={:?}, size={}", !pkt_ptr.is_null(), size);
+
     let ret = unsafe { avcodec_send_packet(self.ptr.as_ptr(), pkt_ptr) };
 
     if ret == AVERROR_EAGAIN {
+      tracing::debug!("send_packet: EAGAIN");
       return Ok(false);
     }
+    if ret == AVERROR_EOF {
+      tracing::debug!("send_packet: EOF");
+    }
     ffi::check_error(ret)?;
+    tracing::debug!("send_packet: accepted");
     Ok(true)
+  }
+
+  /// Receive a decoded frame from the decoder with detailed status
+  ///
+  /// Returns ReceiveResult indicating success, need for more input, or end of stream
+  pub fn receive_frame_with_status(&mut self) -> CodecResult<ReceiveResult<Frame>> {
+    let mut frame = Frame::new()?;
+    let ret = unsafe { avcodec_receive_frame(self.ptr.as_ptr(), frame.as_mut_ptr()) };
+
+    tracing::trace!(
+      "receive_frame_with_status: ret={}, EAGAIN={}, EOF={}",
+      ret,
+      AVERROR_EAGAIN,
+      AVERROR_EOF
+    );
+
+    if ret == AVERROR_EAGAIN {
+      return Ok(ReceiveResult::NeedMoreInput);
+    }
+    if ret == AVERROR_EOF {
+      return Ok(ReceiveResult::EndOfStream);
+    }
+    ffi::check_error(ret)?;
+    Ok(ReceiveResult::Ok(frame))
   }
 
   /// Receive a decoded frame from the decoder
   ///
-  /// Returns Ok(Some(frame)) if a frame is available, Ok(None) if more input needed
+  /// Returns Ok(Some(frame)) if a frame is available, Ok(None) if more input needed or EOF
   pub fn receive_frame(&mut self) -> CodecResult<Option<Frame>> {
-    let mut frame = Frame::new()?;
-    let ret = unsafe { avcodec_receive_frame(self.ptr.as_ptr(), frame.as_mut_ptr()) };
-
-    if ret == AVERROR_EAGAIN || ret == AVERROR_EOF {
-      return Ok(None);
+    match self.receive_frame_with_status()? {
+      ReceiveResult::Ok(frame) => Ok(Some(frame)),
+      ReceiveResult::NeedMoreInput | ReceiveResult::EndOfStream => Ok(None),
     }
-    ffi::check_error(ret)?;
-    Ok(Some(frame))
   }
 
   /// Decode a packet and return all available frames
   pub fn decode(&mut self, packet: Option<&Packet>) -> CodecResult<Vec<Frame>> {
     let mut frames = Vec::new();
 
+    let pkt_pts = packet.map(|p| p.pts()).unwrap_or(-1);
+    tracing::debug!("decode: sending packet with pts={}", pkt_pts);
+
     // Send packet
     if !self.send_packet(packet)? {
+      tracing::debug!("decode: decoder full, draining first");
       // Decoder is full, drain first
       while let Some(frame) = self.receive_frame()? {
+        tracing::debug!("decode: drained frame pts={}", frame.pts());
         frames.push(frame);
       }
       // Retry sending packet
@@ -898,15 +967,86 @@ impl CodecContext {
 
     // Receive all available frames
     while let Some(frame) = self.receive_frame()? {
+      tracing::debug!("decode: received frame pts={}", frame.pts());
       frames.push(frame);
     }
 
+    tracing::debug!("decode: returning {} frames", frames.len());
     Ok(frames)
   }
 
   /// Flush the decoder
+  ///
+  /// Sends NULL packet to enter drain mode and receives all remaining frames.
+  /// For decoders with B-frames, this ensures all reordered frames are output.
   pub fn flush_decoder(&mut self) -> CodecResult<Vec<Frame>> {
-    self.decode(None)
+    let mut frames = Vec::new();
+
+    // First, drain any already-decoded frames that are buffered
+    while let Some(frame) = self.receive_frame()? {
+      tracing::debug!("flush_decoder: got pre-drain frame pts={}", frame.pts());
+      frames.push(frame);
+    }
+
+    // Send NULL packet to enter drain mode
+    // For B-frame content, this signals end of stream
+    let send_result = self.send_packet(None)?;
+    tracing::debug!("flush_decoder: sent NULL packet, accepted={}", send_result);
+
+    // Drain all remaining frames until we get EOF (not just EAGAIN)
+    // For B-frame content, the decoder may need multiple receive calls
+    // to output all reordered frames
+    let mut loop_count = 0;
+    let max_iterations = 1000; // Safety limit
+
+    loop {
+      loop_count += 1;
+      if loop_count > max_iterations {
+        tracing::warn!("flush_decoder: exceeded max iterations, breaking");
+        break;
+      }
+
+      match self.receive_frame_with_status()? {
+        ReceiveResult::Ok(frame) => {
+          tracing::debug!(
+            "flush_decoder: got drain frame pts={}, loop={}",
+            frame.pts(),
+            loop_count
+          );
+          frames.push(frame);
+        }
+        ReceiveResult::NeedMoreInput => {
+          tracing::debug!(
+            "flush_decoder: got EAGAIN after {} iterations, frames_so_far={}",
+            loop_count,
+            frames.len()
+          );
+          // In drain mode after NULL packet, EAGAIN means decoder needs
+          // another NULL packet to continue draining (some decoders need this)
+          // Try sending another NULL packet and continue
+          if let Ok(accepted) = self.send_packet(None)
+            && accepted
+          {
+            tracing::debug!("flush_decoder: sent another NULL packet");
+            continue;
+          }
+          // If we can't send more packets, we're done
+          break;
+        }
+        ReceiveResult::EndOfStream => {
+          tracing::debug!(
+            "flush_decoder: got EOF after {} iterations, total frames={}",
+            loop_count,
+            frames.len()
+          );
+          // True EOF - all frames have been output
+          break;
+        }
+      }
+    }
+
+    tracing::debug!("flush_decoder: returning {} frames", frames.len());
+    std::result::Result::Ok(frames)
   }
 
   // ========================================================================
