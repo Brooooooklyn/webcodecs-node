@@ -285,7 +285,17 @@ fn find_latest_ffmpeg_release(repo: &str) -> Option<String> {
   let api_url = format!("https://api.github.com/repos/{}/releases", repo);
 
   let output = Command::new("curl")
-    .args(["-s", "-f", "-H", "Accept: application/vnd.github+json"])
+    .args([
+      "-s",
+      "-f",
+      "-H",
+      "Accept: application/vnd.github+json",
+      "-H",
+      &format!(
+        "Authorization: Bearer {}",
+        env::var("GITHUB_TOKEN").unwrap()
+      ),
+    ])
     .arg(&api_url)
     .output()
     .ok()?;
@@ -658,6 +668,8 @@ fn get_codec_library_paths(target_os: &str) -> Vec<PathBuf> {
     }
     _ => {}
   }
+
+  paths.push(PathBuf::from("ffmpeg-build/lib"));
 
   if let Ok(brew_prefix) = env::var("HOMEBREW_PREFIX") {
     paths.push(PathBuf::from(brew_prefix).join("lib"));

@@ -9,10 +9,10 @@ use crate::ffi::{
     ffctx_get_frame_size, ffctx_get_height, ffctx_get_pix_fmt, ffctx_get_qmax, ffctx_get_qmin,
     ffctx_get_sample_rate, ffctx_get_time_base, ffctx_get_width, ffctx_set_bit_rate,
     ffctx_set_channels, ffctx_set_flags, ffctx_set_framerate, ffctx_set_gop_size,
-    ffctx_set_has_b_frames, ffctx_set_height, ffctx_set_hw_device_ctx, ffctx_set_level,
-    ffctx_set_max_b_frames, ffctx_set_pix_fmt, ffctx_set_profile, ffctx_set_qmax, ffctx_set_qmin,
-    ffctx_set_rc_buffer_size, ffctx_set_rc_max_rate, ffctx_set_sample_fmt, ffctx_set_sample_rate,
-    ffctx_set_thread_count, ffctx_set_time_base, ffctx_set_width,
+    ffctx_set_has_b_frames, ffctx_set_height, ffctx_set_hw_device_ctx, ffctx_set_level, ffctx_set_max_b_frames,
+    ffctx_set_pix_fmt, ffctx_set_profile, ffctx_set_qmax, ffctx_set_qmin, ffctx_set_rc_buffer_size,
+    ffctx_set_rc_max_rate, ffctx_set_sample_fmt, ffctx_set_sample_rate, ffctx_set_thread_count,
+    ffctx_set_time_base, ffctx_set_width,
   },
   avcodec::{
     avcodec_alloc_context3, avcodec_find_decoder, avcodec_find_encoder,
@@ -979,6 +979,11 @@ impl CodecContext {
   ///
   /// Sends NULL packet to enter drain mode and receives all remaining frames.
   /// For decoders with B-frames, this ensures all reordered frames are output.
+  ///
+  /// FFmpeg drain protocol:
+  /// 1. Send NULL packet with avcodec_send_packet(ctx, NULL) to enter drain mode
+  /// 2. Keep calling avcodec_receive_frame() until AVERROR_EOF
+  /// 3. AVERROR_EOF is the ONLY reliable signal that draining is complete
   pub fn flush_decoder(&mut self) -> CodecResult<Vec<Frame>> {
     let mut frames = Vec::new();
 
@@ -988,55 +993,54 @@ impl CodecContext {
       frames.push(frame);
     }
 
-    // Send NULL packet to enter drain mode
-    // For B-frame content, this signals end of stream
+    // Send NULL packet to enter drain mode.
+    // One NULL packet is sufficient - FFmpeg docs state that after sending NULL,
+    // we should keep calling receive_frame() until AVERROR_EOF.
     let send_result = self.send_packet(None)?;
     tracing::debug!("flush_decoder: sent NULL packet, accepted={}", send_result);
 
-    // Drain all remaining frames until we get EOF (not just EAGAIN)
-    // For B-frame content, the decoder may need multiple receive calls
-    // to output all reordered frames
-    let mut loop_count = 0;
-    let max_iterations = 1000; // Safety limit
+    // Drain all remaining frames until we get EOF.
+    // CRITICAL: Only exit on AVERROR_EOF, not on EAGAIN.
+    // For B-frame content, the decoder buffers frames for reordering and only
+    // outputs them all when it receives the drain signal (NULL packet).
+    //
+    // Safety: Track consecutive EAGAINs without progress to prevent infinite loops
+    // from buggy decoders. Normal decoders should never return EAGAIN during drain.
+    let mut consecutive_eagain = 0;
+    const MAX_CONSECUTIVE_EAGAIN: u32 = 100;
 
     loop {
-      loop_count += 1;
-      if loop_count > max_iterations {
-        tracing::warn!("flush_decoder: exceeded max iterations, breaking");
-        break;
-      }
-
       match self.receive_frame_with_status()? {
         ReceiveResult::Ok(frame) => {
-          tracing::debug!(
-            "flush_decoder: got drain frame pts={}, loop={}",
-            frame.pts(),
-            loop_count
-          );
+          tracing::debug!("flush_decoder: got drain frame pts={}", frame.pts());
           frames.push(frame);
+          consecutive_eagain = 0; // Reset on progress
         }
         ReceiveResult::NeedMoreInput => {
-          tracing::debug!(
-            "flush_decoder: got EAGAIN after {} iterations, frames_so_far={}",
-            loop_count,
-            frames.len()
-          );
-          // In drain mode after NULL packet, EAGAIN means decoder needs
-          // another NULL packet to continue draining (some decoders need this)
-          // Try sending another NULL packet and continue
-          if let Ok(accepted) = self.send_packet(None)
-            && accepted
-          {
-            tracing::debug!("flush_decoder: sent another NULL packet");
-            continue;
+          consecutive_eagain += 1;
+          if consecutive_eagain > MAX_CONSECUTIVE_EAGAIN {
+            // This should never happen with a well-behaved decoder.
+            // Log a warning and exit to prevent infinite loop.
+            tracing::warn!(
+              "flush_decoder: exceeded {} consecutive EAGAINs without progress, \
+               decoder may be misbehaving (frames_so_far={})",
+              MAX_CONSECUTIVE_EAGAIN,
+              frames.len()
+            );
+            break;
           }
-          // If we can't send more packets, we're done
-          break;
+          // EAGAIN during drain mode is unusual but can happen with some decoders.
+          // According to FFmpeg docs, we should continue calling receive_frame()
+          // until we get EOF. The decoder will eventually return EOF when done.
+          tracing::debug!(
+            "flush_decoder: got EAGAIN during drain (attempt {}), continuing",
+            consecutive_eagain
+          );
+          continue;
         }
         ReceiveResult::EndOfStream => {
           tracing::debug!(
-            "flush_decoder: got EOF after {} iterations, total frames={}",
-            loop_count,
+            "flush_decoder: got EOF, total frames={}",
             frames.len()
           );
           // True EOF - all frames have been output
@@ -1046,7 +1050,7 @@ impl CodecContext {
     }
 
     tracing::debug!("flush_decoder: returning {} frames", frames.len());
-    std::result::Result::Ok(frames)
+    Ok(frames)
   }
 
   // ========================================================================
