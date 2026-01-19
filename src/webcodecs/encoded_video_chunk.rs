@@ -314,9 +314,6 @@ impl EncodedVideoChunk {
       None
     };
 
-    // Convert packet PTS to microseconds for fallback timestamp
-    let pts_us = unsafe { av_rescale_q(packet_pts, encoder_time_base, dst_tb) };
-
     // Convert duration from encoder time_base to microseconds
     let duration_us = if packet_duration > 0 {
       Some(unsafe { av_rescale_q(packet_duration, encoder_time_base, dst_tb) })
@@ -334,8 +331,9 @@ impl EncodedVideoChunk {
       data,
       chunk_type,
       // Use explicit timestamp if provided (already in microseconds),
-      // otherwise fall back to packet PTS (converted to microseconds above)
-      timestamp_us: explicit_timestamp.unwrap_or(pts_us),
+      // otherwise fall back to original_pts (which already handles AV_NOPTS_VALUE),
+      // and finally default to 0 if neither is available
+      timestamp_us: explicit_timestamp.or(original_pts).unwrap_or(0),
       duration_us,
       dts_us,
       original_pts,
