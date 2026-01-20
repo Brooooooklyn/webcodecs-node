@@ -149,15 +149,21 @@ jobs:
           # Shallow clone doesn't have the tag in history, so we create one locally
           git tag 4.1
 
+          # Create CMake toolchain file for ARM64 cross-compilation
+          # x265's cmake uses CMAKE_SYSTEM_PROCESSOR for arch detection, which defaults to host processor
+          # The toolchain file sets CMAKE_SYSTEM_PROCESSOR=aarch64 BEFORE x265's detection logic runs
+          @"
+          set(CMAKE_SYSTEM_NAME Windows)
+          set(CMAKE_SYSTEM_PROCESSOR aarch64)
+          set(CROSS_COMPILE_ARM64 ON)
+          "@ | Out-File -FilePath toolchain-arm64.cmake -Encoding utf8
+
           # Build 12-bit lib
           # Use ClangCL for ARM64 NEON assembly support
           # NOWINBASEINTERLOCK skips winbase.h interlocked wrappers that conflict with ClangCL intrinsics
           # STATIC_LINK_CRT=ON uses /MT static CRT (x265's own option, more reliable than CMAKE_MSVC_RUNTIME_LIBRARY)
-          # ARM64=1 and CROSS_COMPILE_ARM64=ON force ARM64 mode (x265 cmake uses CMAKE_SYSTEM_PROCESSOR for arch
-          # detection, but Visual Studio generator overrides it with host arch, ignoring -A ARM64)
           cmake -B build-12bit -S source -G "Visual Studio 17 2022" -A ARM64 -T ClangCL `
-            -DARM64=1 `
-            -DCROSS_COMPILE_ARM64=ON `
+            -DCMAKE_TOOLCHAIN_FILE="../toolchain-arm64.cmake" `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
             -DSTATIC_LINK_CRT=ON `
             -DCMAKE_C_FLAGS="-DNOWINBASEINTERLOCK" `
@@ -172,8 +178,7 @@ jobs:
 
           # Build 10-bit lib
           cmake -B build-10bit -S source -G "Visual Studio 17 2022" -A ARM64 -T ClangCL `
-            -DARM64=1 `
-            -DCROSS_COMPILE_ARM64=ON `
+            -DCMAKE_TOOLCHAIN_FILE="../toolchain-arm64.cmake" `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
             -DSTATIC_LINK_CRT=ON `
             -DCMAKE_C_FLAGS="-DNOWINBASEINTERLOCK" `
@@ -192,8 +197,7 @@ jobs:
           $lib12bit = "$x265Dir/build-12bit/Release/x265-static.lib"
           Write-Host "EXTRA_LIB: $lib10bit;$lib12bit"
           cmake -B build-main -S source -G "Visual Studio 17 2022" -A ARM64 -T ClangCL `
-            -DARM64=1 `
-            -DCROSS_COMPILE_ARM64=ON `
+            -DCMAKE_TOOLCHAIN_FILE="../toolchain-arm64.cmake" `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
             -DSTATIC_LINK_CRT=ON `
             -DCMAKE_C_FLAGS="-DNOWINBASEINTERLOCK" `
