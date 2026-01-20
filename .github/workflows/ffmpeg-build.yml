@@ -149,80 +149,98 @@ jobs:
           # Shallow clone doesn't have the tag in history, so we create one locally
           git tag 4.1
 
+          # Create compiler wrapper scripts that add --target=arm64-pc-windows-msvc
+          # x265's cmake uses CMAKE_CXX_COMPILER directly in add_custom_command for assembly
+          # The AARCH64_*_FLAG variables are NOT cmake CACHE variables, so they can't be overridden
+          # The only way to inject --target is via a wrapper script
+          $LLVM_BIN = "C:/Program Files/LLVM/bin"
+          @"
+          @echo off
+          "$LLVM_BIN/clang.exe" --target=arm64-pc-windows-msvc %*
+          "@ | Out-File -FilePath clang-arm64.cmd -Encoding ascii
+          @"
+          @echo off
+          "$LLVM_BIN/clang++.exe" --target=arm64-pc-windows-msvc %*
+          "@ | Out-File -FilePath clang++-arm64.cmd -Encoding ascii
+
           # Create CMake toolchain file for ARM64 cross-compilation
-          # x265's cmake uses CMAKE_SYSTEM_PROCESSOR for arch detection, which defaults to host processor
-          # The toolchain file sets CMAKE_SYSTEM_PROCESSOR=aarch64 BEFORE x265's detection logic runs
+          # Use our wrapper scripts as the compilers
+          $wrapperDir = (Get-Location).Path -replace '\\','/'
           @"
           set(CMAKE_SYSTEM_NAME Windows)
           set(CMAKE_SYSTEM_PROCESSOR aarch64)
           set(CROSS_COMPILE_ARM64 ON)
+          set(CMAKE_C_COMPILER "$wrapperDir/clang-arm64.cmd")
+          set(CMAKE_CXX_COMPILER "$wrapperDir/clang++-arm64.cmd")
+          set(CMAKE_C_COMPILER_ID Clang)
+          set(CMAKE_CXX_COMPILER_ID Clang)
+          set(CMAKE_C_COMPILER_FRONTEND_VARIANT GNU)
+          set(CMAKE_CXX_COMPILER_FRONTEND_VARIANT GNU)
           "@ | Out-File -FilePath toolchain-arm64.cmake -Encoding utf8
 
-          # Build 12-bit lib
-          # Use ClangCL for ARM64 NEON assembly support
-          # --target=arm64-pc-windows-msvc is REQUIRED for clang-cl to understand ARM64 flags like -march=armv8-a
-          # Without it, clang-cl defaults to x64 and rejects armv8-a as an unknown CPU
-          # NOWINBASEINTERLOCK skips winbase.h interlocked wrappers that conflict with ClangCL intrinsics
-          # STATIC_LINK_CRT=ON uses /MT static CRT (x265's own option, more reliable than CMAKE_MSVC_RUNTIME_LIBRARY)
-          cmake -B build-12bit -S source -G "Visual Studio 17 2022" -A ARM64 -T ClangCL `
+          # Build 12-bit lib with Ninja generator
+          # Visual Studio generator doesn't work well with .cmd wrapper scripts
+          # NOWINBASEINTERLOCK skips winbase.h interlocked wrappers that conflict with clang intrinsics
+          # STATIC_LINK_CRT=ON uses /MT static CRT (x265's own option)
+          cmake -B build-12bit -S source -G Ninja `
             -DCMAKE_TOOLCHAIN_FILE="../toolchain-arm64.cmake" `
+            -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
             -DSTATIC_LINK_CRT=ON `
-            -DCMAKE_C_FLAGS="--target=arm64-pc-windows-msvc -DNOWINBASEINTERLOCK" `
-            -DCMAKE_CXX_FLAGS="--target=arm64-pc-windows-msvc -DNOWINBASEINTERLOCK" `
-            -DCMAKE_ASM_FLAGS="--target=arm64-pc-windows-msvc" `
+            -DCMAKE_C_FLAGS="-DNOWINBASEINTERLOCK" `
+            -DCMAKE_CXX_FLAGS="-DNOWINBASEINTERLOCK" `
             -DENABLE_SHARED=OFF `
             -DENABLE_CLI=OFF `
             -DENABLE_ALPHA=ON `
             -DHIGH_BIT_DEPTH=ON `
             -DEXPORT_C_API=OFF `
             -DMAIN12=ON
-          cmake --build build-12bit --config Release --parallel
+          cmake --build build-12bit --parallel
 
           # Build 10-bit lib
-          cmake -B build-10bit -S source -G "Visual Studio 17 2022" -A ARM64 -T ClangCL `
+          cmake -B build-10bit -S source -G Ninja `
             -DCMAKE_TOOLCHAIN_FILE="../toolchain-arm64.cmake" `
+            -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
             -DSTATIC_LINK_CRT=ON `
-            -DCMAKE_C_FLAGS="--target=arm64-pc-windows-msvc -DNOWINBASEINTERLOCK" `
-            -DCMAKE_CXX_FLAGS="--target=arm64-pc-windows-msvc -DNOWINBASEINTERLOCK" `
-            -DCMAKE_ASM_FLAGS="--target=arm64-pc-windows-msvc" `
+            -DCMAKE_C_FLAGS="-DNOWINBASEINTERLOCK" `
+            -DCMAKE_CXX_FLAGS="-DNOWINBASEINTERLOCK" `
             -DENABLE_SHARED=OFF `
             -DENABLE_CLI=OFF `
             -DENABLE_ALPHA=ON `
             -DHIGH_BIT_DEPTH=ON `
             -DEXPORT_C_API=OFF
-          cmake --build build-10bit --config Release --parallel
+          cmake --build build-10bit --parallel
 
           # Build 8-bit main lib with linked 10/12-bit
-          # Use absolute paths for EXTRA_LIB since linker resolves paths from build directory
+          # Ninja outputs to build directory directly (no Release subdirectory)
           $x265Dir = (Get-Location).Path -replace '\\','/'
-          $lib10bit = "$x265Dir/build-10bit/Release/x265-static.lib"
-          $lib12bit = "$x265Dir/build-12bit/Release/x265-static.lib"
+          $lib10bit = "$x265Dir/build-10bit/libx265.a"
+          $lib12bit = "$x265Dir/build-12bit/libx265.a"
           Write-Host "EXTRA_LIB: $lib10bit;$lib12bit"
-          cmake -B build-main -S source -G "Visual Studio 17 2022" -A ARM64 -T ClangCL `
+          cmake -B build-main -S source -G Ninja `
             -DCMAKE_TOOLCHAIN_FILE="../toolchain-arm64.cmake" `
+            -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
             -DSTATIC_LINK_CRT=ON `
-            -DCMAKE_C_FLAGS="--target=arm64-pc-windows-msvc -DNOWINBASEINTERLOCK" `
-            -DCMAKE_CXX_FLAGS="--target=arm64-pc-windows-msvc -DNOWINBASEINTERLOCK" `
-            -DCMAKE_ASM_FLAGS="--target=arm64-pc-windows-msvc" `
+            -DCMAKE_C_FLAGS="-DNOWINBASEINTERLOCK" `
+            -DCMAKE_CXX_FLAGS="-DNOWINBASEINTERLOCK" `
             -DENABLE_SHARED=OFF `
             -DENABLE_CLI=OFF `
             -DENABLE_ALPHA=ON `
             "-DEXTRA_LIB=$lib10bit;$lib12bit" `
             -DLINKED_10BIT=ON `
             -DLINKED_12BIT=ON
-          cmake --build build-main --config Release --parallel
+          cmake --build build-main --parallel
 
-          # Combine all libs into single static archive using lib.exe (MSVC)
-          lib.exe /OUT:x265-combined.lib `
-            build-main/Release/x265-static.lib `
-            build-10bit/Release/x265-static.lib `
-            build-12bit/Release/x265-static.lib
+          # Combine all libs into single static archive using llvm-ar
+          & "$LLVM_BIN/llvm-ar.exe" rcs x265-combined.lib `
+            build-main/libx265.a `
+            build-10bit/libx265.a `
+            build-12bit/libx265.a
 
           # Install to vcpkg directory so FFmpeg can find it
-          Copy-Item -Force x265-combined.lib "$VCPKG_INSTALLED/lib/x265-static.lib"
+          Copy-Item -Force x265-combined.lib "$VCPKG_INSTALLED/lib/libx265.a"
           Copy-Item -Force source/x265.h "$VCPKG_INSTALLED/include/"
           Copy-Item -Force build-main/x265_config.h "$VCPKG_INSTALLED/include/"
 
@@ -240,8 +258,8 @@ jobs:
             'Name: x265'
             'Description: H.265/HEVC video encoder with alpha support'
             'Version: 4.1'
-            'Libs: -L${libdir} -lx265-static'
-            'Libs.private: -lstdc++'
+            'Libs: -L${libdir} -lx265'
+            'Libs.private: -lc++'
             'Cflags: -I${includedir}'
           ) -join "`n"
           # Use ASCII encoding to avoid UTF-8 BOM which breaks pkg-config
@@ -253,8 +271,8 @@ jobs:
 
       - name: List vcpkg installed libraries
         run: |
-          Write-Host "=== All installed .lib files in vcpkg ==="
-          Get-ChildItem "$env:VCPKG_ROOT/installed/arm64-windows-static/lib/*.lib" | ForEach-Object { $_.Name }
+          Write-Host "=== All installed .lib/.a files in vcpkg ==="
+          Get-ChildItem "$env:VCPKG_ROOT/installed/arm64-windows-static/lib/*" -Include "*.lib","*.a" | ForEach-Object { $_.Name }
 
       - name: Clone FFmpeg
         run: |
