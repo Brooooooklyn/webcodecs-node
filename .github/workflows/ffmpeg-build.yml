@@ -160,14 +160,17 @@ jobs:
 
           # Build 12-bit lib
           # Use ClangCL for ARM64 NEON assembly support
+          # --target=arm64-pc-windows-msvc is REQUIRED for clang-cl to understand ARM64 flags like -march=armv8-a
+          # Without it, clang-cl defaults to x64 and rejects armv8-a as an unknown CPU
           # NOWINBASEINTERLOCK skips winbase.h interlocked wrappers that conflict with ClangCL intrinsics
           # STATIC_LINK_CRT=ON uses /MT static CRT (x265's own option, more reliable than CMAKE_MSVC_RUNTIME_LIBRARY)
           cmake -B build-12bit -S source -G "Visual Studio 17 2022" -A ARM64 -T ClangCL `
             -DCMAKE_TOOLCHAIN_FILE="../toolchain-arm64.cmake" `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
             -DSTATIC_LINK_CRT=ON `
-            -DCMAKE_C_FLAGS="-DNOWINBASEINTERLOCK" `
-            -DCMAKE_CXX_FLAGS="-DNOWINBASEINTERLOCK" `
+            -DCMAKE_C_FLAGS="--target=arm64-pc-windows-msvc -DNOWINBASEINTERLOCK" `
+            -DCMAKE_CXX_FLAGS="--target=arm64-pc-windows-msvc -DNOWINBASEINTERLOCK" `
+            -DCMAKE_ASM_FLAGS="--target=arm64-pc-windows-msvc" `
             -DENABLE_SHARED=OFF `
             -DENABLE_CLI=OFF `
             -DENABLE_ALPHA=ON `
@@ -181,8 +184,9 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="../toolchain-arm64.cmake" `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
             -DSTATIC_LINK_CRT=ON `
-            -DCMAKE_C_FLAGS="-DNOWINBASEINTERLOCK" `
-            -DCMAKE_CXX_FLAGS="-DNOWINBASEINTERLOCK" `
+            -DCMAKE_C_FLAGS="--target=arm64-pc-windows-msvc -DNOWINBASEINTERLOCK" `
+            -DCMAKE_CXX_FLAGS="--target=arm64-pc-windows-msvc -DNOWINBASEINTERLOCK" `
+            -DCMAKE_ASM_FLAGS="--target=arm64-pc-windows-msvc" `
             -DENABLE_SHARED=OFF `
             -DENABLE_CLI=OFF `
             -DENABLE_ALPHA=ON `
@@ -200,8 +204,9 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="../toolchain-arm64.cmake" `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
             -DSTATIC_LINK_CRT=ON `
-            -DCMAKE_C_FLAGS="-DNOWINBASEINTERLOCK" `
-            -DCMAKE_CXX_FLAGS="-DNOWINBASEINTERLOCK" `
+            -DCMAKE_C_FLAGS="--target=arm64-pc-windows-msvc -DNOWINBASEINTERLOCK" `
+            -DCMAKE_CXX_FLAGS="--target=arm64-pc-windows-msvc -DNOWINBASEINTERLOCK" `
+            -DCMAKE_ASM_FLAGS="--target=arm64-pc-windows-msvc" `
             -DENABLE_SHARED=OFF `
             -DENABLE_CLI=OFF `
             -DENABLE_ALPHA=ON `
