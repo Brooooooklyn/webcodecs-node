@@ -101,6 +101,7 @@ jobs:
         with:
           msystem: MSYS
           update: true
+          cache: false
           path-type: inherit
           install: >-
             make
@@ -152,10 +153,11 @@ jobs:
           # Use ClangCL for ARM64 NEON assembly support
           # NOWINBASEINTERLOCK skips winbase.h interlocked wrappers that conflict with ClangCL intrinsics
           # STATIC_LINK_CRT=ON uses /MT static CRT (x265's own option, more reliable than CMAKE_MSVC_RUNTIME_LIBRARY)
-          # CMAKE_SYSTEM_PROCESSOR=aarch64 forces ARM64 detection (x265 cmake uses this for arch detection,
-          # but on Windows it defaults to host arch, not target arch from -A ARM64)
+          # ARM64=1 and CROSS_COMPILE_ARM64=ON force ARM64 mode (x265 cmake uses CMAKE_SYSTEM_PROCESSOR for arch
+          # detection, but Visual Studio generator overrides it with host arch, ignoring -A ARM64)
           cmake -B build-12bit -S source -G "Visual Studio 17 2022" -A ARM64 -T ClangCL `
-            -DCMAKE_SYSTEM_PROCESSOR=aarch64 `
+            -DARM64=1 `
+            -DCROSS_COMPILE_ARM64=ON `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
             -DSTATIC_LINK_CRT=ON `
             -DCMAKE_C_FLAGS="-DNOWINBASEINTERLOCK" `
@@ -170,7 +172,8 @@ jobs:
 
           # Build 10-bit lib
           cmake -B build-10bit -S source -G "Visual Studio 17 2022" -A ARM64 -T ClangCL `
-            -DCMAKE_SYSTEM_PROCESSOR=aarch64 `
+            -DARM64=1 `
+            -DCROSS_COMPILE_ARM64=ON `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
             -DSTATIC_LINK_CRT=ON `
             -DCMAKE_C_FLAGS="-DNOWINBASEINTERLOCK" `
@@ -189,7 +192,8 @@ jobs:
           $lib12bit = "$x265Dir/build-12bit/Release/x265-static.lib"
           Write-Host "EXTRA_LIB: $lib10bit;$lib12bit"
           cmake -B build-main -S source -G "Visual Studio 17 2022" -A ARM64 -T ClangCL `
-            -DCMAKE_SYSTEM_PROCESSOR=aarch64 `
+            -DARM64=1 `
+            -DCROSS_COMPILE_ARM64=ON `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
             -DSTATIC_LINK_CRT=ON `
             -DCMAKE_C_FLAGS="-DNOWINBASEINTERLOCK" `
@@ -525,6 +529,7 @@ jobs:
         with:
           msystem: MSYS
           update: true
+          cache: false
           path-type: inherit
           install: >-
             make
