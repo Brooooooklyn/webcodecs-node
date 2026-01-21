@@ -101,6 +101,7 @@ jobs:
         with:
           msystem: MSYS
           update: true
+          cache: false
           path-type: inherit
           install: >-
             make
@@ -523,6 +524,7 @@ jobs:
         with:
           msystem: MSYS
           update: true
+          cache: false
           path-type: inherit
           install: >-
             make
