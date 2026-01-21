@@ -79,7 +79,7 @@ jobs:
   # Uses native ARM64 runner for native compilation
   build-ffmpeg-windows-arm64:
     name: Build aarch64-pc-windows-msvc
-    runs-on: windows-latest
+    runs-on: windows-11-arm
     permissions:
       id-token: write
       attestations: write
@@ -101,7 +101,6 @@ jobs:
         with:
           msystem: MSYS
           update: true
-          cache: false
           path-type: inherit
           install: >-
             make
@@ -130,10 +129,13 @@ jobs:
             zlib:arm64-windows-static `
             libjxl:arm64-windows-static
 
-      - name: Setup cmake
-        uses: jwlawson/actions-setup-cmake@v2
+      # Install cmake 3.x to avoid cmake 4.x policy errors (CMP0025, CMP0054)
+      # x265's CMakeLists.txt uses cmake_policy(SET CMP0025 OLD) which cmake 4.x doesn't support
+      # jwlawson/actions-setup-cmake doesn't support windows-11-arm, but lukka/get-cmake does
+      - name: Setup cmake 3.x
+        uses: lukka/get-cmake@latest
         with:
-          cmake-version: '3.x'
+          cmakeVersion: '~3.31.0'
 
       - name: Build x265 with alpha support
         shell: pwsh
@@ -149,42 +151,11 @@ jobs:
           # Shallow clone doesn't have the tag in history, so we create one locally
           git tag 4.1
 
-          # Create compiler wrapper scripts that add --target=arm64-pc-windows-msvc
-          # x265's cmake uses CMAKE_CXX_COMPILER directly in add_custom_command for assembly
-          # The AARCH64_*_FLAG variables are NOT cmake CACHE variables, so they can't be overridden
-          # The only way to inject --target is via a wrapper script
-          $LLVM_BIN = "C:/Program Files/LLVM/bin"
-          @"
-          @echo off
-          "$LLVM_BIN/clang.exe" --target=arm64-pc-windows-msvc %*
-          "@ | Out-File -FilePath clang-arm64.cmd -Encoding ascii
-          @"
-          @echo off
-          "$LLVM_BIN/clang++.exe" --target=arm64-pc-windows-msvc %*
-          "@ | Out-File -FilePath clang++-arm64.cmd -Encoding ascii
-
-          # Create CMake toolchain file for ARM64 cross-compilation
-          # Use our wrapper scripts as the compilers
-          $wrapperDir = (Get-Location).Path -replace '\\','/'
-          @"
-          set(CMAKE_SYSTEM_NAME Windows)
-          set(CMAKE_SYSTEM_PROCESSOR aarch64)
-          set(CROSS_COMPILE_ARM64 ON)
-          set(CMAKE_C_COMPILER "$wrapperDir/clang-arm64.cmd")
-          set(CMAKE_CXX_COMPILER "$wrapperDir/clang++-arm64.cmd")
-          set(CMAKE_C_COMPILER_ID Clang)
-          set(CMAKE_CXX_COMPILER_ID Clang)
-          set(CMAKE_C_COMPILER_FRONTEND_VARIANT GNU)
-          set(CMAKE_CXX_COMPILER_FRONTEND_VARIANT GNU)
-          "@ | Out-File -FilePath toolchain-arm64.cmake -Encoding utf8
-
-          # Build 12-bit lib with Ninja generator
-          # Visual Studio generator doesn't work well with .cmd wrapper scripts
-          # NOWINBASEINTERLOCK skips winbase.h interlocked wrappers that conflict with clang intrinsics
-          # STATIC_LINK_CRT=ON uses /MT static CRT (x265's own option)
-          cmake -B build-12bit -S source -G Ninja `
-            -DCMAKE_TOOLCHAIN_FILE="../toolchain-arm64.cmake" `
-            -DCMAKE_BUILD_TYPE=Release `
+          # Build 12-bit lib
+          # Use ClangCL for ARM64 NEON assembly support
+          # NOWINBASEINTERLOCK skips winbase.h interlocked wrappers that conflict with ClangCL intrinsics
+          # STATIC_LINK_CRT=ON uses /MT static CRT (x265's own option, more reliable than CMAKE_MSVC_RUNTIME_LIBRARY)
+          cmake -B build-12bit -S source -G "Visual Studio 17 2022" -A ARM64 -T ClangCL `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
             -DSTATIC_LINK_CRT=ON `
             -DCMAKE_C_FLAGS="-DNOWINBASEINTERLOCK" `
@@ -195,12 +166,10 @@ jobs:
             -DHIGH_BIT_DEPTH=ON `
             -DEXPORT_C_API=OFF `
             -DMAIN12=ON
-          cmake --build build-12bit --parallel
+          cmake --build build-12bit --config Release --parallel
 
           # Build 10-bit lib
-          cmake -B build-10bit -S source -G Ninja `
-            -DCMAKE_TOOLCHAIN_FILE="../toolchain-arm64.cmake" `
-            -DCMAKE_BUILD_TYPE=Release `
+          cmake -B build-10bit -S source -G "Visual Studio 17 2022" -A ARM64 -T ClangCL `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
             -DSTATIC_LINK_CRT=ON `
             -DCMAKE_C_FLAGS="-DNOWINBASEINTERLOCK" `
@@ -210,17 +179,15 @@ jobs:
             -DENABLE_ALPHA=ON `
             -DHIGH_BIT_DEPTH=ON `
             -DEXPORT_C_API=OFF
-          cmake --build build-10bit --parallel
+          cmake --build build-10bit --config Release --parallel
 
           # Build 8-bit main lib with linked 10/12-bit
-          # Ninja outputs to build directory directly (no Release subdirectory)
+          # Use absolute paths for EXTRA_LIB since linker resolves paths from build directory
           $x265Dir = (Get-Location).Path -replace '\\','/'
-          $lib10bit = "$x265Dir/build-10bit/libx265.a"
-          $lib12bit = "$x265Dir/build-12bit/libx265.a"
+          $lib10bit = "$x265Dir/build-10bit/Release/x265-static.lib"
+          $lib12bit = "$x265Dir/build-12bit/Release/x265-static.lib"
           Write-Host "EXTRA_LIB: $lib10bit;$lib12bit"
-          cmake -B build-main -S source -G Ninja `
-            -DCMAKE_TOOLCHAIN_FILE="../toolchain-arm64.cmake" `
-            -DCMAKE_BUILD_TYPE=Release `
+          cmake -B build-main -S source -G "Visual Studio 17 2022" -A ARM64 -T ClangCL `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
             -DSTATIC_LINK_CRT=ON `
             -DCMAKE_C_FLAGS="-DNOWINBASEINTERLOCK" `
@@ -231,16 +198,16 @@ jobs:
             "-DEXTRA_LIB=$lib10bit;$lib12bit" `
             -DLINKED_10BIT=ON `
             -DLINKED_12BIT=ON
-          cmake --build build-main --parallel
+          cmake --build build-main --config Release --parallel
 
-          # Combine all libs into single static archive using llvm-ar
-          & "$LLVM_BIN/llvm-ar.exe" rcs x265-combined.lib `
-            build-main/libx265.a `
-            build-10bit/libx265.a `
-            build-12bit/libx265.a
+          # Combine all libs into single static archive using lib.exe (MSVC)
+          lib.exe /OUT:x265-combined.lib `
+            build-main/Release/x265-static.lib `
+            build-10bit/Release/x265-static.lib `
+            build-12bit/Release/x265-static.lib
 
           # Install to vcpkg directory so FFmpeg can find it
-          Copy-Item -Force x265-combined.lib "$VCPKG_INSTALLED/lib/libx265.a"
+          Copy-Item -Force x265-combined.lib "$VCPKG_INSTALLED/lib/x265-static.lib"
           Copy-Item -Force source/x265.h "$VCPKG_INSTALLED/include/"
           Copy-Item -Force build-main/x265_config.h "$VCPKG_INSTALLED/include/"
 
@@ -258,8 +225,8 @@ jobs:
             'Name: x265'
             'Description: H.265/HEVC video encoder with alpha support'
             'Version: 4.1'
-            'Libs: -L${libdir} -lx265'
-            'Libs.private: -lc++'
+            'Libs: -L${libdir} -lx265-static'
+            'Libs.private: -lstdc++'
             'Cflags: -I${includedir}'
           ) -join "`n"
           # Use ASCII encoding to avoid UTF-8 BOM which breaks pkg-config
@@ -271,8 +238,8 @@ jobs:
 
       - name: List vcpkg installed libraries
         run: |
-          Write-Host "=== All installed .lib/.a files in vcpkg ==="
-          Get-ChildItem "$env:VCPKG_ROOT/installed/arm64-windows-static/lib/*" -Include "*.lib","*.a" | ForEach-Object { $_.Name }
+          Write-Host "=== All installed .lib files in vcpkg ==="
+          Get-ChildItem "$env:VCPKG_ROOT/installed/arm64-windows-static/lib/*.lib" | ForEach-Object { $_.Name }
 
       - name: Clone FFmpeg
         run: |
@@ -556,7 +523,6 @@ jobs:
         with:
           msystem: MSYS
           update: true
-          cache: false
           path-type: inherit
           install: >-
             make
@@ -597,10 +563,12 @@ jobs:
             zlib:x64-windows-static `
             libjxl:x64-windows-static
 
-      - name: Setup cmake
-        uses: jwlawson/actions-setup-cmake@v2
+      # Install cmake 3.x to avoid cmake 4.x policy errors (CMP0025, CMP0054)
+      # x265's CMakeLists.txt uses cmake_policy(SET CMP0025 OLD) which cmake 4.x doesn't support
+      - name: Setup cmake 3.x
+        uses: lukka/get-cmake@latest
         with:
-          cmake-version: '3.x'
+          cmakeVersion: '~3.31.0'
 
       - name: Build x265 with alpha support
         shell: pwsh
