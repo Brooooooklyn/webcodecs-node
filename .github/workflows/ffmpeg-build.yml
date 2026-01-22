@@ -1037,11 +1037,9 @@ jobs:
           path: ffmpeg-armv7-unknown-linux-gnueabihf.tar.gz
           if-no-files-found: error
 
-  # Build macOS x64 static libs (dav1d, libjxl + deps, x265 with alpha)
-  # These are needed because Homebrew only provides dynamic .dylib files
-  # x265 is built from source with ENABLE_ALPHA=ON for HEVC alpha encoding
-  build-static-libs-macos-x64:
-    name: Build static-libs x86_64-apple-darwin
+  # Build macOS x64 FFmpeg from source
+  build-ffmpeg-macos-x64:
+    name: Build x86_64-apple-darwin
     runs-on: macos-15-intel
     permissions:
       id-token: write
@@ -1054,6 +1052,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Setup cmake
         uses: jwlawson/actions-setup-cmake@v2
         with:
@@ -1061,171 +1062,39 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          brew install meson ninja nasm llvm@20
+          brew install meson ninja nasm yasm autoconf automake libtool pkg-config llvm@20
           echo "$(brew --prefix llvm@20)/bin" >> $GITHUB_PATH
 
-      - name: Build static libraries
+      - name: Build FFmpeg
         env:
           CC: clang
           CXX: clang++
         run: |
-          set -ex
-          PREFIX=$(pwd)/static-libs-x86_64-apple-darwin
-          mkdir -p $PREFIX/{lib,include,lib/pkgconfig}
-          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
-          export CFLAGS="-I$PREFIX/include -O2 -mmacosx-version-min=10.13"
-          export CXXFLAGS="-I$PREFIX/include -O2 -mmacosx-version-min=10.13"
-          export LDFLAGS="-L$PREFIX/lib"
-          JOBS=$(sysctl -n hw.ncpu)
-
-          # dav1d (AV1 decoder)
-          git clone --depth 1 --branch 1.5.2 https://code.videolan.org/videolan/dav1d.git
-          cd dav1d
-          meson setup build --default-library=static --buildtype=release \
-            -Denable_tools=false -Denable_tests=false --prefix=$PREFIX
-          ninja -C build && ninja -C build install
-          cd ..
-
-          # highway (SIMD for libjxl)
-          git clone --depth 1 --branch 1.3.0 https://github.com/google/highway.git
-          cd highway
-          cmake -B _build -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
-            -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF \
-            -DHWY_ENABLE_EXAMPLES=OFF -DHWY_ENABLE_TESTS=OFF
-          cmake --build _build -j$JOBS
-          cmake --install _build
-          cd ..
-
-          # brotli (compression for libjxl)
-          git clone --depth 1 --branch v1.1.0 https://github.com/google/brotli.git
-          cd brotli
-          cmake -B _build -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
-            -DBUILD_SHARED_LIBS=OFF -DBROTLI_DISABLE_TESTS=ON
-          cmake --build _build -j$JOBS
-          cmake --install _build
-          cd ..
-
-          # lcms2 (color management for libjxl) - uses autotools, not cmake
-          git clone --depth 1 --branch lcms2.16 https://github.com/mm2/Little-CMS.git
-          cd Little-CMS
-          ./configure --prefix=$PREFIX --enable-static --disable-shared --with-pic
-          make -j$JOBS
-          make install
-          cd ..
-
-          # libjxl (JPEG XL)
-          git clone --depth 1 --branch v0.11.1 --recurse-submodules --shallow-submodules https://github.com/libjxl/libjxl.git
-          cd libjxl
-          cmake -B _build -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
-            -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF \
-            -DJPEGXL_ENABLE_TOOLS=OFF -DJPEGXL_ENABLE_BENCHMARK=OFF \
-            -DJPEGXL_ENABLE_EXAMPLES=OFF -DJPEGXL_ENABLE_MANPAGES=OFF \
-            -DJPEGXL_ENABLE_DOXYGEN=OFF -DJPEGXL_ENABLE_JNI=OFF \
-            -DJPEGXL_ENABLE_JPEGLI=OFF \
-            -DJPEGXL_FORCE_SYSTEM_HWY=ON -DJPEGXL_FORCE_SYSTEM_BROTLI=ON \
-            -DJPEGXL_FORCE_SYSTEM_LCMS2=ON
-          cmake --build _build -j$JOBS
-          cmake --install _build
-          cd ..
-
-          # x265 (HEVC encoder with alpha support)
-          # Build multi-lib x265 with ENABLE_ALPHA=ON for HEVC alpha encoding
-          git clone --depth 1 --branch Release_4.1 https://bitbucket.org/multicoreware/x265_git.git
-          cd x265_git/build
-
-          # Build 12-bit lib (no C API export - will be linked into main)
-          mkdir -p build-12bit && cd build-12bit
-          cmake ../../source \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
-            -DCMAKE_INSTALL_PREFIX=$PREFIX \
-            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            -DENABLE_SHARED=OFF \
-            -DENABLE_CLI=OFF \
-            -DENABLE_ALPHA=ON \
-            -DHIGH_BIT_DEPTH=ON \
-            -DEXPORT_C_API=OFF \
-            -DMAIN12=ON
-          make -j$JOBS
-          cd ..
-
-          # Build 10-bit lib (no C API export - will be linked into main)
-          mkdir -p build-10bit && cd build-10bit
-          cmake ../../source \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
-            -DCMAKE_INSTALL_PREFIX=$PREFIX \
-            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            -DENABLE_SHARED=OFF \
-            -DENABLE_CLI=OFF \
-            -DENABLE_ALPHA=ON \
-            -DHIGH_BIT_DEPTH=ON \
-            -DEXPORT_C_API=OFF
-          make -j$JOBS
-          cd ..
-
-          # Build 8-bit main lib with linked 10/12-bit libs
-          mkdir -p build-main && cd build-main
-          cmake ../../source \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 \
-            -DCMAKE_INSTALL_PREFIX=$PREFIX \
-            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            -DENABLE_SHARED=OFF \
-            -DENABLE_CLI=OFF \
-            -DENABLE_ALPHA=ON \
-            -DEXTRA_LIB="../build-10bit/libx265.a;../build-12bit/libx265.a" \
-            -DLINKED_10BIT=ON \
-            -DLINKED_12BIT=ON
-          make -j$JOBS
-          cd ..
-
-          # Combine all libs into single static archive using libtool (macOS)
-          libtool -static -o libx265.a \
-            build-main/libx265.a \
-            build-10bit/libx265.a \
-            build-12bit/libx265.a
-
-          # Install combined lib and headers
-          cp libx265.a $PREFIX/lib/
-          cp ../source/x265.h $PREFIX/include/ 2>/dev/null || true
-          cp build-main/x265_config.h $PREFIX/include/ 2>/dev/null || true
-
-          # Create pkg-config file for x265
-          # Libs.private needed for static linking (x265 is C++)
-          printf '%s\n' \
-            'prefix=${pcfiledir}/../..' \
-            'exec_prefix=${prefix}' \
-            'libdir=${prefix}/lib' \
-            'includedir=${prefix}/include' \
-            '' \
-            'Name: x265' \
-            'Description: H.265/HEVC video encoder with alpha support' \
-            'Version: 4.1' \
-            'Libs: -L${libdir} -lx265' \
-            'Libs.private: -lc++' \
-            'Cflags: -I${includedir}' \
-            > $PREFIX/lib/pkgconfig/x265.pc
-
-          cd ../..
+          cargo build --release -p build-ffmpeg
+          ./target/release/build-ffmpeg \
+            --target x86_64-apple-darwin \
+            --output ./ffmpeg-x86_64-apple-darwin \
+            --use-system-cc \
+            --verbose
 
       - name: Create tarball
-        run: tar -czvf static-libs-x86_64-apple-darwin.tar.gz -C ./static-libs-x86_64-apple-darwin .
+        run: tar -czvf ffmpeg-x86_64-apple-darwin.tar.gz -C ./ffmpeg-x86_64-apple-darwin .
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: static-libs-x86_64-apple-darwin.tar.gz
+          subject-path: ffmpeg-x86_64-apple-darwin.tar.gz
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: static-libs-x86_64-apple-darwin
-          path: static-libs-x86_64-apple-darwin.tar.gz
+          name: ffmpeg-x86_64-apple-darwin
+          path: ffmpeg-x86_64-apple-darwin.tar.gz
           if-no-files-found: error
 
-  # Build macOS arm64 static libs (dav1d, libjxl + deps, x265 with alpha)
-  # These are needed because Homebrew only provides dynamic .dylib files
-  # x265 is built from source with ENABLE_ALPHA=ON for HEVC alpha encoding
-  build-static-libs-macos-arm64:
-    name: Build static-libs aarch64-apple-darwin
+  # Build macOS arm64 FFmpeg from source
+  build-ffmpeg-macos-arm64:
+    name: Build aarch64-apple-darwin
     runs-on: macos-latest
     permissions:
       id-token: write
@@ -1238,6 +1107,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Setup cmake
         uses: jwlawson/actions-setup-cmake@v2
         with:
@@ -1245,164 +1117,34 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          brew install meson ninja nasm llvm@20
+          brew install meson ninja nasm yasm autoconf automake libtool pkg-config llvm@20
           echo "$(brew --prefix llvm@20)/bin" >> $GITHUB_PATH
 
-      - name: Build static libraries
+      - name: Build FFmpeg
         env:
           CC: clang
           CXX: clang++
         run: |
-          set -ex
-          PREFIX=$(pwd)/static-libs-aarch64-apple-darwin
-          mkdir -p $PREFIX/{lib,include,lib/pkgconfig}
-          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
-          export CFLAGS="-I$PREFIX/include -O2 -mmacosx-version-min=11.0"
-          export CXXFLAGS="-I$PREFIX/include -O2 -mmacosx-version-min=11.0"
-          export LDFLAGS="-L$PREFIX/lib"
-          JOBS=$(sysctl -n hw.ncpu)
-
-          # dav1d (AV1 decoder)
-          git clone --depth 1 --branch 1.5.2 https://code.videolan.org/videolan/dav1d.git
-          cd dav1d
-          meson setup build --default-library=static --buildtype=release \
-            -Denable_tools=false -Denable_tests=false --prefix=$PREFIX
-          ninja -C build && ninja -C build install
-          cd ..
-
-          # highway (SIMD for libjxl)
-          git clone --depth 1 --branch 1.3.0 https://github.com/google/highway.git
-          cd highway
-          cmake -B _build -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
-            -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF \
-            -DHWY_ENABLE_EXAMPLES=OFF -DHWY_ENABLE_TESTS=OFF
-          cmake --build _build -j$JOBS
-          cmake --install _build
-          cd ..
-
-          # brotli (compression for libjxl)
-          git clone --depth 1 --branch v1.1.0 https://github.com/google/brotli.git
-          cd brotli
-          cmake -B _build -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
-            -DBUILD_SHARED_LIBS=OFF -DBROTLI_DISABLE_TESTS=ON
-          cmake --build _build -j$JOBS
-          cmake --install _build
-          cd ..
-
-          # lcms2 (color management for libjxl) - uses autotools, not cmake
-          git clone --depth 1 --branch lcms2.16 https://github.com/mm2/Little-CMS.git
-          cd Little-CMS
-          ./configure --prefix=$PREFIX --enable-static --disable-shared --with-pic
-          make -j$JOBS
-          make install
-          cd ..
-
-          # libjxl (JPEG XL)
-          git clone --depth 1 --branch v0.11.1 --recurse-submodules --shallow-submodules https://github.com/libjxl/libjxl.git
-          cd libjxl
-          cmake -B _build -DCMAKE_INSTALL_PREFIX=$PREFIX -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
-            -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF \
-            -DJPEGXL_ENABLE_TOOLS=OFF -DJPEGXL_ENABLE_BENCHMARK=OFF \
-            -DJPEGXL_ENABLE_EXAMPLES=OFF -DJPEGXL_ENABLE_MANPAGES=OFF \
-            -DJPEGXL_ENABLE_DOXYGEN=OFF -DJPEGXL_ENABLE_JNI=OFF \
-            -DJPEGXL_ENABLE_JPEGLI=OFF \
-            -DJPEGXL_FORCE_SYSTEM_HWY=ON -DJPEGXL_FORCE_SYSTEM_BROTLI=ON \
-            -DJPEGXL_FORCE_SYSTEM_LCMS2=ON
-          cmake --build _build -j$JOBS
-          cmake --install _build
-          cd ..
-
-          # x265 (HEVC encoder with alpha support)
-          # Build multi-lib x265 with ENABLE_ALPHA=ON for HEVC alpha encoding
-          git clone --depth 1 --branch Release_4.1 https://bitbucket.org/multicoreware/x265_git.git
-          cd x265_git/build
-
-          # Build 12-bit lib (no C API export - will be linked into main)
-          mkdir -p build-12bit && cd build-12bit
-          cmake ../../source \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
-            -DCMAKE_INSTALL_PREFIX=$PREFIX \
-            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            -DENABLE_SHARED=OFF \
-            -DENABLE_CLI=OFF \
-            -DENABLE_ALPHA=ON \
-            -DHIGH_BIT_DEPTH=ON \
-            -DEXPORT_C_API=OFF \
-            -DMAIN12=ON
-          make -j$JOBS
-          cd ..
-
-          # Build 10-bit lib (no C API export - will be linked into main)
-          mkdir -p build-10bit && cd build-10bit
-          cmake ../../source \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
-            -DCMAKE_INSTALL_PREFIX=$PREFIX \
-            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            -DENABLE_SHARED=OFF \
-            -DENABLE_CLI=OFF \
-            -DENABLE_ALPHA=ON \
-            -DHIGH_BIT_DEPTH=ON \
-            -DEXPORT_C_API=OFF
-          make -j$JOBS
-          cd ..
-
-          # Build 8-bit main lib with linked 10/12-bit libs
-          mkdir -p build-main && cd build-main
-          cmake ../../source \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
-            -DCMAKE_INSTALL_PREFIX=$PREFIX \
-            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-            -DENABLE_SHARED=OFF \
-            -DENABLE_CLI=OFF \
-            -DENABLE_ALPHA=ON \
-            -DEXTRA_LIB="../build-10bit/libx265.a;../build-12bit/libx265.a" \
-            -DLINKED_10BIT=ON \
-            -DLINKED_12BIT=ON
-          make -j$JOBS
-          cd ..
-
-          # Combine all libs into single static archive using libtool (macOS)
-          libtool -static -o libx265.a \
-            build-main/libx265.a \
-            build-10bit/libx265.a \
-            build-12bit/libx265.a
-
-          # Install combined lib and headers
-          cp libx265.a $PREFIX/lib/
-          cp ../source/x265.h $PREFIX/include/ 2>/dev/null || true
-          cp build-main/x265_config.h $PREFIX/include/ 2>/dev/null || true
-
-          # Create pkg-config file for x265
-          # Libs.private needed for static linking (x265 is C++)
-          printf '%s\n' \
-            'prefix=${pcfiledir}/../..' \
-            'exec_prefix=${prefix}' \
-            'libdir=${prefix}/lib' \
-            'includedir=${prefix}/include' \
-            '' \
-            'Name: x265' \
-            'Description: H.265/HEVC video encoder with alpha support' \
-            'Version: 4.1' \
-            'Libs: -L${libdir} -lx265' \
-            'Libs.private: -lc++' \
-            'Cflags: -I${includedir}' \
-            > $PREFIX/lib/pkgconfig/x265.pc
-
-          cd ../..
+          cargo build --release -p build-ffmpeg
+          ./target/release/build-ffmpeg \
+            --target aarch64-apple-darwin \
+            --output ./ffmpeg-aarch64-apple-darwin \
+            --use-system-cc \
+            --verbose
 
       - name: Create tarball
-        run: tar -czvf static-libs-aarch64-apple-darwin.tar.gz -C ./static-libs-aarch64-apple-darwin .
+        run: tar -czvf ffmpeg-aarch64-apple-darwin.tar.gz -C ./ffmpeg-aarch64-apple-darwin .
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: static-libs-aarch64-apple-darwin.tar.gz
+          subject-path: ffmpeg-aarch64-apple-darwin.tar.gz
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: static-libs-aarch64-apple-darwin
-          path: static-libs-aarch64-apple-darwin.tar.gz
+          name: ffmpeg-aarch64-apple-darwin
+          path: ffmpeg-aarch64-apple-darwin.tar.gz
           if-no-files-found: error
 
   create-release:
@@ -1411,8 +1153,8 @@ jobs:
       - build-ffmpeg-armv7
       - build-ffmpeg-windows-arm64
       - build-ffmpeg-windows-x64
-      - build-static-libs-macos-x64
-      - build-static-libs-macos-arm64
+      - build-ffmpeg-macos-x64
+      - build-ffmpeg-macos-arm64
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1439,8 +1181,8 @@ jobs:
             Pre-built FFmpeg ${{ env.FFMPEG_VERSION }} static libraries.
 
             ## Included Libraries
-            - FFmpeg: avcodec, avutil, swscale, swresample
-            - Video: x264, x265, libvpx, libaom (Linux/arm64), rav1e (Windows x64)
+            - FFmpeg: avcodec, avutil, swscale, swresample, avformat
+            - Video: x264, x265, libvpx, libaom (Linux/macOS/arm64), rav1e (Windows x64)
             - Audio: opus, mp3lame, vorbis
             - Image: libwebp, libjxl
 
@@ -1457,13 +1199,9 @@ jobs:
             - x86_64-pc-windows-msvc (uses rav1e for AV1 encoding)
             - aarch64-pc-windows-msvc (uses libaom for AV1 encoding)
 
-            ### macOS (Static Libs Only)
-            - x86_64-apple-darwin (dav1d, libjxl + deps)
-            - aarch64-apple-darwin (dav1d, libjxl + deps)
-
-            Note: macOS builds use Homebrew FFmpeg. These archives contain only
-            the static libraries (dav1d, libjxl, highway, brotli, lcms2) that
-            Homebrew doesn't provide as static builds.
+            ### macOS
+            - x86_64-apple-darwin (libaom for AV1, VideoToolbox hardware acceleration)
+            - aarch64-apple-darwin (libaom for AV1, VideoToolbox hardware acceleration)
 
             ## Verification
 
