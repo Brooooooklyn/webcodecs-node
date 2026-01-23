@@ -49,12 +49,48 @@ fn main() {
 
 /// Get FFmpeg installation directory
 fn get_ffmpeg_dir(target_os: &str, target_arch: &str, target_env: &str) -> PathBuf {
-  // 1. Check for custom FFMPEG_DIR environment variable
+  // 1. Check for custom FFMPEG_DIR environment variable (explicit override)
   if let Ok(dir) = env::var("FFMPEG_DIR") {
     return PathBuf::from(dir);
   }
 
-  // 2. Check for pkg-config on Unix systems
+  let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+  let target_triple = get_target_triple(target_os, target_arch, target_env);
+
+  // 2. Try bundled FFmpeg in project directory (e.g., ffmpeg-aarch64-apple-darwin/)
+  let bundled_target = manifest_dir.join(format!("ffmpeg-{}", target_triple));
+  if bundled_target.join("lib/libavcodec.a").exists()
+    || bundled_target.join("lib/avcodec.lib").exists()
+  {
+    println!(
+      "cargo:warning=Using bundled FFmpeg at {}",
+      bundled_target.display()
+    );
+    return bundled_target;
+  }
+
+  // Also check legacy platform naming (e.g., ffmpeg/darwin-arm64/)
+  let platform = match (target_os, target_arch) {
+    ("macos", "aarch64") => "darwin-arm64",
+    ("macos", "x86_64") => "darwin-x64",
+    ("linux", "x86_64") => "linux-x64",
+    ("linux", "aarch64") => "linux-arm64",
+    ("windows", "x86_64") => "win32-x64",
+    ("windows", "aarch64") => "win32-arm64",
+    _ => "unknown",
+  };
+  let bundled = manifest_dir.join("ffmpeg").join(platform);
+  if bundled.exists() {
+    return bundled;
+  }
+
+  // 3. Try downloading from GitHub Releases (preferred over system packages)
+  // This ensures consistent builds with libaom instead of system FFmpeg (which may use SVT-AV1)
+  if let Some(downloaded) = download_ffmpeg_from_release(target_os, target_arch, target_env) {
+    return downloaded;
+  }
+
+  // 4. Fall back to pkg-config on Unix systems (for local development without release)
   #[cfg(unix)]
   {
     if let Ok(output) = Command::new("pkg-config")
@@ -65,12 +101,16 @@ fn get_ffmpeg_dir(target_os: &str, target_arch: &str, target_env: &str) -> PathB
       let prefix = String::from_utf8_lossy(&output.stdout);
       let path = PathBuf::from(prefix.trim());
       if path.exists() {
+        println!(
+          "cargo:warning=Using system FFmpeg from pkg-config: {}",
+          path.display()
+        );
         return path;
       }
     }
   }
 
-  // 3. Try common installation paths
+  // 5. Try common installation paths (last resort for local development)
   let common_paths = match target_os {
     "macos" => vec![
       "/opt/homebrew", // Apple Silicon Homebrew
@@ -85,30 +125,12 @@ fn get_ffmpeg_dir(target_os: &str, target_arch: &str, target_env: &str) -> PathB
   for path in common_paths {
     let p = PathBuf::from(path);
     if p.join("include/libavcodec/avcodec.h").exists() {
+      println!(
+        "cargo:warning=Using system FFmpeg from common path: {}",
+        p.display()
+      );
       return p;
     }
-  }
-
-  // 4. Try bundled FFmpeg in project directory
-  let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-  let platform = match (target_os, target_arch) {
-    ("macos", "aarch64") => "darwin-arm64",
-    ("macos", "x86_64") => "darwin-x64",
-    ("linux", "x86_64") => "linux-x64",
-    ("linux", "aarch64") => "linux-arm64",
-    ("windows", "x86_64") => "win32-x64",
-    ("windows", "aarch64") => "win32-arm64",
-    _ => "unknown",
-  };
-
-  let bundled = manifest_dir.join("ffmpeg").join(platform);
-  if bundled.exists() {
-    return bundled;
-  }
-
-  // 5. Try downloading from GitHub Releases (Linux and Windows)
-  if let Some(downloaded) = download_ffmpeg_from_release(target_os, target_arch, target_env) {
-    return downloaded;
   }
 
   // 6. FAIL - no fallback to building from source
@@ -119,14 +141,39 @@ fn get_ffmpeg_dir(target_os: &str, target_arch: &str, target_env: &str) -> PathB
      \n\
      Options:\n\
      1. Set FFMPEG_DIR environment variable to point to FFmpeg installation\n\
-     2. Install FFmpeg via package manager (e.g., brew install ffmpeg)\n\
-     3. Create a GitHub Release with pre-built FFmpeg:\n\
-        - Run the 'Build FFmpeg Static' workflow in GitHub Actions\n\
-        - Or download from: https://github.com/{}/releases\n\
+     2. Place pre-built FFmpeg in ./ffmpeg-{} directory\n\
+     3. Run 'Build FFmpeg Static' workflow to create a GitHub release\n\
+     4. Install FFmpeg via package manager (e.g., brew install ffmpeg)\n\
      \n\
-     For CI: Ensure the ffmpeg-build.yml workflow has been run to create a release.",
-    target_os, target_arch, repo
+     Download from: https://github.com/{}/releases",
+    target_os, target_arch, target_triple, repo
   );
+}
+
+/// Get target triple string
+fn get_target_triple(target_os: &str, target_arch: &str, target_env: &str) -> String {
+  match target_os {
+    "linux" => match (target_arch, target_env) {
+      ("x86_64", "gnu") => "x86_64-unknown-linux-gnu",
+      ("x86_64", "musl") => "x86_64-unknown-linux-musl",
+      ("aarch64", "gnu") => "aarch64-unknown-linux-gnu",
+      ("aarch64", "musl") => "aarch64-unknown-linux-musl",
+      ("arm", "gnueabihf") => "armv7-unknown-linux-gnueabihf",
+      _ => "unknown",
+    },
+    "windows" => match target_arch {
+      "x86_64" => "x86_64-pc-windows-msvc",
+      "aarch64" => "aarch64-pc-windows-msvc",
+      _ => "unknown",
+    },
+    "macos" => match target_arch {
+      "x86_64" => "x86_64-apple-darwin",
+      "aarch64" => "aarch64-apple-darwin",
+      _ => "unknown",
+    },
+    _ => "unknown",
+  }
+  .to_string()
 }
 
 /// Download FFmpeg from GitHub Releases (Linux, Windows, and macOS)
@@ -284,21 +331,16 @@ fn find_latest_ffmpeg_release(repo: &str) -> Option<String> {
   // Use GitHub API to list releases
   let api_url = format!("https://api.github.com/repos/{}/releases", repo);
 
-  let output = Command::new("curl")
-    .args([
-      "-s",
-      "-f",
-      "-H",
-      "Accept: application/vnd.github+json",
-      "-H",
-      &format!(
-        "Authorization: Bearer {}",
-        env::var("GITHUB_TOKEN").unwrap()
-      ),
-    ])
-    .arg(&api_url)
-    .output()
-    .ok()?;
+  // Build curl command - add auth header if GITHUB_TOKEN is available
+  let mut cmd = Command::new("curl");
+  cmd.args(["-s", "-f", "-H", "Accept: application/vnd.github+json"]);
+
+  // Add authorization header if token is available (for higher rate limits in CI)
+  if let Ok(token) = env::var("GITHUB_TOKEN") {
+    cmd.args(["-H", &format!("Authorization: Bearer {}", token)]);
+  }
+
+  let output = cmd.arg(&api_url).output().ok()?;
 
   if !output.status.success() {
     return None;

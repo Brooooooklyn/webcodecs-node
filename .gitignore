@@ -199,3 +199,5 @@ ffmpeg-build/
 /wpt/
 /example/*.webm
 /example/*.mp4
+ffmpeg-aarch64-apple-darwin/
+ffmpeg-x86_64-apple-darwin/

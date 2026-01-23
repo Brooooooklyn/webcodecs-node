@@ -67,7 +67,7 @@ jobs:
       fail-fast: false
       matrix:
         settings:
-          # macOS - download pre-built FFmpeg from release
+          # macOS - FFmpeg auto-downloaded by build.rs
           - host: macos-15-intel
             target: x86_64-apple-darwin
             build: |
@@ -75,7 +75,6 @@ jobs:
               export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER=clang
               export CC=clang
               pnpm build --target x86_64-apple-darwin
-            download_ffmpeg: true
           - host: macos-latest
             target: aarch64-apple-darwin
             build: |
@@ -83,34 +82,27 @@ jobs:
               export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=clang
               export CC=clang
               pnpm build --target aarch64-apple-darwin
-            download_ffmpeg: true
-          # Windows - download pre-built FFmpeg from release
+          # Windows - FFmpeg auto-downloaded by build.rs
           - host: windows-latest
             target: x86_64-pc-windows-msvc
             build: pnpm build --target x86_64-pc-windows-msvc
-            download_ffmpeg: true
           - host: windows-latest
             target: aarch64-pc-windows-msvc
             build: pnpm build --target aarch64-pc-windows-msvc
-            download_ffmpeg: true
-          # Linux glibc - download pre-built FFmpeg from release
+          # Linux glibc - FFmpeg auto-downloaded by build.rs
           - host: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             build: pnpm build --target x86_64-unknown-linux-gnu --use-napi-cross
-            download_ffmpeg: true
           - host: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             build: pnpm build --target aarch64-unknown-linux-gnu --use-napi-cross
-            download_ffmpeg: true
-          # Linux musl - download pre-built FFmpeg from release
+          # Linux musl - FFmpeg auto-downloaded by build.rs
           - host: ubuntu-latest
             target: x86_64-unknown-linux-musl
             build: pnpm build --target x86_64-unknown-linux-musl -x
-            download_ffmpeg: true
           - host: ubuntu-latest
             target: aarch64-unknown-linux-musl
             build: pnpm build --target aarch64-unknown-linux-musl -x
-            download_ffmpeg: true
     name: stable - ${{ matrix.settings.target }} - node@24
     runs-on: ${{ matrix.settings.host }}
     permissions:
@@ -162,47 +154,6 @@ jobs:
         run: |
           brew install llvm@20
           echo "$(brew --prefix llvm@20)/bin" >> $GITHUB_PATH
-      - name: Download FFmpeg from release
-        if: ${{ matrix.settings.download_ffmpeg }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # Find latest ffmpeg-* release
-          RELEASE_TAG=$(gh release list --repo ${{ github.repository }} \
-            --exclude-drafts --exclude-pre-releases \
-            --json tagName --jq '.[].tagName | select(startswith("ffmpeg-"))' \
-            | head -n1)
-
-          if [ -z "$RELEASE_TAG" ]; then
-            echo "ERROR: No FFmpeg release found!"
-            echo "Run the 'Build FFmpeg Static' workflow first to create a release."
-            exit 1
-          fi
-
-          echo "Using FFmpeg release: $RELEASE_TAG"
-
-          mkdir -p ./ffmpeg-build
-
-          # Determine archive format based on target
-          TARGET="${{ matrix.settings.target }}"
-          if [[ "$TARGET" == *"windows"* ]]; then
-            ARCHIVE="ffmpeg-${TARGET}.zip"
-            gh release download "$RELEASE_TAG" \
-              --repo ${{ github.repository }} \
-              --pattern "$ARCHIVE"
-            unzip -o "$ARCHIVE" -d ./ffmpeg-build
-            rm "$ARCHIVE"
-          else
-            ARCHIVE="ffmpeg-${TARGET}.tar.gz"
-            gh release download "$RELEASE_TAG" \
-              --repo ${{ github.repository }} \
-              --pattern "$ARCHIVE"
-            tar -xzf "$ARCHIVE" -C ./ffmpeg-build
-            rm "$ARCHIVE"
-          fi
-
-          echo "FFMPEG_DIR=$(pwd)/ffmpeg-build" >> $GITHUB_ENV
-        shell: bash
       - name: Setup libc++ and compiler-rt static libraries
         if: ${{ endsWith(matrix.settings.target, 'unknown-linux-gnu') }}
         run: |
@@ -232,6 +183,8 @@ jobs:
       - name: Build
         run: ${{ matrix.settings.build }}
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
         if: matrix.settings.target != 'wasm32-wasip1-threads'
@@ -298,40 +251,12 @@ jobs:
         with:
           targets: armv7-unknown-linux-gnueabihf
 
-      - name: Download FFmpeg from release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # Install gh CLI
-          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-          apt-get update && apt-get install -y gh
-
-          RELEASE_TAG=$(gh release list --repo ${{ github.repository }} \
-            --exclude-drafts --exclude-pre-releases \
-            --json tagName --jq '.[].tagName | select(startswith("ffmpeg-"))' \
-            | head -n1)
-
-          if [ -z "$RELEASE_TAG" ]; then
-            echo "ERROR: No FFmpeg release found!"
-            exit 1
-          fi
-
-          echo "Using FFmpeg release: $RELEASE_TAG"
-          mkdir -p ./ffmpeg-build
-
-          gh release download "$RELEASE_TAG" \
-            --repo ${{ github.repository }} \
-            --pattern "ffmpeg-armv7-unknown-linux-gnueabihf.tar.gz"
-          tar -xzf ffmpeg-armv7-unknown-linux-gnueabihf.tar.gz -C ./ffmpeg-build
-          rm ffmpeg-armv7-unknown-linux-gnueabihf.tar.gz
-
-          echo "FFMPEG_DIR=$(pwd)/ffmpeg-build" >> $GITHUB_ENV
-
       - name: Install dependencies
         run: pnpm install
 
       - name: Build
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           export CC=arm-linux-gnueabihf-gcc
           export CXX=arm-linux-gnueabihf-g++

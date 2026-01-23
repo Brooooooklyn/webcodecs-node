@@ -9,10 +9,10 @@ use crate::ffi::{
     ffctx_get_frame_size, ffctx_get_height, ffctx_get_pix_fmt, ffctx_get_qmax, ffctx_get_qmin,
     ffctx_get_sample_rate, ffctx_get_time_base, ffctx_get_width, ffctx_set_bit_rate,
     ffctx_set_channels, ffctx_set_flags, ffctx_set_framerate, ffctx_set_gop_size,
-    ffctx_set_has_b_frames, ffctx_set_height, ffctx_set_hw_device_ctx, ffctx_set_level, ffctx_set_max_b_frames,
-    ffctx_set_pix_fmt, ffctx_set_profile, ffctx_set_qmax, ffctx_set_qmin, ffctx_set_rc_buffer_size,
-    ffctx_set_rc_max_rate, ffctx_set_sample_fmt, ffctx_set_sample_rate, ffctx_set_thread_count,
-    ffctx_set_time_base, ffctx_set_width,
+    ffctx_set_has_b_frames, ffctx_set_height, ffctx_set_hw_device_ctx, ffctx_set_level,
+    ffctx_set_max_b_frames, ffctx_set_pix_fmt, ffctx_set_profile, ffctx_set_qmax, ffctx_set_qmin,
+    ffctx_set_rc_buffer_size, ffctx_set_rc_max_rate, ffctx_set_sample_fmt, ffctx_set_sample_rate,
+    ffctx_set_thread_count, ffctx_set_time_base, ffctx_set_width,
   },
   avcodec::{
     avcodec_alloc_context3, avcodec_find_decoder, avcodec_find_encoder,
@@ -1039,10 +1039,7 @@ impl CodecContext {
           continue;
         }
         ReceiveResult::EndOfStream => {
-          tracing::debug!(
-            "flush_decoder: got EOF, total frames={}",
-            frames.len()
-          );
+          tracing::debug!("flush_decoder: got EOF, total frames={}", frames.len());
           // True EOF - all frames have been output
           break;
         }
