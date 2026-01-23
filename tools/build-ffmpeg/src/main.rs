@@ -1078,10 +1078,19 @@ Cflags: -I${{includedir}}{}
       let content = fs::read_to_string(&cmake_lists)?;
       let patched = content
         // Remove problematic cmake_policy(SET ... OLD) calls
-        .replace("cmake_policy(SET CMP0025 OLD)", "# cmake_policy(SET CMP0025 OLD) # Removed for CMake 4.0+ compatibility")
-        .replace("cmake_policy(SET CMP0054 OLD)", "# cmake_policy(SET CMP0054 OLD) # Removed for CMake 4.0+ compatibility")
+        .replace(
+          "cmake_policy(SET CMP0025 OLD)",
+          "# cmake_policy(SET CMP0025 OLD) # Removed for CMake 4.0+ compatibility",
+        )
+        .replace(
+          "cmake_policy(SET CMP0054 OLD)",
+          "# cmake_policy(SET CMP0054 OLD) # Removed for CMake 4.0+ compatibility",
+        )
         // Update minimum version to avoid deprecation warnings
-        .replace("cmake_minimum_required(VERSION 2.8.8)", "cmake_minimum_required(VERSION 3.10)");
+        .replace(
+          "cmake_minimum_required(VERSION 2.8.8)",
+          "cmake_minimum_required(VERSION 3.10)",
+        );
       fs::write(&cmake_lists, patched)?;
     }
     let multilib_dir = source.join("_build").join("multilib");
@@ -1337,14 +1346,22 @@ Cflags: -I${{includedir}}
       "--enable-vp9-highbitdepth".to_string(),
     ];
 
-    // Cross-compilation: set libvpx target based on architecture
+    // Cross-compilation: set libvpx target based on architecture and OS
+    // libvpx has specific targets for each platform (linux vs darwin) and needs
+    // the correct darwin version for macOS to generate Mach-O object files
     if let Some(cross) = self.cross_config() {
-      let vpx_target = match cross.arch.as_str() {
-        "aarch64" => "arm64-linux-gcc",
+      let vpx_target = match (cross.arch.as_str(), cross.os.as_str()) {
+        // macOS targets - darwin version corresponds to macOS deployment target
+        // macOS 11.0 = Darwin 20 (first Apple Silicon release)
+        ("aarch64", "darwin") => "arm64-darwin20-gcc",
+        // macOS 10.13 = Darwin 17 (minimum for x86_64)
+        ("x86_64", "darwin") => "x86_64-darwin17-gcc",
+        // Linux targets
+        ("aarch64", _) => "arm64-linux-gcc",
+        ("x86_64", _) => "x86_64-linux-gcc",
         // armv7 uses generic-gnu to avoid -march=armv7-a ASFLAGS issues with zig
         // This uses C implementations instead of ARM assembly, but works reliably
-        "armv7" | "arm" => "generic-gnu",
-        "x86_64" => "x86_64-linux-gcc",
+        ("armv7", _) | ("arm", _) => "generic-gnu",
         _ => "generic-gnu",
       };
       args.push(format!("--target={}", vpx_target));
