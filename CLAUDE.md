@@ -10,26 +10,26 @@ WebCodecs API implementation for Node.js using FFmpeg, built with napi-rs (Rust 
 
 **Status:** Feature-complete, production-ready
 
-| Component           | Status      | Notes                                                              |
-| ------------------- | ----------- | ------------------------------------------------------------------ |
-| VideoEncoder        | ✅ Complete | H.264, H.265, VP8, VP9, AV1 + EventTarget                          |
-| VideoDecoder        | ✅ Complete | All codecs + AV1 drain + EventTarget                               |
-| AudioEncoder        | ✅ Complete | AAC, Opus, MP3, FLAC + EventTarget                                 |
-| AudioDecoder        | ✅ Complete | All codecs with resampling + EventTarget                           |
-| VideoFrame          | ✅ Complete | All pixel formats, async copyTo, format conversion, Canvas support |
-| AudioData           | ✅ Complete | All sample formats                                                 |
-| ImageDecoder        | ✅ Complete | JPEG, PNG, WebP, GIF, BMP, AVIF, JPEG XL                           |
-| Mp4Demuxer          | ✅ Complete | H.264, H.265, AV1, AAC, Opus                                       |
-| WebMDemuxer         | ✅ Complete | VP8, VP9, AV1, Opus, Vorbis                                        |
-| MkvDemuxer          | ✅ Complete | All codecs                                                         |
-| Mp4Muxer            | ✅ Complete | H.264, H.265, AV1 + AAC, Opus, MP3, FLAC                           |
-| WebMMuxer           | ✅ Complete | VP8, VP9, AV1 + Opus, Vorbis                                       |
-| MkvMuxer            | ✅ Complete | All codecs                                                         |
-| Threading           | ✅ Complete | Non-blocking Drop, proper lifecycle                                |
-| W3C Spec Compliance | ✅ Complete | All APIs aligned                                                   |
-| Type Definitions    | ✅ Complete | ~1,100 lines in index.d.ts                                         |
-| Test Coverage       | ✅ Complete | 917 tests (34 files), all passing                                  |
-| Hardware Encoding   | ✅ Complete | Zero-copy GPU path, auto-tuning                                    |
+| Component           | Status      | Notes                                                               |
+| ------------------- | ----------- | ------------------------------------------------------------------- |
+| VideoEncoder        | ✅ Complete | H.264, H.265 (with Alpha), VP8, VP9 (with Alpha), AV1 + EventTarget |
+| VideoDecoder        | ✅ Complete | All codecs + AV1 drain + EventTarget                                |
+| AudioEncoder        | ✅ Complete | AAC, Opus, MP3, FLAC + EventTarget                                  |
+| AudioDecoder        | ✅ Complete | All codecs with resampling + EventTarget                            |
+| VideoFrame          | ✅ Complete | All pixel formats, async copyTo, format conversion, Canvas support  |
+| AudioData           | ✅ Complete | All sample formats                                                  |
+| ImageDecoder        | ✅ Complete | JPEG, PNG, WebP, GIF, BMP, AVIF, JPEG XL                            |
+| Mp4Demuxer          | ✅ Complete | H.264, H.265, AV1, AAC, Opus                                        |
+| WebMDemuxer         | ✅ Complete | VP8, VP9, AV1, Opus, Vorbis                                         |
+| MkvDemuxer          | ✅ Complete | All codecs                                                          |
+| Mp4Muxer            | ✅ Complete | H.264, H.265, AV1 + AAC, Opus, MP3, FLAC                            |
+| WebMMuxer           | ✅ Complete | VP8, VP9, AV1 + Opus, Vorbis                                        |
+| MkvMuxer            | ✅ Complete | All codecs                                                          |
+| Threading           | ✅ Complete | Non-blocking Drop, proper lifecycle                                 |
+| W3C Spec Compliance | ✅ Complete | All APIs aligned                                                    |
+| Type Definitions    | ✅ Complete | ~1,100 lines in index.d.ts                                          |
+| Test Coverage       | ✅ Complete | 917 tests (34 files), all passing                                   |
+| Hardware Encoding   | ✅ Complete | Zero-copy GPU path, auto-tuning                                     |
 
 **Remaining Work:** None - All core features complete.
 
@@ -249,7 +249,7 @@ The build system uses explicit full paths to static libraries to avoid dynamic l
 
 ### Supported Codecs
 
-- **Video**: H.264 (avc1), H.265 (hev1/hvc1), VP8, VP9 (with Alpha support) (vp09, vp9), AV1 (av01, av1)
+- **Video**: H.264 (avc1), H.265 (hev1/hvc1 with Alpha support), VP8, VP9 (with Alpha support) (vp09, vp9), AV1 (av01, av1)
 - **Audio**: AAC (mp4a.40.2), Opus, MP3, FLAC, Vorbis, ALAC, PCM variants
 
 **Note:** Short form codec strings `vp9` and `av01`/`av1` are accepted for compatibility with browser implementations, though W3C WPT considers them ambiguous.
@@ -677,6 +677,8 @@ src/codec/context.rs:339,362  # Set extradata if provided (non-critical)
 2. **Duration type** - Using i64 instead of u64 due to NAPI-RS constraints
 3. **ImageDecoder GIF animation** - FFmpeg may return only first frame; for full animation use VideoDecoder with GIF codec
 4. **AV1 per-frame quantizer** - Per-frame QP control (`av1: { quantizer }` in encode options) has no effect with FFmpeg's libaom wrapper. FFmpeg only sets qmin/qmax during encoder initialization, unlike libvpx which supports dynamic qmax updates. VP9 per-frame quantizer works correctly. See [Chromium CL 7204065](https://chromium-review.googlesource.com/c/chromium/src/+/7204065) for context.
+5. **HEVC alpha encoding** - Requires software encoder (libx265). Hardware HEVC encoders (VideoToolbox, NVENC, VAAPI, QSV) do not support alpha channel. Set `hardwareAcceleration: 'prefer-software'` when using `alpha: 'keep'` with HEVC.
+6. **HEVC alpha pixel formats** - Only YUVA420P (8-bit) and YUVA420P10 (10-bit) are supported. YUVA422P and YUVA444P are not supported by x265.
 
 ## NAPI-RS Limitations
 
@@ -701,6 +703,7 @@ These are fundamental limitations that cannot be resolved without upstream NAPI-
   latencyMode?: "quality" | "realtime",
   scalabilityMode?: "L1T1" | "L1T2" | "L1T3",
   hardwareAcceleration?: "no-preference" | "prefer-hardware" | "prefer-software",
+  alpha?: "keep" | "discard",  // VP9 and HEVC only. HEVC alpha requires prefer-software.
 }
 ```
 

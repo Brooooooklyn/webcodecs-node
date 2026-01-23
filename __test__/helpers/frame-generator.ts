@@ -58,6 +58,18 @@ export function calculateI420Size(width: number, height: number): number {
 }
 
 /**
+ * Calculate I420A buffer size
+ *
+ * I420A layout: Y plane (w*h) + U plane (w/2 * h/2) + V plane (w/2 * h/2) + A plane (w*h)
+ */
+export function calculateI420ASize(width: number, height: number): number {
+  const ySize = width * height
+  const uvSize = (width / 2) * (height / 2)
+  const aSize = width * height
+  return ySize + uvSize * 2 + aSize
+}
+
+/**
  * Calculate RGBA buffer size
  */
 export function calculateRGBASize(width: number, height: number): number {
@@ -95,6 +107,52 @@ export function generateSolidColorI420Frame(
 
   const init: VideoFrameBufferInit = {
     format: 'I420',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp,
+    duration,
+  }
+
+  return new VideoFrame(buffer, init)
+}
+
+/**
+ * Generate a solid color I420A frame (with alpha channel)
+ *
+ * Creates a VideoFrame with alpha channel, useful for testing alpha-preserving codecs (VP9, HEVC).
+ * I420A is I420 with an additional full-resolution alpha plane.
+ */
+export function generateSolidColorI420AFrame(
+  width: number,
+  height: number,
+  color: RGBColor,
+  alpha: number,
+  timestamp: number,
+  duration?: number,
+): VideoFrame {
+  const yuv = rgbToYuv(color)
+  const bufferSize = calculateI420ASize(width, height)
+  const buffer = new Uint8Array(bufferSize)
+
+  // Y plane
+  const ySize = width * height
+  buffer.fill(yuv.y, 0, ySize)
+
+  // U plane (half resolution)
+  const uvWidth = width / 2
+  const uvHeight = height / 2
+  const uSize = uvWidth * uvHeight
+  buffer.fill(yuv.u, ySize, ySize + uSize)
+
+  // V plane
+  buffer.fill(yuv.v, ySize + uSize, ySize + uSize * 2)
+
+  // A plane (alpha - full resolution, same as Y)
+  const alphaOffset = ySize + uSize * 2
+  buffer.fill(alpha, alphaOffset, alphaOffset + ySize)
+
+  const init: VideoFrameBufferInit = {
+    format: 'I420A',
     codedWidth: width,
     codedHeight: height,
     timestamp,

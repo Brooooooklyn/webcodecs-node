@@ -15,7 +15,7 @@ import {
   resetHardwareFallbackState,
   VideoEncoder,
 } from '../index.js'
-import { generateSolidColorI420Frame, TestColors, type EncodedVideoChunk } from './helpers/index.js'
+import { generateSolidColorI420Frame, TestColors, hasHardwareAcceleration, type EncodedVideoChunk } from './helpers/index.js'
 import { createEncoderConfig } from './helpers/codec-matrix.js'
 
 // Reset hardware fallback state before each test to ensure test isolation
@@ -247,10 +247,7 @@ test('platform: preferred accelerator matches platform', (t) => {
 // ============================================================================
 
 test('hardware encoding: H.264 with prefer-hardware', async (t) => {
-  const preferred = getPreferredHardwareAccelerator()
-  const isCI = Boolean(process.env.CI || process.env.GITHUB_ACTIONS)
-
-  if (preferred === null) {
+  if (!hasHardwareAcceleration()) {
     t.pass('No hardware accelerator available, skipping')
     return
   }
@@ -267,60 +264,13 @@ test('hardware encoding: H.264 with prefer-hardware', async (t) => {
 
   const frame = generateSolidColorI420Frame(320, 240, TestColors.red, 0)
 
-  // Hardware encoder may fail at configure() time (async error callback),
-  // causing encode() to throw InvalidStateError. Handle gracefully like flush().
-  let encodeError: Error | null = null
-  try {
-    encoder.encode(frame, { keyFrame: true })
-  } catch (e) {
-    encodeError = e as Error
-  }
-
+  encoder.encode(frame, { keyFrame: true })
   frame.close()
 
-  // If encode failed, handle it the same way as flush failures
-  if (encodeError) {
-    if (isCI) {
-      t.pass(`Hardware encoding failed at encode() in CI (expected): ${encodeError.message}`)
-    } else {
-      t.fail(`Hardware encoding failed at encode() locally: ${encodeError.message}`)
-    }
-    // Don't call encoder.close() - encoder is already in Closed state
-    return
-  }
+  await encoder.flush()
 
-  // Hardware encoding may not work in CI VMs even when hardware is detected.
-  // The flush() can throw if hardware encoder fails to create compression session.
-  // This is expected behavior in virtualized environments without real GPU access.
-  let flushError: Error | null = null
-  try {
-    await encoder.flush()
-  } catch (e) {
-    flushError = e as Error
-  }
-
-  if (flushError) {
-    if (isCI) {
-      t.pass(`Hardware encoding failed in CI (expected): ${flushError.message}`)
-    } else {
-      t.fail(`Hardware encoding failed locally: ${flushError.message}`)
-    }
-  } else if (chunks.length === 0 && errors.length === 0) {
-    if (isCI) {
-      t.pass('Hardware encoder detected but encoding unavailable (likely CI VM), skipping')
-    } else {
-      t.fail('Hardware encoder produced no output locally')
-    }
-  } else if (errors.length > 0) {
-    const errorMsg = errors[0]?.message ?? String(errors[0])
-    if (isCI) {
-      t.pass(`Hardware encoding error callback in CI (expected): ${errorMsg}`)
-    } else {
-      t.fail(`Hardware encoding error locally: ${errorMsg}`)
-    }
-  } else {
-    t.true(chunks.length > 0, 'Hardware encoder should produce output')
-  }
+  t.is(errors.length, 0, 'No errors should occur')
+  t.true(chunks.length > 0, 'Hardware encoder should produce output')
 
   encoder.close()
 })
