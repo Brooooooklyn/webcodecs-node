@@ -67,7 +67,7 @@ jobs:
       fail-fast: false
       matrix:
         settings:
-          # macOS - use homebrew FFmpeg + download static libs from release
+          # macOS - download pre-built FFmpeg from release
           - host: macos-15-intel
             target: x86_64-apple-darwin
             build: |
@@ -75,7 +75,7 @@ jobs:
               export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER=clang
               export CC=clang
               pnpm build --target x86_64-apple-darwin
-            download_static_libs: true
+            download_ffmpeg: true
           - host: macos-latest
             target: aarch64-apple-darwin
             build: |
@@ -83,7 +83,7 @@ jobs:
               export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=clang
               export CC=clang
               pnpm build --target aarch64-apple-darwin
-            download_static_libs: true
+            download_ffmpeg: true
           # Windows - download pre-built FFmpeg from release
           - host: windows-latest
             target: x86_64-pc-windows-msvc
@@ -157,49 +157,11 @@ jobs:
         run: ${{ matrix.settings.setup }}
         if: ${{ matrix.settings.setup }}
         shell: bash
-      - name: Install FFmpeg (macOS)
+      - name: Install build tools (macOS)
         if: ${{ contains(matrix.settings.target, 'apple') }}
         run: |
-          brew install llvm@20 ffmpeg
+          brew install llvm@20
           echo "$(brew --prefix llvm@20)/bin" >> $GITHUB_PATH
-
-      - name: Download static libs (macOS)
-        if: ${{ matrix.settings.download_static_libs }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # Find latest ffmpeg-* release
-          RELEASE_TAG=$(gh release list --repo ${{ github.repository }} \
-            --exclude-drafts --exclude-pre-releases \
-            --json tagName --jq '.[].tagName | select(startswith("ffmpeg-"))' \
-            | head -n1)
-
-          if [ -z "$RELEASE_TAG" ]; then
-            echo "ERROR: No FFmpeg release found!"
-            echo "Run the 'Build FFmpeg Static' workflow first to create a release."
-            exit 1
-          fi
-
-          echo "Using release: $RELEASE_TAG"
-
-          # Determine archive name based on target
-          TARGET="${{ matrix.settings.target }}"
-          if [[ "$TARGET" == "x86_64-apple-darwin" ]]; then
-            ARCHIVE="static-libs-x86_64-apple-darwin.tar.gz"
-          else
-            ARCHIVE="static-libs-aarch64-apple-darwin.tar.gz"
-          fi
-
-          # Download and extract to Homebrew prefix
-          gh release download "$RELEASE_TAG" \
-            --repo ${{ github.repository }} \
-            --pattern "$ARCHIVE"
-
-          sudo tar -xzf "$ARCHIVE" -C "$(brew --prefix)"
-          rm "$ARCHIVE"
-
-          echo "Static libs installed to $(brew --prefix)/lib"
-          ls -la "$(brew --prefix)/lib/"lib{dav1d,jxl,hwy}*.a 2>/dev/null || echo "Some libs may not be present"
       - name: Download FFmpeg from release
         if: ${{ matrix.settings.download_ffmpeg }}
         env:
