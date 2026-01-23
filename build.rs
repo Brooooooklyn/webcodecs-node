@@ -4,8 +4,7 @@
 //! 1. NAPI-RS setup
 //! 2. Compiling the C accessor library via `cc`
 //! 3. Static linking of FFmpeg libraries
-//! 4. Downloading pre-built FFmpeg from GitHub Releases (Linux/Windows)
-//! 5. Downloading pre-built static libs from GitHub Releases (macOS)
+//! 4. Downloading pre-built FFmpeg from GitHub Releases (Linux/Windows/macOS)
 
 use std::env;
 use std::fs;
@@ -29,30 +28,14 @@ fn main() {
   let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH not set");
   let target_env = env::var("CARGO_CFG_TARGET_ENV").expect("CARGO_CFG_TARGET_ENV not set");
 
-  // For macOS: download static libs (dav1d, libjxl) if not already present
-  // These are needed because Homebrew only provides dynamic .dylib files
-  let macos_static_libs_dir = if target_os == "macos" {
-    download_static_libs_for_macos(&target_arch)
-  } else {
-    None
-  };
-
   // Get FFmpeg directory
   let ffmpeg_dir = get_ffmpeg_dir(&target_os, &target_arch, &target_env);
-
-  // Add macOS static libs to search path if downloaded
-  if let Some(ref static_libs_path) = macos_static_libs_dir {
-    println!(
-      "cargo:rustc-link-search={}",
-      static_libs_path.join("lib").display()
-    );
-  }
 
   // Compile C accessor library
   compile_accessors(&ffmpeg_dir, &target_os, &target_arch, &target_env);
 
   // Link FFmpeg libraries
-  link_ffmpeg(&ffmpeg_dir, &target_os, macos_static_libs_dir.as_ref());
+  link_ffmpeg(&ffmpeg_dir, &target_os, None);
 
   // Re-run if these files change
   println!("cargo:rerun-if-changed=src/ffi/accessors.c");
@@ -66,12 +49,48 @@ fn main() {
 
 /// Get FFmpeg installation directory
 fn get_ffmpeg_dir(target_os: &str, target_arch: &str, target_env: &str) -> PathBuf {
-  // 1. Check for custom FFMPEG_DIR environment variable
+  // 1. Check for custom FFMPEG_DIR environment variable (explicit override)
   if let Ok(dir) = env::var("FFMPEG_DIR") {
     return PathBuf::from(dir);
   }
 
-  // 2. Check for pkg-config on Unix systems
+  let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+  let target_triple = get_target_triple(target_os, target_arch, target_env);
+
+  // 2. Try bundled FFmpeg in project directory (e.g., ffmpeg-aarch64-apple-darwin/)
+  let bundled_target = manifest_dir.join(format!("ffmpeg-{}", target_triple));
+  if bundled_target.join("lib/libavcodec.a").exists()
+    || bundled_target.join("lib/avcodec.lib").exists()
+  {
+    println!(
+      "cargo:warning=Using bundled FFmpeg at {}",
+      bundled_target.display()
+    );
+    return bundled_target;
+  }
+
+  // Also check legacy platform naming (e.g., ffmpeg/darwin-arm64/)
+  let platform = match (target_os, target_arch) {
+    ("macos", "aarch64") => "darwin-arm64",
+    ("macos", "x86_64") => "darwin-x64",
+    ("linux", "x86_64") => "linux-x64",
+    ("linux", "aarch64") => "linux-arm64",
+    ("windows", "x86_64") => "win32-x64",
+    ("windows", "aarch64") => "win32-arm64",
+    _ => "unknown",
+  };
+  let bundled = manifest_dir.join("ffmpeg").join(platform);
+  if bundled.exists() {
+    return bundled;
+  }
+
+  // 3. Try downloading from GitHub Releases (preferred over system packages)
+  // This ensures consistent builds with libaom instead of system FFmpeg (which may use SVT-AV1)
+  if let Some(downloaded) = download_ffmpeg_from_release(target_os, target_arch, target_env) {
+    return downloaded;
+  }
+
+  // 4. Fall back to pkg-config on Unix systems (for local development without release)
   #[cfg(unix)]
   {
     if let Ok(output) = Command::new("pkg-config")
@@ -82,12 +101,16 @@ fn get_ffmpeg_dir(target_os: &str, target_arch: &str, target_env: &str) -> PathB
       let prefix = String::from_utf8_lossy(&output.stdout);
       let path = PathBuf::from(prefix.trim());
       if path.exists() {
+        println!(
+          "cargo:warning=Using system FFmpeg from pkg-config: {}",
+          path.display()
+        );
         return path;
       }
     }
   }
 
-  // 3. Try common installation paths
+  // 5. Try common installation paths (last resort for local development)
   let common_paths = match target_os {
     "macos" => vec![
       "/opt/homebrew", // Apple Silicon Homebrew
@@ -102,30 +125,12 @@ fn get_ffmpeg_dir(target_os: &str, target_arch: &str, target_env: &str) -> PathB
   for path in common_paths {
     let p = PathBuf::from(path);
     if p.join("include/libavcodec/avcodec.h").exists() {
+      println!(
+        "cargo:warning=Using system FFmpeg from common path: {}",
+        p.display()
+      );
       return p;
     }
-  }
-
-  // 4. Try bundled FFmpeg in project directory
-  let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-  let platform = match (target_os, target_arch) {
-    ("macos", "aarch64") => "darwin-arm64",
-    ("macos", "x86_64") => "darwin-x64",
-    ("linux", "x86_64") => "linux-x64",
-    ("linux", "aarch64") => "linux-arm64",
-    ("windows", "x86_64") => "win32-x64",
-    ("windows", "aarch64") => "win32-arm64",
-    _ => "unknown",
-  };
-
-  let bundled = manifest_dir.join("ffmpeg").join(platform);
-  if bundled.exists() {
-    return bundled;
-  }
-
-  // 5. Try downloading from GitHub Releases (Linux and Windows)
-  if let Some(downloaded) = download_ffmpeg_from_release(target_os, target_arch, target_env) {
-    return downloaded;
   }
 
   // 6. FAIL - no fallback to building from source
@@ -136,17 +141,44 @@ fn get_ffmpeg_dir(target_os: &str, target_arch: &str, target_env: &str) -> PathB
      \n\
      Options:\n\
      1. Set FFMPEG_DIR environment variable to point to FFmpeg installation\n\
-     2. Install FFmpeg via package manager (e.g., brew install ffmpeg)\n\
-     3. Create a GitHub Release with pre-built FFmpeg:\n\
-        - Run the 'Build FFmpeg Static' workflow in GitHub Actions\n\
-        - Or download from: https://github.com/{}/releases\n\
+     2. Place pre-built FFmpeg in ./ffmpeg-{} directory\n\
+     3. Run 'Build FFmpeg Static' workflow to create a GitHub release\n\
+     4. Install FFmpeg via package manager (e.g., brew install ffmpeg)\n\
      \n\
-     For CI: Ensure the ffmpeg-build.yml workflow has been run to create a release.",
-    target_os, target_arch, repo
+     Download from: https://github.com/{}/releases",
+    target_os, target_arch, target_triple, repo
   );
 }
 
-/// Download FFmpeg from GitHub Releases (Linux and Windows)
+/// Get target triple string
+fn get_target_triple(target_os: &str, target_arch: &str, target_env: &str) -> String {
+  match target_os {
+    "linux" => match (target_arch, target_env) {
+      ("x86_64", "gnu") => "x86_64-unknown-linux-gnu",
+      ("x86_64", "musl") => "x86_64-unknown-linux-musl",
+      ("aarch64", "gnu") => "aarch64-unknown-linux-gnu",
+      ("aarch64", "musl") => "aarch64-unknown-linux-musl",
+      // For armv7-unknown-linux-gnueabihf, CARGO_CFG_TARGET_ENV is "gnu" (not "gnueabihf")
+      // The "gnueabihf" part is the ABI, not the env
+      ("arm", "gnu") => "armv7-unknown-linux-gnueabihf",
+      _ => "unknown",
+    },
+    "windows" => match target_arch {
+      "x86_64" => "x86_64-pc-windows-msvc",
+      "aarch64" => "aarch64-pc-windows-msvc",
+      _ => "unknown",
+    },
+    "macos" => match target_arch {
+      "x86_64" => "x86_64-apple-darwin",
+      "aarch64" => "aarch64-apple-darwin",
+      _ => "unknown",
+    },
+    _ => "unknown",
+  }
+  .to_string()
+}
+
+/// Download FFmpeg from GitHub Releases (Linux, Windows, and macOS)
 fn download_ffmpeg_from_release(
   target_os: &str,
   target_arch: &str,
@@ -165,7 +197,8 @@ fn download_ffmpeg_from_release(
         ("x86_64", "musl") => "x86_64-unknown-linux-musl",
         ("aarch64", "gnu") => "aarch64-unknown-linux-gnu",
         ("aarch64", "musl") => "aarch64-unknown-linux-musl",
-        ("arm", "gnueabihf") => "armv7-unknown-linux-gnueabihf",
+        // For armv7-unknown-linux-gnueabihf, CARGO_CFG_TARGET_ENV is "gnu" (not "gnueabihf")
+        ("arm", "gnu") => "armv7-unknown-linux-gnueabihf",
         _ => return None,
       };
       (t, false)
@@ -177,6 +210,14 @@ fn download_ffmpeg_from_release(
         _ => return None,
       };
       (t, true)
+    }
+    "macos" => {
+      let t = match target_arch {
+        "x86_64" => "x86_64-apple-darwin",
+        "aarch64" => "aarch64-apple-darwin",
+        _ => return None,
+      };
+      (t, false)
     }
     _ => return None,
   };
@@ -288,152 +329,21 @@ fn download_ffmpeg_from_release(
   }
 }
 
-/// Download macOS static libs (dav1d, libjxl + deps) if not already present
-///
-/// These are needed because Homebrew only provides dynamic .dylib files,
-/// but FFmpeg's libavcodec.a has undefined symbols for dav1d/jxl that
-/// need to be resolved by linking static .a files.
-fn download_static_libs_for_macos(target_arch: &str) -> Option<PathBuf> {
-  // Skip if FFMPEG_SKIP_DOWNLOAD is set
-  if env::var("FFMPEG_SKIP_DOWNLOAD").unwrap_or_default() == "1" {
-    return None;
-  }
-
-  // Check if static libs already exist in Homebrew paths
-  let brew_prefix = env::var("HOMEBREW_PREFIX").unwrap_or_else(|_| {
-    if target_arch == "aarch64" {
-      "/opt/homebrew".to_string()
-    } else {
-      "/usr/local".to_string()
-    }
-  });
-  let brew_lib = PathBuf::from(&brew_prefix).join("lib");
-
-  // Check for required static libs (all libs needed for libjxl support)
-  let required_libs = [
-    "libdav1d.a",
-    "libjxl.a",
-    "libjxl_threads.a",
-    "libhwy.a",
-    "libbrotlienc.a",
-    "libbrotlidec.a",
-    "libbrotlicommon.a",
-    "liblcms2.a",
-  ];
-  let all_exist = required_libs.iter().all(|lib| brew_lib.join(lib).exists());
-
-  if all_exist {
-    println!(
-      "cargo:warning=Static libs already exist in {}",
-      brew_lib.display()
-    );
-    return None; // No download needed
-  }
-
-  // Map architecture to target triple
-  let target = match target_arch {
-    "x86_64" => "x86_64-apple-darwin",
-    "aarch64" => "aarch64-apple-darwin",
-    _ => return None,
-  };
-
-  let repo =
-    env::var("FFMPEG_GITHUB_REPO").unwrap_or_else(|_| "Brooooooklyn/webcodecs-node".to_string());
-
-  // Determine release tag
-  let release_tag = match env::var("FFMPEG_RELEASE_TAG") {
-    Ok(tag) => tag,
-    Err(_) => find_latest_ffmpeg_release(&repo)?,
-  };
-
-  let archive_name = format!("static-libs-{}.tar.gz", target);
-  let download_url = format!(
-    "https://github.com/{}/releases/download/{}/{}",
-    repo, release_tag, archive_name
-  );
-
-  // Download to OUT_DIR
-  let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
-  let static_libs_dir = out_dir.join("static-libs");
-  let archive_path = out_dir.join(&archive_name);
-
-  // Skip if already extracted - check for libjxl.a
-  let lib_check = static_libs_dir.join("lib").join("libjxl.a");
-  if lib_check.exists() {
-    println!(
-      "cargo:warning=Using cached static libs at {}",
-      static_libs_dir.display()
-    );
-    return Some(static_libs_dir);
-  }
-
-  println!(
-    "cargo:warning=Downloading macOS static libs from {}",
-    download_url
-  );
-
-  // Download using curl
-  let status = Command::new("curl")
-    .args(["-L", "-f", "-o"])
-    .arg(&archive_path)
-    .arg(&download_url)
-    .status();
-
-  match status {
-    Ok(s) if s.success() => {}
-    _ => {
-      println!(
-        "cargo:warning=Failed to download static libs from {}",
-        download_url
-      );
-      println!(
-        "cargo:warning=You may need to build dav1d/libjxl manually or run the FFmpeg build workflow"
-      );
-      return None;
-    }
-  }
-
-  // Create extraction directory
-  if let Err(e) = fs::create_dir_all(&static_libs_dir) {
-    println!("cargo:warning=Failed to create directory: {}", e);
-    return None;
-  }
-
-  // Extract archive using tar
-  let extract_status = Command::new("tar")
-    .arg("xzf")
-    .arg(&archive_path)
-    .arg("-C")
-    .arg(&static_libs_dir)
-    .status();
-
-  match extract_status {
-    Ok(s) if s.success() => {
-      // Clean up archive
-      let _ = fs::remove_file(&archive_path);
-      println!(
-        "cargo:warning=Static libs extracted to {}",
-        static_libs_dir.display()
-      );
-      Some(static_libs_dir)
-    }
-    _ => {
-      println!("cargo:warning=Failed to extract static libs archive");
-      None
-    }
-  }
-}
-
 /// Find the latest ffmpeg-* release tag from GitHub
 fn find_latest_ffmpeg_release(repo: &str) -> Option<String> {
   // Use GitHub API to list releases
   let api_url = format!("https://api.github.com/repos/{}/releases", repo);
 
-  let output = Command::new("curl")
-    .args(["-s", "-f", "-H", "Accept: application/vnd.github+json"])
-    .arg(&api_url)
-    .output()
-    .ok()?;
+  // Build curl command - add auth header if GITHUB_TOKEN is available
+  let mut cmd = Command::new("curl");
+  cmd.args(["-s", "-f", "-H", "Accept: application/vnd.github+json"]);
+
+  // Add authorization header if token is available (for higher rate limits in CI)
+  if let Ok(token) = env::var("GITHUB_TOKEN") {
+    cmd.args(["-H", &format!("Authorization: Bearer {}", token)]);
+  }
+
+  let output = cmd.arg(&api_url).output().ok()?;
 
   if !output.status.success() {
     return None;
@@ -803,6 +713,8 @@ fn get_codec_library_paths(target_os: &str) -> Vec<PathBuf> {
     }
     _ => {}
   }
+
+  paths.push(PathBuf::from("ffmpeg-build/lib"));
 
   if let Ok(brew_prefix) = env::var("HOMEBREW_PREFIX") {
     paths.push(PathBuf::from(brew_prefix).join("lib"));

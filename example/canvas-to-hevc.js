@@ -1,50 +1,13 @@
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { createCanvas } from '@napi-rs/canvas'
-import { VideoEncoder, VideoFrame, WebMMuxer, EncodedVideoChunk } from '../index.js'
 
-const __dirname = new URL('.', import.meta.url).pathname
+import { drawRoundedSquare, easeInOutCubic } from './canvas-utils.js'
+import { VideoEncoder, VideoFrame, Mp4Muxer } from '../index.js'
 
-/**
- * Draw a shape that morphs from square to circle
- * @param {CanvasRenderingContext2D} ctx - Canvas context
- * @param {number} centerX - Center X position
- * @param {number} centerY - Center Y position
- * @param {number} size - Size of the shape
- * @param {number} cornerRadius - Corner radius (0 = square, size/2 = circle)
- * @param {string} color - Fill color
- */
-function drawRoundedSquare(ctx, centerX, centerY, size, cornerRadius, color) {
-  const halfSize = size / 2
-  const x = centerX - halfSize
-  const y = centerY - halfSize
-
-  // Clamp corner radius to valid range
-  const radius = Math.min(cornerRadius, halfSize)
-
-  ctx.beginPath()
-  ctx.moveTo(x + radius, y)
-  ctx.lineTo(x + size - radius, y)
-  ctx.quadraticCurveTo(x + size, y, x + size, y + radius)
-  ctx.lineTo(x + size, y + size - radius)
-  ctx.quadraticCurveTo(x + size, y + size, x + size - radius, y + size)
-  ctx.lineTo(x + radius, y + size)
-  ctx.quadraticCurveTo(x, y + size, x, y + size - radius)
-  ctx.lineTo(x, y + radius)
-  ctx.quadraticCurveTo(x, y, x + radius, y)
-  ctx.closePath()
-
-  ctx.fillStyle = color
-  ctx.fill()
-}
-
-/**
- * Easing function for smooth animation
- */
-function easeInOutCubic(t) {
-  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2
-}
+const __dirname = fileURLToPath(new URL('.', import.meta.url))
 
 const startTime = performance.now()
 
@@ -56,7 +19,7 @@ const durationSeconds = 3 // 3 second animation
 const totalFrames = fps * durationSeconds
 const frameDurationUs = Math.round(1_000_000 / fps)
 
-console.log('Canvas Animation Configuration:')
+console.log('Canvas Animation Configuration (HEVC/H.265):')
 console.log(`  Size: ${width}x${height}`)
 console.log(`  FPS: ${fps}`)
 console.log(`  Duration: ${durationSeconds}s`)
@@ -75,7 +38,6 @@ const encoder = new VideoEncoder({
   output: (chunk, meta) => {
     videoChunks.push(chunk)
     videoMetadatas.push(meta)
-    console.log('✅ alphaSideData', meta.alphaSideData?.length)
 
     const count = videoChunks.length
     if (count % 30 === 0 || count === totalFrames) {
@@ -87,16 +49,22 @@ const encoder = new VideoEncoder({
   },
 })
 
-// Configure encoder for VP9 with alpha channel support
+// Configure encoder for HEVC (H.265)
+// HEVC codec string format: hev1.P.T.LL.CC or hvc1.P.T.LL.CC
+// - hev1/hvc1: HEVC codec identifier
+// - P: Profile (1=Main, 2=Main10)
+// - T: Tier and constraints (6=Main tier)
+// - LL: Level (L93=Level 3.1, L120=Level 4.0, L150=Level 5.0)
+// - CC: Constraint flags (B0=no constraints)
 encoder.configure({
-  codec: 'vp09.00.10.08', // VP9 Profile 0, Level 1.0, 8-bit
+  // codec: 'hev1.1.6.L93.B0', // Safari not support
+  codec: 'hvc1.1.6.L93.B0', // Safari compatible hvc1
   width,
   height,
-  bitrate: 2_000_000, // 2 Mbps
+  bitrate: 600_000, // 600 Kbps
   framerate: fps,
-  // https://w3c.github.io/webcodecs/#dom-videoencoderconfig-alpha
-  // Whether the alpha component of the VideoFrame inputs SHOULD be kept or discarded prior to encoding. If alpha is equal to discard, alpha data is always discarded, regardless of a VideoFrame’s format.
-  alpha: 'keep', // Keep alpha channel for transparency, default is 'discard'
+  hardwareAcceleration: 'prefer-hardware', // 'no-preference' | 'prefer-hardware' | 'prefer-software'
+  latencyMode: 'quality', // 'quality' | 'realtime', when set realtime, has_b_frames = 0
 })
 
 console.log('\nRendering and encoding frames...')
@@ -134,8 +102,9 @@ for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
   const lightness = 50 + 10 * easedProgress
   const color = `hsl(${hue}, ${saturation}%, ${lightness}%)`
 
-  // Clear canvas with transparent background
-  ctx.clearRect(0, 0, width, height)
+  // Clear canvas with solid background (HEVC doesn't support alpha in most cases)
+  ctx.fillStyle = '#1a1a2e'
+  ctx.fillRect(0, 0, width, height)
 
   // Add subtle rotation for extra visual interest
   const rotation = (easedProgress * Math.PI) / 6 // Rotate up to 30 degrees
@@ -156,18 +125,11 @@ for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
 
   ctx.restore()
 
-  // Create a VideoFrame from the canvas with alpha preserved
+  // Create a VideoFrame from the canvas
   const timestamp = frameIndex * frameDurationUs
-  // https://w3c.github.io/webcodecs/#videoframe-interface
   const frame = new VideoFrame(canvas, {
     timestamp,
     duration: frameDurationUs,
-    // Whether to preserve the alpha channel in the canvas.
-    // discard: The alpha channel is discarded, and the frame is treated as fully opaque.
-    // keep(default): The alpha channel is preserved.
-    alpha: 'keep',
-    // You can set some or all frames to be transparent.
-    // alpha: frameIndex <= 50 ? 'discard' : 'keep',
   })
 
   // Encode the frame (request keyframe every 1 second)
@@ -185,56 +147,46 @@ encoder.close()
 
 console.log(`\nCollected ${videoChunks.length} chunks`)
 
-// Now create the muxer and add all chunks
-const muxer = new WebMMuxer()
+// Now create the MP4 muxer (MP4 container supports HEVC)
+const muxer = new Mp4Muxer({ fastStart: true })
 
 // Get codec description from the first keyframe's metadata
 const description = videoMetadatas[0]?.decoderConfig?.description
 
-// Add video track with VP9 codec and alpha support
+// Add video track with HEVC codec
 muxer.addVideoTrack({
-  codec: 'vp09.00.10.08',
+  // codec: 'hev1.1.6.L93.B0', // Safari not support
+  codec: 'hvc1.1.6.L93.B0', // Safari compatible hvc1
   width,
   height,
   description,
-  alpha: true, // Enable alpha channel for transparency
 })
 
 console.log('Muxing chunks...')
 
 // Add all chunks to the muxer
-// WebM uses milliseconds for timestamps, so we need to convert from microseconds
 for (let i = 0; i < videoChunks.length; i++) {
   const chunk = videoChunks[i]
-  // Create new chunk with timestamp converted to milliseconds
-  const data = new Uint8Array(chunk.byteLength)
-  chunk.copyTo(data)
-  const convertedChunk = new EncodedVideoChunk({
-    type: chunk.type,
-    timestamp: Math.round(chunk.timestamp / 1000), // Convert µs to ms
-    duration: chunk.duration ? Math.round(chunk.duration / 1000) : undefined,
-    data,
-  })
-  muxer.addVideoChunk(convertedChunk, videoMetadatas[i])
+  muxer.addVideoChunk(chunk, videoMetadatas[i])
 }
 
 // Flush and finalize the muxer
-console.log('Finalizing WebM...')
+console.log('Finalizing MP4...')
 muxer.flush()
-const webmData = muxer.finalize()
+const mp4Data = muxer.finalize()
 muxer.close()
 
 // Write to file
-const outputPath = join(__dirname, 'canvas.webm')
-writeFileSync(outputPath, webmData)
+const outputPath = join(__dirname, 'canvas-hevc.mp4')
+writeFileSync(outputPath, mp4Data)
 
 const endTime = performance.now()
 const duration = ((endTime - startTime) / 1000).toFixed(2)
 
 console.log(`\nVideo saved to: ${outputPath}`)
-console.log(`File size: ${(webmData.byteLength / 1024 / 1024).toFixed(2)} MB`)
+console.log(`File size: ${(mp4Data.byteLength / 1024 / 1024).toFixed(2)} MB`)
 console.log(`Total time: ${duration}s`)
 
-// Verify alpha channel
-console.log('\nTo verify alpha channel, run:')
-console.log(`  ffprobe -v verbose ${outputPath} 2>&1 | grep alpha_mode`)
+// Verify HEVC codec
+console.log('\nTo verify HEVC codec, run:')
+console.log(`  ffprobe -v quiet -show_streams ${outputPath} | grep codec_name`)

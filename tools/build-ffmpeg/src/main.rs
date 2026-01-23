@@ -103,6 +103,7 @@ impl CrossCompileConfig {
     match self.os.as_str() {
       "linux" => "linux",
       "freebsd" => "freebsd",
+      "darwin" => "darwin",
       _ => "linux",
     }
   }
@@ -603,7 +604,19 @@ Cflags: -I${{includedir}}{}
   fn get_as(&self) -> String {
     // If using system CC, check environment variable first
     if self.use_system_cc {
-      return env::var("AS").unwrap_or_else(|_| "as".to_string());
+      if let Ok(as_env) = env::var("AS") {
+        return as_env;
+      }
+      // On macOS, use clang as assembler (Apple's `as` doesn't understand GNU assembly syntax)
+      let is_macos = self
+        .target
+        .as_ref()
+        .map(|t| t.contains("apple-darwin"))
+        .unwrap_or(cfg!(target_os = "macos"));
+      if is_macos {
+        return self.get_cc();
+      }
+      return "as".to_string();
     }
 
     // When using zig, use CC as assembler (zig cc handles .S files)
@@ -634,32 +647,87 @@ Cflags: -I${{includedir}}{}
       .and_then(|t| CrossCompileConfig::from_target(t))
   }
 
+  /// Check if we're doing a native build (target matches host)
+  fn is_native_build(&self) -> bool {
+    let Some(target) = &self.target else {
+      return true; // No target specified means native build
+    };
+
+    // Get host architecture and OS
+    let host_arch = std::env::consts::ARCH;
+    let host_os = std::env::consts::OS;
+
+    // Parse target triple
+    let Some(cross) = CrossCompileConfig::from_target(target) else {
+      return true;
+    };
+
+    // Map host arch to target arch naming
+    let target_arch_matches = matches!(
+      (host_arch, cross.arch.as_str()),
+      ("aarch64", "aarch64")
+        | ("x86_64", "x86_64")
+        | ("arm", "armv7")
+        | ("arm", "arm")
+        | ("x86", "i686")
+        | ("x86", "i386")
+    );
+
+    // Map host OS to target OS naming
+    let target_os_matches = matches!(
+      (host_os, cross.os.as_str()),
+      ("macos", "darwin") | ("linux", "linux") | ("freebsd", "freebsd") | ("windows", "windows")
+    );
+
+    target_arch_matches && target_os_matches
+  }
+
   /// Get common cmake arguments for cross-compilation
   fn cmake_cross_args(&self) -> Vec<String> {
     let mut args = Vec::new();
     if let Some(cross) = self.cross_config() {
-      args.push(format!(
-        "-DCMAKE_SYSTEM_NAME={}",
-        match cross.os.as_str() {
+      // Only set CMAKE_SYSTEM_NAME/CMAKE_SYSTEM_PROCESSOR when truly cross-compiling.
+      // Setting these for native builds makes CMake think it's cross-compiling,
+      // which breaks things like x265 NEON intrinsics detection.
+      if !self.is_native_build() {
+        let system_name = match cross.os.as_str() {
           "linux" => "Linux",
           "freebsd" => "FreeBSD",
+          "darwin" => "Darwin",
           _ => "Linux",
-        }
-      ));
-      args.push(format!("-DCMAKE_SYSTEM_PROCESSOR={}", cross.arch));
+        };
+        args.push(format!("-DCMAKE_SYSTEM_NAME={}", system_name));
+        args.push(format!("-DCMAKE_SYSTEM_PROCESSOR={}", cross.arch));
 
-      // For system CC (GCC cross-toolchain), provide pthread/math hints
-      // to avoid cmake test failures during cross-compilation
-      if self.use_system_cc {
-        // Tell cmake the compiler can link basic executables (skip try_compile tests)
-        args.push("-DCMAKE_C_COMPILER_WORKS=ON".to_string());
-        args.push("-DCMAKE_CXX_COMPILER_WORKS=ON".to_string());
-        // Tell cmake that pthread works (it's built into glibc)
-        args.push("-DTHREADS_PREFER_PTHREAD_FLAG=ON".to_string());
-        // Pre-set pthread test result (0 = success, avoids try_run)
-        args.push("-DTHREADS_PTHREAD_ARG=0".to_string());
-        // Tell cmake not to try running test executables
-        args.push("-DCMAKE_CROSSCOMPILING_EMULATOR=".to_string());
+        // For system CC (GCC cross-toolchain), provide pthread/math hints
+        // to avoid cmake test failures during cross-compilation
+        if self.use_system_cc {
+          // Tell cmake the compiler can link basic executables (skip try_compile tests)
+          args.push("-DCMAKE_C_COMPILER_WORKS=ON".to_string());
+          args.push("-DCMAKE_CXX_COMPILER_WORKS=ON".to_string());
+          // Tell cmake that pthread works (it's built into glibc)
+          args.push("-DTHREADS_PREFER_PTHREAD_FLAG=ON".to_string());
+          // Pre-set pthread test result (0 = success, avoids try_run)
+          args.push("-DTHREADS_PTHREAD_ARG=0".to_string());
+          // Tell cmake not to try running test executables
+          args.push("-DCMAKE_CROSSCOMPILING_EMULATOR=".to_string());
+        }
+      }
+
+      // macOS-specific settings (always set deployment target, even for native builds)
+      if cross.os == "darwin" {
+        // Set deployment target for macOS
+        let deployment_target = env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| {
+          if cross.arch == "aarch64" {
+            "11.0".to_string()
+          } else {
+            "10.13".to_string()
+          }
+        });
+        args.push(format!(
+          "-DCMAKE_OSX_DEPLOYMENT_TARGET={}",
+          deployment_target
+        ));
       }
     }
     args
@@ -810,13 +878,13 @@ Cflags: -I${{includedir}}{}
     }
 
     // Only set AS/CCAS for ARM targets where .S files use the C compiler
-    // For x86, don't override AS so build systems can find nasm
+    // For x86, don't override AS so build systems can find nasm for Intel-syntax .asm files
     let is_arm = self
       .target
       .as_ref()
       .map(|t| t.contains("arm") || t.contains("aarch64"))
       .unwrap_or(false);
-    if is_arm || self.use_system_cc {
+    if is_arm {
       cmd.env("AS", self.get_as());
       cmd.env("CCAS", self.get_as());
     }
@@ -850,7 +918,12 @@ Cflags: -I${{includedir}}{}
     let source_dir_abs = source_dir.canonicalize()?;
 
     let mut cmd = Command::new("cmake");
-    cmd.arg("-G").arg("Unix Makefiles").args(args);
+    cmd.arg("-G").arg("Unix Makefiles");
+
+    // Add policy version minimum for compatibility with older CMakeLists.txt (e.g., x265)
+    cmd.arg("-DCMAKE_POLICY_VERSION_MINIMUM=3.5");
+
+    cmd.args(args);
 
     // Pass CFLAGS/CXXFLAGS to cmake if set in environment
     if let Ok(cflags) = env::var("CFLAGS") {
@@ -869,13 +942,13 @@ Cflags: -I${{includedir}}{}
     cmd.env("RANLIB", self.get_ranlib());
 
     // Only set AS/CCAS for ARM targets where .S files use the C compiler
-    // For x86, don't override AS so build systems can find nasm
+    // For x86, don't override AS so build systems can find nasm for Intel-syntax .asm files
     let is_arm = self
       .target
       .as_ref()
       .map(|t| t.contains("arm") || t.contains("aarch64"))
       .unwrap_or(false);
-    if is_arm || self.use_system_cc {
+    if is_arm {
       cmd.env("AS", self.get_as());
       cmd.env("CCAS", self.get_as());
     }
@@ -911,7 +984,7 @@ Cflags: -I${{includedir}}{}
     let source = self.source_dir.join("zlib");
     self.git_clone(ZLIB_REPO, Some(ZLIB_VERSION), &source)?;
 
-    let build_dir = source.join("build");
+    let build_dir = source.join("_build");
     fs::create_dir_all(&build_dir)?;
 
     let prefix_str = self.prefix.to_string_lossy().to_string();
@@ -996,7 +1069,31 @@ Cflags: -I${{includedir}}{}
     let _ = self.run_command(&mut cmd); // Ignore errors if already fetched
 
     let cmake_source = source.join("source");
-    let multilib_dir = source.join("build").join("multilib");
+
+    // Patch CMakeLists.txt for newer CMake compatibility (CMake 4.0+ doesn't support OLD policies)
+    // x265's CMakeLists.txt uses deprecated cmake_policy(SET ... OLD) calls
+    let cmake_lists = cmake_source.join("CMakeLists.txt");
+    if cmake_lists.exists() {
+      self.info("Patching x265 CMakeLists.txt for CMake compatibility...");
+      let content = fs::read_to_string(&cmake_lists)?;
+      let patched = content
+        // Remove problematic cmake_policy(SET ... OLD) calls
+        .replace(
+          "cmake_policy(SET CMP0025 OLD)",
+          "# cmake_policy(SET CMP0025 OLD) # Removed for CMake 4.0+ compatibility",
+        )
+        .replace(
+          "cmake_policy(SET CMP0054 OLD)",
+          "# cmake_policy(SET CMP0054 OLD) # Removed for CMake 4.0+ compatibility",
+        )
+        // Update minimum version to avoid deprecation warnings
+        .replace(
+          "cmake_minimum_required(VERSION 2.8.8)",
+          "cmake_minimum_required(VERSION 3.10)",
+        );
+      fs::write(&cmake_lists, patched)?;
+    }
+    let multilib_dir = source.join("_build").join("multilib");
 
     // Check if this is armv7 target (assembly doesn't work reliably with cross-compilation)
     let is_armv7 = self
@@ -1004,6 +1101,9 @@ Cflags: -I${{includedir}}{}
       .as_ref()
       .map(|t| t.starts_with("armv7") || t.starts_with("arm-"))
       .unwrap_or(false);
+
+    // Disable assembly only for armv7 (cross-compilation issues)
+    let disable_asm = is_armv7;
 
     // Generate toolchain file once for all builds
     let toolchain = self.generate_cmake_toolchain()?;
@@ -1016,7 +1116,7 @@ Cflags: -I${{includedir}}{}
         "-DENABLE_CLI=OFF".to_string(),
         "-DENABLE_ALPHA=ON".to_string(), // Enable alpha channel encoding support
         "-DCMAKE_POSITION_INDEPENDENT_CODE=ON".to_string(),
-        if is_armv7 {
+        if disable_asm {
           "-DENABLE_ASSEMBLY=OFF".to_string()
         } else {
           "-DENABLE_ASSEMBLY=ON".to_string()
@@ -1246,14 +1346,22 @@ Cflags: -I${{includedir}}
       "--enable-vp9-highbitdepth".to_string(),
     ];
 
-    // Cross-compilation: set libvpx target based on architecture
+    // Cross-compilation: set libvpx target based on architecture and OS
+    // libvpx has specific targets for each platform (linux vs darwin) and needs
+    // the correct darwin version for macOS to generate Mach-O object files
     if let Some(cross) = self.cross_config() {
-      let vpx_target = match cross.arch.as_str() {
-        "aarch64" => "arm64-linux-gcc",
+      let vpx_target = match (cross.arch.as_str(), cross.os.as_str()) {
+        // macOS targets - darwin version corresponds to macOS deployment target
+        // macOS 11.0 = Darwin 20 (first Apple Silicon release)
+        ("aarch64", "darwin") => "arm64-darwin20-gcc",
+        // macOS 10.13 = Darwin 17 (minimum for x86_64)
+        ("x86_64", "darwin") => "x86_64-darwin17-gcc",
+        // Linux targets
+        ("aarch64", _) => "arm64-linux-gcc",
+        ("x86_64", _) => "x86_64-linux-gcc",
         // armv7 uses generic-gnu to avoid -march=armv7-a ASFLAGS issues with zig
         // This uses C implementations instead of ARM assembly, but works reliably
-        "armv7" | "arm" => "generic-gnu",
-        "x86_64" => "x86_64-linux-gcc",
+        ("armv7", _) | ("arm", _) => "generic-gnu",
         _ => "generic-gnu",
       };
       args.push(format!("--target={}", vpx_target));
@@ -1285,7 +1393,7 @@ Cflags: -I${{includedir}}
     let source = self.source_dir.join("aom");
     self.git_clone(AOM_REPO, Some(AOM_BRANCH), &source)?;
 
-    let build_dir = source.join("build");
+    let build_dir = source.join("_build");
     fs::create_dir_all(&build_dir)?;
 
     let prefix_str = self.prefix.to_string_lossy().to_string();
@@ -1395,7 +1503,7 @@ Cflags: -I${{includedir}}
     let source = self.source_dir.join("opus");
     self.git_clone(OPUS_REPO, Some(OPUS_BRANCH), &source)?;
 
-    let build_dir = source.join("build");
+    let build_dir = source.join("_build");
     fs::create_dir_all(&build_dir)?;
 
     let prefix_str = self.prefix.to_string_lossy().to_string();
@@ -1494,7 +1602,7 @@ Cflags: -I${{includedir}}
     let source = self.source_dir.join("ogg");
     self.git_clone(OGG_REPO, Some(OGG_BRANCH), &source)?;
 
-    let build_dir = source.join("build");
+    let build_dir = source.join("_build");
     fs::create_dir_all(&build_dir)?;
 
     let prefix_str = self.prefix.to_string_lossy().to_string();
@@ -1547,7 +1655,7 @@ Cflags: -I${{includedir}}
     let source = self.source_dir.join("vorbis");
     self.git_clone(VORBIS_REPO, Some(VORBIS_BRANCH), &source)?;
 
-    let build_dir = source.join("build");
+    let build_dir = source.join("_build");
     fs::create_dir_all(&build_dir)?;
 
     let prefix_str = self.prefix.to_string_lossy().to_string();
@@ -1643,7 +1751,7 @@ Cflags: -I${{includedir}}
     let source = self.source_dir.join("libwebp");
     self.git_clone(WEBP_REPO, Some(WEBP_BRANCH), &source)?;
 
-    let build_dir = source.join("build");
+    let build_dir = source.join("_build");
     fs::create_dir_all(&build_dir)?;
 
     let prefix_str = self.prefix.to_string_lossy().to_string();
@@ -1724,7 +1832,8 @@ Cflags: -I${{includedir}}
     let source = self.source_dir.join("highway");
     self.git_clone(HIGHWAY_REPO, Some(HIGHWAY_BRANCH), &source)?;
 
-    let build_dir = source.join("build");
+    // Use _build instead of build to avoid conflict with Bazel's BUILD file on case-insensitive filesystems (macOS)
+    let build_dir = source.join("_build");
     fs::create_dir_all(&build_dir)?;
 
     let prefix_str = self.prefix.to_string_lossy().to_string();
@@ -1781,7 +1890,7 @@ Cflags: -I${{includedir}}
     let source = self.source_dir.join("brotli");
     self.git_clone(BROTLI_REPO, Some(BROTLI_BRANCH), &source)?;
 
-    let build_dir = source.join("build");
+    let build_dir = source.join("_build");
     fs::create_dir_all(&build_dir)?;
 
     let prefix_str = self.prefix.to_string_lossy().to_string();
@@ -1925,7 +2034,7 @@ Cflags: -I${{includedir}}
     let source = self.source_dir.join("libjxl");
     self.git_clone(LIBJXL_REPO, Some(LIBJXL_BRANCH), &source)?;
 
-    let build_dir = source.join("build");
+    let build_dir = source.join("_build");
     fs::create_dir_all(&build_dir)?;
 
     let prefix_str = self.prefix.to_string_lossy().to_string();
@@ -2158,6 +2267,50 @@ Cflags: -I${{includedir}}
       }
     }
 
+    // macOS hardware acceleration via VideoToolbox
+    let is_macos = self
+      .target
+      .as_ref()
+      .map(|t| t.contains("apple-darwin"))
+      .unwrap_or(cfg!(target_os = "macos"));
+
+    if is_macos {
+      self.info("Enabling VideoToolbox hardware acceleration...");
+      args.push("--enable-videotoolbox".to_string());
+      args.push("--enable-audiotoolbox".to_string());
+
+      // Get deployment target from env or use defaults
+      let deployment_target = env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| {
+        if self
+          .target
+          .as_ref()
+          .map(|t| t.starts_with("aarch64"))
+          .unwrap_or(false)
+        {
+          "11.0".to_string()
+        } else {
+          "10.13".to_string()
+        }
+      });
+
+      // Add deployment target to compiler flags
+      let extra_cflags = format!(
+        "-I{} -fPIC -mmacosx-version-min={}",
+        include_dir.display(),
+        deployment_target
+      );
+      let extra_ldflags = format!(
+        "-L{} -mmacosx-version-min={}",
+        lib_dir.display(),
+        deployment_target
+      );
+
+      // Update existing cflags/ldflags args
+      args.retain(|a| !a.starts_with("--extra-cflags") && !a.starts_with("--extra-ldflags"));
+      args.push(format!("--extra-cflags={}", extra_cflags));
+      args.push(format!("--extra-ldflags={}", extra_ldflags));
+    }
+
     // Cross-compilation: pass compiler paths explicitly via --cc=, --cxx=, etc.
     // FFmpeg's configure ignores CC/CXX env vars for library tests, so we must use args
     if let Some(cross) = self.cross_config() {
@@ -2332,6 +2485,8 @@ SUPPORTED TARGETS:
     aarch64-unknown-linux-musl
     armv7-unknown-linux-gnueabihf
     x86_64-unknown-freebsd
+    x86_64-apple-darwin
+    aarch64-apple-darwin
 
 ENVIRONMENT VARIABLES (when --use-system-cc is set):
     CC, CXX, AR, RANLIB, AS   Override default compilers/tools
