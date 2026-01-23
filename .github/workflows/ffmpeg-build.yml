@@ -30,7 +30,7 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -89,7 +89,7 @@ jobs:
       VCPKG_DEFAULT_TRIPLET: arm64-windows-static
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Visual Studio environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -101,6 +101,7 @@ jobs:
         with:
           msystem: MSYS
           update: true
+          cache: false
           path-type: inherit
           install: >-
             make
@@ -128,6 +129,14 @@ jobs:
             libwebp:arm64-windows-static `
             zlib:arm64-windows-static `
             libjxl:arm64-windows-static
+
+      # Install cmake 3.x to avoid cmake 4.x policy errors (CMP0025, CMP0054)
+      # x265's CMakeLists.txt uses cmake_policy(SET CMP0025 OLD) which cmake 4.x doesn't support
+      # jwlawson/actions-setup-cmake doesn't support windows-11-arm, but lukka/get-cmake does
+      - name: Setup cmake 3.x
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: '~3.31.0'
 
       - name: Build x265 with alpha support
         shell: pwsh
@@ -503,7 +512,7 @@ jobs:
       RAV1E_VERSION: '0.8.1'
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Visual Studio environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -515,6 +524,7 @@ jobs:
         with:
           msystem: MSYS
           update: true
+          cache: false
           path-type: inherit
           install: >-
             make
@@ -554,6 +564,13 @@ jobs:
             libwebp:x64-windows-static `
             zlib:x64-windows-static `
             libjxl:x64-windows-static
+
+      # Install cmake 3.x to avoid cmake 4.x policy errors (CMP0025, CMP0054)
+      # x265's CMakeLists.txt uses cmake_policy(SET CMP0025 OLD) which cmake 4.x doesn't support
+      - name: Setup cmake 3.x
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: '~3.31.0'
 
       - name: Build x265 with alpha support
         shell: pwsh
@@ -969,7 +986,7 @@ jobs:
             autoconf automake libtool \
             nasm yasm
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup cmake
         uses: jwlawson/actions-setup-cmake@v2
@@ -1035,7 +1052,7 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: '10.13'
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup cmake
         uses: jwlawson/actions-setup-cmake@v2
@@ -1219,7 +1236,7 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: '11.0'
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup cmake
         uses: jwlawson/actions-setup-cmake@v2
