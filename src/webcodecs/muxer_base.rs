@@ -262,6 +262,12 @@ pub struct MuxerInner<F: MuxerFormat> {
   /// Ticks per video frame in stream time base (set after header written)
   /// For 30fps with timescale=57600: ticks_per_frame = 1920
   video_ticks_per_frame: Option<u64>,
+  /// DTS shift for B-frame support (MP4 only)
+  /// FFmpeg requires pts >= dts. For B-frames where pts < dts, we shift all DTS
+  /// values by this amount to satisfy the constraint while preserving timing.
+  video_dts_shift: i64,
+  /// Last written video DTS (to ensure monotonically increasing after shift)
+  last_video_dts: i64,
   /// Phantom data for format type
   _format: PhantomData<F>,
 }
@@ -299,6 +305,8 @@ impl<F: MuxerFormat> MuxerInner<F> {
       last_audio_pts: -1,
       video_frame_count: 0,
       video_ticks_per_frame: None,
+      video_dts_shift: 0,
+      last_video_dts: i64::MIN,
       _format: PhantomData,
     })
   }
@@ -336,6 +344,8 @@ impl<F: MuxerFormat> MuxerInner<F> {
       last_audio_pts: -1,
       video_frame_count: 0,
       video_ticks_per_frame: None,
+      video_dts_shift: 0,
+      last_video_dts: i64::MIN,
       _format: PhantomData,
     })
   }
@@ -609,20 +619,53 @@ impl<F: MuxerFormat> MuxerInner<F> {
     packet.set_pts(pts);
 
     // Container-specific DTS handling:
-    // - MP4: Supports separate PTS/DTS with negative DTS, use encoder's DTS directly.
-    //        However, FFmpeg requires PTS >= DTS, so we adjust PTS if needed.
+    // - MP4: FFmpeg requires pts >= dts at the API level. For B-frames where the encoder
+    //        outputs pts < dts, we apply a dynamic DTS shift to satisfy this constraint.
+    //        With negative_cts_offsets movflag enabled, FFmpeg stores the composition
+    //        offset in CTTS version 1 (signed), preserving the original timing relationship.
     // - MKV/WebM with B-frames: MKV requires both monotonic DTS AND PTS >= DTS.
     //   With B-frames arriving in decode order, we can't satisfy both without reordering.
     //   Solution: Use sequential timestamps for both PTS and DTS, losing B-frame display order.
     // - MKV/WebM without B-frames: DTS = PTS (already monotonically increasing)
     if F::FORMAT == ContainerFormat::Mp4 {
-      // FFmpeg requires PTS >= DTS for all packets. For B-frames, this may not hold.
-      // Adjust PTS to ensure the constraint is satisfied.
-      if pts < dts {
-        packet.set_pts(dts);
-        tracing::trace!(target: "ffmpeg", "adjusted pts from {} to {} to satisfy pts >= dts", pts, dts);
+      // Apply DTS shift to ensure pts >= dts (required by FFmpeg)
+      // The shift is computed dynamically based on the worst-case B-frame we've seen.
+      let mut shifted_dts = dts + self.video_dts_shift;
+
+      // Ensure DTS is monotonically increasing first
+      let min_dts = self.last_video_dts + 1;
+      if shifted_dts < min_dts {
+        shifted_dts = min_dts;
       }
-      packet.set_dts(dts);
+
+      // Now check if pts >= shifted_dts. If not, we need to increase the global shift
+      // for all FUTURE packets. For this packet, we set DTS = PTS to satisfy the constraint.
+      if pts < shifted_dts {
+        // Calculate how much more shift we need globally
+        // This ensures future packets with similar patterns will work
+        let needed_shift = shifted_dts - pts;
+        self.video_dts_shift -= needed_shift;
+        // For this packet, set DTS = PTS (the maximum allowed value)
+        shifted_dts = pts;
+        tracing::trace!(target: "ffmpeg", "B-frame timing conflict: pts={}, dts={}, setting dts=pts and increasing future shift to {}",
+          pts, dts, self.video_dts_shift);
+      }
+
+      // Final monotonicity check - if DTS would go backwards, we have overlapping timestamps
+      // In this case, bump DTS to maintain monotonicity and log warning
+      if shifted_dts <= self.last_video_dts {
+        let old_dts = shifted_dts;
+        shifted_dts = self.last_video_dts + 1;
+        // Also need to adjust PTS to maintain pts >= dts
+        if pts < shifted_dts {
+          packet.set_pts(shifted_dts);
+          tracing::trace!(target: "ffmpeg", "B-frame overlap: adjusted both pts and dts to {} (was pts={}, dts={})",
+            shifted_dts, pts, old_dts);
+        }
+      }
+
+      self.last_video_dts = shifted_dts;
+      packet.set_dts(shifted_dts);
     } else if has_b_frames {
       // For MKV/WebM with B-frames, use sequential timestamps for both PTS and DTS.
       // This ensures:

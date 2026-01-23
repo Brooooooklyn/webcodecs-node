@@ -337,20 +337,21 @@ impl MuxerContext {
 
     if let Some(opts) = options {
       if self.format == ContainerFormat::Mp4 {
+        // negative_cts_offsets: Use CTTS version 1 with signed composition offsets.
+        // This allows proper B-frame timing without destroying PTS/DTS relationship.
+        // Chromium and modern players support signed CTS offsets (int32).
         let movflags = if opts.fragmented {
-          "frag_keyframe+empty_moov+default_base_moof"
+          "frag_keyframe+empty_moov+default_base_moof+negative_cts_offsets"
         } else if opts.fast_start {
-          "faststart"
+          "faststart+negative_cts_offsets"
         } else {
-          ""
+          "negative_cts_offsets"
         };
 
-        if !movflags.is_empty() {
-          let key = CString::new("movflags").unwrap();
-          let value = CString::new(movflags).unwrap();
-          unsafe {
-            crate::ffi::avutil::av_dict_set(&mut dict_ptr, key.as_ptr(), value.as_ptr(), 0);
-          }
+        let key = CString::new("movflags").unwrap();
+        let value = CString::new(movflags).unwrap();
+        unsafe {
+          crate::ffi::avutil::av_dict_set(&mut dict_ptr, key.as_ptr(), value.as_ptr(), 0);
         }
       } else if (self.format == ContainerFormat::WebM || self.format == ContainerFormat::Mkv)
         && opts.live
