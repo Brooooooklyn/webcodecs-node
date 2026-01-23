@@ -1060,11 +1060,12 @@ jobs:
         with:
           cmake-version: '3.x'
 
+      - name: Setup nasm
+        uses: ilammy/setup-nasm@v1
+
       - name: Install build dependencies
         run: |
-          brew install meson ninja nasm yasm autoconf automake libtool pkg-config llvm@20
-          # Add Homebrew bin to PATH so x264/x265 configure can find nasm
-          echo "$(brew --prefix)/bin" >> $GITHUB_PATH
+          brew install meson ninja yasm autoconf automake libtool pkg-config llvm@20
           echo "$(brew --prefix llvm@20)/bin" >> $GITHUB_PATH
 
       - name: Build FFmpeg
