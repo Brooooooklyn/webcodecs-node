@@ -158,7 +158,9 @@ fn get_target_triple(target_os: &str, target_arch: &str, target_env: &str) -> St
       ("x86_64", "musl") => "x86_64-unknown-linux-musl",
       ("aarch64", "gnu") => "aarch64-unknown-linux-gnu",
       ("aarch64", "musl") => "aarch64-unknown-linux-musl",
-      ("arm", "gnueabihf") => "armv7-unknown-linux-gnueabihf",
+      // For armv7-unknown-linux-gnueabihf, CARGO_CFG_TARGET_ENV is "gnu" (not "gnueabihf")
+      // The "gnueabihf" part is the ABI, not the env
+      ("arm", "gnu") => "armv7-unknown-linux-gnueabihf",
       _ => "unknown",
     },
     "windows" => match target_arch {
@@ -195,7 +197,8 @@ fn download_ffmpeg_from_release(
         ("x86_64", "musl") => "x86_64-unknown-linux-musl",
         ("aarch64", "gnu") => "aarch64-unknown-linux-gnu",
         ("aarch64", "musl") => "aarch64-unknown-linux-musl",
-        ("arm", "gnueabihf") => "armv7-unknown-linux-gnueabihf",
+        // For armv7-unknown-linux-gnueabihf, CARGO_CFG_TARGET_ENV is "gnu" (not "gnueabihf")
+        ("arm", "gnu") => "armv7-unknown-linux-gnueabihf",
         _ => return None,
       };
       (t, false)
