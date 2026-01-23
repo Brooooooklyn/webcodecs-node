@@ -456,16 +456,16 @@ Frame reordering is done by the video decoder, not the demuxer.
 
 ```
 Input VideoFrame                 Encoder                    EncodedVideoChunk
-┌──────────────────┐            ┌──────────────────┐       ┌──────────────────┐
-│ timestamp: 33333 │ ────────── │ FFmpeg Encoder   │ ───── │ timestamp_us:    │
-│ (1st frame)      │  (push to  │ (buffers for     │ (pop  │   33333          │
-└──────────────────┘  ts_queue) │  B-frame reorder)│  from │ dts_us: -16667   │
+┌──────────────────┐            ┌──────────────────┐        ┌──────────────────┐
+│ timestamp: 33333 │ ────────── │ FFmpeg Encoder   │ ─────- │ timestamp_us:    │
+│ (1st frame)      │  (push to  │ (buffers for     │ (pop   │   33333          │
+└──────────────────┘  ts_queue) │  B-frame reorder)│  from  │ dts_us: -16667   │
                                 └──────────────────┘  queue)│ original_pts: 0  │
-                                                           └──────────────────┘
+                                                            └──────────────────┘
 
 Input VideoFrame                                           EncodedVideoChunk
 ┌──────────────────┐                                       ┌──────────────────┐
-│ timestamp: 66666 │ ──────────────────────────────────── │ timestamp_us:    │
+│ timestamp: 66666 │ ────────────────────────────────────- │ timestamp_us:    │
 │ (2nd frame)      │                                       │   66666          │
 └──────────────────┘                                       │ dts_us: 0        │
                                                            │ original_pts:    │
@@ -503,10 +503,10 @@ EncodedVideoChunk              Muxer Processing              Written Packet
 ├─────────────────────────────────────────────────────────────┤
 │ Entry Count: N                                              │
 ├─────────────────────────────────────────────────────────────┤
-│ Sample 0: count=1, offset=512   (I-frame: pts > dts)       │
-│ Sample 1: count=1, offset=2048  (P-frame: pts > dts)       │
-│ Sample 2: count=1, offset=512   (P-frame: pts > dts)       │
-│ Sample 3: count=1, offset=-512  (B-frame: pts < dts)       │
+│ Sample 0: count=1, offset=512   (I-frame: pts > dts)        │
+│ Sample 1: count=1, offset=2048  (P-frame: pts > dts)        │
+│ Sample 2: count=1, offset=512   (P-frame: pts > dts)        │
+│ Sample 3: count=1, offset=-512  (B-frame: pts < dts)        │
 │ ...                                                         │
 └─────────────────────────────────────────────────────────────┘
 ```
