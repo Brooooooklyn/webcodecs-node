@@ -73,6 +73,10 @@ void ffctx_set_max_b_frames(AVCodecContext* ctx, int max_b_frames) {
     ctx->max_b_frames = max_b_frames;
 }
 
+void ffctx_set_has_b_frames(AVCodecContext* ctx, int has_b_frames) {
+    ctx->has_b_frames = has_b_frames;
+}
+
 void ffctx_set_time_base(AVCodecContext* ctx, int num, int den) {
     ctx->time_base.num = num;
     ctx->time_base.den = den;

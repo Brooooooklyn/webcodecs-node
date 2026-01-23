@@ -7,7 +7,9 @@ use crate::codec::{
   BitrateMode as CodecBitrateMode, CodecContext, EncoderConfig, EncoderCreationResult, Frame,
   HwDeviceContext, HwFrameConfig, HwFrameContext, Packet, Scaler,
 };
-use crate::ffi::{AVCodecID, AVHWDeviceType, AVPictureType, AVPixelFormat};
+use crate::ffi::{
+  AVCodecID, AVHWDeviceType, AVPictureType, AVPixelFormat, AVRational, avutil::av_rescale_q,
+};
 use crate::webcodecs::error::DOMExceptionName;
 use crate::webcodecs::error::{throw_invalid_state_error, throw_type_error_unit};
 use crate::webcodecs::hw_fallback::{
@@ -268,7 +270,11 @@ impl FromNapiValue for VideoEncoderInit {
 }
 
 /// Threshold for detecting silent encoder failure (no output after N frames)
-const SILENT_FAILURE_THRESHOLD: u32 = 3;
+/// This value should be larger than max_b_frames + 1 because B-frame encoders
+/// need to buffer frames before producing output (not a real failure).
+/// For HEVC with B-pyramid (has_b_frames=2), we need at least 4 frames.
+/// Using 5 to be safe across different encoders and configurations.
+const SILENT_FAILURE_THRESHOLD: u32 = 5;
 
 /// Type alias for weak event listener callback (allows Node.js process to exit)
 type WeakEventListenerCallback =
@@ -423,6 +429,38 @@ struct VideoEncoderInner {
   /// Codec ID for the current encoder configuration
   /// Used to determine codec-specific quantizer mapping
   codec_id: Option<AVCodecID>,
+}
+
+/// Get default GOP settings based on latency mode.
+///
+/// Returns `(gop_size, max_b_frames)` as `Option<u32>`:
+/// - Realtime mode: `Some(10), Some(0)` - Small GOP, no B-frames for low latency
+/// - Quality mode: `None, None` - Let encoder use its optimized defaults
+///
+/// ## Why None for quality mode?
+///
+/// FFmpeg's AVCodecContext defaults are `gop_size=12, max_b_frames=0`, which are
+/// designed for video conferencing, not quality encoding. When we pass `None`,
+/// the codec layer translates this to `-1`, which causes FFmpeg to skip setting
+/// these values, allowing encoders to use their own optimized defaults:
+///
+/// | Encoder      | Default gop_size | Default max_b_frames |
+/// |--------------|------------------|----------------------|
+/// | libx264      | 250              | 3                    |
+/// | libx265      | 250              | 4                    |
+/// | VideoToolbox | (hardware)       | (hardware)           |
+/// | NVENC        | (hardware)       | (hardware)           |
+///
+/// ## Why explicit values for realtime mode?
+///
+/// - Small GOP (10): Ensures frequent keyframes for seeking/recovery
+/// - No B-frames (0): Eliminates encoding latency (B-frames require future frames)
+fn get_default_gop_settings(realtime: bool) -> (Option<u32>, Option<u32>) {
+  if realtime {
+    (Some(10), Some(0)) // Low latency: small GOP, no B-frames
+  } else {
+    (None, None) // Quality mode: let encoder use its optimized defaults
+  }
 }
 
 /// Get the preferred hardware device type for the current platform
@@ -791,8 +829,15 @@ impl VideoEncoder {
     // Release the read lock now that we have an owned frame
     drop(frame_guard);
 
-    // Set frame PTS
-    frame_to_encode.set_pts(timestamp);
+    // Set frame PTS - convert from microseconds to encoder time_base units
+    // FFmpeg expects frame->pts in time_base units, not microseconds
+    let encoder_time_base = guard.context.as_ref().map(|ctx| ctx.time_base());
+    let pts_in_timebase = if let Some(tb) = encoder_time_base {
+      unsafe { av_rescale_q(timestamp, AVRational::MICROSECONDS, tb) }
+    } else {
+      timestamp // fallback to microseconds if no context
+    };
+    frame_to_encode.set_pts(pts_in_timebase);
 
     // Force keyframe if requested via encode options (W3C WebCodecs spec)
     if options.as_ref().is_some_and(|o| o.key_frame == Some(true)) {
@@ -872,15 +917,23 @@ impl VideoEncoder {
 
           if Self::fallback_to_software(&mut guard) {
             // Re-encode all buffered frames with software encoder
+            let sw_encoder_time_base = guard.context.as_ref().map(|ctx| ctx.time_base());
             for (buffered_frame, buffered_ts, _buffered_opts, buffered_rotation, buffered_flip) in
               pending_frames
             {
               let mut frame_to_reencode = buffered_frame;
-              frame_to_reencode.set_pts(buffered_ts);
+              // Convert microseconds to encoder time_base units
+              let pts_in_timebase = if let Some(tb) = sw_encoder_time_base {
+                unsafe { av_rescale_q(buffered_ts, AVRational::MICROSECONDS, tb) }
+              } else {
+                buffered_ts
+              };
+              frame_to_reencode.set_pts(pts_in_timebase);
 
               if let Some(ctx) = guard.context.as_mut()
                 && let Ok(pkts) = ctx.encode(Some(&frame_to_reencode))
               {
+                let enc_tb = ctx.time_base();
                 for packet in pkts {
                   // Extract alpha side data for VP9 alpha support
                   let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
@@ -890,6 +943,7 @@ impl VideoEncoder {
                     packet,
                     Some(buffered_ts),
                     guard.use_avcc_format,
+                    enc_tb,
                   );
 
                   // Create SVC metadata if temporal layers are configured
@@ -1040,15 +1094,23 @@ impl VideoEncoder {
 
             if Self::fallback_to_software(&mut guard) {
               // Re-encode all buffered frames with software encoder
+              let sw_encoder_time_base = guard.context.as_ref().map(|ctx| ctx.time_base());
               for (buffered_frame, buffered_ts, _buffered_opts, buffered_rotation, buffered_flip) in
                 pending_frames
               {
                 let mut frame_to_reencode = buffered_frame;
-                frame_to_reencode.set_pts(buffered_ts);
+                // Convert microseconds to encoder time_base units
+                let pts_in_timebase = if let Some(tb) = sw_encoder_time_base {
+                  unsafe { av_rescale_q(buffered_ts, AVRational::MICROSECONDS, tb) }
+                } else {
+                  buffered_ts
+                };
+                frame_to_reencode.set_pts(pts_in_timebase);
 
                 if let Some(ctx) = guard.context.as_mut()
                   && let Ok(pkts) = ctx.encode(Some(&frame_to_reencode))
                 {
+                  let enc_tb = ctx.time_base();
                   // Process any output packets from re-encoding
                   for packet in pkts {
                     // Extract alpha side data for VP9 alpha support
@@ -1060,6 +1122,7 @@ impl VideoEncoder {
                       packet,
                       Some(buffered_ts),
                       guard.use_avcc_format,
+                      enc_tb,
                     );
 
                     // Create SVC metadata if temporal layers are configured
@@ -1169,6 +1232,13 @@ impl VideoEncoder {
       let _ = Self::fire_dequeue_event(event_state);
     }
 
+    // Get encoder time base for timestamp conversion
+    let encoder_time_base = guard
+      .context
+      .as_ref()
+      .map(|ctx| ctx.time_base())
+      .unwrap_or(AVRational::MICROSECONDS);
+
     // Process output packets - call callback for each
     for packet in packets {
       // Pop timestamp from queue to preserve original input timestamp
@@ -1179,8 +1249,12 @@ impl VideoEncoder {
       let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
       let packet_is_key = packet.is_key();
 
-      let chunk =
-        EncodedVideoChunk::from_packet_with_format(packet, output_timestamp, guard.use_avcc_format);
+      let chunk = EncodedVideoChunk::from_packet_with_format(
+        packet,
+        output_timestamp,
+        guard.use_avcc_format,
+        encoder_time_base,
+      );
 
       // Create SVC metadata if temporal layers are configured
       let svc = create_svc_metadata(guard.temporal_layer_count, guard.output_frame_count);
@@ -1379,6 +1453,13 @@ impl VideoEncoder {
     };
 
     // Queue remaining packets for synchronous delivery in resolver
+    // Get encoder time base for timestamp conversion
+    let encoder_time_base = guard
+      .context
+      .as_ref()
+      .map(|ctx| ctx.time_base())
+      .unwrap_or(AVRational::MICROSECONDS);
+
     for packet in packets {
       // Pop timestamp from queue to preserve original input timestamp
       let output_timestamp = guard.timestamp_queue.pop_front();
@@ -1386,8 +1467,12 @@ impl VideoEncoder {
       let alpha_side_data = extract_alpha_side_data(&packet, guard.use_alpha);
       let packet_is_key = packet.is_key();
 
-      let chunk =
-        EncodedVideoChunk::from_packet_with_format(packet, output_timestamp, guard.use_avcc_format);
+      let chunk = EncodedVideoChunk::from_packet_with_format(
+        packet,
+        output_timestamp,
+        guard.use_avcc_format,
+        encoder_time_base,
+      );
 
       // Create SVC metadata if temporal layers are configured
       let svc = create_svc_metadata(guard.temporal_layer_count, guard.output_frame_count);
@@ -1564,11 +1649,7 @@ impl VideoEncoder {
           };
 
           let realtime = matches!(config.latency_mode, Some(LatencyMode::Realtime));
-          let (gop_size, max_b_frames) = if realtime {
-            (10, 0) // Low latency: small GOP, no B-frames
-          } else {
-            (60, 2) // Quality mode: larger GOP with B-frames
-          };
+          let (gop_size, max_b_frames) = get_default_gop_settings(realtime);
 
           let pixel_format = if guard.use_alpha {
             AVPixelFormat::Yuva420p
@@ -1687,11 +1768,7 @@ impl VideoEncoder {
     };
 
     let realtime = matches!(config.latency_mode, Some(LatencyMode::Realtime));
-    let (gop_size, max_b_frames) = if realtime {
-      (10, 0) // Low latency: small GOP, no B-frames
-    } else {
-      (60, 2) // Quality mode: larger GOP with B-frames
-    };
+    let (gop_size, max_b_frames) = get_default_gop_settings(realtime);
 
     // Determine if alpha channel should be preserved (only VP9 supports alpha)
     // Use parsed codec_id rather than string matching to handle all valid VP9 codec string formats
@@ -1958,10 +2035,8 @@ impl VideoEncoder {
       None => CodecBitrateMode::Constant,
     };
 
-    let (gop_size, max_b_frames) = match config.latency_mode {
-      Some(LatencyMode::Realtime) => (10, 0),
-      _ => (60, 2),
-    };
+    let realtime = matches!(config.latency_mode, Some(LatencyMode::Realtime));
+    let (gop_size, max_b_frames) = get_default_gop_settings(realtime);
 
     // Use the same pixel format (with or without alpha) as the original encoder
     let pixel_format = if inner.use_alpha {
@@ -2467,11 +2542,7 @@ impl VideoEncoder {
 
     // Parse latency mode: "realtime" = low latency, "quality" = default quality mode
     let realtime = matches!(config.latency_mode, Some(LatencyMode::Realtime));
-    let (gop_size, max_b_frames) = if realtime {
-      (10, 0) // Low latency: small GOP, no B-frames
-    } else {
-      (60, 2) // Quality mode: larger GOP with B-frames
-    };
+    let (gop_size, max_b_frames) = get_default_gop_settings(realtime);
 
     // Determine if alpha channel should be preserved
     // Only VP9 supports alpha encoding (YUVA420P pixel format)

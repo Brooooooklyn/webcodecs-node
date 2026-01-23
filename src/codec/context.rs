@@ -3,16 +3,16 @@
 //! Provides encoding and decoding functionality with RAII cleanup.
 
 use crate::ffi::{
-  self, AVCodec, AVCodecContext, AVCodecID, AVHWDeviceType, AVPixelFormat,
+  self, AVCodec, AVCodecContext, AVCodecID, AVHWDeviceType, AVPixelFormat, AVRational,
   accessors::{
     codec_flag, ffctx_get_extradata, ffctx_get_extradata_size, ffctx_get_flags,
     ffctx_get_frame_size, ffctx_get_height, ffctx_get_pix_fmt, ffctx_get_qmax, ffctx_get_qmin,
-    ffctx_get_sample_rate, ffctx_get_width, ffctx_set_bit_rate, ffctx_set_channels,
-    ffctx_set_flags, ffctx_set_framerate, ffctx_set_gop_size, ffctx_set_height,
-    ffctx_set_hw_device_ctx, ffctx_set_level, ffctx_set_max_b_frames, ffctx_set_pix_fmt,
-    ffctx_set_profile, ffctx_set_qmax, ffctx_set_qmin, ffctx_set_rc_buffer_size,
-    ffctx_set_rc_max_rate, ffctx_set_sample_fmt, ffctx_set_sample_rate, ffctx_set_thread_count,
-    ffctx_set_time_base, ffctx_set_width,
+    ffctx_get_sample_rate, ffctx_get_time_base, ffctx_get_width, ffctx_set_bit_rate,
+    ffctx_set_channels, ffctx_set_flags, ffctx_set_framerate, ffctx_set_gop_size,
+    ffctx_set_has_b_frames, ffctx_set_height, ffctx_set_hw_device_ctx, ffctx_set_level,
+    ffctx_set_max_b_frames, ffctx_set_pix_fmt, ffctx_set_profile, ffctx_set_qmax, ffctx_set_qmin,
+    ffctx_set_rc_buffer_size, ffctx_set_rc_max_rate, ffctx_set_sample_fmt, ffctx_set_sample_rate,
+    ffctx_set_thread_count, ffctx_set_time_base, ffctx_set_width,
   },
   avcodec::{
     avcodec_alloc_context3, avcodec_find_decoder, avcodec_find_encoder,
@@ -53,6 +53,17 @@ pub struct DecoderCreationResult {
 pub enum CodecType {
   Encoder,
   Decoder,
+}
+
+/// Result of a receive operation indicating the actual state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiveResult<T> {
+  /// Successfully received data
+  Ok(T),
+  /// Decoder needs more input (EAGAIN)
+  NeedMoreInput,
+  /// End of stream reached (EOF)
+  EndOfStream,
 }
 
 /// Safe wrapper around AVCodecContext
@@ -348,8 +359,18 @@ impl CodecContext {
       );
 
       // GOP settings
-      ffctx_set_gop_size(ctx, config.gop_size as i32);
-      ffctx_set_max_b_frames(ctx, config.max_b_frames as i32);
+      // When None, pass -1 to let encoder use its own default:
+      // - libx264: gop_size=250, max_b_frames=3 (superfast preset)
+      // - libx265: gop_size=250, max_b_frames=3, b-adapt=0 (ultrafast preset)
+      // - VideoToolbox: uses hardware defaults
+      // When Some(value), use the specified value.
+      // Note: FFmpeg's default is gop_size=12, max_b_frames=0, which is not ideal
+      // for quality mode, so we use -1 to let encoders use their optimized defaults.
+      // The actual bframes value depends on the preset set in apply_sw_encoder_options().
+      let gop_size = config.gop_size.map(|v| v as i32).unwrap_or(-1);
+      let max_b_frames = config.max_b_frames.map(|v| v as i32).unwrap_or(-1);
+      ffctx_set_gop_size(ctx, gop_size);
+      ffctx_set_max_b_frames(ctx, max_b_frames);
 
       // Threading
       if config.thread_count > 0 {
@@ -364,17 +385,9 @@ impl CodecContext {
         ffctx_set_level(ctx, level);
       }
 
-      // Configure x265 via x265-params:
-      // - preset=medium: Ensures consistent quality across platforms
-      // - log-level=error: Suppress verbose x265 logging
-      // - qpmax=40: Limit maximum QP to prevent extreme quality degradation
-      //   (default is 69, which allows very low quality in edge cases like single-frame encoding)
-      av_opt_set(
-        ctx as *mut std::ffi::c_void,
-        c"x265-params".as_ptr(),
-        c"preset=medium:log-level=error:qpmax=40".as_ptr(),
-        opt_flag::SEARCH_CHILDREN,
-      );
+      // Note: Encoder-specific options (preset, tune, x265-params, etc.)
+      // should be set via apply_sw_encoder_options() or apply_hw_encoder_options()
+      // after configure_encoder() and before open().
     }
 
     Ok(())
@@ -463,6 +476,13 @@ impl CodecContext {
         }
         // Disable software fallback for consistent hardware behavior
         av_opt_set_int(ctx, c"allow_sw".as_ptr(), 0, opt_flag::SEARCH_CHILDREN);
+        // In quality mode, enable B-frames for better compression
+        // VideoToolbox defaults to 0 B-frames, so we explicitly set it
+        // Note: We use ffctx_set_max_b_frames directly because FFmpeg's vtenc_configure_encoder
+        // checks avctx->max_b_frames > 0 to set has_b_frames, and this must be > 0 for B-frames.
+        if !realtime {
+          ffctx_set_max_b_frames(self.ptr.as_ptr(), 2);
+        }
       }
       // NVENC (NVIDIA)
       else if encoder_name.contains("nvenc") {
@@ -607,11 +627,26 @@ impl CodecContext {
       // Use ultrafast preset which has low latency settings built-in
       // Note: tune=zerolatency causes conflicts (lookahead=0 vs bframes)
       // so we just use ultrafast which is fast enough for real-time
+      //
+      // IMPORTANT: preset must be set via -preset option, NOT in x265-params!
+      // Setting preset in x265-params doesn't properly apply all preset defaults.
+      // ultrafast preset defaults: bframes=3, b-adapt=0, lookahead=5
+      //
+      // x265-params is only for additional parameters:
+      // - log-level=error: Suppress verbose x265 logging to stderr
+      // - qpmax=40: Limit maximum QP to prevent extreme quality degradation
+      //   (x265 default is 69, which can produce very low quality in edge cases)
       else if encoder_name == "libx265" {
         av_opt_set(
           ctx,
           c"preset".as_ptr(),
           c"ultrafast".as_ptr(),
+          opt_flag::SEARCH_CHILDREN,
+        );
+        av_opt_set(
+          ctx,
+          c"x265-params".as_ptr(),
+          c"log-level=error:qpmax=40".as_ptr(),
           opt_flag::SEARCH_CHILDREN,
         );
       }
@@ -738,11 +773,36 @@ impl CodecContext {
         ffctx_set_thread_count(ctx, 0);
       }
 
+      // Set decoder flags
+      let mut flags = 0;
+
       // Low-latency mode (for optimizeForLatency in WebCodecs)
-      // AV_CODEC_FLAG_LOW_DELAY = (1 << 19) = 524288
       // Forces low delay output to reduce buffering
       if config.low_latency {
-        ffi::accessors::ffctx_set_flags(ctx, 1 << 19);
+        flags |= ffi::accessors::codec_flag::LOW_DELAY;
+      }
+
+      // Output even potentially corrupted frames
+      // This ensures we get all frames even if the decoder thinks some are invalid
+      // Important for B-frame content where frame ordering can be complex
+      flags |= ffi::accessors::codec_flag::OUTPUT_CORRUPT;
+
+      if flags != 0 {
+        ffi::accessors::ffctx_set_flags(ctx, flags);
+      }
+
+      // Set flags2: SHOW_ALL ensures all frames are output including B-frames
+      // that might otherwise be held back due to recovery state
+      let flags2 = ffi::accessors::codec_flag2::SHOW_ALL;
+      ffi::accessors::ffctx_set_flags2(ctx, flags2);
+
+      // For H.264 and HEVC, set has_b_frames BEFORE opening the codec
+      // This tells the decoder to allocate a proper reorder buffer for B-frames.
+      // Without this, the decoder may drop frames when reordering is needed.
+      // The value 2 matches what avformat typically sets based on SPS analysis.
+      // Note: This MUST be set before avcodec_open2() for proper buffer allocation.
+      if matches!(config.codec_id, AVCodecID::H264 | AVCodecID::Hevc) {
+        ffctx_set_has_b_frames(ctx, 2);
       }
 
       // TODO: Set extradata if provided
@@ -835,37 +895,70 @@ impl CodecContext {
   /// Returns Ok(true) if packet was accepted, Ok(false) if decoder needs output drained first
   pub fn send_packet(&mut self, packet: Option<&Packet>) -> CodecResult<bool> {
     let pkt_ptr = packet.map(|p| p.as_ptr()).unwrap_or(std::ptr::null());
+    let size = packet.map(|p| p.size()).unwrap_or(0);
+    tracing::debug!("send_packet: ptr={:?}, size={}", !pkt_ptr.is_null(), size);
+
     let ret = unsafe { avcodec_send_packet(self.ptr.as_ptr(), pkt_ptr) };
 
     if ret == AVERROR_EAGAIN {
+      tracing::debug!("send_packet: EAGAIN");
       return Ok(false);
     }
+    if ret == AVERROR_EOF {
+      tracing::debug!("send_packet: EOF");
+    }
     ffi::check_error(ret)?;
+    tracing::debug!("send_packet: accepted");
     Ok(true)
+  }
+
+  /// Receive a decoded frame from the decoder with detailed status
+  ///
+  /// Returns ReceiveResult indicating success, need for more input, or end of stream
+  pub fn receive_frame_with_status(&mut self) -> CodecResult<ReceiveResult<Frame>> {
+    let mut frame = Frame::new()?;
+    let ret = unsafe { avcodec_receive_frame(self.ptr.as_ptr(), frame.as_mut_ptr()) };
+
+    tracing::trace!(
+      "receive_frame_with_status: ret={}, EAGAIN={}, EOF={}",
+      ret,
+      AVERROR_EAGAIN,
+      AVERROR_EOF
+    );
+
+    if ret == AVERROR_EAGAIN {
+      return Ok(ReceiveResult::NeedMoreInput);
+    }
+    if ret == AVERROR_EOF {
+      return Ok(ReceiveResult::EndOfStream);
+    }
+    ffi::check_error(ret)?;
+    Ok(ReceiveResult::Ok(frame))
   }
 
   /// Receive a decoded frame from the decoder
   ///
-  /// Returns Ok(Some(frame)) if a frame is available, Ok(None) if more input needed
+  /// Returns Ok(Some(frame)) if a frame is available, Ok(None) if more input needed or EOF
   pub fn receive_frame(&mut self) -> CodecResult<Option<Frame>> {
-    let mut frame = Frame::new()?;
-    let ret = unsafe { avcodec_receive_frame(self.ptr.as_ptr(), frame.as_mut_ptr()) };
-
-    if ret == AVERROR_EAGAIN || ret == AVERROR_EOF {
-      return Ok(None);
+    match self.receive_frame_with_status()? {
+      ReceiveResult::Ok(frame) => Ok(Some(frame)),
+      ReceiveResult::NeedMoreInput | ReceiveResult::EndOfStream => Ok(None),
     }
-    ffi::check_error(ret)?;
-    Ok(Some(frame))
   }
 
   /// Decode a packet and return all available frames
   pub fn decode(&mut self, packet: Option<&Packet>) -> CodecResult<Vec<Frame>> {
     let mut frames = Vec::new();
 
+    let pkt_pts = packet.map(|p| p.pts()).unwrap_or(-1);
+    tracing::debug!("decode: sending packet with pts={}", pkt_pts);
+
     // Send packet
     if !self.send_packet(packet)? {
+      tracing::debug!("decode: decoder full, draining first");
       // Decoder is full, drain first
       while let Some(frame) = self.receive_frame()? {
+        tracing::debug!("decode: drained frame pts={}", frame.pts());
         frames.push(frame);
       }
       // Retry sending packet
@@ -874,15 +967,87 @@ impl CodecContext {
 
     // Receive all available frames
     while let Some(frame) = self.receive_frame()? {
+      tracing::debug!("decode: received frame pts={}", frame.pts());
       frames.push(frame);
     }
 
+    tracing::debug!("decode: returning {} frames", frames.len());
     Ok(frames)
   }
 
   /// Flush the decoder
+  ///
+  /// Sends NULL packet to enter drain mode and receives all remaining frames.
+  /// For decoders with B-frames, this ensures all reordered frames are output.
+  ///
+  /// FFmpeg drain protocol:
+  /// 1. Send NULL packet with avcodec_send_packet(ctx, NULL) to enter drain mode
+  /// 2. Keep calling avcodec_receive_frame() until AVERROR_EOF
+  /// 3. AVERROR_EOF is the ONLY reliable signal that draining is complete
   pub fn flush_decoder(&mut self) -> CodecResult<Vec<Frame>> {
-    self.decode(None)
+    let mut frames = Vec::new();
+
+    // First, drain any already-decoded frames that are buffered
+    while let Some(frame) = self.receive_frame()? {
+      tracing::debug!("flush_decoder: got pre-drain frame pts={}", frame.pts());
+      frames.push(frame);
+    }
+
+    // Send NULL packet to enter drain mode.
+    // One NULL packet is sufficient - FFmpeg docs state that after sending NULL,
+    // we should keep calling receive_frame() until AVERROR_EOF.
+    let send_result = self.send_packet(None)?;
+    tracing::debug!("flush_decoder: sent NULL packet, accepted={}", send_result);
+
+    // Drain all remaining frames until we get EOF.
+    // CRITICAL: Only exit on AVERROR_EOF, not on EAGAIN.
+    // For B-frame content, the decoder buffers frames for reordering and only
+    // outputs them all when it receives the drain signal (NULL packet).
+    //
+    // Safety: Track consecutive EAGAINs without progress to prevent infinite loops
+    // from buggy decoders. Normal decoders should never return EAGAIN during drain.
+    let mut consecutive_eagain = 0;
+    const MAX_CONSECUTIVE_EAGAIN: u32 = 100;
+
+    loop {
+      match self.receive_frame_with_status()? {
+        ReceiveResult::Ok(frame) => {
+          tracing::debug!("flush_decoder: got drain frame pts={}", frame.pts());
+          frames.push(frame);
+          consecutive_eagain = 0; // Reset on progress
+        }
+        ReceiveResult::NeedMoreInput => {
+          consecutive_eagain += 1;
+          if consecutive_eagain > MAX_CONSECUTIVE_EAGAIN {
+            // This should never happen with a well-behaved decoder.
+            // Log a warning and exit to prevent infinite loop.
+            tracing::warn!(
+              "flush_decoder: exceeded {} consecutive EAGAINs without progress, \
+               decoder may be misbehaving (frames_so_far={})",
+              MAX_CONSECUTIVE_EAGAIN,
+              frames.len()
+            );
+            break;
+          }
+          // EAGAIN during drain mode is unusual but can happen with some decoders.
+          // According to FFmpeg docs, we should continue calling receive_frame()
+          // until we get EOF. The decoder will eventually return EOF when done.
+          tracing::debug!(
+            "flush_decoder: got EAGAIN during drain (attempt {}), continuing",
+            consecutive_eagain
+          );
+          continue;
+        }
+        ReceiveResult::EndOfStream => {
+          tracing::debug!("flush_decoder: got EOF, total frames={}", frames.len());
+          // True EOF - all frames have been output
+          break;
+        }
+      }
+    }
+
+    tracing::debug!("flush_decoder: returning {} frames", frames.len());
+    Ok(frames)
   }
 
   // ========================================================================
@@ -956,6 +1121,16 @@ impl CodecContext {
       } else {
         Some(std::slice::from_raw_parts(ptr, size as usize))
       }
+    }
+  }
+
+  /// Get configured time base
+  pub fn time_base(&self) -> AVRational {
+    unsafe {
+      let mut num: i32 = 0;
+      let mut den: i32 = 0;
+      ffctx_get_time_base(self.as_ptr(), &mut num, &mut den);
+      AVRational::new(num, den)
     }
   }
 }

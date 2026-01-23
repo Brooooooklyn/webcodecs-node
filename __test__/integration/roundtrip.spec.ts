@@ -467,3 +467,236 @@ test('roundtrip: re-encoding (double roundtrip)', async (t) => {
   }
   decoder2.close()
 })
+
+// ============================================================================
+// B-Frame Regression Tests
+// ============================================================================
+
+test('roundtrip: B-frame frame count preservation (quality mode)', async (t) => {
+  // This test verifies that when B-frames are enabled (quality mode),
+  // the decoded frame count equals the input frame count.
+  // This is a regression test for B-frame handling bugs.
+  const width = 320
+  const height = 240
+  const frameCount = 10
+
+  // Create diverse frame sequence to encourage B-frame usage
+  const originalFrames: VideoFrame[] = []
+
+  for (let i = 0; i < frameCount; i++) {
+    const timestamp = i * 33333 // ~30fps
+    // Alternate between different frame types to encourage temporal prediction
+    const frame =
+      i % 3 === 0
+        ? generateSolidColorI420Frame(width, height, TestColors.red, timestamp)
+        : i % 3 === 1
+          ? generateGradientI420Frame(width, height, timestamp)
+          : generateSolidColorI420Frame(width, height, TestColors.blue, timestamp)
+
+    originalFrames.push(frame)
+  }
+
+  // Encode with quality mode (enables B-frames by default)
+  const { encoder, chunks, getDecoderConfig } = createTestEncoder()
+  encoder.configure({
+    ...createEncoderConfig('h264', width, height),
+    latencyMode: 'quality', // Explicitly enable quality mode for B-frames
+  })
+
+  encoder.encode(originalFrames[0], { keyFrame: true })
+  for (let i = 1; i < originalFrames.length; i++) {
+    encoder.encode(originalFrames[i])
+  }
+
+  for (const frame of originalFrames) {
+    frame.close()
+  }
+
+  await encoder.flush()
+  encoder.close()
+
+  t.true(chunks.length > 0, 'Should produce encoded chunks')
+  t.log(`Encoded ${frameCount} frames into ${chunks.length} chunks`)
+
+  // Decode all chunks
+  const { decoder, frames: decodedFrames, errors } = createTestDecoder()
+  const decoderConfig = getDecoderConfig()
+  decoder.configure({
+    ...createDecoderConfig('h264', { codedWidth: width, codedHeight: height }),
+    description: decoderConfig?.description,
+  })
+
+  for (const chunk of chunks) {
+    decoder.decode(chunk)
+  }
+  await decoder.flush()
+
+  t.is(errors.length, 0, 'Should have no decoder errors')
+
+  // CRITICAL ASSERTION: Frame count must be preserved despite B-frame buffering
+  t.is(
+    decodedFrames.length,
+    frameCount,
+    `Decoded frame count (${decodedFrames.length}) must equal input frame count (${frameCount})`,
+  )
+
+  t.log(`Decoded ${decodedFrames.length} frames from ${chunks.length} chunks`)
+
+  // Verify frames are in display order (timestamps should be monotonically increasing)
+  for (let i = 1; i < decodedFrames.length; i++) {
+    t.true(
+      decodedFrames[i].timestamp >= decodedFrames[i - 1].timestamp,
+      `Frame ${i} timestamp (${decodedFrames[i].timestamp}) should be >= frame ${i - 1} (${decodedFrames[i - 1].timestamp})`,
+    )
+  }
+
+  // Cleanup
+  for (const frame of decodedFrames) {
+    frame.close()
+  }
+  decoder.close()
+})
+
+test('roundtrip: B-frame frame count preservation (HEVC quality mode)', async (t) => {
+  // Same test as above but for HEVC codec which also supports B-frames
+  const width = 320
+  const height = 240
+  const frameCount = 10
+
+  const originalFrames: VideoFrame[] = []
+
+  for (let i = 0; i < frameCount; i++) {
+    const timestamp = i * 33333
+    const frame =
+      i % 2 === 0
+        ? generateSolidColorI420Frame(width, height, TestColors.green, timestamp)
+        : generateGradientI420Frame(width, height, timestamp)
+    originalFrames.push(frame)
+  }
+
+  // Encode with quality mode
+  const { encoder, chunks, getDecoderConfig } = createTestEncoder()
+  encoder.configure({
+    ...createEncoderConfig('h265', width, height),
+    latencyMode: 'quality',
+  })
+
+  encoder.encode(originalFrames[0], { keyFrame: true })
+  for (let i = 1; i < originalFrames.length; i++) {
+    encoder.encode(originalFrames[i])
+  }
+
+  for (const frame of originalFrames) {
+    frame.close()
+  }
+
+  await encoder.flush()
+  encoder.close()
+
+  t.true(chunks.length > 0, 'Should produce encoded chunks')
+  t.log(`HEVC: Encoded ${frameCount} frames into ${chunks.length} chunks`)
+
+  // Decode
+  const { decoder, frames: decodedFrames, errors } = createTestDecoder()
+  const decoderConfig = getDecoderConfig()
+  decoder.configure({
+    ...createDecoderConfig('h265', { codedWidth: width, codedHeight: height }),
+    description: decoderConfig?.description,
+  })
+
+  for (const chunk of chunks) {
+    decoder.decode(chunk)
+  }
+  await decoder.flush()
+
+  t.is(errors.length, 0, 'Should have no decoder errors')
+
+  // CRITICAL ASSERTION: Frame count preservation
+  t.is(
+    decodedFrames.length,
+    frameCount,
+    `HEVC decoded frame count (${decodedFrames.length}) must equal input (${frameCount})`,
+  )
+
+  t.log(`HEVC: Decoded ${decodedFrames.length} frames`)
+
+  // Verify display order
+  for (let i = 1; i < decodedFrames.length; i++) {
+    t.true(
+      decodedFrames[i].timestamp >= decodedFrames[i - 1].timestamp,
+      `HEVC frame ${i} should maintain display order`,
+    )
+  }
+
+  // Cleanup
+  for (const frame of decodedFrames) {
+    frame.close()
+  }
+  decoder.close()
+})
+
+test('roundtrip: realtime mode produces same frame count (no B-frames)', async (t) => {
+  // Control test: realtime mode disables B-frames, should also preserve frame count
+  const width = 320
+  const height = 240
+  const frameCount = 10
+
+  const originalFrames: VideoFrame[] = []
+
+  for (let i = 0; i < frameCount; i++) {
+    const timestamp = i * 33333
+    originalFrames.push(generateSolidColorI420Frame(width, height, TestColors.red, timestamp))
+  }
+
+  // Encode with realtime mode (no B-frames)
+  const { encoder, chunks, getDecoderConfig } = createTestEncoder()
+  encoder.configure({
+    ...createEncoderConfig('h264', width, height),
+    latencyMode: 'realtime', // Disables B-frames
+  })
+
+  encoder.encode(originalFrames[0], { keyFrame: true })
+  for (let i = 1; i < originalFrames.length; i++) {
+    encoder.encode(originalFrames[i])
+  }
+
+  for (const frame of originalFrames) {
+    frame.close()
+  }
+
+  await encoder.flush()
+  encoder.close()
+
+  t.true(chunks.length > 0, 'Should produce encoded chunks')
+  t.log(`Realtime mode: Encoded ${frameCount} frames into ${chunks.length} chunks`)
+
+  // Decode
+  const { decoder, frames: decodedFrames, errors } = createTestDecoder()
+  const decoderConfig = getDecoderConfig()
+  decoder.configure({
+    ...createDecoderConfig('h264', { codedWidth: width, codedHeight: height }),
+    description: decoderConfig?.description,
+  })
+
+  for (const chunk of chunks) {
+    decoder.decode(chunk)
+  }
+  await decoder.flush()
+
+  t.is(errors.length, 0, 'Should have no decoder errors')
+
+  // Frame count should be preserved in realtime mode too
+  t.is(
+    decodedFrames.length,
+    frameCount,
+    `Realtime mode decoded count (${decodedFrames.length}) must equal input (${frameCount})`,
+  )
+
+  t.log(`Realtime mode: Decoded ${decodedFrames.length} frames`)
+
+  // Cleanup
+  for (const frame of decodedFrames) {
+    frame.close()
+  }
+  decoder.close()
+})

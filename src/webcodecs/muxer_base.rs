@@ -88,6 +88,7 @@ pub struct StoredVideoTrackInfo {
   pub codec: String,
   pub width: u32,
   pub height: u32,
+  pub framerate: f64,
 }
 
 /// Stored audio track info (extracted from config)
@@ -182,6 +183,7 @@ pub struct GenericVideoTrackConfig {
   pub codec_id: AVCodecID,
   pub width: u32,
   pub height: u32,
+  pub framerate: f64,
   pub extradata: Option<Vec<u8>>,
   /// Whether this track has alpha channel (VP9 alpha support)
   pub has_alpha: bool,
@@ -246,12 +248,26 @@ pub struct MuxerInner<F: MuxerFormat> {
   pub streaming_handle: Option<StreamingBufferHandle>,
   /// Whether streaming mode is enabled
   pub is_streaming: bool,
-  /// Format-specific options holder
+  /// Format-specific options holder (without fast_start - that's handled separately)
   pub muxer_options: MuxerOptions,
+  /// Whether to apply fastStart post-processing (MP4 only)
+  /// We handle this ourselves because FFmpeg's faststart doesn't work with custom I/O
+  apply_faststart: bool,
   /// Last video PTS written (to ensure monotonically increasing)
   last_video_pts: i64,
   /// Last audio PTS written (to ensure monotonically increasing)
   last_audio_pts: i64,
+  /// Video frame counter (for precise PTS calculation)
+  video_frame_count: u64,
+  /// Ticks per video frame in stream time base (set after header written)
+  /// For 30fps with timescale=57600: ticks_per_frame = 1920
+  video_ticks_per_frame: Option<u64>,
+  /// DTS shift for B-frame support (MP4 only)
+  /// FFmpeg requires pts >= dts. For B-frames where pts < dts, we shift all DTS
+  /// values by this amount to satisfy the constraint while preserving timing.
+  video_dts_shift: i64,
+  /// Last written video DTS (to ensure monotonically increasing after shift)
+  last_video_dts: i64,
   /// Phantom data for format type
   _format: PhantomData<F>,
 }
@@ -266,6 +282,16 @@ impl<F: MuxerFormat> MuxerInner<F> {
       )
     })?;
 
+    // Extract fast_start option - we handle this ourselves via post-processing
+    // because FFmpeg's faststart doesn't work with custom I/O contexts
+    let apply_faststart = options.fast_start && F::FORMAT == ContainerFormat::Mp4;
+
+    // Create options for FFmpeg without fast_start (we'll apply it in post-processing)
+    let ffmpeg_options = MuxerOptions {
+      fast_start: false, // Never pass to FFmpeg - we handle it ourselves
+      ..options
+    };
+
     Ok(Self {
       muxer,
       state: MuxerState::ConfiguringTracks,
@@ -273,9 +299,14 @@ impl<F: MuxerFormat> MuxerInner<F> {
       audio_track_info: None,
       streaming_handle: None,
       is_streaming: false,
-      muxer_options: options,
+      muxer_options: ffmpeg_options,
+      apply_faststart,
       last_video_pts: -1,
       last_audio_pts: -1,
+      video_frame_count: 0,
+      video_ticks_per_frame: None,
+      video_dts_shift: 0,
+      last_video_dts: i64::MIN,
       _format: PhantomData,
     })
   }
@@ -293,6 +324,13 @@ impl<F: MuxerFormat> MuxerInner<F> {
     // Get the streaming handle
     let streaming_handle = muxer.get_streaming_handle();
 
+    // Note: fastStart is not supported in streaming mode - it requires the complete
+    // file to rearrange atoms. Use fragmented MP4 for streaming instead.
+    let ffmpeg_options = MuxerOptions {
+      fast_start: false, // Not supported in streaming mode
+      ..options
+    };
+
     Ok(Self {
       muxer,
       state: MuxerState::ConfiguringTracks,
@@ -300,9 +338,14 @@ impl<F: MuxerFormat> MuxerInner<F> {
       audio_track_info: None,
       streaming_handle,
       is_streaming: true,
-      muxer_options: options,
+      muxer_options: ffmpeg_options,
+      apply_faststart: false, // Never apply in streaming mode
       last_video_pts: -1,
       last_audio_pts: -1,
+      video_frame_count: 0,
+      video_ticks_per_frame: None,
+      video_dts_shift: 0,
+      last_video_dts: i64::MIN,
       _format: PhantomData,
     })
   }
@@ -330,13 +373,35 @@ impl<F: MuxerFormat> MuxerInner<F> {
       AVPixelFormat::Yuv420p
     };
 
+    // Calculate time_base for precise timing using FFmpeg's algorithm:
+    // Start with fps as timescale, then double until >= 10000
+    // This ensures millisecond-level precision while keeping timescale reasonable
+    // For 30fps: 30 -> 60 -> 120 -> 240 -> 480 -> 960 -> 1920 -> 3840 -> 7680 -> 15360
+    let time_base = if config.framerate > 0.0 && config.framerate.is_finite() {
+      let fps = config.framerate;
+      const MIN_FPS: f64 = 1.0;
+      if fps >= MIN_FPS {
+        // FFmpeg's algorithm: double until >= 10000
+        let mut timescale = fps.round() as i32;
+        while timescale < 10000 {
+          timescale *= 2;
+        }
+        AVRational::new(1, timescale)
+      } else {
+        // Fallback to microseconds for very low framerates
+        AVRational::MICROSECONDS
+      }
+    } else {
+      AVRational::MICROSECONDS
+    };
+
     // Create video stream config
     let stream_config = VideoStreamConfig {
       codec_id: config.codec_id,
       width: config.width,
       height: config.height,
       pixel_format,
-      time_base: AVRational::MICROSECONDS,
+      time_base,
       bitrate: None,
       extradata: config.extradata,
     };
@@ -352,6 +417,7 @@ impl<F: MuxerFormat> MuxerInner<F> {
       codec: config.codec,
       width: config.width,
       height: config.height,
+      framerate: config.framerate,
     });
 
     Ok(())
@@ -414,6 +480,21 @@ impl<F: MuxerFormat> MuxerInner<F> {
           )
         })?;
       self.state = MuxerState::Muxing;
+
+      // Calculate ticks per frame for precise PTS calculation
+      // This avoids floating point cumulative errors
+      if let (Some(tb), Some(track_info)) = (self.muxer.video_time_base(), &self.video_track_info) {
+        // ticks_per_frame = time_base_den / fps
+        // For 30fps with tb=1/57600: ticks_per_frame = 57600 / 30 = 1920
+        let fps = track_info.framerate;
+        // Use minimum fps threshold to avoid extremely large tick values from division
+        // 1.0 fps is a reasonable lower bound for any practical video
+        // Also check is_finite() to guard against NaN/Infinity
+        const MIN_FPS: f64 = 1.0;
+        if fps.is_finite() && fps >= MIN_FPS {
+          self.video_ticks_per_frame = Some((tb.den as f64 / fps).round() as u64);
+        }
+      }
     }
     Ok(())
   }
@@ -440,10 +521,19 @@ impl<F: MuxerFormat> MuxerInner<F> {
       ));
     }
 
+    // Always increment frame counter at start to ensure it stays in sync
+    // regardless of which code path is taken (B-frame, non-B-frame, or fallback).
+    // This fixes issues when mixing encoder chunks (with DTS) and JS API chunks (without DTS).
+    self.video_frame_count += 1;
+
     // Get chunk data and metadata
     let chunk_type = chunk.chunk_type()?;
     let timestamp = chunk.timestamp()?;
     let duration = chunk.duration()?;
+    // Get internal DTS if available (for B-frame support)
+    let chunk_dts = chunk.dts()?;
+    // Get original PTS from encoder (for B-frame support)
+    let chunk_original_pts = chunk.original_pts()?;
 
     // Get packet using optimized path:
     // - If chunk has Packet (from encoder): shallow_clone shares buffer (zero-copy)
@@ -453,19 +543,153 @@ impl<F: MuxerFormat> MuxerInner<F> {
     // Set packet properties
     packet.set_stream_index(video_index);
 
-    // Ensure monotonically increasing PTS (video time base is microseconds)
-    let pts = if timestamp <= self.last_video_pts {
-      self.last_video_pts + 1
-    } else {
-      timestamp
-    };
-    self.last_video_pts = pts;
+    // Track whether we have B-frames (encoder provides both original_pts and dts)
+    let has_b_frames = chunk_original_pts.is_some() && chunk_dts.is_some();
 
+    // Calculate PTS/DTS for the packet
+    // For B-frames: use original_pts and dts_us from encoder (already correct)
+    // For non-B-frames: use frame counter for precise timing
+    let (pts, dts, dur) = if let (Some(orig_pts), Some(orig_dts)) = (chunk_original_pts, chunk_dts)
+    {
+      // B-frames present: scale original PTS and DTS directly from encoder
+      // The encoder already computed correct PTS/DTS relationship
+      if let Some(dst_tb) = self.muxer.video_time_base() {
+        use crate::ffi::AVRational;
+        let src_tb = AVRational::MICROSECONDS;
+        use crate::ffi::avutil::av_rescale_q;
+
+        // Scale both PTS and DTS from microseconds to target timebase
+        let scaled_pts = unsafe { av_rescale_q(orig_pts, src_tb, dst_tb) };
+        let scaled_dts = unsafe { av_rescale_q(orig_dts, src_tb, dst_tb) };
+
+        // For B-frame videos, don't apply any offset - let FFmpeg handle negative DTS
+        // FFmpeg's MP4 muxer will automatically create an edit list (edts atom) when
+        // it detects negative DTS, which tells players the correct start time.
+        //
+        // If we manually shift timestamps to make DTS >= 0, we lose the original
+        // timing relationship and start_time won't be 0.
+        let final_pts = scaled_pts;
+        let final_dts = scaled_dts;
+
+        // Calculate duration from ticks_per_frame or from chunk duration
+        let dur = if let Some(tpf) = self.video_ticks_per_frame {
+          tpf as i64
+        } else {
+          duration
+            .map(|d| unsafe { av_rescale_q(d, src_tb, dst_tb) })
+            .unwrap_or(0)
+        };
+
+        (final_pts, final_dts, dur)
+      } else {
+        // Fallback: use original values
+        (orig_pts, orig_dts, duration.unwrap_or(0))
+      }
+    } else if let Some(ticks_per_frame) = self.video_ticks_per_frame {
+      // No B-frames: use frame counter for precise timing
+      // Use (video_frame_count - 1) since we already incremented at function start
+      let frame_idx = self.video_frame_count - 1;
+      let pts = (frame_idx * ticks_per_frame) as i64;
+      (pts, pts, ticks_per_frame as i64)
+    } else {
+      // Fallback: convert from microseconds (may have precision loss)
+      let pts = if timestamp <= self.last_video_pts {
+        self.last_video_pts + 1
+      } else {
+        timestamp
+      };
+      self.last_video_pts = pts;
+
+      // Convert timestamps from microseconds to stream time base
+      if let Some(dst_tb) = self.muxer.video_time_base() {
+        use crate::ffi::AVRational;
+        let src_tb = AVRational::MICROSECONDS; // 1/1000000
+        use crate::ffi::avutil::av_rescale_q;
+        let scaled_pts = unsafe { av_rescale_q(pts, src_tb, dst_tb) };
+        let scaled_dur = duration
+          .map(|d| unsafe { av_rescale_q(d, src_tb, dst_tb) })
+          .unwrap_or(0);
+        (scaled_pts, scaled_pts, scaled_dur)
+      } else {
+        (pts, pts, duration.unwrap_or(0))
+      }
+    };
+
+    tracing::trace!(target: "ffmpeg", "video packet: pts={}, dts={}, dur={}", pts, dts, dur);
     packet.set_pts(pts);
-    packet.set_dts(pts);
-    if let Some(dur) = duration {
-      packet.set_duration(dur);
+
+    // Container-specific DTS handling:
+    // - MP4: FFmpeg requires pts >= dts at the API level. For B-frames where the encoder
+    //        outputs pts < dts, we apply a dynamic DTS shift to satisfy this constraint.
+    //        With negative_cts_offsets movflag enabled, FFmpeg stores the composition
+    //        offset in CTTS version 1 (signed), preserving the original timing relationship.
+    // - MKV/WebM with B-frames: MKV requires both monotonic DTS AND PTS >= DTS.
+    //   With B-frames arriving in decode order, we can't satisfy both without reordering.
+    //   Solution: Use sequential timestamps for both PTS and DTS, losing B-frame display order.
+    // - MKV/WebM without B-frames: DTS = PTS (already monotonically increasing)
+    if F::FORMAT == ContainerFormat::Mp4 {
+      // Apply DTS shift to ensure pts >= dts (required by FFmpeg)
+      // The shift is computed dynamically based on the worst-case B-frame we've seen.
+      let mut shifted_dts = dts + self.video_dts_shift;
+
+      // Ensure DTS is monotonically increasing first
+      let min_dts = self.last_video_dts + 1;
+      if shifted_dts < min_dts {
+        shifted_dts = min_dts;
+      }
+
+      // Now check if pts >= shifted_dts. If not, we need to increase the global shift
+      // for all FUTURE packets. For this packet, we set DTS = PTS to satisfy the constraint.
+      if pts < shifted_dts {
+        // Calculate how much more shift we need globally
+        // This ensures future packets with similar patterns will work
+        let needed_shift = shifted_dts - pts;
+        self.video_dts_shift -= needed_shift;
+        // For this packet, set DTS = PTS (the maximum allowed value)
+        shifted_dts = pts;
+        tracing::trace!(target: "ffmpeg", "B-frame timing conflict: pts={}, dts={}, setting dts=pts and increasing future shift to {}",
+          pts, dts, self.video_dts_shift);
+      }
+
+      // Final monotonicity check - if DTS would go backwards, we have overlapping timestamps
+      // In this case, bump DTS to maintain monotonicity and log warning
+      if shifted_dts <= self.last_video_dts {
+        let old_dts = shifted_dts;
+        shifted_dts = self.last_video_dts + 1;
+        // Also need to adjust PTS to maintain pts >= dts
+        if pts < shifted_dts {
+          packet.set_pts(shifted_dts);
+          tracing::trace!(target: "ffmpeg", "B-frame overlap: adjusted both pts and dts to {} (was pts={}, dts={})",
+            shifted_dts, pts, old_dts);
+        }
+      }
+
+      self.last_video_dts = shifted_dts;
+      packet.set_dts(shifted_dts);
+    } else if has_b_frames {
+      // For MKV/WebM with B-frames, use sequential timestamps for both PTS and DTS.
+      // This ensures:
+      // 1. DTS is monotonically increasing
+      // 2. PTS >= DTS (PTS == DTS)
+      // Trade-off: B-frames display at decode time, not original display time.
+      // This is acceptable for MKV/WebM where B-frame timing is less critical.
+      // Use (video_frame_count - 1) since we already incremented at function start
+      let frame_idx = self.video_frame_count - 1;
+      let sequential_ts = if let Some(tpf) = self.video_ticks_per_frame {
+        (frame_idx as i64) * (tpf as i64)
+      } else {
+        // If no ticks_per_frame, use frame count with default ~33333µs (~30fps)
+        // Time base is microseconds when ticks_per_frame is None
+        (frame_idx as i64) * 33333
+      };
+      // Override PTS to match DTS for MKV B-frame compatibility
+      packet.set_pts(sequential_ts);
+      packet.set_dts(sequential_ts);
+    } else {
+      // No B-frames: DTS = PTS is already correct and monotonically increasing
+      packet.set_dts(dts);
     }
+    packet.set_duration(dur);
 
     // Set keyframe flag
     if chunk_type == EncodedVideoChunkType::Key {
@@ -560,7 +784,7 @@ impl<F: MuxerFormat> MuxerInner<F> {
     self.last_audio_pts = pts;
 
     packet.set_pts(pts);
-    packet.set_dts(pts);
+    packet.set_dts(pts); // Audio has no B-frames, DTS always equals PTS
 
     if let Some(dur) = duration {
       let duration_in_samples = dur * sample_rate / 1_000_000;
@@ -645,10 +869,17 @@ impl<F: MuxerFormat> MuxerInner<F> {
     }
 
     // In buffer mode, return the complete buffer
-    let data = self
+    let mut data = self
       .muxer
       .take_buffer()
       .ok_or_else(|| Error::new(Status::GenericFailure, "Failed to get output buffer"))?;
+
+    // Apply fastStart post-processing if requested (MP4 only)
+    // This moves the moov atom to the beginning of the file for faster streaming playback.
+    // We do this ourselves because FFmpeg's faststart option doesn't work with custom I/O.
+    if self.apply_faststart {
+      data = crate::codec::mp4_faststart::apply_faststart(data);
+    }
 
     Ok(data)
   }

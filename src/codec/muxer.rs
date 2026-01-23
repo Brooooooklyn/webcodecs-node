@@ -9,8 +9,8 @@ use crate::ffi::accessors::{
   ffcodecpar_set_bit_rate, ffcodecpar_set_channels, ffcodecpar_set_codec_id,
   ffcodecpar_set_codec_type, ffcodecpar_set_extradata, ffcodecpar_set_format,
   ffcodecpar_set_frame_size, ffcodecpar_set_height, ffcodecpar_set_sample_rate,
-  ffcodecpar_set_width, fffmt_get_oformat_flags, fffmt_set_pb, ffstream_get_codecpar,
-  ffstream_get_index, ffstream_set_time_base,
+  ffcodecpar_set_width, fffmt_get_oformat_flags, fffmt_get_stream, fffmt_set_pb,
+  ffstream_get_codecpar, ffstream_get_index, ffstream_get_time_base, ffstream_set_time_base,
 };
 use crate::ffi::avformat::{
   AVFormatContext, av_interleaved_write_frame, av_write_trailer, avfmt_flag,
@@ -337,20 +337,21 @@ impl MuxerContext {
 
     if let Some(opts) = options {
       if self.format == ContainerFormat::Mp4 {
+        // negative_cts_offsets: Use CTTS version 1 with signed composition offsets.
+        // This allows proper B-frame timing without destroying PTS/DTS relationship.
+        // Chromium and modern players support signed CTS offsets (int32).
         let movflags = if opts.fragmented {
-          "frag_keyframe+empty_moov+default_base_moof"
+          "frag_keyframe+empty_moov+default_base_moof+negative_cts_offsets"
         } else if opts.fast_start {
-          "faststart"
+          "faststart+negative_cts_offsets"
         } else {
-          ""
+          "negative_cts_offsets"
         };
 
-        if !movflags.is_empty() {
-          let key = CString::new("movflags").unwrap();
-          let value = CString::new(movflags).unwrap();
-          unsafe {
-            crate::ffi::avutil::av_dict_set(&mut dict_ptr, key.as_ptr(), value.as_ptr(), 0);
-          }
+        let key = CString::new("movflags").unwrap();
+        let value = CString::new(movflags).unwrap();
+        unsafe {
+          crate::ffi::avutil::av_dict_set(&mut dict_ptr, key.as_ptr(), value.as_ptr(), 0);
         }
       } else if (self.format == ContainerFormat::WebM || self.format == ContainerFormat::Mkv)
         && opts.live
@@ -488,6 +489,25 @@ impl MuxerContext {
   /// Get audio stream index
   pub fn audio_stream_index(&self) -> Option<i32> {
     self.audio_stream_index
+  }
+
+  /// Get video stream time_base (after header is written)
+  /// Returns None if no video stream or header not written yet
+  pub fn video_time_base(&self) -> Option<AVRational> {
+    if !self.header_written {
+      return None;
+    }
+    let stream_idx = self.video_stream_index?;
+    unsafe {
+      let stream = fffmt_get_stream(self.ptr.as_ptr(), stream_idx as u32);
+      if stream.is_null() {
+        return None;
+      }
+      let mut num: i32 = 0;
+      let mut den: i32 = 0;
+      ffstream_get_time_base(stream, &mut num, &mut den);
+      Some(AVRational::new(num, den))
+    }
   }
 
   /// Check if header has been written

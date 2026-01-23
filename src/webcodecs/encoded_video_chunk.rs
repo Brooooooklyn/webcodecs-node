@@ -4,6 +4,7 @@
 //! See: https://developer.mozilla.org/en-US/docs/Web/API/EncodedVideoChunk
 
 use crate::codec::Packet;
+use crate::ffi::{AVRational, avutil::av_rescale_q};
 use crate::webcodecs::error::{enforce_range_long_long, enforce_range_long_long_optional};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -213,6 +214,14 @@ pub(crate) struct EncodedVideoChunkInner {
   pub(crate) chunk_type: EncodedVideoChunkType,
   pub(crate) timestamp_us: i64,
   pub(crate) duration_us: Option<i64>,
+  /// Internal decode timestamp (DTS) for B-frame support.
+  /// Not exposed via WebCodecs API, but used internally for correct muxing.
+  /// When None, DTS equals PTS (no B-frames or unknown).
+  pub(crate) dts_us: Option<i64>,
+  /// Original PTS from encoder packet (in encoder time_base units).
+  /// Used alongside dts_us for correct B-frame muxing.
+  /// When Some, muxer should use this pair instead of timestamp_us.
+  pub(crate) original_pts: Option<i64>,
 }
 
 // SAFETY: EncodedVideoChunkInner can be safely sent and shared between threads.
@@ -249,6 +258,8 @@ impl EncodedVideoChunk {
       chunk_type: init.chunk_type,
       timestamp_us: init.timestamp,
       duration_us: init.duration,
+      dts_us: None,       // No DTS info from JS API
+      original_pts: None, // No original PTS from JS API
     };
 
     Ok(Self {
@@ -258,10 +269,15 @@ impl EncodedVideoChunk {
 
   /// Create from internal Packet with optional AVCC conversion
   /// If use_avcc is true, converts from Annex B to AVCC format (length-prefixed NALUs)
+  ///
+  /// The encoder_time_base parameter is the encoder's time_base (e.g., 1/30 for 30fps).
+  /// Packet timestamps (pts, dts, duration) are in encoder time_base units and must be
+  /// converted to microseconds for the WebCodecs API.
   pub fn from_packet_with_format(
     packet: Packet,
     explicit_timestamp: Option<i64>,
     use_avcc: bool,
+    encoder_time_base: AVRational,
   ) -> Self {
     let chunk_type = if packet.is_key() {
       EncodedVideoChunkType::Key
@@ -270,7 +286,40 @@ impl EncodedVideoChunk {
     };
 
     let packet_pts = packet.pts();
+    let packet_dts = packet.dts();
     let packet_duration = packet.duration();
+
+    // Target time base is microseconds (1/1000000)
+    let dst_tb = AVRational::MICROSECONDS;
+
+    // Extract DTS and original PTS for proper B-frame support
+    // AV_NOPTS_VALUE is i64::MIN in FFmpeg
+    const AV_NOPTS_VALUE: i64 = i64::MIN;
+
+    // Convert DTS from encoder time_base to microseconds
+    // Always store DTS if valid (even if equal to PTS)
+    // This ensures consistent handling in muxer for all frames
+    let dts_us = if packet_dts != AV_NOPTS_VALUE {
+      Some(unsafe { av_rescale_q(packet_dts, encoder_time_base, dst_tb) })
+    } else {
+      None
+    };
+
+    // Convert PTS from encoder time_base to microseconds
+    // Always store original PTS if valid (independent of DTS)
+    // This allows muxer to reconstruct correct PTS/DTS relationship
+    let original_pts = if packet_pts != AV_NOPTS_VALUE {
+      Some(unsafe { av_rescale_q(packet_pts, encoder_time_base, dst_tb) })
+    } else {
+      None
+    };
+
+    // Convert duration from encoder time_base to microseconds
+    let duration_us = if packet_duration > 0 {
+      Some(unsafe { av_rescale_q(packet_duration, encoder_time_base, dst_tb) })
+    } else {
+      None
+    };
 
     let data = if use_avcc {
       Either::A(convert_annexb_to_avcc(packet.as_slice()))
@@ -281,13 +330,13 @@ impl EncodedVideoChunk {
     let inner = EncodedVideoChunkInner {
       data,
       chunk_type,
-      // Use explicit timestamp if provided, otherwise fall back to packet PTS
-      timestamp_us: explicit_timestamp.unwrap_or(packet_pts),
-      duration_us: if packet_duration > 0 {
-        Some(packet_duration)
-      } else {
-        None
-      },
+      // Use explicit timestamp if provided (already in microseconds),
+      // otherwise fall back to original_pts (which already handles AV_NOPTS_VALUE),
+      // and finally default to 0 if neither is available
+      timestamp_us: explicit_timestamp.or(original_pts).unwrap_or(0),
+      duration_us,
+      dts_us,
+      original_pts,
     };
 
     Self {
@@ -311,6 +360,20 @@ impl EncodedVideoChunk {
   #[napi(getter)]
   pub fn duration(&self) -> Result<Option<i64>> {
     self.with_inner(|inner| Ok(inner.duration_us))
+  }
+
+  /// Get the internal decode timestamp (DTS) in microseconds.
+  /// This is NOT part of the WebCodecs API, but used internally for B-frame support.
+  /// Returns None if DTS equals PTS (no B-frames).
+  pub(crate) fn dts(&self) -> Result<Option<i64>> {
+    self.with_inner(|inner| Ok(inner.dts_us))
+  }
+
+  /// Get the original PTS from encoder packet (in encoder time_base units).
+  /// This is NOT part of the WebCodecs API, but used internally for B-frame support.
+  /// Returns None if no B-frames or chunk was created from JS API.
+  pub(crate) fn original_pts(&self) -> Result<Option<i64>> {
+    self.with_inner(|inner| Ok(inner.original_pts))
   }
 
   /// Get the byte length of the encoded data
@@ -590,25 +653,60 @@ pub fn is_avcc_format(data: &[u8]) -> bool {
   // Check if data[3] is part of length or a NAL header
   // If 00 00 01 XX where XX is a valid NAL header AND length doesn't make sense, it's Annex B
   if data[0] == 0 && data[1] == 0 && data[2] == 1 {
-    // This could be 3-byte Annex B (00 00 01 <NAL>) or AVCC with length 0x000001XX
-    // Check if interpreting as AVCC makes sense:
-    // - The 5th byte (data[4]) should be a valid NAL header
-    // - The length (0x000001XX) should match data structure
+    // This could be 3-byte Annex B (00 00 01 <NAL>) or AVCC/HVCC with length 0x000001XX
+    //
+    // CRITICAL: Check if the length exactly matches data size FIRST, before NAL header checks.
+    // This is the strongest signal for AVCC/HVCC format - length prefixes are exact.
+    // WebCodecs chunks contain complete access units, so length + 4 == data.len() is definitive.
+    if nal_len + 4 == data.len() {
+      return true; // Length matches exactly - definitely AVCC/HVCC format
+    }
 
+    // For multi-NAL chunks, try parsing multiple NALs
+    let mut offset = 0;
+    let mut valid_multi_nal = true;
+    while offset + 4 <= data.len() {
+      let len = u32::from_be_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+      ]) as usize;
+      if len == 0 || offset + 4 + len > data.len() {
+        valid_multi_nal = false;
+        break;
+      }
+      offset += 4 + len;
+    }
+    if valid_multi_nal && offset == data.len() {
+      return true; // All NALs parsed perfectly - definitely AVCC/HVCC format
+    }
+
+    // Length doesn't match exactly - fall back to NAL header heuristics
     let nal_header_if_annexb = data[3]; // NAL header if this is Annex B
-    let nal_header_if_avcc = data[4]; // NAL header if this is AVCC
+    let nal_header_if_avcc = data[4]; // NAL header if this is AVCC/HVCC
 
     // Check if Annex B interpretation is valid (data[3] is valid NAL header)
+    // For H.264: forbidden_bit=0, type 1-23
     let annexb_forbidden_bit = (nal_header_if_annexb >> 7) & 1;
-    let annexb_nal_type = nal_header_if_annexb & 0x1F;
-    let annexb_valid = annexb_forbidden_bit == 0 && annexb_nal_type <= 23 && annexb_nal_type > 0;
+    let annexb_h264_nal_type = nal_header_if_annexb & 0x1F;
+    let annexb_h264_valid = annexb_forbidden_bit == 0 && (1..=23).contains(&annexb_h264_nal_type);
+    // For HEVC: forbidden_bit=0, type 0-40 (in 6 bits at position 1-6)
+    let annexb_hevc_nal_type = (nal_header_if_annexb >> 1) & 0x3F;
+    let annexb_hevc_valid = annexb_forbidden_bit == 0 && annexb_hevc_nal_type <= 40;
+    let annexb_valid = annexb_h264_valid || annexb_hevc_valid;
 
-    // Check if AVCC interpretation is valid (data[4] is valid NAL header)
+    // Check if AVCC/HVCC interpretation is valid (data[4] is valid NAL header)
+    // For H.264: forbidden_bit=0, type 1-23
     let avcc_forbidden_bit = (nal_header_if_avcc >> 7) & 1;
-    let avcc_nal_type = nal_header_if_avcc & 0x1F;
-    let avcc_valid = avcc_forbidden_bit == 0 && avcc_nal_type <= 23 && avcc_nal_type > 0;
+    let avcc_h264_nal_type = nal_header_if_avcc & 0x1F;
+    let avcc_h264_valid = avcc_forbidden_bit == 0 && (1..=23).contains(&avcc_h264_nal_type);
+    // For HEVC: forbidden_bit=0, type 0-40
+    let avcc_hevc_nal_type = (nal_header_if_avcc >> 1) & 0x3F;
+    let avcc_hevc_valid = avcc_forbidden_bit == 0 && avcc_hevc_nal_type <= 40;
+    let avcc_valid = avcc_h264_valid || avcc_hevc_valid;
 
-    // If only AVCC interpretation is valid, it's AVCC
+    // If only AVCC/HVCC interpretation is valid, it's AVCC/HVCC
     if avcc_valid && !annexb_valid {
       return true;
     }
@@ -616,35 +714,8 @@ pub fn is_avcc_format(data: &[u8]) -> bool {
     if annexb_valid && !avcc_valid {
       return false;
     }
-    // If both are valid, prefer AVCC if length exactly matches data
-    if avcc_valid && annexb_valid {
-      // AVCC is more likely if the length exactly consumes remaining data
-      // For a single NAL chunk: nal_len + 4 == data.len()
-      if nal_len + 4 == data.len() {
-        return true;
-      }
-      // For multi-NAL chunk, try parsing multiple NALs
-      let mut offset = 0;
-      let mut valid_multi_nal = true;
-      while offset + 4 <= data.len() {
-        let len = u32::from_be_bytes([
-          data[offset],
-          data[offset + 1],
-          data[offset + 2],
-          data[offset + 3],
-        ]) as usize;
-        if len == 0 || offset + 4 + len > data.len() {
-          valid_multi_nal = false;
-          break;
-        }
-        offset += 4 + len;
-      }
-      if valid_multi_nal && offset == data.len() {
-        return true;
-      }
-      // Default to Annex B for ambiguous cases
-      return false;
-    }
+    // Default to Annex B for remaining ambiguous cases (both valid or neither valid)
+    return false;
   }
 
   // For non-ambiguous cases, check if the 5th byte is a valid NAL header

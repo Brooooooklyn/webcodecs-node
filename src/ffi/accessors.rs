@@ -27,6 +27,7 @@ unsafe extern "C" {
   pub fn ffctx_get_qmax(ctx: *const AVCodecContext) -> c_int;
   pub fn ffctx_set_gop_size(ctx: *mut AVCodecContext, gop_size: c_int);
   pub fn ffctx_set_max_b_frames(ctx: *mut AVCodecContext, max_b_frames: c_int);
+  pub fn ffctx_set_has_b_frames(ctx: *mut AVCodecContext, has_b_frames: c_int);
   pub fn ffctx_set_time_base(ctx: *mut AVCodecContext, num: c_int, den: c_int);
   pub fn ffctx_set_framerate(ctx: *mut AVCodecContext, num: c_int, den: c_int);
   pub fn ffctx_set_sample_aspect_ratio(ctx: *mut AVCodecContext, num: c_int, den: c_int);
@@ -355,6 +356,14 @@ pub mod codec_flag {
 
   /// Codec can export data for HW decoding
   pub const EXPORT_DATA: c_int = 1 << 5;
+
+  /// Output even potentially corrupted frames (decoder)
+  /// Helps ensure all frames are output even if they have minor issues
+  pub const OUTPUT_CORRUPT: c_int = 1 << 3;
+
+  /// Force low delay decoding (decoder)
+  /// Reduces frame buffering at the cost of less error resilience
+  pub const LOW_DELAY: c_int = 1 << 19;
 }
 
 pub mod codec_flag2 {
