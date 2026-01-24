@@ -285,14 +285,15 @@ pub enum AVPixelFormat {
   Yuva420p10le = 87, // I420AP10
   Yuva422p10le = 89, // I422AP10
   Yuva444p10le = 91, // I444AP10
-  // Hardware formats
-  Videotoolbox = 162,
-  Cuda = 119,
-  Vaapi = 53,
-  Qsv = 173,
-  D3d11 = 174,
-  Dxva2Vld = 55,
-  Vulkan = 185,
+  // Hardware formats - FFmpeg 8.x (libavutil 60) values
+  // Verified against ffmpeg-src/FFmpeg/libavutil/pixfmt.h
+  Videotoolbox = 157,
+  Cuda = 117,
+  Vaapi = 44,
+  Qsv = 114,
+  D3d11 = 171,
+  Dxva2Vld = 51,
+  Vulkan = 190,
 }
 
 impl AVPixelFormat {
@@ -417,17 +418,15 @@ impl AVPixelFormat {
       87 => Self::Yuva420p10le,
       89 => Self::Yuva422p10le,
       91 => Self::Yuva444p10le,
-      // Hardware pixel format mappings - numeric values from FFmpeg's AVPixelFormat enum.
-      // These include both current (FFmpeg 8.x/libavutil 60) and legacy values for
-      // backwards compatibility. Verified against ffmpeg-src/FFmpeg/libavutil/pixfmt.h.
-      // If updating FFmpeg version, re-verify these mappings.
-      157 | 162 => Self::Videotoolbox, // 157 (current), 162 (legacy)
-      117 | 119 => Self::Cuda,         // 117 (current), 119 (legacy)
-      44 | 53 => Self::Vaapi,          // 44 (current), 53 (legacy)
-      114 | 173 => Self::Qsv,          // 114 (current), 173 (legacy)
-      171 | 174 | 175 => Self::D3d11,  // 171 (current), 174/175 (legacy)
-      51 | 55 => Self::Dxva2Vld,       // 51 (current), 55 (legacy)
-      190 | 185 => Self::Vulkan,       // 190 (current), 185 (legacy)
+      // Hardware formats - FFmpeg 8.x (libavutil 60) values
+      // Verified against ffmpeg-src/FFmpeg/libavutil/pixfmt.h
+      157 => Self::Videotoolbox,
+      117 => Self::Cuda,
+      44 => Self::Vaapi,
+      114 => Self::Qsv,
+      171 => Self::D3d11,
+      51 => Self::Dxva2Vld,
+      190 => Self::Vulkan,
       _ => Self::None,
     }
   }

@@ -274,6 +274,12 @@ pub fn download_hw_frame(hw_frame: &Frame) -> CodecResult<Frame> {
   sw_frame.set_pts(hw_frame.pts());
   sw_frame.set_duration(hw_frame.duration());
 
+  // Copy color space metadata from source frame
+  sw_frame.set_color_primaries(hw_frame.color_primaries());
+  sw_frame.set_color_trc(hw_frame.color_trc());
+  sw_frame.set_colorspace(hw_frame.colorspace());
+  sw_frame.set_color_range(hw_frame.color_range());
+
   tracing::debug!(target: "webcodecs", "download_hw_frame: success, format={:?}", sw_frame.format());
   Ok(sw_frame)
 }
