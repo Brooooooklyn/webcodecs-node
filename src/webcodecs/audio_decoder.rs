@@ -1578,17 +1578,19 @@ fn decode_audio_chunk_data(
     )
   })?;
 
-  // Set packet timestamps
-  packet.set_pts(timestamp);
-  packet.set_dts(timestamp);
-
   // Allocate and copy data to packet using safe wrapper
+  // NOTE: This must be done BEFORE setting timestamps because copy_data_from
+  // calls unref() internally which would reset timestamps to AV_NOPTS_VALUE.
   packet.copy_data_from(data).map_err(|e| {
     Error::new(
       Status::GenericFailure,
       format!("Failed to copy packet data: {}", e),
     )
   })?;
+
+  // Set packet timestamps AFTER copying data (unref in copy_data_from resets timestamps)
+  packet.set_pts(timestamp);
+  packet.set_dts(timestamp);
 
   // Decode
   let frames = context

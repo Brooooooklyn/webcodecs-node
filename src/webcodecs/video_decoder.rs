@@ -3,8 +3,8 @@
 //! Provides video decoding functionality using FFmpeg.
 //! See: https://w3c.github.io/webcodecs/#videodecoder-interface
 
-use crate::codec::{CodecContext, DecoderConfig, Frame, Packet};
-use crate::ffi::{AVCodecID, AVHWDeviceType};
+use crate::codec::{CodecContext, DecoderConfig, Frame, Packet, download_hw_frame};
+use crate::ffi::{AVCodecID, AVHWDeviceType, accessors::ffctx_set_hw_get_format};
 use crate::webcodecs::encoded_video_chunk::InternalSlice;
 use crate::webcodecs::error::{
   DOMExceptionName, throw_data_error, throw_invalid_state_error, throw_type_error_unit,
@@ -195,7 +195,9 @@ pub struct VideoDecoderSupport {
 }
 
 /// Threshold for detecting silent decoder failure (no output after N chunks)
-const SILENT_FAILURE_THRESHOLD: u32 = 3;
+/// Set to 10 to accommodate H.264/HEVC B-frame buffering (typically 4-8 frames)
+/// while still detecting genuinely failing decoders within ~333ms at 30fps.
+const SILENT_FAILURE_THRESHOLD: u32 = 10;
 
 /// Internal decoder state
 struct VideoDecoderInner {
@@ -517,9 +519,9 @@ impl VideoDecoder {
     let duration = encoded_chunk.duration_us;
     let is_keyframe = encoded_chunk.chunk_type == crate::webcodecs::EncodedVideoChunkType::Key;
 
-    // Convert AVCC/HVCC format to Annex B if needed for H.264/H.265
-    // FFmpeg's decoder expects Annex B format (start code prefixed NALUs)
-    // Also prepend SPS/PPS from extradata to keyframes (FFmpeg may not use extradata properly)
+    // Handle packet data format based on decoder type:
+    // - Hardware decoders (VideoToolbox, etc.) expect AVCC/HVCC format (length-prefixed NALUs)
+    // - Software decoders expect Annex B format (start code prefixed NALUs)
     let data = {
       let codec = &guard.codec_string;
       let is_avc_codec = codec.starts_with("avc1")
@@ -527,7 +529,12 @@ impl VideoDecoder {
         || codec.starts_with("hvc1")
         || codec.starts_with("hev1");
 
-      if is_avc_codec && is_avcc_format(encoded_chunk.data.as_slice()) {
+      // For hardware decoding, keep data in original AVCC/HVCC format
+      // VideoToolbox expects length-prefixed NALUs directly
+      if guard.is_hardware {
+        Cow::Borrowed(encoded_chunk.data.as_slice())
+      } else if is_avc_codec && is_avcc_format(encoded_chunk.data.as_slice()) {
+        // For software decoding, convert to Annex B format
         let mut converted = convert_avcc_to_annexb(encoded_chunk.data.as_slice());
 
         // Prepend SPS/PPS/VPS from extradata to keyframes
@@ -681,8 +688,25 @@ impl VideoDecoder {
         .timestamp_queue
         .pop_front()
         .unwrap_or((timestamp, duration));
+
+      // Download hardware frames to CPU memory if needed
+      let output_frame = if frame.format().is_hardware() {
+        match download_hw_frame(&frame) {
+          Ok(sw_frame) => sw_frame,
+          Err(e) => {
+            Self::report_error(
+              &mut guard,
+              &format!("OperationError: Failed to download hardware frame: {}", e),
+            );
+            return;
+          }
+        }
+      } else {
+        frame
+      };
+
       let video_frame = VideoFrame::from_internal_with_orientation(
-        frame,
+        output_frame,
         output_timestamp,
         output_duration,
         guard.config_rotation,
@@ -815,8 +839,19 @@ impl VideoDecoder {
 
       // Deliver frames (queue during flush, NonBlocking otherwise)
       for frame in frames {
+        // Download hardware frames to CPU memory if needed
+        // (shouldn't happen in fallback path but handle for safety)
+        let output_frame = if frame.format().is_hardware() {
+          match download_hw_frame(&frame) {
+            Ok(sw_frame) => sw_frame,
+            Err(_) => continue, // Skip failed frame downloads during re-decode
+          }
+        } else {
+          frame
+        };
+
         let video_frame = VideoFrame::from_internal_with_orientation(
-          frame,
+          output_frame,
           timestamp,
           duration,
           guard.config_rotation,
@@ -882,7 +917,8 @@ impl VideoDecoder {
     };
 
     // Queue remaining frames for delivery (always queue during flush for synchronous delivery)
-    for frame in frames {
+    tracing::debug!(target: "webcodecs", "process_flush: processing {} flushed frames", frames.len());
+    for frame in frames.into_iter() {
       // Pop timestamp from queue to preserve original input timestamp
       // (FFmpeg may modify PTS internally during decoding)
       let (output_timestamp, output_duration) =
@@ -896,8 +932,26 @@ impl VideoDecoder {
           };
           (pts, dur)
         });
+
+      // Download hardware frames to CPU memory if needed
+      let output_frame = if frame.format().is_hardware() {
+        match download_hw_frame(&frame) {
+          Ok(sw_frame) => sw_frame,
+          Err(e) => {
+            let msg = format!("Failed to download hardware frame: {}", e);
+            Self::report_error(&mut guard, &msg);
+            return Err(Error::new(
+              Status::GenericFailure,
+              format!("EncodingError: {}", msg),
+            ));
+          }
+        }
+      } else {
+        frame
+      };
+
       let video_frame = VideoFrame::from_internal_with_orientation(
-        frame,
+        output_frame,
         output_timestamp,
         output_duration,
         guard.config_rotation,
@@ -979,9 +1033,9 @@ impl VideoDecoder {
     };
 
     // Create decoder context
-    let (mut context, is_hardware) = if let Some(hw) = hw_type {
+    let (mut context, is_hardware, hw_pix_fmt_raw) = if let Some(hw) = hw_type {
       match CodecContext::new_decoder_with_hw_info(codec_id, Some(hw)) {
-        Ok(result) => (result.context, result.is_hardware),
+        Ok(result) => (result.context, result.is_hardware, result.hw_pix_fmt_raw),
         Err(e) => {
           Self::report_error(
             &mut guard,
@@ -992,7 +1046,7 @@ impl VideoDecoder {
       }
     } else {
       match CodecContext::new_decoder(codec_id) {
-        Ok(ctx) => (ctx, false),
+        Ok(ctx) => (ctx, false, None),
         Err(e) => {
           Self::report_error(
             &mut guard,
@@ -1003,9 +1057,19 @@ impl VideoDecoder {
       }
     };
 
-    // Convert avcC/hvcC extradata to Annex B if needed
+    // Handle extradata format based on decoder type:
+    // - Hardware decoders (VideoToolbox, etc.) expect avcC/hvcC format (original container format)
+    // - Software decoders expect Annex B format (start code prefixed NALUs)
     let extradata = config.description.as_ref().and_then(|d| {
       let data = d.to_vec();
+
+      // For hardware decoding, keep extradata in original avcC/hvcC format
+      // VideoToolbox parses avcC format directly to initialize the decoder session
+      if is_hardware {
+        return Some(data);
+      }
+
+      // For software decoding, convert to Annex B format
       let is_h264 = codec.starts_with("avc1") || codec.starts_with("avc3");
       let is_h265 = codec.starts_with("hvc1") || codec.starts_with("hev1");
 
@@ -1019,11 +1083,18 @@ impl VideoDecoder {
     });
 
     // Configure decoder
+    // For hardware decoders, use single-threaded mode (thread_count=1) to avoid
+    // race conditions during flush that can cause crashes with VideoToolbox and other
+    // hardware accelerators. For software decoders, use auto-detect (thread_count=0)
+    // for optimal performance.
+    let thread_count = if is_hardware { 1 } else { 0 };
     let decoder_config = DecoderConfig {
       codec_id,
-      thread_count: 0,
+      thread_count,
       extradata,
       low_latency: config.optimize_for_latency.unwrap_or(false),
+      width: config.coded_width,
+      height: config.coded_height,
     };
 
     if let Err(e) = context.configure_decoder(&decoder_config) {
@@ -1034,12 +1105,31 @@ impl VideoDecoder {
       return;
     }
 
+    // Set up get_format callback for hardware decoding
+    // This is required for FFmpeg to negotiate the correct pixel format with hardware decoders
+    if is_hardware && let Some(pix_fmt_raw) = hw_pix_fmt_raw {
+      unsafe {
+        ffctx_set_hw_get_format(context.as_mut_ptr(), pix_fmt_raw);
+      }
+    }
+
     if let Err(e) = context.open() {
       Self::report_error(
         &mut guard,
         &format!("NotSupportedError: Failed to open decoder: {}", e),
       );
       return;
+    }
+
+    // Log context state after opening for debugging
+    if is_hardware {
+      tracing::debug!(
+        "Decoder opened: pix_fmt={:?}, width={}, height={}, is_hardware={}",
+        context.pixel_format(),
+        context.width(),
+        context.height(),
+        is_hardware
+      );
     }
 
     // Update inner state
@@ -1310,10 +1400,10 @@ impl VideoDecoder {
     };
 
     // Create decoder context with optional hardware acceleration
-    let (mut context, is_hardware) = if let Some(hw) = hw_type {
+    let (mut context, is_hardware, hw_pix_fmt_raw) = if let Some(hw) = hw_type {
       // Hardware decoder requested (prefer-hardware only)
       match CodecContext::new_decoder_with_hw_info(codec_id, Some(hw)) {
-        Ok(result) => (result.context, result.is_hardware),
+        Ok(result) => (result.context, result.is_hardware, result.hw_pix_fmt_raw),
         Err(e) => {
           // Hardware decoder creation failed - report error (no fallback for prefer-hardware)
           Self::report_error(
@@ -1326,7 +1416,7 @@ impl VideoDecoder {
     } else {
       // Software decoder (no-preference or prefer-software)
       match CodecContext::new_decoder(codec_id) {
-        Ok(ctx) => (ctx, false),
+        Ok(ctx) => (ctx, false, None),
         Err(e) => {
           Self::report_error(&mut inner, &format!("Failed to create decoder: {}", e));
           return Ok(());
@@ -1334,10 +1424,19 @@ impl VideoDecoder {
       }
     };
 
-    // Convert avcC/hvcC extradata to Annex B if needed for H.264/H.265
-    // FFmpeg's decoder expects Annex B format (SPS/PPS/VPS with start codes)
+    // Handle extradata format based on decoder type:
+    // - Hardware decoders (VideoToolbox, etc.) expect avcC/hvcC format (original container format)
+    // - Software decoders expect Annex B format (start code prefixed NALUs)
     let extradata = config.description.as_ref().and_then(|d| {
       let data = d.to_vec();
+
+      // For hardware decoding, keep extradata in original avcC/hvcC format
+      // VideoToolbox parses avcC format directly to initialize the decoder session
+      if is_hardware {
+        return Some(data);
+      }
+
+      // For software decoding, convert to Annex B format
       let is_h264 = codec.starts_with("avc1") || codec.starts_with("avc3");
       let is_h265 = codec.starts_with("hvc1") || codec.starts_with("hev1");
 
@@ -1351,11 +1450,18 @@ impl VideoDecoder {
     });
 
     // Configure decoder
+    // For hardware decoders, use single-threaded mode (thread_count=1) to avoid
+    // race conditions during flush that can cause crashes with VideoToolbox and other
+    // hardware accelerators. For software decoders, use auto-detect (thread_count=0)
+    // for optimal performance.
+    let thread_count = if is_hardware { 1 } else { 0 };
     let decoder_config = DecoderConfig {
       codec_id,
-      thread_count: 0, // Auto
+      thread_count,
       extradata,
       low_latency: config.optimize_for_latency.unwrap_or(false),
+      width: config.coded_width,
+      height: config.coded_height,
     };
 
     if let Err(e) = context.configure_decoder(&decoder_config) {
@@ -1363,10 +1469,39 @@ impl VideoDecoder {
       return Ok(());
     }
 
+    // Set up get_format callback for hardware decoding
+    // This is required for FFmpeg to negotiate the correct pixel format with hardware decoders
+    tracing::debug!(
+      is_hardware = is_hardware,
+      hw_type = ?hw_type,
+      hw_pix_fmt_raw = ?hw_pix_fmt_raw,
+      "Configuring decoder hardware acceleration"
+    );
+    if is_hardware && let Some(pix_fmt_raw) = hw_pix_fmt_raw {
+      tracing::debug!(
+        hw_pix_fmt_raw = pix_fmt_raw,
+        "Setting get_format callback for hardware pixel format"
+      );
+      unsafe {
+        ffctx_set_hw_get_format(context.as_mut_ptr(), pix_fmt_raw);
+      }
+    }
+
     // Open the decoder
     if let Err(e) = context.open() {
       Self::report_error(&mut inner, &format!("Failed to open decoder: {}", e));
       return Ok(());
+    }
+
+    // Log context state after opening for debugging
+    if is_hardware {
+      tracing::debug!(
+        "Decoder opened (reconfigure): pix_fmt={:?}, width={}, height={}, is_hardware={}",
+        context.pixel_format(),
+        context.width(),
+        context.height(),
+        is_hardware
+      );
     }
 
     inner.context = Some(context);
@@ -2329,20 +2464,22 @@ fn decode_chunk_data(
     )
   })?;
 
-  // Set packet timestamps
-  packet.set_pts(timestamp);
-  packet.set_dts(timestamp);
-  if let Some(dur) = duration {
-    packet.set_duration(dur);
-  }
-
   // Allocate and copy data to packet using safe wrapper
+  // NOTE: This must be done BEFORE setting timestamps because copy_data_from
+  // calls unref() internally which would reset timestamps to AV_NOPTS_VALUE.
   packet.copy_data_from(data).map_err(|e| {
     Error::new(
       Status::GenericFailure,
       format!("Failed to copy packet data: {}", e),
     )
   })?;
+
+  // Set packet timestamps AFTER copying data (unref in copy_data_from resets timestamps)
+  packet.set_pts(timestamp);
+  packet.set_dts(timestamp);
+  if let Some(dur) = duration {
+    packet.set_duration(dur);
+  }
 
   // Decode
   let frames = context

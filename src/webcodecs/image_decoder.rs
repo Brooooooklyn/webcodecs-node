@@ -716,6 +716,8 @@ impl ImageDecoder {
               thread_count: 0,
               extradata: None,
               low_latency: false,
+              width: None,
+              height: None,
             };
 
             context.configure_decoder(&decoder_config).map_err(|e| {
@@ -962,6 +964,8 @@ fn pre_parse_and_cache_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<(
     thread_count: 0,
     extradata: None,
     low_latency: false,
+    width: None,
+    height: None,
   };
 
   context.configure_decoder(&decoder_config).map_err(|e| {

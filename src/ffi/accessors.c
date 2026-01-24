@@ -216,6 +216,40 @@ int ffctx_get_extradata_size(const AVCodecContext* ctx) {
     return ctx->extradata_size;
 }
 
+/**
+ * Set extradata on a codec context.
+ * This allocates new memory with av_malloc and copies the data.
+ * Any existing extradata is freed first.
+ *
+ * @param ctx The codec context
+ * @param data Pointer to the extradata to copy
+ * @param size Size of the extradata in bytes
+ * @return 0 on success, negative error code on failure
+ */
+int ffctx_set_extradata(AVCodecContext* ctx, const uint8_t* data, int size) {
+    // Free existing extradata if any
+    if (ctx->extradata) {
+        av_freep(&ctx->extradata);
+        ctx->extradata_size = 0;
+    }
+
+    if (!data || size <= 0) {
+        return 0;  // Nothing to set
+    }
+
+    // Allocate new extradata with padding (FFmpeg requires AV_INPUT_BUFFER_PADDING_SIZE)
+    ctx->extradata = av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (!ctx->extradata) {
+        return AVERROR(ENOMEM);
+    }
+
+    // Copy the data
+    memcpy(ctx->extradata, data, size);
+    ctx->extradata_size = size;
+
+    return 0;
+}
+
 /* ============================================================================
  * AVFrame Setters
  * ============================================================================ */
@@ -373,6 +407,10 @@ const uint8_t* ffframe_data_const(const AVFrame* frame, int plane) {
         return NULL;
     }
     return frame->data[plane];
+}
+
+AVBufferRef* ffframe_get_hw_frames_ctx(const AVFrame* frame) {
+    return frame ? frame->hw_frames_ctx : NULL;
 }
 
 int ffframe_linesize(const AVFrame* frame, int plane) {
@@ -1034,4 +1072,101 @@ void fffio_set_seekable(AVIOContext* ctx, int seekable) {
     if (ctx) {
         ctx->seekable = seekable;
     }
+}
+
+/* ============================================================================
+ * Hardware Decoding Support
+ * ============================================================================ */
+
+/**
+ * Static get_format callback that selects hardware pixel format from opaque.
+ * This is required for hardware decoding - FFmpeg needs this callback to
+ * negotiate the pixel format with the hardware decoder.
+ */
+static enum AVPixelFormat ff_get_format_hw(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
+    intptr_t hw_pix_fmt = (intptr_t)ctx->opaque;
+
+    // Find the hardware format in the list of supported formats
+    for (const enum AVPixelFormat *p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+        if (*p == (enum AVPixelFormat)hw_pix_fmt) {
+            return *p;
+        }
+    }
+
+    // Fall back to first software format
+    return pix_fmts[0];
+}
+
+/**
+ * Set up get_format callback for hardware decoding.
+ * Must be called after setting hw_device_ctx but before avcodec_open2().
+ *
+ * WARNING: This function uses ctx->opaque to store the hardware pixel format.
+ * If other code needs to use ctx->opaque for application-specific data,
+ * this will conflict. Consider refactoring to use a wrapper struct if
+ * additional opaque data is needed in the future.
+ *
+ * @param ctx The codec context
+ * @param hw_pix_fmt The hardware pixel format (e.g., AV_PIX_FMT_VIDEOTOOLBOX)
+ */
+void ffctx_set_hw_get_format(AVCodecContext* ctx, int hw_pix_fmt) {
+    ctx->opaque = (void*)(intptr_t)hw_pix_fmt;
+    ctx->get_format = ff_get_format_hw;
+}
+
+/* ============================================================================
+ * AVCodecHWConfig Accessors
+ * ============================================================================ */
+
+/**
+ * Get the pixel format from a codec hardware config.
+ * Returns the hardware pixel format (e.g., AV_PIX_FMT_VIDEOTOOLBOX).
+ */
+int ffhwconfig_get_pix_fmt(const AVCodecHWConfig* config) {
+    return config ? config->pix_fmt : AV_PIX_FMT_NONE;
+}
+
+/**
+ * Get the methods bitmask from a codec hardware config.
+ * Check against AV_CODEC_HW_CONFIG_METHOD_* constants.
+ */
+int ffhwconfig_get_methods(const AVCodecHWConfig* config) {
+    return config ? config->methods : 0;
+}
+
+/**
+ * Get the device type from a codec hardware config.
+ * Returns the AVHWDeviceType (e.g., AV_HWDEVICE_TYPE_VIDEOTOOLBOX).
+ */
+int ffhwconfig_get_device_type(const AVCodecHWConfig* config) {
+    return config ? config->device_type : 0;
+}
+
+/**
+ * Check if codec supports hardware decoding with a specific device type.
+ * Returns the pixel format if supported, or AV_PIX_FMT_NONE if not.
+ *
+ * @param codec The codec to check
+ * @param device_type The hardware device type to look for
+ * @return The hardware pixel format, or AV_PIX_FMT_NONE if not supported
+ */
+int ff_codec_get_hw_pix_fmt(const AVCodec* codec, int device_type) {
+    if (!codec) {
+        return AV_PIX_FMT_NONE;
+    }
+
+    for (int i = 0; ; i++) {
+        const AVCodecHWConfig* config = avcodec_get_hw_config(codec, i);
+        if (!config) {
+            break;
+        }
+
+        // Check if this config matches our device type and supports hw_device_ctx method
+        if ((config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) &&
+            config->device_type == (enum AVHWDeviceType)device_type) {
+            return config->pix_fmt;
+        }
+    }
+
+    return AV_PIX_FMT_NONE;
 }

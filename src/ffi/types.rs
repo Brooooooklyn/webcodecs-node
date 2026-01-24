@@ -285,14 +285,15 @@ pub enum AVPixelFormat {
   Yuva420p10le = 87, // I420AP10
   Yuva422p10le = 89, // I422AP10
   Yuva444p10le = 91, // I444AP10
-  // Hardware formats
-  Videotoolbox = 162,
-  Cuda = 119,
-  Vaapi = 53,
-  Qsv = 173,
-  D3d11 = 174,
-  Dxva2Vld = 55,
-  Vulkan = 185,
+  // Hardware formats - FFmpeg 8.x (libavutil 60) values
+  // Verified against ffmpeg-src/FFmpeg/libavutil/pixfmt.h
+  Videotoolbox = 157,
+  Cuda = 117,
+  Vaapi = 44,
+  Qsv = 114,
+  D3d11 = 171,
+  Dxva2Vld = 51,
+  Vulkan = 190,
 }
 
 impl AVPixelFormat {
@@ -417,13 +418,15 @@ impl AVPixelFormat {
       87 => Self::Yuva420p10le,
       89 => Self::Yuva422p10le,
       91 => Self::Yuva444p10le,
-      162 => Self::Videotoolbox,
-      119 => Self::Cuda,
-      53 => Self::Vaapi,
-      173 => Self::Qsv,
-      174 => Self::D3d11,
-      55 => Self::Dxva2Vld,
-      185 => Self::Vulkan,
+      // Hardware formats - FFmpeg 8.x (libavutil 60) values
+      // Verified against ffmpeg-src/FFmpeg/libavutil/pixfmt.h
+      157 => Self::Videotoolbox,
+      117 => Self::Cuda,
+      44 => Self::Vaapi,
+      114 => Self::Qsv,
+      171 => Self::D3d11,
+      51 => Self::Dxva2Vld,
+      190 => Self::Vulkan,
       _ => Self::None,
     }
   }
