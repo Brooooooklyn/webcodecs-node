@@ -240,8 +240,9 @@ impl Clone for HwFrameContext {
     // SAFETY: av_buffer_ref returns a valid pointer if the input is valid,
     // and we know self.ptr is valid since it's in a valid HwFrameContext
     Self {
-      ptr: NonNull::new(new_ref)
-        .expect("Failed to create reference to hardware frames context: av_buffer_ref returned null"),
+      ptr: NonNull::new(new_ref).expect(
+        "Failed to create reference to hardware frames context: av_buffer_ref returned null",
+      ),
       device_type: self.device_type,
       sw_format: self.sw_format,
       hw_format: self.hw_format,
