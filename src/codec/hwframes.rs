@@ -10,7 +10,7 @@ use crate::ffi::{
     ffhwframes_get_sw_format, ffhwframes_get_width, ffhwframes_set_format, ffhwframes_set_height,
     ffhwframes_set_initial_pool_size, ffhwframes_set_sw_format, ffhwframes_set_width,
   },
-  avutil::av_buffer_unref,
+  avutil::{av_buffer_ref, av_buffer_unref},
   hwaccel::{
     av_hwframe_ctx_alloc, av_hwframe_ctx_init, av_hwframe_get_buffer, av_hwframe_transfer_data,
   },
@@ -227,6 +227,26 @@ impl HwFrameContext {
   pub fn actual_hw_format(&self) -> AVPixelFormat {
     let raw = unsafe { ffhwframes_get_format(self.ptr.as_ptr()) };
     AVPixelFormat::from_raw(raw)
+  }
+}
+
+impl Clone for HwFrameContext {
+  /// Clone the hardware frames context by creating a new reference.
+  ///
+  /// FFmpeg uses reference counting for AVBufferRef, so this creates
+  /// a new reference to the same underlying hardware frames pool.
+  fn clone(&self) -> Self {
+    let new_ref = unsafe { av_buffer_ref(self.ptr.as_ptr()) };
+    // SAFETY: av_buffer_ref returns a valid pointer if the input is valid,
+    // and we know self.ptr is valid since it's in a valid HwFrameContext
+    Self {
+      ptr: NonNull::new(new_ref).expect("av_buffer_ref failed"),
+      device_type: self.device_type,
+      sw_format: self.sw_format,
+      hw_format: self.hw_format,
+      width: self.width,
+      height: self.height,
+    }
   }
 }
 

@@ -9,10 +9,11 @@ use crate::ffi::{
     ffctx_get_frame_size, ffctx_get_height, ffctx_get_pix_fmt, ffctx_get_qmax, ffctx_get_qmin,
     ffctx_get_sample_rate, ffctx_get_time_base, ffctx_get_width, ffctx_set_bit_rate,
     ffctx_set_channels, ffctx_set_flags, ffctx_set_framerate, ffctx_set_gop_size,
-    ffctx_set_has_b_frames, ffctx_set_height, ffctx_set_hw_device_ctx, ffctx_set_level,
-    ffctx_set_max_b_frames, ffctx_set_pix_fmt, ffctx_set_profile, ffctx_set_qmax, ffctx_set_qmin,
-    ffctx_set_rc_buffer_size, ffctx_set_rc_max_rate, ffctx_set_sample_fmt, ffctx_set_sample_rate,
-    ffctx_set_thread_count, ffctx_set_thread_type, ffctx_set_time_base, ffctx_set_width,
+    ffctx_set_has_b_frames, ffctx_set_height, ffctx_set_hw_device_ctx, ffctx_set_hw_frames_ctx,
+    ffctx_set_level, ffctx_set_max_b_frames, ffctx_set_pix_fmt, ffctx_set_profile, ffctx_set_qmax,
+    ffctx_set_qmin, ffctx_set_rc_buffer_size, ffctx_set_rc_max_rate, ffctx_set_sample_fmt,
+    ffctx_set_sample_rate, ffctx_set_thread_count, ffctx_set_thread_type, ffctx_set_time_base,
+    ffctx_set_width,
   },
   avcodec::{
     avcodec_alloc_context3, avcodec_find_decoder, avcodec_find_encoder,
@@ -27,7 +28,7 @@ use std::ptr::NonNull;
 
 use super::{
   AudioDecoderConfig, AudioEncoderConfig, BitrateMode, CodecError, CodecResult, DecoderConfig,
-  EncoderConfig, Frame, HwDeviceContext, Packet,
+  EncoderConfig, Frame, HwDeviceContext, HwFrameContext, Packet,
 };
 
 /// Result of encoder creation with metadata about hardware acceleration
@@ -75,6 +76,7 @@ pub struct CodecContext {
   codec: *const AVCodec,
   codec_type: CodecType,
   hw_device: Option<HwDeviceContext>,
+  hw_frames: Option<HwFrameContext>,
 }
 
 impl CodecContext {
@@ -303,6 +305,7 @@ impl CodecContext {
         codec,
         codec_type,
         hw_device: None,
+        hw_frames: None,
       })
       .ok_or(CodecError::AllocationFailed("AVCodecContext"))
   }
@@ -895,6 +898,25 @@ impl CodecContext {
       ffctx_set_hw_device_ctx(self.ptr.as_ptr(), hw_device.as_ptr());
     }
     self.hw_device = Some(hw_device);
+  }
+
+  /// Set hardware frames context for hardware-accelerated encoding
+  ///
+  /// This must be called BEFORE opening the encoder when using hardware frames.
+  /// The hw_frames_ctx tells the encoder that input frames will be GPU-resident
+  /// and belong to this specific hardware frames pool.
+  ///
+  /// This also updates the encoder's pixel format to match the hardware format,
+  /// which is required by FFmpeg for hardware encoding with hw_frames_ctx.
+  pub fn set_hw_frames(&mut self, hw_frames: HwFrameContext) {
+    unsafe {
+      // Set the encoder's pix_fmt to the hardware format
+      // FFmpeg requires ctx->pix_fmt to match hw_frames_ctx->format
+      ffctx_set_pix_fmt(self.ptr.as_ptr(), hw_frames.hw_format().as_raw());
+      // Attach the hardware frames context
+      ffctx_set_hw_frames_ctx(self.ptr.as_ptr(), hw_frames.as_ptr());
+    }
+    self.hw_frames = Some(hw_frames);
   }
 
   /// Open the codec (must be called after configuration)

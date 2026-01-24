@@ -10,6 +10,7 @@ use crate::codec::{
 use crate::ffi::{
   AVCodecID, AVHWDeviceType, AVPictureType, AVPixelFormat, AVRational, avutil::av_rescale_q,
 };
+use crate::webcodecs::codec_pressure;
 use crate::webcodecs::error::DOMExceptionName;
 use crate::webcodecs::error::{throw_invalid_state_error, throw_type_error_unit};
 use crate::webcodecs::hw_fallback::{
@@ -432,6 +433,13 @@ struct VideoEncoderInner {
   /// Codec ID for the current encoder configuration
   /// Used to determine codec-specific quantizer mapping
   codec_id: Option<AVCodecID>,
+
+  // ========================================================================
+  // Hardware encoder pressure tracking
+  // ========================================================================
+  /// Whether we acquired a hardware encoder slot from the pressure gauge
+  /// Must be released on close/drop/fallback to avoid resource leaks
+  acquired_hw_slot: bool,
 }
 
 /// Get default GOP settings based on latency mode.
@@ -553,6 +561,12 @@ impl Drop for VideoEncoder {
       ctx.flush();
       let _ = ctx.send_frame(None);
       while ctx.receive_packet().ok().flatten().is_some() {}
+
+      // Release the hardware encoder slot if we acquired one
+      if inner.acquired_hw_slot {
+        codec_pressure::gauge().release_hw_encoder();
+        inner.acquired_hw_slot = false;
+      }
     }
   }
 }
@@ -608,6 +622,8 @@ impl VideoEncoder {
       pixel_format: AVPixelFormat::Yuv420p,
       // Codec identification (set during configure)
       codec_id: None,
+      // Hardware encoder pressure tracking (managed by codec_pressure gauge)
+      acquired_hw_slot: false,
     };
 
     let inner = Arc::new(Mutex::new(inner));
@@ -870,6 +886,15 @@ impl VideoEncoder {
       }
     }
 
+    // Before GPU upload, save original CPU frame for potential fallback.
+    // When hardware encoding fails, we need the CPU frame (with valid linesize)
+    // for software fallback. GPU frames have linesize=0 and can't be encoded by software.
+    let cpu_frame_for_fallback = if guard.use_hw_frames && guard.hw_frame_ctx.is_some() {
+      frame_to_encode.shallow_clone().ok()
+    } else {
+      None
+    };
+
     // Upload frame to GPU if hardware frame context is available
     // This provides zero-copy encoding for hardware encoders
     if guard.use_hw_frames && guard.hw_frame_ctx.is_some() {
@@ -906,12 +931,16 @@ impl VideoEncoder {
           && !guard.first_output_produced
           && guard.hw_preference == HardwareAcceleration::NoPreference
         {
-          // Buffer current frame for re-encoding using shallow clone (shares pixel buffer
-          // via FFmpeg's atomic refcount). Safe because re-encoding only reads pixels.
-          if let Ok(shallow) = frame_to_encode.shallow_clone() {
+          // Buffer current frame for re-encoding. Use the saved CPU frame if available
+          // (GPU frames have linesize=0 and can't be encoded by software encoders).
+          let frame_to_buffer = cpu_frame_for_fallback
+            .as_ref()
+            .and_then(|f| f.shallow_clone().ok())
+            .or_else(|| frame_to_encode.shallow_clone().ok());
+          if let Some(buffered) = frame_to_buffer {
             guard
               .pending_frames
-              .push((shallow, timestamp, options.clone(), rotation, flip));
+              .push((buffered, timestamp, options.clone(), rotation, flip));
           }
           let pending_frames = std::mem::take(&mut guard.pending_frames);
 
@@ -930,6 +959,8 @@ impl VideoEncoder {
               };
               frame_to_reencode.set_pts(pts_in_timebase);
 
+              // Increment frame_count so flush() knows to drain the encoder
+              guard.frame_count += 1;
               if let Some(ctx) = guard.context.as_mut()
                 && let Ok(pkts) = ctx.encode(Some(&frame_to_reencode))
               {
@@ -986,14 +1017,10 @@ impl VideoEncoder {
                       alpha_side_data,
                     }
                   };
-                  if guard.inside_flush {
-                    guard.pending_chunks.push((chunk, metadata));
-                  } else {
-                    guard.output_callback.call(
-                      (chunk, metadata).into(),
-                      ThreadsafeFunctionCallMode::NonBlocking,
-                    );
-                  }
+                  // During fallback re-encoding, always buffer chunks to pending_chunks.
+                  // This ensures they're delivered when flush() drains pending_chunks,
+                  // rather than via NonBlocking callbacks that may run after flush resolves.
+                  guard.pending_chunks.push((chunk, metadata));
                   guard.first_output_produced = true;
                 }
               }
@@ -1057,12 +1084,16 @@ impl VideoEncoder {
     // produce output for the first few frames - this is expected behavior.
 
     if packets.is_empty() && guard.is_hardware && !guard.first_output_produced {
-      // Buffer the frame for potential re-encoding on fallback using shallow clone
-      // (shares pixel buffer via FFmpeg's atomic refcount - safe for read-only re-encoding)
-      if let Ok(shallow) = frame_to_encode.shallow_clone() {
+      // Buffer the frame for potential re-encoding on fallback. Use the saved CPU frame
+      // if available (GPU frames have linesize=0 and can't be encoded by software encoders).
+      let frame_to_buffer = cpu_frame_for_fallback
+        .as_ref()
+        .and_then(|f| f.shallow_clone().ok())
+        .or_else(|| frame_to_encode.shallow_clone().ok());
+      if let Some(buffered) = frame_to_buffer {
         guard
           .pending_frames
-          .push((shallow, timestamp, options.clone(), rotation, flip));
+          .push((buffered, timestamp, options.clone(), rotation, flip));
       }
       guard.silent_encode_count += 1;
 
@@ -1111,6 +1142,8 @@ impl VideoEncoder {
                 };
                 frame_to_reencode.set_pts(pts_in_timebase);
 
+                // Increment frame_count so flush() knows to drain the encoder
+                guard.frame_count += 1;
                 if let Some(ctx) = guard.context.as_mut()
                   && let Ok(pkts) = ctx.encode(Some(&frame_to_reencode))
                 {
@@ -1169,16 +1202,10 @@ impl VideoEncoder {
                         alpha_side_data,
                       }
                     };
-                    // During flush, queue chunks for synchronous delivery in resolver
-                    // Otherwise, use NonBlocking callback for immediate delivery
-                    if guard.inside_flush {
-                      guard.pending_chunks.push((chunk, metadata));
-                    } else {
-                      guard.output_callback.call(
-                        (chunk, metadata).into(),
-                        ThreadsafeFunctionCallMode::NonBlocking,
-                      );
-                    }
+                    // During fallback re-encoding, always buffer chunks to pending_chunks.
+                    // This ensures they're delivered when flush() drains pending_chunks,
+                    // rather than via NonBlocking callbacks that may run after flush resolves.
+                    guard.pending_chunks.push((chunk, metadata));
                     guard.first_output_produced = true;
                   }
                 }
@@ -1731,6 +1758,12 @@ impl VideoEncoder {
       while ctx.receive_packet().ok().flatten().is_some() {}
     }
 
+    // Release the old hardware encoder slot (we're replacing the encoder)
+    if guard.acquired_hw_slot {
+      codec_pressure::gauge().release_hw_encoder();
+      guard.acquired_hw_slot = false;
+    }
+
     // Clear work-related state
     guard.encode_queue_size = 0;
     guard.timestamp_queue.clear();
@@ -1765,17 +1798,33 @@ impl VideoEncoder {
       .hardware_acceleration
       .unwrap_or(HardwareAcceleration::NoPreference);
 
-    // Determine hardware type based on preference
-    let hw_type = match hw_preference {
-      HardwareAcceleration::PreferHardware => Some(get_platform_hw_type()),
+    // Determine hardware type based on preference and pressure gauge
+    let (hw_type, mut acquired_hw_slot) = match hw_preference {
+      HardwareAcceleration::PreferHardware => {
+        // prefer-hardware: Try to acquire slot, warn if at capacity but still try
+        let acquired = codec_pressure::gauge().try_acquire_hw_encoder();
+        if !acquired {
+          tracing::warn!(
+            target: "webcodecs",
+            "Hardware encoder slots exhausted, attempting hardware anyway (prefer-hardware)"
+          );
+        }
+        (Some(get_platform_hw_type()), acquired)
+      }
       HardwareAcceleration::NoPreference => {
         if is_hw_encoding_disabled() {
-          None
+          (None, false)
+        } else if !codec_pressure::gauge().try_acquire_hw_encoder() {
+          tracing::info!(
+            target: "webcodecs",
+            "Hardware encoder slots exhausted, using software encoder"
+          );
+          (None, false)
         } else {
-          Some(get_platform_hw_type())
+          (Some(get_platform_hw_type()), true)
         }
       }
-      HardwareAcceleration::PreferSoftware => None,
+      HardwareAcceleration::PreferSoftware => (None, false),
     };
 
     // Build encoder config first (needed for software fallback)
@@ -1857,6 +1906,11 @@ impl VideoEncoder {
         Err(e) => {
           // For no-preference, try software fallback if HW failed at creation
           if hw_preference == HardwareAcceleration::NoPreference && hw_type.is_some() {
+            // Release the hardware slot since we're falling back to software
+            if acquired_hw_slot {
+              codec_pressure::gauge().release_hw_encoder();
+              acquired_hw_slot = false;
+            }
             match Self::create_software_encoder(
               codec_id,
               &encoder_config,
@@ -1873,6 +1927,10 @@ impl VideoEncoder {
               }
             }
           } else {
+            // Release the hardware slot on error
+            if acquired_hw_slot {
+              codec_pressure::gauge().release_hw_encoder();
+            }
             Self::report_error(
               &mut guard,
               &format!("NotSupportedError: Failed to create encoder: {}", e),
@@ -1886,6 +1944,11 @@ impl VideoEncoder {
     if let Err(e) = context.configure_encoder(&encoder_config) {
       // Fallback to software if HW configure fails
       if hw_preference == HardwareAcceleration::NoPreference && is_hardware {
+        // Release the hardware slot since we're falling back to software
+        if acquired_hw_slot {
+          codec_pressure::gauge().release_hw_encoder();
+          acquired_hw_slot = false;
+        }
         match Self::create_software_encoder(codec_id, &encoder_config, use_avcc_format, realtime) {
           Ok((ctx, name)) => {
             context = ctx;
@@ -1901,6 +1964,10 @@ impl VideoEncoder {
           }
         }
       } else {
+        // Release the hardware slot on error
+        if acquired_hw_slot {
+          codec_pressure::gauge().release_hw_encoder();
+        }
         Self::report_error(
           &mut guard,
           &format!("NotSupportedError: Failed to configure encoder: {}", e),
@@ -1916,6 +1983,11 @@ impl VideoEncoder {
       if let Err(e) = context.open() {
         // Fallback to software if HW open fails
         if hw_preference == HardwareAcceleration::NoPreference && is_hardware {
+          // Release the hardware slot since we're falling back to software
+          if acquired_hw_slot {
+            codec_pressure::gauge().release_hw_encoder();
+            acquired_hw_slot = false;
+          }
           match Self::create_software_encoder(codec_id, &encoder_config, use_avcc_format, realtime)
           {
             Ok((ctx, name)) => {
@@ -1932,6 +2004,10 @@ impl VideoEncoder {
             }
           }
         } else {
+          // Release the hardware slot on error
+          if acquired_hw_slot {
+            codec_pressure::gauge().release_hw_encoder();
+          }
           Self::report_error(
             &mut guard,
             &format!("NotSupportedError: Failed to open encoder: {}", e),
@@ -1944,6 +2020,10 @@ impl VideoEncoder {
     // HEVC alpha requires software encoder - hardware encoders don't support alpha
     // Check after encoder creation so that no-preference fallback can succeed
     if use_alpha && codec_id == AVCodecID::Hevc && is_hardware {
+      // Release the hardware slot on error
+      if acquired_hw_slot {
+        codec_pressure::gauge().release_hw_encoder();
+      }
       Self::report_error(
         &mut guard,
         "NotSupportedError: HEVC alpha encoding requires software encoder. Set hardwareAcceleration to 'prefer-software'",
@@ -1964,6 +2044,8 @@ impl VideoEncoder {
     guard.encoder_name = encoder_name;
     guard.use_avcc_format = use_avcc_format;
     guard.hw_preference = hw_preference;
+    // Track whether we acquired a hardware encoder slot from pressure gauge
+    guard.acquired_hw_slot = acquired_hw_slot && is_hardware;
 
     // Parse temporal layer count from scalabilityMode
     guard.temporal_layer_count = config
@@ -2112,6 +2194,12 @@ impl VideoEncoder {
       return false;
     }
 
+    // Release the hardware encoder slot since we're falling back to software
+    if inner.acquired_hw_slot {
+      codec_pressure::gauge().release_hw_encoder();
+      inner.acquired_hw_slot = false;
+    }
+
     // Replace the hardware context with software
     inner.context = Some(context);
     inner.is_hardware = false;
@@ -2119,6 +2207,10 @@ impl VideoEncoder {
     inner.silent_encode_count = 0;
     inner.first_output_produced = false;
     inner.extradata_sent = false;
+
+    // Disable hardware frame upload - software encoder can't handle GPU frames
+    inner.use_hw_frames = false;
+    inner.hw_frame_ctx = None;
 
     true
   }
@@ -2532,20 +2624,34 @@ impl VideoEncoder {
     // - prefer-software: Use software only
     //
     // Also check if hardware encoding is globally disabled due to repeated failures
-    let hw_type = match &hw_preference {
+    // and if we can acquire a hardware encoder slot from the pressure gauge
+    let (hw_type, mut acquired_hw_slot) = match &hw_preference {
       HardwareAcceleration::PreferHardware => {
-        // prefer-hardware: Always try hardware (even if globally disabled, per user request)
-        Some(get_platform_hw_type())
+        // prefer-hardware: Try to acquire slot, warn if at capacity but still try
+        let acquired = codec_pressure::gauge().try_acquire_hw_encoder();
+        if !acquired {
+          tracing::warn!(
+            target: "webcodecs",
+            "Hardware encoder slots exhausted, attempting hardware anyway (prefer-hardware)"
+          );
+        }
+        (Some(get_platform_hw_type()), acquired)
       }
       HardwareAcceleration::NoPreference => {
-        // no-preference: Use hardware unless globally disabled
+        // no-preference: Use hardware unless globally disabled or at pressure capacity
         if is_hw_encoding_disabled() {
-          None // Skip hardware, use software
+          (None, false) // Skip hardware, use software
+        } else if !codec_pressure::gauge().try_acquire_hw_encoder() {
+          tracing::info!(
+            target: "webcodecs",
+            "Hardware encoder slots exhausted, using software encoder"
+          );
+          (None, false) // Fall back to software
         } else {
-          Some(get_platform_hw_type())
+          (Some(get_platform_hw_type()), true)
         }
       }
-      HardwareAcceleration::PreferSoftware => None,
+      HardwareAcceleration::PreferSoftware => (None, false),
     };
 
     // Create encoder context with hardware acceleration info
@@ -2558,6 +2664,11 @@ impl VideoEncoder {
       Err(e) => {
         // For no-preference, try again with software only if HW failed at creation
         if hw_preference == HardwareAcceleration::NoPreference {
+          // Release the hardware slot since we're falling back to software
+          if acquired_hw_slot {
+            codec_pressure::gauge().release_hw_encoder();
+            acquired_hw_slot = false;
+          }
           match CodecContext::new_encoder_with_hw_info(codec_id, None) {
             Ok(result) => result,
             Err(e2) => {
@@ -2566,6 +2677,10 @@ impl VideoEncoder {
             }
           }
         } else {
+          // Release the hardware slot on error
+          if acquired_hw_slot {
+            codec_pressure::gauge().release_hw_encoder();
+          }
           Self::report_error(&mut inner, &format!("Failed to create encoder: {}", e));
           return Ok(());
         }
@@ -2589,8 +2704,23 @@ impl VideoEncoder {
     let use_alpha = (codec_id == AVCodecID::Vp9 || codec_id == AVCodecID::Hevc)
       && matches!(config.alpha, Some(AlphaOption::Keep));
 
-    // NOTE: HEVC alpha check moved after all fallbacks (configure/open) to allow
-    // no-preference to fall back to software when hardware fails with YUVA420P
+    // Early check: HEVC alpha with prefer-hardware must fail immediately with helpful message
+    // Hardware HEVC encoders (VideoToolbox, NVENC, etc.) don't support alpha channel.
+    // For no-preference, we let hardware fail and fall back to software naturally.
+    // For prefer-hardware, we fail early with a clear error message.
+    if use_alpha
+      && codec_id == AVCodecID::Hevc
+      && hw_preference == HardwareAcceleration::PreferHardware
+    {
+      Self::report_error(
+        &mut inner,
+        "NotSupportedError: HEVC alpha encoding requires software encoder. Set hardwareAcceleration to 'prefer-software'",
+      );
+      return Ok(());
+    }
+
+    // NOTE: HEVC alpha check also exists after all fallbacks (configure/open) to catch
+    // no-preference cases where hardware fails and software fallback is used
 
     // Select pixel format based on alpha and bit depth
     let pixel_format = if use_alpha {
@@ -2625,6 +2755,11 @@ impl VideoEncoder {
     if let Err(e) = context.configure_encoder(&encoder_config) {
       // For no-preference, try software fallback if hardware configure fails
       if hw_preference == HardwareAcceleration::NoPreference && is_hardware {
+        // Release the hardware slot since we're falling back to software
+        if acquired_hw_slot {
+          codec_pressure::gauge().release_hw_encoder();
+          acquired_hw_slot = false;
+        }
         match Self::create_software_encoder(
           codec_id,
           &encoder_config,
@@ -2648,6 +2783,10 @@ impl VideoEncoder {
           }
         }
       } else {
+        // Release the hardware slot on error
+        if acquired_hw_slot {
+          codec_pressure::gauge().release_hw_encoder();
+        }
         Self::report_error(&mut inner, &format!("Failed to configure encoder: {}", e));
         return Ok(());
       }
@@ -2669,10 +2808,40 @@ impl VideoEncoder {
       context.set_global_header();
     }
 
+    // Try to create hardware frame context for zero-copy GPU encoding
+    // This MUST be done BEFORE opening the encoder, as FFmpeg requires
+    // hw_frames_ctx to be set on the context before avcodec_open2().
+    // This is optional - if it fails, we fall back to CPU frames.
+    let (hw_device_ctx, hw_frame_ctx, use_hw_frames) = if is_hardware {
+      if let Some(hw) = hw_type {
+        match Self::try_create_hw_frame_context(hw, width, height) {
+          Ok((device, frames)) => {
+            // Attach the hw_frames_ctx to the encoder context BEFORE open
+            context.set_hw_frames(frames.clone());
+            (Some(device), Some(frames), true)
+          }
+          Err(_) => {
+            // Failed to create hw frame context, fall back to CPU frames
+            // This is not an error - hardware encoders can accept CPU frames too
+            (None, None, false)
+          }
+        }
+      } else {
+        (None, None, false)
+      }
+    } else {
+      (None, None, false)
+    };
+
     // Open the encoder
     if let Err(e) = context.open() {
       // For no-preference, try software fallback if hardware open fails
       if hw_preference == HardwareAcceleration::NoPreference && is_hardware {
+        // Release the hardware slot since we're falling back to software
+        if acquired_hw_slot {
+          codec_pressure::gauge().release_hw_encoder();
+          acquired_hw_slot = false;
+        }
         match Self::create_software_encoder(
           codec_id,
           &encoder_config,
@@ -2696,6 +2865,10 @@ impl VideoEncoder {
           }
         }
       } else {
+        // Release the hardware slot on error
+        if acquired_hw_slot {
+          codec_pressure::gauge().release_hw_encoder();
+        }
         Self::report_error(&mut inner, &format!("Failed to open encoder: {}", e));
         return Ok(());
       }
@@ -2704,31 +2877,16 @@ impl VideoEncoder {
     // HEVC alpha requires software encoder - hardware encoders don't support alpha
     // Check after all fallbacks so that no-preference can successfully fall back to software
     if use_alpha && codec_id == AVCodecID::Hevc && is_hardware {
+      // Release the hardware slot on error
+      if acquired_hw_slot {
+        codec_pressure::gauge().release_hw_encoder();
+      }
       Self::report_error(
         &mut inner,
         "NotSupportedError: HEVC alpha encoding requires software encoder. Set hardwareAcceleration to 'prefer-software'",
       );
       return Ok(());
     }
-
-    // Try to create hardware frame context for zero-copy GPU encoding
-    // This is optional - if it fails, we fall back to CPU frames (current behavior)
-    let (hw_device_ctx, hw_frame_ctx, use_hw_frames) = if is_hardware {
-      if let Some(hw) = hw_type {
-        match Self::try_create_hw_frame_context(hw, width, height) {
-          Ok((device, frames)) => (Some(device), Some(frames), true),
-          Err(_) => {
-            // Failed to create hw frame context, fall back to CPU frames
-            // This is not an error - hardware encoders can accept CPU frames too
-            (None, None, false)
-          }
-        }
-      } else {
-        (None, None, false)
-      }
-    } else {
-      (None, None, false)
-    };
 
     inner.context = Some(context);
     inner.config = Some(config);
@@ -2744,6 +2902,10 @@ impl VideoEncoder {
     inner.silent_encode_count = 0;
     inner.first_output_produced = false;
     inner.pending_frames.clear();
+    // Track whether we acquired a hardware encoder slot from pressure gauge
+    // Must be released on close/drop/fallback. If we fell back to software,
+    // the slot was already released during fallback logic.
+    inner.acquired_hw_slot = acquired_hw_slot && is_hardware;
 
     // Hardware frame context for zero-copy GPU encoding
     inner.hw_device_ctx = hw_device_ctx;
@@ -3115,6 +3277,12 @@ impl VideoEncoder {
     inner.extradata_sent = false;
     inner.encode_queue_size = 0;
 
+    // Release the hardware encoder slot if we acquired one
+    if inner.acquired_hw_slot {
+      codec_pressure::gauge().release_hw_encoder();
+      inner.acquired_hw_slot = false;
+    }
+
     // Reset hardware tracking state
     inner.is_hardware = false;
     inner.encoder_name = String::new();
@@ -3198,6 +3366,12 @@ impl VideoEncoder {
       let _ = ctx.send_frame(None);
       // Drain all remaining packets
       while ctx.receive_packet().ok().flatten().is_some() {}
+    }
+
+    // Release the hardware encoder slot if we acquired one
+    if inner.acquired_hw_slot {
+      codec_pressure::gauge().release_hw_encoder();
+      inner.acquired_hw_slot = false;
     }
 
     inner.context = None;
