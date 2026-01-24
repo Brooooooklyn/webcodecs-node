@@ -2830,7 +2830,7 @@ impl VideoEncoder {
     // This MUST be done BEFORE opening the encoder, as FFmpeg requires
     // hw_frames_ctx to be set on the context before avcodec_open2().
     // This is optional - if it fails, we fall back to CPU frames.
-    let (hw_device_ctx, hw_frame_ctx, use_hw_frames) = if is_hardware {
+    let (mut hw_device_ctx, mut hw_frame_ctx, mut use_hw_frames) = if is_hardware {
       if let Some(hw) = hw_type {
         match Self::try_create_hw_frame_context(hw, width, height) {
           Ok((device, frames)) => {
@@ -2870,6 +2870,10 @@ impl VideoEncoder {
             context = sw_ctx;
             is_hardware = false;
             encoder_name = sw_name;
+            // Reset hardware frame context - software encoder doesn't use GPU frames
+            hw_device_ctx = None;
+            hw_frame_ctx = None;
+            use_hw_frames = false;
           }
           Err(e2) => {
             Self::report_error(
