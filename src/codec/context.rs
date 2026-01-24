@@ -12,7 +12,7 @@ use crate::ffi::{
     ffctx_set_has_b_frames, ffctx_set_height, ffctx_set_hw_device_ctx, ffctx_set_level,
     ffctx_set_max_b_frames, ffctx_set_pix_fmt, ffctx_set_profile, ffctx_set_qmax, ffctx_set_qmin,
     ffctx_set_rc_buffer_size, ffctx_set_rc_max_rate, ffctx_set_sample_fmt, ffctx_set_sample_rate,
-    ffctx_set_thread_count, ffctx_set_time_base, ffctx_set_width,
+    ffctx_set_thread_count, ffctx_set_thread_type, ffctx_set_time_base, ffctx_set_width,
   },
   avcodec::{
     avcodec_alloc_context3, avcodec_find_decoder, avcodec_find_encoder,
@@ -46,6 +46,9 @@ pub struct DecoderCreationResult {
   pub context: CodecContext,
   /// Whether the decoder uses hardware acceleration
   pub is_hardware: bool,
+  /// Hardware pixel format as raw FFmpeg value if using hardware decoding
+  /// This is the raw AV_PIX_FMT_* value (e.g., 162 for VideoToolbox in FFmpeg 6.x)
+  pub hw_pix_fmt_raw: Option<i32>,
 }
 
 /// Type of codec (encoder or decoder)
@@ -206,21 +209,62 @@ impl CodecContext {
     codec_id: AVCodecID,
     hw_type: Option<AVHWDeviceType>,
   ) -> CodecResult<DecoderCreationResult> {
-    let mut ctx = Self::new_decoder(codec_id)?;
-    let mut is_hardware = false;
+    // For AV1, try libdav1d first to avoid libaom stability issues
+    let codec = if codec_id == AVCodecID::Av1 {
+      let decoder_name = c"libdav1d";
+      let codec = unsafe { ffi::avcodec::avcodec_find_decoder_by_name(decoder_name.as_ptr()) };
+      if !codec.is_null() {
+        codec
+      } else {
+        unsafe { avcodec_find_decoder(codec_id.as_raw()) }
+      }
+    } else {
+      unsafe { avcodec_find_decoder(codec_id.as_raw()) }
+    };
 
-    // Attach hardware device context if requested
-    if let Some(hw) = hw_type
-      && let Ok(hw_device) = HwDeviceContext::new(hw)
-    {
-      ctx.set_hw_device(hw_device);
-      is_hardware = true;
+    if codec.is_null() {
+      return Err(CodecError::DecoderNotFound(codec_id));
     }
-    // Hardware decode will fall back to software if device creation fails
 
+    let mut is_hardware = false;
+    let mut hw_pix_fmt_raw = None;
+
+    // Check if hardware acceleration is requested and supported
+    if let Some(hw) = hw_type {
+      // Check if the codec supports this hardware type
+      let pix_fmt_raw = unsafe { ffi::accessors::ff_codec_get_hw_pix_fmt(codec, hw.as_raw()) };
+
+      // AV_PIX_FMT_NONE is -1
+      if pix_fmt_raw != -1 {
+        // Hardware is supported by this codec
+        if let Ok(hw_device) = HwDeviceContext::new(hw) {
+          // Create context from codec
+          let mut ctx = Self::from_codec(codec, CodecType::Decoder)?;
+          ctx.set_hw_device(hw_device);
+          is_hardware = true;
+          hw_pix_fmt_raw = Some(pix_fmt_raw);
+
+          return Ok(DecoderCreationResult {
+            context: ctx,
+            is_hardware,
+            hw_pix_fmt_raw,
+          });
+        }
+      }
+      // Hardware not supported or device creation failed, fall through to software
+      tracing::debug!(
+        codec = ?codec_id,
+        hw_type = ?hw,
+        "Hardware decoding not supported for this codec, falling back to software"
+      );
+    }
+
+    // Software decoder
+    let ctx = Self::from_codec(codec, CodecType::Decoder)?;
     Ok(DecoderCreationResult {
       context: ctx,
       is_hardware,
+      hw_pix_fmt_raw,
     })
   }
 
@@ -765,11 +809,22 @@ impl CodecContext {
     unsafe {
       let ctx = self.ptr.as_ptr();
 
-      // Threading (use frame threading for decoders)
+      // Threading configuration
+      // For hardware decoders, thread_count=1 is passed to disable frame threading
+      // which can cause race conditions during flush with hardware acceleration.
+      // For software decoders, thread_count=0 (auto-detect) is used for performance.
+      tracing::debug!(target: "webcodecs", "configure_decoder: thread_count={}", config.thread_count);
       if config.thread_count > 0 {
         ffctx_set_thread_count(ctx, config.thread_count as i32);
+        // When single-threaded (thread_count=1), also disable threading mode
+        // thread_type=0 means no threading (FF_THREAD_NONE)
+        if config.thread_count == 1 {
+          tracing::debug!(target: "webcodecs", "configure_decoder: setting thread_type=0 for single-threaded mode");
+          ffctx_set_thread_type(ctx, 0);
+        }
       } else {
-        // Auto-detect thread count
+        // Auto-detect thread count for software decoders
+        tracing::debug!(target: "webcodecs", "configure_decoder: using auto-detect thread_count=0");
         ffctx_set_thread_count(ctx, 0);
       }
 
@@ -805,8 +860,30 @@ impl CodecContext {
         ffctx_set_has_b_frames(ctx, 2);
       }
 
-      // TODO: Set extradata if provided
-      // This requires allocating memory with av_malloc
+      // Set width/height if provided (may be required for hardware decoding)
+      // These values help the decoder allocate proper output buffers.
+      if let Some(w) = config.width {
+        ffctx_set_width(ctx, w as i32);
+      }
+      if let Some(h) = config.height {
+        ffctx_set_height(ctx, h as i32);
+      }
+
+      // Set extradata if provided (e.g., SPS/PPS for H.264, VPS/SPS/PPS for HEVC)
+      // This is critical for hardware decoding - without extradata, the decoder
+      // cannot determine stream parameters and may fail to produce output.
+      if let Some(ref extradata) = config.extradata
+        && !extradata.is_empty()
+      {
+        let ret =
+          ffi::accessors::ffctx_set_extradata(ctx, extradata.as_ptr(), extradata.len() as i32);
+        if ret < 0 {
+          return Err(CodecError::HardwareError(format!(
+            "Failed to set extradata: {}",
+            ffi::FFmpegError::from_code(ret)
+          )));
+        }
+      }
     }
 
     Ok(())
@@ -895,9 +972,6 @@ impl CodecContext {
   /// Returns Ok(true) if packet was accepted, Ok(false) if decoder needs output drained first
   pub fn send_packet(&mut self, packet: Option<&Packet>) -> CodecResult<bool> {
     let pkt_ptr = packet.map(|p| p.as_ptr()).unwrap_or(std::ptr::null());
-    let size = packet.map(|p| p.size()).unwrap_or(0);
-    tracing::debug!("send_packet: ptr={:?}, size={}", !pkt_ptr.is_null(), size);
-
     let ret = unsafe { avcodec_send_packet(self.ptr.as_ptr(), pkt_ptr) };
 
     if ret == AVERROR_EAGAIN {
@@ -919,13 +993,6 @@ impl CodecContext {
     let mut frame = Frame::new()?;
     let ret = unsafe { avcodec_receive_frame(self.ptr.as_ptr(), frame.as_mut_ptr()) };
 
-    tracing::trace!(
-      "receive_frame_with_status: ret={}, EAGAIN={}, EOF={}",
-      ret,
-      AVERROR_EAGAIN,
-      AVERROR_EOF
-    );
-
     if ret == AVERROR_EAGAIN {
       return Ok(ReceiveResult::NeedMoreInput);
     }
@@ -933,6 +1000,11 @@ impl CodecContext {
       return Ok(ReceiveResult::EndOfStream);
     }
     ffi::check_error(ret)?;
+    tracing::debug!(
+      "receive_frame_with_status: got frame! pts={}, format={:?}",
+      frame.pts(),
+      frame.format()
+    );
     Ok(ReceiveResult::Ok(frame))
   }
 
@@ -950,15 +1022,10 @@ impl CodecContext {
   pub fn decode(&mut self, packet: Option<&Packet>) -> CodecResult<Vec<Frame>> {
     let mut frames = Vec::new();
 
-    let pkt_pts = packet.map(|p| p.pts()).unwrap_or(-1);
-    tracing::debug!("decode: sending packet with pts={}", pkt_pts);
-
     // Send packet
     if !self.send_packet(packet)? {
-      tracing::debug!("decode: decoder full, draining first");
       // Decoder is full, drain first
       while let Some(frame) = self.receive_frame()? {
-        tracing::debug!("decode: drained frame pts={}", frame.pts());
         frames.push(frame);
       }
       // Retry sending packet
@@ -967,7 +1034,6 @@ impl CodecContext {
 
     // Receive all available frames
     while let Some(frame) = self.receive_frame()? {
-      tracing::debug!("decode: received frame pts={}", frame.pts());
       frames.push(frame);
     }
 
@@ -985,11 +1051,11 @@ impl CodecContext {
   /// 2. Keep calling avcodec_receive_frame() until AVERROR_EOF
   /// 3. AVERROR_EOF is the ONLY reliable signal that draining is complete
   pub fn flush_decoder(&mut self) -> CodecResult<Vec<Frame>> {
+    tracing::debug!(target: "webcodecs", "flush_decoder: starting flush");
     let mut frames = Vec::new();
 
     // First, drain any already-decoded frames that are buffered
     while let Some(frame) = self.receive_frame()? {
-      tracing::debug!("flush_decoder: got pre-drain frame pts={}", frame.pts());
       frames.push(frame);
     }
 
@@ -1012,7 +1078,6 @@ impl CodecContext {
     loop {
       match self.receive_frame_with_status()? {
         ReceiveResult::Ok(frame) => {
-          tracing::debug!("flush_decoder: got drain frame pts={}", frame.pts());
           frames.push(frame);
           consecutive_eagain = 0; // Reset on progress
         }
@@ -1032,14 +1097,9 @@ impl CodecContext {
           // EAGAIN during drain mode is unusual but can happen with some decoders.
           // According to FFmpeg docs, we should continue calling receive_frame()
           // until we get EOF. The decoder will eventually return EOF when done.
-          tracing::debug!(
-            "flush_decoder: got EAGAIN during drain (attempt {}), continuing",
-            consecutive_eagain
-          );
           continue;
         }
         ReceiveResult::EndOfStream => {
-          tracing::debug!("flush_decoder: got EOF, total frames={}", frames.len());
           // True EOF - all frames have been output
           break;
         }

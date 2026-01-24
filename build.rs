@@ -775,6 +775,52 @@ fn link_platform_libraries(target_os: &str) {
       println!("cargo:rustc-link-lib=bz2");
       println!("cargo:rustc-link-lib=iconv");
       println!("cargo:rustc-link-lib=lzma");
+
+      // Force-link the compiler runtime function for __builtin_available.
+      // When LTO is enabled, this symbol can be incorrectly marked as unused
+      // and not linked, causing crashes in FFmpeg's VideoToolbox code that
+      // uses __builtin_available(macOS 12.0, ...) for API version checks.
+      // We link libclang_rt.osx.a which contains ___isPlatformVersionAtLeast.
+      //
+      // Find the clang runtime library path dynamically using xcrun
+      if let Ok(output) = Command::new("xcrun").args(["--show-sdk-path"]).output()
+        && output.status.success()
+      {
+        // Get the clang version from the toolchain
+        if let Ok(clang_output) = Command::new("xcrun").args(["clang", "--version"]).output()
+          && clang_output.status.success()
+        {
+          let version_str = String::from_utf8_lossy(&clang_output.stdout);
+          // Extract version number (e.g., "clang version 17.0.0" -> "17")
+          if let Some(ver_line) = version_str.lines().next()
+            && let Some(ver_start) = ver_line.find("version ")
+          {
+            let ver_part = &ver_line[ver_start + 8..];
+            if let Some(major_end) = ver_part.find('.') {
+              let major_version = &ver_part[..major_end];
+              let clang_rt_path = format!(
+                "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/{}/lib/darwin/libclang_rt.osx.a",
+                major_version
+              );
+              if Path::new(&clang_rt_path).exists() {
+                println!("cargo:rustc-link-arg={}", clang_rt_path);
+              } else {
+                // Fallback: try to find any version
+                let clang_lib_base = "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang";
+                if let Ok(entries) = fs::read_dir(clang_lib_base) {
+                  for entry in entries.flatten() {
+                    let path = entry.path().join("lib/darwin/libclang_rt.osx.a");
+                    if path.exists() {
+                      println!("cargo:rustc-link-arg={}", path.display());
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
 
     "linux" => {

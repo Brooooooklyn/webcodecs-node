@@ -44,6 +44,27 @@ unsafe extern "C" {
   pub fn ffctx_set_hw_device_ctx(ctx: *mut AVCodecContext, hw_device_ctx: *mut AVBufferRef);
   pub fn ffctx_set_hw_frames_ctx(ctx: *mut AVCodecContext, hw_frames_ctx: *mut AVBufferRef);
 
+  /// Set up get_format callback for hardware decoding.
+  /// Must be called after setting hw_device_ctx but before avcodec_open2().
+  pub fn ffctx_set_hw_get_format(ctx: *mut AVCodecContext, hw_pix_fmt: c_int);
+
+  // ========================================================================
+  // AVCodecHWConfig Accessors
+  // ========================================================================
+
+  /// Get the pixel format from a codec hardware config.
+  pub fn ffhwconfig_get_pix_fmt(config: *const crate::ffi::hwaccel::AVCodecHWConfig) -> c_int;
+
+  /// Get the methods bitmask from a codec hardware config.
+  pub fn ffhwconfig_get_methods(config: *const crate::ffi::hwaccel::AVCodecHWConfig) -> c_int;
+
+  /// Get the device type from a codec hardware config.
+  pub fn ffhwconfig_get_device_type(config: *const crate::ffi::hwaccel::AVCodecHWConfig) -> c_int;
+
+  /// Check if codec supports hardware decoding with a specific device type.
+  /// Returns the pixel format if supported, or AV_PIX_FMT_NONE if not.
+  pub fn ff_codec_get_hw_pix_fmt(codec: *const AVCodec, device_type: c_int) -> c_int;
+
   // ========================================================================
   // AVCodecContext Getters
   // ========================================================================
@@ -62,6 +83,7 @@ unsafe extern "C" {
   pub fn ffctx_get_level(ctx: *const AVCodecContext) -> c_int;
   pub fn ffctx_get_extradata(ctx: *const AVCodecContext) -> *const u8;
   pub fn ffctx_get_extradata_size(ctx: *const AVCodecContext) -> c_int;
+  pub fn ffctx_set_extradata(ctx: *mut AVCodecContext, data: *const u8, size: c_int) -> c_int;
   pub fn ffctx_get_flags(ctx: *const AVCodecContext) -> c_int;
 
   // ========================================================================
@@ -150,6 +172,10 @@ unsafe extern "C" {
   pub fn ffframe_data(frame: *mut AVFrame, plane: c_int) -> *mut u8;
   pub fn ffframe_data_const(frame: *const AVFrame, plane: c_int) -> *const u8;
   pub fn ffframe_linesize(frame: *const AVFrame, plane: c_int) -> c_int;
+
+  /// Get the hardware frames context from an AVFrame.
+  /// Returns NULL if the frame has no hardware frames context.
+  pub fn ffframe_get_hw_frames_ctx(frame: *const AVFrame) -> *mut AVBufferRef;
 
   // ========================================================================
   // AVFrame Audio Data Access (extended_data for planar audio)

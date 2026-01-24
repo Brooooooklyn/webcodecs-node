@@ -417,13 +417,14 @@ impl AVPixelFormat {
       87 => Self::Yuva420p10le,
       89 => Self::Yuva422p10le,
       91 => Self::Yuva444p10le,
-      162 => Self::Videotoolbox,
-      119 => Self::Cuda,
-      53 => Self::Vaapi,
-      173 => Self::Qsv,
-      174 => Self::D3d11,
-      55 => Self::Dxva2Vld,
-      185 => Self::Vulkan,
+      // Hardware formats - FFmpeg 8.x values (with fallback to older versions)
+      157 | 162 => Self::Videotoolbox, // 157 (FFmpeg 8.x), 162 (older)
+      117 | 119 => Self::Cuda,         // 117 (FFmpeg 8.x), 119 (older)
+      44 | 53 => Self::Vaapi,          // 44 (FFmpeg 8.x), 53 (older)
+      114 | 173 => Self::Qsv,          // 114 (FFmpeg 8.x), 173 (older)
+      171 | 174 | 175 => Self::D3d11,  // 171 (FFmpeg 8.x), 174/175 (older)
+      51 | 55 => Self::Dxva2Vld,       // 51 (FFmpeg 8.x), 55 (older)
+      190 | 185 => Self::Vulkan,       // 190 (FFmpeg 8.x), 185 (older)
       _ => Self::None,
     }
   }

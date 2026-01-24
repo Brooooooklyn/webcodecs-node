@@ -21,7 +21,7 @@ pub use audio_buffer::AudioSampleBuffer;
 pub use context::{CodecContext, CodecType, DecoderCreationResult, EncoderCreationResult};
 pub use frame::Frame;
 pub use hwdevice::HwDeviceContext;
-pub use hwframes::{HwFrameConfig, HwFrameContext};
+pub use hwframes::{HwFrameConfig, HwFrameContext, download_hw_frame};
 pub use packet::Packet;
 pub use resampler::Resampler;
 pub use scaler::{ScaleAlgorithm, Scaler};
@@ -121,6 +121,10 @@ pub struct DecoderConfig {
   /// Enable low-latency mode (for optimizeForLatency in WebCodecs)
   /// When true, decoder outputs frames immediately without buffering
   pub low_latency: bool,
+  /// Video coded width (for hardware decoding - may be required for some platforms)
+  pub width: Option<u32>,
+  /// Video coded height (for hardware decoding - may be required for some platforms)
+  pub height: Option<u32>,
 }
 
 impl Default for DecoderConfig {
@@ -130,6 +134,8 @@ impl Default for DecoderConfig {
       thread_count: 0,
       extradata: None,
       low_latency: false,
+      width: None,
+      height: None,
     }
   }
 }

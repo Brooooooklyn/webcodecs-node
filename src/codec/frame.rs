@@ -163,38 +163,8 @@ impl Frame {
   /// Get pixel format
   pub fn format(&self) -> AVPixelFormat {
     let fmt = unsafe { ffframe_get_format(self.as_ptr()) };
-    // Safe conversion - unknown formats become None
-    match fmt {
-      // 8-bit YUV planar formats
-      0 => AVPixelFormat::Yuv420p,
-      4 => AVPixelFormat::Yuv422p,
-      5 => AVPixelFormat::Yuv444p,
-      33 => AVPixelFormat::Yuva420p,
-      78 => AVPixelFormat::Yuva422p,
-      79 => AVPixelFormat::Yuva444p,
-      // Semi-planar formats
-      23 => AVPixelFormat::Nv12,
-      24 => AVPixelFormat::Nv21,
-      // RGB formats
-      2 => AVPixelFormat::Rgb24,
-      3 => AVPixelFormat::Bgr24,
-      25 => AVPixelFormat::Argb,
-      26 => AVPixelFormat::Rgba,
-      27 => AVPixelFormat::Abgr,
-      28 => AVPixelFormat::Bgra,
-      // 10-bit YUV formats
-      62 => AVPixelFormat::Yuv420p10le,
-      64 => AVPixelFormat::Yuv422p10le,
-      68 => AVPixelFormat::Yuv444p10le,
-      87 => AVPixelFormat::Yuva420p10le,
-      89 => AVPixelFormat::Yuva422p10le,
-      91 => AVPixelFormat::Yuva444p10le,
-      // 12-bit YUV formats
-      123 => AVPixelFormat::Yuv420p12le,
-      127 => AVPixelFormat::Yuv422p12le,
-      131 => AVPixelFormat::Yuv444p12le,
-      _ => AVPixelFormat::None,
-    }
+    // Use centralized conversion that includes hardware formats
+    AVPixelFormat::from_raw(fmt)
   }
 
   /// Set pixel format

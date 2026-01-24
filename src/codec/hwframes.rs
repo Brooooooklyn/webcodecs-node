@@ -6,9 +6,9 @@
 use crate::ffi::{
   AVBufferRef, AVHWDeviceType, AVPixelFormat, FFmpegError,
   accessors::{
-    ffhwframes_get_format, ffhwframes_get_height, ffhwframes_get_sw_format, ffhwframes_get_width,
-    ffhwframes_set_format, ffhwframes_set_height, ffhwframes_set_initial_pool_size,
-    ffhwframes_set_sw_format, ffhwframes_set_width,
+    ffframe_data_const, ffframe_get_hw_frames_ctx, ffhwframes_get_format, ffhwframes_get_height,
+    ffhwframes_get_sw_format, ffhwframes_get_width, ffhwframes_set_format, ffhwframes_set_height,
+    ffhwframes_set_initial_pool_size, ffhwframes_set_sw_format, ffhwframes_set_width,
   },
   avutil::av_buffer_unref,
   hwaccel::{
@@ -237,6 +237,54 @@ impl Drop for HwFrameContext {
       av_buffer_unref(&mut ptr);
     }
   }
+}
+
+/// Download a hardware frame to CPU memory.
+///
+/// This function transfers pixel data from GPU memory to a software (CPU) frame.
+/// Required for hardware decoding since decoded frames reside in GPU memory.
+///
+/// # Arguments
+/// * `hw_frame` - A hardware (GPU) frame from the decoder
+///
+/// # Returns
+/// A software (CPU) frame containing the downloaded pixel data
+pub fn download_hw_frame(hw_frame: &Frame) -> CodecResult<Frame> {
+  // Validate hardware frame has required context before attempting transfer
+  let hw_frames_ctx = unsafe { ffframe_get_hw_frames_ctx(hw_frame.as_ptr()) };
+  if hw_frames_ctx.is_null() {
+    return Err(CodecError::HardwareError(
+      "Hardware frame has no hw_frames_ctx - cannot download".into(),
+    ));
+  }
+
+  // For VideoToolbox frames, validate data[3] (CVPixelBufferRef) is present
+  // This pointer holds the actual GPU texture reference
+  let data3 = unsafe { ffframe_data_const(hw_frame.as_ptr(), 3) };
+  if data3.is_null() {
+    return Err(CodecError::HardwareError(
+      "Hardware frame has no pixel buffer (data[3] is NULL)".into(),
+    ));
+  }
+
+  let mut sw_frame = Frame::new()?;
+
+  // Transfer data from GPU to CPU
+  let ret = unsafe { av_hwframe_transfer_data(sw_frame.as_mut_ptr(), hw_frame.as_ptr(), 0) };
+
+  if ret < 0 {
+    return Err(CodecError::HardwareError(format!(
+      "Failed to download frame from GPU: {}",
+      FFmpegError::from_code(ret)
+    )));
+  }
+
+  // Copy timestamp metadata from source frame
+  sw_frame.set_pts(hw_frame.pts());
+  sw_frame.set_duration(hw_frame.duration());
+
+  tracing::debug!(target: "webcodecs", "download_hw_frame: success, format={:?}", sw_frame.format());
+  Ok(sw_frame)
 }
 
 // Hardware frames contexts can be shared across threads
