@@ -46,8 +46,7 @@
     "bench": "node --import @oxc-node/core/register benchmark/compare.ts",
     "build": "oxnode ./build.ts --platform --release",
     "build:debug": "oxnode ./build.ts --platform",
-    "format": "run-p format:rs format:oxfmt format:prettier",
-    "format:prettier": "prettier . \"!**/*.{js,jsx,ts,tsx}\" -w",
+    "format": "run-p format:rs format:oxfmt",
     "format:oxfmt": "oxfmt",
     "format:rs": "cargo fmt",
     "lint": "oxlint --type-aware",
@@ -55,7 +54,7 @@
     "test": "ava",
     "demo": "cd example && vite",
     "typecheck": "tsc -b tsconfig.json && tsc ./index.d.ts",
-    "preversion": "napi build --platform && git add .",
+    "preversion": "oxnode ./build.ts --platform && git add .",
     "version": "napi version"
   },
   "lint-staged": {
@@ -64,8 +63,8 @@
     ]
   },
   "devDependencies": {
-    "@emnapi/core": "^1.7.1",
-    "@emnapi/runtime": "^1.7.1",
+    "@emnapi/core": "^1.8.1",
+    "@emnapi/runtime": "^1.8.1",
     "@napi-rs/canvas": "^0.1.88",
     "@napi-rs/cli": "^3.5.1",
     "@napi-rs/wasm-runtime": "^1.1.1",
@@ -73,18 +72,18 @@
     "@oxc-node/core": "^0.0.35",
     "@taplo/cli": "^0.7.0",
     "@tybys/wasm-util": "^0.10.1",
-    "@types/node": "^25.0.3",
+    "@types/node": "^25.0.10",
     "ava": "^6.4.1",
     "chalk": "^5.6.2",
-    "emnapi": "^1.7.1",
+    "emnapi": "^1.8.1",
     "husky": "^9.1.7",
     "lint-staged": "^16.2.7",
-    "mediabunny": "1.27.3",
+    "mediabunny": "1.30.1",
     "npm-run-all2": "^8.0.4",
-    "oxfmt": "^0.21.0",
-    "oxlint": "^1.36.0",
-    "oxlint-tsgolint": "^0.10.0",
-    "prettier": "^3.7.4",
+    "oxfmt": "^0.26.0",
+    "oxlint": "^1.41.0",
+    "oxlint-tsgolint": "^0.11.1",
+    "prettier": "^3.8.1",
     "tinybench": "^6.0.0",
     "typescript": "^5.9.3",
     "webcodecs-polyfill": "^1.0.1",
@@ -114,14 +113,7 @@
       "armv7-unknown-linux-gnueabihf"
     ]
   },
-  "packageManager": "pnpm@10.27.0",
-  "prettier": {
-    "arrowParens": "always",
-    "printWidth": 120,
-    "semi": false,
-    "singleQuote": true,
-    "trailingComma": "all"
-  },
+  "packageManager": "pnpm@10.28.1",
   "ava": {
     "environmentVariables": {
       "TS_NODE_PROJECT": "./tsconfig.json"

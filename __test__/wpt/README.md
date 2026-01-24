@@ -279,7 +279,9 @@ if (encoder.state === 'closed') {
   t.is(errorCount, 1)
 } else {
   // Encoder still open - flush should throw
-  await t.throwsAsync(encoder.flush(), { message: /EncodingError|InvalidStateError/ })
+  await t.throwsAsync(encoder.flush(), {
+    message: /EncodingError|InvalidStateError/,
+  })
 }
 ```
 
