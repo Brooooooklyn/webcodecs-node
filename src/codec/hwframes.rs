@@ -6,7 +6,7 @@
 use crate::ffi::{
   AVBufferRef, AVHWDeviceType, AVPixelFormat, FFmpegError,
   accessors::{
-    ffframe_data_const, ffframe_get_hw_frames_ctx, ffhwframes_get_format, ffhwframes_get_height,
+    ffframe_get_hw_frames_ctx, ffhwframes_get_format, ffhwframes_get_height,
     ffhwframes_get_sw_format, ffhwframes_get_width, ffhwframes_set_format, ffhwframes_set_height,
     ffhwframes_set_initial_pool_size, ffhwframes_set_sw_format, ffhwframes_set_width,
   },
@@ -255,15 +255,6 @@ pub fn download_hw_frame(hw_frame: &Frame) -> CodecResult<Frame> {
   if hw_frames_ctx.is_null() {
     return Err(CodecError::HardwareError(
       "Hardware frame has no hw_frames_ctx - cannot download".into(),
-    ));
-  }
-
-  // For VideoToolbox frames, validate data[3] (CVPixelBufferRef) is present
-  // This pointer holds the actual GPU texture reference
-  let data3 = unsafe { ffframe_data_const(hw_frame.as_ptr(), 3) };
-  if data3.is_null() {
-    return Err(CodecError::HardwareError(
-      "Hardware frame has no pixel buffer (data[3] is NULL)".into(),
     ));
   }
 

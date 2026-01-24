@@ -145,10 +145,6 @@ void ffctx_set_hw_device_ctx(AVCodecContext* ctx, AVBufferRef* hw_device_ctx) {
     }
 }
 
-AVBufferRef* ffctx_get_hw_device_ctx(const AVCodecContext* ctx) {
-    return ctx->hw_device_ctx;
-}
-
 void ffctx_set_hw_frames_ctx(AVCodecContext* ctx, AVBufferRef* hw_frames_ctx) {
     if (ctx->hw_frames_ctx) {
         av_buffer_unref(&ctx->hw_frames_ctx);
@@ -1104,6 +1100,11 @@ static enum AVPixelFormat ff_get_format_hw(AVCodecContext *ctx, const enum AVPix
 /**
  * Set up get_format callback for hardware decoding.
  * Must be called after setting hw_device_ctx but before avcodec_open2().
+ *
+ * WARNING: This function uses ctx->opaque to store the hardware pixel format.
+ * If other code needs to use ctx->opaque for application-specific data,
+ * this will conflict. Consider refactoring to use a wrapper struct if
+ * additional opaque data is needed in the future.
  *
  * @param ctx The codec context
  * @param hw_pix_fmt The hardware pixel format (e.g., AV_PIX_FMT_VIDEOTOOLBOX)

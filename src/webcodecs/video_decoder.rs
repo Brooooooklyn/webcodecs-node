@@ -195,8 +195,9 @@ pub struct VideoDecoderSupport {
 }
 
 /// Threshold for detecting silent decoder failure (no output after N chunks)
-/// Note: H.264 with B-frames often needs to buffer many frames before output
-const SILENT_FAILURE_THRESHOLD: u32 = 15;
+/// Set to 10 to accommodate H.264/HEVC B-frame buffering (typically 4-8 frames)
+/// while still detecting genuinely failing decoders within ~333ms at 30fps.
+const SILENT_FAILURE_THRESHOLD: u32 = 10;
 
 /// Internal decoder state
 struct VideoDecoderInner {
@@ -1056,9 +1057,19 @@ impl VideoDecoder {
       }
     };
 
-    // Convert avcC/hvcC extradata to Annex B if needed
+    // Handle extradata format based on decoder type:
+    // - Hardware decoders (VideoToolbox, etc.) expect avcC/hvcC format (original container format)
+    // - Software decoders expect Annex B format (start code prefixed NALUs)
     let extradata = config.description.as_ref().and_then(|d| {
       let data = d.to_vec();
+
+      // For hardware decoding, keep extradata in original avcC/hvcC format
+      // VideoToolbox parses avcC format directly to initialize the decoder session
+      if is_hardware {
+        return Some(data);
+      }
+
+      // For software decoding, convert to Annex B format
       let is_h264 = codec.starts_with("avc1") || codec.starts_with("avc3");
       let is_h265 = codec.starts_with("hvc1") || codec.starts_with("hev1");
 
