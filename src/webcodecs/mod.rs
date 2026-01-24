@@ -6,6 +6,7 @@
 mod audio_data;
 mod audio_decoder;
 mod audio_encoder;
+pub(crate) mod codec_pressure;
 pub mod codec_string;
 pub mod demuxer_base;
 mod encoded_audio_chunk;
