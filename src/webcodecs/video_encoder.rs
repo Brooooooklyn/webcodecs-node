@@ -1940,6 +1940,13 @@ impl VideoEncoder {
         }
       };
 
+    // If we acquired a hardware slot but got a software encoder (internal fallback),
+    // release the slot since we're not actually using hardware
+    if acquired_hw_slot && !is_hardware {
+      codec_pressure::gauge().release_hw_encoder();
+      acquired_hw_slot = false;
+    }
+
     // Configure encoder (with fallback for HW failures)
     if let Err(e) = context.configure_encoder(&encoder_config) {
       // Fallback to software if HW configure fails
@@ -2687,6 +2694,13 @@ impl VideoEncoder {
       }
     };
 
+    // If we acquired a hardware slot but got a software encoder (internal fallback),
+    // release the slot since we're not actually using hardware
+    if acquired_hw_slot && !is_hardware {
+      codec_pressure::gauge().release_hw_encoder();
+      acquired_hw_slot = false;
+    }
+
     // Convert WebCodecs bitrate mode to internal codec bitrate mode
     let bitrate_mode = match config.bitrate_mode {
       Some(VideoEncoderBitrateMode::Constant) => CodecBitrateMode::Constant,
@@ -2712,6 +2726,10 @@ impl VideoEncoder {
       && codec_id == AVCodecID::Hevc
       && hw_preference == HardwareAcceleration::PreferHardware
     {
+      // Release the hardware slot before returning error
+      if acquired_hw_slot {
+        codec_pressure::gauge().release_hw_encoder();
+      }
       Self::report_error(
         &mut inner,
         "NotSupportedError: HEVC alpha encoding requires software encoder. Set hardwareAcceleration to 'prefer-software'",
