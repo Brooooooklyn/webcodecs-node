@@ -216,7 +216,7 @@ jobs:
       attestations: write
       contents: read
     container:
-      image: debian:bullseye
+      image: debian:trixie
 
     steps:
       - name: Setup tools
