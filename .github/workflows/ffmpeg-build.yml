@@ -64,7 +64,7 @@ jobs:
             -C ./ffmpeg-${{ matrix.target }} .
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: ffmpeg-${{ matrix.target }}.tar.gz
 
@@ -487,7 +487,7 @@ jobs:
           Compress-Archive -Path "ffmpeg-aarch64-pc-windows-msvc/*" -DestinationPath "ffmpeg-aarch64-pc-windows-msvc.zip"
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: ffmpeg-aarch64-pc-windows-msvc.zip
 
@@ -952,7 +952,7 @@ jobs:
           Compress-Archive -Path "ffmpeg-x86_64-pc-windows-msvc/*" -DestinationPath "ffmpeg-x86_64-pc-windows-msvc.zip"
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: ffmpeg-x86_64-pc-windows-msvc.zip
 
@@ -1026,7 +1026,7 @@ jobs:
             -C ./ffmpeg-armv7-unknown-linux-gnueabihf .
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: ffmpeg-armv7-unknown-linux-gnueabihf.tar.gz
 
@@ -1084,7 +1084,7 @@ jobs:
         run: tar -czvf ffmpeg-x86_64-apple-darwin.tar.gz -C ./ffmpeg-x86_64-apple-darwin .
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: ffmpeg-x86_64-apple-darwin.tar.gz
 
@@ -1141,7 +1141,7 @@ jobs:
         run: tar -czvf ffmpeg-aarch64-apple-darwin.tar.gz -C ./ffmpeg-aarch64-apple-darwin .
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: ffmpeg-aarch64-apple-darwin.tar.gz
 

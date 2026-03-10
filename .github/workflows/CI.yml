@@ -186,7 +186,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         if: matrix.settings.target != 'wasm32-wasip1-threads'
         with:
           subject-path: '*.node'
@@ -268,7 +268,7 @@ jobs:
           pnpm build --target armv7-unknown-linux-gnueabihf
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: '*.node'
 
