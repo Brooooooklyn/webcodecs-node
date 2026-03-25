@@ -53,7 +53,7 @@
     "prepublishOnly": "napi prepublish -t npm",
     "test": "ava",
     "demo": "cd example && vite",
-    "typecheck": "tsc -b tsconfig.json && tsc ./index.d.ts",
+    "typecheck": "tsc -b tsconfig.json && tsc --ignoreConfig ./index.d.ts",
     "preversion": "oxnode ./build.ts --platform && git add .",
     "version": "napi version"
   },
