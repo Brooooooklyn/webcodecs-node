@@ -85,7 +85,7 @@
     "oxlint-tsgolint": "^0.17.0",
     "prettier": "^3.8.1",
     "tinybench": "^6.0.0",
-    "typescript": "^5.9.3",
+    "typescript": "^6.0.0",
     "webcodecs-polyfill": "^1.0.1",
     "vite-plugin-mkcert": "^1.17.9"
   },
