@@ -82,7 +82,7 @@
     "npm-run-all2": "^8.0.4",
     "oxfmt": "^0.43.0",
     "oxlint": "^1.41.0",
-    "oxlint-tsgolint": "^0.18.0",
+    "oxlint-tsgolint": "^0.19.0",
     "prettier": "^3.8.1",
     "tinybench": "^6.0.0",
     "typescript": "^5.9.3",
