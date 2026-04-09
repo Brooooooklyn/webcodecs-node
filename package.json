@@ -87,7 +87,7 @@
     "tinybench": "^6.0.0",
     "typescript": "^6.0.0",
     "webcodecs-polyfill": "^1.0.1",
-    "vite-plugin-mkcert": "^1.17.9"
+    "vite-plugin-mkcert": "^2.0.0"
   },
   "peerDependencies": {
     "@napi-rs/canvas": ">=0.1.0"
