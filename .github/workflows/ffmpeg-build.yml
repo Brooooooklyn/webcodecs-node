@@ -1178,7 +1178,7 @@ jobs:
           ls -la release/
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ffmpeg-${{ env.FFMPEG_VERSION }}
           name: FFmpeg ${{ env.FFMPEG_VERSION }} Static Builds
