@@ -111,7 +111,7 @@ jobs:
             gcc
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11.5
+        uses: lukka/run-vcpkg@v11.6
         with:
           vcpkgGitCommitId: '74e6536215718009aae747d86d84b78376bf9e09'
 
@@ -547,7 +547,7 @@ jobs:
           Get-ChildItem rav1e-dist -Recurse
 
       - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11.5
+        uses: lukka/run-vcpkg@v11.6
         with:
           vcpkgGitCommitId: '74e6536215718009aae747d86d84b78376bf9e09'
 
