@@ -300,7 +300,7 @@ jobs:
             target: aarch64-apple-darwin
             architecture: arm64
         node:
-          - '22'
+          - '22.20'
           - '24'
           - 'bun'
         exclude:
@@ -360,7 +360,7 @@ jobs:
           # disable armv7 because it's too slow
           # - armv7-unknown-linux-gnueabihf
         node:
-          - '22'
+          - '22.20'
     runs-on: ${{ contains(matrix.target, 'aarch64') && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
