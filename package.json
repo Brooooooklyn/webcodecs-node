@@ -118,9 +118,9 @@
     "environmentVariables": {
       "TS_NODE_PROJECT": "./tsconfig.json"
     },
-    "extensions": {
-      "ts": "module"
-    },
+    "extensions": [
+      "ts"
+    ],
     "files": [
       "__test__/**/*.spec.ts"
     ],
