@@ -65,7 +65,7 @@
   "devDependencies": {
     "@emnapi/core": "^1.8.1",
     "@emnapi/runtime": "^1.8.1",
-    "@napi-rs/canvas": "^0.1.88",
+    "@napi-rs/canvas": "^1.0.0",
     "@napi-rs/cli": "^3.5.1",
     "@napi-rs/wasm-runtime": "^1.1.1",
     "@oxc-node/cli": "^0.1.0",
