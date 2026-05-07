@@ -1,0 +1,11 @@
+allowBuilds:
+  node-av: true
+  '@seydx/node-av-darwin-arm64': true
+  '@seydx/node-av-darwin-x64': true
+  '@seydx/node-av-linux-arm64': true
+  '@seydx/node-av-linux-x64': true
+  '@seydx/node-av-win32-arm64-mingw': true
+  '@seydx/node-av-win32-arm64-msvc': true
+  '@seydx/node-av-win32-x64-mingw': true
+  '@seydx/node-av-win32-x64-msvc': true
+  esbuild: true
