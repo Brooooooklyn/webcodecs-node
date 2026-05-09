@@ -216,7 +216,7 @@ jobs:
       attestations: write
       contents: read
     container:
-      image: debian:bullseye-20260421
+      image: debian:bullseye-20260505
 
     steps:
       - name: Setup tools
