@@ -54,8 +54,8 @@ importers:
         specifier: ^17.0.0
         version: 17.0.0
       mediabunny:
-        specifier: 1.44.2
-        version: 1.44.2
+        specifier: 1.45.0
+        version: 1.45.0
       npm-run-all2:
         specifier: ^8.0.4
         version: 8.0.4
@@ -1967,8 +1967,8 @@ packages:
     resolution: {integrity: sha512-BUiRtTtV39LIJwinWBjqVsU9xhdnz7/i889V859IBFpuqGAj6LuOvHv5XLbgZ2R7ptJoJaEcxkv88/h25T7Ciw==}
     engines: {node: '>=8'}
 
-  mediabunny@1.44.2:
-    resolution: {integrity: sha512-3ou3LB3ln31TYn/YZnRhRIVqwfgNy85gFvD3j34mEDq59Bc5PiNSV5ECavshm/+F2etC8UsJ/XdOrSoW3rB6lg==}
+  mediabunny@1.45.0:
+    resolution: {integrity: sha512-oK3sMMYbucoF6LUX62L/2M9d+p9ve6KDQgL87kNfhsB0/XmTe9iRLUcgQgg9Gpgvi8Sb96zYfOUL6i17y0bdNg==}
 
   memoize@11.0.0:
     resolution: {integrity: sha512-cjsfZaC9b1clqPeIVMbb5dLHSXgdgGWGxdAU3oTUUkHiwWTKTBNnSmcqWJncNjYtBi3S8Rp0c5GIiyGztR8TRA==}
@@ -4055,7 +4055,7 @@ snapshots:
     dependencies:
       blueimp-md5: 2.19.0
 
-  mediabunny@1.44.2:
+  mediabunny@1.45.0:
     dependencies:
       '@types/dom-mediacapture-transform': 0.1.11
       '@types/dom-webcodecs': 0.1.13
