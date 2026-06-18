@@ -1040,7 +1040,7 @@ jobs:
   # Build macOS x64 FFmpeg from source
   build-ffmpeg-macos-x64:
     name: Build x86_64-apple-darwin
-    runs-on: macos-15-intel
+    runs-on: macos-26-intel
     permissions:
       id-token: write
       attestations: write
