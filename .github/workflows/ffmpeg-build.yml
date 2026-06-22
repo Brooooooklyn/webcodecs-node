@@ -30,7 +30,7 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -89,7 +89,7 @@ jobs:
       VCPKG_DEFAULT_TRIPLET: arm64-windows-static
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Setup Visual Studio environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -512,7 +512,7 @@ jobs:
       RAV1E_VERSION: '0.8.1'
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Setup Visual Studio environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -986,7 +986,7 @@ jobs:
             autoconf automake libtool \
             nasm yasm
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Setup cmake
         uses: jwlawson/actions-setup-cmake@v2
@@ -1050,7 +1050,7 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: '10.13'
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -1108,7 +1108,7 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: '11.0'
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
