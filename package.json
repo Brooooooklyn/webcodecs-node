@@ -79,7 +79,7 @@
     "husky": "^9.1.7",
     "lint-staged": "^17.0.0",
     "mediabunny": "1.45.2",
-    "npm-run-all2": "^8.0.4",
+    "npm-run-all2": "^9.0.0",
     "oxfmt": "^0.50.0",
     "oxlint": "^1.41.0",
     "oxlint-tsgolint": "^0.22.0",
