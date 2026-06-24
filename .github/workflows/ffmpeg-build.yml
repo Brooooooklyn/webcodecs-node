@@ -972,7 +972,7 @@ jobs:
       attestations: write
       contents: read
     container:
-      image: debian:bullseye-20260505
+      image: debian:bullseye-20260623
 
     steps:
       - name: Setup tools
