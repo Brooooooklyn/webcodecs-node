@@ -5,7 +5,7 @@
 
 use crate::codec::demuxer::{DemuxerContext, MediaType, StreamInfo};
 use crate::codec::io_buffer::BufferSource;
-use crate::ffi::AVCodecID;
+use crate::ffi::{AV_NOPTS_VALUE, AVCodecID};
 use crate::webcodecs::encoded_audio_chunk::{
   EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkType,
 };
@@ -588,7 +588,8 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
         Ok(Some((packet, stream_index))) => {
           if Some(stream_index) == video_index {
             // Process video packet
-            let timestamp = convert_timestamp(packet.pts(), video_time_base);
+            let dts = packet.dts();
+            let timestamp = convert_packet_timestamp(packet.pts(), dts, video_time_base);
             let duration = if packet.duration() > 0 {
               Some(convert_timestamp(packet.duration(), video_time_base))
             } else {
@@ -601,8 +602,7 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
               EncodedVideoChunkType::Delta
             };
 
-            let dts = packet.dts();
-            let dts_us = if dts == i64::MIN {
+            let dts_us = if dts == AV_NOPTS_VALUE {
               None
             } else {
               Some(convert_timestamp(dts, video_time_base))
@@ -616,7 +616,7 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
             }));
           } else if Some(stream_index) == audio_index {
             // Process audio packet
-            let timestamp = convert_timestamp(packet.pts(), audio_time_base);
+            let timestamp = convert_packet_timestamp(packet.pts(), packet.dts(), audio_time_base);
             let duration = if packet.duration() > 0 {
               Some(convert_timestamp(packet.duration(), audio_time_base))
             } else {
@@ -869,6 +869,23 @@ pub fn convert_timestamp(ts: i64, time_base: Option<(i32, i32)>) -> i64 {
   }
 }
 
+/// Resolve a packet's presentation timestamp and convert it to microseconds.
+///
+/// FFmpeg uses `AV_NOPTS_VALUE` when a timestamp is unavailable. Prefer PTS,
+/// fall back to DTS when only decode timing is known, and use zero when the
+/// packet has neither so the sentinel never leaks through the WebCodecs API.
+fn convert_packet_timestamp(pts: i64, dts: i64, time_base: Option<(i32, i32)>) -> i64 {
+  let timestamp = if pts != AV_NOPTS_VALUE {
+    pts
+  } else if dts != AV_NOPTS_VALUE {
+    dts
+  } else {
+    0
+  };
+
+  convert_timestamp(timestamp, time_base)
+}
+
 // ============================================================================
 // Common Codec String Parsing Functions
 // ============================================================================
@@ -980,6 +997,27 @@ mod tests {
   fn test_convert_timestamp_zero_denominator() {
     // Zero denominator should return original
     assert_eq!(convert_timestamp(1000, Some((1, 0))), 1000);
+  }
+
+  #[test]
+  fn test_convert_packet_timestamp_prefers_pts() {
+    assert_eq!(convert_packet_timestamp(90, 60, Some((1, 30))), 3_000_000);
+  }
+
+  #[test]
+  fn test_convert_packet_timestamp_falls_back_to_dts() {
+    assert_eq!(
+      convert_packet_timestamp(AV_NOPTS_VALUE, 60, Some((1, 30))),
+      2_000_000
+    );
+  }
+
+  #[test]
+  fn test_convert_packet_timestamp_defaults_to_zero() {
+    assert_eq!(
+      convert_packet_timestamp(AV_NOPTS_VALUE, AV_NOPTS_VALUE, Some((1, 30))),
+      0
+    );
   }
 
   #[test]
