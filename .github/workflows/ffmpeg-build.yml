@@ -502,7 +502,8 @@ jobs:
   # Build Windows x64 from source with rav1e (libaom crashes on Windows MSVC)
   build-ffmpeg-windows-x64:
     name: Build x86_64-pc-windows-msvc
-    runs-on: windows-latest
+    # x265's multi-lib build uses the Visual Studio 17 2022 CMake generator.
+    runs-on: windows-2022
     permissions:
       id-token: write
       attestations: write
