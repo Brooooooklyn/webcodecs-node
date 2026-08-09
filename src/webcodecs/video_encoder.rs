@@ -179,22 +179,25 @@ type ErrorCallback = ThreadsafeFunction<Error, UnknownReturnValue, Error, Status
 // Note: For ondequeue, we use FunctionRef instead of ThreadsafeFunction
 // to support both getter and setter per WebCodecs spec
 
+/// Per-frame data sent to the worker as one FIFO command payload.
+struct VideoEncodeRequest {
+  /// Shared reference to the frame data (via Arc for Rust-level sharing)
+  frame: Arc<ParkingLotRwLock<Frame>>,
+  timestamp: i64,
+  options: Option<VideoEncoderEncodeOptions>,
+  /// Rotation from input VideoFrame (for metadata output)
+  rotation: f64,
+  /// Flip from input VideoFrame (for metadata output)
+  flip: bool,
+  /// Color space from this input frame. The worker installs the first value
+  /// after each FIFO-ordered configuration change.
+  color_space: Option<VideoColorSpaceInit>,
+}
+
 /// Commands sent to the worker thread
 enum EncoderCommand {
   /// Encode a video frame
-  Encode {
-    /// Shared reference to the frame data (via Arc for Rust-level sharing)
-    frame: Arc<ParkingLotRwLock<Frame>>,
-    timestamp: i64,
-    options: Option<VideoEncoderEncodeOptions>,
-    /// Rotation from input VideoFrame (for metadata output)
-    rotation: f64,
-    /// Flip from input VideoFrame (for metadata output)
-    flip: bool,
-    /// Color space from this input frame. The worker installs the first value
-    /// after each FIFO-ordered configuration change.
-    color_space: Option<VideoColorSpaceInit>,
-  },
+  Encode(VideoEncodeRequest),
   /// Flush the encoder and send result back via response channel
   Flush(Sender<Result<()>>),
   /// Reconfigure the encoder with new config (W3C spec: control message)
@@ -687,25 +690,8 @@ impl VideoEncoder {
       }
 
       match command {
-        EncoderCommand::Encode {
-          frame,
-          timestamp,
-          options,
-          rotation,
-          flip,
-          color_space,
-        } => {
-          Self::process_encode(
-            &inner,
-            &event_state,
-            frame,
-            timestamp,
-            options,
-            rotation,
-            flip,
-            color_space,
-            &reset_flag,
-          );
+        EncoderCommand::Encode(request) => {
+          Self::process_encode(&inner, &event_state, request, &reset_flag);
         }
         EncoderCommand::Flush(response_sender) => {
           let result = Self::process_flush(&inner, &event_state, &reset_flag);
@@ -722,14 +708,18 @@ impl VideoEncoder {
   fn process_encode(
     inner: &Arc<Mutex<VideoEncoderInner>>,
     event_state: &Arc<RwLock<EventListenerState>>,
-    frame_arc: Arc<ParkingLotRwLock<Frame>>,
-    timestamp: i64,
-    options: Option<VideoEncoderEncodeOptions>,
-    rotation: f64,
-    flip: bool,
-    color_space: Option<VideoColorSpaceInit>,
+    request: VideoEncodeRequest,
     reset_flag: &AtomicBool,
   ) {
+    let VideoEncodeRequest {
+      frame: frame_arc,
+      timestamp,
+      options,
+      rotation,
+      flip,
+      color_space,
+    } = request;
+
     let mut guard = match inner.lock() {
       Ok(g) => g,
       Err(_) => return, // Lock poisoned
@@ -3097,14 +3087,14 @@ impl VideoEncoder {
         if !reset_flag.load(Ordering::SeqCst)
           && let Some(sender) = weak_sender.upgrade()
         {
-          let _ = sender.send(EncoderCommand::Encode {
+          let _ = sender.send(EncoderCommand::Encode(VideoEncodeRequest {
             frame: frame_arc,
             timestamp,
             options,
             rotation,
             flip,
             color_space,
-          });
+          }));
         }
         Ok(())
       })?;
