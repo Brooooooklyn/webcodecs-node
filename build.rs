@@ -17,47 +17,47 @@ use sha2::{Digest, Sha256};
 /// The Rust FFI constants and C accessors are validated against this FFmpeg
 /// release. `FFMPEG_RELEASE_TAG` remains an explicit escape hatch for
 /// maintainers testing a deliberate upgrade.
-const DEFAULT_FFMPEG_RELEASE_TAG: &str = "ffmpeg-n8.0.1";
+const DEFAULT_FFMPEG_RELEASE_TAG: &str = "ffmpeg-n9.0";
 const DEFAULT_FFMPEG_GITHUB_REPO: &str = "Brooooooklyn/webcodecs-node";
 
-/// SHA-256 digests published by GitHub for the pinned ffmpeg-n8.0.1 assets.
+/// SHA-256 digests published by GitHub for the pinned ffmpeg-n9.0 assets.
 /// A release/tag upgrade must update these values in the same change.
 const DEFAULT_FFMPEG_ARCHIVE_SHA256: &[(&str, &str)] = &[
   (
     "ffmpeg-aarch64-apple-darwin.tar.gz",
-    "ef26bdc401c86cbca70d26fdbe6f105c7c113b2d82f944818cfc4f7e53028f2a",
+    "3bddf95511e108ba204abfd0ce68b8e6423c7d5122a25152201ee60530cb4cc8",
   ),
   (
     "ffmpeg-aarch64-pc-windows-msvc.zip",
-    "041e1597f0044213d650713def40e95ad056831745b192948ce54edfd6f883d7",
+    "3ba0fd4f88f572bb8d792fbca8ac15625ac92412b9fc5448f77041252f885b36",
   ),
   (
     "ffmpeg-aarch64-unknown-linux-gnu.tar.gz",
-    "f1dc3135a93bdf77e335eed97cacfe8f6b59bc519cf26ab387352af7e17d72cc",
+    "8407fd0157fd559e062dd339167650bb541a6a43ddfb6d9a38b81691f3f931f0",
   ),
   (
     "ffmpeg-aarch64-unknown-linux-musl.tar.gz",
-    "92c866ef4ca371e7ad3e535c165bed015c354129a96f46a359cd94e0805e1fb0",
+    "4e7638aff618adbcea9a16dfb75d1372d86747fc417428b13c09805b35f0feea",
   ),
   (
     "ffmpeg-armv7-unknown-linux-gnueabihf.tar.gz",
-    "251f0da8509e3619861c9361d521dde03b13bb39aa3be3f7d7f921c7a91fd55e",
+    "4c56ab8bf74a84037316b291db88c69f88cade2cc9fc431fa1a685dc1fb4c8f3",
   ),
   (
     "ffmpeg-x86_64-apple-darwin.tar.gz",
-    "e9c827e33490f11647f2134366e3f2ffa0b339b32fde68dfbd81215ff20c6762",
+    "2b455254194790c36cb3e7271fb4c4ed25b333afdcc3f2606097a67720b19d82",
   ),
   (
     "ffmpeg-x86_64-pc-windows-msvc.zip",
-    "9d50047fec0bcabc778101cef9a040796ba53d2fc4a98f10a07832c01a63652c",
+    "548c0b4aac8edc8119fc50af4bbd3a55dfe0d6750df30a784e84f0f87d925129",
   ),
   (
     "ffmpeg-x86_64-unknown-linux-gnu.tar.gz",
-    "09296b012887001d6a9f962ee3d2ee2e6d28c8adf54c6e2f2c441f01a24c36ed",
+    "b1d609cda08e946d555bf60d1ffb18828b8ef0030018bdb7255b7814b000cf85",
   ),
   (
     "ffmpeg-x86_64-unknown-linux-musl.tar.gz",
-    "da90b04a46a9bb41cc4db54849c6df9801d1ef34798754fec8053adc1b9fe868",
+    "11e1fc40efdd112409622d297c8a16e07940fc2c86cc8c476cebdd3c8673e5e4",
   ),
 ];
 

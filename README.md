@@ -695,9 +695,9 @@ For full API documentation, see the [W3C WebCodecs specification](https://w3c.gi
 - Node.js 18+
 - pnpm
 
-The build downloads the pinned FFmpeg 8.0.1 release by default. If you opt out
+The build downloads the pinned FFmpeg 9.0 release by default. If you opt out
 of that download or set `FFMPEG_DIR`, the supplied FFmpeg headers and libraries
-must be from FFmpeg 8.x; FFmpeg 7.x system/Homebrew installations are rejected
+must be from FFmpeg 9.x; FFmpeg 8.x system/Homebrew installations are rejected
 by the ABI guard.
 
 ### Build

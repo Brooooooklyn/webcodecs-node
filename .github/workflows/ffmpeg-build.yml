@@ -1186,6 +1186,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ffmpeg-${{ env.FFMPEG_VERSION }}
+          target_commitish: ${{ github.sha }}
           name: FFmpeg ${{ env.FFMPEG_VERSION }} Static Builds
           body: |
             Pre-built FFmpeg ${{ env.FFMPEG_VERSION }} static libraries.
