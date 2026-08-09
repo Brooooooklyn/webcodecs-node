@@ -39,7 +39,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 [build-dependencies]
 napi-build = "2"
 cc = "1"
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 
 [profile.release]
 lto = true
