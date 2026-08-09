@@ -350,21 +350,79 @@ test('ImageDecoder streamed animation waits for a requested future frame', async
   t.false(decoder.complete)
   t.is(decoder.tracks.selectedTrack!.frameCount, 1)
 
-  let settled = false
-  const secondFramePromise = decoder.decode({ frameIndex: 1 }).finally(() => {
-    settled = true
-  })
+  let settled = 0
+  const secondFramePromises = [
+    decoder.decode({ frameIndex: 1 }).finally(() => {
+      settled += 1
+    }),
+    decoder.decode({ frameIndex: 1 }).finally(() => {
+      settled += 1
+    }),
+  ]
   await new Promise((resolve) => setTimeout(resolve, 25))
-  t.false(settled, 'decode should wait while the requested frame may still arrive')
+  t.is(settled, 0, 'decodes should wait while the requested frame may still arrive')
 
   controller.enqueue(data.subarray(900))
   controller.close()
-  const secondFrame = await secondFramePromise
-  t.is(secondFrame.image.timestamp, 1_000_000)
-  t.true(secondFrame.complete)
+  const secondFrames = await Promise.all(secondFramePromises)
+  t.is(secondFrames[0].image.timestamp, 1_000_000)
+  t.is(secondFrames[1].image.timestamp, 1_000_000)
+  t.true(secondFrames[0].complete)
+  t.true(secondFrames[1].complete)
   t.is(decoder.tracks.selectedTrack!.frameCount, 3)
 
-  secondFrame.image.close()
+  secondFrames[0].image.close()
+  secondFrames[1].image.close()
+  decoder.close()
+})
+
+test('ImageDecoder pending streamed decode rejects after a stream error', async (t) => {
+  const data = readFileSync(join(__dirname, 'fixtures/animated.gif'))
+  let controller!: ReadableStreamDefaultController<Uint8Array>
+  const stream = new ReadableStream<Uint8Array>({
+    start(streamController) {
+      controller = streamController
+      controller.enqueue(data.subarray(0, 900))
+    },
+  })
+  const decoder = new ImageDecoder({ data: stream, type: 'image/gif' })
+
+  await decoder.tracks.ready
+  t.false(decoder.complete)
+  t.is(decoder.tracks.selectedTrack!.frameCount, 1)
+
+  const completedOutcome = decoder.completed.then(
+    () => ({ status: 'resolved' as const }),
+    (error: unknown) => ({ status: 'rejected' as const, error }),
+  )
+  const decodeOutcomePromise = decoder.decode({ frameIndex: 1 }).then(
+    (result) => {
+      result.image.close()
+      return { status: 'resolved' as const }
+    },
+    (error: unknown) => ({ status: 'rejected' as const, error }),
+  )
+
+  controller.error(new Error('intentional stream failure'))
+
+  const decodeOutcome = await Promise.race([
+    decodeOutcomePromise,
+    new Promise<{ status: 'timeout' }>((resolve) =>
+      setTimeout(() => resolve({ status: 'timeout' }), 500),
+    ),
+  ])
+  const completed = await completedOutcome
+
+  t.true(decoder.complete)
+  t.is(completed.status, 'rejected')
+  if (completed.status === 'rejected') {
+    t.is((completed.error as Error).message, 'intentional stream failure')
+  }
+  t.is(decodeOutcome.status, 'rejected', 'decode must not remain pending after a stream error')
+  if (decodeOutcome.status === 'rejected') {
+    t.true(decodeOutcome.error instanceof RangeError)
+  }
+
   decoder.close()
 })
 

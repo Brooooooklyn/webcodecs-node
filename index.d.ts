@@ -539,7 +539,8 @@ export declare class EncodedVideoChunk {
 export declare class ImageDecoder {
   /**
    * Create a new ImageDecoder
-   * Supports both Uint8Array and ReadableStream as data source per W3C spec
+   * Supports both Uint8Array and ReadableStream as data source per W3C spec.
+   * ReadableStream input is buffered without a fixed size limit.
    */
   constructor(init: ImageDecoderInit)
   /** Whether the data is fully buffered */

@@ -447,7 +447,8 @@ pub struct ImageDecoder {
 #[napi]
 impl ImageDecoder {
   /// Create a new ImageDecoder
-  /// Supports both Uint8Array and ReadableStream as data source per W3C spec
+  /// Supports both Uint8Array and ReadableStream as data source per W3C spec.
+  /// ReadableStream input is buffered without a fixed size limit.
   #[napi(constructor)]
   pub fn new<'env>(env: &'env Env, mut this: This, init: ImageDecoderInit<'env>) -> Result<Self> {
     // Parse MIME type to codec ID - accept invalid types (will fail at decode time per W3C spec)
@@ -556,6 +557,12 @@ impl ImageDecoder {
           let chunk = match item {
             Ok(chunk) => chunk,
             Err(error) => {
+              // A stream error is terminal. Mark the input complete before
+              // waking decode waiters so they reject instead of waiting for an
+              // update that can never arrive.
+              if let Ok(inner_guard) = inner_clone.lock() {
+                inner_guard.complete.store(true, Ordering::Release);
+              }
               signal_tracks_ready(&inner_clone);
               return Err(error);
             }
@@ -726,7 +733,11 @@ impl ImageDecoder {
       loop {
         // Register before inspecting the cache so a probe cannot notify in the
         // narrow interval between the state check and awaiting the signal.
-        let notified = update_notify.notified();
+        let mut notified = std::pin::pin!(update_notify.notified());
+        // Constructing Notified does not register it with Notify. Register it
+        // before the blocking cache check so notify_waiters() reaches every
+        // concurrent decode, rather than relying on a single stored permit.
+        notified.as_mut().enable();
         let decode_inner = inner.clone();
         let result = spawn_blocking(move || decode_cached_frame(&decode_inner, frame_index))
           .await

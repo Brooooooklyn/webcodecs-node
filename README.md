@@ -168,6 +168,11 @@ result.image.close()
 decoder.close()
 ```
 
+When `data` is a `ReadableStream`, `ImageDecoder` accumulates every chunk so it
+can re-probe the growing input. This buffer currently has no fixed limit, so
+applications should bound or reject unexpectedly large streams before passing
+them to the decoder.
+
 ### Container Demuxing
 
 Read encoded video/audio from MP4, WebM, or MKV containers:
