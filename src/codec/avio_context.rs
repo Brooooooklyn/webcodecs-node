@@ -320,7 +320,7 @@ unsafe extern "C" fn write_callback(opaque: *mut c_void, buf: *const u8, buf_siz
 
   let result = match mode {
     IoMode::BufferWrite(buffer) => buffer.write(data),
-    IoMode::StreamingWrite(buffer) => buffer.write_blocking(data),
+    IoMode::StreamingWrite(buffer) => buffer.write_nonblocking(data),
     IoMode::BufferRead(_) => return -1, // Can't write to read buffer
   };
 

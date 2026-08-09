@@ -53,6 +53,14 @@ macro_rules! lock_muxer_inner {
 pub(crate) use lock_muxer_inner;
 pub(crate) use lock_muxer_inner_mut;
 
+fn next_reordered_video_timestamp(last_dts: i64, last_duration: i64) -> i64 {
+  if last_dts == i64::MIN {
+    0
+  } else {
+    last_dts.saturating_add(last_duration.max(1))
+  }
+}
+
 // ============================================================================
 // Shared State Types
 // ============================================================================
@@ -169,7 +177,8 @@ pub struct AudioDecoderConfigJs {
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
 pub struct StreamingMuxerOptions {
-  /// Buffer capacity for streaming output (default: 256KB)
+  /// Maximum bytes returned by each streaming read (default: 256KB).
+  /// Muxer writes are queued without blocking the JavaScript consumer.
   pub buffer_capacity: Option<u32>,
 }
 
@@ -253,21 +262,19 @@ pub struct MuxerInner<F: MuxerFormat> {
   /// Whether to apply fastStart post-processing (MP4 only)
   /// We handle this ourselves because FFmpeg's faststart doesn't work with custom I/O
   apply_faststart: bool,
-  /// Last video PTS written (to ensure monotonically increasing)
-  last_video_pts: i64,
   /// Last audio PTS written (to ensure monotonically increasing)
   last_audio_pts: i64,
-  /// Video frame counter (for precise PTS calculation)
-  video_frame_count: u64,
   /// Ticks per video frame in stream time base (set after header written)
-  /// For 30fps with timescale=57600: ticks_per_frame = 1920
+  /// Used only as a duration fallback when a chunk has no explicit duration.
   video_ticks_per_frame: Option<u64>,
-  /// DTS shift for B-frame support (MP4 only)
-  /// FFmpeg requires pts >= dts. For B-frames where pts < dts, we shift all DTS
-  /// values by this amount to satisfy the constraint while preserving timing.
+  /// Running DTS offset used when MP4 rejects a codec-provided B-frame pair.
   video_dts_shift: i64,
-  /// Last written video DTS (to ensure monotonically increasing after shift)
+  /// Last written video DTS (to ensure monotonically increasing decode order)
   last_video_dts: i64,
+  /// Duration of the previously written video packet. The Matroska/WebM
+  /// reordered-frame compatibility path advances from the previous packet's
+  /// end, not by the duration of the packet currently being written.
+  last_video_duration: i64,
   /// Phantom data for format type
   _format: PhantomData<F>,
 }
@@ -301,12 +308,11 @@ impl<F: MuxerFormat> MuxerInner<F> {
       is_streaming: false,
       muxer_options: ffmpeg_options,
       apply_faststart,
-      last_video_pts: -1,
       last_audio_pts: -1,
-      video_frame_count: 0,
       video_ticks_per_frame: None,
       video_dts_shift: 0,
       last_video_dts: i64::MIN,
+      last_video_duration: 0,
       _format: PhantomData,
     })
   }
@@ -340,12 +346,11 @@ impl<F: MuxerFormat> MuxerInner<F> {
       is_streaming: true,
       muxer_options: ffmpeg_options,
       apply_faststart: false, // Never apply in streaming mode
-      last_video_pts: -1,
       last_audio_pts: -1,
-      video_frame_count: 0,
       video_ticks_per_frame: None,
       video_dts_shift: 0,
       last_video_dts: i64::MIN,
+      last_video_duration: 0,
       _format: PhantomData,
     })
   }
@@ -521,11 +526,6 @@ impl<F: MuxerFormat> MuxerInner<F> {
       ));
     }
 
-    // Always increment frame counter at start to ensure it stays in sync
-    // regardless of which code path is taken (B-frame, non-B-frame, or fallback).
-    // This fixes issues when mixing encoder chunks (with DTS) and JS API chunks (without DTS).
-    self.video_frame_count += 1;
-
     // Get chunk data and metadata
     let chunk_type = chunk.chunk_type()?;
     let timestamp = chunk.timestamp()?;
@@ -543,152 +543,76 @@ impl<F: MuxerFormat> MuxerInner<F> {
     // Set packet properties
     packet.set_stream_index(video_index);
 
-    // Track whether we have B-frames (encoder provides both original_pts and dts)
-    let has_b_frames = chunk_original_pts.is_some() && chunk_dts.is_some();
+    // Encoder/demuxer chunks may carry a private DTS/PTS pair for frame reordering.
+    // Public chunks only expose a presentation timestamp, so DTS defaults to PTS.
+    // Never synthesize presentation timestamps from frame count: doing so destroys
+    // variable frame rate, gaps, and discontinuities.
+    let pts_us = chunk_original_pts.unwrap_or(timestamp);
+    let dts_us = chunk_dts.unwrap_or(pts_us);
 
-    // Calculate PTS/DTS for the packet
-    // For B-frames: use original_pts and dts_us from encoder (already correct)
-    // For non-B-frames: use frame counter for precise timing
-    let (pts, dts, dur) = if let (Some(orig_pts), Some(orig_dts)) = (chunk_original_pts, chunk_dts)
-    {
-      // B-frames present: scale original PTS and DTS directly from encoder
-      // The encoder already computed correct PTS/DTS relationship
-      if let Some(dst_tb) = self.muxer.video_time_base() {
-        use crate::ffi::AVRational;
-        let src_tb = AVRational::MICROSECONDS;
-        use crate::ffi::avutil::av_rescale_q;
-
-        // Scale both PTS and DTS from microseconds to target timebase
-        let scaled_pts = unsafe { av_rescale_q(orig_pts, src_tb, dst_tb) };
-        let scaled_dts = unsafe { av_rescale_q(orig_dts, src_tb, dst_tb) };
-
-        // For B-frame videos, don't apply any offset - let FFmpeg handle negative DTS
-        // FFmpeg's MP4 muxer will automatically create an edit list (edts atom) when
-        // it detects negative DTS, which tells players the correct start time.
-        //
-        // If we manually shift timestamps to make DTS >= 0, we lose the original
-        // timing relationship and start_time won't be 0.
-        let final_pts = scaled_pts;
-        let final_dts = scaled_dts;
-
-        // Calculate duration from ticks_per_frame or from chunk duration
-        let dur = if let Some(tpf) = self.video_ticks_per_frame {
-          tpf as i64
-        } else {
-          duration
-            .map(|d| unsafe { av_rescale_q(d, src_tb, dst_tb) })
-            .unwrap_or(0)
-        };
-
-        (final_pts, final_dts, dur)
-      } else {
-        // Fallback: use original values
-        (orig_pts, orig_dts, duration.unwrap_or(0))
-      }
-    } else if let Some(ticks_per_frame) = self.video_ticks_per_frame {
-      // No B-frames: use frame counter for precise timing
-      // Use (video_frame_count - 1) since we already incremented at function start
-      let frame_idx = self.video_frame_count - 1;
-      let pts = (frame_idx * ticks_per_frame) as i64;
-      (pts, pts, ticks_per_frame as i64)
+    let (pts, dts, dur) = if let Some(dst_tb) = self.muxer.video_time_base() {
+      use crate::ffi::avutil::av_rescale_q;
+      let src_tb = AVRational::MICROSECONDS;
+      let pts = unsafe { av_rescale_q(pts_us, src_tb, dst_tb) };
+      let dts = unsafe { av_rescale_q(dts_us, src_tb, dst_tb) };
+      let dur = duration
+        .map(|value| unsafe { av_rescale_q(value, src_tb, dst_tb) })
+        .or_else(|| self.video_ticks_per_frame.map(|value| value as i64))
+        .unwrap_or(0);
+      (pts, dts, dur)
     } else {
-      // Fallback: convert from microseconds (may have precision loss)
-      let pts = if timestamp <= self.last_video_pts {
-        self.last_video_pts + 1
-      } else {
-        timestamp
-      };
-      self.last_video_pts = pts;
-
-      // Convert timestamps from microseconds to stream time base
-      if let Some(dst_tb) = self.muxer.video_time_base() {
-        use crate::ffi::AVRational;
-        let src_tb = AVRational::MICROSECONDS; // 1/1000000
-        use crate::ffi::avutil::av_rescale_q;
-        let scaled_pts = unsafe { av_rescale_q(pts, src_tb, dst_tb) };
-        let scaled_dur = duration
-          .map(|d| unsafe { av_rescale_q(d, src_tb, dst_tb) })
-          .unwrap_or(0);
-        (scaled_pts, scaled_pts, scaled_dur)
-      } else {
-        (pts, pts, duration.unwrap_or(0))
-      }
+      (pts_us, dts_us, duration.unwrap_or(0))
     };
 
-    tracing::trace!(target: "ffmpeg", "video packet: pts={}, dts={}, dur={}", pts, dts, dur);
-    packet.set_pts(pts);
-
-    // Container-specific DTS handling:
-    // - MP4: FFmpeg requires pts >= dts at the API level. For B-frames where the encoder
-    //        outputs pts < dts, we apply a dynamic DTS shift to satisfy this constraint.
-    //        With negative_cts_offsets movflag enabled, FFmpeg stores the composition
-    //        offset in CTTS version 1 (signed), preserving the original timing relationship.
-    // - MKV/WebM with B-frames: MKV requires both monotonic DTS AND PTS >= DTS.
-    //   With B-frames arriving in decode order, we can't satisfy both without reordering.
-    //   Solution: Use sequential timestamps for both PTS and DTS, losing B-frame display order.
-    // - MKV/WebM without B-frames: DTS = PTS (already monotonically increasing)
-    if F::FORMAT == ContainerFormat::Mp4 {
-      // Apply DTS shift to ensure pts >= dts (required by FFmpeg)
-      // The shift is computed dynamically based on the worst-case B-frame we've seen.
-      let mut shifted_dts = dts + self.video_dts_shift;
-
-      // Ensure DTS is monotonically increasing first
-      let min_dts = self.last_video_dts + 1;
+    let has_reordered_timestamps =
+      chunk_original_pts.is_some() && chunk_dts.is_some() && dts != pts;
+    let (final_pts, final_dts) = if F::FORMAT == ContainerFormat::Mp4 {
+      // FFmpeg's MP4 muxer requires monotonically increasing DTS and PTS >=
+      // DTS. Some hardware encoders emit B-frame pairs that violate the
+      // latter at the API boundary. Shift only decode timestamps, preserving
+      // source PTS unless the two constraints conflict for this packet.
+      let mut shifted_dts = dts.saturating_add(self.video_dts_shift);
+      let min_dts = self.last_video_dts.saturating_add(1);
       if shifted_dts < min_dts {
         shifted_dts = min_dts;
       }
 
-      // Now check if pts >= shifted_dts. If not, we need to increase the global shift
-      // for all FUTURE packets. For this packet, we set DTS = PTS to satisfy the constraint.
       if pts < shifted_dts {
-        // Calculate how much more shift we need globally
-        // This ensures future packets with similar patterns will work
-        let needed_shift = shifted_dts - pts;
-        self.video_dts_shift -= needed_shift;
-        // For this packet, set DTS = PTS (the maximum allowed value)
+        self.video_dts_shift = self
+          .video_dts_shift
+          .saturating_sub(shifted_dts.saturating_sub(pts));
         shifted_dts = pts;
-        tracing::trace!(target: "ffmpeg", "B-frame timing conflict: pts={}, dts={}, setting dts=pts and increasing future shift to {}",
-          pts, dts, self.video_dts_shift);
       }
 
-      // Final monotonicity check - if DTS would go backwards, we have overlapping timestamps
-      // In this case, bump DTS to maintain monotonicity and log warning
       if shifted_dts <= self.last_video_dts {
-        let old_dts = shifted_dts;
-        shifted_dts = self.last_video_dts + 1;
-        // Also need to adjust PTS to maintain pts >= dts
-        if pts < shifted_dts {
-          packet.set_pts(shifted_dts);
-          tracing::trace!(target: "ffmpeg", "B-frame overlap: adjusted both pts and dts to {} (was pts={}, dts={})",
-            shifted_dts, pts, old_dts);
-        }
+        shifted_dts = self.last_video_dts.saturating_add(1);
       }
-
-      self.last_video_dts = shifted_dts;
-      packet.set_dts(shifted_dts);
-    } else if has_b_frames {
-      // For MKV/WebM with B-frames, use sequential timestamps for both PTS and DTS.
-      // This ensures:
-      // 1. DTS is monotonically increasing
-      // 2. PTS >= DTS (PTS == DTS)
-      // Trade-off: B-frames display at decode time, not original display time.
-      // This is acceptable for MKV/WebM where B-frame timing is less critical.
-      // Use (video_frame_count - 1) since we already incremented at function start
-      let frame_idx = self.video_frame_count - 1;
-      let sequential_ts = if let Some(tpf) = self.video_ticks_per_frame {
-        (frame_idx as i64) * (tpf as i64)
-      } else {
-        // If no ticks_per_frame, use frame count with default ~33333µs (~30fps)
-        // Time base is microseconds when ticks_per_frame is None
-        (frame_idx as i64) * 33333
-      };
-      // Override PTS to match DTS for MKV B-frame compatibility
-      packet.set_pts(sequential_ts);
-      packet.set_dts(sequential_ts);
+      (pts.max(shifted_dts), shifted_dts)
+    } else if has_reordered_timestamps {
+      // FFmpeg's Matroska muxer rejects decode-order packets once a B-frame
+      // presentation timestamp falls below its DTS. Keep the established
+      // compatibility behavior for that constrained case; non-reordered
+      // streams retain their source timestamps below.
+      let sequential =
+        next_reordered_video_timestamp(self.last_video_dts, self.last_video_duration);
+      (sequential, sequential)
     } else {
-      // No B-frames: DTS = PTS is already correct and monotonically increasing
-      packet.set_dts(dts);
-    }
+      let monotonic_dts = if dts <= self.last_video_dts {
+        self.last_video_dts.saturating_add(1)
+      } else {
+        dts
+      };
+      let constrained_pts = pts.max(monotonic_dts);
+      if monotonic_dts != dts {
+        tracing::warn!(target: "webcodecs", "Adjusted non-monotonic video PTS/DTS from {}/{} to {}/{}", pts, dts, constrained_pts, monotonic_dts);
+      }
+      (constrained_pts, monotonic_dts)
+    };
+    tracing::trace!(target: "ffmpeg", "video packet: pts={}, dts={}, dur={}", final_pts, final_dts, dur);
+    packet.set_pts(final_pts);
+    self.last_video_dts = final_dts;
+    self.last_video_duration = dur;
+    packet.set_dts(final_dts);
     packet.set_duration(dur);
 
     // Set keyframe flag
@@ -773,11 +697,17 @@ impl<F: MuxerFormat> MuxerInner<F> {
       .as_ref()
       .map(|c| c.sample_rate)
       .unwrap_or(48000) as i64;
-    let pts_in_samples = timestamp * sample_rate / 1_000_000;
+    let audio_time_base = AVRational {
+      num: 1,
+      den: sample_rate as i32,
+    };
+    let pts_in_samples = unsafe {
+      crate::ffi::avutil::av_rescale_q(timestamp, AVRational::MICROSECONDS, audio_time_base)
+    };
 
     // Ensure monotonically increasing PTS (audio time base is 1/sample_rate)
     let pts = if pts_in_samples <= self.last_audio_pts {
-      self.last_audio_pts + 1
+      self.last_audio_pts.saturating_add(1)
     } else {
       pts_in_samples
     };
@@ -787,7 +717,8 @@ impl<F: MuxerFormat> MuxerInner<F> {
     packet.set_dts(pts); // Audio has no B-frames, DTS always equals PTS
 
     if let Some(dur) = duration {
-      let duration_in_samples = dur * sample_rate / 1_000_000;
+      let duration_in_samples =
+        unsafe { crate::ffi::avutil::av_rescale_q(dur, AVRational::MICROSECONDS, audio_time_base) };
       packet.set_duration(duration_in_samples);
     }
 
@@ -901,16 +832,42 @@ impl<F: MuxerFormat> MuxerInner<F> {
   }
 
   /// Check if streaming is finished (EOF reached)
-  pub fn is_streaming_finished(&self) -> bool {
+  pub fn is_streaming_finished(&self) -> Result<bool> {
+    if !self.is_streaming {
+      return Err(Error::new(Status::GenericFailure, "Not in streaming mode"));
+    }
+
     if let Some(ref handle) = self.streaming_handle {
-      handle.is_eof()
+      Ok(handle.is_eof())
     } else {
-      true
+      Err(Error::new(
+        Status::GenericFailure,
+        "Streaming handle not available",
+      ))
     }
   }
 
   /// Get current state as string
   pub fn state_string(&self) -> &'static str {
     self.state.as_str()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::next_reordered_video_timestamp;
+
+  #[test]
+  fn reordered_vfr_timestamps_advance_by_previous_packet_duration() {
+    let first = next_reordered_video_timestamp(i64::MIN, 0);
+    let second = next_reordered_video_timestamp(first, 40);
+    let third = next_reordered_video_timestamp(second, 20);
+
+    assert_eq!([first, second, third], [0, 40, 60]);
+  }
+
+  #[test]
+  fn reordered_timestamps_remain_monotonic_without_duration() {
+    assert_eq!(next_reordered_video_timestamp(10, 0), 11);
   }
 }

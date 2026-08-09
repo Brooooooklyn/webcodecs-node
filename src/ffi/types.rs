@@ -60,6 +60,8 @@ pub enum AVCodecID {
   Webp = 171, // WebP image
   Hevc = 173, // H.265
   Av1 = 225,
+  Jpegxl = 258,
+  JpegxlAnim = 272,
   // Audio codecs (starting at 0x10000 = 65536)
   PcmS16le = 65536, // PCM signed 16-bit little-endian
   PcmS16be = 65537, // PCM signed 16-bit big-endian
@@ -168,6 +170,7 @@ impl AVCodecID {
       Self::Gif => "gif",
       Self::Bmp => "bmp",
       Self::Webp => "webp",
+      Self::Jpegxl | Self::JpegxlAnim => "jpegxl",
       // Audio
       Self::Aac => "mp4a.40.2", // AAC-LC
       Self::Opus => "opus",
@@ -220,6 +223,8 @@ impl AVCodecID {
       171 => Self::Webp,
       173 => Self::Hevc,
       225 => Self::Av1,
+      258 => Self::Jpegxl,
+      272 => Self::JpegxlAnim,
       65536 => Self::PcmS16le,
       65537 => Self::PcmS16be,
       65538 => Self::PcmU16le,

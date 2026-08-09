@@ -8,7 +8,10 @@ use crate::codec::{
   Resampler, context::get_audio_encoder_name,
 };
 use crate::ffi::{AVCodecID, AVSampleFormat};
-use crate::webcodecs::error::{DOMExceptionName, throw_invalid_state_error, throw_type_error_unit};
+use crate::webcodecs::error::{
+  DOMExceptionName, native_dom_exception_error, throw_invalid_state_error, throw_type_error_unit,
+};
+use crate::webcodecs::flush_tracker::FlushTracker;
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
 use crate::webcodecs::{
   AacBitstreamFormat, AudioData, AudioEncoderConfig, AudioEncoderSupport, EncodedAudioChunk,
@@ -218,7 +221,12 @@ enum EncoderCommand {
 /// Internal encoder state
 struct AudioEncoderInner {
   state: CodecState,
+  /// Most recently requested configuration. `encode()` uses this immediately
+  /// so calls made after a queued reconfigure prepare input for the new codec.
   config: Option<AudioEncoderConfig>,
+  /// Configuration currently installed on the worker. Output produced before
+  /// a queued reconfigure must continue to advertise this configuration.
+  active_config: Option<AudioEncoderConfig>,
   context: Option<CodecContext>,
   resampler: Option<Resampler>,
   sample_buffer: Option<AudioSampleBuffer>,
@@ -232,17 +240,13 @@ struct AudioEncoderInner {
   output_callback: OutputCallback,
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
-  /// Pending flush response senders (for AbortError on reset)
-  pending_flush_senders: Vec<Sender<Result<()>>>,
+  /// Pending flush operations, tracked independently for overlapping calls.
+  flushes: FlushTracker,
   /// Queue of input timestamps for correlation with output packets
   /// (needed because FFmpeg may buffer frames internally)
   timestamp_queue: std::collections::VecDeque<i64>,
   /// Base timestamp from the first input AudioData (for timestamp calculation)
   base_timestamp: Option<i64>,
-  /// Abort channel senders - reset() sends abort signal through these
-  pending_abort_senders: Vec<Sender<()>>,
-  /// Atomic flag for flush abort - set by reset() to signal pending flush to abort
-  flush_abort_flag: Option<Arc<AtomicBool>>,
   /// W3C spec: Flag to suppress output delivery after reset()
   /// When true, pending outputs are not delivered to the user callback
   #[allow(dead_code)]
@@ -250,9 +254,6 @@ struct AudioEncoderInner {
   /// Queue of encoded chunks waiting to be delivered via output callback
   /// Worker pushes chunks here during flush; flush() drains them synchronously via FunctionRef
   pending_chunks: Vec<(EncodedAudioChunk, EncodedAudioChunkMetadata)>,
-  /// Flag indicating whether a flush operation is in progress
-  /// When true, worker queues chunks to pending_chunks instead of calling NonBlocking callback
-  inside_flush: bool,
   /// Flag indicating whether the encoder was closed due to an error
   /// Used to return EncodingError from flush() instead of InvalidStateError
   had_error: bool,
@@ -350,6 +351,7 @@ impl AudioEncoder {
     let inner = AudioEncoderInner {
       state: CodecState::Unconfigured,
       config: None,
+      active_config: None,
       context: None,
       resampler: None,
       sample_buffer: None,
@@ -359,14 +361,11 @@ impl AudioEncoder {
       encode_queue_size: 0,
       output_callback: init.output,
       error_callback: init.error,
-      pending_flush_senders: Vec::new(),
+      flushes: FlushTracker::default(),
       timestamp_queue: std::collections::VecDeque::new(),
       base_timestamp: None,
-      pending_abort_senders: Vec::new(),
-      flush_abort_flag: None,
       output_suppressed: false,
       pending_chunks: Vec::new(),
-      inside_flush: false,
       had_error: false,
       use_adts: false,
       adts_params: None,
@@ -428,29 +427,20 @@ impl AudioEncoder {
             Status::GenericFailure,
             "AbortError: The operation was aborted",
           )));
-        } else {
-          // For encode commands, just decrement queue and fire dequeue
-          if let Ok(mut guard) = inner.lock() {
-            let old_size = guard.encode_queue_size;
-            guard.encode_queue_size = old_size.saturating_sub(1);
-            if old_size > 0 {
-              let _ = Self::fire_dequeue_event(&event_state);
-            }
-          }
         }
         continue;
       }
 
       match command {
         EncoderCommand::Encode { frame, timestamp } => {
-          Self::process_encode(&inner, &event_state, frame, timestamp);
+          Self::process_encode(&inner, &event_state, frame, timestamp, &reset_flag);
         }
         EncoderCommand::Flush(response_sender) => {
-          let result = Self::process_flush(&inner, &event_state);
+          let result = Self::process_flush(&inner, &event_state, &reset_flag);
           let _ = response_sender.send(result);
         }
         EncoderCommand::Reconfigure(config) => {
-          Self::process_reconfigure(&inner, &config);
+          Self::process_reconfigure(&inner, &config, &reset_flag);
         }
       }
     }
@@ -462,11 +452,19 @@ impl AudioEncoder {
     event_state: &Arc<RwLock<EventListenerState>>,
     frame: Frame,
     timestamp: i64,
+    reset_flag: &AtomicBool,
   ) {
     let mut guard = match inner.lock() {
       Ok(g) => g,
       Err(_) => return, // Lock poisoned
     };
+
+    // A detached pre-reset worker may have received this command immediately
+    // before reset set its token. Recheck under the shared-state lock so it
+    // cannot mutate the next generation's queue accounting or codec state.
+    if reset_flag.load(Ordering::SeqCst) {
+      return;
+    }
 
     // Check if encoder is still configured
     if guard.state != CodecState::Configured {
@@ -487,7 +485,7 @@ impl AudioEncoder {
     }
 
     // Get config info (unwrap validated config values)
-    let codec_string = match guard.config.as_ref() {
+    let codec_string = match guard.active_config.as_ref() {
       Some(config) => config.codec.clone().unwrap_or_default(),
       None => {
         let old_size = guard.encode_queue_size;
@@ -678,7 +676,7 @@ impl AudioEncoder {
         let metadata = if is_flac {
           // FLAC: Always include decoderConfig with fresh extradata on every chunk
           let (target_sample_rate, target_channels) = guard
-            .config
+            .active_config
             .as_ref()
             .map(|c| {
               (
@@ -701,7 +699,7 @@ impl AudioEncoder {
           // Non-FLAC: Only send decoderConfig on first chunk
           guard.extradata_sent = true;
           let (target_sample_rate, target_channels) = guard
-            .config
+            .active_config
             .as_ref()
             .map(|c| {
               (
@@ -727,7 +725,7 @@ impl AudioEncoder {
 
         // During flush, queue chunks for synchronous delivery in resolver
         // Otherwise, use NonBlocking callback for immediate delivery
-        if guard.inside_flush {
+        if guard.flushes.should_buffer_outputs() {
           guard.pending_chunks.push((chunk, metadata));
         } else {
           guard.output_callback.call(
@@ -754,11 +752,19 @@ impl AudioEncoder {
   fn process_flush(
     inner: &Arc<Mutex<AudioEncoderInner>>,
     _event_state: &Arc<RwLock<EventListenerState>>,
+    reset_flag: &AtomicBool,
   ) -> Result<()> {
-    {
+    let active_config = {
       let mut guard = inner
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+      if reset_flag.load(Ordering::SeqCst) {
+        return Err(Error::new(
+          Status::GenericFailure,
+          "AbortError: The operation was aborted",
+        ));
+      }
 
       // W3C spec: If an error occurred during encoding, flush should reject with EncodingError.
       // This must be checked first to return the correct error type.
@@ -779,13 +785,13 @@ impl AudioEncoder {
 
       // Check if FLAC - W3C FLAC spec requires decoderConfig on every chunk
       let is_flac = guard
-        .config
+        .active_config
         .as_ref()
         .is_some_and(|c| c.codec.as_deref().unwrap_or("").to_lowercase() == "flac");
 
       // Get config info for FLAC metadata
       let (codec_string, target_sample_rate, target_channels) = guard
-        .config
+        .active_config
         .as_ref()
         .map(|c| {
           (
@@ -800,13 +806,28 @@ impl AudioEncoder {
       let get_flac_extradata =
         |ctx: &CodecContext| -> Option<Vec<u8>> { ctx.extradata().map(prepend_flac_header) };
 
-      // Flush any remaining samples in buffer
-      if let Some(ref mut sample_buffer) = guard.sample_buffer
-        && let Ok(Some(mut frame)) = sample_buffer.flush()
-      {
+      // Flush any remaining samples in buffer.
+      let (remainder, frame_size, sample_rate) = match guard.sample_buffer.as_mut() {
+        Some(sample_buffer) => {
+          let frame_size = sample_buffer.frame_size() as i64;
+          let sample_rate = sample_buffer.sample_rate() as i64;
+          let remainder = match sample_buffer.flush() {
+            Ok(frame) => frame,
+            Err(error) => {
+              let message = format!("Failed to flush buffered audio: {}", error);
+              Self::report_error(&mut guard, &message);
+              return Err(Error::new(
+                Status::GenericFailure,
+                format!("EncodingError: {}", message),
+              ));
+            }
+          };
+          (remainder, frame_size, sample_rate)
+        }
+        None => (None, 0, 1),
+      };
+      if let Some(mut frame) = remainder {
         // Set timestamp using base_timestamp
-        let frame_size = sample_buffer.frame_size() as i64;
-        let sample_rate = sample_buffer.sample_rate() as i64;
         let base_ts = guard.base_timestamp.unwrap_or(0);
         let frame_timestamp =
           base_ts + (guard.frame_count as i64 * frame_size * 1_000_000) / sample_rate;
@@ -818,62 +839,75 @@ impl AudioEncoder {
         let context = match guard.context.as_mut() {
           Some(ctx) => ctx,
           None => {
-            Self::report_error(&mut guard, "No encoder context");
-            return Ok(());
+            let message = "No encoder context";
+            Self::report_error(&mut guard, message);
+            return Err(Error::new(
+              Status::GenericFailure,
+              format!("EncodingError: {}", message),
+            ));
           }
         };
 
-        if let Ok(packets) = context.encode(Some(&frame)) {
-          let duration_us = (frame.nb_samples() as i64 * 1_000_000) / sample_rate;
-          let adts_params = if guard.use_adts {
-            guard.adts_params
+        let packets = match context.encode(Some(&frame)) {
+          Ok(packets) => packets,
+          Err(error) => {
+            let message = format!("Failed to encode buffered audio: {}", error);
+            Self::report_error(&mut guard, &message);
+            return Err(Error::new(
+              Status::GenericFailure,
+              format!("EncodingError: {}", message),
+            ));
+          }
+        };
+        let duration_us = (frame.nb_samples() as i64 * 1_000_000) / sample_rate;
+        let adts_params = if guard.use_adts {
+          guard.adts_params
+        } else {
+          None
+        };
+        for packet in packets {
+          let output_timestamp = guard.timestamp_queue.pop_front();
+          let chunk = EncodedAudioChunk::from_packet_with_adts(
+            packet,
+            Some(duration_us),
+            output_timestamp,
+            adts_params,
+          );
+          // Create decoderConfig: FLAC on every chunk, others only on first chunk
+          let decoder_config = if is_flac {
+            // FLAC: Always include decoderConfig with fresh extradata
+            let extradata = guard.context.as_ref().and_then(get_flac_extradata);
+            Some(AudioDecoderConfigOutput {
+              codec: codec_string.clone(),
+              sample_rate: Some(target_sample_rate),
+              number_of_channels: Some(target_channels),
+              description: extradata.map(Uint8Array::from),
+            })
+          } else if !guard.extradata_sent {
+            // First chunk: Include decoderConfig
+            guard.extradata_sent = true;
+            // ADTS format: No description (metadata in frame headers)
+            // Raw AAC: Include AudioSpecificConfig
+            let extradata = if guard.use_adts {
+              None
+            } else {
+              guard
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.extradata().map(|d| d.to_vec()))
+            };
+            Some(AudioDecoderConfigOutput {
+              codec: codec_string.clone(),
+              sample_rate: Some(target_sample_rate),
+              number_of_channels: Some(target_channels),
+              description: extradata.map(Uint8Array::from),
+            })
           } else {
             None
           };
-          for packet in packets {
-            let output_timestamp = guard.timestamp_queue.pop_front();
-            let chunk = EncodedAudioChunk::from_packet_with_adts(
-              packet,
-              Some(duration_us),
-              output_timestamp,
-              adts_params,
-            );
-            // Create decoderConfig: FLAC on every chunk, others only on first chunk
-            let decoder_config = if is_flac {
-              // FLAC: Always include decoderConfig with fresh extradata
-              let extradata = guard.context.as_ref().and_then(get_flac_extradata);
-              Some(AudioDecoderConfigOutput {
-                codec: codec_string.clone(),
-                sample_rate: Some(target_sample_rate),
-                number_of_channels: Some(target_channels),
-                description: extradata.map(Uint8Array::from),
-              })
-            } else if !guard.extradata_sent {
-              // First chunk: Include decoderConfig
-              guard.extradata_sent = true;
-              // ADTS format: No description (metadata in frame headers)
-              // Raw AAC: Include AudioSpecificConfig
-              let extradata = if guard.use_adts {
-                None
-              } else {
-                guard
-                  .context
-                  .as_ref()
-                  .and_then(|ctx| ctx.extradata().map(|d| d.to_vec()))
-              };
-              Some(AudioDecoderConfigOutput {
-                codec: codec_string.clone(),
-                sample_rate: Some(target_sample_rate),
-                number_of_channels: Some(target_channels),
-                description: extradata.map(Uint8Array::from),
-              })
-            } else {
-              None
-            };
-            let metadata = EncodedAudioChunkMetadata { decoder_config };
-            // Always queue during flush for synchronous delivery
-            guard.pending_chunks.push((chunk, metadata));
-          }
+          let metadata = EncodedAudioChunkMetadata { decoder_config };
+          // Always queue during flush for synchronous delivery
+          guard.pending_chunks.push((chunk, metadata));
         }
       }
 
@@ -881,16 +915,24 @@ impl AudioEncoder {
       let context = match guard.context.as_mut() {
         Some(ctx) => ctx,
         None => {
-          Self::report_error(&mut guard, "No encoder context");
-          return Ok(());
+          let message = "No encoder context";
+          Self::report_error(&mut guard, message);
+          return Err(Error::new(
+            Status::GenericFailure,
+            format!("EncodingError: {}", message),
+          ));
         }
       };
 
       let packets = match context.flush_encoder() {
         Ok(pkts) => pkts,
         Err(e) => {
-          Self::report_error(&mut guard, &format!("Flush failed: {}", e));
-          return Ok(());
+          let message = format!("Flush failed: {}", e);
+          Self::report_error(&mut guard, &message);
+          return Err(Error::new(
+            Status::GenericFailure,
+            format!("EncodingError: {}", message),
+          ));
         }
       };
 
@@ -940,16 +982,23 @@ impl AudioEncoder {
         // Always queue during flush for synchronous delivery
         guard.pending_chunks.push((chunk, metadata));
       }
-    } // mutex released here
+      guard.active_config.clone()
+    }; // mutex released here
 
-    // Reset encoder state so it can accept more data (per W3C spec, flush should leave
-    // encoder in configured state, ready for more encode() calls)
-    {
-      let mut guard = inner
+    // FFmpeg audio encoders enter EOF after flush_encoder(); avcodec_flush_buffers
+    // does not make all of them reusable. Recreate the active context before
+    // resolving flush so the configured encoder can accept more AudioData.
+    if let Some(config) = active_config {
+      Self::process_reconfigure(inner, &config, reset_flag);
+
+      let guard = inner
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-      if let Some(ref mut context) = guard.context {
-        context.flush();
+      if guard.had_error {
+        return Err(Error::new(
+          Status::GenericFailure,
+          "EncodingError: Failed to restore encoder after flush",
+        ));
       }
     }
 
@@ -958,11 +1007,19 @@ impl AudioEncoder {
 
   /// Process a reconfigure command on the worker thread
   /// Drains old context, clears work state, and creates new encoder context
-  fn process_reconfigure(inner: &Arc<Mutex<AudioEncoderInner>>, config: &AudioEncoderConfig) {
+  fn process_reconfigure(
+    inner: &Arc<Mutex<AudioEncoderInner>>,
+    config: &AudioEncoderConfig,
+    reset_flag: &AtomicBool,
+  ) {
     let mut guard = match inner.lock() {
       Ok(g) => g,
       Err(_) => return, // Lock poisoned
     };
+
+    if reset_flag.load(Ordering::SeqCst) {
+      return;
+    }
 
     // Drain old context (codec thread safety)
     if let Some(ctx) = guard.context.as_mut() {
@@ -971,8 +1028,8 @@ impl AudioEncoder {
       while ctx.receive_packet().ok().flatten().is_some() {}
     }
 
-    // Clear work-related state
-    guard.encode_queue_size = 0;
+    // Clear codec-local work state. Do not reset encode_queue_size here:
+    // main-thread encode() calls after this FIFO command are already counted.
     guard.timestamp_queue.clear();
     guard.frame_count = 0;
     guard.extradata_sent = false;
@@ -1096,7 +1153,7 @@ impl AudioEncoder {
     guard.resampler = None;
     guard.use_adts = use_adts;
     guard.adts_params = adts_params;
-    guard.config = Some(config.clone());
+    guard.active_config = Some(config.clone());
     guard.cached_flac_decoder_config = None;
   }
 
@@ -1285,7 +1342,7 @@ impl AudioEncoder {
     // This ensures pending encode commands are processed before reconfiguration
     if inner.state == CodecState::Configured {
       // Validate codec synchronously before queueing
-      let _codec_id = match parse_audio_codec_string(&codec) {
+      let codec_id = match parse_audio_codec_string(&codec) {
         Ok(id) => id,
         Err(e) => {
           Self::report_error(
@@ -1296,8 +1353,11 @@ impl AudioEncoder {
         }
       };
 
-      // Store config for immediate property reads
+      // Prepare subsequent inputs for the requested configuration immediately;
+      // the worker keeps its old active_config until this FIFO reconfigure runs.
       inner.config = Some(config.clone());
+      inner.target_format = get_encoder_sample_format(codec_id);
+      inner.resampler = None;
 
       // Queue reconfigure via microtask (runs AFTER pending encode microtasks)
       // Use Weak reference to allow close() to immediately close channel without deadlock
@@ -1411,6 +1471,7 @@ impl AudioEncoder {
       inner.adts_params = None;
     }
 
+    inner.active_config = Some(config.clone());
     inner.config = Some(config);
 
     // Create new channel and worker if needed (after reconfiguration)
@@ -1505,8 +1566,21 @@ impl AudioEncoder {
         || src_channels != target_channels
         || src_format.to_av_format() != inner.target_format;
 
-      // Create resampler if needed and not already created
-      if needs_resampling && inner.resampler.is_none() {
+      // A resampler is valid only for the exact source and destination tuple.
+      // AudioEncoder accepts legal mixed-format input, so never reuse a
+      // converter created for an earlier AudioData object.
+      let resampler_matches = inner.resampler.as_ref().is_some_and(|resampler| {
+        resampler.src_channels() == src_channels
+          && resampler.src_sample_rate() == src_sample_rate_u32
+          && resampler.src_format() == src_format.to_av_format()
+          && resampler.dst_channels() == target_channels
+          && resampler.dst_sample_rate() == target_sample_rate_u32
+          && resampler.dst_format() == inner.target_format
+      });
+
+      if !needs_resampling {
+        inner.resampler = None;
+      } else if !resampler_matches {
         match Resampler::new(
           src_channels,
           src_sample_rate_u32,
@@ -1543,7 +1617,11 @@ impl AudioEncoder {
       };
 
       // Resample if needed (creates new frame) or pass through (shared via refcount)
-      let frame_to_send = if let Some(ref mut resampler) = inner.resampler {
+      let frame_to_send = if needs_resampling {
+        let resampler = inner
+          .resampler
+          .as_mut()
+          .expect("resampler is created when conversion is required");
         match resampler.convert_alloc(&frame) {
           Ok(f) => f,
           Err(e) => {
@@ -1599,22 +1677,27 @@ impl AudioEncoder {
   pub fn flush<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
     // Create abort flag for this flush operation
     let flush_abort_flag = Arc::new(AtomicBool::new(false));
+    let (response_sender, response_receiver) = channel::bounded::<Result<()>>(1);
 
     // W3C spec: Check state upfront and return rejected promise with appropriate error
     // (not throw synchronously - flush() should always return a promise)
-    {
+    let flush_id = {
       let mut inner = self
         .inner
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
       if inner.state == CodecState::Closed {
+        let (error_name, error_msg) = if inner.had_error {
+          (DOMExceptionName::EncodingError, "Encode error occurred")
+        } else {
+          (
+            DOMExceptionName::InvalidStateError,
+            "Cannot flush a closed codec",
+          )
+        };
         // Return rejected promise with native DOMException (async to allow error callback to run)
-        return reject_with_dom_exception_async(
-          env,
-          DOMExceptionName::InvalidStateError,
-          "Cannot flush a closed codec",
-        );
+        return reject_with_dom_exception_async(env, error_name, error_msg);
       }
       if inner.state == CodecState::Unconfigured {
         // Return rejected promise with native DOMException (async to allow error callback to run)
@@ -1625,23 +1708,10 @@ impl AudioEncoder {
         );
       }
 
-      // Store abort flag for reset() to access
-      inner.flush_abort_flag = Some(flush_abort_flag.clone());
-      // Set inside_flush flag so worker queues chunks instead of calling NonBlocking callback
-      inner.inside_flush = true;
-    }
-
-    // Create a response channel for worker result
-    let (response_sender, response_receiver) = channel::bounded::<Result<()>>(1);
-
-    // Track this flush - store sender in Inner for reset() to use
-    {
-      let mut inner = self
-        .inner
-        .lock()
-        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-      inner.pending_flush_senders.push(response_sender.clone());
-    }
+      inner
+        .flushes
+        .register(response_sender.clone(), flush_abort_flag.clone())
+    };
 
     // Send flush command through the channel (deferred to microtask for W3C spec compliance)
     // This ensures flush is processed after all pending encode microtasks complete (FIFO order)
@@ -1660,7 +1730,14 @@ impl AudioEncoder {
         Ok(())
       })?;
     } else {
-      return throw_invalid_state_error(env, "Cannot flush a closed codec");
+      if let Ok(mut inner) = self.inner.lock() {
+        inner.flushes.finish(flush_id);
+      }
+      return reject_with_dom_exception_async(
+        env,
+        DOMExceptionName::InvalidStateError,
+        "Cannot flush a closed codec",
+      );
     }
 
     // Clone references for the callback closure
@@ -1684,44 +1761,49 @@ impl AudioEncoder {
         })
         .flatten();
 
-        Ok((result, inner_clone, flush_abort_flag))
+        Ok((result, inner_clone, flush_abort_flag, flush_id))
       },
-      move |env, (result, inner, abort_flag)| {
+      move |env, (result, inner, abort_flag, flush_id)| {
         // Drain pending chunks and call output callback SYNCHRONOUSLY
         // This runs on the main thread with Env access
         let chunks = {
           let mut guard = inner
             .lock()
             .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+          guard.flushes.begin_output_delivery(flush_id);
           std::mem::take(&mut guard.pending_chunks)
         };
 
         // Call output callback for each chunk synchronously
         // If callback calls reset(), abort_flag will be set before next iteration
-        let callback = output_callback_ref.borrow_back(env)?;
-        for (chunk, metadata) in chunks {
-          // Check abort flag before each callback - exit early if reset() was called
-          if abort_flag.load(Ordering::SeqCst) {
-            break;
+        let callback_result = (|| -> Result<()> {
+          let callback = output_callback_ref.borrow_back(env)?;
+          for (chunk, metadata) in chunks {
+            // Check abort flag before each callback - exit early if reset() was called
+            if abort_flag.load(Ordering::SeqCst) {
+              break;
+            }
+            callback.call((chunk, metadata).into())?;
           }
-          callback.call((chunk, metadata).into())?;
-        }
+          Ok(())
+        })();
 
-        // Clean up flags
+        // Always release this operation, including when the JS callback throws.
         {
           let mut guard = inner
             .lock()
             .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-          guard.flush_abort_flag = None;
-          guard.inside_flush = false;
+          guard.flushes.finish(flush_id);
         }
+        callback_result?;
 
         // Check abort flag after draining all chunks
         if abort_flag.load(Ordering::SeqCst) {
-          return Err(Error::new(
-            Status::GenericFailure,
-            "AbortError: The operation was aborted",
-          ));
+          return Err(native_dom_exception_error(
+            env,
+            DOMExceptionName::AbortError,
+            "The operation was aborted",
+          )?);
         }
 
         // Return worker result (errors keep DOMException-style message for now)
@@ -1745,27 +1827,7 @@ impl AudioEncoder {
         return throw_invalid_state_error(&env, "Cannot reset a closed codec");
       }
 
-      // Set abort flag FIRST (synchronously, before any other reset logic)
-      // This signals any pending flush() that is yielding to return AbortError
-      if let Some(ref flag) = inner.flush_abort_flag {
-        flag.store(true, Ordering::SeqCst);
-      }
-
-      // W3C spec: Abort all pending flushes with AbortError BEFORE dropping sender
-
-      // Send abort signal through all abort channels - this causes pending flush()
-      // calls to return AbortError via the select! in spawn_blocking
-      for sender in inner.pending_abort_senders.drain(..) {
-        let _ = sender.send(());
-      }
-
-      // Also try to send through the response channel (fallback)
-      for sender in inner.pending_flush_senders.drain(..) {
-        let _ = sender.send(Err(Error::new(
-          Status::GenericFailure,
-          "AbortError: The operation was aborted",
-        )));
-      }
+      inner.flushes.abort_all();
     }
 
     // Set reset flag to signal worker to skip remaining pending encodes
@@ -1789,6 +1851,7 @@ impl AudioEncoder {
     inner.resampler = None;
     inner.sample_buffer = None;
     inner.config = None;
+    inner.active_config = None;
     inner.state = CodecState::Unconfigured;
     inner.frame_count = 0;
     inner.extradata_sent = false;
@@ -1796,15 +1859,13 @@ impl AudioEncoder {
     inner.encode_queue_size = 0;
     inner.timestamp_queue.clear();
     inner.base_timestamp = None;
-    // Clear any remaining abort senders (shouldn't be any, but just in case)
-    inner.pending_abort_senders.clear();
-
     // Clear flush-related state
-    inner.inside_flush = false;
+    inner.flushes.clear();
     inner.pending_chunks.clear();
 
-    // Reset the abort flag for new worker
-    self.reset_flag.store(false, Ordering::SeqCst);
+    // Give the new worker a fresh cancellation token. Re-arming the old token
+    // would allow a detached pre-reset worker to resume against new state.
+    self.reset_flag = Arc::new(AtomicBool::new(false));
 
     // Create new channel and worker for future encode operations
     let (sender, receiver) = channel::unbounded();
@@ -1830,7 +1891,7 @@ impl AudioEncoder {
   pub fn close(&mut self, env: Env) -> Result<()> {
     // Check state first - W3C spec: throw InvalidStateError if already closed
     {
-      let inner = self
+      let mut inner = self
         .inner
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
@@ -1838,6 +1899,8 @@ impl AudioEncoder {
       if inner.state == CodecState::Closed {
         return throw_invalid_state_error(&env, "Cannot close an already closed codec");
       }
+
+      inner.flushes.abort_all();
     }
 
     // Drop sender to stop accepting new commands and close channel.
@@ -1861,6 +1924,7 @@ impl AudioEncoder {
     inner.resampler = None;
     inner.sample_buffer = None;
     inner.config = None;
+    inner.active_config = None;
     inner.state = CodecState::Closed;
     inner.encode_queue_size = 0;
 

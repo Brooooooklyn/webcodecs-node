@@ -95,6 +95,30 @@ pub fn throw_dom_exception<T>(env: &Env, name: DOMExceptionName, message: &str) 
   ))
 }
 
+/// Create a native JavaScript DOMException as a napi Error without throwing it.
+///
+/// Async completion callbacks must return the error to the promise machinery;
+/// throwing inside such a callback leaves a pending exception instead of
+/// rejecting the promise on some Node.js versions.
+pub fn native_dom_exception_error(
+  env: &Env,
+  name: DOMExceptionName,
+  message: &str,
+) -> Result<Error> {
+  let global = env.get_global()?;
+  let dom_exception_constructor =
+    global.get_named_property_unchecked::<Function<FnArgs<(&str, &str)>>>("DOMException")?;
+  let error = dom_exception_constructor.new_instance((message, name.as_str()).into())?;
+  Ok(Error::from(error))
+}
+
+/// Create a native JavaScript RangeError as a napi Error without throwing it.
+pub fn native_range_error(env: &Env, message: &str) -> Result<Error> {
+  let error =
+    napi::JsRangeError::from(Error::new(Status::GenericFailure, message)).into_unknown(*env);
+  Ok(Error::from(error))
+}
+
 // ============================================================================
 // Native DOMException Throwing Helpers
 // ============================================================================

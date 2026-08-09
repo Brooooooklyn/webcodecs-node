@@ -6,7 +6,10 @@
 use crate::codec::{AudioDecoderConfig as InternalAudioDecoderConfig, CodecContext, Frame, Packet};
 use crate::ffi::AVCodecID;
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunkInner;
-use crate::webcodecs::error::{DOMExceptionName, throw_invalid_state_error, throw_type_error_unit};
+use crate::webcodecs::error::{
+  DOMExceptionName, native_dom_exception_error, throw_invalid_state_error, throw_type_error_unit,
+};
+use crate::webcodecs::flush_tracker::FlushTracker;
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
 use crate::webcodecs::{AudioData, AudioDecoderConfig, AudioDecoderSupport, EncodedAudioChunk};
 use crossbeam::channel::{self, Receiver, Sender};
@@ -100,6 +103,7 @@ enum DecoderCommand {
   Decode {
     chunk: Arc<RwLock<Option<EncodedAudioChunkInner>>>,
     timestamp: i64,
+    duration: Option<i64>,
   },
   /// Flush the decoder and send result back via response channel
   Flush(Sender<Result<()>>),
@@ -194,19 +198,14 @@ struct AudioDecoderInner {
   error_callback: ErrorCallback,
   /// Whether an error has occurred during decoding (for flush error propagation)
   had_error: bool,
-  /// Pending flush response senders (for AbortError on reset)
-  pending_flush_senders: Vec<Sender<Result<()>>>,
-  /// Atomic flag for flush abort - set by reset() to signal pending flush to abort
-  flush_abort_flag: Option<Arc<AtomicBool>>,
+  /// Pending flush operations, tracked independently for overlapping calls.
+  flushes: FlushTracker,
   /// Queue of decoded audio data waiting to be delivered via output callback
   /// Worker pushes data here during flush; flush() drains them synchronously via FunctionRef
   pending_data: Vec<AudioData>,
-  /// Flag indicating whether a flush operation is in progress
-  /// When true, worker queues data to pending_data instead of calling NonBlocking callback
-  inside_flush: bool,
   /// Queue of timestamps from input chunks (to preserve original timestamps)
   /// FFmpeg may return AV_NOPTS_VALUE for frame.pts(), so we track input timestamps
-  timestamp_queue: std::collections::VecDeque<i64>,
+  timestamp_queue: std::collections::VecDeque<(i64, Option<i64>)>,
 }
 
 /// AudioDecoder - WebCodecs-compliant audio decoder
@@ -295,10 +294,8 @@ impl AudioDecoder {
       output_callback: init.output,
       error_callback: init.error,
       had_error: false,
-      pending_flush_senders: Vec::new(),
-      flush_abort_flag: None,
+      flushes: FlushTracker::default(),
       pending_data: Vec::new(),
-      inside_flush: false,
       timestamp_queue: std::collections::VecDeque::new(),
     };
 
@@ -353,29 +350,31 @@ impl AudioDecoder {
             Status::GenericFailure,
             "AbortError: The operation was aborted",
           )));
-        } else {
-          // For decode commands, just decrement queue and fire dequeue
-          if let Ok(mut guard) = inner.lock() {
-            let old_size = guard.decode_queue_size;
-            guard.decode_queue_size = old_size.saturating_sub(1);
-            if old_size > 0 {
-              let _ = Self::fire_dequeue_event(&event_state);
-            }
-          }
         }
         continue;
       }
 
       match command {
-        DecoderCommand::Decode { chunk, timestamp } => {
-          Self::process_decode(&inner, &event_state, chunk, timestamp);
+        DecoderCommand::Decode {
+          chunk,
+          timestamp,
+          duration,
+        } => {
+          Self::process_decode(
+            &inner,
+            &event_state,
+            chunk,
+            timestamp,
+            duration,
+            &reset_flag,
+          );
         }
         DecoderCommand::Flush(response_sender) => {
-          let result = Self::process_flush(&inner, &event_state);
+          let result = Self::process_flush(&inner, &event_state, &reset_flag);
           let _ = response_sender.send(result);
         }
         DecoderCommand::Reconfigure(config) => {
-          Self::process_reconfigure(&inner, &config);
+          Self::process_reconfigure(&inner, &config, &reset_flag);
         }
       }
     }
@@ -387,11 +386,17 @@ impl AudioDecoder {
     event_state: &Arc<RwLock<EventListenerState>>,
     chunk: Arc<RwLock<Option<EncodedAudioChunkInner>>>,
     timestamp: i64,
+    duration: Option<i64>,
+    reset_flag: &AtomicBool,
   ) {
     let mut guard = match inner.lock() {
       Ok(g) => g,
       Err(_) => return, // Lock poisoned
     };
+
+    if reset_flag.load(Ordering::SeqCst) {
+      return;
+    }
 
     // Check if decoder is still configured
     if guard.state != CodecState::Configured {
@@ -453,7 +458,7 @@ impl AudioDecoder {
 
     // Store the original timestamp for output (FFmpeg may return AV_NOPTS_VALUE)
     // Must be done before borrowing context to satisfy borrow checker
-    guard.timestamp_queue.push_back(timestamp);
+    guard.timestamp_queue.push_back((timestamp, duration));
 
     // Get context
     let context = match guard.context.as_mut() {
@@ -475,6 +480,7 @@ impl AudioDecoder {
     let frames = match decode_audio_chunk_data(context, data, timestamp) {
       Ok(f) => f,
       Err(e) => {
+        guard.timestamp_queue.pop_back();
         let old_size = guard.decode_queue_size;
         guard.decode_queue_size = old_size.saturating_sub(1);
         if old_size > 0 {
@@ -496,12 +502,24 @@ impl AudioDecoder {
       let _ = Self::fire_dequeue_event(event_state);
     }
 
+    // A buffering decoder may not return a frame until a later packet or
+    // flush. Preserve this input's timestamp for that eventual output.
+    if frames.is_empty() {
+      return;
+    }
+
     // Convert internal frames to AudioData and deliver
     // Pop the original timestamp (fallback to frame.pts() if queue empty)
-    let output_timestamp = guard
-      .timestamp_queue
-      .pop_front()
-      .unwrap_or_else(|| frames.first().map(|f| f.pts()).unwrap_or(0));
+    let (output_timestamp, output_duration) =
+      guard.timestamp_queue.pop_front().unwrap_or_else(|| {
+        let pts = frames
+          .first()
+          .map(|frame| frame.pts())
+          .filter(|pts| *pts != crate::ffi::types::AV_NOPTS_VALUE)
+          .unwrap_or(0);
+        (pts, None)
+      });
+    let mut next_timestamp = output_timestamp;
     for (i, frame) in frames.into_iter().enumerate() {
       // For the first frame, use the original input timestamp
       // For subsequent frames, calculate based on sample count or use frame.pts()
@@ -513,19 +531,28 @@ impl AudioDecoder {
         if frame_pts != crate::ffi::types::AV_NOPTS_VALUE {
           frame_pts
         } else {
-          output_timestamp
+          next_timestamp
         }
       };
+      let frame_duration = if frame.sample_rate() > 0 {
+        (frame.nb_samples() as i64)
+          .saturating_mul(1_000_000)
+          .checked_div(frame.sample_rate() as i64)
+          .unwrap_or(0)
+      } else {
+        output_duration.unwrap_or(0)
+      };
+      next_timestamp = pts.saturating_add(frame_duration);
       let audio_data = AudioData::from_internal(frame, pts);
 
       // During flush, queue data for synchronous delivery in resolver
       // Otherwise, use NonBlocking callback for immediate delivery
-      if guard.inside_flush {
+      if guard.flushes.should_buffer_outputs() {
         guard.pending_data.push(audio_data);
       } else {
         guard
           .output_callback
-          .call(audio_data, ThreadsafeFunctionCallMode::Blocking);
+          .call(audio_data, ThreadsafeFunctionCallMode::NonBlocking);
       }
     }
   }
@@ -534,10 +561,18 @@ impl AudioDecoder {
   fn process_flush(
     inner: &Arc<Mutex<AudioDecoderInner>>,
     _event_state: &Arc<RwLock<EventListenerState>>,
+    reset_flag: &AtomicBool,
   ) -> Result<()> {
     let mut guard = inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    if reset_flag.load(Ordering::SeqCst) {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "AbortError: The operation was aborted",
+      ));
+    }
 
     // W3C spec: If an error occurred during decoding, flush should reject with EncodingError.
     // This must be checked first to return the correct error type.
@@ -559,8 +594,12 @@ impl AudioDecoder {
     let context = match guard.context.as_mut() {
       Some(ctx) => ctx,
       None => {
-        Self::report_error(&mut guard, "No decoder context");
-        return Ok(());
+        let message = "No decoder context";
+        Self::report_error(&mut guard, message);
+        return Err(Error::new(
+          Status::GenericFailure,
+          format!("EncodingError: {}", message),
+        ));
       }
     };
 
@@ -568,18 +607,32 @@ impl AudioDecoder {
     let frames = match context.flush_decoder() {
       Ok(f) => f,
       Err(e) => {
-        Self::report_error(&mut guard, &format!("Flush failed: {}", e));
-        return Ok(());
+        let message = format!("Flush failed: {}", e);
+        Self::report_error(&mut guard, &message);
+        return Err(Error::new(
+          Status::GenericFailure,
+          format!("EncodingError: {}", message),
+        ));
       }
     };
 
     // Queue remaining frames for delivery (always queue during flush for synchronous delivery)
     for frame in frames {
-      let pts = frame.pts();
-      let audio_data = AudioData::from_internal(frame, pts);
+      let (timestamp, _duration) = guard.timestamp_queue.pop_front().unwrap_or_else(|| {
+        let pts = frame.pts();
+        let timestamp = if pts == crate::ffi::types::AV_NOPTS_VALUE {
+          0
+        } else {
+          pts
+        };
+        let duration = (frame.duration() > 0).then_some(frame.duration());
+        (timestamp, duration)
+      });
+      let audio_data = AudioData::from_internal(frame, timestamp);
       // Always queue during flush for synchronous delivery in resolver
       guard.pending_data.push(audio_data);
     }
+    guard.timestamp_queue.clear();
 
     // Reset decoder state so it can accept more data (per W3C spec, flush should leave
     // decoder in configured state, ready for more decode() calls)
@@ -592,11 +645,19 @@ impl AudioDecoder {
 
   /// Process a reconfigure command on the worker thread
   /// Drains old context, clears work state, and creates new decoder context
-  fn process_reconfigure(inner: &Arc<Mutex<AudioDecoderInner>>, config: &AudioDecoderConfig) {
+  fn process_reconfigure(
+    inner: &Arc<Mutex<AudioDecoderInner>>,
+    config: &AudioDecoderConfig,
+    reset_flag: &AtomicBool,
+  ) {
     let mut guard = match inner.lock() {
       Ok(g) => g,
       Err(_) => return, // Lock poisoned
     };
+
+    if reset_flag.load(Ordering::SeqCst) {
+      return;
+    }
 
     // Drain old context (codec thread safety)
     if let Some(ctx) = guard.context.as_mut() {
@@ -605,8 +666,8 @@ impl AudioDecoder {
       while ctx.receive_frame().ok().flatten().is_some() {}
     }
 
-    // Clear work-related state
-    guard.decode_queue_size = 0;
+    // Clear codec-local work state. Do not reset decode_queue_size here:
+    // main-thread decode() calls after this FIFO command are already counted.
     guard.timestamp_queue.clear();
     guard.frame_count = 0;
 
@@ -700,7 +761,7 @@ impl AudioDecoder {
     let error = Error::new(Status::GenericFailure, error_msg);
     inner
       .error_callback
-      .call(error, ThreadsafeFunctionCallMode::Blocking);
+      .call(error, ThreadsafeFunctionCallMode::NonBlocking);
     inner.had_error = true;
     inner.state = CodecState::Closed;
   }
@@ -984,7 +1045,7 @@ impl AudioDecoder {
   #[napi]
   pub fn decode(&self, env: Env, chunk: &EncodedAudioChunk) -> Result<()> {
     // Extract data and timestamp on main thread (brief lock)
-    let (chunk, timestamp) = {
+    let (chunk, timestamp, duration) = {
       let mut inner = self
         .inner
         .lock()
@@ -1005,11 +1066,18 @@ impl AudioDecoder {
           return Ok(());
         }
       };
+      let duration = match chunk.duration() {
+        Ok(duration) => duration,
+        Err(e) => {
+          Self::report_error(&mut inner, &format!("Failed to get duration: {}", e));
+          return Ok(());
+        }
+      };
 
       // Increment queue size (pending operation)
       inner.decode_queue_size += 1;
 
-      (Arc::clone(&chunk.inner), timestamp)
+      (Arc::clone(&chunk.inner), timestamp, duration)
     };
 
     // Send decode command to worker thread (deferred to microtask for W3C spec compliance)
@@ -1024,7 +1092,11 @@ impl AudioDecoder {
         if !reset_flag.load(Ordering::SeqCst) {
           // Only send if decoder hasn't been closed (weak reference can still upgrade)
           if let Some(sender) = weak_sender.upgrade() {
-            let _ = sender.send(DecoderCommand::Decode { chunk, timestamp });
+            let _ = sender.send(DecoderCommand::Decode {
+              chunk,
+              timestamp,
+              duration,
+            });
           }
         }
         Ok(())
@@ -1049,10 +1121,11 @@ impl AudioDecoder {
   pub fn flush<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
     // Create abort flag for this flush operation
     let flush_abort_flag = Arc::new(AtomicBool::new(false));
+    let (response_sender, response_receiver) = channel::bounded::<Result<()>>(1);
 
     // W3C spec: Check state upfront and return rejected promise with appropriate error
     // (not throw synchronously - flush() should always return a promise)
-    {
+    let flush_id = {
       let mut inner = self
         .inner
         .lock()
@@ -1080,23 +1153,10 @@ impl AudioDecoder {
         );
       }
 
-      // Store abort flag for reset() to access
-      inner.flush_abort_flag = Some(flush_abort_flag.clone());
-      // Set inside_flush flag so worker queues data instead of calling NonBlocking callback
-      inner.inside_flush = true;
-    }
-
-    // Create a response channel
-    let (response_sender, response_receiver) = channel::bounded::<Result<()>>(1);
-
-    // Track this flush for AbortError on reset()
-    {
-      let mut inner = self
-        .inner
-        .lock()
-        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-      inner.pending_flush_senders.push(response_sender.clone());
-    }
+      inner
+        .flushes
+        .register(response_sender.clone(), flush_abort_flag.clone())
+    };
 
     // Send flush command through the channel (deferred to microtask for W3C spec compliance)
     // This ensures flush is processed after all pending decode microtasks complete (FIFO order)
@@ -1116,7 +1176,14 @@ impl AudioDecoder {
         Ok(())
       })?;
     } else {
-      return throw_invalid_state_error(env, "Cannot flush a closed codec");
+      if let Ok(mut inner) = self.inner.lock() {
+        inner.flushes.finish(flush_id);
+      }
+      return reject_with_dom_exception_async(
+        env,
+        DOMExceptionName::InvalidStateError,
+        "Cannot flush a closed codec",
+      );
     }
 
     // Clone references for the callback closure
@@ -1140,44 +1207,49 @@ impl AudioDecoder {
         })
         .flatten();
 
-        Ok((result, inner_clone, flush_abort_flag))
+        Ok((result, inner_clone, flush_abort_flag, flush_id))
       },
-      move |env, (result, inner, abort_flag)| {
+      move |env, (result, inner, abort_flag, flush_id)| {
         // Drain pending data and call output callback SYNCHRONOUSLY
         // This runs on the main thread with Env access
         let data_items = {
           let mut guard = inner
             .lock()
             .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+          guard.flushes.begin_output_delivery(flush_id);
           std::mem::take(&mut guard.pending_data)
         };
 
         // Call output callback for each data item synchronously
         // If callback calls reset(), abort_flag will be set before next iteration
-        let callback = output_callback_ref.borrow_back(env)?;
-        for data in data_items {
-          // Check abort flag before each callback - exit early if reset() was called
-          if abort_flag.load(Ordering::SeqCst) {
-            break;
+        let callback_result = (|| -> Result<()> {
+          let callback = output_callback_ref.borrow_back(env)?;
+          for data in data_items {
+            // Check abort flag before each callback - exit early if reset() was called
+            if abort_flag.load(Ordering::SeqCst) {
+              break;
+            }
+            callback.call(data)?;
           }
-          callback.call(data)?;
-        }
+          Ok(())
+        })();
 
-        // Clean up flags
+        // Always release this operation, including when the JS callback throws.
         {
           let mut guard = inner
             .lock()
             .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-          guard.flush_abort_flag = None;
-          guard.inside_flush = false;
+          guard.flushes.finish(flush_id);
         }
+        callback_result?;
 
         // Check abort flag after draining all data
         if abort_flag.load(Ordering::SeqCst) {
-          return Err(Error::new(
-            Status::GenericFailure,
-            "AbortError: The operation was aborted",
-          ));
+          return Err(native_dom_exception_error(
+            env,
+            DOMExceptionName::AbortError,
+            "The operation was aborted",
+          )?);
         }
 
         // Return worker result (errors keep DOMException-style message for now)
@@ -1191,7 +1263,7 @@ impl AudioDecoder {
   pub fn reset(&mut self, env: Env) -> Result<()> {
     // Check state first before touching the worker
     {
-      let inner = self
+      let mut inner = self
         .inner
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
@@ -1201,35 +1273,16 @@ impl AudioDecoder {
         return throw_invalid_state_error(&env, "Cannot reset a closed codec");
       }
 
-      // Set abort flag FIRST (synchronously, before any other reset logic)
-      // This signals any pending flush() that is yielding to return AbortError
-      if let Some(ref flag) = inner.flush_abort_flag {
-        flag.store(true, Ordering::SeqCst);
-      }
+      inner.flushes.abort_all();
     }
 
     // Set reset flag to signal worker to skip remaining pending decodes
     // This must be done BEFORE dropping the command sender
     self.reset_flag.store(true, Ordering::SeqCst);
 
-    // W3C spec: Abort all pending flushes with AbortError BEFORE dropping sender
-    {
-      let mut inner = self
-        .inner
-        .lock()
-        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-      for sender in inner.pending_flush_senders.drain(..) {
-        let _ = sender.send(Err(Error::new(
-          Status::GenericFailure,
-          "AbortError: The operation was aborted",
-        )));
-      }
-    }
-
-    // Drop sender to signal worker to stop
-    // Note: Don't join worker here - with microtask pattern, worker might not exit
-    // immediately if microtasks still hold cloned senders. Worker will exit on
-    // next timeout check when it sees reset_flag is set.
+    // Drop sender to signal worker to stop. Pending microtasks hold only Weak
+    // references, so the channel disconnects after they observe reset_flag.
+    // Do not join here: the old worker may be waiting on a JS callback.
     drop(self.command_sender.take());
     drop(self.worker_handle.take()); // Detach old worker thread
 
@@ -1248,12 +1301,13 @@ impl AudioDecoder {
     inner.had_error = false;
 
     // Clear flush-related state
-    inner.inside_flush = false;
+    inner.flushes.clear();
     inner.pending_data.clear();
     inner.timestamp_queue.clear();
 
-    // Reset the abort flag for new worker
-    self.reset_flag.store(false, Ordering::SeqCst);
+    // Give the new worker a fresh cancellation token. Re-arming the old token
+    // would allow a detached pre-reset worker to resume against new state.
+    self.reset_flag = Arc::new(AtomicBool::new(false));
 
     // Create new channel and worker for future decode operations
     let (sender, receiver) = channel::unbounded();
@@ -1288,7 +1342,7 @@ impl AudioDecoder {
   pub fn close(&mut self, env: Env) -> Result<()> {
     // Check state first - W3C spec: throw InvalidStateError if already closed
     {
-      let inner = self
+      let mut inner = self
         .inner
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
@@ -1296,6 +1350,8 @@ impl AudioDecoder {
       if inner.state == CodecState::Closed {
         return throw_invalid_state_error(&env, "Cannot close an already closed codec");
       }
+
+      inner.flushes.abort_all();
     }
 
     // Drop sender to stop accepting new commands

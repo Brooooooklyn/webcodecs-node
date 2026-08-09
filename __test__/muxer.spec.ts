@@ -9,6 +9,7 @@ import test from 'ava'
 import {
   Mp4Muxer,
   WebMMuxer,
+  WebMDemuxer,
   MkvMuxer,
   VideoEncoder,
   AudioEncoder,
@@ -19,6 +20,63 @@ import {
   type EncodedAudioChunkMetadata,
 } from '../index.js'
 import { generateSolidColorI420Frame, generateSilence, TestColors } from './helpers/index.js'
+
+test('WebMMuxer: preserves sparse source timestamps through demux', async (t) => {
+  const chunks: EncodedVideoChunk[] = []
+  const encoder = new VideoEncoder({
+    output: (chunk) => chunks.push(chunk),
+    error: (error) => t.fail(error.message),
+  })
+  encoder.configure({ codec: 'vp8', width: 64, height: 64, bitrate: 100_000, framerate: 30 })
+
+  for (const timestamp of [0, 1_000_000]) {
+    const frame = generateSolidColorI420Frame(64, 64, TestColors.red, timestamp)
+    encoder.encode(frame, { keyFrame: true })
+    frame.close()
+  }
+  await encoder.flush()
+  encoder.close()
+
+  const muxer = new WebMMuxer()
+  muxer.addVideoTrack({ codec: 'vp8', width: 64, height: 64, framerate: 30 })
+  for (const chunk of chunks) muxer.addVideoChunk(chunk)
+  const data = muxer.finalize()
+  muxer.close()
+
+  const timestamps: number[] = []
+  const demuxer = new WebMDemuxer({
+    videoOutput: (chunk) => timestamps.push(chunk.timestamp),
+    error: (error) => t.fail(error.message),
+  })
+  await demuxer.loadBuffer(data)
+  await demuxer.demuxAsync()
+  demuxer.close()
+
+  t.deepEqual(timestamps, [0, 1_000_000])
+})
+
+test('WebMMuxer: accepts duplicate source timestamps', async (t) => {
+  const chunks: EncodedVideoChunk[] = []
+  const encoder = new VideoEncoder({
+    output: (chunk) => chunks.push(chunk),
+    error: (error) => t.fail(error.message),
+  })
+  encoder.configure({ codec: 'vp8', width: 64, height: 64, bitrate: 100_000, framerate: 30 })
+
+  for (let i = 0; i < 2; i++) {
+    const frame = generateSolidColorI420Frame(64, 64, TestColors.red, 0)
+    encoder.encode(frame, { keyFrame: true })
+    frame.close()
+  }
+  await encoder.flush()
+  encoder.close()
+
+  const muxer = new WebMMuxer()
+  muxer.addVideoTrack({ codec: 'vp8', width: 64, height: 64, framerate: 30 })
+  for (const chunk of chunks) muxer.addVideoChunk(chunk)
+  t.true(muxer.finalize().length > 0)
+  muxer.close()
+})
 
 // Reset hardware fallback state before each test
 test.beforeEach(() => {
@@ -138,6 +196,58 @@ test('Mp4Muxer: muxes video chunks and produces valid MP4', async (t) => {
 test('WebMMuxer: constructor creates muxer', (t) => {
   const muxer = new WebMMuxer()
   t.truthy(muxer)
+  muxer.close()
+})
+
+test('Muxers: streaming-only status getters reject in buffer mode', (t) => {
+  for (const Muxer of [Mp4Muxer, WebMMuxer, MkvMuxer]) {
+    const muxer = new Muxer()
+    t.throws(() => muxer.isFinished, { message: /Not in streaming mode/ })
+    t.throws(() => muxer.read(), { message: /Not in streaming mode/ })
+    muxer.close()
+  }
+})
+
+test('WebMMuxer: streaming output does not block when reads are delayed', async (t) => {
+  const chunks: EncodedVideoChunk[] = []
+  const encoder = new VideoEncoder({
+    output: (chunk) => chunks.push(chunk),
+    error: (error) => t.fail(error.message),
+  })
+  encoder.configure({
+    codec: 'vp8',
+    width: 64,
+    height: 64,
+    bitrate: 100_000,
+    hardwareAcceleration: 'prefer-software',
+  })
+  for (let index = 0; index < 20; index++) {
+    const frame = generateSolidColorI420Frame(64, 64, TestColors.red, index * 33_333)
+    encoder.encode(frame, { keyFrame: index === 0 })
+    frame.close()
+  }
+  await encoder.flush()
+  encoder.close()
+
+  // Sixteen bytes is deliberately smaller than the container header. The old
+  // fixed ring buffer deadlocked in addVideoChunk() before JavaScript could read.
+  const muxer = new WebMMuxer({ live: true, streaming: { bufferCapacity: 16 } })
+  muxer.addVideoTrack({ codec: 'vp8', width: 64, height: 64, framerate: 30 })
+  for (const chunk of chunks) muxer.addVideoChunk(chunk)
+  t.is(muxer.finalize().length, 0)
+
+  const outputParts: Uint8Array[] = []
+  for (;;) {
+    const part = muxer.read()
+    t.truthy(part, 'finalized streaming muxer should return data or EOF')
+    if (!part || part.length === 0) break
+    t.true(part.length <= 16)
+    outputParts.push(part)
+  }
+  const output = Buffer.concat(outputParts)
+  t.true(output.length > 16)
+  t.deepEqual([...output.subarray(0, 4)], [0x1a, 0x45, 0xdf, 0xa3])
+  t.true(muxer.isFinished)
   muxer.close()
 })
 

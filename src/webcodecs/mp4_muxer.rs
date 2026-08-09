@@ -353,7 +353,7 @@ impl Mp4Muxer {
   #[napi(getter)]
   pub fn is_finished(&self) -> Result<bool> {
     lock_muxer_inner!(self => _guard, inner);
-    Ok(inner.is_streaming_finished())
+    inner.is_streaming_finished()
   }
 
   /// Close the muxer and release resources
@@ -411,14 +411,8 @@ mod tests {
       Mp4Format::parse_video_codec("av01.0.04M.08"),
       Ok(AVCodecID::Av1)
     ));
-    assert!(matches!(
-      Mp4Format::parse_video_codec("vp9"),
-      Ok(AVCodecID::Vp9)
-    ));
-    assert!(matches!(
-      Mp4Format::parse_video_codec("vp09.00.10.08"),
-      Ok(AVCodecID::Vp9)
-    ));
+    assert!(Mp4Format::parse_video_codec("vp9").is_err());
+    assert!(Mp4Format::parse_video_codec("vp09.00.10.08").is_err());
   }
 
   #[test]

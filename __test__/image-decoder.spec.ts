@@ -31,6 +31,7 @@ test('ImageDecoder decodes static PNG image', async (t) => {
   t.truthy(result.image)
   t.is(result.image.codedWidth, 8)
   t.is(result.image.codedHeight, 8)
+  t.is(result.image.duration, null)
 
   // Static images should have frameCount = 1
   const tracks = decoder.tracks
@@ -68,10 +69,21 @@ test('ImageDecoder PNG throws for out-of-bounds frame_index', async (t) => {
   result.image.close()
 
   // Now try to access invalid frame index
-  await t.throwsAsync(() => decoder.decode({ frameIndex: 999 }), {
+  const error = await t.throwsAsync(() => decoder.decode({ frameIndex: 999 }), {
     message: /out of bounds/,
   })
+  t.true(error instanceof RangeError)
 
+  decoder.close()
+})
+
+test('ImageDecoder MIME mismatch rejects with EncodingError', async (t) => {
+  const data = readFileSync(join(__dirname, 'fixtures/test.png'))
+  const decoder = new ImageDecoder({ data, type: 'image/jpeg' })
+  const error = await t.throwsAsync(decoder.decode())
+
+  t.true(error instanceof DOMException)
+  t.is(error.name, 'EncodingError')
   decoder.close()
 })
 
@@ -108,8 +120,29 @@ test('ImageDecoder GIF frame_count is populated after first decode', async (t) =
   // After decode, frameCount should be populated
   const tracks = decoder.tracks
   t.true(tracks.selectedTrack!.animated)
-  t.true(tracks.selectedTrack!.frameCount > 0)
+  t.true(tracks.selectedTrack!.frameCount > 1)
 
+  const first = await decoder.decode({ frameIndex: 0 })
+  const second = await decoder.decode({ frameIndex: 1 })
+  t.is(first.image.timestamp, 0)
+  t.is(second.image.timestamp, 1_000_000)
+  t.is(first.image.duration, 1_000_000)
+  t.is(second.image.duration, 1_000_000)
+  first.image.close()
+  second.image.close()
+
+  decoder.close()
+})
+
+test('ImageDecoder parses finite GIF repetition count', async (t) => {
+  const data = Buffer.from(readFileSync(join(__dirname, 'fixtures/animated.gif')))
+  // NETSCAPE2.0 application extension loop-count bytes in this fixture.
+  data[35] = 5
+  data[36] = 0
+  const decoder = new ImageDecoder({ data, type: 'image/gif' })
+
+  await decoder.tracks.ready
+  t.is(decoder.tracks.selectedTrack!.repetitionCount, 5)
   decoder.close()
 })
 
@@ -225,6 +258,27 @@ test('ImageDecoder.isTypeSupported returns true for supported types', async (t) 
   t.true(await ImageDecoder.isTypeSupported('image/gif'))
   t.true(await ImageDecoder.isTypeSupported('image/webp'))
   t.true(await ImageDecoder.isTypeSupported('image/bmp'))
+  t.true(await ImageDecoder.isTypeSupported('image/jxl'))
+})
+
+test('ImageDecoder decodes JPEG XL image data', async (t) => {
+  // libjxl/testdata jxl/spline_on_first_frame.jxl at commit 73695d3.
+  // The tiny upstream conformance sample is BSD-3-Clause licensed.
+  const data = Buffer.from(
+    '/wpHQCTYYyAAAHQAAuAoKipGxmAQgF8AAEToz4Qk4ox2AughlkBwAADYY1gAAHAAAuAgKipGxkgAfgEAEKFfEhIJRFhA4YklEBxgCA==',
+    'base64',
+  )
+  const decoder = new ImageDecoder({ data, type: 'image/jxl' })
+  const result = await decoder.decode()
+
+  t.is(result.image.codedWidth, 32)
+  t.is(result.image.codedHeight, 32)
+  t.is(result.image.format, 'RGBX')
+  t.is(result.image.timestamp, 0)
+  t.true(result.complete)
+
+  result.image.close()
+  decoder.close()
 })
 
 test('ImageDecoder.isTypeSupported returns false for unsupported types', async (t) => {
@@ -266,6 +320,121 @@ test('ImageDecoder completed getter resolves immediately for buffered data', asy
   await t.notThrowsAsync(async () => {
     await decoder.completed
   })
+
+  decoder.close()
+})
+
+test('ImageDecoder stream becomes ready before EOF once a frame is decodable', async (t) => {
+  const data = readFileSync(join(__dirname, 'fixtures/test.png'))
+  let closeStream!: () => void
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(data)
+      closeStream = () => controller.close()
+    },
+  })
+  const decoder = new ImageDecoder({ data: stream, type: 'image/png' })
+
+  await decoder.tracks.ready
+  const result = await decoder.decode()
+  t.false(decoder.complete)
+  t.is(result.image.codedWidth, 8)
+
+  closeStream()
+  await decoder.completed
+  t.true(decoder.complete)
+  result.image.close()
+  decoder.close()
+})
+
+test('ImageDecoder streamed animation waits for a requested future frame', async (t) => {
+  const data = readFileSync(join(__dirname, 'fixtures/animated.gif'))
+  let controller!: ReadableStreamDefaultController<Uint8Array>
+  const stream = new ReadableStream<Uint8Array>({
+    start(streamController) {
+      controller = streamController
+      // This prefix contains exactly the first of the fixture's three frames.
+      controller.enqueue(data.subarray(0, 900))
+    },
+  })
+  const decoder = new ImageDecoder({ data: stream, type: 'image/gif' })
+
+  await decoder.tracks.ready
+  t.false(decoder.complete)
+  t.is(decoder.tracks.selectedTrack!.frameCount, 1)
+
+  let settled = 0
+  const secondFramePromises = [
+    decoder.decode({ frameIndex: 1 }).finally(() => {
+      settled += 1
+    }),
+    decoder.decode({ frameIndex: 1 }).finally(() => {
+      settled += 1
+    }),
+  ]
+  await new Promise((resolve) => setTimeout(resolve, 25))
+  t.is(settled, 0, 'decodes should wait while the requested frame may still arrive')
+
+  controller.enqueue(data.subarray(900))
+  controller.close()
+  const secondFrames = await Promise.all(secondFramePromises)
+  t.is(secondFrames[0].image.timestamp, 1_000_000)
+  t.is(secondFrames[1].image.timestamp, 1_000_000)
+  t.true(secondFrames[0].complete)
+  t.true(secondFrames[1].complete)
+  t.is(decoder.tracks.selectedTrack!.frameCount, 3)
+
+  secondFrames[0].image.close()
+  secondFrames[1].image.close()
+  decoder.close()
+})
+
+test('ImageDecoder pending streamed decode rejects after a stream error', async (t) => {
+  const data = readFileSync(join(__dirname, 'fixtures/animated.gif'))
+  let controller!: ReadableStreamDefaultController<Uint8Array>
+  const stream = new ReadableStream<Uint8Array>({
+    start(streamController) {
+      controller = streamController
+      controller.enqueue(data.subarray(0, 900))
+    },
+  })
+  const decoder = new ImageDecoder({ data: stream, type: 'image/gif' })
+
+  await decoder.tracks.ready
+  t.false(decoder.complete)
+  t.is(decoder.tracks.selectedTrack!.frameCount, 1)
+
+  const completedOutcome = decoder.completed.then(
+    () => ({ status: 'resolved' as const }),
+    (error: unknown) => ({ status: 'rejected' as const, error }),
+  )
+  const decodeOutcomePromise = decoder.decode({ frameIndex: 1 }).then(
+    (result) => {
+      result.image.close()
+      return { status: 'resolved' as const }
+    },
+    (error: unknown) => ({ status: 'rejected' as const, error }),
+  )
+
+  controller.error(new Error('intentional stream failure'))
+
+  const decodeOutcome = await Promise.race([
+    decodeOutcomePromise,
+    new Promise<{ status: 'timeout' }>((resolve) =>
+      setTimeout(() => resolve({ status: 'timeout' }), 500),
+    ),
+  ])
+  const completed = await completedOutcome
+
+  t.true(decoder.complete)
+  t.is(completed.status, 'rejected')
+  if (completed.status === 'rejected') {
+    t.is((completed.error as Error).message, 'intentional stream failure')
+  }
+  t.is(decodeOutcome.status, 'rejected', 'decode must not remain pending after a stream error')
+  if (decodeOutcome.status === 'rejected') {
+    t.true(decodeOutcome.error instanceof RangeError)
+  }
 
   decoder.close()
 })

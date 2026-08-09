@@ -206,6 +206,35 @@ test('AudioEncoder: encode() multiple frames', async (t) => {
   encoder.close()
 })
 
+test('AudioEncoder: mixed input formats recreate and bypass resamplers correctly', async (t) => {
+  const { encoder, chunks, errors } = createTestEncoder()
+
+  encoder.configure({
+    codec: 'opus',
+    sampleRate: 48000,
+    numberOfChannels: 2,
+    bitrate: 64000,
+  })
+
+  const inputs = [
+    generateSilence(882, 1, 44100, 'f32', 0),
+    generateSilence(960, 2, 48000, 'f32', 20000),
+    generateSilence(640, 2, 32000, 's16', 40000),
+  ]
+  for (const input of inputs) {
+    encoder.encode(input)
+    input.close()
+  }
+
+  await encoder.flush()
+
+  t.deepEqual(errors, [])
+  t.true(chunks.length >= 3)
+  const encodedDuration = chunks.reduce((total, chunk) => total + (chunk.duration ?? 0), 0)
+  t.true(encodedDuration >= 59000, `expected about 60ms, got ${encodedDuration}us`)
+  encoder.close()
+})
+
 test('AudioEncoder: encode() with AAC', async (t) => {
   const { encoder, chunks } = createTestEncoder()
 

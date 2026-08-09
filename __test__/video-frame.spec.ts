@@ -264,10 +264,15 @@ test('VideoFrame: clone() creates independent copy', async (t) => {
 })
 
 test('VideoFrame: close() releases resources', (t) => {
-  const frame = generateSolidColorI420Frame(128, 96, TestColors.red, 0)
+  const frame = generateSolidColorI420Frame(128, 96, TestColors.red, 12_345, 33_333)
 
   // Should not throw
   t.notThrows(() => frame.close())
+
+  // Metadata remains observable after the native pixel storage is detached.
+  t.is(frame.timestamp, 12_345)
+  t.is(frame.duration, 33_333)
+  t.throws(() => frame.allocationSize())
 
   // Idempotent - calling close again should not throw
   t.notThrows(() => frame.close())

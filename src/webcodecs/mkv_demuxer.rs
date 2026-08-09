@@ -7,8 +7,8 @@ use crate::ffi::AVCodecID;
 use crate::webcodecs::demuxer_base::{
   AudioOutputCallback, DemuxerAudioDecoderConfig, DemuxerChunk, DemuxerFormat, DemuxerInner,
   DemuxerTrackInfo, DemuxerVideoDecoderConfig, ErrorCallback, VideoOutputCallback,
-  parse_aac_codec_string, parse_h264_codec_string, parse_hevc_codec_string, parse_vp9_codec_string,
-  with_demuxer_inner, with_demuxer_inner_mut,
+  demux_with_callbacks, parse_aac_codec_string, parse_h264_codec_string, parse_hevc_codec_string,
+  parse_vp9_codec_string, with_demuxer_inner, with_demuxer_inner_mut,
 };
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunk;
 use crate::webcodecs::encoded_video_chunk::EncodedVideoChunk;
@@ -71,13 +71,14 @@ impl FromNapiValue for MkvDemuxerInit {
     let video_output: Option<VideoOutputCallback> = match obj
       .get_named_property::<Option<Function<EncodedVideoChunk, UnknownReturnValue>>>("videoOutput")
     {
-      Ok(Some(func)) => Some(
+      Ok(Some(func)) => Some(Arc::new(
         func
           .build_threadsafe_function()
           .callee_handled::<false>()
           .weak::<true>()
+          .max_queue_size::<64>()
           .build()?,
-      ),
+      )),
       _ => None,
     };
 
@@ -85,13 +86,14 @@ impl FromNapiValue for MkvDemuxerInit {
     let audio_output: Option<AudioOutputCallback> = match obj
       .get_named_property::<Option<Function<EncodedAudioChunk, UnknownReturnValue>>>("audioOutput")
     {
-      Ok(Some(func)) => Some(
+      Ok(Some(func)) => Some(Arc::new(
         func
           .build_threadsafe_function()
           .callee_handled::<false>()
           .weak::<true>()
+          .max_queue_size::<64>()
           .build()?,
-      ),
+      )),
       _ => None,
     };
 
@@ -104,11 +106,14 @@ impl FromNapiValue for MkvDemuxerInit {
       }
     };
 
-    let error: ErrorCallback = error_func
-      .build_threadsafe_function()
-      .callee_handled::<false>()
-      .weak::<true>()
-      .build()?;
+    let error: ErrorCallback = Arc::new(
+      error_func
+        .build_threadsafe_function()
+        .callee_handled::<false>()
+        .weak::<true>()
+        .max_queue_size::<64>()
+        .build()?,
+    );
 
     Ok(MkvDemuxerInit {
       video_output,
@@ -238,15 +243,16 @@ impl MkvDemuxer {
 
   #[napi]
   pub fn demux(&self, count: Option<u32>) -> Result<()> {
+    {
+      let mut guard = with_demuxer_inner_mut!(self);
+      guard.begin_callback_demux()?;
+    }
+
     let inner = self.inner.clone();
     let max_packets = count.unwrap_or(u32::MAX);
 
     std::thread::spawn(move || {
-      let mut guard = match inner.lock() {
-        Ok(g) => g,
-        Err(_) => return,
-      };
-      guard.demux_sync(max_packets);
+      let _ = demux_with_callbacks(&inner, max_packets);
     });
 
     Ok(())
@@ -255,18 +261,17 @@ impl MkvDemuxer {
   /// Demux packets asynchronously (awaitable version of demux)
   #[napi]
   pub async fn demux_async(&self, count: Option<u32>) -> Result<()> {
+    {
+      let mut guard = with_demuxer_inner_mut!(self);
+      guard.begin_callback_demux()?;
+    }
+
     let inner = self.inner.clone();
     let max_packets = count.unwrap_or(u32::MAX);
 
-    tokio::task::spawn_blocking(move || {
-      let mut guard = inner
-        .lock()
-        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-      guard.demux_sync(max_packets);
-      Ok(())
-    })
-    .await
-    .map_err(|e| Error::new(Status::GenericFailure, format!("Task error: {}", e)))?
+    tokio::task::spawn_blocking(move || demux_with_callbacks(&inner, max_packets))
+      .await
+      .map_err(|e| Error::new(Status::GenericFailure, format!("Task error: {}", e)))?
   }
 
   #[napi]

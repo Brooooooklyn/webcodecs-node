@@ -322,9 +322,9 @@ test('ImageDecoder: decode after close throws', async (t) => {
 
   decoder.close()
 
-  // Async rejections use standard Error with DOMException name in message
   const error = await t.throwsAsync(decoder.decode())
-  t.true(error?.message.includes('InvalidStateError'), 'decode on closed should include InvalidStateError')
+  t.true(error instanceof DOMException)
+  t.is(error.name, 'InvalidStateError')
 })
 
 test('ImageDecoder: double close is safe', async (t) => {
@@ -458,7 +458,8 @@ test('ImageDecoder: out of range frameIndex', async (t) => {
   result.image.close()
 
   // Try to decode non-existent frame
-  await t.throwsAsync(decoder.decode({ frameIndex: 9999 }), { message: /RangeError/ })
+  const error = await t.throwsAsync(decoder.decode({ frameIndex: 9999 }))
+  t.true(error instanceof RangeError)
 
   decoder.close()
 })

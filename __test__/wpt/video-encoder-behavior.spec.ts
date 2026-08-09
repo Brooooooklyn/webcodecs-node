@@ -181,11 +181,6 @@ test('VideoEncoder: encodeQueueSize tracking', async (t) => {
     frame.close()
   }
 
-  // Note: Encoding after flush is not supported for all FFmpeg encoders (e.g., libvpx)
-  // because the encoder enters EOF state that can't be reset with avcodec_flush_buffers().
-  // For full W3C compliance, encoder context would need to be recreated after flush.
-  // This test focuses on verifying dequeue events fire correctly.
-
   encoder.close()
 })
 
@@ -317,6 +312,39 @@ test('VideoEncoder: encode after reconfigure', async (t) => {
   frame1.close()
   frame2.close()
   frame3.close()
+})
+
+test('VideoEncoder: FIFO reconfigure keeps old metadata and resets conversion state', async (t) => {
+  const outputs: Array<{ timestamp: number; width?: number; height?: number }> = []
+  const errors: Error[] = []
+  const encoder = new VideoEncoder({
+    output: (chunk, metadata) =>
+      outputs.push({
+        timestamp: chunk.timestamp,
+        width: metadata?.decoderConfig?.codedWidth,
+        height: metadata?.decoderConfig?.codedHeight,
+      }),
+    error: (error) => errors.push(error),
+  })
+
+  encoder.configure({ codec: 'vp8', width: 16, height: 16, hardwareAcceleration: 'prefer-software' })
+  const oldFrame = generateSolidColorI420Frame(16, 16, TestColors.red, 100)
+  encoder.encode(oldFrame, { keyFrame: true })
+  oldFrame.close()
+
+  encoder.configure({ codec: 'vp8', width: 32, height: 32, hardwareAcceleration: 'prefer-software' })
+  const newFrame = generateSolidColorI420Frame(32, 32, TestColors.green, 200)
+  encoder.encode(newFrame, { keyFrame: true })
+  newFrame.close()
+
+  await encoder.flush()
+
+  t.deepEqual(errors, [])
+  t.deepEqual(outputs, [
+    { timestamp: 100, width: 16, height: 16 },
+    { timestamp: 200, width: 32, height: 32 },
+  ])
+  encoder.close()
 })
 
 // ============================================================================

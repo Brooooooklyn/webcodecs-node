@@ -12,6 +12,11 @@
 #include <libavutil/opt.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/samplefmt.h>
+#include <libavformat/avformat.h>
+
+#if LIBAVCODEC_VERSION_MAJOR != 62 || LIBAVUTIL_VERSION_MAJOR != 60 || LIBAVFORMAT_VERSION_MAJOR != 62
+#error "Unsupported FFmpeg headers: webcodecs-node is pinned to FFmpeg 8.x (libavcodec 62, libavutil 60, libavformat 62)"
+#endif
 
 /* ============================================================================
  * AVCodecContext Setters
@@ -798,8 +803,6 @@ int ff_image_fill_arrays(uint8_t* dst_data[4], int dst_linesize[4],
 /* ============================================================================
  * AVFormatContext Accessors (libavformat)
  * ============================================================================ */
-
-#include <libavformat/avformat.h>
 
 void fffmt_set_pb(AVFormatContext* ctx, AVIOContext* pb) {
     ctx->pb = pb;

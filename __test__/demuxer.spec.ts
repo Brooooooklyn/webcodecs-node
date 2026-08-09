@@ -210,6 +210,70 @@ runTest('Mp4Demuxer: seek and demux', async (t) => {
   })
 })
 
+runTest('Mp4Demuxer: rejects overlapping callback demux sessions', async (t) => {
+  let outputCount = 0
+  let resolveOutputs!: () => void
+  const outputs = new Promise<void>((resolve) => {
+    resolveOutputs = resolve
+  })
+  const onOutput = () => {
+    outputCount += 1
+    if (outputCount === 100) resolveOutputs()
+  }
+  const demuxer = new Mp4Demuxer({
+    videoOutput: onOutput,
+    audioOutput: onOutput,
+    error: (error) => t.fail(error.message),
+  })
+  await demuxer.load(path.join(FIXTURES_DIR, 'small_buck_bunny.mp4'))
+
+  // The first session fills the bounded callback queue while this JavaScript
+  // turn is still running, making the overlap deterministic.
+  demuxer.demux(100)
+  t.throws(() => demuxer.demux(1), { message: /already in progress/ })
+
+  await outputs
+  // The callback-session reservation is released by the native worker after
+  // the final JavaScript callback has returned. Poll the observable state
+  // instead of assuming a fixed number of event-loop turns also schedules
+  // that worker (notably under emulated ARM CI).
+  const readyDeadline = Date.now() + 5_000
+  while (demuxer.state === 'demuxing' && Date.now() < readyDeadline) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 10))
+  }
+  t.is(demuxer.state, 'ready')
+  await t.notThrowsAsync(() => demuxer.demuxAsync(1))
+  demuxer.close()
+})
+
+runTest('Mp4Demuxer: close during callback demux is not reported as an error', async (t) => {
+  let errorCount = 0
+  let resolveClosed!: () => void
+  const closed = new Promise<void>((resolve) => {
+    resolveClosed = resolve
+  })
+  let demuxer!: Mp4Demuxer
+  const onOutput = () => {
+    demuxer.close()
+    resolveClosed()
+  }
+  demuxer = new Mp4Demuxer({
+    videoOutput: onOutput,
+    audioOutput: onOutput,
+    error: () => {
+      errorCount += 1
+    },
+  })
+  await demuxer.load(path.join(FIXTURES_DIR, 'small_buck_bunny.mp4'))
+
+  demuxer.demux(100)
+  await closed
+  await new Promise<void>((resolve) => setImmediate(resolve))
+
+  t.is(demuxer.state, 'closed')
+  t.is(errorCount, 0)
+})
+
 runTest('Mp4Demuxer: state transitions', async (t) => {
   const demuxer = new Mp4Demuxer({
     error: (e: Error) => t.fail(`Error: ${e.message}`),
@@ -1131,6 +1195,29 @@ runTest('Mp4Demuxer: async iterator yields DemuxerChunk with correct structure',
   demuxer.close()
 })
 
+runTest('Mp4Demuxer: callback demux resumes after partial async iteration', async (t) => {
+  let callbackChunks = 0
+  const onOutput = () => {
+    callbackChunks += 1
+  }
+  const demuxer = new Mp4Demuxer({
+    videoOutput: onOutput,
+    audioOutput: onOutput,
+    error: (e: Error) => t.fail(`Error: ${e.message}`),
+  })
+
+  await demuxer.load(path.join(FIXTURES_DIR, 'small_buck_bunny.mp4'))
+  for await (const _chunk of demuxer) {
+    break
+  }
+
+  t.is(demuxer.state, 'demuxing')
+  await t.notThrowsAsync(() => demuxer.demuxAsync(1))
+  t.is(callbackChunks, 1)
+  t.is(demuxer.state, 'ready')
+  demuxer.close()
+})
+
 runTest('Mp4Demuxer: demuxAsync completes all packets', async (t) => {
   const videoChunks: EncodedVideoChunk[] = []
   const audioChunks: EncodedAudioChunk[] = []
@@ -1170,6 +1257,27 @@ runTest('Mp4Demuxer: demuxAsync with no count demuxes all', async (t) => {
   demuxer.close()
 })
 
+runTest('Mp4Demuxer: seek rejects during an active callback session', async (t) => {
+  let callbackRan = false
+  const demuxer = new Mp4Demuxer({
+    videoOutput: () => {
+      callbackRan = true
+      const error = t.throws(() => demuxer.seek(0))
+      t.regex(error.message, /demux operation is in progress/)
+    },
+    error: (error) => t.fail(error.message),
+  })
+
+  await demuxer.load(path.join(FIXTURES_DIR, 'small_buck_bunny.mp4'))
+  const videoTrack = demuxer.tracks.find((track) => track.trackType === 'video')
+  t.truthy(videoTrack)
+  demuxer.selectVideoTrack(videoTrack!.index)
+
+  await demuxer.demuxAsync(1)
+  t.true(callbackRan)
+  demuxer.close()
+})
+
 runTest('WebMDemuxer: async iterator with for-await-of', async (t) => {
   const webmData = await generateWebMWithVP9()
 
@@ -1188,6 +1296,28 @@ runTest('WebMDemuxer: async iterator with for-await-of', async (t) => {
   t.true(chunks.length > 0, 'Should have iterated over chunks')
   t.true(chunks.every((c) => c.chunkType === 'video'), 'All chunks should be video (VP9 only)')
 
+  demuxer.close()
+})
+
+runTest('WebMDemuxer: callback demux resumes after partial async iteration', async (t) => {
+  const webmData = await generateWebMWithVP9()
+  let callbackChunks = 0
+  const demuxer = new WebMDemuxer({
+    videoOutput: () => {
+      callbackChunks += 1
+    },
+    error: (e: Error) => t.fail(`Error: ${e.message}`),
+  })
+
+  await demuxer.loadBuffer(webmData)
+  for await (const _chunk of demuxer) {
+    break
+  }
+
+  t.is(demuxer.state, 'demuxing')
+  await t.notThrowsAsync(() => demuxer.demuxAsync(1))
+  t.is(callbackChunks, 1)
+  t.is(demuxer.state, 'ready')
   demuxer.close()
 })
 
@@ -1228,6 +1358,28 @@ runTest('MkvDemuxer: async iterator with for-await-of', async (t) => {
   t.true(chunks.length > 0, 'Should have iterated over chunks')
   t.true(chunks.every((c) => c.chunkType === 'video'), 'All chunks should be video (H.264 only)')
 
+  demuxer.close()
+})
+
+runTest('MkvDemuxer: callback demux resumes after partial async iteration', async (t) => {
+  const mkvData = await generateMkvWithH264()
+  let callbackChunks = 0
+  const demuxer = new MkvDemuxer({
+    videoOutput: () => {
+      callbackChunks += 1
+    },
+    error: (e: Error) => t.fail(`Error: ${e.message}`),
+  })
+
+  await demuxer.loadBuffer(mkvData)
+  for await (const _chunk of demuxer) {
+    break
+  }
+
+  t.is(demuxer.state, 'demuxing')
+  await t.notThrowsAsync(() => demuxer.demuxAsync(1))
+  t.is(callbackChunks, 1)
+  t.is(demuxer.state, 'ready')
   demuxer.close()
 })
 

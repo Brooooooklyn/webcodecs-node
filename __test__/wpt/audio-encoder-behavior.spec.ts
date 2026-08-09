@@ -201,7 +201,9 @@ test('AudioEncoder: reset during flush', async (t) => {
   await firstOutputPromise
 
   // Flush should be aborted
-  await t.throwsAsync(flushDone, { message: /AbortError/ })
+  const flushError = await t.throwsAsync(flushDone)
+  t.true(flushError instanceof DOMException)
+  t.is(flushError.name, 'AbortError')
 
   // Note: On slow CI runners (QEMU), the worker may produce both outputs via
   // NonBlocking callbacks BEFORE flush() sets inside_flush=true. Once queued,
@@ -290,11 +292,46 @@ test('AudioEncoder: encodeQueueSize tracking', async (t) => {
     data.close()
   }
 
-  // Note: Encoding after flush is not supported for all FFmpeg encoders (e.g., libopus)
-  // because the encoder enters EOF state that can't be reset with avcodec_flush_buffers().
-  // For full W3C compliance, encoder context would need to be recreated after flush.
-  // This test focuses on verifying dequeue events fire correctly.
+  encoder.close()
+})
 
+test('AudioEncoder: flush recreation preserves queue accounting for later encodes', async (t) => {
+  const config = {
+    codec: 'opus',
+    sampleRate: 48000,
+    numberOfChannels: 2,
+  } as const
+  const support = await AudioEncoder.isConfigSupported(config)
+  if (!support.supported) {
+    t.pass('Opus not supported')
+    return
+  }
+
+  const encoder = new AudioEncoder({ output() {}, error: (error) => t.fail(error.message) })
+  encoder.configure(config)
+
+  let dequeueCount = 0
+  encoder.ondequeue = () => {
+    dequeueCount++
+  }
+
+  const first = generateSilence(960, 2, 48000, 'f32', 0)
+  const second = generateSilence(960, 2, 48000, 'f32', 20000)
+  encoder.encode(first)
+  const firstFlush = encoder.flush()
+  encoder.encode(second)
+  const secondFlush = encoder.flush()
+
+  await Promise.all([firstFlush, secondFlush])
+  for (let turn = 0; turn < 20 && dequeueCount < 2; turn++) {
+    await endAfterEventLoopTurn()
+  }
+
+  t.is(encoder.encodeQueueSize, 0)
+  t.is(dequeueCount, 2, 'each accepted encode operation fires a dequeue event')
+
+  first.close()
+  second.close()
   encoder.close()
 })
 
@@ -383,6 +420,38 @@ test('AudioEncoder: emit decoder config and extra data', async (t) => {
   encoder.close()
 })
 
+test('AudioEncoder: FIFO reconfigure keeps decoder config with its producing context', async (t) => {
+  const outputs: Array<{ timestamp: number; channels?: number }> = []
+  const errors: Error[] = []
+  const encoder = new AudioEncoder({
+    output: (chunk, metadata) =>
+      outputs.push({ timestamp: chunk.timestamp, channels: metadata?.decoderConfig?.numberOfChannels }),
+    error: (error) => errors.push(error),
+  })
+
+  encoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 })
+  const stereo = generateSilence(960, 2, 48000, 'f32', 0)
+  encoder.encode(stereo)
+  stereo.close()
+
+  encoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 })
+  const mono = generateSilence(960, 1, 48000, 'f32', 20000)
+  encoder.encode(mono)
+  mono.close()
+
+  await encoder.flush()
+
+  t.deepEqual(errors, [])
+  t.deepEqual(
+    outputs.filter((output) => output.channels !== undefined),
+    [
+    { timestamp: 0, channels: 2 },
+    { timestamp: 20000, channels: 1 },
+    ],
+  )
+  encoder.close()
+})
+
 // ============================================================================
 // Encode-Decode Roundtrip Tests
 // ============================================================================
@@ -467,7 +536,7 @@ test('AudioEncoder: encoding and decoding roundtrip', async (t) => {
 // Channel Number Variation Tests
 // ============================================================================
 
-test('AudioEncoder: channel number variation error', async (t) => {
+test('AudioEncoder: resamples channel number variations', async (t) => {
   const support = await AudioEncoder.isConfigSupported({
     codec: 'opus',
     sampleRate: 48000,
@@ -509,35 +578,27 @@ test('AudioEncoder: channel number variation error', async (t) => {
   t.is(errorCount, 0, 'no errors with good data')
   t.true(outputs > 0, 'got outputs')
 
-  // Try to encode data with different channel count
+  // A different input channel count is legal and must be resampled.
   outputs = 0
-  const badData = generateSineTone(440, 4800, 2, 48000, 'f32', 200000) // 2 channels instead of 1
-  encoder.encode(badData)
+  const variedData = generateSineTone(440, 4800, 2, 48000, 'f32', 200000)
+  encoder.encode(variedData)
+  await encoder.flush()
 
-  // Give the error callback time to fire (it's async via ThreadsafeFunction)
-  // On some platforms, the error callback closes the encoder before flush() is called
-  await new Promise((resolve) => setTimeout(resolve, 50))
-
-  if (encoder.state === 'closed') {
-    // Error callback already fired and closed the encoder
-    t.is(errorCount, 1, 'error for bad channel count')
-  } else {
-    // Encoder still open, flush should throw EncodingError
-    await t.throwsAsync(encoder.flush(), { message: /EncodingError|InvalidStateError/ })
-    t.is(errorCount, 1, 'error for bad channel count')
-    t.is(encoder.state as string, 'closed', 'encoder closed after error')
-  }
+  t.is(errorCount, 0, 'no error for legal channel conversion')
+  t.true(outputs > 0, 'converted audio produces output')
+  t.is(encoder.state as string, 'configured')
 
   goodData1.close()
   goodData2.close()
-  badData.close()
+  variedData.close()
+  encoder.close()
 })
 
 // ============================================================================
 // Sample Rate Variation Tests
 // ============================================================================
 
-test('AudioEncoder: sample rate variation error', async (t) => {
+test('AudioEncoder: resamples sample rate variations', async (t) => {
   const support = await AudioEncoder.isConfigSupported({
     codec: 'opus',
     sampleRate: 48000,
@@ -579,28 +640,20 @@ test('AudioEncoder: sample rate variation error', async (t) => {
   t.is(errorCount, 0, 'no errors with good data')
   t.true(outputs > 0, 'got outputs')
 
-  // Try to encode data with different sample rate
+  // A different input sample rate is legal and must be resampled.
   outputs = 0
-  const badData = generateSineTone(440, 4410, 1, 44100, 'f32', 200000) // 44100 instead of 48000
-  encoder.encode(badData)
+  const variedData = generateSineTone(440, 4410, 1, 44100, 'f32', 200000)
+  encoder.encode(variedData)
+  await encoder.flush()
 
-  // Give the error callback time to fire (it's async via ThreadsafeFunction)
-  // On some platforms, the error callback closes the encoder before flush() is called
-  await new Promise((resolve) => setTimeout(resolve, 50))
-
-  if (encoder.state === 'closed') {
-    // Error callback already fired and closed the encoder
-    t.is(errorCount, 1, 'error for bad sample rate')
-  } else {
-    // Encoder still open, flush should throw EncodingError
-    await t.throwsAsync(encoder.flush(), { message: /EncodingError|InvalidStateError/ })
-    t.is(errorCount, 1, 'error for bad sample rate')
-    t.is(encoder.state as string, 'closed', 'encoder closed after error')
-  }
+  t.is(errorCount, 0, 'no error for legal sample-rate conversion')
+  t.true(outputs > 0, 'converted audio produces output')
+  t.is(encoder.state as string, 'configured')
 
   goodData1.close()
   goodData2.close()
-  badData.close()
+  variedData.close()
+  encoder.close()
 })
 
 // ============================================================================
