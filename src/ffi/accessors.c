@@ -14,8 +14,8 @@
 #include <libavutil/samplefmt.h>
 #include <libavformat/avformat.h>
 
-#if LIBAVCODEC_VERSION_MAJOR != 62 || LIBAVUTIL_VERSION_MAJOR != 60 || LIBAVFORMAT_VERSION_MAJOR != 62
-#error "Unsupported FFmpeg headers: webcodecs-node is pinned to FFmpeg 8.x (libavcodec 62, libavutil 60, libavformat 62)"
+#if LIBAVCODEC_VERSION_MAJOR != 63 || LIBAVUTIL_VERSION_MAJOR != 61 || LIBAVFORMAT_VERSION_MAJOR != 63
+#error "Unsupported FFmpeg headers: webcodecs-node is pinned to FFmpeg 9.x (libavcodec 63, libavutil 61, libavformat 63)"
 #endif
 
 /* ============================================================================

@@ -1,6 +1,6 @@
 //! FFmpeg build script for CI environments
 //!
-//! Builds FFmpeg 8.0.1 and all codec dependencies from source for Linux/FreeBSD targets.
+//! Builds FFmpeg 9.0 and all codec dependencies from source for Linux/FreeBSD targets.
 //! Usage: cargo run --release --bin build-ffmpeg -- [OPTIONS]
 
 use std::env;
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 // Version constants
-const FFMPEG_VERSION: &str = "n8.0.1";
+const DEFAULT_FFMPEG_VERSION: &str = "n9.0";
 const X264_REPO: &str = "https://code.videolan.org/videolan/x264.git";
 const X265_REPO: &str = "https://bitbucket.org/multicoreware/x265_git.git";
 const X265_BRANCH: &str = "Release_4.1";
@@ -44,6 +44,8 @@ const LIBJXL_BRANCH: &str = "v0.11.1";
 
 /// Build context containing all configuration
 struct BuildContext {
+  /// FFmpeg git tag to build
+  ffmpeg_version: String,
   /// Installation prefix for all libraries
   prefix: PathBuf,
   /// Directory for source code
@@ -133,6 +135,7 @@ impl BuildContext {
     };
 
     Self {
+      ffmpeg_version: DEFAULT_FFMPEG_VERSION.to_string(),
       prefix,
       source_dir,
       target,
@@ -143,6 +146,11 @@ impl BuildContext {
       use_system_cc,
       zig_wrapper_dir: None,
     }
+  }
+
+  fn with_ffmpeg_version(mut self, ffmpeg_version: String) -> Self {
+    self.ffmpeg_version = ffmpeg_version;
+    self
   }
 
   /// Ensure zig wrappers are created and return the wrapper directory
@@ -2175,7 +2183,7 @@ Cflags: -I${{includedir}}
     self.info("Building FFmpeg...");
 
     let source = self.source_dir.join("FFmpeg");
-    self.git_clone(FFMPEG_REPO, Some(FFMPEG_VERSION), &source)?;
+    self.git_clone(FFMPEG_REPO, Some(&self.ffmpeg_version), &source)?;
 
     let prefix_str = self.prefix.to_string_lossy().to_string();
     let include_dir = self.prefix.join("include");
@@ -2469,6 +2477,7 @@ USAGE:
     build-ffmpeg [OPTIONS]
 
 OPTIONS:
+    --ffmpeg-version <TAG>    FFmpeg git tag [default: n9.0]
     -o, --output <DIR>        Output installation directory [default: ./ffmpeg-build]
     -t, --target <TARGET>     Cross-compilation target [default: host]
     -s, --source-dir <DIR>    Directory for source code [default: ./ffmpeg-src]
@@ -2502,9 +2511,10 @@ EXAMPLE:
 }
 
 /// Parse command line arguments
-fn parse_args() -> Result<BuildContext, String> {
-  let args: Vec<String> = env::args().collect();
+fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<BuildContext, String> {
+  let args: Vec<String> = args.into_iter().collect();
 
+  let mut ffmpeg_version = DEFAULT_FFMPEG_VERSION.to_string();
   let mut output = PathBuf::from("./ffmpeg-build");
   let mut source_dir = PathBuf::from("./ffmpeg-src");
   let mut target: Option<String> = None;
@@ -2516,6 +2526,13 @@ fn parse_args() -> Result<BuildContext, String> {
   let mut i = 1;
   while i < args.len() {
     match args[i].as_str() {
+      "--ffmpeg-version" => {
+        i += 1;
+        if i >= args.len() {
+          return Err("Missing argument for --ffmpeg-version".to_string());
+        }
+        ffmpeg_version = args[i].clone();
+      }
       "-o" | "--output" => {
         i += 1;
         if i >= args.len() {
@@ -2579,15 +2596,22 @@ fn parse_args() -> Result<BuildContext, String> {
     source_dir
   };
 
-  Ok(BuildContext::new(
-    output,
-    source_dir,
-    target,
-    jobs,
-    verbose,
-    skip_deps,
-    use_system_cc,
-  ))
+  Ok(
+    BuildContext::new(
+      output,
+      source_dir,
+      target,
+      jobs,
+      verbose,
+      skip_deps,
+      use_system_cc,
+    )
+    .with_ffmpeg_version(ffmpeg_version),
+  )
+}
+
+fn parse_args() -> Result<BuildContext, String> {
+  parse_args_from(env::args())
 }
 
 fn main() {
@@ -2605,6 +2629,7 @@ fn main() {
   println!("========================================");
   println!("Output directory: {}", ctx.prefix.display());
   println!("Source directory: {}", ctx.source_dir.display());
+  println!("FFmpeg version: {}", ctx.ffmpeg_version);
   println!("Jobs: {}", ctx.jobs);
   if let Some(ref t) = ctx.target {
     println!("Target: {}", t);
@@ -2633,4 +2658,34 @@ fn main() {
   println!("To use the built FFmpeg, set:");
   println!("  export FFMPEG_DIR={}", ctx.prefix.display());
   println!();
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn args(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_string()).collect()
+  }
+
+  #[test]
+  fn defaults_to_latest_stable_ffmpeg() {
+    let context = parse_args_from(args(&["build-ffmpeg"])).unwrap();
+    assert_eq!(context.ffmpeg_version, "n9.0");
+  }
+
+  #[test]
+  fn accepts_ffmpeg_version_override() {
+    let context = parse_args_from(args(&["build-ffmpeg", "--ffmpeg-version", "n8.1.2"])).unwrap();
+    assert_eq!(context.ffmpeg_version, "n8.1.2");
+  }
+
+  #[test]
+  fn rejects_missing_ffmpeg_version() {
+    let error = match parse_args_from(args(&["build-ffmpeg", "--ffmpeg-version"])) {
+      Ok(_) => panic!("missing FFmpeg version should be rejected"),
+      Err(error) => error,
+    };
+    assert_eq!(error, "Missing argument for --ffmpeg-version");
+  }
 }
