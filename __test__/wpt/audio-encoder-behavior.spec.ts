@@ -292,11 +292,46 @@ test('AudioEncoder: encodeQueueSize tracking', async (t) => {
     data.close()
   }
 
-  // Note: Encoding after flush is not supported for all FFmpeg encoders (e.g., libopus)
-  // because the encoder enters EOF state that can't be reset with avcodec_flush_buffers().
-  // For full W3C compliance, encoder context would need to be recreated after flush.
-  // This test focuses on verifying dequeue events fire correctly.
+  encoder.close()
+})
 
+test('AudioEncoder: flush recreation preserves queue accounting for later encodes', async (t) => {
+  const config = {
+    codec: 'opus',
+    sampleRate: 48000,
+    numberOfChannels: 2,
+  } as const
+  const support = await AudioEncoder.isConfigSupported(config)
+  if (!support.supported) {
+    t.pass('Opus not supported')
+    return
+  }
+
+  const encoder = new AudioEncoder({ output() {}, error: (error) => t.fail(error.message) })
+  encoder.configure(config)
+
+  let dequeueCount = 0
+  encoder.ondequeue = () => {
+    dequeueCount++
+  }
+
+  const first = generateSilence(960, 2, 48000, 'f32', 0)
+  const second = generateSilence(960, 2, 48000, 'f32', 20000)
+  encoder.encode(first)
+  const firstFlush = encoder.flush()
+  encoder.encode(second)
+  const secondFlush = encoder.flush()
+
+  await Promise.all([firstFlush, secondFlush])
+  for (let turn = 0; turn < 20 && dequeueCount < 2; turn++) {
+    await endAfterEventLoopTurn()
+  }
+
+  t.is(encoder.encodeQueueSize, 0)
+  t.is(dequeueCount, 2, 'each accepted encode operation fires a dequeue event')
+
+  first.close()
+  second.close()
   encoder.close()
 })
 

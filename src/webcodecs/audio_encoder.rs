@@ -806,13 +806,28 @@ impl AudioEncoder {
       let get_flac_extradata =
         |ctx: &CodecContext| -> Option<Vec<u8>> { ctx.extradata().map(prepend_flac_header) };
 
-      // Flush any remaining samples in buffer
-      if let Some(ref mut sample_buffer) = guard.sample_buffer
-        && let Ok(Some(mut frame)) = sample_buffer.flush()
-      {
+      // Flush any remaining samples in buffer.
+      let (remainder, frame_size, sample_rate) = match guard.sample_buffer.as_mut() {
+        Some(sample_buffer) => {
+          let frame_size = sample_buffer.frame_size() as i64;
+          let sample_rate = sample_buffer.sample_rate() as i64;
+          let remainder = match sample_buffer.flush() {
+            Ok(frame) => frame,
+            Err(error) => {
+              let message = format!("Failed to flush buffered audio: {}", error);
+              Self::report_error(&mut guard, &message);
+              return Err(Error::new(
+                Status::GenericFailure,
+                format!("EncodingError: {}", message),
+              ));
+            }
+          };
+          (remainder, frame_size, sample_rate)
+        }
+        None => (None, 0, 1),
+      };
+      if let Some(mut frame) = remainder {
         // Set timestamp using base_timestamp
-        let frame_size = sample_buffer.frame_size() as i64;
-        let sample_rate = sample_buffer.sample_rate() as i64;
         let base_ts = guard.base_timestamp.unwrap_or(0);
         let frame_timestamp =
           base_ts + (guard.frame_count as i64 * frame_size * 1_000_000) / sample_rate;
@@ -824,62 +839,75 @@ impl AudioEncoder {
         let context = match guard.context.as_mut() {
           Some(ctx) => ctx,
           None => {
-            Self::report_error(&mut guard, "No encoder context");
-            return Ok(());
+            let message = "No encoder context";
+            Self::report_error(&mut guard, message);
+            return Err(Error::new(
+              Status::GenericFailure,
+              format!("EncodingError: {}", message),
+            ));
           }
         };
 
-        if let Ok(packets) = context.encode(Some(&frame)) {
-          let duration_us = (frame.nb_samples() as i64 * 1_000_000) / sample_rate;
-          let adts_params = if guard.use_adts {
-            guard.adts_params
+        let packets = match context.encode(Some(&frame)) {
+          Ok(packets) => packets,
+          Err(error) => {
+            let message = format!("Failed to encode buffered audio: {}", error);
+            Self::report_error(&mut guard, &message);
+            return Err(Error::new(
+              Status::GenericFailure,
+              format!("EncodingError: {}", message),
+            ));
+          }
+        };
+        let duration_us = (frame.nb_samples() as i64 * 1_000_000) / sample_rate;
+        let adts_params = if guard.use_adts {
+          guard.adts_params
+        } else {
+          None
+        };
+        for packet in packets {
+          let output_timestamp = guard.timestamp_queue.pop_front();
+          let chunk = EncodedAudioChunk::from_packet_with_adts(
+            packet,
+            Some(duration_us),
+            output_timestamp,
+            adts_params,
+          );
+          // Create decoderConfig: FLAC on every chunk, others only on first chunk
+          let decoder_config = if is_flac {
+            // FLAC: Always include decoderConfig with fresh extradata
+            let extradata = guard.context.as_ref().and_then(get_flac_extradata);
+            Some(AudioDecoderConfigOutput {
+              codec: codec_string.clone(),
+              sample_rate: Some(target_sample_rate),
+              number_of_channels: Some(target_channels),
+              description: extradata.map(Uint8Array::from),
+            })
+          } else if !guard.extradata_sent {
+            // First chunk: Include decoderConfig
+            guard.extradata_sent = true;
+            // ADTS format: No description (metadata in frame headers)
+            // Raw AAC: Include AudioSpecificConfig
+            let extradata = if guard.use_adts {
+              None
+            } else {
+              guard
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.extradata().map(|d| d.to_vec()))
+            };
+            Some(AudioDecoderConfigOutput {
+              codec: codec_string.clone(),
+              sample_rate: Some(target_sample_rate),
+              number_of_channels: Some(target_channels),
+              description: extradata.map(Uint8Array::from),
+            })
           } else {
             None
           };
-          for packet in packets {
-            let output_timestamp = guard.timestamp_queue.pop_front();
-            let chunk = EncodedAudioChunk::from_packet_with_adts(
-              packet,
-              Some(duration_us),
-              output_timestamp,
-              adts_params,
-            );
-            // Create decoderConfig: FLAC on every chunk, others only on first chunk
-            let decoder_config = if is_flac {
-              // FLAC: Always include decoderConfig with fresh extradata
-              let extradata = guard.context.as_ref().and_then(get_flac_extradata);
-              Some(AudioDecoderConfigOutput {
-                codec: codec_string.clone(),
-                sample_rate: Some(target_sample_rate),
-                number_of_channels: Some(target_channels),
-                description: extradata.map(Uint8Array::from),
-              })
-            } else if !guard.extradata_sent {
-              // First chunk: Include decoderConfig
-              guard.extradata_sent = true;
-              // ADTS format: No description (metadata in frame headers)
-              // Raw AAC: Include AudioSpecificConfig
-              let extradata = if guard.use_adts {
-                None
-              } else {
-                guard
-                  .context
-                  .as_ref()
-                  .and_then(|ctx| ctx.extradata().map(|d| d.to_vec()))
-              };
-              Some(AudioDecoderConfigOutput {
-                codec: codec_string.clone(),
-                sample_rate: Some(target_sample_rate),
-                number_of_channels: Some(target_channels),
-                description: extradata.map(Uint8Array::from),
-              })
-            } else {
-              None
-            };
-            let metadata = EncodedAudioChunkMetadata { decoder_config };
-            // Always queue during flush for synchronous delivery
-            guard.pending_chunks.push((chunk, metadata));
-          }
+          let metadata = EncodedAudioChunkMetadata { decoder_config };
+          // Always queue during flush for synchronous delivery
+          guard.pending_chunks.push((chunk, metadata));
         }
       }
 
@@ -887,16 +915,24 @@ impl AudioEncoder {
       let context = match guard.context.as_mut() {
         Some(ctx) => ctx,
         None => {
-          Self::report_error(&mut guard, "No encoder context");
-          return Ok(());
+          let message = "No encoder context";
+          Self::report_error(&mut guard, message);
+          return Err(Error::new(
+            Status::GenericFailure,
+            format!("EncodingError: {}", message),
+          ));
         }
       };
 
       let packets = match context.flush_encoder() {
         Ok(pkts) => pkts,
         Err(e) => {
-          Self::report_error(&mut guard, &format!("Flush failed: {}", e));
-          return Ok(());
+          let message = format!("Flush failed: {}", e);
+          Self::report_error(&mut guard, &message);
+          return Err(Error::new(
+            Status::GenericFailure,
+            format!("EncodingError: {}", message),
+          ));
         }
       };
 
@@ -992,8 +1028,8 @@ impl AudioEncoder {
       while ctx.receive_packet().ok().flatten().is_some() {}
     }
 
-    // Clear work-related state
-    guard.encode_queue_size = 0;
+    // Clear codec-local work state. Do not reset encode_queue_size here:
+    // main-thread encode() calls after this FIFO command are already counted.
     guard.timestamp_queue.clear();
     guard.frame_count = 0;
     guard.extradata_sent = false;

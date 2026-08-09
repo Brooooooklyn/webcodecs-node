@@ -371,12 +371,11 @@ fn download_ffmpeg_from_release(
     }
   };
   if actual_sha256 != expected_sha256 {
-    println!(
-      "cargo:warning=FFmpeg archive checksum mismatch for {}: expected {}, got {}",
+    let _ = fs::remove_file(&archive_path);
+    panic!(
+      "FFmpeg archive checksum mismatch for {}: expected {}, got {}",
       archive_name, expected_sha256, actual_sha256
     );
-    let _ = fs::remove_file(&archive_path);
-    return None;
   }
 
   // Create extraction directory

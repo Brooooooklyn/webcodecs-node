@@ -1091,19 +1091,19 @@ fn gif_repetition_count(data: &[u8]) -> Option<f64> {
   const NETSCAPE: &[u8; 11] = b"NETSCAPE2.0";
   const ANIMEXTS: &[u8; 11] = b"ANIMEXTS1.0";
 
-  for offset in 0..data.len().saturating_sub(18) {
-    if data[offset] != 0x21 || data[offset + 1] != 0xff || data[offset + 2] != 0x0b {
+  for window in data.windows(18) {
+    if window[0] != 0x21 || window[1] != 0xff || window[2] != 0x0b {
       continue;
     }
-    let application = &data[offset + 3..offset + 14];
+    let application = &window[3..14];
     if application != NETSCAPE && application != ANIMEXTS {
       continue;
     }
-    if data[offset + 14] != 0x03 || data[offset + 15] != 0x01 {
+    if window[14] != 0x03 || window[15] != 0x01 {
       continue;
     }
 
-    let count = u16::from_le_bytes([data[offset + 16], data[offset + 17]]);
+    let count = u16::from_le_bytes([window[16], window[17]]);
     return Some(if count == 0 {
       f64::INFINITY
     } else {
@@ -1278,21 +1278,21 @@ fn decode_image_data(
 /// Convert container time-base ticks into the microseconds required by
 /// WebCodecs before frames enter the shared cache.
 fn normalize_frame_timing(frames: &mut [Frame], time_base: (i32, i32)) {
-  if time_base.0 <= 0 || time_base.1 <= 0 {
-    return;
-  }
-
-  let source = AVRational {
+  let source = (time_base.0 > 0 && time_base.1 > 0).then_some(AVRational {
     num: time_base.0,
     den: time_base.1,
-  };
+  });
   for frame in frames {
     let pts = frame.pts();
-    if pts != AV_NOPTS_VALUE {
+    if pts == AV_NOPTS_VALUE {
+      frame.set_pts(0);
+    } else if let Some(source) = source {
       frame.set_pts(unsafe { av_rescale_q(pts, source, AVRational::MICROSECONDS) });
     }
     let duration = frame.duration();
-    if duration > 0 {
+    if duration > 0
+      && let Some(source) = source
+    {
       frame.set_duration(unsafe { av_rescale_q(duration, source, AVRational::MICROSECONDS) });
     }
   }
@@ -1300,7 +1300,9 @@ fn normalize_frame_timing(frames: &mut [Frame], time_base: (i32, i32)) {
 
 #[cfg(test)]
 mod tests {
-  use super::gif_repetition_count;
+  use super::{gif_repetition_count, normalize_frame_timing};
+  use crate::codec::Frame;
+  use crate::ffi::types::AV_NOPTS_VALUE;
 
   #[test]
   fn parses_finite_and_infinite_gif_repetition_counts() {
@@ -1309,10 +1311,37 @@ mod tests {
 
     extension[16] = 0;
     assert_eq!(gif_repetition_count(&extension), Some(f64::INFINITY));
+
+    // The 18-byte application block is sufficient to read the loop count;
+    // the trailing block terminator is not part of the fields inspected here.
+    extension.pop();
+    assert_eq!(gif_repetition_count(&extension), Some(f64::INFINITY));
   }
 
   #[test]
   fn gif_without_loop_extension_does_not_repeat() {
     assert_eq!(gif_repetition_count(b"GIF89a"), Some(0.0));
+  }
+
+  #[test]
+  fn container_frame_without_pts_is_normalized_to_zero() {
+    let mut frame = Frame::new().expect("allocate frame");
+    frame.set_pts(AV_NOPTS_VALUE);
+    let mut frames = [frame];
+
+    normalize_frame_timing(&mut frames, (1, 1000));
+
+    assert_eq!(frames[0].pts(), 0);
+  }
+
+  #[test]
+  fn missing_pts_is_normalized_even_with_invalid_container_time_base() {
+    let mut frame = Frame::new().expect("allocate frame");
+    frame.set_pts(AV_NOPTS_VALUE);
+    let mut frames = [frame];
+
+    normalize_frame_timing(&mut frames, (0, 0));
+
+    assert_eq!(frames[0].pts(), 0);
   }
 }

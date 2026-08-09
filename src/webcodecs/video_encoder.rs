@@ -1479,8 +1479,12 @@ impl VideoEncoder {
     let context = match guard.context.as_mut() {
       Some(ctx) => ctx,
       None => {
-        Self::report_error(&mut guard, "No encoder context");
-        return Ok(());
+        let message = "No encoder context";
+        Self::report_error(&mut guard, message);
+        return Err(Error::new(
+          Status::GenericFailure,
+          format!("EncodingError: {}", message),
+        ));
       }
     };
 
@@ -1488,8 +1492,12 @@ impl VideoEncoder {
     let packets = match context.flush_encoder() {
       Ok(pkts) => pkts,
       Err(e) => {
-        Self::report_error(&mut guard, &format!("Flush failed: {}", e));
-        return Ok(());
+        let message = format!("Flush failed: {}", e);
+        Self::report_error(&mut guard, &message);
+        return Err(Error::new(
+          Status::GenericFailure,
+          format!("EncodingError: {}", message),
+        ));
       }
     };
 
@@ -1784,8 +1792,8 @@ impl VideoEncoder {
       guard.acquired_hw_slot = false;
     }
 
-    // Clear work-related state
-    guard.encode_queue_size = 0;
+    // Clear codec-local work state. Do not reset encode_queue_size here:
+    // main-thread encode() calls after this FIFO command are already counted.
     guard.timestamp_queue.clear();
     guard.frame_count = 0;
     guard.extradata_sent = false;

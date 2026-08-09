@@ -181,11 +181,6 @@ test('VideoEncoder: encodeQueueSize tracking', async (t) => {
     frame.close()
   }
 
-  // Note: Encoding after flush is not supported for all FFmpeg encoders (e.g., libvpx)
-  // because the encoder enters EOF state that can't be reset with avcodec_flush_buffers().
-  // For full W3C compliance, encoder context would need to be recreated after flush.
-  // This test focuses on verifying dequeue events fire correctly.
-
   encoder.close()
 })
 

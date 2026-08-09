@@ -594,8 +594,12 @@ impl AudioDecoder {
     let context = match guard.context.as_mut() {
       Some(ctx) => ctx,
       None => {
-        Self::report_error(&mut guard, "No decoder context");
-        return Ok(());
+        let message = "No decoder context";
+        Self::report_error(&mut guard, message);
+        return Err(Error::new(
+          Status::GenericFailure,
+          format!("EncodingError: {}", message),
+        ));
       }
     };
 
@@ -603,8 +607,12 @@ impl AudioDecoder {
     let frames = match context.flush_decoder() {
       Ok(f) => f,
       Err(e) => {
-        Self::report_error(&mut guard, &format!("Flush failed: {}", e));
-        return Ok(());
+        let message = format!("Flush failed: {}", e);
+        Self::report_error(&mut guard, &message);
+        return Err(Error::new(
+          Status::GenericFailure,
+          format!("EncodingError: {}", message),
+        ));
       }
     };
 
@@ -658,8 +666,8 @@ impl AudioDecoder {
       while ctx.receive_frame().ok().flatten().is_some() {}
     }
 
-    // Clear work-related state
-    guard.decode_queue_size = 0;
+    // Clear codec-local work state. Do not reset decode_queue_size here:
+    // main-thread decode() calls after this FIFO command are already counted.
     guard.timestamp_queue.clear();
     guard.frame_count = 0;
 

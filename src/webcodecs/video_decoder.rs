@@ -1001,8 +1001,8 @@ impl VideoDecoder {
       while ctx.receive_frame().ok().flatten().is_some() {}
     }
 
-    // Clear work-related state
-    guard.decode_queue_size = 0;
+    // Clear codec-local work state. Do not reset decode_queue_size here:
+    // main-thread decode() calls after this FIFO command are already counted.
     guard.timestamp_queue.clear();
     guard.keyframe_received = false;
     guard.silent_decode_count = 0;
