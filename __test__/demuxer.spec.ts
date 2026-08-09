@@ -235,9 +235,11 @@ runTest('Mp4Demuxer: rejects overlapping callback demux sessions', async (t) => 
   await outputs
   // The callback-session reservation is released by the native worker after
   // the final JavaScript callback has returned. Poll the observable state
-  // instead of assuming that one event-loop turn also schedules that worker.
-  for (let attempt = 0; attempt < 100 && demuxer.state === 'demuxing'; attempt += 1) {
-    await new Promise<void>((resolve) => setImmediate(resolve))
+  // instead of assuming a fixed number of event-loop turns also schedules
+  // that worker (notably under emulated ARM CI).
+  const readyDeadline = Date.now() + 5_000
+  while (demuxer.state === 'demuxing' && Date.now() < readyDeadline) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 10))
   }
   t.is(demuxer.state, 'ready')
   await t.notThrowsAsync(() => demuxer.demuxAsync(1))
