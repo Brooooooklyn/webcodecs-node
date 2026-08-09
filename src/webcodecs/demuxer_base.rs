@@ -669,6 +669,7 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
     self.tracks.clear();
     self.selected_video_track = None;
     self.selected_audio_track = None;
+    self.callback_demux_active = false;
     self.state = DemuxerState::Closed;
   }
 
