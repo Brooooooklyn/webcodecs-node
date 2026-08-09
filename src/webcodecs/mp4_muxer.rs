@@ -353,7 +353,7 @@ impl Mp4Muxer {
   #[napi(getter)]
   pub fn is_finished(&self) -> Result<bool> {
     lock_muxer_inner!(self => _guard, inner);
-    Ok(inner.is_streaming_finished())
+    inner.is_streaming_finished()
   }
 
   /// Close the muxer and release resources

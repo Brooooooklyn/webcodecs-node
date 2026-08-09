@@ -221,7 +221,12 @@ enum EncoderCommand {
 /// Internal encoder state
 struct AudioEncoderInner {
   state: CodecState,
+  /// Most recently requested configuration. `encode()` uses this immediately
+  /// so calls made after a queued reconfigure prepare input for the new codec.
   config: Option<AudioEncoderConfig>,
+  /// Configuration currently installed on the worker. Output produced before
+  /// a queued reconfigure must continue to advertise this configuration.
+  active_config: Option<AudioEncoderConfig>,
   context: Option<CodecContext>,
   resampler: Option<Resampler>,
   sample_buffer: Option<AudioSampleBuffer>,
@@ -346,6 +351,7 @@ impl AudioEncoder {
     let inner = AudioEncoderInner {
       state: CodecState::Unconfigured,
       config: None,
+      active_config: None,
       context: None,
       resampler: None,
       sample_buffer: None,
@@ -421,29 +427,20 @@ impl AudioEncoder {
             Status::GenericFailure,
             "AbortError: The operation was aborted",
           )));
-        } else {
-          // For encode commands, just decrement queue and fire dequeue
-          if let Ok(mut guard) = inner.lock() {
-            let old_size = guard.encode_queue_size;
-            guard.encode_queue_size = old_size.saturating_sub(1);
-            if old_size > 0 {
-              let _ = Self::fire_dequeue_event(&event_state);
-            }
-          }
         }
         continue;
       }
 
       match command {
         EncoderCommand::Encode { frame, timestamp } => {
-          Self::process_encode(&inner, &event_state, frame, timestamp);
+          Self::process_encode(&inner, &event_state, frame, timestamp, &reset_flag);
         }
         EncoderCommand::Flush(response_sender) => {
-          let result = Self::process_flush(&inner, &event_state);
+          let result = Self::process_flush(&inner, &event_state, &reset_flag);
           let _ = response_sender.send(result);
         }
         EncoderCommand::Reconfigure(config) => {
-          Self::process_reconfigure(&inner, &config);
+          Self::process_reconfigure(&inner, &config, &reset_flag);
         }
       }
     }
@@ -455,11 +452,19 @@ impl AudioEncoder {
     event_state: &Arc<RwLock<EventListenerState>>,
     frame: Frame,
     timestamp: i64,
+    reset_flag: &AtomicBool,
   ) {
     let mut guard = match inner.lock() {
       Ok(g) => g,
       Err(_) => return, // Lock poisoned
     };
+
+    // A detached pre-reset worker may have received this command immediately
+    // before reset set its token. Recheck under the shared-state lock so it
+    // cannot mutate the next generation's queue accounting or codec state.
+    if reset_flag.load(Ordering::SeqCst) {
+      return;
+    }
 
     // Check if encoder is still configured
     if guard.state != CodecState::Configured {
@@ -480,7 +485,7 @@ impl AudioEncoder {
     }
 
     // Get config info (unwrap validated config values)
-    let codec_string = match guard.config.as_ref() {
+    let codec_string = match guard.active_config.as_ref() {
       Some(config) => config.codec.clone().unwrap_or_default(),
       None => {
         let old_size = guard.encode_queue_size;
@@ -671,7 +676,7 @@ impl AudioEncoder {
         let metadata = if is_flac {
           // FLAC: Always include decoderConfig with fresh extradata on every chunk
           let (target_sample_rate, target_channels) = guard
-            .config
+            .active_config
             .as_ref()
             .map(|c| {
               (
@@ -694,7 +699,7 @@ impl AudioEncoder {
           // Non-FLAC: Only send decoderConfig on first chunk
           guard.extradata_sent = true;
           let (target_sample_rate, target_channels) = guard
-            .config
+            .active_config
             .as_ref()
             .map(|c| {
               (
@@ -747,11 +752,19 @@ impl AudioEncoder {
   fn process_flush(
     inner: &Arc<Mutex<AudioEncoderInner>>,
     _event_state: &Arc<RwLock<EventListenerState>>,
+    reset_flag: &AtomicBool,
   ) -> Result<()> {
-    {
+    let active_config = {
       let mut guard = inner
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+      if reset_flag.load(Ordering::SeqCst) {
+        return Err(Error::new(
+          Status::GenericFailure,
+          "AbortError: The operation was aborted",
+        ));
+      }
 
       // W3C spec: If an error occurred during encoding, flush should reject with EncodingError.
       // This must be checked first to return the correct error type.
@@ -772,13 +785,13 @@ impl AudioEncoder {
 
       // Check if FLAC - W3C FLAC spec requires decoderConfig on every chunk
       let is_flac = guard
-        .config
+        .active_config
         .as_ref()
         .is_some_and(|c| c.codec.as_deref().unwrap_or("").to_lowercase() == "flac");
 
       // Get config info for FLAC metadata
       let (codec_string, target_sample_rate, target_channels) = guard
-        .config
+        .active_config
         .as_ref()
         .map(|c| {
           (
@@ -933,16 +946,23 @@ impl AudioEncoder {
         // Always queue during flush for synchronous delivery
         guard.pending_chunks.push((chunk, metadata));
       }
-    } // mutex released here
+      guard.active_config.clone()
+    }; // mutex released here
 
-    // Reset encoder state so it can accept more data (per W3C spec, flush should leave
-    // encoder in configured state, ready for more encode() calls)
-    {
-      let mut guard = inner
+    // FFmpeg audio encoders enter EOF after flush_encoder(); avcodec_flush_buffers
+    // does not make all of them reusable. Recreate the active context before
+    // resolving flush so the configured encoder can accept more AudioData.
+    if let Some(config) = active_config {
+      Self::process_reconfigure(inner, &config, reset_flag);
+
+      let guard = inner
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-      if let Some(ref mut context) = guard.context {
-        context.flush();
+      if guard.had_error {
+        return Err(Error::new(
+          Status::GenericFailure,
+          "EncodingError: Failed to restore encoder after flush",
+        ));
       }
     }
 
@@ -951,11 +971,19 @@ impl AudioEncoder {
 
   /// Process a reconfigure command on the worker thread
   /// Drains old context, clears work state, and creates new encoder context
-  fn process_reconfigure(inner: &Arc<Mutex<AudioEncoderInner>>, config: &AudioEncoderConfig) {
+  fn process_reconfigure(
+    inner: &Arc<Mutex<AudioEncoderInner>>,
+    config: &AudioEncoderConfig,
+    reset_flag: &AtomicBool,
+  ) {
     let mut guard = match inner.lock() {
       Ok(g) => g,
       Err(_) => return, // Lock poisoned
     };
+
+    if reset_flag.load(Ordering::SeqCst) {
+      return;
+    }
 
     // Drain old context (codec thread safety)
     if let Some(ctx) = guard.context.as_mut() {
@@ -1089,7 +1117,7 @@ impl AudioEncoder {
     guard.resampler = None;
     guard.use_adts = use_adts;
     guard.adts_params = adts_params;
-    guard.config = Some(config.clone());
+    guard.active_config = Some(config.clone());
     guard.cached_flac_decoder_config = None;
   }
 
@@ -1278,7 +1306,7 @@ impl AudioEncoder {
     // This ensures pending encode commands are processed before reconfiguration
     if inner.state == CodecState::Configured {
       // Validate codec synchronously before queueing
-      let _codec_id = match parse_audio_codec_string(&codec) {
+      let codec_id = match parse_audio_codec_string(&codec) {
         Ok(id) => id,
         Err(e) => {
           Self::report_error(
@@ -1289,8 +1317,11 @@ impl AudioEncoder {
         }
       };
 
-      // Store config for immediate property reads
+      // Prepare subsequent inputs for the requested configuration immediately;
+      // the worker keeps its old active_config until this FIFO reconfigure runs.
       inner.config = Some(config.clone());
+      inner.target_format = get_encoder_sample_format(codec_id);
+      inner.resampler = None;
 
       // Queue reconfigure via microtask (runs AFTER pending encode microtasks)
       // Use Weak reference to allow close() to immediately close channel without deadlock
@@ -1404,6 +1435,7 @@ impl AudioEncoder {
       inner.adts_params = None;
     }
 
+    inner.active_config = Some(config.clone());
     inner.config = Some(config);
 
     // Create new channel and worker if needed (after reconfiguration)
@@ -1498,8 +1530,21 @@ impl AudioEncoder {
         || src_channels != target_channels
         || src_format.to_av_format() != inner.target_format;
 
-      // Create resampler if needed and not already created
-      if needs_resampling && inner.resampler.is_none() {
+      // A resampler is valid only for the exact source and destination tuple.
+      // AudioEncoder accepts legal mixed-format input, so never reuse a
+      // converter created for an earlier AudioData object.
+      let resampler_matches = inner.resampler.as_ref().is_some_and(|resampler| {
+        resampler.src_channels() == src_channels
+          && resampler.src_sample_rate() == src_sample_rate_u32
+          && resampler.src_format() == src_format.to_av_format()
+          && resampler.dst_channels() == target_channels
+          && resampler.dst_sample_rate() == target_sample_rate_u32
+          && resampler.dst_format() == inner.target_format
+      });
+
+      if !needs_resampling {
+        inner.resampler = None;
+      } else if !resampler_matches {
         match Resampler::new(
           src_channels,
           src_sample_rate_u32,
@@ -1536,7 +1581,11 @@ impl AudioEncoder {
       };
 
       // Resample if needed (creates new frame) or pass through (shared via refcount)
-      let frame_to_send = if let Some(ref mut resampler) = inner.resampler {
+      let frame_to_send = if needs_resampling {
+        let resampler = inner
+          .resampler
+          .as_mut()
+          .expect("resampler is created when conversion is required");
         match resampler.convert_alloc(&frame) {
           Ok(f) => f,
           Err(e) => {
@@ -1603,12 +1652,16 @@ impl AudioEncoder {
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
       if inner.state == CodecState::Closed {
+        let (error_name, error_msg) = if inner.had_error {
+          (DOMExceptionName::EncodingError, "Encode error occurred")
+        } else {
+          (
+            DOMExceptionName::InvalidStateError,
+            "Cannot flush a closed codec",
+          )
+        };
         // Return rejected promise with native DOMException (async to allow error callback to run)
-        return reject_with_dom_exception_async(
-          env,
-          DOMExceptionName::InvalidStateError,
-          "Cannot flush a closed codec",
-        );
+        return reject_with_dom_exception_async(env, error_name, error_msg);
       }
       if inner.state == CodecState::Unconfigured {
         // Return rejected promise with native DOMException (async to allow error callback to run)
@@ -1644,7 +1697,11 @@ impl AudioEncoder {
       if let Ok(mut inner) = self.inner.lock() {
         inner.flushes.finish(flush_id);
       }
-      return throw_invalid_state_error(env, "Cannot flush a closed codec");
+      return reject_with_dom_exception_async(
+        env,
+        DOMExceptionName::InvalidStateError,
+        "Cannot flush a closed codec",
+      );
     }
 
     // Clone references for the callback closure
@@ -1758,6 +1815,7 @@ impl AudioEncoder {
     inner.resampler = None;
     inner.sample_buffer = None;
     inner.config = None;
+    inner.active_config = None;
     inner.state = CodecState::Unconfigured;
     inner.frame_count = 0;
     inner.extradata_sent = false;
@@ -1830,6 +1888,7 @@ impl AudioEncoder {
     inner.resampler = None;
     inner.sample_buffer = None;
     inner.config = None;
+    inner.active_config = None;
     inner.state = CodecState::Closed;
     inner.encode_queue_size = 0;
 

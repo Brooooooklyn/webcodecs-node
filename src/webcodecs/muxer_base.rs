@@ -53,6 +53,14 @@ macro_rules! lock_muxer_inner {
 pub(crate) use lock_muxer_inner;
 pub(crate) use lock_muxer_inner_mut;
 
+fn next_reordered_video_timestamp(last_dts: i64, last_duration: i64) -> i64 {
+  if last_dts == i64::MIN {
+    0
+  } else {
+    last_dts.saturating_add(last_duration.max(1))
+  }
+}
+
 // ============================================================================
 // Shared State Types
 // ============================================================================
@@ -263,6 +271,10 @@ pub struct MuxerInner<F: MuxerFormat> {
   video_dts_shift: i64,
   /// Last written video DTS (to ensure monotonically increasing decode order)
   last_video_dts: i64,
+  /// Duration of the previously written video packet. The Matroska/WebM
+  /// reordered-frame compatibility path advances from the previous packet's
+  /// end, not by the duration of the packet currently being written.
+  last_video_duration: i64,
   /// Phantom data for format type
   _format: PhantomData<F>,
 }
@@ -300,6 +312,7 @@ impl<F: MuxerFormat> MuxerInner<F> {
       video_ticks_per_frame: None,
       video_dts_shift: 0,
       last_video_dts: i64::MIN,
+      last_video_duration: 0,
       _format: PhantomData,
     })
   }
@@ -337,6 +350,7 @@ impl<F: MuxerFormat> MuxerInner<F> {
       video_ticks_per_frame: None,
       video_dts_shift: 0,
       last_video_dts: i64::MIN,
+      last_video_duration: 0,
       _format: PhantomData,
     })
   }
@@ -579,11 +593,8 @@ impl<F: MuxerFormat> MuxerInner<F> {
       // presentation timestamp falls below its DTS. Keep the established
       // compatibility behavior for that constrained case; non-reordered
       // streams retain their source timestamps below.
-      let sequential = if self.last_video_dts == i64::MIN {
-        0
-      } else {
-        self.last_video_dts.saturating_add(dur.max(1))
-      };
+      let sequential =
+        next_reordered_video_timestamp(self.last_video_dts, self.last_video_duration);
       (sequential, sequential)
     } else {
       let monotonic_dts = if dts <= self.last_video_dts {
@@ -600,6 +611,7 @@ impl<F: MuxerFormat> MuxerInner<F> {
     tracing::trace!(target: "ffmpeg", "video packet: pts={}, dts={}, dur={}", final_pts, final_dts, dur);
     packet.set_pts(final_pts);
     self.last_video_dts = final_dts;
+    self.last_video_duration = dur;
     packet.set_dts(final_dts);
     packet.set_duration(dur);
 
@@ -820,16 +832,42 @@ impl<F: MuxerFormat> MuxerInner<F> {
   }
 
   /// Check if streaming is finished (EOF reached)
-  pub fn is_streaming_finished(&self) -> bool {
+  pub fn is_streaming_finished(&self) -> Result<bool> {
+    if !self.is_streaming {
+      return Err(Error::new(Status::GenericFailure, "Not in streaming mode"));
+    }
+
     if let Some(ref handle) = self.streaming_handle {
-      handle.is_eof()
+      Ok(handle.is_eof())
     } else {
-      true
+      Err(Error::new(
+        Status::GenericFailure,
+        "Streaming handle not available",
+      ))
     }
   }
 
   /// Get current state as string
   pub fn state_string(&self) -> &'static str {
     self.state.as_str()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::next_reordered_video_timestamp;
+
+  #[test]
+  fn reordered_vfr_timestamps_advance_by_previous_packet_duration() {
+    let first = next_reordered_video_timestamp(i64::MIN, 0);
+    let second = next_reordered_video_timestamp(first, 40);
+    let third = next_reordered_video_timestamp(second, 20);
+
+    assert_eq!([first, second, third], [0, 40, 60]);
+  }
+
+  #[test]
+  fn reordered_timestamps_remain_monotonic_without_duration() {
+    assert_eq!(next_reordered_video_timestamp(10, 0), 11);
   }
 }

@@ -233,7 +233,12 @@ runTest('Mp4Demuxer: rejects overlapping callback demux sessions', async (t) => 
   t.throws(() => demuxer.demux(1), { message: /already in progress/ })
 
   await outputs
-  await new Promise<void>((resolve) => setImmediate(resolve))
+  // The callback-session reservation is released by the native worker after
+  // the final JavaScript callback has returned. Poll the observable state
+  // instead of assuming that one event-loop turn also schedules that worker.
+  for (let attempt = 0; attempt < 100 && demuxer.state === 'demuxing'; attempt += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve))
+  }
   t.is(demuxer.state, 'ready')
   await t.notThrowsAsync(() => demuxer.demuxAsync(1))
   demuxer.close()
@@ -1247,6 +1252,27 @@ runTest('Mp4Demuxer: demuxAsync with no count demuxes all', async (t) => {
   t.true(videoChunks.length > 0, 'Should have demuxed all video chunks')
   t.is(demuxer.state, 'ended', 'State should be ended after demuxing all')
 
+  demuxer.close()
+})
+
+runTest('Mp4Demuxer: seek rejects during an active callback session', async (t) => {
+  let callbackRan = false
+  const demuxer = new Mp4Demuxer({
+    videoOutput: () => {
+      callbackRan = true
+      const error = t.throws(() => demuxer.seek(0))
+      t.regex(error.message, /demux operation is in progress/)
+    },
+    error: (error) => t.fail(error.message),
+  })
+
+  await demuxer.load(path.join(FIXTURES_DIR, 'small_buck_bunny.mp4'))
+  const videoTrack = demuxer.tracks.find((track) => track.trackType === 'video')
+  t.truthy(videoTrack)
+  demuxer.selectVideoTrack(videoTrack!.index)
+
+  await demuxer.demuxAsync(1)
+  t.true(callbackRan)
   demuxer.close()
 })
 

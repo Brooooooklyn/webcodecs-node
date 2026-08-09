@@ -8,13 +8,58 @@
 
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use sha2::{Digest, Sha256};
 
 /// The Rust FFI constants and C accessors are validated against this FFmpeg
 /// release. `FFMPEG_RELEASE_TAG` remains an explicit escape hatch for
 /// maintainers testing a deliberate upgrade.
 const DEFAULT_FFMPEG_RELEASE_TAG: &str = "ffmpeg-n8.0.1";
+const DEFAULT_FFMPEG_GITHUB_REPO: &str = "Brooooooklyn/webcodecs-node";
+
+/// SHA-256 digests published by GitHub for the pinned ffmpeg-n8.0.1 assets.
+/// A release/tag upgrade must update these values in the same change.
+const DEFAULT_FFMPEG_ARCHIVE_SHA256: &[(&str, &str)] = &[
+  (
+    "ffmpeg-aarch64-apple-darwin.tar.gz",
+    "ef26bdc401c86cbca70d26fdbe6f105c7c113b2d82f944818cfc4f7e53028f2a",
+  ),
+  (
+    "ffmpeg-aarch64-pc-windows-msvc.zip",
+    "041e1597f0044213d650713def40e95ad056831745b192948ce54edfd6f883d7",
+  ),
+  (
+    "ffmpeg-aarch64-unknown-linux-gnu.tar.gz",
+    "f1dc3135a93bdf77e335eed97cacfe8f6b59bc519cf26ab387352af7e17d72cc",
+  ),
+  (
+    "ffmpeg-aarch64-unknown-linux-musl.tar.gz",
+    "92c866ef4ca371e7ad3e535c165bed015c354129a96f46a359cd94e0805e1fb0",
+  ),
+  (
+    "ffmpeg-armv7-unknown-linux-gnueabihf.tar.gz",
+    "251f0da8509e3619861c9361d521dde03b13bb39aa3be3f7d7f921c7a91fd55e",
+  ),
+  (
+    "ffmpeg-x86_64-apple-darwin.tar.gz",
+    "e9c827e33490f11647f2134366e3f2ffa0b339b32fde68dfbd81215ff20c6762",
+  ),
+  (
+    "ffmpeg-x86_64-pc-windows-msvc.zip",
+    "9d50047fec0bcabc778101cef9a040796ba53d2fc4a98f10a07832c01a63652c",
+  ),
+  (
+    "ffmpeg-x86_64-unknown-linux-gnu.tar.gz",
+    "09296b012887001d6a9f962ee3d2ee2e6d28c8adf54c6e2f2c441f01a24c36ed",
+  ),
+  (
+    "ffmpeg-x86_64-unknown-linux-musl.tar.gz",
+    "da90b04a46a9bb41cc4db54849c6df9801d1ef34798754fec8053adc1b9fe868",
+  ),
+];
 
 fn main() {
   // NAPI-RS build setup
@@ -48,6 +93,7 @@ fn main() {
   println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
   println!("cargo:rerun-if-env-changed=FFMPEG_GITHUB_REPO");
   println!("cargo:rerun-if-env-changed=FFMPEG_RELEASE_TAG");
+  println!("cargo:rerun-if-env-changed=FFMPEG_ARCHIVE_SHA256");
   println!("cargo:rerun-if-env-changed=FFMPEG_SKIP_DOWNLOAD");
   println!("cargo:rerun-if-env-changed=SKIP_FFMPEG_BUILD");
 }
@@ -140,7 +186,7 @@ fn get_ffmpeg_dir(target_os: &str, target_arch: &str, target_env: &str) -> PathB
 
   // 6. FAIL - no fallback to building from source
   let repo =
-    env::var("FFMPEG_GITHUB_REPO").unwrap_or_else(|_| "Brooooooklyn/webcodecs-node".to_string());
+    env::var("FFMPEG_GITHUB_REPO").unwrap_or_else(|_| DEFAULT_FFMPEG_GITHUB_REPO.to_string());
   panic!(
     "FFmpeg not found for target {}-{}.\n\
      \n\
@@ -228,7 +274,7 @@ fn download_ffmpeg_from_release(
   };
 
   let repo =
-    env::var("FFMPEG_GITHUB_REPO").unwrap_or_else(|_| "Brooooooklyn/webcodecs-node".to_string());
+    env::var("FFMPEG_GITHUB_REPO").unwrap_or_else(|_| DEFAULT_FFMPEG_GITHUB_REPO.to_string());
 
   // Determine release tag
   let release_tag =
@@ -238,6 +284,17 @@ fn download_ffmpeg_from_release(
     ("zip", format!("ffmpeg-{}.zip", target))
   } else {
     ("tar.gz", format!("ffmpeg-{}.tar.gz", target))
+  };
+
+  let expected_sha256 = match expected_ffmpeg_archive_sha256(&repo, &release_tag, &archive_name) {
+    Some(value) => value,
+    None => {
+      println!(
+        "cargo:warning=No trusted SHA-256 digest for {}/{}/{}. Set FFMPEG_ARCHIVE_SHA256 when testing a custom release.",
+        repo, release_tag, archive_name
+      );
+      return None;
+    }
   };
 
   let download_url = format!(
@@ -250,6 +307,7 @@ fn download_ffmpeg_from_release(
   let ffmpeg_dir = out_dir.join("ffmpeg");
   let archive_path = out_dir.join(&archive_name);
   let release_marker = ffmpeg_dir.join(".release-tag");
+  let release_marker_value = format!("{}\nsha256:{}", release_tag, expected_sha256);
 
   // Skip if already extracted - check for platform-specific library
   let lib_check = if is_windows {
@@ -259,7 +317,7 @@ fn download_ffmpeg_from_release(
   };
 
   let cached_release_matches = fs::read_to_string(&release_marker)
-    .map(|cached| cached.trim() == release_tag)
+    .map(|cached| cached.trim() == release_marker_value)
     .unwrap_or(false);
   if lib_check.exists() && cached_release_matches {
     println!(
@@ -300,6 +358,27 @@ fn download_ffmpeg_from_release(
     }
   }
 
+  let actual_sha256 = match sha256_file(&archive_path) {
+    Ok(value) => value,
+    Err(error) => {
+      println!(
+        "cargo:warning=Failed to hash downloaded FFmpeg archive {}: {}",
+        archive_path.display(),
+        error
+      );
+      let _ = fs::remove_file(&archive_path);
+      return None;
+    }
+  };
+  if actual_sha256 != expected_sha256 {
+    println!(
+      "cargo:warning=FFmpeg archive checksum mismatch for {}: expected {}, got {}",
+      archive_name, expected_sha256, actual_sha256
+    );
+    let _ = fs::remove_file(&archive_path);
+    return None;
+  }
+
   // Create extraction directory
   if let Err(e) = fs::create_dir_all(&ffmpeg_dir) {
     println!("cargo:warning=Failed to create directory: {}", e);
@@ -332,7 +411,7 @@ fn download_ffmpeg_from_release(
 
   match extract_status {
     Ok(s) if s.success() => {
-      if let Err(error) = fs::write(&release_marker, &release_tag) {
+      if let Err(error) = fs::write(&release_marker, &release_marker_value) {
         println!(
           "cargo:warning=Failed to write FFmpeg release marker: {}",
           error
@@ -352,6 +431,43 @@ fn download_ffmpeg_from_release(
       None
     }
   }
+}
+
+fn expected_ffmpeg_archive_sha256(
+  repo: &str,
+  release_tag: &str,
+  archive_name: &str,
+) -> Option<String> {
+  if let Ok(value) = env::var("FFMPEG_ARCHIVE_SHA256") {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.len() == 64 && normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+      return Some(normalized);
+    }
+    println!("cargo:warning=FFMPEG_ARCHIVE_SHA256 must contain exactly 64 hexadecimal digits");
+    return None;
+  }
+
+  if repo != DEFAULT_FFMPEG_GITHUB_REPO || release_tag != DEFAULT_FFMPEG_RELEASE_TAG {
+    return None;
+  }
+
+  DEFAULT_FFMPEG_ARCHIVE_SHA256
+    .iter()
+    .find_map(|(name, digest)| (*name == archive_name).then(|| (*digest).to_string()))
+}
+
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+  let mut file = fs::File::open(path)?;
+  let mut hasher = Sha256::new();
+  let mut buffer = [0u8; 64 * 1024];
+  loop {
+    let count = file.read(&mut buffer)?;
+    if count == 0 {
+      break;
+    }
+    hasher.update(&buffer[..count]);
+  }
+  Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Compile the C accessor library

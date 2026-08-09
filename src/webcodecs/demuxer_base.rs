@@ -10,12 +10,15 @@ use crate::webcodecs::encoded_audio_chunk::{
   EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkType,
 };
 use crate::webcodecs::encoded_video_chunk::{EncodedVideoChunk, EncodedVideoChunkType};
+use futures::executor::block_on;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{
   ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
 };
 use napi_derive::napi;
+use std::any::Any;
 use std::marker::PhantomData;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
 // ============================================================================
@@ -481,6 +484,13 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
 
   /// Seek to a timestamp in microseconds
   pub fn seek(&mut self, timestamp_us: i64) -> Result<()> {
+    if self.callback_demux_active {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "Cannot seek while a callback demux operation is in progress",
+      ));
+    }
+
     let stream_index = self.selected_video_track.unwrap_or(-1);
 
     let demuxer = self
@@ -680,15 +690,52 @@ pub fn demux_with_callbacks<F: DemuxerFormat>(
   inner: &Arc<Mutex<DemuxerInner<F>>>,
   max_packets: u32,
 ) -> Result<()> {
-  let result = demux_with_callbacks_inner(inner, max_packets);
+  let result = catch_unwind(AssertUnwindSafe(|| {
+    demux_with_callbacks_inner(inner, max_packets)
+  }));
 
-  // Always release the session, including lock/callback errors. The public
-  // entry points reserve it before spawning this blocking work.
-  if let Ok(mut guard) = inner.lock() {
-    guard.finish_callback_demux();
+  // Always release the session, including lock/callback errors and panics. A
+  // panic while the mutex was held poisons it; recover the state and clear the
+  // poison so the demuxer is not permanently bricked by one worker failure.
+  match inner.lock() {
+    Ok(mut guard) => guard.finish_callback_demux(),
+    Err(poisoned) => {
+      poisoned.into_inner().finish_callback_demux();
+      inner.clear_poison();
+    }
   }
 
-  result
+  match result {
+    Ok(result) => result,
+    Err(payload) => {
+      let message = format!(
+        "Demux worker panicked: {}",
+        panic_payload_message(payload.as_ref())
+      );
+      let error_callback = inner.lock().ok().and_then(|guard| {
+        (guard.state != DemuxerState::Closed)
+          .then(|| guard.error_callback.clone())
+          .flatten()
+      });
+      if let Some(callback) = error_callback {
+        let _ = callback.call(
+          Error::new(Status::GenericFailure, message.clone()),
+          ThreadsafeFunctionCallMode::Blocking,
+        );
+      }
+      Err(Error::new(Status::GenericFailure, message))
+    }
+  }
+}
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+  if let Some(message) = payload.downcast_ref::<&str>() {
+    (*message).to_string()
+  } else if let Some(message) = payload.downcast_ref::<String>() {
+    message.clone()
+  } else {
+    "unknown panic payload".to_string()
+  }
 }
 
 fn demux_with_callbacks_inner<F: DemuxerFormat>(
@@ -713,12 +760,22 @@ fn demux_with_callbacks_inner<F: DemuxerFormat>(
       Ok(Some(chunk)) => {
         if let Some(video_chunk) = chunk.video_chunk {
           if let Some(callback) = video_callback {
-            let _ = callback.call(video_chunk, ThreadsafeFunctionCallMode::Blocking);
+            block_on(callback.call_async(video_chunk)).map_err(|error| {
+              Error::new(
+                Status::GenericFailure,
+                format!("Video output callback failed: {}", error),
+              )
+            })?;
           }
         } else if let Some(audio_chunk) = chunk.audio_chunk
           && let Some(callback) = audio_callback
         {
-          let _ = callback.call(audio_chunk, ThreadsafeFunctionCallMode::Blocking);
+          block_on(callback.call_async(audio_chunk)).map_err(|error| {
+            Error::new(
+              Status::GenericFailure,
+              format!("Audio output callback failed: {}", error),
+            )
+          })?;
         }
       }
       Ok(None) => break,
@@ -729,10 +786,15 @@ fn demux_with_callbacks_inner<F: DemuxerFormat>(
           .lock()
           .map(|guard| guard.state == DemuxerState::Closed)
           .unwrap_or(false);
-        if !closed && let Some(callback) = error_callback {
-          let _ = callback.call(error, ThreadsafeFunctionCallMode::Blocking);
+        if closed {
+          break;
         }
-        break;
+
+        let message = error.reason.clone();
+        if let Some(callback) = error_callback {
+          let _ = block_on(callback.call_async(error));
+        }
+        return Err(Error::new(Status::GenericFailure, message));
       }
     }
   }

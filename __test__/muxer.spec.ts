@@ -199,6 +199,15 @@ test('WebMMuxer: constructor creates muxer', (t) => {
   muxer.close()
 })
 
+test('Muxers: streaming-only status getters reject in buffer mode', (t) => {
+  for (const Muxer of [Mp4Muxer, WebMMuxer, MkvMuxer]) {
+    const muxer = new Muxer()
+    t.throws(() => muxer.isFinished, { message: /Not in streaming mode/ })
+    t.throws(() => muxer.read(), { message: /Not in streaming mode/ })
+    muxer.close()
+  }
+})
+
 test('WebMMuxer: streaming output does not block when reads are delayed', async (t) => {
   const chunks: EncodedVideoChunk[] = []
   const encoder = new VideoEncoder({

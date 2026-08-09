@@ -415,6 +415,11 @@ struct ImageDecoderInner {
   /// Cached decoded frames (for animated images, populated on first decode)
   /// Cached decoded frames wrapped in Arc for efficient sharing
   cached_frames: Option<Vec<Arc<ParkingLotRwLock<Frame>>>>,
+  /// Incremented when reset/close invalidates in-flight decode work.
+  cache_epoch: u64,
+  /// Encoded byte length represented by the current cache. Prevents an older
+  /// streamed probe from overwriting a newer, more complete decode.
+  cached_data_len: usize,
   /// Color space conversion mode (W3C spec)
   color_space_conversion: ColorSpaceConversion,
   /// Desired width for scaling (W3C spec - must be paired with desired_height)
@@ -496,6 +501,8 @@ impl ImageDecoder {
       tracks: tracks.clone(),
       closed: false,
       cached_frames: None,
+      cache_epoch: 0,
+      cached_data_len: 0,
       color_space_conversion: init.color_space_conversion,
       desired_width: init.desired_width,
       desired_height: init.desired_height,
@@ -780,6 +787,8 @@ impl ImageDecoder {
 
     inner.context = None;
     inner.cached_frames = None;
+    inner.cache_epoch = inner.cache_epoch.wrapping_add(1);
+    inner.cached_data_len = 0;
 
     // Reset frame_count for animated formats (will be re-detected on next decode)
     if let Ok(mut track_inner) = inner.tracks.inner.lock()
@@ -802,6 +811,8 @@ impl ImageDecoder {
 
     inner.context = None;
     inner.cached_frames = None;
+    inner.cache_epoch = inner.cache_epoch.wrapping_add(1);
+    inner.cached_data_len = 0;
     inner.closed = true;
 
     // Wake any waiters so they can check closed state
@@ -943,53 +954,62 @@ fn signal_tracks_ready(inner: &Arc<Mutex<ImageDecoderInner>>) {
 /// Unlike `pre_parse_and_cache_frames`, failures do not resolve `tracks.ready`,
 /// which lets streamed images retry as more bytes arrive.
 fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
-  let mut inner_guard = inner
-    .lock()
-    .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-  // Check if already closed
-  if inner_guard.closed {
-    return Err(invalid_state_error("ImageDecoder is closed"));
-  }
-
-  // Get the data bytes
-  let data_bytes: Vec<u8> = match &inner_guard.data {
-    ImageDecoderData::Buffer(buf) => buf.as_ref().to_vec(),
-    ImageDecoderData::Vec(vec) => vec.clone(),
-    ImageDecoderData::Empty => {
-      return Err(Error::new(Status::GenericFailure, "No data available"));
+  // Snapshot everything needed for FFmpeg work under the mutex, then release
+  // it. Large animated images can take a long time to decode; close() and
+  // reset() must remain responsive while that work is in flight.
+  let (
+    data_bytes,
+    codec_id,
+    mime_type,
+    prefer_animation,
+    desired_width,
+    desired_height,
+    cache_epoch,
+  ) = {
+    let guard = inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    if guard.closed {
+      return Err(invalid_state_error("ImageDecoder is closed"));
     }
+
+    let data_bytes = match &guard.data {
+      ImageDecoderData::Buffer(buf) => buf.as_ref().to_vec(),
+      ImageDecoderData::Vec(vec) => vec.clone(),
+      ImageDecoderData::Empty => {
+        return Err(Error::new(Status::GenericFailure, "No data available"));
+      }
+    };
+
+    (
+      data_bytes,
+      guard.codec_id,
+      guard.mime_type.clone(),
+      guard.prefer_animation,
+      guard.desired_width,
+      guard.desired_height,
+      guard.cache_epoch,
+    )
   };
 
-  // Check if codec_id is valid (invalid MIME type at construction is deferred to here)
-  let codec_id = match inner_guard.codec_id {
-    Some(id) => id,
-    None => {
-      return Err(Error::new(
-        Status::GenericFailure,
-        format!("Unsupported image type: {}", inner_guard.mime_type),
-      ));
-    }
-  };
+  // Invalid MIME types are intentionally accepted by the constructor and
+  // reject decode(), as required by the WebCodecs ImageDecoder algorithm.
+  let codec_id = codec_id.ok_or_else(|| {
+    Error::new(
+      Status::GenericFailure,
+      format!("Unsupported image type: {}", mime_type),
+    )
+  })?;
 
   // Demux and decode all frames.
   let (context, mut frames) = decode_image_data(codec_id, &data_bytes)?;
 
   // Apply preferAnimation: if false and format supports animation, only keep first frame
-  let prefer_animation = inner_guard.prefer_animation;
   if prefer_animation == Some(false) && !frames.is_empty() {
     frames.truncate(1);
-    // Mark track as non-animated since user explicitly prefers static
-    if let Ok(mut track_inner) = inner_guard.tracks.inner.lock()
-      && let Some(track) = track_inner.tracks.get_mut(0)
-    {
-      track.animated = false;
-    }
   }
 
   // Apply desiredWidth/desiredHeight scaling if both are specified
-  let desired_width = inner_guard.desired_width;
-  let desired_height = inner_guard.desired_height;
   let frames = if let (Some(dw), Some(dh)) = (desired_width, desired_height) {
     let mut scaled_frames = Vec::with_capacity(frames.len());
     for frame in frames {
@@ -1023,21 +1043,76 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
     frames
   };
 
-  // Update frame_count in track info
-  if !frames.is_empty()
-    && let Ok(mut track_inner) = inner_guard.tracks.inner.lock()
+  let repetition_count = if codec_id == AVCodecID::Gif {
+    gif_repetition_count(&data_bytes)
+  } else {
+    None
+  };
+
+  let mut guard = inner
+    .lock()
+    .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+  if guard.closed {
+    return Err(invalid_state_error("ImageDecoder is closed"));
+  }
+  // reset()/close() invalidated the work, or a newer streamed probe already
+  // committed more input. Never overwrite either state with this snapshot.
+  if guard.cache_epoch != cache_epoch || data_bytes.len() < guard.cached_data_len {
+    return Ok(());
+  }
+
+  if let Ok(mut track_inner) = guard.tracks.inner.lock()
     && let Some(track) = track_inner.tracks.get_mut(0)
   {
-    track.frame_count = frames.len() as u32;
+    if !frames.is_empty() {
+      track.frame_count = frames.len() as u32;
+    }
+    if prefer_animation == Some(false) {
+      track.animated = false;
+      track.repetition_count = 0.0;
+    } else if let Some(repetition_count) = repetition_count {
+      track.repetition_count = repetition_count;
+    }
   }
 
   // Wrap frames in Arc for efficient sharing from cache
   let shared_frames: Vec<Arc<ParkingLotRwLock<Frame>>> =
     frames.into_iter().map(|f| f.into_shared()).collect();
-  inner_guard.cached_frames = Some(shared_frames);
-  inner_guard.context = Some(context);
+  guard.cached_frames = Some(shared_frames);
+  guard.context = Some(context);
+  guard.cached_data_len = data_bytes.len();
 
   Ok(())
+}
+
+/// Parse the GIF application extension used for animation loop control.
+/// NETSCAPE/ANIMEXTS stores a little-endian repeat count; zero means infinite.
+fn gif_repetition_count(data: &[u8]) -> Option<f64> {
+  const NETSCAPE: &[u8; 11] = b"NETSCAPE2.0";
+  const ANIMEXTS: &[u8; 11] = b"ANIMEXTS1.0";
+
+  for offset in 0..data.len().saturating_sub(18) {
+    if data[offset] != 0x21 || data[offset + 1] != 0xff || data[offset + 2] != 0x0b {
+      continue;
+    }
+    let application = &data[offset + 3..offset + 14];
+    if application != NETSCAPE && application != ANIMEXTS {
+      continue;
+    }
+    if data[offset + 14] != 0x03 || data[offset + 15] != 0x01 {
+      continue;
+    }
+
+    let count = u16::from_le_bytes([data[offset + 16], data[offset + 17]]);
+    return Some(if count == 0 {
+      f64::INFINITY
+    } else {
+      count as f64
+    });
+  }
+
+  // No loop extension means the animation plays once and repeats zero times.
+  Some(0.0)
 }
 
 /// Parse MIME type to FFmpeg codec ID
@@ -1188,6 +1263,14 @@ fn decode_image_data(
   if let Ok(flushed) = context.flush_decoder() {
     all_frames.extend(flushed);
   }
+  // Raw elementary image packets have no container timestamp. FFmpeg commonly
+  // leaves AVFrame.pts at AV_NOPTS_VALUE; WebCodecs timestamps must never
+  // expose that sentinel to JavaScript.
+  for frame in &mut all_frames {
+    if frame.pts() == AV_NOPTS_VALUE {
+      frame.set_pts(0);
+    }
+  }
 
   Ok((context, all_frames))
 }
@@ -1212,5 +1295,24 @@ fn normalize_frame_timing(frames: &mut [Frame], time_base: (i32, i32)) {
     if duration > 0 {
       frame.set_duration(unsafe { av_rescale_q(duration, source, AVRational::MICROSECONDS) });
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::gif_repetition_count;
+
+  #[test]
+  fn parses_finite_and_infinite_gif_repetition_counts() {
+    let mut extension = b"\x21\xff\x0bNETSCAPE2.0\x03\x01\x05\x00\x00".to_vec();
+    assert_eq!(gif_repetition_count(&extension), Some(5.0));
+
+    extension[16] = 0;
+    assert_eq!(gif_repetition_count(&extension), Some(f64::INFINITY));
+  }
+
+  #[test]
+  fn gif_without_loop_extension_does_not_repeat() {
+    assert_eq!(gif_repetition_count(b"GIF89a"), Some(0.0));
   }
 }

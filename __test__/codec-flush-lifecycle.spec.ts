@@ -98,3 +98,20 @@ test('reset aborts pending flushes with native AbortError DOMExceptions', async 
     codec.close()
   }
 })
+
+test('errored encoders reject flush with native EncodingError DOMExceptions', async (t) => {
+  const encoders = [
+    new AudioEncoder({ output() {}, error() {} }),
+    new VideoEncoder({ output() {}, error() {} }),
+  ] as const
+
+  encoders[0].configure({ codec: 'unsupported-audio-codec', sampleRate: 48000, numberOfChannels: 2 })
+  encoders[1].configure({ codec: 'unsupported-video-codec', width: 64, height: 64 })
+
+  for (const encoder of encoders) {
+    t.is(encoder.state, 'closed')
+    const error = await t.throwsAsync(encoder.flush())
+    t.true(error instanceof DOMException)
+    t.is((error as DOMException).name, 'EncodingError')
+  }
+})

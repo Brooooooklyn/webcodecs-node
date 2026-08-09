@@ -134,6 +134,18 @@ test('ImageDecoder GIF frame_count is populated after first decode', async (t) =
   decoder.close()
 })
 
+test('ImageDecoder parses finite GIF repetition count', async (t) => {
+  const data = Buffer.from(readFileSync(join(__dirname, 'fixtures/animated.gif')))
+  // NETSCAPE2.0 application extension loop-count bytes in this fixture.
+  data[35] = 5
+  data[36] = 0
+  const decoder = new ImageDecoder({ data, type: 'image/gif' })
+
+  await decoder.tracks.ready
+  t.is(decoder.tracks.selectedTrack!.repetitionCount, 5)
+  decoder.close()
+})
+
 test('ImageDecoder GIF can decode specific frames by index', async (t) => {
   const data = readFileSync(join(__dirname, 'fixtures/animated.gif'))
   const decoder = new ImageDecoder({ data, type: 'image/gif' })
@@ -262,6 +274,7 @@ test('ImageDecoder decodes JPEG XL image data', async (t) => {
   t.is(result.image.codedWidth, 32)
   t.is(result.image.codedHeight, 32)
   t.is(result.image.format, 'RGBX')
+  t.is(result.image.timestamp, 0)
   t.true(result.complete)
 
   result.image.close()

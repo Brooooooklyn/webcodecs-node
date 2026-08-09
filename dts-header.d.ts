@@ -111,32 +111,6 @@ export interface MuxerAudioTrackConfig {
   description?: Uint8Array
 }
 
-/** Init options for Mp4Muxer */
-export interface Mp4MuxerInit {
-  /** Move moov atom to beginning (not compatible with streaming) */
-  fastStart?: boolean
-  /** Use fragmented MP4 for streaming */
-  fragmented?: boolean
-  /** Enable streaming output mode */
-  streaming?: { bufferCapacity?: number }
-}
-
-/** Init options for WebMMuxer */
-export interface WebMMuxerInit {
-  /** Enable live streaming mode */
-  live?: boolean
-  /** Enable streaming output mode */
-  streaming?: { bufferCapacity?: number }
-}
-
-/** Init options for MkvMuxer */
-export interface MkvMuxerInit {
-  /** Enable live streaming mode */
-  live?: boolean
-  /** Enable streaming output mode */
-  streaming?: { bufferCapacity?: number }
-}
-
 // ============================================================================
 // Async Iterator Types
 // ============================================================================

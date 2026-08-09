@@ -319,6 +319,39 @@ test('VideoEncoder: encode after reconfigure', async (t) => {
   frame3.close()
 })
 
+test('VideoEncoder: FIFO reconfigure keeps old metadata and resets conversion state', async (t) => {
+  const outputs: Array<{ timestamp: number; width?: number; height?: number }> = []
+  const errors: Error[] = []
+  const encoder = new VideoEncoder({
+    output: (chunk, metadata) =>
+      outputs.push({
+        timestamp: chunk.timestamp,
+        width: metadata?.decoderConfig?.codedWidth,
+        height: metadata?.decoderConfig?.codedHeight,
+      }),
+    error: (error) => errors.push(error),
+  })
+
+  encoder.configure({ codec: 'vp8', width: 16, height: 16, hardwareAcceleration: 'prefer-software' })
+  const oldFrame = generateSolidColorI420Frame(16, 16, TestColors.red, 100)
+  encoder.encode(oldFrame, { keyFrame: true })
+  oldFrame.close()
+
+  encoder.configure({ codec: 'vp8', width: 32, height: 32, hardwareAcceleration: 'prefer-software' })
+  const newFrame = generateSolidColorI420Frame(32, 32, TestColors.green, 200)
+  encoder.encode(newFrame, { keyFrame: true })
+  newFrame.close()
+
+  await encoder.flush()
+
+  t.deepEqual(errors, [])
+  t.deepEqual(outputs, [
+    { timestamp: 100, width: 16, height: 16 },
+    { timestamp: 200, width: 32, height: 32 },
+  ])
+  encoder.close()
+})
+
 // ============================================================================
 // Closed Codec Tests
 // WPT: "Verify closed VideoEncoder operations"

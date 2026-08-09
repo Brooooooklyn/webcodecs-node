@@ -433,29 +433,20 @@ impl VideoDecoder {
             Status::GenericFailure,
             "AbortError: The operation was aborted",
           )));
-        } else {
-          // For decode commands, just decrement queue and fire dequeue
-          if let Ok(mut guard) = inner.lock() {
-            let old_size = guard.decode_queue_size;
-            guard.decode_queue_size = old_size.saturating_sub(1);
-            if old_size > 0 {
-              let _ = Self::fire_dequeue_event(&event_state);
-            }
-          }
         }
         continue;
       }
 
       match command {
         WorkerCommand::Decode(chunk) => {
-          Self::process_decode(&inner, &event_state, chunk);
+          Self::process_decode(&inner, &event_state, chunk, &reset_flag);
         }
         WorkerCommand::Flush(response_sender) => {
-          let result = Self::process_flush(&inner, &event_state);
+          let result = Self::process_flush(&inner, &event_state, &reset_flag);
           let _ = response_sender.send(result);
         }
         WorkerCommand::Reconfigure(config) => {
-          Self::process_reconfigure(&inner, config);
+          Self::process_reconfigure(&inner, config, &reset_flag);
         }
       }
     }
@@ -470,11 +461,16 @@ impl VideoDecoder {
     inner: &Arc<Mutex<VideoDecoderInner>>,
     event_state: &Arc<RwLock<EventListenerState>>,
     chunk: Arc<RwLock<Option<EncodedVideoChunkInner>>>,
+    reset_flag: &AtomicBool,
   ) {
     let mut guard = match inner.lock() {
       Ok(g) => g,
       Err(_) => return, // Lock poisoned
     };
+
+    if reset_flag.load(Ordering::SeqCst) {
+      return;
+    }
 
     // Check if decoder is still configured
     if guard.state != CodecState::Configured {
@@ -868,10 +864,18 @@ impl VideoDecoder {
   fn process_flush(
     inner: &Arc<Mutex<VideoDecoderInner>>,
     _event_state: &Arc<RwLock<EventListenerState>>,
+    reset_flag: &AtomicBool,
   ) -> Result<()> {
     let mut guard = inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    if reset_flag.load(Ordering::SeqCst) {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "AbortError: The operation was aborted",
+      ));
+    }
 
     // W3C spec: If an error occurred during decoding, flush should reject with EncodingError.
     // This must be checked first to return the correct error type.
@@ -971,11 +975,19 @@ impl VideoDecoder {
 
   /// Process a reconfigure command on the worker thread
   /// Drains old context and creates new one with updated config
-  fn process_reconfigure(inner: &Arc<Mutex<VideoDecoderInner>>, config: VideoDecoderConfig) {
+  fn process_reconfigure(
+    inner: &Arc<Mutex<VideoDecoderInner>>,
+    config: VideoDecoderConfig,
+    reset_flag: &AtomicBool,
+  ) {
     let mut guard = match inner.lock() {
       Ok(g) => g,
       Err(_) => return, // Lock poisoned
     };
+
+    if reset_flag.load(Ordering::SeqCst) {
+      return;
+    }
 
     // Don't reconfigure if decoder is closed
     if guard.state == CodecState::Closed {
@@ -1668,7 +1680,11 @@ impl VideoDecoder {
       if let Ok(mut inner) = self.inner.lock() {
         inner.flushes.finish(flush_id);
       }
-      return throw_invalid_state_error(env, "Cannot flush a closed codec");
+      return reject_with_dom_exception_async(
+        env,
+        DOMExceptionName::InvalidStateError,
+        "Cannot flush a closed codec",
+      );
     }
 
     // Clone references for the callback closure
@@ -1765,10 +1781,9 @@ impl VideoDecoder {
     // This must be done BEFORE dropping the command sender
     self.reset_flag.store(true, Ordering::SeqCst);
 
-    // Drop sender to signal worker to stop
-    // Note: Don't join worker here - with microtask pattern, worker might not exit
-    // immediately if microtasks still hold cloned senders. Worker will exit on
-    // next timeout check when it sees reset_flag is set.
+    // Drop sender to signal worker to stop. Pending microtasks hold only Weak
+    // references, so the channel disconnects after they observe reset_flag.
+    // Do not join here: the old worker may be waiting on a JS callback.
     drop(self.command_sender.take());
     drop(self.worker_handle.take()); // Detach old worker thread
 

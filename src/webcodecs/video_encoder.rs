@@ -191,6 +191,9 @@ enum EncoderCommand {
     rotation: f64,
     /// Flip from input VideoFrame (for metadata output)
     flip: bool,
+    /// Color space from this input frame. The worker installs the first value
+    /// after each FIFO-ordered configuration change.
+    color_space: Option<VideoColorSpaceInit>,
   },
   /// Flush the encoder and send result back via response channel
   Flush(Sender<Result<()>>),
@@ -353,6 +356,9 @@ struct VideoEncoderInner {
   output_callback: OutputCallback,
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
+  /// Whether the encoder entered the closed state because encoding failed.
+  /// Used to distinguish EncodingError from an explicit close in flush().
+  had_error: bool,
   /// Pending flush operations, tracked independently for overlapping calls.
   flushes: FlushTracker,
   /// Queue of input timestamps for correlation with output packets
@@ -591,6 +597,7 @@ impl VideoEncoder {
       encode_queue_size: 0,
       output_callback: init.output,
       error_callback: init.error,
+      had_error: false,
       flushes: FlushTracker::default(),
       timestamp_queue: std::collections::VecDeque::new(),
       // Hardware acceleration tracking
@@ -675,15 +682,6 @@ impl VideoEncoder {
             Status::GenericFailure,
             "AbortError: The operation was aborted",
           )));
-        } else {
-          // For encode commands, just decrement queue and fire dequeue
-          if let Ok(mut guard) = inner.lock() {
-            let old_size = guard.encode_queue_size;
-            guard.encode_queue_size = old_size.saturating_sub(1);
-            if old_size > 0 {
-              let _ = Self::fire_dequeue_event(&event_state);
-            }
-          }
         }
         continue;
       }
@@ -695,6 +693,7 @@ impl VideoEncoder {
           options,
           rotation,
           flip,
+          color_space,
         } => {
           Self::process_encode(
             &inner,
@@ -704,14 +703,16 @@ impl VideoEncoder {
             options,
             rotation,
             flip,
+            color_space,
+            &reset_flag,
           );
         }
         EncoderCommand::Flush(response_sender) => {
-          let result = Self::process_flush(&inner, &event_state);
+          let result = Self::process_flush(&inner, &event_state, &reset_flag);
           let _ = response_sender.send(result);
         }
         EncoderCommand::Reconfigure(config) => {
-          Self::process_reconfigure(&inner, config);
+          Self::process_reconfigure(&inner, config, &reset_flag);
         }
       }
     }
@@ -726,11 +727,17 @@ impl VideoEncoder {
     options: Option<VideoEncoderEncodeOptions>,
     rotation: f64,
     flip: bool,
+    color_space: Option<VideoColorSpaceInit>,
+    reset_flag: &AtomicBool,
   ) {
     let mut guard = match inner.lock() {
       Ok(g) => g,
       Err(_) => return, // Lock poisoned
     };
+
+    if reset_flag.load(Ordering::SeqCst) {
+      return;
+    }
 
     // Check if encoder is still configured
     if guard.state != CodecState::Configured {
@@ -743,6 +750,10 @@ impl VideoEncoder {
       // State could be Unconfigured (reset called) or Closed (close called)
       // Don't call report_error() - that would set state to Closed and invoke error callback
       return;
+    }
+
+    if guard.input_color_space.is_none() {
+      guard.input_color_space = color_space;
     }
 
     // Get config info (unwrap validated config values)
@@ -1429,10 +1440,25 @@ impl VideoEncoder {
   fn process_flush(
     inner: &Arc<Mutex<VideoEncoderInner>>,
     _event_state: &Arc<RwLock<EventListenerState>>,
+    reset_flag: &AtomicBool,
   ) -> Result<()> {
     let mut guard = inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+
+    if reset_flag.load(Ordering::SeqCst) {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "AbortError: The operation was aborted",
+      ));
+    }
+
+    if guard.state == CodecState::Closed && guard.had_error {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "EncodingError: Encode error occurred",
+      ));
+    }
 
     // Per W3C spec: state check happens on main thread (in flush() method).
     // If state changed after that check (e.g., reconfigure failed), silently succeed.
@@ -1736,11 +1762,19 @@ impl VideoEncoder {
 
   /// Process a reconfigure command on the worker thread
   /// Drains old context and creates new one with updated config
-  fn process_reconfigure(inner: &Arc<Mutex<VideoEncoderInner>>, config: VideoEncoderConfig) {
+  fn process_reconfigure(
+    inner: &Arc<Mutex<VideoEncoderInner>>,
+    config: VideoEncoderConfig,
+    reset_flag: &AtomicBool,
+  ) {
     let mut guard = match inner.lock() {
       Ok(g) => g,
       Err(_) => return, // Lock poisoned
     };
+
+    if reset_flag.load(Ordering::SeqCst) {
+      return;
+    }
 
     // Don't reconfigure if encoder is closed
     if guard.state == CodecState::Closed {
@@ -1767,6 +1801,10 @@ impl VideoEncoder {
     guard.extradata_sent = false;
     guard.output_frame_count = 0;
     guard.pending_frames.clear();
+    guard.scaler = None;
+    guard.input_color_space = None;
+    guard.silent_encode_count = 0;
+    guard.first_output_produced = false;
 
     // Parse codec to get codec_id
     let codec_string = match config.codec.as_ref() {
@@ -2073,6 +2111,7 @@ impl VideoEncoder {
     inner
       .error_callback
       .call(error, ThreadsafeFunctionCallMode::NonBlocking);
+    inner.had_error = true;
     inner.state = CodecState::Closed;
   }
 
@@ -2534,9 +2573,6 @@ impl VideoEncoder {
         );
         return Ok(());
       }
-
-      // Store config for immediate property reads and new encode validation
-      inner.config = Some(config.clone());
 
       // Queue reconfigure via microtask (runs AFTER pending encode microtasks)
       // Use Weak reference to allow close() to immediately close channel without deadlock
@@ -3006,7 +3042,7 @@ impl VideoEncoder {
     }
 
     // Get Arc reference to frame and metadata on main thread (no pixel copy)
-    let (frame_arc, timestamp, rotation, flip) = {
+    let (frame_arc, timestamp, rotation, flip, color_space) = {
       let mut inner = self
         .inner
         .lock()
@@ -3042,17 +3078,12 @@ impl VideoEncoder {
       let rotation = frame.rotation().unwrap_or(0.0);
       let flip = frame.flip().unwrap_or(false);
 
-      // Capture colorSpace from first input frame (for decoderConfig metadata)
-      if inner.input_color_space.is_none()
-        && let Ok(color_space) = frame.color_space()
-      {
-        inner.input_color_space = Some(color_space.to_init());
-      }
+      let color_space = frame.color_space().ok().map(|value| value.to_init());
 
       // Increment queue size (pending operation)
       inner.encode_queue_size += 1;
 
-      (frame_arc, timestamp, rotation, flip)
+      (frame_arc, timestamp, rotation, flip, color_space)
     };
 
     // Send encode command to worker thread via microtask for W3C spec FIFO ordering
@@ -3072,6 +3103,7 @@ impl VideoEncoder {
             options,
             rotation,
             flip,
+            color_space,
           });
         }
         Ok(())
@@ -3108,12 +3140,16 @@ impl VideoEncoder {
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
       if inner.state == CodecState::Closed {
+        let (error_name, error_msg) = if inner.had_error {
+          (DOMExceptionName::EncodingError, "Encode error occurred")
+        } else {
+          (
+            DOMExceptionName::InvalidStateError,
+            "Cannot flush a closed codec",
+          )
+        };
         // Return rejected promise with native DOMException (async to allow error callback to run)
-        return reject_with_dom_exception_async(
-          env,
-          DOMExceptionName::InvalidStateError,
-          "Cannot flush a closed codec",
-        );
+        return reject_with_dom_exception_async(env, error_name, error_msg);
       }
       if inner.state == CodecState::Unconfigured {
         // Return rejected promise with native DOMException (async to allow error callback to run)
@@ -3149,7 +3185,11 @@ impl VideoEncoder {
       if let Ok(mut inner) = self.inner.lock() {
         inner.flushes.finish(flush_id);
       }
-      return throw_invalid_state_error(env, "Cannot flush a closed codec");
+      return reject_with_dom_exception_async(
+        env,
+        DOMExceptionName::InvalidStateError,
+        "Cannot flush a closed codec",
+      );
     }
 
     // Clone references for the callback closure
@@ -3274,6 +3314,7 @@ impl VideoEncoder {
     inner.frame_count = 0;
     inner.extradata_sent = false;
     inner.encode_queue_size = 0;
+    inner.had_error = false;
 
     // Release the hardware encoder slot if we acquired one
     if inner.acquired_hw_slot {
@@ -3289,6 +3330,7 @@ impl VideoEncoder {
     inner.first_output_produced = false;
     inner.pending_frames.clear();
     inner.timestamp_queue.clear();
+    inner.input_color_space = None;
 
     // Reset temporal SVC tracking
     inner.temporal_layer_count = None;
@@ -3380,6 +3422,7 @@ impl VideoEncoder {
     inner.context = None;
     inner.scaler = None;
     inner.config = None;
+    inner.input_color_space = None;
     inner.state = CodecState::Closed;
     inner.encode_queue_size = 0;
 
