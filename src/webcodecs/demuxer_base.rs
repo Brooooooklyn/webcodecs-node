@@ -307,7 +307,10 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
       ));
     }
 
-    if self.state != DemuxerState::Ready {
+    // Async iteration reads one packet at a time and leaves the shared state in
+    // Demuxing after yielding. It does not own a persistent callback session,
+    // so a callback demux may resume from that idle iterator state.
+    if self.state != DemuxerState::Ready && self.state != DemuxerState::Demuxing {
       return Err(Error::new(
         Status::GenericFailure,
         "Demuxer is not ready for a callback demux operation",

@@ -1188,6 +1188,29 @@ runTest('Mp4Demuxer: async iterator yields DemuxerChunk with correct structure',
   demuxer.close()
 })
 
+runTest('Mp4Demuxer: callback demux resumes after partial async iteration', async (t) => {
+  let callbackChunks = 0
+  const onOutput = () => {
+    callbackChunks += 1
+  }
+  const demuxer = new Mp4Demuxer({
+    videoOutput: onOutput,
+    audioOutput: onOutput,
+    error: (e: Error) => t.fail(`Error: ${e.message}`),
+  })
+
+  await demuxer.load(path.join(FIXTURES_DIR, 'small_buck_bunny.mp4'))
+  for await (const _chunk of demuxer) {
+    break
+  }
+
+  t.is(demuxer.state, 'demuxing')
+  await t.notThrowsAsync(() => demuxer.demuxAsync(1))
+  t.is(callbackChunks, 1)
+  t.is(demuxer.state, 'ready')
+  demuxer.close()
+})
+
 runTest('Mp4Demuxer: demuxAsync completes all packets', async (t) => {
   const videoChunks: EncodedVideoChunk[] = []
   const audioChunks: EncodedAudioChunk[] = []
@@ -1248,6 +1271,28 @@ runTest('WebMDemuxer: async iterator with for-await-of', async (t) => {
   demuxer.close()
 })
 
+runTest('WebMDemuxer: callback demux resumes after partial async iteration', async (t) => {
+  const webmData = await generateWebMWithVP9()
+  let callbackChunks = 0
+  const demuxer = new WebMDemuxer({
+    videoOutput: () => {
+      callbackChunks += 1
+    },
+    error: (e: Error) => t.fail(`Error: ${e.message}`),
+  })
+
+  await demuxer.loadBuffer(webmData)
+  for await (const _chunk of demuxer) {
+    break
+  }
+
+  t.is(demuxer.state, 'demuxing')
+  await t.notThrowsAsync(() => demuxer.demuxAsync(1))
+  t.is(callbackChunks, 1)
+  t.is(demuxer.state, 'ready')
+  demuxer.close()
+})
+
 runTest('WebMDemuxer: demuxAsync completes', async (t) => {
   const webmData = await generateWebMWithVP9()
   const videoChunks: EncodedVideoChunk[] = []
@@ -1285,6 +1330,28 @@ runTest('MkvDemuxer: async iterator with for-await-of', async (t) => {
   t.true(chunks.length > 0, 'Should have iterated over chunks')
   t.true(chunks.every((c) => c.chunkType === 'video'), 'All chunks should be video (H.264 only)')
 
+  demuxer.close()
+})
+
+runTest('MkvDemuxer: callback demux resumes after partial async iteration', async (t) => {
+  const mkvData = await generateMkvWithH264()
+  let callbackChunks = 0
+  const demuxer = new MkvDemuxer({
+    videoOutput: () => {
+      callbackChunks += 1
+    },
+    error: (e: Error) => t.fail(`Error: ${e.message}`),
+  })
+
+  await demuxer.loadBuffer(mkvData)
+  for await (const _chunk of demuxer) {
+    break
+  }
+
+  t.is(demuxer.state, 'demuxing')
+  await t.notThrowsAsync(() => demuxer.demuxAsync(1))
+  t.is(callbackChunks, 1)
+  t.is(demuxer.state, 'ready')
   demuxer.close()
 })
 
