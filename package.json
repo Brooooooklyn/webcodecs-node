@@ -32,7 +32,6 @@
       "require": "./polyfill.js"
     }
   },
-  "browser": "browser.js",
   "types": "index.d.ts",
   "files": [
     "index.d.ts",

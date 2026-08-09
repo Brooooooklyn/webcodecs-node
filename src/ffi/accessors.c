@@ -13,6 +13,10 @@
 #include <libavutil/channel_layout.h>
 #include <libavutil/samplefmt.h>
 
+#if LIBAVCODEC_VERSION_MAJOR != 62 || LIBAVUTIL_VERSION_MAJOR != 60
+#error "Unsupported FFmpeg headers: webcodecs-node is pinned to FFmpeg 8.x (libavcodec 62, libavutil 60)"
+#endif
+
 /* ============================================================================
  * AVCodecContext Setters
  * ============================================================================ */

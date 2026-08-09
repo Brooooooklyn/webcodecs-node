@@ -275,6 +275,32 @@ test('VideoEncoder: flush() returns a Promise', async (t) => {
   encoder.close()
 })
 
+test('VideoEncoder: reset aborts every overlapping flush', async (t) => {
+  let outputs = 0
+  const encoder = new VideoEncoder({
+    output: () => {
+      outputs++
+      if (outputs === 1) encoder.reset()
+    },
+    error: (error) => t.fail(error.message),
+  })
+  encoder.configure(createEncoderConfig('vp8', 64, 64))
+
+  for (let i = 0; i < 5; i++) {
+    const frame = generateSolidColorI420Frame(64, 64, TestColors.red, i * 33_333)
+    encoder.encode(frame, { keyFrame: i === 0 })
+    frame.close()
+  }
+
+  const results = await Promise.allSettled([encoder.flush(), encoder.flush()])
+  t.is(outputs, 1)
+  t.true(results.every((result) => result.status === 'rejected'))
+  for (const result of results) {
+    if (result.status === 'rejected') t.regex(result.reason.message, /AbortError/)
+  }
+  encoder.close()
+})
+
 // ============================================================================
 // reset() Tests
 // ============================================================================

@@ -31,6 +31,7 @@ test('ImageDecoder decodes static PNG image', async (t) => {
   t.truthy(result.image)
   t.is(result.image.codedWidth, 8)
   t.is(result.image.codedHeight, 8)
+  t.is(result.image.duration, null)
 
   // Static images should have frameCount = 1
   const tracks = decoder.tracks
@@ -108,7 +109,16 @@ test('ImageDecoder GIF frame_count is populated after first decode', async (t) =
   // After decode, frameCount should be populated
   const tracks = decoder.tracks
   t.true(tracks.selectedTrack!.animated)
-  t.true(tracks.selectedTrack!.frameCount > 0)
+  t.true(tracks.selectedTrack!.frameCount > 1)
+
+  const first = await decoder.decode({ frameIndex: 0 })
+  const second = await decoder.decode({ frameIndex: 1 })
+  t.is(first.image.timestamp, 0)
+  t.is(second.image.timestamp, 1_000_000)
+  t.is(first.image.duration, 1_000_000)
+  t.is(second.image.duration, 1_000_000)
+  first.image.close()
+  second.image.close()
 
   decoder.close()
 })
@@ -225,6 +235,7 @@ test('ImageDecoder.isTypeSupported returns true for supported types', async (t) 
   t.true(await ImageDecoder.isTypeSupported('image/gif'))
   t.true(await ImageDecoder.isTypeSupported('image/webp'))
   t.true(await ImageDecoder.isTypeSupported('image/bmp'))
+  t.true(await ImageDecoder.isTypeSupported('image/jxl'))
 })
 
 test('ImageDecoder.isTypeSupported returns false for unsupported types', async (t) => {
@@ -267,6 +278,29 @@ test('ImageDecoder completed getter resolves immediately for buffered data', asy
     await decoder.completed
   })
 
+  decoder.close()
+})
+
+test('ImageDecoder stream becomes ready before EOF once a frame is decodable', async (t) => {
+  const data = readFileSync(join(__dirname, 'fixtures/test.png'))
+  let closeStream!: () => void
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(data)
+      closeStream = () => controller.close()
+    },
+  })
+  const decoder = new ImageDecoder({ data: stream, type: 'image/png' })
+
+  await decoder.tracks.ready
+  const result = await decoder.decode()
+  t.false(decoder.complete)
+  t.is(result.image.codedWidth, 8)
+
+  closeStream()
+  await decoder.completed
+  t.true(decoder.complete)
+  result.image.close()
   decoder.close()
 })
 

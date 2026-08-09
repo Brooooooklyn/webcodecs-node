@@ -9,15 +9,14 @@ use crate::ffi::AVCodecID;
 use crate::webcodecs::encoded_audio_chunk::{
   EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkType,
 };
-use crate::webcodecs::encoded_video_chunk::{
-  EncodedVideoChunk, EncodedVideoChunkInit, EncodedVideoChunkType,
-};
+use crate::webcodecs::encoded_video_chunk::{EncodedVideoChunk, EncodedVideoChunkType};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{
   ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
 };
 use napi_derive::napi;
 use std::marker::PhantomData;
+use std::sync::{Arc, Mutex};
 
 // ============================================================================
 // BufferSource implementation for Uint8Array (zero-copy support)
@@ -68,15 +67,34 @@ pub(crate) use with_demuxer_inner_mut;
 // ============================================================================
 
 /// Type alias for video output callback
-pub type VideoOutputCallback =
-  ThreadsafeFunction<EncodedVideoChunk, UnknownReturnValue, EncodedVideoChunk, Status, false, true>;
+pub type VideoOutputCallback = Arc<
+  ThreadsafeFunction<
+    EncodedVideoChunk,
+    UnknownReturnValue,
+    EncodedVideoChunk,
+    Status,
+    false,
+    true,
+    64,
+  >,
+>;
 
 /// Type alias for audio output callback
-pub type AudioOutputCallback =
-  ThreadsafeFunction<EncodedAudioChunk, UnknownReturnValue, EncodedAudioChunk, Status, false, true>;
+pub type AudioOutputCallback = Arc<
+  ThreadsafeFunction<
+    EncodedAudioChunk,
+    UnknownReturnValue,
+    EncodedAudioChunk,
+    Status,
+    false,
+    true,
+    64,
+  >,
+>;
 
 /// Type alias for error callback
-pub type ErrorCallback = ThreadsafeFunction<Error, UnknownReturnValue, Error, Status, false, true>;
+pub type ErrorCallback =
+  Arc<ThreadsafeFunction<Error, UnknownReturnValue, Error, Status, false, true, 64>>;
 
 // ============================================================================
 // Shared State Types
@@ -422,149 +440,6 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
     }
   }
 
-  /// Demux packets (runs in the calling thread context)
-  ///
-  /// This method should be called from within a spawned thread.
-  /// It holds the mutex for the duration of the demux operation.
-  pub fn demux_sync(&mut self, max_packets: u32) {
-    if self.state != DemuxerState::Ready && self.state != DemuxerState::Demuxing {
-      if let Some(ref error_cb) = self.error_callback {
-        let _ = error_cb.call(
-          Error::new(
-            Status::GenericFailure,
-            "Demuxer is not ready. Call load() first.",
-          ),
-          ThreadsafeFunctionCallMode::NonBlocking,
-        );
-      }
-      return;
-    }
-
-    self.state = DemuxerState::Demuxing;
-
-    let video_index = self.selected_video_track;
-    let audio_index = self.selected_audio_track;
-    let mut packets_read = 0u32;
-
-    // Get stream time bases for timestamp conversion
-    let video_time_base = video_index.and_then(|idx| {
-      self
-        .demuxer
-        .as_ref()
-        .and_then(|d| d.get_stream(idx).map(|s| s.time_base))
-    });
-    let audio_time_base = audio_index.and_then(|idx| {
-      self
-        .demuxer
-        .as_ref()
-        .and_then(|d| d.get_stream(idx).map(|s| s.time_base))
-    });
-
-    while packets_read < max_packets {
-      let demuxer = match self.demuxer.as_mut() {
-        Some(d) => d,
-        None => break,
-      };
-
-      match demuxer.read_packet() {
-        Ok(Some((packet, stream_index))) => {
-          if Some(stream_index) == video_index {
-            // Process video packet
-            let timestamp = convert_timestamp(packet.pts(), video_time_base);
-            let duration = if packet.duration() > 0 {
-              Some(convert_timestamp(packet.duration(), video_time_base))
-            } else {
-              None
-            };
-
-            let chunk_type = if packet.is_key() {
-              EncodedVideoChunkType::Key
-            } else {
-              EncodedVideoChunkType::Delta
-            };
-
-            let init = EncodedVideoChunkInit {
-              chunk_type,
-              timestamp,
-              duration,
-              data: Either::B(packet),
-            };
-
-            match EncodedVideoChunk::new(init) {
-              Ok(chunk) => {
-                if let Some(ref cb) = self.video_callback {
-                  let _ = cb.call(chunk, ThreadsafeFunctionCallMode::NonBlocking);
-                }
-              }
-              Err(e) => {
-                if let Some(ref err_cb) = self.error_callback {
-                  let _ = err_cb.call(
-                    Error::new(
-                      Status::GenericFailure,
-                      format!("Failed to create video chunk: {}", e),
-                    ),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                  );
-                }
-              }
-            }
-          } else if Some(stream_index) == audio_index {
-            // Process audio packet
-            let timestamp = convert_timestamp(packet.pts(), audio_time_base);
-            let duration = if packet.duration() > 0 {
-              Some(convert_timestamp(packet.duration(), audio_time_base))
-            } else {
-              None
-            };
-
-            let init = EncodedAudioChunkInit {
-              chunk_type: EncodedAudioChunkType::Key, // Audio packets are typically keyframes
-              timestamp,
-              duration,
-              data: Either::B(packet),
-            };
-
-            match EncodedAudioChunk::new(init) {
-              Ok(chunk) => {
-                if let Some(ref cb) = self.audio_callback {
-                  let _ = cb.call(chunk, ThreadsafeFunctionCallMode::NonBlocking);
-                }
-              }
-              Err(e) => {
-                if let Some(ref err_cb) = self.error_callback {
-                  let _ = err_cb.call(
-                    Error::new(
-                      Status::GenericFailure,
-                      format!("Failed to create audio chunk: {}", e),
-                    ),
-                    ThreadsafeFunctionCallMode::NonBlocking,
-                  );
-                }
-              }
-            }
-          }
-          // Ignore packets from other tracks
-
-          packets_read += 1;
-        }
-        Ok(None) => {
-          // End of stream
-          self.state = DemuxerState::EndOfStream;
-          break;
-        }
-        Err(e) => {
-          if let Some(ref err_cb) = self.error_callback {
-            let _ = err_cb.call(
-              Error::new(Status::GenericFailure, format!("Demuxer error: {}", e)),
-              ThreadsafeFunctionCallMode::NonBlocking,
-            );
-          }
-          break;
-        }
-      }
-    }
-  }
-
   /// Seek to a timestamp in microseconds
   pub fn seek(&mut self, timestamp_us: i64) -> Result<()> {
     let stream_index = self.selected_video_track.unwrap_or(-1);
@@ -677,28 +552,19 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
               EncodedVideoChunkType::Delta
             };
 
-            let init = EncodedVideoChunkInit {
-              chunk_type,
-              timestamp,
-              duration,
-              data: Either::B(packet),
+            let dts = packet.dts();
+            let dts_us = if dts == i64::MIN {
+              None
+            } else {
+              Some(convert_timestamp(dts, video_time_base))
             };
-
-            match EncodedVideoChunk::new(init) {
-              Ok(chunk) => {
-                return Ok(Some(DemuxerChunk {
-                  chunk_type: "video".to_string(),
-                  video_chunk: Some(chunk),
-                  audio_chunk: None,
-                }));
-              }
-              Err(e) => {
-                return Err(Error::new(
-                  Status::GenericFailure,
-                  format!("Failed to create video chunk: {}", e),
-                ));
-              }
-            }
+            let chunk =
+              EncodedVideoChunk::from_demux_packet(packet, chunk_type, timestamp, dts_us, duration);
+            return Ok(Some(DemuxerChunk {
+              chunk_type: "video".to_string(),
+              video_chunk: Some(chunk),
+              audio_chunk: None,
+            }));
           } else if Some(stream_index) == audio_index {
             // Process audio packet
             let timestamp = convert_timestamp(packet.pts(), audio_time_base);
@@ -766,6 +632,53 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/// Read and dispatch packets without holding the demuxer mutex while a
+/// JavaScript callback is queued. Callback queues are bounded, so a slow
+/// consumer applies backpressure without making getters, seek(), or close()
+/// wait behind the entire media stream.
+pub fn demux_with_callbacks<F: DemuxerFormat>(
+  inner: &Arc<Mutex<DemuxerInner<F>>>,
+  max_packets: u32,
+) -> Result<()> {
+  for _ in 0..max_packets {
+    let (next, video_callback, audio_callback, error_callback) = {
+      let mut guard = inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+      let next = guard.read_next_chunk();
+      (
+        next,
+        guard.video_callback.clone(),
+        guard.audio_callback.clone(),
+        guard.error_callback.clone(),
+      )
+    };
+
+    match next {
+      Ok(Some(chunk)) => {
+        if let Some(video_chunk) = chunk.video_chunk {
+          if let Some(callback) = video_callback {
+            let _ = callback.call(video_chunk, ThreadsafeFunctionCallMode::Blocking);
+          }
+        } else if let Some(audio_chunk) = chunk.audio_chunk
+          && let Some(callback) = audio_callback
+        {
+          let _ = callback.call(audio_chunk, ThreadsafeFunctionCallMode::Blocking);
+        }
+      }
+      Ok(None) => break,
+      Err(error) => {
+        if let Some(callback) = error_callback {
+          let _ = callback.call(error, ThreadsafeFunctionCallMode::Blocking);
+        }
+        break;
+      }
+    }
+  }
+
+  Ok(())
+}
 
 /// Parse stream info into track info using format-specific codec conversion
 fn parse_tracks<F: DemuxerFormat>(streams: &[StreamInfo]) -> Vec<DemuxerTrackInfo> {
@@ -925,7 +838,10 @@ mod tests {
   #[test]
   fn test_convert_timestamp_microseconds() {
     // Already in microseconds (1/1000000)
-    assert_eq!(convert_timestamp(1_000_000, Some((1, 1_000_000))), 1);
+    assert_eq!(
+      convert_timestamp(1_000_000, Some((1, 1_000_000))),
+      1_000_000
+    );
   }
 
   #[test]
@@ -933,8 +849,8 @@ mod tests {
     // Large timestamp that would overflow without checked arithmetic
     // i64::MAX / 1_000_000 is still huge, but this tests the path
     let result = convert_timestamp(i64::MAX / 1000, Some((1, 1)));
-    // Should return original on overflow
-    assert_eq!(result, i64::MAX / 1000);
+    // Positive overflow saturates rather than wrapping.
+    assert_eq!(result, i64::MAX);
   }
 
   #[test]

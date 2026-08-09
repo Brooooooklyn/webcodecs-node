@@ -11,6 +11,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The Rust FFI constants and C accessors are validated against this FFmpeg
+/// release. `FFMPEG_RELEASE_TAG` remains an explicit escape hatch for
+/// maintainers testing a deliberate upgrade.
+const DEFAULT_FFMPEG_RELEASE_TAG: &str = "ffmpeg-n8.0.1";
+
 fn main() {
   // NAPI-RS build setup
   napi_build::setup();
@@ -226,10 +231,8 @@ fn download_ffmpeg_from_release(
     env::var("FFMPEG_GITHUB_REPO").unwrap_or_else(|_| "Brooooooklyn/webcodecs-node".to_string());
 
   // Determine release tag
-  let release_tag = match env::var("FFMPEG_RELEASE_TAG") {
-    Ok(tag) => tag,
-    Err(_) => find_latest_ffmpeg_release(&repo)?,
-  };
+  let release_tag =
+    env::var("FFMPEG_RELEASE_TAG").unwrap_or_else(|_| DEFAULT_FFMPEG_RELEASE_TAG.to_string());
 
   let (archive_ext, archive_name) = if is_windows {
     ("zip", format!("ffmpeg-{}.zip", target))
@@ -246,6 +249,7 @@ fn download_ffmpeg_from_release(
   let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
   let ffmpeg_dir = out_dir.join("ffmpeg");
   let archive_path = out_dir.join(&archive_name);
+  let release_marker = ffmpeg_dir.join(".release-tag");
 
   // Skip if already extracted - check for platform-specific library
   let lib_check = if is_windows {
@@ -254,12 +258,26 @@ fn download_ffmpeg_from_release(
     ffmpeg_dir.join("lib").join("libavcodec.a")
   };
 
-  if lib_check.exists() {
+  let cached_release_matches = fs::read_to_string(&release_marker)
+    .map(|cached| cached.trim() == release_tag)
+    .unwrap_or(false);
+  if lib_check.exists() && cached_release_matches {
     println!(
       "cargo:warning=Using cached FFmpeg at {}",
       ffmpeg_dir.display()
     );
     return Some(ffmpeg_dir);
+  }
+
+  if ffmpeg_dir.exists()
+    && let Err(error) = fs::remove_dir_all(&ffmpeg_dir)
+  {
+    println!(
+      "cargo:warning=Failed to clear stale FFmpeg cache at {}: {}",
+      ffmpeg_dir.display(),
+      error
+    );
+    return None;
   }
 
   println!("cargo:warning=Downloading FFmpeg from {}", download_url);
@@ -314,6 +332,13 @@ fn download_ffmpeg_from_release(
 
   match extract_status {
     Ok(s) if s.success() => {
+      if let Err(error) = fs::write(&release_marker, &release_tag) {
+        println!(
+          "cargo:warning=Failed to write FFmpeg release marker: {}",
+          error
+        );
+        return None;
+      }
       // Clean up archive
       let _ = fs::remove_file(&archive_path);
       println!("cargo:warning=FFmpeg extracted to {}", ffmpeg_dir.display());
@@ -327,46 +352,6 @@ fn download_ffmpeg_from_release(
       None
     }
   }
-}
-
-/// Find the latest ffmpeg-* release tag from GitHub
-fn find_latest_ffmpeg_release(repo: &str) -> Option<String> {
-  // Use GitHub API to list releases
-  let api_url = format!("https://api.github.com/repos/{}/releases", repo);
-
-  // Build curl command - add auth header if GITHUB_TOKEN is available
-  let mut cmd = Command::new("curl");
-  cmd.args(["-s", "-f", "-H", "Accept: application/vnd.github+json"]);
-
-  // Add authorization header if token is available (for higher rate limits in CI)
-  if let Ok(token) = env::var("GITHUB_TOKEN") {
-    cmd.args(["-H", &format!("Authorization: Bearer {}", token)]);
-  }
-
-  let output = cmd.arg(&api_url).output().ok()?;
-
-  if !output.status.success() {
-    return None;
-  }
-
-  let body = String::from_utf8_lossy(&output.stdout);
-
-  // Simple JSON parsing - find first "tag_name": "ffmpeg-*"
-  // This is a minimal parser to avoid adding dependencies
-  for line in body.lines() {
-    if let Some(pos) = line.find("\"tag_name\"") {
-      let rest = &line[pos..];
-      if let Some(start) = rest.find("ffmpeg-") {
-        let tag_str = &rest[start..];
-        if let Some(end) = tag_str.find('"') {
-          let tag = &tag_str[..end];
-          return Some(tag.to_string());
-        }
-      }
-    }
-  }
-
-  None
 }
 
 /// Compile the C accessor library

@@ -13,6 +13,7 @@ use crate::ffi::{
 use crate::webcodecs::codec_pressure;
 use crate::webcodecs::error::DOMExceptionName;
 use crate::webcodecs::error::{throw_invalid_state_error, throw_type_error_unit};
+use crate::webcodecs::flush_tracker::FlushTracker;
 use crate::webcodecs::hw_fallback::{
   is_hw_encoding_disabled, record_hw_encoding_failure, record_hw_encoding_success,
 };
@@ -350,8 +351,8 @@ struct VideoEncoderInner {
   output_callback: OutputCallback,
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
-  /// Pending flush response senders (for AbortError on reset)
-  pending_flush_senders: Vec<Sender<Result<()>>>,
+  /// Pending flush operations, tracked independently for overlapping calls.
+  flushes: FlushTracker,
   /// Queue of input timestamps for correlation with output packets
   /// (needed because FFmpeg may buffer frames internally and reorder)
   timestamp_queue: std::collections::VecDeque<i64>,
@@ -372,14 +373,9 @@ struct VideoEncoderInner {
   /// Buffered frames during silent failure detection period (for re-encoding on fallback)
   /// Tuple: (Frame, timestamp, options, rotation, flip)
   pending_frames: Vec<(Frame, i64, Option<VideoEncoderEncodeOptions>, f64, bool)>,
-  /// Atomic flag for flush abort - set by reset() to signal pending flush to abort
-  flush_abort_flag: Option<Arc<AtomicBool>>,
   /// Queue of encoded chunks waiting to be delivered via output callback
   /// Worker pushes chunks here during flush; flush() drains them synchronously via FunctionRef
   pending_chunks: Vec<(EncodedVideoChunk, EncodedVideoChunkMetadata)>,
-  /// Flag indicating whether a flush operation is in progress
-  /// When true, worker queues chunks to pending_chunks instead of calling NonBlocking callback
-  inside_flush: bool,
 
   // ========================================================================
   // Hardware frame context for zero-copy GPU encoding
@@ -593,7 +589,7 @@ impl VideoEncoder {
       encode_queue_size: 0,
       output_callback: init.output,
       error_callback: init.error,
-      pending_flush_senders: Vec::new(),
+      flushes: FlushTracker::default(),
       timestamp_queue: std::collections::VecDeque::new(),
       // Hardware acceleration tracking
       is_hardware: false,
@@ -602,9 +598,7 @@ impl VideoEncoder {
       silent_encode_count: 0,
       first_output_produced: false,
       pending_frames: Vec::new(),
-      flush_abort_flag: None,
       pending_chunks: Vec::new(),
-      inside_flush: false,
       // Hardware frame context fields
       hw_device_ctx: None,
       hw_frame_ctx: None,
@@ -1418,7 +1412,7 @@ impl VideoEncoder {
 
       // During flush, queue chunks for synchronous delivery in resolver
       // Otherwise, use Blocking callback for immediate delivery
-      if guard.inside_flush {
+      if guard.flushes.is_active() {
         guard.pending_chunks.push((chunk, metadata));
       } else {
         guard.output_callback.call(
@@ -3100,10 +3094,12 @@ impl VideoEncoder {
   pub fn flush<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
     // Create abort flag for this flush operation
     let flush_abort_flag = Arc::new(AtomicBool::new(false));
+    // Create a response channel before registering this individual operation.
+    let (response_sender, response_receiver) = channel::bounded::<Result<()>>(1);
 
     // W3C spec: Check state upfront and return rejected promise with appropriate error
     // (not throw synchronously - flush() should always return a promise)
-    {
+    let flush_id = {
       let mut inner = self
         .inner
         .lock()
@@ -3126,23 +3122,10 @@ impl VideoEncoder {
         );
       }
 
-      // Store abort flag for reset() to access
-      inner.flush_abort_flag = Some(flush_abort_flag.clone());
-      // Set inside_flush flag so worker queues chunks instead of calling NonBlocking callback
-      inner.inside_flush = true;
-    }
-
-    // Create a response channel
-    let (response_sender, response_receiver) = channel::bounded::<Result<()>>(1);
-
-    // Track this flush for AbortError on reset()
-    {
-      let mut inner = self
-        .inner
-        .lock()
-        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-      inner.pending_flush_senders.push(response_sender.clone());
-    }
+      inner
+        .flushes
+        .register(response_sender.clone(), flush_abort_flag.clone())
+    };
 
     // Send flush command through the channel (deferred to microtask for W3C spec compliance)
     // This ensures flush is processed after all pending encode microtasks complete (FIFO order)
@@ -3161,6 +3144,9 @@ impl VideoEncoder {
         Ok(())
       })?;
     } else {
+      if let Ok(mut inner) = self.inner.lock() {
+        inner.flushes.finish(flush_id);
+      }
       return throw_invalid_state_error(env, "Cannot flush a closed codec");
     }
 
@@ -3185,9 +3171,9 @@ impl VideoEncoder {
         })
         .flatten();
 
-        Ok((result, inner_clone, flush_abort_flag))
+        Ok((result, inner_clone, flush_abort_flag, flush_id))
       },
-      move |env, (result, inner, abort_flag)| {
+      move |env, (result, inner, abort_flag, flush_id)| {
         // Drain pending chunks and call output callback SYNCHRONOUSLY
         // This runs on the main thread with Env access
         let chunks = {
@@ -3199,23 +3185,26 @@ impl VideoEncoder {
 
         // Call output callback for each chunk synchronously
         // If callback calls reset(), abort_flag will be set before next iteration
-        let callback = output_callback_ref.borrow_back(env)?;
-        for (chunk, metadata) in chunks {
-          // Check abort flag before each callback - exit early if reset() was called
-          if abort_flag.load(Ordering::SeqCst) {
-            break;
+        let callback_result = (|| -> Result<()> {
+          let callback = output_callback_ref.borrow_back(env)?;
+          for (chunk, metadata) in chunks {
+            // Check abort flag before each callback - exit early if reset() was called
+            if abort_flag.load(Ordering::SeqCst) {
+              break;
+            }
+            callback.call((chunk, metadata).into())?;
           }
-          callback.call((chunk, metadata).into())?;
-        }
+          Ok(())
+        })();
 
-        // Clean up flags
+        // Always release this operation, including when the JS callback throws.
         {
           let mut guard = inner
             .lock()
             .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-          guard.flush_abort_flag = None;
-          guard.inside_flush = false;
+          guard.flushes.finish(flush_id);
         }
+        callback_result?;
 
         // Check abort flag after draining all chunks
         if abort_flag.load(Ordering::SeqCst) {
@@ -3236,7 +3225,7 @@ impl VideoEncoder {
   pub fn reset(&mut self, env: Env) -> Result<()> {
     // Check state first before touching the worker
     {
-      let inner = self
+      let mut inner = self
         .inner
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
@@ -3246,30 +3235,13 @@ impl VideoEncoder {
         return throw_invalid_state_error(&env, "Cannot reset a closed codec");
       }
 
-      // Set abort flag FIRST (synchronously, before any other reset logic)
-      // This signals any pending flush() that is yielding to return AbortError
-      if let Some(ref flag) = inner.flush_abort_flag {
-        flag.store(true, Ordering::SeqCst);
-      }
+      // Abort every pending flush before any worker teardown.
+      inner.flushes.abort_all();
     }
 
     // Set reset flag to signal worker to skip remaining pending encodes
     // This must be done BEFORE dropping the command sender
     self.reset_flag.store(true, Ordering::SeqCst);
-
-    // W3C spec: Abort all pending flushes with AbortError BEFORE dropping sender
-    {
-      let mut inner = self
-        .inner
-        .lock()
-        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-      for sender in inner.pending_flush_senders.drain(..) {
-        let _ = sender.send(Err(Error::new(
-          Status::GenericFailure,
-          "AbortError: The operation was aborted",
-        )));
-      }
-    }
 
     // Drop sender to signal worker to stop
     // Note: Don't join - microtasks might still hold cloned senders. After reset()
@@ -3322,7 +3294,7 @@ impl VideoEncoder {
     inner.use_avcc_format = false;
 
     // Clear flush-related state
-    inner.inside_flush = false;
+    inner.flushes.clear();
     inner.pending_chunks.clear();
 
     // Reset the abort flag for new worker

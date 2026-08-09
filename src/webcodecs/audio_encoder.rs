@@ -9,6 +9,7 @@ use crate::codec::{
 };
 use crate::ffi::{AVCodecID, AVSampleFormat};
 use crate::webcodecs::error::{DOMExceptionName, throw_invalid_state_error, throw_type_error_unit};
+use crate::webcodecs::flush_tracker::FlushTracker;
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
 use crate::webcodecs::{
   AacBitstreamFormat, AudioData, AudioEncoderConfig, AudioEncoderSupport, EncodedAudioChunk,
@@ -232,17 +233,13 @@ struct AudioEncoderInner {
   output_callback: OutputCallback,
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
-  /// Pending flush response senders (for AbortError on reset)
-  pending_flush_senders: Vec<Sender<Result<()>>>,
+  /// Pending flush operations, tracked independently for overlapping calls.
+  flushes: FlushTracker,
   /// Queue of input timestamps for correlation with output packets
   /// (needed because FFmpeg may buffer frames internally)
   timestamp_queue: std::collections::VecDeque<i64>,
   /// Base timestamp from the first input AudioData (for timestamp calculation)
   base_timestamp: Option<i64>,
-  /// Abort channel senders - reset() sends abort signal through these
-  pending_abort_senders: Vec<Sender<()>>,
-  /// Atomic flag for flush abort - set by reset() to signal pending flush to abort
-  flush_abort_flag: Option<Arc<AtomicBool>>,
   /// W3C spec: Flag to suppress output delivery after reset()
   /// When true, pending outputs are not delivered to the user callback
   #[allow(dead_code)]
@@ -250,9 +247,6 @@ struct AudioEncoderInner {
   /// Queue of encoded chunks waiting to be delivered via output callback
   /// Worker pushes chunks here during flush; flush() drains them synchronously via FunctionRef
   pending_chunks: Vec<(EncodedAudioChunk, EncodedAudioChunkMetadata)>,
-  /// Flag indicating whether a flush operation is in progress
-  /// When true, worker queues chunks to pending_chunks instead of calling NonBlocking callback
-  inside_flush: bool,
   /// Flag indicating whether the encoder was closed due to an error
   /// Used to return EncodingError from flush() instead of InvalidStateError
   had_error: bool,
@@ -359,14 +353,11 @@ impl AudioEncoder {
       encode_queue_size: 0,
       output_callback: init.output,
       error_callback: init.error,
-      pending_flush_senders: Vec::new(),
+      flushes: FlushTracker::default(),
       timestamp_queue: std::collections::VecDeque::new(),
       base_timestamp: None,
-      pending_abort_senders: Vec::new(),
-      flush_abort_flag: None,
       output_suppressed: false,
       pending_chunks: Vec::new(),
-      inside_flush: false,
       had_error: false,
       use_adts: false,
       adts_params: None,
@@ -727,7 +718,7 @@ impl AudioEncoder {
 
         // During flush, queue chunks for synchronous delivery in resolver
         // Otherwise, use NonBlocking callback for immediate delivery
-        if guard.inside_flush {
+        if guard.flushes.is_active() {
           guard.pending_chunks.push((chunk, metadata));
         } else {
           guard.output_callback.call(
@@ -1599,10 +1590,11 @@ impl AudioEncoder {
   pub fn flush<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
     // Create abort flag for this flush operation
     let flush_abort_flag = Arc::new(AtomicBool::new(false));
+    let (response_sender, response_receiver) = channel::bounded::<Result<()>>(1);
 
     // W3C spec: Check state upfront and return rejected promise with appropriate error
     // (not throw synchronously - flush() should always return a promise)
-    {
+    let flush_id = {
       let mut inner = self
         .inner
         .lock()
@@ -1625,23 +1617,10 @@ impl AudioEncoder {
         );
       }
 
-      // Store abort flag for reset() to access
-      inner.flush_abort_flag = Some(flush_abort_flag.clone());
-      // Set inside_flush flag so worker queues chunks instead of calling NonBlocking callback
-      inner.inside_flush = true;
-    }
-
-    // Create a response channel for worker result
-    let (response_sender, response_receiver) = channel::bounded::<Result<()>>(1);
-
-    // Track this flush - store sender in Inner for reset() to use
-    {
-      let mut inner = self
-        .inner
-        .lock()
-        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-      inner.pending_flush_senders.push(response_sender.clone());
-    }
+      inner
+        .flushes
+        .register(response_sender.clone(), flush_abort_flag.clone())
+    };
 
     // Send flush command through the channel (deferred to microtask for W3C spec compliance)
     // This ensures flush is processed after all pending encode microtasks complete (FIFO order)
@@ -1660,6 +1639,9 @@ impl AudioEncoder {
         Ok(())
       })?;
     } else {
+      if let Ok(mut inner) = self.inner.lock() {
+        inner.flushes.finish(flush_id);
+      }
       return throw_invalid_state_error(env, "Cannot flush a closed codec");
     }
 
@@ -1684,9 +1666,9 @@ impl AudioEncoder {
         })
         .flatten();
 
-        Ok((result, inner_clone, flush_abort_flag))
+        Ok((result, inner_clone, flush_abort_flag, flush_id))
       },
-      move |env, (result, inner, abort_flag)| {
+      move |env, (result, inner, abort_flag, flush_id)| {
         // Drain pending chunks and call output callback SYNCHRONOUSLY
         // This runs on the main thread with Env access
         let chunks = {
@@ -1698,23 +1680,26 @@ impl AudioEncoder {
 
         // Call output callback for each chunk synchronously
         // If callback calls reset(), abort_flag will be set before next iteration
-        let callback = output_callback_ref.borrow_back(env)?;
-        for (chunk, metadata) in chunks {
-          // Check abort flag before each callback - exit early if reset() was called
-          if abort_flag.load(Ordering::SeqCst) {
-            break;
+        let callback_result = (|| -> Result<()> {
+          let callback = output_callback_ref.borrow_back(env)?;
+          for (chunk, metadata) in chunks {
+            // Check abort flag before each callback - exit early if reset() was called
+            if abort_flag.load(Ordering::SeqCst) {
+              break;
+            }
+            callback.call((chunk, metadata).into())?;
           }
-          callback.call((chunk, metadata).into())?;
-        }
+          Ok(())
+        })();
 
-        // Clean up flags
+        // Always release this operation, including when the JS callback throws.
         {
           let mut guard = inner
             .lock()
             .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-          guard.flush_abort_flag = None;
-          guard.inside_flush = false;
+          guard.flushes.finish(flush_id);
         }
+        callback_result?;
 
         // Check abort flag after draining all chunks
         if abort_flag.load(Ordering::SeqCst) {
@@ -1745,27 +1730,7 @@ impl AudioEncoder {
         return throw_invalid_state_error(&env, "Cannot reset a closed codec");
       }
 
-      // Set abort flag FIRST (synchronously, before any other reset logic)
-      // This signals any pending flush() that is yielding to return AbortError
-      if let Some(ref flag) = inner.flush_abort_flag {
-        flag.store(true, Ordering::SeqCst);
-      }
-
-      // W3C spec: Abort all pending flushes with AbortError BEFORE dropping sender
-
-      // Send abort signal through all abort channels - this causes pending flush()
-      // calls to return AbortError via the select! in spawn_blocking
-      for sender in inner.pending_abort_senders.drain(..) {
-        let _ = sender.send(());
-      }
-
-      // Also try to send through the response channel (fallback)
-      for sender in inner.pending_flush_senders.drain(..) {
-        let _ = sender.send(Err(Error::new(
-          Status::GenericFailure,
-          "AbortError: The operation was aborted",
-        )));
-      }
+      inner.flushes.abort_all();
     }
 
     // Set reset flag to signal worker to skip remaining pending encodes
@@ -1796,11 +1761,8 @@ impl AudioEncoder {
     inner.encode_queue_size = 0;
     inner.timestamp_queue.clear();
     inner.base_timestamp = None;
-    // Clear any remaining abort senders (shouldn't be any, but just in case)
-    inner.pending_abort_senders.clear();
-
     // Clear flush-related state
-    inner.inside_flush = false;
+    inner.flushes.clear();
     inner.pending_chunks.clear();
 
     // Reset the abort flag for new worker

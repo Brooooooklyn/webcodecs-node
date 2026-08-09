@@ -344,6 +344,26 @@ impl EncodedVideoChunk {
     }
   }
 
+  /// Create a chunk from a demuxed packet while preserving decode timing.
+  pub(crate) fn from_demux_packet(
+    packet: Packet,
+    chunk_type: EncodedVideoChunkType,
+    timestamp_us: i64,
+    dts_us: Option<i64>,
+    duration_us: Option<i64>,
+  ) -> Self {
+    Self {
+      inner: Arc::new(RwLock::new(Some(EncodedVideoChunkInner {
+        data: Either::B(packet),
+        chunk_type,
+        timestamp_us,
+        duration_us,
+        dts_us,
+        original_pts: Some(timestamp_us),
+      }))),
+    }
+  }
+
   /// Get the chunk type
   #[napi(getter, js_name = "type")]
   pub fn chunk_type(&self) -> Result<EncodedVideoChunkType> {

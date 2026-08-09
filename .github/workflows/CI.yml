@@ -62,6 +62,9 @@ jobs:
       - name: Clippy
         run: cargo clippy
 
+      - name: Rust unit tests
+        run: cargo test --lib
+
   build:
     strategy:
       fail-fast: false

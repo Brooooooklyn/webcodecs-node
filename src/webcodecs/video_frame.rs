@@ -1193,6 +1193,9 @@ fn parse_visible_rect(
 #[napi]
 pub struct VideoFrame {
   inner: Arc<Mutex<Option<VideoFrameInner>>>,
+  /// Timestamp and duration live outside the detachable resource per WebCodecs.
+  timestamp_us: i64,
+  duration_us: Option<i64>,
 }
 
 /// Parse rotation value per W3C spec algorithm
@@ -1207,6 +1210,14 @@ fn parse_rotation(rotation: f64) -> f64 {
 
 #[napi]
 impl VideoFrame {
+  fn from_inner(inner: VideoFrameInner) -> Self {
+    Self {
+      timestamp_us: inner.timestamp_us,
+      duration_us: inner.duration_us,
+      inner: Arc::new(Mutex::new(Some(inner))),
+    }
+  }
+
   /// Create a new VideoFrame from buffer data, another VideoFrame, or a Canvas (W3C WebCodecs spec)
   ///
   /// Constructor forms per W3C spec:
@@ -1445,9 +1456,7 @@ impl VideoFrame {
       closed: false,
     };
 
-    Ok(Self {
-      inner: Arc::new(Mutex::new(Some(inner))),
-    })
+    Ok(Self::from_inner(inner))
   }
 
   /// Internal: Create VideoFrame from @napi-rs/canvas Canvas (CanvasImageSource constructor form)
@@ -1740,9 +1749,7 @@ impl VideoFrame {
         closed: false,
       };
 
-      Ok(VideoFrame {
-        inner: Arc::new(Mutex::new(Some(new_inner))),
-      })
+      Ok(VideoFrame::from_inner(new_inner))
     })
   }
 
@@ -1770,9 +1777,7 @@ impl VideoFrame {
       closed: false,
     };
 
-    Self {
-      inner: Arc::new(Mutex::new(Some(inner))),
-    }
+    Self::from_inner(inner)
   }
 
   /// Create a VideoFrame from an Arc<RwLock<Frame>> (for sharing frame data)
@@ -1807,9 +1812,7 @@ impl VideoFrame {
       closed: false,
     };
 
-    Self {
-      inner: Arc::new(Mutex::new(Some(inner))),
-    }
+    Self::from_inner(inner)
   }
 
   /// Create a VideoFrame from an internal Frame with rotation/flip (for decoder output)
@@ -1873,9 +1876,7 @@ impl VideoFrame {
       closed: false,
     };
 
-    Self {
-      inner: Arc::new(Mutex::new(Some(inner))),
-    }
+    Self::from_inner(inner)
   }
 
   /// Create a VideoFrame from an internal Frame with color space control (for ImageDecoder)
@@ -1917,9 +1918,7 @@ impl VideoFrame {
       closed: false,
     };
 
-    Self {
-      inner: Arc::new(Mutex::new(Some(inner))),
-    }
+    Self::from_inner(inner)
   }
 
   /// Create a VideoFrame from a shared Arc<RwLock<Frame>> with color space control
@@ -1962,9 +1961,7 @@ impl VideoFrame {
       closed: false,
     };
 
-    Self {
-      inner: Arc::new(Mutex::new(Some(inner))),
-    }
+    Self::from_inner(inner)
   }
 
   /// Get the pixel format
@@ -2087,15 +2084,7 @@ impl VideoFrame {
   /// The timestamp is preserved even after close() - only resource reference is cleared
   #[napi(getter)]
   pub fn timestamp(&self) -> Result<i64> {
-    let guard = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    match guard.as_ref() {
-      Some(inner) => Ok(inner.timestamp_us),
-      None => Ok(0),
-    }
+    Ok(self.timestamp_us)
   }
 
   /// Get the duration in microseconds
@@ -2103,15 +2092,7 @@ impl VideoFrame {
   /// The duration is preserved even after close() - only resource reference is cleared
   #[napi(getter)]
   pub fn duration(&self) -> Result<Option<i64>> {
-    let guard = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    match guard.as_ref() {
-      Some(inner) => Ok(inner.duration_us),
-      None => Ok(None),
-    }
+    Ok(self.duration_us)
   }
 
   /// Get the color space parameters
@@ -2900,9 +2881,7 @@ impl VideoFrame {
       closed: false,
     };
 
-    Ok(VideoFrame {
-      inner: Arc::new(Mutex::new(Some(new_inner))),
-    })
+    Ok(VideoFrame::from_inner(new_inner))
   }
 
   /// Close and release resources
@@ -2917,11 +2896,9 @@ impl VideoFrame {
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    if let Some(inner) = guard.as_mut() {
-      inner.closed = true;
-      // Note: We keep the inner struct to preserve metadata (timestamp, duration, etc.)
-      // per W3C spec. The FFmpeg Frame memory will be released when VideoFrame is dropped.
-    }
+    // Detach and drop the resource immediately. Timestamp and duration are stored
+    // separately so their getters remain available after detachment.
+    *guard = None;
 
     Ok(())
   }

@@ -9,6 +9,7 @@ import test from 'ava'
 import {
   Mp4Muxer,
   WebMMuxer,
+  WebMDemuxer,
   MkvMuxer,
   VideoEncoder,
   AudioEncoder,
@@ -19,6 +20,63 @@ import {
   type EncodedAudioChunkMetadata,
 } from '../index.js'
 import { generateSolidColorI420Frame, generateSilence, TestColors } from './helpers/index.js'
+
+test('WebMMuxer: preserves sparse source timestamps through demux', async (t) => {
+  const chunks: EncodedVideoChunk[] = []
+  const encoder = new VideoEncoder({
+    output: (chunk) => chunks.push(chunk),
+    error: (error) => t.fail(error.message),
+  })
+  encoder.configure({ codec: 'vp8', width: 64, height: 64, bitrate: 100_000, framerate: 30 })
+
+  for (const timestamp of [0, 1_000_000]) {
+    const frame = generateSolidColorI420Frame(64, 64, TestColors.red, timestamp)
+    encoder.encode(frame, { keyFrame: true })
+    frame.close()
+  }
+  await encoder.flush()
+  encoder.close()
+
+  const muxer = new WebMMuxer()
+  muxer.addVideoTrack({ codec: 'vp8', width: 64, height: 64, framerate: 30 })
+  for (const chunk of chunks) muxer.addVideoChunk(chunk)
+  const data = muxer.finalize()
+  muxer.close()
+
+  const timestamps: number[] = []
+  const demuxer = new WebMDemuxer({
+    videoOutput: (chunk) => timestamps.push(chunk.timestamp),
+    error: (error) => t.fail(error.message),
+  })
+  await demuxer.loadBuffer(data)
+  await demuxer.demuxAsync()
+  demuxer.close()
+
+  t.deepEqual(timestamps, [0, 1_000_000])
+})
+
+test('WebMMuxer: accepts duplicate source timestamps', async (t) => {
+  const chunks: EncodedVideoChunk[] = []
+  const encoder = new VideoEncoder({
+    output: (chunk) => chunks.push(chunk),
+    error: (error) => t.fail(error.message),
+  })
+  encoder.configure({ codec: 'vp8', width: 64, height: 64, bitrate: 100_000, framerate: 30 })
+
+  for (let i = 0; i < 2; i++) {
+    const frame = generateSolidColorI420Frame(64, 64, TestColors.red, 0)
+    encoder.encode(frame, { keyFrame: true })
+    frame.close()
+  }
+  await encoder.flush()
+  encoder.close()
+
+  const muxer = new WebMMuxer()
+  muxer.addVideoTrack({ codec: 'vp8', width: 64, height: 64, framerate: 30 })
+  for (const chunk of chunks) muxer.addVideoChunk(chunk)
+  t.true(muxer.finalize().length > 0)
+  muxer.close()
+})
 
 // Reset hardware fallback state before each test
 test.beforeEach(() => {

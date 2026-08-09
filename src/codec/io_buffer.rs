@@ -2,6 +2,7 @@
 //!
 //! Provides memory and streaming buffers for FFmpeg's custom I/O system.
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -307,9 +308,7 @@ impl Seek for MemoryBuffer {
 
 /// Internal state for streaming buffer
 struct StreamingBufferState {
-  buffer: Vec<u8>,
-  write_pos: usize,
-  read_pos: usize,
+  buffer: VecDeque<u8>,
   /// Total bytes written (for tracking)
   total_written: u64,
   /// Total bytes read (for tracking)
@@ -320,110 +319,68 @@ struct StreamingBufferState {
   closed: bool,
 }
 
-/// Ring buffer for streaming output with backpressure support
+/// Growable queue for streaming output.
 ///
 /// This buffer is designed for streaming muxer output:
 /// - Producer (muxer) writes encoded data
-/// - Consumer reads data via ReadableStream
-/// - Backpressure when buffer is full
-/// - Thread-safe via mutex + condvars
+/// - Consumer drains bounded chunks via `read()`
+/// - Writes never block the JavaScript thread waiting for that same consumer
+/// - Thread-safe via a mutex and a condition variable for native blocking readers
 pub struct StreamingBuffer {
   inner: Arc<Mutex<StreamingBufferState>>,
-  not_full: Arc<Condvar>,
   not_empty: Arc<Condvar>,
-  capacity: usize,
+  read_chunk_size: usize,
 }
 
 impl StreamingBuffer {
-  /// Create a new streaming buffer with specified capacity
+  /// Create a new streaming buffer with the specified read chunk size.
   pub fn new(capacity: usize) -> Self {
+    let read_chunk_size = capacity.max(1);
     Self {
       inner: Arc::new(Mutex::new(StreamingBufferState {
-        buffer: vec![0; capacity],
-        write_pos: 0,
-        read_pos: 0,
+        buffer: VecDeque::with_capacity(read_chunk_size),
         total_written: 0,
         total_read: 0,
         finished: false,
         closed: false,
       })),
-      not_full: Arc::new(Condvar::new()),
       not_empty: Arc::new(Condvar::new()),
-      capacity,
+      read_chunk_size,
     }
   }
 
-  /// Get capacity of the buffer
+  /// Get the maximum chunk size returned by a read.
   pub fn capacity(&self) -> usize {
-    self.capacity
+    self.read_chunk_size
   }
 
   /// Clone for sharing between producer and consumer
   pub fn clone_handle(&self) -> StreamingBufferHandle {
     StreamingBufferHandle {
       inner: Arc::clone(&self.inner),
-      not_full: Arc::clone(&self.not_full),
       not_empty: Arc::clone(&self.not_empty),
-      capacity: self.capacity,
+      read_chunk_size: self.read_chunk_size,
     }
   }
 
-  /// Write data to the buffer, blocking if full
+  /// Write data to the queue without blocking.
   ///
   /// Returns the number of bytes written, or an error if closed.
-  pub fn write_blocking(&self, data: &[u8]) -> io::Result<usize> {
+  pub fn write_nonblocking(&self, data: &[u8]) -> io::Result<usize> {
     if data.is_empty() {
       return Ok(0);
     }
 
-    let mut written = 0;
-
-    while written < data.len() {
-      let mut state = self.inner.lock().unwrap();
-
-      // Check if closed
-      if state.closed {
-        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Buffer closed"));
-      }
-
-      // Calculate available space
-      let used = if state.write_pos >= state.read_pos {
-        state.write_pos - state.read_pos
-      } else {
-        self.capacity - state.read_pos + state.write_pos
-      };
-      let available = self.capacity - used - 1; // -1 to distinguish full from empty
-
-      if available == 0 {
-        // Buffer full, wait for consumer
-        state = self.not_full.wait(state).unwrap();
-        continue;
-      }
-
-      // Write as much as possible
-      let to_write = available.min(data.len() - written);
-
-      // Handle wrap-around - extract positions first to avoid borrow issues
-      let write_pos = state.write_pos;
-      let first_part = (self.capacity - write_pos).min(to_write);
-      state.buffer[write_pos..write_pos + first_part]
-        .copy_from_slice(&data[written..written + first_part]);
-
-      if first_part < to_write {
-        let second_part = to_write - first_part;
-        state.buffer[..second_part]
-          .copy_from_slice(&data[written + first_part..written + to_write]);
-      }
-
-      state.write_pos = (write_pos + to_write) % self.capacity;
-      state.total_written += to_write as u64;
-      written += to_write;
-
-      // Notify consumer
-      self.not_empty.notify_one();
+    let mut state = self.inner.lock().unwrap();
+    if state.closed {
+      return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Buffer closed"));
     }
+    state.buffer.extend(data.iter().copied());
+    state.total_written += data.len() as u64;
+    drop(state);
+    self.not_empty.notify_one();
 
-    Ok(written)
+    Ok(data.len())
   }
 
   /// Signal that writing is complete
@@ -438,7 +395,6 @@ impl StreamingBuffer {
     let mut state = self.inner.lock().unwrap();
     state.closed = true;
     state.finished = true;
-    self.not_full.notify_all();
     self.not_empty.notify_all();
   }
 
@@ -457,7 +413,7 @@ impl StreamingBuffer {
 
 impl Write for StreamingBuffer {
   fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-    self.write_blocking(buf)
+    self.write_nonblocking(buf)
   }
 
   fn flush(&mut self) -> io::Result<()> {
@@ -468,9 +424,8 @@ impl Write for StreamingBuffer {
 /// Handle for the consumer side of a streaming buffer
 pub struct StreamingBufferHandle {
   inner: Arc<Mutex<StreamingBufferState>>,
-  not_full: Arc<Condvar>,
   not_empty: Arc<Condvar>,
-  capacity: usize,
+  read_chunk_size: usize,
 }
 
 impl StreamingBufferHandle {
@@ -482,35 +437,16 @@ impl StreamingBufferHandle {
   pub fn read_available(&self) -> Option<Vec<u8>> {
     let mut state = self.inner.lock().unwrap();
 
-    // Calculate used space
-    let used = if state.write_pos >= state.read_pos {
-      state.write_pos - state.read_pos
-    } else {
-      self.capacity - state.read_pos + state.write_pos
-    };
-
-    if used == 0 {
+    if state.buffer.is_empty() {
       if state.finished {
         return Some(Vec::new()); // EOF - empty array signals finished
       }
       return None; // No data yet, but not finished
     }
 
-    // Read all available data
-    let mut data = Vec::with_capacity(used);
-
-    if state.write_pos > state.read_pos {
-      data.extend_from_slice(&state.buffer[state.read_pos..state.write_pos]);
-    } else {
-      data.extend_from_slice(&state.buffer[state.read_pos..]);
-      data.extend_from_slice(&state.buffer[..state.write_pos]);
-    }
-
-    state.read_pos = state.write_pos;
+    let to_read = state.buffer.len().min(self.read_chunk_size);
+    let data: Vec<u8> = state.buffer.drain(..to_read).collect();
     state.total_read += data.len() as u64;
-
-    // Notify producer
-    self.not_full.notify_one();
 
     Some(data)
   }
@@ -522,30 +458,10 @@ impl StreamingBufferHandle {
     loop {
       let mut state = self.inner.lock().unwrap();
 
-      // Calculate used space
-      let used = if state.write_pos >= state.read_pos {
-        state.write_pos - state.read_pos
-      } else {
-        self.capacity - state.read_pos + state.write_pos
-      };
-
-      if used > 0 {
-        // Data available
-        let mut data = Vec::with_capacity(used);
-
-        if state.write_pos > state.read_pos {
-          data.extend_from_slice(&state.buffer[state.read_pos..state.write_pos]);
-        } else {
-          data.extend_from_slice(&state.buffer[state.read_pos..]);
-          data.extend_from_slice(&state.buffer[..state.write_pos]);
-        }
-
-        state.read_pos = state.write_pos;
+      if !state.buffer.is_empty() {
+        let to_read = state.buffer.len().min(self.read_chunk_size);
+        let data: Vec<u8> = state.buffer.drain(..to_read).collect();
         state.total_read += data.len() as u64;
-
-        // Notify producer
-        self.not_full.notify_one();
-
         return Some(data);
       }
 
@@ -565,12 +481,7 @@ impl StreamingBufferHandle {
   /// Check if the buffer is finished and empty
   pub fn is_eof(&self) -> bool {
     let state = self.inner.lock().unwrap();
-    let used = if state.write_pos >= state.read_pos {
-      state.write_pos - state.read_pos
-    } else {
-      self.capacity - state.read_pos + state.write_pos
-    };
-    state.finished && used == 0
+    state.finished && state.buffer.is_empty()
   }
 
   /// Get total bytes read
@@ -645,34 +556,28 @@ mod tests {
     let handle = buf.clone_handle();
 
     // Write some data
-    buf.write_blocking(b"Hello").unwrap();
+    buf.write_nonblocking(b"Hello").unwrap();
 
     // Read it back
     let data = handle.read_available().unwrap();
     assert_eq!(&data, b"Hello");
 
     // No more data available
-    let data = handle.read_available().unwrap();
-    assert!(data.is_empty());
+    assert!(handle.read_available().is_none());
 
     // Finish and check EOF
     buf.finish();
-    assert!(handle.read_available().is_none());
+    assert_eq!(handle.read_available(), Some(Vec::new()));
   }
 
   #[test]
-  fn test_streaming_buffer_wrap_around() {
+  fn test_streaming_buffer_chunks_large_writes() {
     let buf = StreamingBuffer::new(8);
     let handle = buf.clone_handle();
 
-    // Write and read to advance positions
-    buf.write_blocking(b"1234").unwrap();
-    handle.read_available().unwrap();
-
-    // Now write more to cause wrap-around
-    buf.write_blocking(b"5678").unwrap();
-
-    let data = handle.read_available().unwrap();
-    assert_eq!(&data, b"5678");
+    // A write larger than the preferred read chunk must never block.
+    buf.write_nonblocking(b"123456789ABC").unwrap();
+    assert_eq!(handle.read_available().unwrap(), b"12345678");
+    assert_eq!(handle.read_available().unwrap(), b"9ABC");
   }
 }
