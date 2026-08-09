@@ -427,6 +427,14 @@ test('VideoFrame: properties after close', (t) => {
     codedHeight: 2,
     timestamp: 0,
     duration: 1000,
+    rotation: 90,
+    flip: true,
+    colorSpace: {
+      primaries: 'bt709',
+      transfer: 'bt709',
+      matrix: 'bt709',
+      fullRange: false,
+    },
   })
 
   frame.close()
@@ -436,6 +444,16 @@ test('VideoFrame: properties after close', (t) => {
   t.is(frame.codedHeight, 0)
   t.is(frame.displayWidth, 0)
   t.is(frame.displayHeight, 0)
+  t.is(frame.timestamp, 0)
+  t.is(frame.duration, 1000)
+  t.is(frame.rotation, 90)
+  t.true(frame.flip)
+  t.deepEqual(frame.colorSpace.toJSON(), {
+    primaries: 'bt709',
+    transfer: 'bt709',
+    matrix: 'bt709',
+    fullRange: false,
+  })
 })
 
 // ============================================================================

@@ -201,7 +201,9 @@ test('AudioEncoder: reset during flush', async (t) => {
   await firstOutputPromise
 
   // Flush should be aborted
-  await t.throwsAsync(flushDone, { message: /AbortError/ })
+  const flushError = await t.throwsAsync(flushDone)
+  t.true(flushError instanceof DOMException)
+  t.is(flushError.name, 'AbortError')
 
   // Note: On slow CI runners (QEMU), the worker may produce both outputs via
   // NonBlocking callbacks BEFORE flush() sets inside_flush=true. Once queued,

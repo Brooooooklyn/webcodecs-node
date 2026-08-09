@@ -1738,7 +1738,10 @@ export declare function resetHardwareFallbackState(): void
 
 /** Streaming mode options for muxers */
 export interface StreamingMuxerOptions {
-  /** Maximum bytes returned by each streaming read (default: 256KB). Muxer writes are queued without blocking the JavaScript consumer. */
+  /**
+   * Maximum bytes returned by each streaming read (default: 256KB).
+   * Muxer writes are queued without blocking the JavaScript consumer.
+   */
   bufferCapacity?: number
 }
 

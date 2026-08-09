@@ -283,6 +283,7 @@ import { Mp4Muxer } from '@napi-rs/webcodecs'
 
 const muxer = new Mp4Muxer({
   fragmented: true, // Required for MP4 streaming
+  // Maximum bytes returned by each read(); this is not a memory limit.
   streaming: { bufferCapacity: 256 * 1024 },
 })
 
@@ -302,6 +303,12 @@ if (muxer.isFinished) {
   stream.end()
 }
 ```
+
+Streaming writes are queued in a growable native buffer so `addVideoChunk()`
+and `addAudioChunk()` never wait for JavaScript to call `read()`. Applications
+must drain `read()` regularly; an indefinitely stalled consumer can retain the
+entire muxed output in memory. `bufferCapacity` controls only the maximum size
+of each returned read chunk.
 
 ### VideoFrame from Canvas
 
@@ -682,6 +689,11 @@ For full API documentation, see the [W3C WebCodecs specification](https://w3c.gi
 - Rust (latest stable)
 - Node.js 18+
 - pnpm
+
+The build downloads the pinned FFmpeg 8.0.1 release by default. If you opt out
+of that download or set `FFMPEG_DIR`, the supplied FFmpeg headers and libraries
+must be from FFmpeg 8.x; FFmpeg 7.x system/Homebrew installations are rejected
+by the ABI guard.
 
 ### Build
 

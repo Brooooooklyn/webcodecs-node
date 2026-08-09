@@ -296,7 +296,10 @@ test('VideoEncoder: reset aborts every overlapping flush', async (t) => {
   t.is(outputs, 1)
   t.true(results.every((result) => result.status === 'rejected'))
   for (const result of results) {
-    if (result.status === 'rejected') t.regex(result.reason.message, /AbortError/)
+    if (result.status === 'rejected') {
+      t.true(result.reason instanceof DOMException)
+      t.is(result.reason.name, 'AbortError')
+    }
   }
   encoder.close()
 })

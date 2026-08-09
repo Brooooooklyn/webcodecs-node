@@ -7,7 +7,8 @@ use crate::codec::{CodecContext, DecoderConfig, Frame, Packet, download_hw_frame
 use crate::ffi::{AVCodecID, AVHWDeviceType, accessors::ffctx_set_hw_get_format};
 use crate::webcodecs::encoded_video_chunk::InternalSlice;
 use crate::webcodecs::error::{
-  DOMExceptionName, throw_data_error, throw_invalid_state_error, throw_type_error_unit,
+  DOMExceptionName, native_dom_exception_error, throw_data_error, throw_invalid_state_error,
+  throw_type_error_unit,
 };
 use crate::webcodecs::flush_tracker::FlushTracker;
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
@@ -710,7 +711,7 @@ impl VideoDecoder {
 
       // During flush, queue frames for synchronous delivery in resolver
       // Otherwise, use NonBlocking callback for immediate delivery
-      if guard.flushes.is_active() {
+      if guard.flushes.should_buffer_outputs() {
         guard.pending_frames.push(video_frame);
       } else {
         guard
@@ -852,7 +853,7 @@ impl VideoDecoder {
           guard.config_flip,
           guard.config_color_space.as_ref(),
         );
-        if guard.flushes.is_active() {
+        if guard.flushes.should_buffer_outputs() {
           guard.pending_frames.push(video_frame);
         } else {
           guard
@@ -1700,6 +1701,7 @@ impl VideoDecoder {
           let mut guard = inner
             .lock()
             .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+          guard.flushes.begin_output_delivery(flush_id);
           std::mem::take(&mut guard.pending_frames)
         };
 
@@ -1728,10 +1730,11 @@ impl VideoDecoder {
 
         // Check abort flag after draining all frames
         if abort_flag.load(Ordering::SeqCst) {
-          return Err(Error::new(
-            Status::GenericFailure,
-            "AbortError: The operation was aborted",
-          ));
+          return Err(native_dom_exception_error(
+            env,
+            DOMExceptionName::AbortError,
+            "The operation was aborted",
+          )?);
         }
 
         // Return worker result (errors keep DOMException-style message for now)
@@ -1803,8 +1806,9 @@ impl VideoDecoder {
     inner.flushes.clear();
     inner.pending_frames.clear();
 
-    // Reset the abort flag for new worker
-    self.reset_flag.store(false, Ordering::SeqCst);
+    // Give the new worker a fresh cancellation token. Re-arming the old token
+    // would allow a detached pre-reset worker to resume against new state.
+    self.reset_flag = Arc::new(AtomicBool::new(false));
 
     // Create new channel and worker for future decode operations
     let (sender, receiver) = channel::unbounded();
@@ -1839,7 +1843,7 @@ impl VideoDecoder {
   pub fn close(&mut self, env: Env) -> Result<()> {
     // Check state first - W3C spec: throw InvalidStateError if already closed
     {
-      let inner = self
+      let mut inner = self
         .inner
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
@@ -1847,6 +1851,8 @@ impl VideoDecoder {
       if inner.state == CodecState::Closed {
         return throw_invalid_state_error(&env, "Cannot close an already closed codec");
       }
+
+      inner.flushes.abort_all();
     }
 
     // Drop sender to stop accepting new commands and close channel.

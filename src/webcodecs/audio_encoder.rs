@@ -8,7 +8,9 @@ use crate::codec::{
   Resampler, context::get_audio_encoder_name,
 };
 use crate::ffi::{AVCodecID, AVSampleFormat};
-use crate::webcodecs::error::{DOMExceptionName, throw_invalid_state_error, throw_type_error_unit};
+use crate::webcodecs::error::{
+  DOMExceptionName, native_dom_exception_error, throw_invalid_state_error, throw_type_error_unit,
+};
 use crate::webcodecs::flush_tracker::FlushTracker;
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
 use crate::webcodecs::{
@@ -718,7 +720,7 @@ impl AudioEncoder {
 
         // During flush, queue chunks for synchronous delivery in resolver
         // Otherwise, use NonBlocking callback for immediate delivery
-        if guard.flushes.is_active() {
+        if guard.flushes.should_buffer_outputs() {
           guard.pending_chunks.push((chunk, metadata));
         } else {
           guard.output_callback.call(
@@ -1675,6 +1677,7 @@ impl AudioEncoder {
           let mut guard = inner
             .lock()
             .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+          guard.flushes.begin_output_delivery(flush_id);
           std::mem::take(&mut guard.pending_chunks)
         };
 
@@ -1703,10 +1706,11 @@ impl AudioEncoder {
 
         // Check abort flag after draining all chunks
         if abort_flag.load(Ordering::SeqCst) {
-          return Err(Error::new(
-            Status::GenericFailure,
-            "AbortError: The operation was aborted",
-          ));
+          return Err(native_dom_exception_error(
+            env,
+            DOMExceptionName::AbortError,
+            "The operation was aborted",
+          )?);
         }
 
         // Return worker result (errors keep DOMException-style message for now)
@@ -1765,8 +1769,9 @@ impl AudioEncoder {
     inner.flushes.clear();
     inner.pending_chunks.clear();
 
-    // Reset the abort flag for new worker
-    self.reset_flag.store(false, Ordering::SeqCst);
+    // Give the new worker a fresh cancellation token. Re-arming the old token
+    // would allow a detached pre-reset worker to resume against new state.
+    self.reset_flag = Arc::new(AtomicBool::new(false));
 
     // Create new channel and worker for future encode operations
     let (sender, receiver) = channel::unbounded();
@@ -1792,7 +1797,7 @@ impl AudioEncoder {
   pub fn close(&mut self, env: Env) -> Result<()> {
     // Check state first - W3C spec: throw InvalidStateError if already closed
     {
-      let inner = self
+      let mut inner = self
         .inner
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
@@ -1800,6 +1805,8 @@ impl AudioEncoder {
       if inner.state == CodecState::Closed {
         return throw_invalid_state_error(&env, "Cannot close an already closed codec");
       }
+
+      inner.flushes.abort_all();
     }
 
     // Drop sender to stop accepting new commands and close channel.

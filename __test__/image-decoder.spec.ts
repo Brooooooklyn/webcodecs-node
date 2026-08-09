@@ -69,10 +69,21 @@ test('ImageDecoder PNG throws for out-of-bounds frame_index', async (t) => {
   result.image.close()
 
   // Now try to access invalid frame index
-  await t.throwsAsync(() => decoder.decode({ frameIndex: 999 }), {
+  const error = await t.throwsAsync(() => decoder.decode({ frameIndex: 999 }), {
     message: /out of bounds/,
   })
+  t.true(error instanceof RangeError)
 
+  decoder.close()
+})
+
+test('ImageDecoder MIME mismatch rejects with EncodingError', async (t) => {
+  const data = readFileSync(join(__dirname, 'fixtures/test.png'))
+  const decoder = new ImageDecoder({ data, type: 'image/jpeg' })
+  const error = await t.throwsAsync(decoder.decode())
+
+  t.true(error instanceof DOMException)
+  t.is(error.name, 'EncodingError')
   decoder.close()
 })
 
@@ -238,6 +249,25 @@ test('ImageDecoder.isTypeSupported returns true for supported types', async (t) 
   t.true(await ImageDecoder.isTypeSupported('image/jxl'))
 })
 
+test('ImageDecoder decodes JPEG XL image data', async (t) => {
+  // libjxl/testdata jxl/spline_on_first_frame.jxl at commit 73695d3.
+  // The tiny upstream conformance sample is BSD-3-Clause licensed.
+  const data = Buffer.from(
+    '/wpHQCTYYyAAAHQAAuAoKipGxmAQgF8AAEToz4Qk4ox2AughlkBwAADYY1gAAHAAAuAgKipGxkgAfgEAEKFfEhIJRFhA4YklEBxgCA==',
+    'base64',
+  )
+  const decoder = new ImageDecoder({ data, type: 'image/jxl' })
+  const result = await decoder.decode()
+
+  t.is(result.image.codedWidth, 32)
+  t.is(result.image.codedHeight, 32)
+  t.is(result.image.format, 'RGBX')
+  t.true(result.complete)
+
+  result.image.close()
+  decoder.close()
+})
+
 test('ImageDecoder.isTypeSupported returns false for unsupported types', async (t) => {
   t.false(await ImageDecoder.isTypeSupported('image/unknown'))
   t.false(await ImageDecoder.isTypeSupported('video/mp4'))
@@ -301,6 +331,40 @@ test('ImageDecoder stream becomes ready before EOF once a frame is decodable', a
   await decoder.completed
   t.true(decoder.complete)
   result.image.close()
+  decoder.close()
+})
+
+test('ImageDecoder streamed animation waits for a requested future frame', async (t) => {
+  const data = readFileSync(join(__dirname, 'fixtures/animated.gif'))
+  let controller!: ReadableStreamDefaultController<Uint8Array>
+  const stream = new ReadableStream<Uint8Array>({
+    start(streamController) {
+      controller = streamController
+      // This prefix contains exactly the first of the fixture's three frames.
+      controller.enqueue(data.subarray(0, 900))
+    },
+  })
+  const decoder = new ImageDecoder({ data: stream, type: 'image/gif' })
+
+  await decoder.tracks.ready
+  t.false(decoder.complete)
+  t.is(decoder.tracks.selectedTrack!.frameCount, 1)
+
+  let settled = false
+  const secondFramePromise = decoder.decode({ frameIndex: 1 }).finally(() => {
+    settled = true
+  })
+  await new Promise((resolve) => setTimeout(resolve, 25))
+  t.false(settled, 'decode should wait while the requested frame may still arrive')
+
+  controller.enqueue(data.subarray(900))
+  controller.close()
+  const secondFrame = await secondFramePromise
+  t.is(secondFrame.image.timestamp, 1_000_000)
+  t.true(secondFrame.complete)
+  t.is(decoder.tracks.selectedTrack!.frameCount, 3)
+
+  secondFrame.image.close()
   decoder.close()
 })
 

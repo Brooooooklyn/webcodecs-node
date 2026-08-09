@@ -41,6 +41,17 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: lint-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: lint-cargo-
+
       - name: Install dependencies
         run: pnpm install
 

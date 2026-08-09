@@ -210,6 +210,63 @@ runTest('Mp4Demuxer: seek and demux', async (t) => {
   })
 })
 
+runTest('Mp4Demuxer: rejects overlapping callback demux sessions', async (t) => {
+  let outputCount = 0
+  let resolveOutputs!: () => void
+  const outputs = new Promise<void>((resolve) => {
+    resolveOutputs = resolve
+  })
+  const onOutput = () => {
+    outputCount += 1
+    if (outputCount === 100) resolveOutputs()
+  }
+  const demuxer = new Mp4Demuxer({
+    videoOutput: onOutput,
+    audioOutput: onOutput,
+    error: (error) => t.fail(error.message),
+  })
+  await demuxer.load(path.join(FIXTURES_DIR, 'small_buck_bunny.mp4'))
+
+  // The first session fills the bounded callback queue while this JavaScript
+  // turn is still running, making the overlap deterministic.
+  demuxer.demux(100)
+  t.throws(() => demuxer.demux(1), { message: /already in progress/ })
+
+  await outputs
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  t.is(demuxer.state, 'ready')
+  await t.notThrowsAsync(() => demuxer.demuxAsync(1))
+  demuxer.close()
+})
+
+runTest('Mp4Demuxer: close during callback demux is not reported as an error', async (t) => {
+  let errorCount = 0
+  let resolveClosed!: () => void
+  const closed = new Promise<void>((resolve) => {
+    resolveClosed = resolve
+  })
+  let demuxer!: Mp4Demuxer
+  const onOutput = () => {
+    demuxer.close()
+    resolveClosed()
+  }
+  demuxer = new Mp4Demuxer({
+    videoOutput: onOutput,
+    audioOutput: onOutput,
+    error: () => {
+      errorCount += 1
+    },
+  })
+  await demuxer.load(path.join(FIXTURES_DIR, 'small_buck_bunny.mp4'))
+
+  demuxer.demux(100)
+  await closed
+  await new Promise<void>((resolve) => setImmediate(resolve))
+
+  t.is(demuxer.state, 'closed')
+  t.is(errorCount, 0)
+})
+
 runTest('Mp4Demuxer: state transitions', async (t) => {
   const demuxer = new Mp4Demuxer({
     error: (e: Error) => t.fail(`Error: ${e.message}`),

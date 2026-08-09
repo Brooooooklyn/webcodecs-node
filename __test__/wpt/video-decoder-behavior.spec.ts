@@ -248,7 +248,9 @@ test('VideoDecoder: reset during flush', async (t) => {
   await waitFor(() => outputs >= 1, 'Should get at least one output', 5000)
 
   // Flush should have been aborted
-  await t.throwsAsync(flushPromise, { message: /AbortError/ })
+  const flushError = await t.throwsAsync(flushPromise)
+  t.true(flushError instanceof DOMException)
+  t.is(flushError.name, 'AbortError')
 
   // Note: With native addon multi-threaded implementation, callbacks that were
   // already queued before reset() may still fire. The key test is that flush()
@@ -552,7 +554,9 @@ test('VideoDecoder: new flush after reset in callback', async (t) => {
   firstFlushPromise = decoder.flush()
 
   // First flush should be aborted
-  await t.throwsAsync(firstFlushPromise, { message: /AbortError/ })
+  const firstFlushError = await t.throwsAsync(firstFlushPromise)
+  t.true(firstFlushError instanceof DOMException)
+  t.is(firstFlushError.name, 'AbortError')
 
   // Wait for second flush (may be set by callback)
   // eslint-disable-next-line @typescript-eslint/await-thenable -- type narrowing limitation

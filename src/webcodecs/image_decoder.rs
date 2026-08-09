@@ -8,7 +8,10 @@ use crate::codec::{CodecContext, DecoderConfig, Frame, Packet, ScaleAlgorithm, S
 use crate::ffi::avutil::av_rescale_q;
 use crate::ffi::{AV_NOPTS_VALUE, AVCodecID, AVRational};
 use crate::webcodecs::VideoFrame;
-use crate::webcodecs::error::{invalid_state_error, throw_invalid_state_error};
+use crate::webcodecs::error::{
+  DOMExceptionName, invalid_state_error, native_dom_exception_error, native_range_error,
+  throw_invalid_state_error,
+};
 use futures::stream::StreamExt;
 use napi::bindgen_prelude::*;
 use napi::tokio::sync::Notify;
@@ -571,11 +574,7 @@ impl ImageDecoder {
             }
           };
 
-          let is_ready = inner_clone
-            .lock()
-            .map(|guard| guard.tracks.ready.load(Ordering::Acquire))
-            .unwrap_or(false);
-          if !is_ready && buffered_len >= next_probe_size {
+          if buffered_len >= next_probe_size {
             let probe_inner = inner_clone.clone();
             if matches!(
               spawn_blocking(move || cache_decoded_frames(&probe_inner)).await,
@@ -697,8 +696,9 @@ impl ImageDecoder {
 
     let inner = self.inner.clone();
 
-    // Spawn async task that first waits for ready, then decodes
-    env.spawn_future(async move {
+    // Keep the Rust error as the resolved future value so the completion
+    // callback can construct the precise native JavaScript exception class.
+    let decode = async move {
       // Check if closed before waiting
       {
         let inner_guard = inner
@@ -712,163 +712,46 @@ impl ImageDecoder {
       // Wait for ready promise (ensures initial pre-parsing is complete)
       ready_promise.await?;
 
-      // Now do the actual decode in a blocking task
-      spawn_blocking(move || {
-        let mut inner = inner
+      let frame_index = options.as_ref().and_then(|o| o.frame_index).unwrap_or(0) as usize;
+      let update_notify = {
+        let guard = inner
           .lock()
           .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+        guard.tracks.ready_notify.clone()
+      };
 
-        if inner.closed {
-          return Err(invalid_state_error("ImageDecoder is closed"));
+      // A streamed animated image can establish its tracks before the requested
+      // frame has arrived. Keep the decode pending until a later incremental
+      // probe finds that frame or EOF proves that the index is infeasible.
+      loop {
+        // Register before inspecting the cache so a probe cannot notify in the
+        // narrow interval between the state check and awaiting the signal.
+        let notified = update_notify.notified();
+        let decode_inner = inner.clone();
+        let result = spawn_blocking(move || decode_cached_frame(&decode_inner, frame_index))
+          .await
+          .map_err(|join_error| {
+            Error::new(
+              Status::GenericFailure,
+              format!("Decode task failed: {}", join_error),
+            )
+          })??;
+
+        if let Some(result) = result {
+          return Ok(result);
         }
 
-        let frame_index = options.as_ref().and_then(|o| o.frame_index).unwrap_or(0) as usize;
+        notified.await;
+      }
+    };
 
-        // If frames were cleared (e.g., by reset), re-decode them
-        if inner.cached_frames.is_none() {
-          // Get the data bytes
-          let data_bytes: Vec<u8> = match &inner.data {
-            ImageDecoderData::Buffer(buf) => buf.as_ref().to_vec(),
-            ImageDecoderData::Vec(vec) => vec.clone(),
-            ImageDecoderData::Empty => {
-              return Err(Error::new(Status::GenericFailure, "No data available"));
-            }
-          };
-
-          // Check if codec_id is valid (invalid MIME type at construction is deferred to here)
-          let codec_id = match inner.codec_id {
-            Some(id) => id,
-            None => {
-              return Err(Error::new(
-                Status::GenericFailure,
-                format!("Unsupported image type: {}", inner.mime_type),
-              ));
-            }
-          };
-
-          // Demux the image container before decoding so animated formats feed
-          // one compressed packet per frame instead of one packet for the
-          // entire file.
-          let (context, mut frames) = decode_image_data(codec_id, &data_bytes)?;
-          inner.context = Some(context);
-
-          // Apply preferAnimation: if false and format supports animation, only keep first frame
-          if inner.prefer_animation == Some(false) && !frames.is_empty() {
-            frames.truncate(1);
-            // Mark track as non-animated since user explicitly prefers static
-            if let Ok(mut track_inner) = inner.tracks.inner.lock()
-              && let Some(track) = track_inner.tracks.get_mut(0)
-            {
-              track.animated = false;
-            }
-          }
-
-          // Apply desiredWidth/desiredHeight scaling if both are specified
-          let frames = if let (Some(dw), Some(dh)) = (inner.desired_width, inner.desired_height) {
-            let mut scaled_frames = Vec::with_capacity(frames.len());
-            for frame in frames {
-              let scaler = Scaler::new(
-                frame.width(),
-                frame.height(),
-                frame.format(),
-                dw,
-                dh,
-                frame.format(),
-                ScaleAlgorithm::Lanczos,
-              )
-              .map_err(|e| {
-                Error::new(
-                  Status::GenericFailure,
-                  format!("Failed to create scaler: {}", e),
-                )
-              })?;
-
-              let scaled = scaler.scale_alloc(&frame).map_err(|e| {
-                Error::new(
-                  Status::GenericFailure,
-                  format!("Failed to scale frame: {}", e),
-                )
-              })?;
-              scaled_frames.push(scaled);
-            }
-            scaled_frames
-          } else {
-            frames
-          };
-
-          // Update frame_count
-          if !frames.is_empty()
-            && let Ok(mut track_inner) = inner.tracks.inner.lock()
-            && let Some(track) = track_inner.tracks.get_mut(0)
-          {
-            track.frame_count = frames.len() as u32;
-          }
-
-          // Wrap frames in Arc for efficient sharing from cache
-          let shared_frames: Vec<Arc<ParkingLotRwLock<Frame>>> =
-            frames.into_iter().map(|f| f.into_shared()).collect();
-          inner.cached_frames = Some(shared_frames);
-        }
-
-        // Get reference to cached frames
-        let frames = inner.cached_frames.as_ref().ok_or_else(|| {
-          Error::new(
-            Status::GenericFailure,
-            "No frames available - decoding may have failed",
-          )
-        })?;
-
-        // Validate frame_index
-        if frames.is_empty() {
-          return Err(Error::new(
-            Status::GenericFailure,
-            "No frames decoded from image",
-          ));
-        }
-
-        if frame_index >= frames.len() {
-          return Err(Error::new(
-            Status::InvalidArg,
-            format!(
-              "RangeError: Frame index {} out of bounds (image has {} frames)",
-              frame_index,
-              frames.len()
-            ),
-          ));
-        }
-
-        // Clone the Arc to share the frame data (no pixel copy needed)
-        let frame_arc = frames[frame_index].clone();
-        let frame_guard = frame_arc.read();
-        let pts = frame_guard.pts();
-        let duration = match (frames.len(), frame_guard.duration()) {
-          (count, value) if count > 1 && value > 0 => Some(value),
-          _ => None,
-        };
-        drop(frame_guard);
-
-        // Per Chromium behavior: "default" extracts color space, "none" ignores it
-        let extract_color_space = inner.color_space_conversion == ColorSpaceConversion::Default;
-        let video_frame = VideoFrame::from_internal_arc_with_color_space(
-          frame_arc,
-          pts,
-          duration,
-          extract_color_space,
-        );
-
-        Ok(ImageDecodeResult {
-          image: video_frame,
-          complete: true,
-        })
-      })
-      .await
-      .map_err(|join_error| {
-        Error::new(
-          Status::GenericFailure,
-          format!("Decode task failed: {}", join_error),
-        )
-      })?
-    })
+    env.spawn_future_with_callback(
+      async move { Ok(decode.await) },
+      |env, result| match result {
+        Ok(result) => Ok(result),
+        Err(error) => Err(native_image_decode_error(env, error)?),
+      },
+    )
   }
 
   /// Reset the decoder
@@ -933,6 +816,98 @@ impl ImageDecoder {
   pub async fn is_type_supported(mime_type: String) -> bool {
     parse_mime_type(&mime_type).is_ok()
   }
+}
+
+fn native_image_decode_error(env: &Env, error: Error) -> Result<Error> {
+  if let Some(message) = error.reason.strip_prefix("RangeError:") {
+    return native_range_error(env, message.trim());
+  }
+  if let Some(message) = error.reason.strip_prefix("InvalidStateError:") {
+    return native_dom_exception_error(env, DOMExceptionName::InvalidStateError, message.trim());
+  }
+  if error.reason.starts_with("Unsupported image type:") {
+    return native_dom_exception_error(env, DOMExceptionName::NotSupportedError, &error.reason);
+  }
+
+  native_dom_exception_error(env, DOMExceptionName::EncodingError, &error.reason)
+}
+
+/// Return a requested cached frame, or None while a streamed image may still
+/// grow to contain that frame. This implementation only emits complete frames;
+/// completeFramesOnly=false therefore retains the allowed complete-frame
+/// behavior rather than exposing partial progressive generations.
+fn decode_cached_frame(
+  inner: &Arc<Mutex<ImageDecoderInner>>,
+  frame_index: usize,
+) -> Result<Option<ImageDecodeResult>> {
+  let (needs_cache, data_complete) = {
+    let guard = inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    if guard.closed {
+      return Err(invalid_state_error("ImageDecoder is closed"));
+    }
+    (
+      guard.cached_frames.is_none(),
+      guard.complete.load(Ordering::Acquire),
+    )
+  };
+
+  // A reset can clear the cache. For fully buffered input, reconstruct it now;
+  // for a live stream, wait for the collector's next successful probe.
+  if needs_cache {
+    if !data_complete {
+      return Ok(None);
+    }
+    cache_decoded_frames(inner)?;
+  }
+
+  let guard = inner
+    .lock()
+    .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+  if guard.closed {
+    return Err(invalid_state_error("ImageDecoder is closed"));
+  }
+
+  let frames = guard.cached_frames.as_ref().ok_or_else(|| {
+    Error::new(
+      Status::GenericFailure,
+      "No frames available - decoding may have failed",
+    )
+  })?;
+  let data_complete = guard.complete.load(Ordering::Acquire);
+
+  if frame_index >= frames.len() {
+    if !data_complete {
+      return Ok(None);
+    }
+    return Err(Error::new(
+      Status::InvalidArg,
+      format!(
+        "RangeError: Frame index {} out of bounds (image has {} frames)",
+        frame_index,
+        frames.len()
+      ),
+    ));
+  }
+
+  // Clone the Arc to share the frame data (no pixel copy needed).
+  let frame_arc = frames[frame_index].clone();
+  let frame_guard = frame_arc.read();
+  let pts = frame_guard.pts();
+  let frame_duration = frame_guard.duration();
+  let duration = (frames.len() > 1 && frame_duration > 0).then_some(frame_duration);
+  drop(frame_guard);
+
+  // Per Chromium behavior: "default" extracts color space, "none" ignores it.
+  let extract_color_space = guard.color_space_conversion == ColorSpaceConversion::Default;
+  let video_frame =
+    VideoFrame::from_internal_arc_with_color_space(frame_arc, pts, duration, extract_color_space);
+
+  Ok(Some(ImageDecodeResult {
+    image: video_frame,
+    complete: true,
+  }))
 }
 
 /// Pre-parse image and cache decoded frames

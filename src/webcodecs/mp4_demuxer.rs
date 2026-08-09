@@ -281,6 +281,11 @@ impl Mp4Demuxer {
   /// Otherwise, reads all packets until end of stream.
   #[napi]
   pub fn demux(&self, count: Option<u32>) -> Result<()> {
+    {
+      let mut guard = with_demuxer_inner_mut!(self);
+      guard.begin_callback_demux()?;
+    }
+
     let inner = self.inner.clone();
     let max_packets = count.unwrap_or(u32::MAX);
 
@@ -304,6 +309,11 @@ impl Mp4Demuxer {
   /// `for await (const chunk of demuxer) { ... }`
   #[napi]
   pub async fn demux_async(&self, count: Option<u32>) -> Result<()> {
+    {
+      let mut guard = with_demuxer_inner_mut!(self);
+      guard.begin_callback_demux()?;
+    }
+
     let inner = self.inner.clone();
     let max_packets = count.unwrap_or(u32::MAX);
 

@@ -685,11 +685,17 @@ impl<F: MuxerFormat> MuxerInner<F> {
       .as_ref()
       .map(|c| c.sample_rate)
       .unwrap_or(48000) as i64;
-    let pts_in_samples = timestamp * sample_rate / 1_000_000;
+    let audio_time_base = AVRational {
+      num: 1,
+      den: sample_rate as i32,
+    };
+    let pts_in_samples = unsafe {
+      crate::ffi::avutil::av_rescale_q(timestamp, AVRational::MICROSECONDS, audio_time_base)
+    };
 
     // Ensure monotonically increasing PTS (audio time base is 1/sample_rate)
     let pts = if pts_in_samples <= self.last_audio_pts {
-      self.last_audio_pts + 1
+      self.last_audio_pts.saturating_add(1)
     } else {
       pts_in_samples
     };
@@ -699,7 +705,8 @@ impl<F: MuxerFormat> MuxerInner<F> {
     packet.set_dts(pts); // Audio has no B-frames, DTS always equals PTS
 
     if let Some(dur) = duration {
-      let duration_in_samples = dur * sample_rate / 1_000_000;
+      let duration_in_samples =
+        unsafe { crate::ffi::avutil::av_rescale_q(dur, AVRational::MICROSECONDS, audio_time_base) };
       packet.set_duration(duration_in_samples);
     }
 

@@ -267,6 +267,12 @@ pub struct DemuxerInner<F: DemuxerFormat> {
   pub audio_callback: Option<AudioOutputCallback>,
   /// Error callback
   pub error_callback: Option<ErrorCallback>,
+  /// Whether a callback-based demux()/demuxAsync() session currently owns the
+  /// packet stream. FFmpeg packet reads are serialized by the mutex, but the
+  /// JavaScript callbacks happen after that mutex is released. Without an
+  /// explicit session guard, two callers can therefore enqueue adjacent
+  /// packets in the opposite order.
+  callback_demux_active: bool,
   /// Phantom data for format type
   _format: PhantomData<F>,
 }
@@ -287,7 +293,37 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
       video_callback,
       audio_callback,
       error_callback: Some(error_callback),
+      callback_demux_active: false,
       _format: PhantomData,
+    }
+  }
+
+  /// Reserve the packet stream for one callback-based demux session.
+  pub fn begin_callback_demux(&mut self) -> Result<()> {
+    if self.callback_demux_active {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "A demux operation is already in progress",
+      ));
+    }
+
+    if self.state != DemuxerState::Ready {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "Demuxer is not ready for a callback demux operation",
+      ));
+    }
+
+    self.callback_demux_active = true;
+    Ok(())
+  }
+
+  /// Release a callback-based demux session. A count-limited batch remains
+  /// usable for a later batch, while EOF and close keep their terminal states.
+  fn finish_callback_demux(&mut self) {
+    self.callback_demux_active = false;
+    if self.state == DemuxerState::Demuxing {
+      self.state = DemuxerState::Ready;
     }
   }
 
@@ -641,6 +677,21 @@ pub fn demux_with_callbacks<F: DemuxerFormat>(
   inner: &Arc<Mutex<DemuxerInner<F>>>,
   max_packets: u32,
 ) -> Result<()> {
+  let result = demux_with_callbacks_inner(inner, max_packets);
+
+  // Always release the session, including lock/callback errors. The public
+  // entry points reserve it before spawning this blocking work.
+  if let Ok(mut guard) = inner.lock() {
+    guard.finish_callback_demux();
+  }
+
+  result
+}
+
+fn demux_with_callbacks_inner<F: DemuxerFormat>(
+  inner: &Arc<Mutex<DemuxerInner<F>>>,
+  max_packets: u32,
+) -> Result<()> {
   for _ in 0..max_packets {
     let (next, video_callback, audio_callback, error_callback) = {
       let mut guard = inner
@@ -669,7 +720,13 @@ pub fn demux_with_callbacks<F: DemuxerFormat>(
       }
       Ok(None) => break,
       Err(error) => {
-        if let Some(callback) = error_callback {
+        // close() is an intentional cancellation, not a demux failure. Avoid
+        // surfacing the next read's state check through the error callback.
+        let closed = inner
+          .lock()
+          .map(|guard| guard.state == DemuxerState::Closed)
+          .unwrap_or(false);
+        if !closed && let Some(callback) = error_callback {
           let _ = callback.call(error, ThreadsafeFunctionCallMode::Blocking);
         }
         break;

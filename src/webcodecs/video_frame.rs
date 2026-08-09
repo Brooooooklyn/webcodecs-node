@@ -1044,7 +1044,6 @@ struct VideoFrameInner {
   /// Horizontal flip
   flip: bool,
   color_space: VideoColorSpace,
-  closed: bool,
 }
 
 /// Get (horizontal_factor, vertical_factor) sub-sampling for chroma planes
@@ -1193,9 +1192,12 @@ fn parse_visible_rect(
 #[napi]
 pub struct VideoFrame {
   inner: Arc<Mutex<Option<VideoFrameInner>>>,
-  /// Timestamp and duration live outside the detachable resource per WebCodecs.
+  /// Frame metadata lives outside the detachable resource per WebCodecs.
   timestamp_us: i64,
   duration_us: Option<i64>,
+  rotation: f64,
+  flip: bool,
+  color_space: VideoColorSpace,
 }
 
 /// Parse rotation value per W3C spec algorithm
@@ -1214,6 +1216,9 @@ impl VideoFrame {
     Self {
       timestamp_us: inner.timestamp_us,
       duration_us: inner.duration_us,
+      rotation: inner.rotation,
+      flip: inner.flip,
+      color_space: inner.color_space.clone(),
       inner: Arc::new(Mutex::new(Some(inner))),
     }
   }
@@ -1243,11 +1248,7 @@ impl VideoFrame {
           .inner
           .lock()
           .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-        let is_closed = match guard.as_ref() {
-          None => true,
-          Some(inner) => inner.closed,
-        };
-        if is_closed {
+        if guard.is_none() {
           return throw_invalid_state_error(&env, "VideoFrame is closed");
         }
       }
@@ -1453,7 +1454,6 @@ impl VideoFrame {
       rotation,
       flip,
       color_space,
-      closed: false,
     };
 
     Ok(Self::from_inner(inner))
@@ -1746,7 +1746,6 @@ impl VideoFrame {
         rotation: combined_rotation,
         flip: combined_flip,
         color_space: source_inner.color_space.clone(),
-        closed: false,
       };
 
       Ok(VideoFrame::from_inner(new_inner))
@@ -1774,7 +1773,6 @@ impl VideoFrame {
       rotation: 0.0,
       flip: false,
       color_space: VideoColorSpace::default(),
-      closed: false,
     };
 
     Self::from_inner(inner)
@@ -1809,7 +1807,6 @@ impl VideoFrame {
       rotation: 0.0,
       flip: false,
       color_space: VideoColorSpace::default(),
-      closed: false,
     };
 
     Self::from_inner(inner)
@@ -1873,7 +1870,6 @@ impl VideoFrame {
       rotation: parsed_rotation,
       flip,
       color_space,
-      closed: false,
     };
 
     Self::from_inner(inner)
@@ -1915,7 +1911,6 @@ impl VideoFrame {
       rotation: 0.0,
       flip: false,
       color_space,
-      closed: false,
     };
 
     Self::from_inner(inner)
@@ -1958,7 +1953,6 @@ impl VideoFrame {
       rotation: 0.0,
       flip: false,
       color_space,
-      closed: false,
     };
 
     Self::from_inner(inner)
@@ -1973,7 +1967,7 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) if !inner.closed => Ok(Some(inner.original_format)),
+      Some(inner) => Ok(Some(inner.original_format)),
       _ => Ok(None),
     }
   }
@@ -1987,7 +1981,7 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) if !inner.closed => Ok(inner.frame.read().width()),
+      Some(inner) => Ok(inner.frame.read().width()),
       _ => Ok(0),
     }
   }
@@ -2001,7 +1995,7 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) if !inner.closed => Ok(inner.frame.read().height()),
+      Some(inner) => Ok(inner.frame.read().height()),
       _ => Ok(0),
     }
   }
@@ -2015,7 +2009,7 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) if !inner.closed => Ok(inner.display_width),
+      Some(inner) => Ok(inner.display_width),
       _ => Ok(0),
     }
   }
@@ -2029,7 +2023,7 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) if !inner.closed => Ok(inner.display_height),
+      Some(inner) => Ok(inner.display_height),
       _ => Ok(0),
     }
   }
@@ -2045,7 +2039,7 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) if !inner.closed => {
+      Some(inner) => {
         let frame_guard = inner.frame.read();
         Ok(DOMRectReadOnly {
           x: 0.0,
@@ -2069,7 +2063,7 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) if !inner.closed => Ok(DOMRectReadOnly {
+      Some(inner) => Ok(DOMRectReadOnly {
         x: inner.visible_left as f64,
         y: inner.visible_top as f64,
         width: inner.visible_width as f64,
@@ -2098,7 +2092,7 @@ impl VideoFrame {
   /// Get the color space parameters
   #[napi(getter)]
   pub fn color_space(&self) -> Result<VideoColorSpace> {
-    self.with_inner(|inner| Ok(inner.color_space.clone()))
+    Ok(self.color_space.clone())
   }
 
   /// Get whether this VideoFrame has been closed (W3C WebCodecs spec)
@@ -2109,7 +2103,7 @@ impl VideoFrame {
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    Ok(guard.is_none() || guard.as_ref().is_none_or(|i| i.closed))
+    Ok(guard.is_none())
   }
 
   /// Get the number of planes in this VideoFrame (W3C WebCodecs spec)
@@ -2126,7 +2120,7 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) if !inner.closed => Ok(Self::get_number_of_planes(inner.original_format)),
+      Some(inner) => Ok(Self::get_number_of_planes(inner.original_format)),
       _ => throw_invalid_state_error(&env, "VideoFrame is closed"),
     }
   }
@@ -2134,13 +2128,13 @@ impl VideoFrame {
   /// Get the rotation in degrees clockwise (0, 90, 180, 270) - W3C WebCodecs spec
   #[napi(getter)]
   pub fn rotation(&self) -> Result<f64> {
-    self.with_inner(|inner| Ok(inner.rotation))
+    Ok(self.rotation)
   }
 
   /// Get whether horizontal flip is applied - W3C WebCodecs spec
   #[napi(getter)]
   pub fn flip(&self) -> Result<bool> {
-    self.with_inner(|inner| Ok(inner.flip))
+    Ok(self.flip)
   }
 
   /// Get the metadata associated with this VideoFrame - W3C WebCodecs spec
@@ -2159,7 +2153,7 @@ impl VideoFrame {
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
     let inner = match guard.as_ref() {
-      Some(inner) if !inner.closed => inner,
+      Some(inner) => inner,
       _ => return throw_invalid_state_error(&env, "VideoFrame is closed"),
     };
 
@@ -2269,7 +2263,7 @@ impl VideoFrame {
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
       let inner = match guard.as_ref() {
-        Some(inner) if !inner.closed => inner,
+        Some(inner) => inner,
         _ => return Err(invalid_state_error("VideoFrame is closed")),
       };
 
@@ -2375,7 +2369,7 @@ impl VideoFrame {
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
       let inner = match guard.as_ref() {
-        Some(inner) if !inner.closed => inner,
+        Some(inner) => inner,
         _ => return Err(invalid_state_error("VideoFrame is closed")),
       };
 
@@ -2859,7 +2853,7 @@ impl VideoFrame {
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
     let inner = match guard.as_ref() {
-      Some(inner) if !inner.closed => inner,
+      Some(inner) => inner,
       _ => return throw_invalid_state_error(&env, "VideoFrame is closed"),
     };
 
@@ -2878,7 +2872,6 @@ impl VideoFrame {
       rotation: inner.rotation,
       flip: inner.flip,
       color_space: inner.color_space.clone(),
-      closed: false,
     };
 
     Ok(VideoFrame::from_inner(new_inner))
@@ -2939,7 +2932,7 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) if !inner.closed => f(inner),
+      Some(inner) => f(inner),
       _ => Err(invalid_state_error("VideoFrame is closed")),
     }
   }

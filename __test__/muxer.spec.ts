@@ -199,6 +199,49 @@ test('WebMMuxer: constructor creates muxer', (t) => {
   muxer.close()
 })
 
+test('WebMMuxer: streaming output does not block when reads are delayed', async (t) => {
+  const chunks: EncodedVideoChunk[] = []
+  const encoder = new VideoEncoder({
+    output: (chunk) => chunks.push(chunk),
+    error: (error) => t.fail(error.message),
+  })
+  encoder.configure({
+    codec: 'vp8',
+    width: 64,
+    height: 64,
+    bitrate: 100_000,
+    hardwareAcceleration: 'prefer-software',
+  })
+  for (let index = 0; index < 20; index++) {
+    const frame = generateSolidColorI420Frame(64, 64, TestColors.red, index * 33_333)
+    encoder.encode(frame, { keyFrame: index === 0 })
+    frame.close()
+  }
+  await encoder.flush()
+  encoder.close()
+
+  // Sixteen bytes is deliberately smaller than the container header. The old
+  // fixed ring buffer deadlocked in addVideoChunk() before JavaScript could read.
+  const muxer = new WebMMuxer({ live: true, streaming: { bufferCapacity: 16 } })
+  muxer.addVideoTrack({ codec: 'vp8', width: 64, height: 64, framerate: 30 })
+  for (const chunk of chunks) muxer.addVideoChunk(chunk)
+  t.is(muxer.finalize().length, 0)
+
+  const outputParts: Uint8Array[] = []
+  for (;;) {
+    const part = muxer.read()
+    t.truthy(part, 'finalized streaming muxer should return data or EOF')
+    if (!part || part.length === 0) break
+    t.true(part.length <= 16)
+    outputParts.push(part)
+  }
+  const output = Buffer.concat(outputParts)
+  t.true(output.length > 16)
+  t.deepEqual([...output.subarray(0, 4)], [0x1a, 0x45, 0xdf, 0xa3])
+  t.true(muxer.isFinished)
+  muxer.close()
+})
+
 test('WebMMuxer: can add video track', (t) => {
   const muxer = new WebMMuxer()
 
