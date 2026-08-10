@@ -503,7 +503,7 @@ jobs:
   build-ffmpeg-windows-x64:
     name: Build x86_64-pc-windows-msvc
     # x265's multi-lib build uses the Visual Studio 17 2022 CMake generator.
-    runs-on: windows-2022
+    runs-on: windows-2025
     permissions:
       id-token: write
       attestations: write
