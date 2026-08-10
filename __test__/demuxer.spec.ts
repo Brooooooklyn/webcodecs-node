@@ -9,6 +9,8 @@ import { promises as fs } from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
 
+import { waitFor } from './helpers/index.js'
+
 // Skip demuxer tests on Linux armv7 (QEMU emulation too slow, causes timeouts)
 const isLinuxArmv7 = process.platform === 'linux' && process.arch === 'arm'
 const runTest = isLinuxArmv7 ? test.skip : test
@@ -145,22 +147,23 @@ runTest('Mp4Demuxer: demux video chunks', async (t) => {
         // Demux a limited number of packets
         demuxer.demux(20)
 
-        // Wait a bit for demuxing to complete
-        setTimeout(() => {
-          if (!errorOccurred) {
-            t.true(videoChunks.length > 0, 'Should have demuxed video chunks')
+        // Poll for the callbacks instead of assuming a fixed wall-clock budget is
+        // enough to drain the native worker (notably under emulated ARM CI).
+        waitFor(() => errorOccurred || videoChunks.length > 0, 'demuxed video chunks')
+          .then(() => {
+            if (!errorOccurred) {
+              t.true(videoChunks.length > 0, 'Should have demuxed video chunks')
 
-            // Check first chunk properties
-            if (videoChunks.length > 0) {
+              // Check first chunk properties
               const firstChunk = videoChunks[0]
               t.truthy(firstChunk.type, 'Chunk should have type')
               t.true(firstChunk.byteLength > 0, 'Chunk should have data')
-            }
 
-            demuxer.close()
-            resolve()
-          }
-        }, 500)
+              demuxer.close()
+              resolve()
+            }
+          })
+          .catch(reject)
       })
       .catch(reject)
   })
@@ -668,17 +671,19 @@ runTest('WebMDemuxer: demux VP9 video chunks', async (t) => {
       .then(() => {
         demuxer.demux(20)
 
-        setTimeout(() => {
-          if (!errorOccurred) {
-            t.true(videoChunks.length > 0, 'Should have demuxed video chunks')
-            if (videoChunks.length > 0) {
+        // Poll for the callbacks instead of assuming a fixed wall-clock budget is
+        // enough to drain the native worker (notably under emulated ARM CI).
+        waitFor(() => errorOccurred || videoChunks.length > 0, 'demuxed video chunks')
+          .then(() => {
+            if (!errorOccurred) {
+              t.true(videoChunks.length > 0, 'Should have demuxed video chunks')
               t.truthy(videoChunks[0].type, 'Chunk should have type')
               t.true(videoChunks[0].byteLength > 0, 'Chunk should have data')
+              demuxer.close()
+              resolve()
             }
-            demuxer.close()
-            resolve()
-          }
-        }, 500)
+          })
+          .catch(reject)
       })
       .catch(reject)
   })
@@ -1031,17 +1036,19 @@ runTest('MkvDemuxer: demux H.264 video chunks', async (t) => {
       .then(() => {
         demuxer.demux(20)
 
-        setTimeout(() => {
-          if (!errorOccurred) {
-            t.true(videoChunks.length > 0, 'Should have demuxed video chunks')
-            if (videoChunks.length > 0) {
+        // Poll for the callbacks instead of assuming a fixed wall-clock budget is
+        // enough to drain the native worker (notably under emulated ARM CI).
+        waitFor(() => errorOccurred || videoChunks.length > 0, 'demuxed video chunks')
+          .then(() => {
+            if (!errorOccurred) {
+              t.true(videoChunks.length > 0, 'Should have demuxed video chunks')
               t.truthy(videoChunks[0].type, 'Chunk should have type')
               t.true(videoChunks[0].byteLength > 0, 'Chunk should have data')
+              demuxer.close()
+              resolve()
             }
-            demuxer.close()
-            resolve()
-          }
-        }, 500)
+          })
+          .catch(reject)
       })
       .catch(reject)
   })
