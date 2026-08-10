@@ -805,6 +805,39 @@ Cflags: -I${{includedir}}{}
     self.run_command_visible(&mut cmd)
   }
 
+  /// Clone a repository at a specific revision and reject stale source reuse.
+  fn git_clone_at_revision(&self, url: &str, revision: &str, dest: &Path) -> io::Result<()> {
+    self.git_clone(url, Some(revision), dest)?;
+
+    let resolve_revision = |revision: &str| -> io::Result<String> {
+      let output = Command::new("git")
+        .arg("-C")
+        .arg(dest)
+        .args(["rev-parse", "--verify", &format!("{revision}^{{commit}}")])
+        .output()?;
+
+      if !output.status.success() {
+        return Err(io::Error::other(format!(
+          "Source checkout {} does not contain requested revision {revision}; remove it and rerun",
+          dest.display()
+        )));
+      }
+
+      Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+
+    let current_revision = resolve_revision("HEAD")?;
+    let requested_revision = resolve_revision(revision)?;
+    if current_revision != requested_revision {
+      return Err(io::Error::other(format!(
+        "Source checkout {} is at {current_revision}, not requested revision {revision} ({requested_revision}); remove it and rerun",
+        dest.display()
+      )));
+    }
+
+    Ok(())
+  }
+
   /// Download and extract a tarball
   fn download_tarball(&self, url: &str, dest: &Path) -> io::Result<()> {
     if dest.exists() {
@@ -2183,7 +2216,7 @@ Cflags: -I${{includedir}}
     self.info("Building FFmpeg...");
 
     let source = self.source_dir.join("FFmpeg");
-    self.git_clone(FFMPEG_REPO, Some(&self.ffmpeg_version), &source)?;
+    self.git_clone_at_revision(FFMPEG_REPO, &self.ffmpeg_version, &source)?;
 
     let prefix_str = self.prefix.to_string_lossy().to_string();
     let include_dir = self.prefix.join("include");
@@ -2663,9 +2696,34 @@ fn main() {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::time::{SystemTime, UNIX_EPOCH};
 
   fn args(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_string()).collect()
+  }
+
+  fn run_git(directory: &Path, args: &[&str]) {
+    let status = Command::new("git")
+      .args(args)
+      .current_dir(directory)
+      .env("GIT_TERMINAL_PROMPT", "0")
+      .env("GIT_EDITOR", "true")
+      .status()
+      .unwrap();
+    assert!(status.success(), "git {args:?} failed");
+  }
+
+  fn temporary_directory(name: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .unwrap()
+      .as_nanos();
+    let directory = env::temp_dir().join(format!(
+      "webcodecs-node-{name}-{}-{nonce}",
+      std::process::id()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    directory
   }
 
   #[test]
@@ -2687,5 +2745,50 @@ mod tests {
       Err(error) => error,
     };
     assert_eq!(error, "Missing argument for --ffmpeg-version");
+  }
+
+  #[test]
+  fn rejects_reusing_checkout_at_different_revision() {
+    let root = temporary_directory("git-revision");
+    let repository = root.join("repository");
+    let checkout = root.join("checkout");
+    fs::create_dir_all(&repository).unwrap();
+
+    run_git(&repository, &["init", "--quiet"]);
+    run_git(&repository, &["config", "user.name", "Test User"]);
+    run_git(&repository, &["config", "user.email", "test@example.com"]);
+    run_git(&repository, &["config", "commit.gpgSign", "false"]);
+    run_git(&repository, &["config", "tag.gpgSign", "false"]);
+    fs::write(repository.join("version"), "n8.0\n").unwrap();
+    run_git(&repository, &["add", "version"]);
+    run_git(&repository, &["commit", "--quiet", "-m", "FFmpeg 8"]);
+    run_git(&repository, &["tag", "--no-sign", "n8.0"]);
+    fs::write(repository.join("version"), "n9.0\n").unwrap();
+    run_git(&repository, &["commit", "--quiet", "-am", "FFmpeg 9"]);
+    run_git(&repository, &["tag", "--no-sign", "n9.0"]);
+
+    let context = BuildContext::new(
+      root.join("output"),
+      root.join("source"),
+      None,
+      1,
+      false,
+      false,
+      true,
+    );
+    let repository_url = repository.to_string_lossy();
+    context
+      .git_clone_at_revision(&repository_url, "n8.0", &checkout)
+      .unwrap();
+    context
+      .git_clone_at_revision(&repository_url, "n8.0", &checkout)
+      .unwrap();
+
+    let error = context
+      .git_clone_at_revision(&repository_url, "n9.0", &checkout)
+      .unwrap_err();
+    assert!(error.to_string().contains("not requested revision n9.0"));
+
+    fs::remove_dir_all(root).unwrap();
   }
 }
