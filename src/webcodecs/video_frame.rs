@@ -1234,13 +1234,17 @@ impl VideoFrame {
     ts_args_type = "source: VideoFrame | Uint8Array | CanvasLike, init?: VideoFrameBufferInit | VideoFrameInit"
   )]
   pub fn new(env: Env, source: Unknown, init: Option<VideoFrameConstructorInit>) -> Result<Self> {
-    // Try VideoFrame first (check for codedWidth property which only VideoFrame has)
-    if let Ok(source_obj) = source.coerce_to_object()
-      && source_obj.has_named_property("codedWidth").unwrap_or(false)
-    {
-      // It's a VideoFrame - unwrap and use frame clone path
-      let video_frame: &VideoFrame =
-        unsafe { <&VideoFrame>::from_napi_value(env.raw(), source.raw())? };
+    // Try VideoFrame first. This is a real `instanceof` check rather than a probe for
+    // `codedWidth`: any object could carry that property, and unwrapping a non-VideoFrame
+    // would blindly cast a foreign pointer to `&VideoFrame`.
+    if VideoFrame::instance_of(&env, &source).unwrap_or(false) {
+      // It's a VideoFrame - unwrap and use frame clone path.
+      // `ClassInstance` is the only unwrap permitted inside a native call; `<&VideoFrame>`
+      // registers a native borrow, which napi only allows while the generated argument
+      // conversion is still in scope.
+      let source_instance =
+        unsafe { ClassInstance::<VideoFrame>::from_napi_value(env.raw(), source.raw())? };
+      let video_frame: &VideoFrame = &source_instance;
 
       // Check if source is closed and throw native DOMException
       {
