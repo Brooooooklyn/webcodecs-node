@@ -7,6 +7,7 @@
 //! 4. Downloading pre-built FFmpeg from GitHub Releases (Linux/Windows/macOS)
 
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -466,7 +467,14 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
     }
     hasher.update(&buffer[..count]);
   }
-  Ok(format!("{:x}", hasher.finalize()))
+  // `sha2` 0.11 returns a `hybrid-array` `Array`, which no longer implements
+  // `LowerHex`, so the digest is rendered byte by byte.
+  let digest = hasher.finalize();
+  let mut hex = String::with_capacity(digest.len() * 2);
+  for byte in digest {
+    write!(hex, "{byte:02x}").expect("writing to a String never fails");
+  }
+  Ok(hex)
 }
 
 /// Compile the C accessor library
