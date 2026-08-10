@@ -56,12 +56,12 @@ pub enum AVCodecID {
   Bmp = 78, // BMP image
   Gif = 97, // GIF image
   Vp8 = 139,
-  Vp9 = 167,
-  Webp = 171, // WebP image
-  Hevc = 173, // H.265
-  Av1 = 225,
-  Jpegxl = 258,
-  JpegxlAnim = 272,
+  Vp9 = 166,
+  Webp = 170, // WebP image
+  Hevc = 172, // H.265
+  Av1 = 222,
+  Jpegxl = 255,
+  JpegxlAnim = 269,
   // Audio codecs (starting at 0x10000 = 65536)
   PcmS16le = 65536, // PCM signed 16-bit little-endian
   PcmS16be = 65537, // PCM signed 16-bit big-endian
@@ -70,13 +70,13 @@ pub enum AVCodecID {
   PcmS8 = 65540,    // PCM signed 8-bit
   PcmU8 = 65541,    // PCM unsigned 8-bit
   PcmF32le = 65557, // PCM 32-bit float little-endian
-  PcmF32be = 65558, // PCM 32-bit float big-endian
+  PcmF32be = 65556, // PCM 32-bit float big-endian
   PcmF64le = 65559, // PCM 64-bit double little-endian
-  PcmF64be = 65560, // PCM 64-bit double big-endian
+  PcmF64be = 65558, // PCM 64-bit double big-endian
   PcmS32le = 65544, // PCM signed 32-bit little-endian
   PcmS32be = 65545, // PCM signed 32-bit big-endian
-  PcmS24le = 65566, // PCM signed 24-bit little-endian
-  PcmS24be = 65567, // PCM signed 24-bit big-endian
+  PcmS24le = 65548, // PCM signed 24-bit little-endian
+  PcmS24be = 65549, // PCM signed 24-bit big-endian
   Mp2 = 86016,      // MPEG Audio Layer 2
   Mp3 = 86017,      // MPEG Audio Layer 3
   Aac = 86018,      // Advanced Audio Coding
@@ -219,12 +219,12 @@ impl AVCodecID {
       78 => Self::Bmp,
       97 => Self::Gif,
       139 => Self::Vp8,
-      167 => Self::Vp9,
-      171 => Self::Webp,
-      173 => Self::Hevc,
-      225 => Self::Av1,
-      258 => Self::Jpegxl,
-      272 => Self::JpegxlAnim,
+      166 => Self::Vp9,
+      170 => Self::Webp,
+      172 => Self::Hevc,
+      222 => Self::Av1,
+      255 => Self::Jpegxl,
+      269 => Self::JpegxlAnim,
       65536 => Self::PcmS16le,
       65537 => Self::PcmS16be,
       65538 => Self::PcmU16le,
@@ -233,12 +233,12 @@ impl AVCodecID {
       65541 => Self::PcmU8,
       65544 => Self::PcmS32le,
       65545 => Self::PcmS32be,
+      65556 => Self::PcmF32be,
       65557 => Self::PcmF32le,
-      65558 => Self::PcmF32be,
+      65558 => Self::PcmF64be,
       65559 => Self::PcmF64le,
-      65560 => Self::PcmF64be,
-      65566 => Self::PcmS24le,
-      65567 => Self::PcmS24be,
+      65548 => Self::PcmS24le,
+      65549 => Self::PcmS24be,
       86016 => Self::Mp2,
       86017 => Self::Mp3,
       86018 => Self::Aac,
@@ -290,7 +290,7 @@ pub enum AVPixelFormat {
   Yuva420p10le = 87, // I420AP10
   Yuva422p10le = 89, // I422AP10
   Yuva444p10le = 91, // I444AP10
-  // Hardware formats - FFmpeg 8.x (libavutil 60) values
+  // Hardware formats - FFmpeg 9.x (libavutil 61) values
   // Verified against ffmpeg-src/FFmpeg/libavutil/pixfmt.h
   Videotoolbox = 157,
   Cuda = 117,
@@ -423,7 +423,7 @@ impl AVPixelFormat {
       87 => Self::Yuva420p10le,
       89 => Self::Yuva422p10le,
       91 => Self::Yuva444p10le,
-      // Hardware formats - FFmpeg 8.x (libavutil 60) values
+      // Hardware formats - FFmpeg 9.x (libavutil 61) values
       // Verified against ffmpeg-src/FFmpeg/libavutil/pixfmt.h
       157 => Self::Videotoolbox,
       117 => Self::Cuda,

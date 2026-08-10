@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       ffmpeg_version:
-        description: 'FFmpeg version tag (e.g., n8.0.1)'
+        description: 'FFmpeg version tag (e.g., n9.0)'
         required: true
-        default: 'n8.0.1'
+        default: 'n9.0'
 
 env:
-  FFMPEG_VERSION: ${{ github.event.inputs.ffmpeg_version || 'n8.0.1' }}
+  FFMPEG_VERSION: ${{ github.event.inputs.ffmpeg_version || 'n9.0' }}
 
 jobs:
   # Build for x86_64 and aarch64 targets using zig
@@ -54,6 +54,7 @@ jobs:
         run: |
           cargo build --release -p build-ffmpeg
           ./target/release/build-ffmpeg \
+            --ffmpeg-version "$FFMPEG_VERSION" \
             --target ${{ matrix.target }} \
             --output ./ffmpeg-${{ matrix.target }} \
             --verbose
@@ -244,7 +245,7 @@ jobs:
 
       - name: Clone FFmpeg
         run: |
-          git clone --depth=1 -b ${{ env.FFMPEG_VERSION }} https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          git clone --depth=1 -b "$env:FFMPEG_VERSION" https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
 
       - name: Build FFmpeg with MSVC toolchain
         shell: msys2 {0}
@@ -501,7 +502,8 @@ jobs:
   # Build Windows x64 from source with rav1e (libaom crashes on Windows MSVC)
   build-ffmpeg-windows-x64:
     name: Build x86_64-pc-windows-msvc
-    runs-on: windows-latest
+    # x265's multi-lib build uses the Visual Studio 17 2022 CMake generator.
+    runs-on: windows-2022
     permissions:
       id-token: write
       attestations: write
@@ -670,7 +672,7 @@ jobs:
 
       - name: Clone FFmpeg
         run: |
-          git clone --depth=1 -b ${{ env.FFMPEG_VERSION }} https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          git clone --depth=1 -b "$env:FFMPEG_VERSION" https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
 
       - name: Build FFmpeg with MSVC toolchain
         shell: msys2 {0}
@@ -1015,6 +1017,7 @@ jobs:
           export CXXFLAGS="-march=armv7-a -mfpu=neon -mfloat-abi=hard"
           cargo build --release -p build-ffmpeg
           ./target/release/build-ffmpeg \
+            --ffmpeg-version "$FFMPEG_VERSION" \
             --target armv7-unknown-linux-gnueabihf \
             --output ./ffmpeg-armv7-unknown-linux-gnueabihf \
             --use-system-cc \
@@ -1075,6 +1078,7 @@ jobs:
         run: |
           cargo build --release -p build-ffmpeg
           ./target/release/build-ffmpeg \
+            --ffmpeg-version "$FFMPEG_VERSION" \
             --target x86_64-apple-darwin \
             --output ./ffmpeg-x86_64-apple-darwin \
             --use-system-cc \
@@ -1132,6 +1136,7 @@ jobs:
         run: |
           cargo build --release -p build-ffmpeg
           ./target/release/build-ffmpeg \
+            --ffmpeg-version "$FFMPEG_VERSION" \
             --target aarch64-apple-darwin \
             --output ./ffmpeg-aarch64-apple-darwin \
             --use-system-cc \
@@ -1181,6 +1186,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ffmpeg-${{ env.FFMPEG_VERSION }}
+          target_commitish: ${{ github.sha }}
           name: FFmpeg ${{ env.FFMPEG_VERSION }} Static Builds
           body: |
             Pre-built FFmpeg ${{ env.FFMPEG_VERSION }} static libraries.

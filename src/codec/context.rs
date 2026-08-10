@@ -48,7 +48,7 @@ pub struct DecoderCreationResult {
   /// Whether the decoder uses hardware acceleration
   pub is_hardware: bool,
   /// Hardware pixel format as raw FFmpeg value if using hardware decoding
-  /// This is the raw AV_PIX_FMT_* value (e.g., 157 for VideoToolbox in FFmpeg 8.x)
+  /// This is the raw AV_PIX_FMT_* value (e.g., 157 for VideoToolbox in FFmpeg 9.x)
   pub hw_pix_fmt_raw: Option<i32>,
 }
 
