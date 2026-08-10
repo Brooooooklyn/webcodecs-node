@@ -9,28 +9,14 @@ allowBuilds:
   '@seydx/node-av-win32-x64-mingw': true
   '@seydx/node-av-win32-x64-msvc': true
   esbuild: true
-  minimumReleaseAgeExclude:
-    - '@emnapi/*'
-    - '@napi-rs/*'
-    - '@oxc-node/*'
-    - '@oxfmt/*'
-    - '@oxlint-tsgolint/*'
-    - '@oxlint/*'
-    - emnapi
-    - oxfmt
-    - oxlint
-    - oxlint-tsgolint
 minimumReleaseAgeExclude:
-  - '@napi-rs/canvas-android-arm64@1.0.5'
-  - '@napi-rs/canvas-darwin-arm64@1.0.5'
-  - '@napi-rs/canvas-darwin-x64@1.0.5'
-  - '@napi-rs/canvas-linux-arm-gnueabihf@1.0.5'
-  - '@napi-rs/canvas-linux-arm64-gnu@1.0.5'
-  - '@napi-rs/canvas-linux-arm64-musl@1.0.5'
-  - '@napi-rs/canvas-linux-riscv64-gnu@1.0.5'
-  - '@napi-rs/canvas-linux-x64-gnu@1.0.5'
-  - '@napi-rs/canvas-linux-x64-musl@1.0.5'
-  - '@napi-rs/canvas-win32-arm64-msvc@1.0.5'
-  - '@napi-rs/canvas-win32-x64-msvc@1.0.5'
-  - '@napi-rs/canvas@1.0.5'
-  - '@napi-rs/cli@3.8.4'
+  - '@emnapi/*'
+  - '@napi-rs/*'
+  - '@oxc-node/*'
+  - '@oxfmt/*'
+  - '@oxlint-tsgolint/*'
+  - '@oxlint/*'
+  - emnapi
+  - oxfmt
+  - oxlint
+  - oxlint-tsgolint
