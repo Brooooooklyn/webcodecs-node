@@ -9,14 +9,14 @@ allowBuilds:
   '@seydx/node-av-win32-x64-mingw': true
   '@seydx/node-av-win32-x64-msvc': true
   esbuild: true
-  minimumReleaseAgeExclude:
-    - '@emnapi/*'
-    - '@napi-rs/*'
-    - '@oxc-node/*'
-    - '@oxfmt/*'
-    - '@oxlint-tsgolint/*'
-    - '@oxlint/*'
-    - emnapi
-    - oxfmt
-    - oxlint
-    - oxlint-tsgolint
+minimumReleaseAgeExclude:
+  - '@emnapi/*'
+  - '@napi-rs/*'
+  - '@oxc-node/*'
+  - '@oxfmt/*'
+  - '@oxlint-tsgolint/*'
+  - '@oxlint/*'
+  - emnapi
+  - oxfmt
+  - oxlint
+  - oxlint-tsgolint

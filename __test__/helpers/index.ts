@@ -63,15 +63,29 @@ export async function hasHevcAlphaSupport(): Promise<boolean> {
       hardwareAcceleration: 'prefer-software',
     })
 
-    // Wait for potential async error
-    setTimeout(() => {
+    // The "unsupported" verdict arrives asynchronously on the error callback. A
+    // negative can therefore be detected as soon as it lands, while a positive can
+    // only be concluded by waiting. Poll for the negative and fall back to a
+    // generous deadline, rather than betting the verdict on a fixed 50ms budget a
+    // loaded runner can overshoot -- a misdetection here silently poisons every
+    // test that depends on it. The result is cached for the rest of the process.
+    const deadline = Date.now() + 2_000
+    const settle = () => {
       hevcAlphaSupportChecked = true
       hevcAlphaSupported = encoder.state === 'configured' && !errorReceived
       if (encoder.state !== 'closed') {
         encoder.close()
       }
       resolve(hevcAlphaSupported)
-    }, 50)
+    }
+    const poll = () => {
+      if (errorReceived || encoder.state !== 'configured' || Date.now() >= deadline) {
+        settle()
+        return
+      }
+      setTimeout(poll, 10)
+    }
+    setTimeout(poll, 10)
   })
 }
 

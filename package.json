@@ -62,31 +62,31 @@
     ]
   },
   "devDependencies": {
-    "@emnapi/core": "^1.8.1",
-    "@emnapi/runtime": "^1.8.1",
-    "@napi-rs/canvas": "^1.0.0",
-    "@napi-rs/cli": "^3.5.1",
-    "@napi-rs/wasm-runtime": "^1.1.1",
+    "@emnapi/core": "^1.11.3",
+    "@emnapi/runtime": "^1.11.3",
+    "@napi-rs/canvas": "^1.0.5",
+    "@napi-rs/cli": "^3.8.4",
+    "@napi-rs/wasm-runtime": "^1.2.2",
     "@oxc-node/cli": "^0.1.0",
     "@oxc-node/core": "^0.1.0",
     "@taplo/cli": "^0.7.0",
-    "@tybys/wasm-util": "^0.10.1",
-    "@types/node": "^25.0.10",
-    "ava": "^8.0.0",
+    "@tybys/wasm-util": "^0.10.3",
+    "@types/node": "^26.2.0",
+    "ava": "^8.0.1",
     "chalk": "^6.0.0",
-    "emnapi": "^1.8.1",
+    "emnapi": "^1.11.3",
     "husky": "^9.1.7",
-    "lint-staged": "^17.0.0",
-    "mediabunny": "1.50.8",
-    "npm-run-all2": "^9.0.0",
-    "oxfmt": "^0.59.0",
-    "oxlint": "^1.41.0",
-    "oxlint-tsgolint": "^7.0.0",
-    "prettier": "^3.8.1",
-    "tinybench": "^6.0.0",
-    "typescript": "^7.0.0",
+    "lint-staged": "^17.3.0",
+    "mediabunny": "1.53.0",
+    "npm-run-all2": "^9.0.3",
+    "oxfmt": "^0.62.0",
+    "oxlint": "^1.77.0",
+    "oxlint-tsgolint": "^7.0.2001",
+    "prettier": "^3.9.6",
+    "tinybench": "^6.1.2",
+    "typescript": "^7.0.2",
     "webcodecs-polyfill": "^1.0.1",
-    "vite-plugin-mkcert": "^2.0.0"
+    "vite-plugin-mkcert": "^2.1.0"
   },
   "peerDependencies": {
     "@napi-rs/canvas": ">=0.1.0"
@@ -112,7 +112,7 @@
       "armv7-unknown-linux-gnueabihf"
     ]
   },
-  "packageManager": "pnpm@11.14.0",
+  "packageManager": "pnpm@11.21.0",
   "ava": {
     "environmentVariables": {
       "TS_NODE_PROJECT": "./tsconfig.json"

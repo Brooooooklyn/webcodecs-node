@@ -15,6 +15,7 @@ import {
   TestColors,
   hasHardwareAcceleration,
   hasHevcAlphaSupport,
+  waitFor,
   type EncodedVideoChunk,
 } from './helpers/index.js'
 import { createEncoderConfig } from './helpers/codec-matrix.js'
@@ -623,8 +624,9 @@ test.serial('VideoEncoder: HEVC alpha encoding fails with hardware acceleration'
     hardwareAcceleration: 'prefer-hardware',
   })
 
-  // Wait for error callback (async due to ThreadsafeFunctionCallMode::NonBlocking)
-  await new Promise((resolve) => setTimeout(resolve, 100))
+  // Wait for error callback (async due to ThreadsafeFunctionCallMode::NonBlocking).
+  // Poll rather than budget a fixed 100ms, which a loaded CI runner can overshoot.
+  await waitFor(() => errors.length >= 1, 'hardware HEVC alpha error to be reported')
 
   t.true(errors.length >= 1, 'Should report an error for hardware HEVC alpha')
   t.true(
