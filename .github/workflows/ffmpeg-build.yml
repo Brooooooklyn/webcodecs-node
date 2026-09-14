@@ -38,7 +38,7 @@ jobs:
       - name: Setup zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
 
       - name: Setup nasm
         uses: ilammy/setup-nasm@v1

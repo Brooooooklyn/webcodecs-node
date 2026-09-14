@@ -62,28 +62,28 @@
     ]
   },
   "devDependencies": {
-    "@emnapi/core": "^1.11.3",
-    "@emnapi/runtime": "^1.11.3",
-    "@napi-rs/canvas": "^1.0.5",
-    "@napi-rs/cli": "^3.8.4",
-    "@napi-rs/wasm-runtime": "^1.2.2",
-    "@oxc-node/cli": "^0.1.0",
-    "@oxc-node/core": "^0.1.0",
+    "@emnapi/core": "^2.0.0-alpha.5",
+    "@emnapi/runtime": "^2.0.0-alpha.5",
+    "@napi-rs/canvas": "^1.0.9",
+    "@napi-rs/cli": "^3.9.1",
+    "@napi-rs/wasm-runtime": "^1.2.4",
+    "@oxc-node/cli": "^0.1.2",
+    "@oxc-node/core": "^0.1.2",
     "@taplo/cli": "^0.7.0",
-    "@tybys/wasm-util": "^0.10.3",
-    "@types/node": "^26.2.0",
+    "@tybys/wasm-util": "^0.10.4",
+    "@types/node": "^26.5.1",
     "ava": "^8.0.1",
     "chalk": "^6.0.0",
-    "emnapi": "^1.11.3",
+    "emnapi": "^2.0.0-alpha.5",
     "husky": "^9.1.7",
-    "lint-staged": "^17.3.0",
-    "mediabunny": "1.55.1",
+    "lint-staged": "^17.5.1",
+    "mediabunny": "1.56.2",
     "npm-run-all2": "^9.0.3",
-    "oxfmt": "^0.64.0",
-    "oxlint": "^1.77.0",
+    "oxfmt": "^0.68.0",
+    "oxlint": "^1.83.0",
     "oxlint-tsgolint": "^7.0.2001",
     "prettier": "^3.9.6",
-    "tinybench": "^6.1.2",
+    "tinybench": "^6.2.0",
     "typescript": "^7.0.2",
     "webcodecs-polyfill": "^1.0.1",
     "vite-plugin-mkcert": "^2.1.0"
@@ -112,7 +112,7 @@
       "armv7-unknown-linux-gnueabihf"
     ]
   },
-  "packageManager": "pnpm@11.22.0",
+  "packageManager": "pnpm@12.4.1",
   "ava": {
     "environmentVariables": {
       "TS_NODE_PROJECT": "./tsconfig.json"
