@@ -151,7 +151,7 @@ jobs:
       - uses: mlugg/setup-zig@v2
         if: ${{ contains(matrix.settings.target, 'musl') }}
         with:
-          version: 0.15.2
+          version: 0.16.0
       - name: Install cargo-zigbuild
         uses: taiki-e/install-action@v2
         if: ${{ contains(matrix.settings.target, 'musl') }}
@@ -235,7 +235,13 @@ jobs:
     steps:
       - name: Setup tools
         run: |
-          apt-get update
+          # bullseye is EOL: deb.debian.org purged its packages.
+          # Use the snapshot.debian.org sources shipped (commented out) in the image.
+          sed -i \
+            -e 's|^# deb http://snapshot.debian.org|deb http://snapshot.debian.org|' \
+            -e 's|^deb http://deb.debian.org|# deb http://deb.debian.org|' \
+            /etc/apt/sources.list
+          apt-get update -o Acquire::Check-Valid-Until=false
           apt-get install -y \
             gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
             libc6-dev-armhf-cross libatomic1-armhf-cross \

@@ -9,6 +9,15 @@ allowBuilds:
   '@seydx/node-av-win32-x64-mingw': true
   '@seydx/node-av-win32-x64-msvc': true
   esbuild: true
+# pnpm 12 resolves the physical CPU (arm64) even under Rosetta, but the
+# x86_64-apple-darwin test job runs x64 Node on arm64 runners and needs
+# x64 variants of platform packages (node-av, esbuild) installed.
+supportedArchitectures:
+  os:
+    - current
+  cpu:
+    - current
+    - x64
 minimumReleaseAgeExclude:
   - '@emnapi/*'
   - '@napi-rs/*'

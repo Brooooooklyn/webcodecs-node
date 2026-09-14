@@ -177,6 +177,7 @@ export type TypedArray =
   | Float64Array
   | BigInt64Array
   | BigUint64Array
+
 /**
  * AudioData - represents uncompressed audio data
  *
@@ -1246,10 +1247,7 @@ export declare class WebMMuxer {
 }
 
 /** AAC bitstream format (W3C WebCodecs AAC Registration) */
-export type AacBitstreamFormat = /** Raw AAC frames - metadata in description */
-| 'aac'
-/** ADTS frames - metadata in each frame */
-| 'adts'
+export type AacBitstreamFormat = 'aac' | 'adts'
 
 /** AAC encoder configuration (W3C WebCodecs AAC Registration) */
 export interface AacEncoderConfig {
@@ -1268,10 +1266,7 @@ export interface AddEventListenerOptions {
  * Alpha channel handling option (W3C WebCodecs spec)
  * Default is "discard" per spec
  */
-export type AlphaOption = /** Keep alpha channel if present */
-| 'keep'
-/** Discard alpha channel (default per W3C spec) */
-| 'discard'
+export type AlphaOption = 'keep' | 'discard'
 
 /** Options for copyTo operation */
 export interface AudioDataCopyToOptions {
@@ -1353,28 +1348,10 @@ export interface AudioEncoderSupport {
 }
 
 /** Audio sample format (WebCodecs spec) */
-export type AudioSampleFormat = /** Unsigned 8-bit integer samples| interleaved */
-| 'u8'
-/** Signed 16-bit integer samples| interleaved */
-| 's16'
-/** Signed 32-bit integer samples| interleaved */
-| 's32'
-/** 32-bit float samples| interleaved */
-| 'f32'
-/** Unsigned 8-bit integer samples| planar */
-| 'u8-planar'
-/** Signed 16-bit integer samples| planar */
-| 's16-planar'
-/** Signed 32-bit integer samples| planar */
-| 's32-planar'
-/** 32-bit float samples| planar */
-| 'f32-planar'
+export type AudioSampleFormat = 'u8' | 's16' | 's32' | 'f32' | 'u8-planar' | 's16-planar' | 's32-planar' | 'f32-planar'
 
 /** AVC (H.264) bitstream format (W3C WebCodecs AVC Registration) */
-export type AvcBitstreamFormat = /** AVC format with parameter sets in description (ISO 14496-15) */
-| 'avc'
-/** Annex B format with parameter sets in bitstream */
-| 'annexb'
+export type AvcBitstreamFormat = 'avc' | 'annexb'
 
 /** AVC (H.264) encoder configuration (W3C WebCodecs AVC Registration) */
 export interface AvcEncoderConfig {
@@ -1383,24 +1360,13 @@ export interface AvcEncoderConfig {
 }
 
 /** Bitrate mode for audio encoding (W3C WebCodecs spec) */
-export type BitrateMode = /** Variable bitrate (default) */
-| 'variable'
-/** Constant bitrate */
-| 'constant'
+export type BitrateMode = 'variable' | 'constant'
 
 /** Encoder state per WebCodecs spec */
-export type CodecState = /** Encoder not configured */
-| 'unconfigured'
-/** Encoder configured and ready */
-| 'configured'
-/** Encoder closed */
-| 'closed'
+export type CodecState = 'unconfigured' | 'configured' | 'closed'
 
 /** ColorSpaceConversion for ImageDecoder (W3C WebCodecs spec) */
-export type ColorSpaceConversion = /** Apply default color space conversion (spec default) */
-| 'default'
-/** No color space conversion */
-| 'none'
+export type ColorSpaceConversion = 'default' | 'none'
 
 /** Audio decoder configuration exposed to JavaScript */
 export interface DemuxerAudioDecoderConfig {
@@ -1467,10 +1433,7 @@ export interface EncodedAudioChunkMetadataJs {
 }
 
 /** Type of encoded audio chunk */
-export type EncodedAudioChunkType = /** Key chunk - can be decoded independently */
-| 'key'
-/** Delta chunk - depends on previous chunks */
-| 'delta'
+export type EncodedAudioChunkType = 'key' | 'delta'
 
 /** Output callback metadata per WebCodecs spec */
 export interface EncodedVideoChunkMetadata {
@@ -1497,10 +1460,7 @@ export interface EncodedVideoChunkMetadataJs {
 }
 
 /** Type of encoded video chunk */
-export type EncodedVideoChunkType = /** Keyframe - can be decoded independently */
-| 'key'
-/** Delta frame - depends on previous frames */
-| 'delta'
+export type EncodedVideoChunkType = 'key' | 'delta'
 
 /** Options for removeEventListener (W3C DOM spec) */
 export interface EventListenerOptions {
@@ -1525,12 +1485,7 @@ export declare function getHardwareAccelerators(): Array<HardwareAccelerator>
 export declare function getPreferredHardwareAccelerator(): string | null
 
 /** Hardware acceleration preference (W3C WebCodecs spec) */
-export type HardwareAcceleration = /** No preference - may use hardware or software */
-| 'no-preference'
-/** Prefer hardware acceleration */
-| 'prefer-hardware'
-/** Prefer software implementation */
-| 'prefer-software'
+export type HardwareAcceleration = 'no-preference' | 'prefer-hardware' | 'prefer-software'
 
 /** Hardware accelerator information */
 export interface HardwareAccelerator {
@@ -1543,10 +1498,7 @@ export interface HardwareAccelerator {
 }
 
 /** HEVC (H.265) bitstream format (W3C WebCodecs HEVC Registration) */
-export type HevcBitstreamFormat = /** HEVC format with parameter sets in description (ISO 14496-15) */
-| 'hevc'
-/** Annex B format with parameter sets in bitstream */
-| 'annexb'
+export type HevcBitstreamFormat = 'hevc' | 'annexb'
 
 /** HEVC (H.265) encoder configuration (W3C WebCodecs HEVC Registration) */
 export interface HevcEncoderConfig {
@@ -1566,10 +1518,7 @@ export interface ImageDecodeOptions {
 export declare function isHardwareAcceleratorAvailable(name: string): boolean
 
 /** Latency mode for video encoding (W3C WebCodecs spec) */
-export type LatencyMode = /** Optimize for quality (default) */
-| 'quality'
-/** Optimize for low latency */
-| 'realtime'
+export type LatencyMode = 'quality' | 'realtime'
 
 /** Audio track configuration for MKV muxer */
 export interface MkvAudioTrackConfig {
@@ -1648,18 +1597,10 @@ export interface Mp4VideoTrackConfig {
 }
 
 /** Opus application mode (W3C WebCodecs Opus Registration) */
-export type OpusApplication = /** Optimize for VoIP (speech intelligibility) */
-| 'voip'
-/** Optimize for audio fidelity (default) */
-| 'audio'
-/** Minimize coding delay */
-| 'lowdelay'
+export type OpusApplication = 'voip' | 'audio' | 'lowdelay'
 
 /** Opus bitstream format (W3C WebCodecs Opus Registration) */
-export type OpusBitstreamFormat = /** Opus packets (RFC 6716) - no metadata needed for decoding */
-| 'opus'
-/** Ogg encapsulation (RFC 7845) - metadata in description */
-| 'ogg'
+export type OpusBitstreamFormat = 'opus' | 'ogg'
 
 /** Opus encoder configuration (W3C WebCodecs Opus Registration) */
 export interface OpusEncoderConfig {
@@ -1685,12 +1626,7 @@ export interface OpusEncoderConfig {
 }
 
 /** Opus signal type hint (W3C WebCodecs Opus Registration) */
-export type OpusSignal = /** Auto-detect signal type */
-| 'auto'
-/** Music signal */
-| 'music'
-/** Voice/speech signal */
-| 'voice'
+export type OpusSignal = 'auto' | 'music' | 'voice'
 
 /** Layout information for a single plane per WebCodecs spec */
 export interface PlaneLayout {
@@ -1733,16 +1669,7 @@ export interface SvcOutputMetadataJs {
 }
 
 /** Video color primaries (W3C WebCodecs spec) */
-export type VideoColorPrimaries = /** BT.709 / sRGB primaries */
-| 'bt709'
-/** BT.470 BG (PAL) */
-| 'bt470bg'
-/** SMPTE 170M (NTSC) */
-| 'smpte170m'
-/** BT.2020 (UHD) */
-| 'bt2020'
-/** SMPTE 432 (DCI-P3) */
-| 'smpte432'
+export type VideoColorPrimaries = 'bt709' | 'bt470bg' | 'smpte170m' | 'bt2020' | 'smpte432'
 
 /** Options for addEventListener (W3C DOM spec) */
 export interface VideoDecoderAddEventListenerOptions {
@@ -1799,12 +1726,7 @@ export interface VideoDecoderSupport {
 }
 
 /** Bitrate mode for video encoding (W3C WebCodecs spec) */
-export type VideoEncoderBitrateMode = /** Variable bitrate (default) */
-| 'variable'
-/** Constant bitrate */
-| 'constant'
-/** Use quantizer parameter from codec-specific options */
-| 'quantizer'
+export type VideoEncoderBitrateMode = 'variable' | 'constant' | 'quantizer'
 
 /** Encode options per WebCodecs spec */
 export interface VideoEncoderEncodeOptions {
@@ -1899,76 +1821,34 @@ export interface VideoFrameRect {
 }
 
 /** Video matrix coefficients (W3C WebCodecs spec) */
-export type VideoMatrixCoefficients = /** RGB (identity matrix) */
-| 'rgb'
-/** BT.709 */
-| 'bt709'
-/** BT.470 BG */
-| 'bt470bg'
-/** SMPTE 170M */
-| 'smpte170m'
-/** BT.2020 non-constant luminance */
-| 'bt2020-ncl'
+export type VideoMatrixCoefficients = 'rgb' | 'bt709' | 'bt470bg' | 'smpte170m' | 'bt2020-ncl'
 
 /** Video pixel format (WebCodecs spec) */
-export type VideoPixelFormat = /** Planar YUV 4:2:0| 12bpp| (1 Cr & Cb sample per 2x2 Y samples) */
-| 'I420'
-/** Planar YUV 4:2:0| 12bpp| with alpha plane */
-| 'I420A'
-/** Planar YUV 4:2:2| 16bpp */
-| 'I422'
-/** Planar YUV 4:2:2| 16bpp| with alpha plane */
-| 'I422A'
-/** Planar YUV 4:4:4| 24bpp */
-| 'I444'
-/** Planar YUV 4:4:4| 24bpp| with alpha plane */
-| 'I444A'
-/** Planar YUV 4:2:0| 10-bit */
-| 'I420P10'
-/** Planar YUV 4:2:0| 10-bit| with alpha plane */
-| 'I420AP10'
-/** Planar YUV 4:2:2| 10-bit */
-| 'I422P10'
-/** Planar YUV 4:2:2| 10-bit| with alpha plane */
-| 'I422AP10'
-/** Planar YUV 4:4:4| 10-bit */
-| 'I444P10'
-/** Planar YUV 4:4:4| 10-bit| with alpha plane */
-| 'I444AP10'
-/** Planar YUV 4:2:0| 12-bit */
-| 'I420P12'
-/** Planar YUV 4:2:2| 12-bit */
-| 'I422P12'
-/** Planar YUV 4:4:4| 12-bit */
-| 'I444P12'
-/** Semi-planar YUV 4:2:0| 12bpp (Y plane + interleaved UV) */
-| 'NV12'
-/** Semi-planar YUV 4:2:0| 12bpp (Y plane + interleaved VU) - per W3C WebCodecs spec */
-| 'NV21'
-/** RGBA 32bpp */
-| 'RGBA'
-/** RGBX 32bpp (alpha ignored) */
-| 'RGBX'
-/** BGRA 32bpp */
-| 'BGRA'
-/** BGRX 32bpp (alpha ignored) */
-| 'BGRX'
+export type VideoPixelFormat =
+  | 'I420'
+  | 'I420A'
+  | 'I422'
+  | 'I422A'
+  | 'I444'
+  | 'I444A'
+  | 'I420P10'
+  | 'I420AP10'
+  | 'I422P10'
+  | 'I422AP10'
+  | 'I444P10'
+  | 'I444AP10'
+  | 'I420P12'
+  | 'I422P12'
+  | 'I444P12'
+  | 'NV12'
+  | 'NV21'
+  | 'RGBA'
+  | 'RGBX'
+  | 'BGRA'
+  | 'BGRX'
 
 /** Video transfer characteristics (W3C WebCodecs spec) */
-export type VideoTransferCharacteristics = /** BT.709 transfer */
-| 'bt709'
-/** SMPTE 170M transfer */
-| 'smpte170m'
-/** IEC 61966-2-1 (sRGB) - technical name */
-| 'iec61966-2-1'
-/** sRGB transfer (alias for iec61966-2-1) */
-| 'srgb'
-/** Linear transfer */
-| 'linear'
-/** Perceptual Quantizer (HDR) */
-| 'pq'
-/** Hybrid Log-Gamma (HDR) */
-| 'hlg'
+export type VideoTransferCharacteristics = 'bt709' | 'smpte170m' | 'iec61966-2-1' | 'srgb' | 'linear' | 'pq' | 'hlg'
 
 /** Audio track configuration for WebM muxer */
 export interface WebMAudioTrackConfig {
