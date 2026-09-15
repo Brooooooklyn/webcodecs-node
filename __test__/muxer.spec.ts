@@ -1335,9 +1335,12 @@ test('Mp4Muxer: sampleEntry override validation', async (t) => {
     t.is(getMp4VideoSampleEntryTag(mp4Data), 'hvc1', "forced 'hvc1' selects hvc1")
   }
 
-  // Forced 'hvc1' with an incomplete description is an error, not a fallback
+  // Forced 'hvc1' with an incomplete description is an error, not a fallback,
+  // and the rejected attempt must leave no stream behind: retrying with a
+  // valid track on the same muxer must produce exactly one video track whose
+  // samples all demux (fragmented output exercises the header path).
   {
-    const muxer = new Mp4Muxer()
+    const muxer = new Mp4Muxer({ fragmented: true })
     t.throws(
       () =>
         muxer.addVideoTrack({
@@ -1350,7 +1353,30 @@ test('Mp4Muxer: sampleEntry override validation', async (t) => {
         }),
       { instanceOf: Error, message: /hvc1 sample entry requested/ },
     )
+    muxer.addVideoTrack({
+      codec: 'hev1.1.6.L93.B0',
+      width: 128,
+      height: 128,
+      framerate: 30,
+      description,
+      sampleEntry: 'hev1',
+    })
+    for (const chunk of chunks) muxer.addVideoChunk(chunk)
+    muxer.flush()
+    const mp4Data = muxer.finalize()
     muxer.close()
+
+    const demuxedChunks: EncodedVideoChunk[] = []
+    const demuxer = new Mp4Demuxer({
+      videoOutput: (chunk) => demuxedChunks.push(chunk),
+      error: (e) => t.fail(`Demuxer error: ${e.message}`),
+    })
+    await demuxer.loadBuffer(mp4Data)
+    const videoTracks = demuxer.tracks.filter((track) => track.trackType === 'video')
+    t.is(videoTracks.length, 1, 'retry must leave exactly one video track')
+    await demuxer.demuxAsync()
+    demuxer.close()
+    t.is(demuxedChunks.length, chunks.length, 'all samples demux after the retry')
   }
 
   // Unknown values and non-HEVC tracks are rejected
