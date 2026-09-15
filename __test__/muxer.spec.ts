@@ -969,6 +969,57 @@ test('Mp4Muxer: hvc1 strip preserves edit-list trimming of discarded tail sample
   t.is(hvc1, control, 'hvc1 strip must preserve the trimmed edit list')
 })
 
+test('Mp4Muxer: hvc1 strip preserves edit-list trimming of a discarded keyframe', async (t) => {
+  // Fixture: head-trimmed edit list (media_time skips one frame) with
+  // duplicate in-band parameter sets in sample 1 — the skipped keyframe.
+  // Stripping must not lose KEY|DISCARD: keyframe marking must OR, not
+  // assign, or the trimmed head frame is restored in the output edit list.
+  const fixture = readFileSync(join(__dirname, 'fixtures/hevc-trimmed-head.mp4'))
+  const demuxedChunks: EncodedVideoChunk[] = []
+  const demuxer = new Mp4Demuxer({
+    videoOutput: (chunk) => demuxedChunks.push(chunk),
+    error: (e) => t.fail(`Demuxer error: ${e.message}`),
+  })
+  await demuxer.loadBuffer(fixture)
+  const config = demuxer.videoDecoderConfig
+  t.truthy(config, 'Fixture should expose a video decoder config')
+  t.truthy(config?.description, 'Fixture should carry an hvcC description')
+  if (!config?.description) {
+    demuxer.close()
+    return
+  }
+  await demuxer.demuxAsync()
+  demuxer.close()
+
+  const muxWith = (description?: Uint8Array) => {
+    const muxer = new Mp4Muxer()
+    muxer.addVideoTrack({
+      codec: config.codec,
+      width: config.codedWidth,
+      height: config.codedHeight,
+      framerate: 30,
+      description,
+    })
+    for (const chunk of demuxedChunks) muxer.addVideoChunk(chunk)
+    muxer.flush()
+    const out = muxer.finalize()
+    muxer.close()
+    return out
+  }
+
+  const hvcc = new Uint8Array(config.description)
+  const elstMediaTime = (mp4: Uint8Array): number => {
+    const text = Buffer.from(mp4).toString('latin1')
+    const view = new DataView(mp4.buffer, mp4.byteOffset)
+    return view.getUint32(text.indexOf('elst') + 16)
+  }
+
+  const control = elstMediaTime(muxWith(hvccWithoutPps(hvcc)))
+  const hvc1 = elstMediaTime(muxWith(hvcc))
+  t.is(control, 512, 'control should keep the one-frame head trim')
+  t.is(hvc1, control, 'hvc1 strip must preserve the trimmed head keyframe')
+})
+
 test('Mp4Muxer: rejects metadata description changes under hvc1', async (t) => {
   // Encoder chunks carry their description via metadata.decoderConfig; a
   // changed description mid-stream must be rejected under hvc1 just like
@@ -1022,7 +1073,19 @@ test('Mp4Muxer: rejects metadata description changes under hvc1', async (t) => {
     { instanceOf: Error },
   )
   t.regex(err?.message ?? '', /description changed mid-stream/)
+
+  // The rejection must not corrupt muxer timing state: chunks added after
+  // the failed call keep their own timestamps rather than extending the
+  // rejected chunk's position.
+  for (let i = 1; i < 3; i++) muxer.addVideoChunk(big.chunks[i], big.metadatas[i])
+  muxer.flush()
+  const mp4Data = muxer.finalize()
   muxer.close()
+  const text = Buffer.from(mp4Data).toString('latin1')
+  const view = new DataView(mp4Data.buffer, mp4Data.byteOffset)
+  const mvhd = text.indexOf('mvhd')
+  const durationMs = (view.getUint32(mvhd + 20) / view.getUint32(mvhd + 16)) * 1000
+  t.true(durationMs > 50 && durationMs < 150, `output should stay 3 frames (~100ms), got ${durationMs}ms`)
 })
 
 test('Mp4Muxer: keeps hev1 and preserves in-band parameter sets when hvcC is incomplete', async (t) => {

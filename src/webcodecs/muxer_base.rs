@@ -569,6 +569,23 @@ impl<F: MuxerFormat> MuxerInner<F> {
           "HEVC description changed mid-stream, which the 'hvc1' sample entry cannot represent",
         ));
       }
+      // The same change can arrive via metadata.decoderConfig.description
+      // (e.g. chunks from a second encoder session). Reject it here, before
+      // any timestamp state is touched, so the muxer stays usable afterwards.
+      let metadata_desc: Option<&[u8]> = metadata
+        .as_ref()
+        .and_then(|m| m.decoder_config.as_ref())
+        .and_then(|c| c.description.as_ref())
+        .map(|d| &d[..]);
+      if let Some(desc_data) = metadata_desc
+        && !desc_data.is_empty()
+        && desc_data != hvc1.extradata.as_slice()
+      {
+        return Err(Error::new(
+          Status::GenericFailure,
+          "HEVC description changed mid-stream, which the 'hvc1' sample entry cannot represent",
+        ));
+      }
       let stripped =
         strip_hevc_parameter_sets(packet.as_slice(), hvc1.nal_len_size, &hvc1.parameter_sets)
           .map_err(|e| Error::new(Status::GenericFailure, e))?;
@@ -662,40 +679,26 @@ impl<F: MuxerFormat> MuxerInner<F> {
     packet.set_dts(final_dts);
     packet.set_duration(dur);
 
-    // Set keyframe flag
+    // Set keyframe flag, preserving flags the packet already carries
+    // (e.g. AV_PKT_FLAG_DISCARD on edit-list-trimmed samples)
     if chunk_type == EncodedVideoChunkType::Key {
-      packet.set_flags(crate::ffi::pkt_flag::KEY);
+      packet.set_flags(packet.flags() | crate::ffi::pkt_flag::KEY);
     }
 
-    // Handle metadata - extract description if present
-    if let Some(description) = metadata
-      .as_ref()
-      .and_then(|m| m.decoder_config.as_ref())
-      .and_then(|c| c.description.as_ref())
+    // Handle metadata - extract description if present. Under 'hvc1' a changed
+    // description was already validated above (identical re-sends are no-ops);
+    // under 'hev1' dynamic updates remain allowed.
+    if self.strip_hevc_ps.is_none()
+      && let Some(description) = metadata
+        .as_ref()
+        .and_then(|m| m.decoder_config.as_ref())
+        .and_then(|c| c.description.as_ref())
     {
       let desc_data: &[u8] = description;
-      if !desc_data.is_empty() {
-        match &self.strip_hevc_ps {
-          Some(hvc1) => {
-            // Under 'hvc1' the description is fixed at track-add time; a
-            // changed decoderConfig.description mid-stream cannot be
-            // represented and does not update movenc's already-written sample
-            // description. A redundant re-send of the identical hvcC is
-            // tolerated.
-            if desc_data != hvc1.extradata.as_slice() {
-              return Err(Error::new(
-                Status::GenericFailure,
-                "HEVC description changed mid-stream, which the 'hvc1' sample entry cannot represent",
-              ));
-            }
-          }
-          None => {
-            // Update extradata dynamically if available
-            if let Err(e) = self.muxer.update_video_extradata(desc_data) {
-              tracing::warn!(target: "webcodecs", "Failed to update video extradata: {}", e);
-            }
-          }
-        }
+      if !desc_data.is_empty()
+        && let Err(e) = self.muxer.update_video_extradata(desc_data)
+      {
+        tracing::warn!(target: "webcodecs", "Failed to update video extradata: {}", e);
       }
     }
 
@@ -800,8 +803,9 @@ impl<F: MuxerFormat> MuxerInner<F> {
       }
     }
 
-    // Audio packets are typically all keyframes
-    packet.set_flags(crate::ffi::pkt_flag::KEY);
+    // Audio packets are typically all keyframes; OR (not assign) so any
+    // carried flags survive
+    packet.set_flags(packet.flags() | crate::ffi::pkt_flag::KEY);
 
     // Write packet
     self.muxer.write_packet(&mut packet).map_err(|e| {
