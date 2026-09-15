@@ -909,6 +909,122 @@ test('Mp4Muxer: rejects mid-stream HEVC description changes under hvc1', async (
   muxer.close()
 })
 
+/** elst segment_duration in milliseconds (movie timescale from mvhd) */
+function elstSegmentDurationMs(mp4: Uint8Array): number {
+  const text = Buffer.from(mp4).toString('latin1')
+  const view = new DataView(mp4.buffer, mp4.byteOffset)
+  const elst = text.indexOf('elst')
+  if (elst < 0) throw new Error('no elst box')
+  const mvhd = text.indexOf('mvhd')
+  const timescale = view.getUint32(mvhd + 16)
+  return (view.getUint32(elst + 12) / timescale) * 1000
+}
+
+test('Mp4Muxer: hvc1 strip preserves edit-list trimming of discarded tail samples', async (t) => {
+  // Fixture: 6 samples trimmed to 3 by its edit list, with duplicate in-band
+  // parameter sets in sample 4 (a discarded delta sample). Stripping must not
+  // lose AV_PKT_FLAG_DISCARD, or movenc would re-extend the output edit list
+  // to the trimmed tail.
+  const fixture = readFileSync(join(__dirname, 'fixtures/hevc-trimmed-tail.mp4'))
+  const demuxedChunks: EncodedVideoChunk[] = []
+  const demuxer = new Mp4Demuxer({
+    videoOutput: (chunk) => demuxedChunks.push(chunk),
+    error: (e) => t.fail(`Demuxer error: ${e.message}`),
+  })
+  await demuxer.loadBuffer(fixture)
+  const config = demuxer.videoDecoderConfig
+  t.truthy(config, 'Fixture should expose a video decoder config')
+  t.truthy(config?.description, 'Fixture should carry an hvcC description')
+  if (!config?.description) {
+    demuxer.close()
+    return
+  }
+  await demuxer.demuxAsync()
+  demuxer.close()
+  t.is(demuxedChunks.length, 6, 'Fixture should demux all six samples')
+
+  const muxWith = (description?: Uint8Array) => {
+    const muxer = new Mp4Muxer()
+    muxer.addVideoTrack({
+      codec: config.codec,
+      width: config.codedWidth,
+      height: config.codedHeight,
+      framerate: 30,
+      description,
+    })
+    for (const chunk of demuxedChunks) muxer.addVideoChunk(chunk)
+    muxer.flush()
+    const out = muxer.finalize()
+    muxer.close()
+    return out
+  }
+
+  const hvcc = new Uint8Array(config.description)
+  // hev1 control (incomplete hvcC keeps the strip inactive): flags untouched
+  const control = elstSegmentDurationMs(muxWith(hvccWithoutPps(hvcc)))
+  // hvc1 path strips sample 4 and must keep its DISCARD flag
+  const hvc1 = elstSegmentDurationMs(muxWith(hvcc))
+
+  t.true(control > 0 && control < 150, `control edit list should keep the 3-frame trim, got ${control}ms`)
+  t.is(hvc1, control, 'hvc1 strip must preserve the trimmed edit list')
+})
+
+test('Mp4Muxer: rejects metadata description changes under hvc1', async (t) => {
+  // Encoder chunks carry their description via metadata.decoderConfig; a
+  // changed description mid-stream must be rejected under hvc1 just like
+  // AV_PKT_DATA_NEW_EXTRADATA, instead of silently updating codecpar after
+  // movenc captured the sample description.
+  async function encodeHevcAt(width: number, height: number) {
+    const chunks: EncodedVideoChunk[] = []
+    const metadatas: (EncodedVideoChunkMetadata | undefined)[] = []
+    const encoder = new VideoEncoder({
+      output: (chunk, metadata) => {
+        chunks.push(chunk)
+        metadatas.push(metadata)
+      },
+      error: (e) => t.fail(e.message),
+    })
+    encoder.configure({
+      codec: 'hev1.1.6.L93.B0',
+      width,
+      height,
+      bitrate: 500_000,
+      framerate: 30,
+      hardwareAcceleration: 'prefer-software',
+    })
+    for (let i = 0; i < 3; i++) {
+      const frame = generateSolidColorI420Frame(width, height, TestColors.green, i * 33333)
+      encoder.encode(frame, { keyFrame: i === 0 })
+      frame.close()
+    }
+    await encoder.flush()
+    encoder.close()
+    return { chunks, metadatas }
+  }
+
+  const big = await encodeHevcAt(128, 128)
+  const small = await encodeHevcAt(64, 64)
+  const description = big.metadatas[0]?.decoderConfig?.description
+  t.truthy(description)
+  if (!description) return
+
+  const muxer = new Mp4Muxer()
+  muxer.addVideoTrack({
+    codec: 'hev1.1.6.L93.B0',
+    width: 128,
+    height: 128,
+    framerate: 30,
+    description,
+  })
+  for (let i = 0; i < 3; i++) muxer.addVideoChunk(big.chunks[i], big.metadatas[i])
+  const err = t.throws(
+    () => muxer.addVideoChunk(small.chunks[0], small.metadatas[0]),
+    { instanceOf: Error },
+  )
+  t.regex(err?.message ?? '', /description changed mid-stream/)
+  muxer.close()
+})
+
 test('Mp4Muxer: keeps hev1 and preserves in-band parameter sets when hvcC is incomplete', async (t) => {
   const { chunks, metadatas } = await encodeHevcChunks(128, 128, 3)
   const description = metadatas[0]?.decoderConfig?.description

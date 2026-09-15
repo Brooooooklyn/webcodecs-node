@@ -578,6 +578,11 @@ impl<F: MuxerFormat> MuxerInner<F> {
         stripped_packet
           .copy_data_from(&stripped)
           .map_err(|e| Error::new(Status::GenericFailure, format!("Packet copy: {}", e)))?;
+        // Preserve the source packet's flags — notably AV_PKT_FLAG_DISCARD,
+        // which mov.c sets for edit-list-trimmed samples and movenc uses to
+        // keep trimmed tails out of the output edit list. The keyframe-flag
+        // logic below only ever adds KEY, so this must carry over explicitly.
+        stripped_packet.set_flags(packet.flags());
         packet = stripped_packet;
       }
     }
@@ -670,9 +675,26 @@ impl<F: MuxerFormat> MuxerInner<F> {
     {
       let desc_data: &[u8] = description;
       if !desc_data.is_empty() {
-        // Update extradata dynamically if available
-        if let Err(e) = self.muxer.update_video_extradata(desc_data) {
-          tracing::warn!(target: "webcodecs", "Failed to update video extradata: {}", e);
+        match &self.strip_hevc_ps {
+          Some(hvc1) => {
+            // Under 'hvc1' the description is fixed at track-add time; a
+            // changed decoderConfig.description mid-stream cannot be
+            // represented and does not update movenc's already-written sample
+            // description. A redundant re-send of the identical hvcC is
+            // tolerated.
+            if desc_data != hvc1.extradata.as_slice() {
+              return Err(Error::new(
+                Status::GenericFailure,
+                "HEVC description changed mid-stream, which the 'hvc1' sample entry cannot represent",
+              ));
+            }
+          }
+          None => {
+            // Update extradata dynamically if available
+            if let Err(e) = self.muxer.update_video_extradata(desc_data) {
+              tracing::warn!(target: "webcodecs", "Failed to update video extradata: {}", e);
+            }
+          }
         }
       }
     }
