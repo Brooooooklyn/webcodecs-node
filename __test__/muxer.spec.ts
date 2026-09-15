@@ -107,6 +107,82 @@ test('Mp4Muxer: constructor accepts options', (t) => {
   muxer.close()
 })
 
+test('Mp4Muxer: fastStart keeps all tracks demuxable (issue #108)', async (t) => {
+  // The faststart moov rewrite adjusts every stco/co64 chunk offset by the
+  // moov size. A walker without container bounds bled into sibling traks and
+  // shifted later tracks' offsets once per nesting level, so only the first
+  // track survived. Both tracks must demux identically to the non-fastStart
+  // control, and moov must precede mdat.
+  const videoChunks: EncodedVideoChunk[] = []
+  const videoEncoder = new VideoEncoder({
+    output: (chunk) => videoChunks.push(chunk),
+    error: (e) => t.fail(e.message),
+  })
+  videoEncoder.configure({ codec: 'avc1.42001E', width: 64, height: 64, bitrate: 100_000, framerate: 30 })
+  for (let i = 0; i < 5; i++) {
+    const frame = generateSolidColorI420Frame(64, 64, TestColors.green, i * 33333)
+    videoEncoder.encode(frame, { keyFrame: i === 0 })
+    frame.close()
+  }
+  await videoEncoder.flush()
+  videoEncoder.close()
+
+  const audioChunks: EncodedAudioChunk[] = []
+  const audioEncoder = new AudioEncoder({
+    output: (chunk) => audioChunks.push(chunk),
+    error: (e) => t.fail(e.message),
+  })
+  audioEncoder.configure({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 1, bitrate: 96_000 })
+  for (let i = 0; i < 5; i++) {
+    const data = generateSilence(1024, 1, 48000, 'f32', i * 21333)
+    audioEncoder.encode(data)
+    data.close()
+  }
+  await audioEncoder.flush()
+  audioEncoder.close()
+
+  const mux = (fastStart: boolean) => {
+    const muxer = new Mp4Muxer(fastStart ? { fastStart: true } : {})
+    muxer.addVideoTrack({ codec: 'avc1.42001E', width: 64, height: 64, framerate: 30 })
+    muxer.addAudioTrack({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 1 })
+    for (const chunk of videoChunks) muxer.addVideoChunk(chunk)
+    for (const chunk of audioChunks) muxer.addAudioChunk(chunk)
+    muxer.flush()
+    const out = muxer.finalize()
+    muxer.close()
+    return out
+  }
+
+  const demux = async (mp4: Uint8Array) => {
+    const video: number[] = []
+    const audio: number[] = []
+    const demuxer = new Mp4Demuxer({
+      videoOutput: (chunk) => video.push(chunk.timestamp),
+      audioOutput: (chunk) => audio.push(chunk.timestamp),
+      error: (e) => t.fail(`Demuxer error: ${e.message}`),
+    })
+    await demuxer.loadBuffer(mp4)
+    await demuxer.demuxAsync()
+    demuxer.close()
+    return { video, audio }
+  }
+
+  const control = await demux(mux(false))
+  const fast = await demux(mux(true))
+
+  t.is(fast.video.length, control.video.length, 'fastStart video chunk count')
+  t.is(fast.audio.length, control.audio.length, 'fastStart audio chunk count')
+  t.deepEqual(fast.video, control.video, 'fastStart video timestamps')
+  t.deepEqual(fast.audio, control.audio, 'fastStart audio timestamps')
+
+  const fastData = mux(true)
+  const text = Buffer.from(fastData).toString('latin1')
+  t.true(
+    text.indexOf('moov') < text.indexOf('mdat') && text.indexOf('moov') >= 0,
+    'fastStart output should place moov before mdat',
+  )
+})
+
 test('Mp4Muxer: can add video track', (t) => {
   const muxer = new Mp4Muxer()
 
