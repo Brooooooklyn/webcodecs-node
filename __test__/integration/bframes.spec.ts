@@ -10,16 +10,24 @@
 
 import test from 'ava'
 import type { ExecutionContext } from 'ava'
+import path from 'path'
+import { fileURLToPath } from 'url'
 
 import {
   EncodedVideoChunk,
+  Mp4Demuxer,
   resetHardwareFallbackState,
   VideoEncoder,
   VideoDecoder,
   VideoFrame,
 } from '../../index.js'
-import type { EncodedVideoChunkMetadata, VideoDecoderConfig, VideoEncoderConfig } from '../../index.js'
-import { hasHardwareAcceleration } from '../helpers/index.js'
+import type {
+  EncodedVideoChunkMetadata,
+  VideoDecoderConfig,
+  VideoEncoderConfig,
+  VideoPixelFormat,
+} from '../../index.js'
+import { hasHardwareAcceleration, waitFor } from '../helpers/index.js'
 
 // Reset hardware fallback state before each test to ensure test isolation
 test.beforeEach(() => {
@@ -244,7 +252,14 @@ test('decoder pairs duration with the same frame as its timestamp', async (t) =>
   }
 })
 
-test('decoder pairs duration with the exact chunk under duplicate timestamps', async (t) => {
+interface DupTsResult {
+  contentIndex: number
+  timestamp: number
+  duration: number | undefined
+  format: VideoPixelFormat | null
+}
+
+async function decodeDuplicateTsChunks(t: ExecutionContext, decoderHw: VideoDecoderConfig['hardwareAcceleration']) {
   const { chunks, errors: encErrors, decoderConfig } = await encodeIndexFrames(HEVC_CONFIG)
   t.is(encErrors.length, 0, 'No encoder errors')
   t.is(chunks.length, FRAME_COUNT, 'One chunk per input frame')
@@ -283,7 +298,7 @@ test('decoder pairs duration with the exact chunk under duplicate timestamps', a
     codec: 'hev1.1.6.L93.B0',
     codedWidth: WIDTH,
     codedHeight: HEIGHT,
-    hardwareAcceleration: 'prefer-software',
+    hardwareAcceleration: decoderHw,
     description: decoderConfig?.description,
   })
 
@@ -298,6 +313,7 @@ test('decoder pairs duration with the exact chunk under duplicate timestamps', a
 
   // Correlate by pixel content, not timestamp: the two duplicate-timestamp
   // frames are indistinguishable by ts, which is the point of this test.
+  const results: DupTsResult[] = []
   for (const frame of frames) {
     const data = new Uint8Array(frame.allocationSize())
     await frame.copyTo(data)
@@ -306,16 +322,133 @@ test('decoder pairs duration with the exact chunk under duplicate timestamps', a
     for (const value of yPlane) {
       sum += value
     }
-    const averageY = sum / yPlane.length
-    const contentIndex = Math.round(averageY / 10)
-    const expected = expectedByContent.get(contentIndex)
-    t.truthy(expected, `frame with Y≈${averageY.toFixed(1)} maps to content frame ${contentIndex}`)
-    t.is(frame.timestamp, expected!.ts, `content frame ${contentIndex} timestamp`)
+    results.push({
+      contentIndex: Math.round(sum / yPlane.length / 10),
+      timestamp: frame.timestamp,
+      duration: frame.duration ?? undefined,
+      format: frame.format,
+    })
+    frame.close()
+  }
+  return { results, expectedByContent }
+}
+
+function assertDuplicateTsResults(
+  t: ExecutionContext,
+  results: DupTsResult[],
+  expectedByContent: Map<number, { ts: number; duration: number | undefined }>,
+) {
+  for (const result of results) {
+    const expected = expectedByContent.get(result.contentIndex)
+    t.truthy(expected, `frame maps to content frame ${result.contentIndex}`)
+    t.is(result.timestamp, expected!.ts, `content frame ${result.contentIndex} timestamp`)
     t.is(
-      frame.duration ?? undefined,
+      result.duration,
       expected!.duration,
-      `content frame ${contentIndex} (Y≈${averageY.toFixed(1)}) must carry duration ${expected!.duration}, not the other duplicate's`,
+      `content frame ${result.contentIndex} must carry duration ${expected!.duration}, not the other duplicate's`,
     )
+  }
+}
+
+test('decoder pairs duration with the exact chunk under duplicate timestamps', async (t) => {
+  const { results, expectedByContent } = await decodeDuplicateTsChunks(t, 'prefer-software')
+  assertDuplicateTsResults(t, results, expectedByContent)
+})
+
+// VideoToolbox decoder attribution (macOS only). VT decode is a hwaccel
+// inside the software HEVC decoder: ff_get_buffer stamps packet props
+// (pts, duration, opaque) on the picture before VT fills it, so exact chunk
+// identity propagates the same way as software. This test fails if that
+// ever regresses (the PTS fallback mispairs these duplicates by design).
+const testVTDecoder = process.platform === 'darwin' ? test : test.skip
+
+testVTDecoder('VideoToolbox decoder pairs duration with the exact chunk under duplicate timestamps', async (t) => {
+  if (!hasHardwareAcceleration()) {
+    t.pass('No usable hardware accelerator available, skipping')
+    return
+  }
+  const { results, expectedByContent } = await decodeDuplicateTsChunks(t, 'prefer-hardware')
+
+  // prefer-hardware still permits FFmpeg to fall back to software when
+  // hwaccel init fails at decode time, even on capable machines. VT
+  // downloads 8-bit frames as NV12 while software decode yields I420, so
+  // only assert attribution when VT frames were actually seen — otherwise
+  // this would record a VT pass it never exercised.
+  if (!results.some((r) => r.format === 'NV12')) {
+    t.pass('VideoToolbox hwaccel did not engage (software fallback), skipping')
+    return
+  }
+  assertDuplicateTsResults(t, results, expectedByContent)
+})
+
+// AV1 show_existing attribution through FFmpeg's libdav1d wrapper. The
+// fixture bitstream contains 3 show_existing chunks (the 3-byte packets
+// pinned below) and 4 invisible frame OBUs (verified with ffmpeg
+// trace_headers). dav1d attaches the *display* packet's properties to a
+// show_existing output (dav1d_picture_copy_props from the input packet's
+// mempool), so each output frame must carry the metadata of the chunk whose
+// display it is — a decoder that attached the stored reference's metadata
+// instead would break the exact 1:1 mapping asserted here.
+const AV1_FIXTURE = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures', 'wpt', 'av1.mp4')
+const AV1_CHUNK_COUNT = 10
+
+test('AV1 decoder pairs metadata with the exact chunk across show_existing re-displays', async (t) => {
+  const videoChunks: EncodedVideoChunk[] = []
+  const demuxer = new Mp4Demuxer({
+    videoOutput: (chunk) => videoChunks.push(chunk),
+    error: (e) => t.fail(`Demuxer error: ${e.message}`),
+  })
+  await demuxer.load(AV1_FIXTURE)
+  const decoderConfig = demuxer.videoDecoderConfig
+  if (!decoderConfig) {
+    demuxer.close()
+    t.fail('Missing AV1 decoder config')
+    return
+  }
+  demuxer.demux()
+  await waitFor(() => videoChunks.length >= AV1_CHUNK_COUNT, 'all AV1 chunks demuxed')
+  demuxer.close()
+  t.is(videoChunks.length, AV1_CHUNK_COUNT, 'One chunk per fixture sample')
+
+  // The test's coverage rests on these being show_existing packets; pin
+  // their size so a fixture swap cannot silently void it.
+  for (const i of [2, 4, 6]) {
+    t.is(videoChunks[i].byteLength, 3, `chunk ${i} must be a 3-byte show_existing packet`)
+  }
+
+  // Rewrap each chunk with a distinct duration so any misattribution between
+  // the display chunk and the stored reference shows up in the output.
+  const durations = videoChunks.map((_, i) => (i + 1) * 1111)
+
+  const { decoder, frames, errors } = createTestDecoder()
+  decoder.configure({
+    codec: decoderConfig.codec,
+    codedWidth: decoderConfig.codedWidth,
+    codedHeight: decoderConfig.codedHeight,
+    hardwareAcceleration: 'prefer-software',
+    description: decoderConfig.description,
+  })
+  for (const [i, chunk] of videoChunks.entries()) {
+    const data = new Uint8Array(chunk.byteLength)
+    chunk.copyTo(data)
+    decoder.decode(
+      new EncodedVideoChunk({
+        type: chunk.type,
+        timestamp: chunk.timestamp,
+        duration: durations[i],
+        data,
+      }),
+    )
+  }
+  await decoder.flush()
+  decoder.close()
+
+  t.is(errors.length, 0, `No decoder errors, got: ${errors.map((e) => e.message).join(', ')}`)
+  t.is(frames.length, AV1_CHUNK_COUNT, 'One output frame per display chunk')
+
+  for (const [i, frame] of frames.entries()) {
+    t.is(frame.timestamp, videoChunks[i].timestamp, `frame ${i} must carry its own chunk's timestamp`)
+    t.is(frame.duration, durations[i], `frame ${i} must carry its own chunk's duration (${durations[i]})`)
     frame.close()
   }
 })

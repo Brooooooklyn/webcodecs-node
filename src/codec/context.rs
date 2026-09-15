@@ -397,6 +397,12 @@ impl CodecContext {
       // output packets impossible to attribute back to their input frame.
       ffctx_set_time_base(ctx, 1, 1_000_000);
 
+      // Keep frame->duration through avcodec_send_frame so encoder wrappers
+      // propagate it to packet duration. ff_encode_preinit does not validate
+      // this flag, so it is safe for encoders that ignore frame duration.
+      let flags = ffctx_get_flags(ctx);
+      ffctx_set_flags(ctx, flags | codec_flag::FRAME_DURATION);
+
       // Framerate
       ffctx_set_framerate(
         ctx,
@@ -845,8 +851,11 @@ impl CodecContext {
       flags |= ffi::accessors::codec_flag::OUTPUT_CORRUPT;
 
       // Propagate packet opaque to output frames so callers can recover exact
-      // chunk identity through B-frame reordering (not all decoders honor it;
-      // VideoToolbox does not, callers must keep a pts-based fallback).
+      // chunk identity through B-frame reordering. All software decoders honor
+      // it via ff_get_buffer — including hwaccel users like VideoToolbox,
+      // whose frames are stamped before the hwaccel fills them. Decoders that
+      // set frame props themselves (libdav1d, cuvid, mediacodec) may not, so
+      // callers must keep a pts-based fallback.
       flags |= ffi::accessors::codec_flag::COPY_OPAQUE;
 
       if flags != 0 {

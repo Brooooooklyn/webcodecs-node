@@ -204,8 +204,10 @@ const SILENT_FAILURE_THRESHOLD: u32 = 10;
 /// Metadata for one in-flight chunk, keyed by its opaque sequence tag.
 /// The tag travels through FFmpeg as the packet/frame opaque pointer, giving
 /// exact chunk identity through B-frame reordering, even for duplicate
-/// timestamps. Decoders that do not propagate opaque (VideoToolbox) fall
-/// back to matching by frame PTS.
+/// timestamps. All software decoders propagate it via ff_get_buffer
+/// (including VideoToolbox, which is a hwaccel inside them); decoders that
+/// set frame props themselves (cuvid, mediacodec) may not and fall back to
+/// matching by frame PTS.
 #[derive(Clone, Copy)]
 struct ChunkMeta {
   timestamp: i64,
@@ -1212,9 +1214,11 @@ impl VideoDecoder {
   /// Resolve the (timestamp, duration) pair belonging to a decoded frame.
   ///
   /// Resolution tiers:
-  /// 1. Exact chunk identity via the opaque sequence tag (software decoders,
-  ///    which propagate packet opaque to frame under AV_CODEC_FLAG_COPY_OPAQUE).
-  /// 2. Frame PTS matched against pending chunk timestamps (VideoToolbox).
+  /// 1. Exact chunk identity via the opaque sequence tag (all software
+  ///    decoders propagate packet opaque to frame under
+  ///    AV_CODEC_FLAG_COPY_OPAQUE, including VideoToolbox's hwaccel path).
+  /// 2. Frame PTS matched against pending chunk timestamps (decoders that
+  ///    set frame props themselves, e.g. cuvid, mediacodec).
   /// 3. Oldest pending chunk (NOPTS frames), else the given fallback.
   fn resolve_frame_metadata(
     guard: &mut VideoDecoderInner,

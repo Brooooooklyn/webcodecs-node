@@ -20,7 +20,9 @@ const AOM_REPO: &str = "https://aomedia.googlesource.com/aom";
 const AOM_BRANCH: &str = "v3.13.1";
 const OPUS_REPO: &str = "https://github.com/xiph/opus.git";
 const OPUS_BRANCH: &str = "v1.5.2";
-const LAME_URL: &str = "https://sourceforge.net/projects/lame/files/lame/3.100/lame-3.100.tar.gz";
+// SourceForge serves an HTML error page instead of the tarball from some
+// networks; the Debian mirror is a plain static file server.
+const LAME_URL: &str = "https://deb.debian.org/debian/pool/main/l/lame/lame_3.100.orig.tar.gz";
 const OGG_REPO: &str = "https://github.com/xiph/ogg.git";
 const OGG_BRANCH: &str = "v1.3.5";
 const VORBIS_REPO: &str = "https://github.com/xiph/vorbis.git";
@@ -856,6 +858,17 @@ Cflags: -I${{includedir}}{}
       .arg(url)
       .current_dir(&self.source_dir);
     self.run_command_visible(&mut cmd)?;
+
+    // Fail fast with a clear message when the mirror returned an error page
+    // instead of the archive (tar would otherwise fail with an opaque error).
+    let bytes = fs::read(&tarball)?;
+    if bytes.len() < 2 || bytes[0] != 0x1f || bytes[1] != 0x8b {
+      fs::remove_file(&tarball)?;
+      return Err(io::Error::other(format!(
+        "Downloaded file from {} is not a gzip archive",
+        url
+      )));
+    }
 
     // Extract
     let mut cmd = Command::new("tar");

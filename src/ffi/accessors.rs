@@ -115,6 +115,7 @@ unsafe extern "C" {
   pub fn ffframe_set_format(frame: *mut AVFrame, format: c_int);
   pub fn ffframe_set_pts(frame: *mut AVFrame, pts: i64);
   pub fn ffframe_get_opaque(frame: *const AVFrame) -> *mut std::ffi::c_void;
+  pub fn ffframe_set_opaque(frame: *mut AVFrame, opaque: *mut std::ffi::c_void);
   pub fn ffpkt_get_opaque(pkt: *const AVPacket) -> *mut std::ffi::c_void;
   pub fn ffpkt_set_opaque(pkt: *mut AVPacket, opaque: *mut std::ffi::c_void);
   pub fn ffframe_set_duration(frame: *mut AVFrame, duration: i64);
@@ -379,6 +380,10 @@ pub mod codec_flag {
 
   /// Propagate AVPacket.opaque to decoded AVFrame.opaque
   pub const COPY_OPAQUE: c_int = 1 << 7;
+
+  /// Preserve AVFrame.duration through avcodec_send_frame instead of zeroing
+  /// it on the internal copy; duration must be in AVCodecContext.time_base units
+  pub const FRAME_DURATION: c_int = 1 << 8;
 
   /// Use only bitexact stuff (except (I)DCT)
   pub const BITEXACT: c_int = 1 << 23;
