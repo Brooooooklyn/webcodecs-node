@@ -15,8 +15,8 @@ import {
   VideoEncoder,
   VideoDecoder,
   AudioEncoder,
+  EncodedVideoChunk,
   resetHardwareFallbackState,
-  type EncodedVideoChunk,
   type EncodedAudioChunk,
   type EncodedVideoChunkMetadata,
   type EncodedAudioChunkMetadata,
@@ -389,6 +389,194 @@ test('Mp4Muxer: hvc1 HEVC output round-trips through Mp4Demuxer and VideoDecoder
     t.is(frame.codedHeight, 128)
     frame.close()
   }
+})
+
+/** NAL unit types of a length-prefixed (4-byte) HEVC sample buffer */
+function hevcNalTypes(data: Uint8Array): number[] {
+  const types: number[] = []
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+  let off = 0
+  while (off + 5 <= data.length) {
+    const len = view.getUint32(off)
+    if (len <= 0 || off + 4 + len > data.length) break
+    types.push((data[off + 4] >> 1) & 0x3f)
+    off += 4 + len
+  }
+  return types
+}
+
+/** Payloads of all mdat boxes in an MP4 file */
+function mdatPayloads(mp4: Uint8Array): Uint8Array[] {
+  const view = new DataView(mp4.buffer, mp4.byteOffset, mp4.byteLength)
+  const payloads: Uint8Array[] = []
+  for (let i = 4; i + 8 <= mp4.length; i++) {
+    // 'mdat' fourcc; box header starts 4 bytes earlier at the size field
+    if (mp4[i] === 0x6d && mp4[i + 1] === 0x64 && mp4[i + 2] === 0x61 && mp4[i + 3] === 0x74) {
+      const size = view.getUint32(i - 4)
+      if (size >= 8 && i - 4 + size <= mp4.length) payloads.push(mp4.subarray(i + 4, i - 4 + size))
+    }
+  }
+  return payloads
+}
+
+/** Extract VPS/SPS/PPS NAL units (types 32-34) from an hvcC description */
+function extractHevcParameterSets(hvcc: Uint8Array): Uint8Array[] {
+  const sets: Uint8Array[] = []
+  const numArrays = hvcc[22]
+  let off = 23
+  for (let a = 0; a < numArrays; a++) {
+    const nalType = hvcc[off] & 0x3f
+    const numNalus = (hvcc[off + 1] << 8) | hvcc[off + 2]
+    off += 3
+    for (let n = 0; n < numNalus; n++) {
+      const len = (hvcc[off] << 8) | hvcc[off + 1]
+      off += 2
+      if (nalType >= 32 && nalType <= 34) sets.push(hvcc.slice(off, off + len))
+      off += len
+    }
+  }
+  return sets
+}
+
+/** Copy chunks, prepending 4-byte length-prefixed VPS/SPS/PPS to the first sample */
+function prependParameterSets(chunks: EncodedVideoChunk[], description: Uint8Array): EncodedVideoChunk[] {
+  const psPrefix = extractHevcParameterSets(description)
+  if (psPrefix.length === 0) throw new Error('hvcC description carries no parameter sets')
+  return chunks.map((chunk, i) => {
+    const data = new Uint8Array(chunk.byteLength)
+    chunk.copyTo(data)
+    if (i !== 0) return new EncodedVideoChunk({ type: chunk.type, timestamp: chunk.timestamp, data })
+    const parts = psPrefix.map((nal) => {
+      const lp = new Uint8Array(4 + nal.length)
+      new DataView(lp.buffer).setUint32(0, nal.length)
+      lp.set(nal, 4)
+      return lp
+    })
+    parts.push(data)
+    const combined = new Uint8Array(parts.reduce((sum, p) => sum + p.length, 0))
+    let off = 0
+    for (const p of parts) {
+      combined.set(p, off)
+      off += p.length
+    }
+    return new EncodedVideoChunk({ type: chunk.type, timestamp: chunk.timestamp, data: combined })
+  })
+}
+
+/** hvcC record with the PPS array removed (well-formed but incomplete) */
+function hvccWithoutPps(hvcc: Uint8Array): Uint8Array {
+  const header = hvcc.slice(0, 22)
+  const numArrays = hvcc[22]
+  const kept: Uint8Array[] = []
+  let off = 23
+  for (let a = 0; a < numArrays; a++) {
+    const start = off
+    const nalType = hvcc[off] & 0x3f
+    const numNalus = (hvcc[off + 1] << 8) | hvcc[off + 2]
+    off += 3
+    for (let n = 0; n < numNalus; n++) {
+      const len = (hvcc[off] << 8) | hvcc[off + 1]
+      off += 2 + len
+    }
+    if (nalType !== 34) kept.push(hvcc.slice(start, off))
+  }
+  const out = new Uint8Array(23 + kept.reduce((sum, k) => sum + k.length, 0))
+  out.set(header, 0)
+  out[22] = kept.length
+  let w = 23
+  for (const k of kept) {
+    out.set(k, w)
+    w += k.length
+  }
+  return out
+}
+
+for (const fragmented of [false, true]) {
+  test(`Mp4Muxer: strips in-band HEVC parameter sets under hvc1 (fragmented=${fragmented})`, async (t) => {
+    const frameCount = 3
+    const { chunks, metadatas } = await encodeHevcChunks(128, 128, frameCount)
+    const description = metadatas[0]?.decoderConfig?.description
+    t.truthy(description, 'Encoder should provide an hvcC description')
+    if (!description) return
+
+    // Samples carrying in-band VPS/SPS/PPS (allowed for hev1, forbidden for hvc1)
+    const inBandChunks = prependParameterSets(chunks, new Uint8Array(description))
+
+    const muxer = new Mp4Muxer(fragmented ? { fragmented: true } : {})
+    muxer.addVideoTrack({ codec: 'hev1.1.6.L93.B0', width: 128, height: 128, framerate: 30, description })
+    for (const chunk of inBandChunks) muxer.addVideoChunk(chunk)
+    muxer.flush()
+    const mp4Data = muxer.finalize()
+    muxer.close()
+
+    t.is(getMp4VideoSampleEntryTag(mp4Data), 'hvc1', 'Sample entry should be hvc1')
+    const payloads = mdatPayloads(mp4Data)
+    t.true(payloads.length > 0, 'Should have mdat payloads')
+    const types = payloads.flatMap((p) => hevcNalTypes(p))
+    t.true(types.includes(20), 'Samples should still carry slice NALs')
+    t.false(
+      types.some((nalType) => nalType >= 32 && nalType <= 34),
+      `hvc1 samples must not carry VPS/SPS/PPS, got types ${JSON.stringify(types)}`,
+    )
+
+    if (fragmented) return
+
+    // The stripped output must still decode (parameter sets come from the hvcC)
+    const demuxedChunks: EncodedVideoChunk[] = []
+    const demuxer = new Mp4Demuxer({
+      videoOutput: (chunk) => demuxedChunks.push(chunk),
+      error: (e) => t.fail(`Demuxer error: ${e.message}`),
+    })
+    await demuxer.loadBuffer(mp4Data)
+    const config = demuxer.videoDecoderConfig
+    t.truthy(config)
+    if (!config) return
+    await demuxer.demuxAsync()
+    demuxer.close()
+    t.is(demuxedChunks.length, frameCount, 'All chunks should demux')
+
+    const decodedFrames: VideoFrame[] = []
+    const decoder = new VideoDecoder({
+      output: (frame) => decodedFrames.push(frame),
+      error: (e) => t.fail(`Decoder error: ${e.message}`),
+    })
+    decoder.configure({
+      codec: config.codec,
+      codedWidth: config.codedWidth,
+      codedHeight: config.codedHeight,
+      description: config.description,
+    })
+    for (const chunk of demuxedChunks) decoder.decode(chunk)
+    await decoder.flush()
+    decoder.close()
+    t.is(decodedFrames.length, frameCount, 'Every frame should decode after stripping')
+    for (const frame of decodedFrames) frame.close()
+  })
+}
+
+test('Mp4Muxer: keeps hev1 and preserves in-band parameter sets when hvcC is incomplete', async (t) => {
+  const { chunks, metadatas } = await encodeHevcChunks(128, 128, 3)
+  const description = metadatas[0]?.decoderConfig?.description
+  t.truthy(description, 'Encoder should provide an hvcC description')
+  if (!description) return
+
+  const incomplete = hvccWithoutPps(new Uint8Array(description))
+  const inBandChunks = prependParameterSets(chunks, new Uint8Array(description))
+
+  const muxer = new Mp4Muxer()
+  muxer.addVideoTrack({ codec: 'hev1.1.6.L93.B0', width: 128, height: 128, framerate: 30, description: incomplete })
+  for (const chunk of inBandChunks) muxer.addVideoChunk(chunk)
+  muxer.flush()
+  const mp4Data = muxer.finalize()
+  muxer.close()
+
+  // Without a complete VPS/SPS/PPS set in the hvcC the muxer must not claim hvc1
+  t.is(getMp4VideoSampleEntryTag(mp4Data), 'hev1', 'Sample entry should stay hev1')
+  const types = mdatPayloads(mp4Data).flatMap((p) => hevcNalTypes(p))
+  t.true(
+    types.some((nalType) => nalType >= 32 && nalType <= 34),
+    `hev1 samples should keep their in-band parameter sets, got types ${JSON.stringify(types)}`,
+  )
 })
 
 // ============================================================================

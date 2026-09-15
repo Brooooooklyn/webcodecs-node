@@ -132,6 +132,9 @@ pub struct MuxerContext {
   finalized: bool,
   /// Container format
   format: ContainerFormat,
+  /// HEVC length-prefix size when the 'hvc1' tag was selected for the video
+  /// stream (None when the tag was left as FFmpeg's default 'hev1')
+  hvc1_nal_len_size: Option<usize>,
 }
 
 impl MuxerContext {
@@ -191,6 +194,7 @@ impl MuxerContext {
       header_written: false,
       finalized: false,
       format,
+      hvc1_nal_len_size: None,
     })
   }
 
@@ -247,13 +251,19 @@ impl MuxerContext {
       // MP4/HEVC: write the 'hvc1' sample entry when parameter sets are carried
       // in the sample description (hvcC) instead of the bitstream. FFmpeg only
       // emits 'hvc1' when the codec tag is set explicitly (its default is
-      // 'hev1'); with the tag set, movenc also strips in-band parameter sets
-      // and marks hvcC arrays complete, per ISO/IEC 14496-15.
-      if self.format == ContainerFormat::Mp4
-        && config.codec_id == AVCodecID::Hevc
-        && config.extradata.as_ref().is_some_and(|e| !e.is_empty())
-      {
-        ffcodecpar_set_codec_tag(codecpar, u32::from_le_bytes(*b"hvc1"));
+      // 'hev1'); with the tag set, movenc also marks hvcC arrays complete, per
+      // ISO/IEC 14496-15. Only select 'hvc1' when the hvcC record carries a
+      // complete set of VPS/SPS/PPS — otherwise samples may contain parameter
+      // sets that 'hvc1' forbids, so keep 'hev1'. The caller strips in-band
+      // parameter sets from samples using the returned length-prefix size.
+      if self.format == ContainerFormat::Mp4 && config.codec_id == AVCodecID::Hevc {
+        self.hvc1_nal_len_size = config
+          .extradata
+          .as_deref()
+          .and_then(parse_hvcc_parameter_sets_complete);
+        if self.hvc1_nal_len_size.is_some() {
+          ffcodecpar_set_codec_tag(codecpar, u32::from_le_bytes(*b"hvc1"));
+        }
       }
 
       // Set time base on stream
@@ -499,6 +509,12 @@ impl MuxerContext {
     self.video_stream_index
   }
 
+  /// HEVC length-prefix size when the 'hvc1' tag was selected for the video
+  /// stream, or None when 'hev1' is in use
+  pub fn hvc1_nal_len_size(&self) -> Option<usize> {
+    self.hvc1_nal_len_size
+  }
+
   /// Get audio stream index
   pub fn audio_stream_index(&self) -> Option<i32> {
     self.audio_stream_index
@@ -640,6 +656,62 @@ impl MuxerContext {
         codec_id, self.format
       )))
     }
+  }
+}
+
+/// Parse an hvcC (HVCDecoderConfigurationRecord) and return its length-prefix
+/// size (1-4 bytes) when the record is well-formed and carries at least one
+/// VPS, SPS, and PPS NAL. Returns None for malformed or incomplete records.
+///
+/// Layout per ISO/IEC 14496-15: 23-byte fixed header, byte 21 low 2 bits are
+/// lengthSizeMinusOne, byte 22 is numOfArrays, then per array: 1 header byte
+/// (low 6 bits are the NAL unit type), u16-be numNalus, and per NAL a u16-be
+/// length followed by the NAL data.
+fn parse_hvcc_parameter_sets_complete(extradata: &[u8]) -> Option<usize> {
+  const NAL_TYPE_VPS: u8 = 32;
+  const NAL_TYPE_SPS: u8 = 33;
+  const NAL_TYPE_PPS: u8 = 34;
+
+  if extradata.len() < 23 {
+    return None;
+  }
+  let len_size = usize::from(extradata[21] & 0x03) + 1;
+  let num_arrays = usize::from(extradata[22]);
+
+  let mut offset = 23;
+  let mut has_vps = false;
+  let mut has_sps = false;
+  let mut has_pps = false;
+  for _ in 0..num_arrays {
+    let header = *extradata.get(offset)?;
+    let num_nalus = usize::from(u16::from_be_bytes([
+      *extradata.get(offset + 1)?,
+      *extradata.get(offset + 2)?,
+    ]));
+    offset += 3;
+    for _ in 0..num_nalus {
+      let nal_len = usize::from(u16::from_be_bytes([
+        *extradata.get(offset)?,
+        *extradata.get(offset + 1)?,
+      ]));
+      offset += 2;
+      if nal_len == 0 || extradata.len() - offset < nal_len {
+        return None;
+      }
+      match header & 0x3f {
+        NAL_TYPE_VPS => has_vps = true,
+        NAL_TYPE_SPS => has_sps = true,
+        NAL_TYPE_PPS => has_pps = true,
+        _ => {}
+      }
+      offset += nal_len;
+    }
+  }
+
+  if offset == extradata.len() && has_vps && has_sps && has_pps {
+    Some(len_size)
+  } else {
+    None
   }
 }
 

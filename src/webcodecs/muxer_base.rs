@@ -3,6 +3,7 @@
 //! This module provides common functionality for Mp4Muxer, WebMMuxer, and MkvMuxer
 //! to eliminate code duplication across the three implementations.
 
+use crate::codec::Packet;
 use crate::codec::io_buffer::StreamingBufferHandle;
 use crate::codec::muxer::{
   AudioStreamConfig, ContainerFormat, MuxerContext, MuxerOptions, MuxerOutput, VideoStreamConfig,
@@ -275,6 +276,10 @@ pub struct MuxerInner<F: MuxerFormat> {
   /// reordered-frame compatibility path advances from the previous packet's
   /// end, not by the duration of the packet currently being written.
   last_video_duration: i64,
+  /// HEVC length-prefix size when the video track uses the 'hvc1' sample
+  /// entry. In-band VPS/SPS/PPS NALs are stripped from samples because 'hvc1'
+  /// forbids them; None when 'hev1' is in use (in-band sets allowed).
+  strip_hevc_ps_len: Option<usize>,
   /// Phantom data for format type
   _format: PhantomData<F>,
 }
@@ -313,6 +318,7 @@ impl<F: MuxerFormat> MuxerInner<F> {
       video_dts_shift: 0,
       last_video_dts: i64::MIN,
       last_video_duration: 0,
+      strip_hevc_ps_len: None,
       _format: PhantomData,
     })
   }
@@ -351,6 +357,7 @@ impl<F: MuxerFormat> MuxerInner<F> {
       video_dts_shift: 0,
       last_video_dts: i64::MIN,
       last_video_duration: 0,
+      strip_hevc_ps_len: None,
       _format: PhantomData,
     })
   }
@@ -417,6 +424,9 @@ impl<F: MuxerFormat> MuxerInner<F> {
         format!("Failed to add video stream: {}", e),
       )
     })?;
+
+    // 'hvc1' forbids in-band parameter sets; strip them from samples below
+    self.strip_hevc_ps_len = self.muxer.hvc1_nal_len_size();
 
     self.video_track_info = Some(StoredVideoTrackInfo {
       codec: config.codec,
@@ -539,6 +549,20 @@ impl<F: MuxerFormat> MuxerInner<F> {
     // - If chunk has Packet (from encoder): shallow_clone shares buffer (zero-copy)
     // - If chunk has Vec<u8> (from JS): copy data into new packet
     let mut packet = chunk.get_packet_for_muxing()?;
+
+    // 'hvc1' forbids in-band VPS/SPS/PPS; drop them from the sample. Done
+    // before any packet metadata is set so the swap is a plain data replace.
+    if let Some(stripped) = self
+      .strip_hevc_ps_len
+      .and_then(|len_size| strip_hevc_parameter_sets(packet.as_slice(), len_size))
+    {
+      let mut stripped_packet = Packet::new()
+        .map_err(|e| Error::new(Status::GenericFailure, format!("Packet alloc: {}", e)))?;
+      stripped_packet
+        .copy_data_from(&stripped)
+        .map_err(|e| Error::new(Status::GenericFailure, format!("Packet copy: {}", e)))?;
+      packet = stripped_packet;
+    }
 
     // Set packet properties
     packet.set_stream_index(video_index);
@@ -851,6 +875,45 @@ impl<F: MuxerFormat> MuxerInner<F> {
   pub fn state_string(&self) -> &'static str {
     self.state.as_str()
   }
+}
+
+/// Strip VPS/SPS/PPS NAL units from a length-prefixed HEVC sample.
+///
+/// Mirrors `ff_hevc_annexb2mp4` with filter_ps=1 (FFmpeg hevc.c): drops
+/// exactly NAL types 32/33/34, keeps everything else (including AUD).
+/// Returns None — meaning pass the original data through unchanged — when no
+/// parameter sets are present or the buffer does not parse cleanly as
+/// length-prefixed NALs (truncated length, zero-length NAL, trailing bytes).
+fn strip_hevc_parameter_sets(data: &[u8], len_size: usize) -> Option<Vec<u8>> {
+  const NAL_TYPE_VPS: u8 = 32;
+  const NAL_TYPE_PPS: u8 = 34;
+
+  let mut offset = 0;
+  let mut out: Option<Vec<u8>> = None;
+  while offset < data.len() {
+    if data.len() - offset < len_size {
+      return None;
+    }
+    let mut nal_len: usize = 0;
+    for &b in &data[offset..offset + len_size] {
+      nal_len = (nal_len << 8) | usize::from(b);
+    }
+    let nal_start = offset + len_size;
+    if nal_len == 0 || data.len() - nal_start < nal_len {
+      return None;
+    }
+    let nal_type = (data[nal_start] >> 1) & 0x3f;
+    let is_ps = (NAL_TYPE_VPS..=NAL_TYPE_PPS).contains(&nal_type);
+    match out.as_mut() {
+      // Already stripping: keep non-parameter-set NALs (prefix + data)
+      Some(buf) if !is_ps => buf.extend_from_slice(&data[offset..nal_start + nal_len]),
+      // First parameter-set NAL: start the output with everything before it
+      None if is_ps => out = Some(data[..offset].to_vec()),
+      _ => {}
+    }
+    offset = nal_start + nal_len;
+  }
+  out
 }
 
 #[cfg(test)]
