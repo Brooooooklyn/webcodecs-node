@@ -11,9 +11,15 @@
 import test from 'ava'
 import type { ExecutionContext } from 'ava'
 
-import { resetHardwareFallbackState, VideoEncoder, VideoDecoder, VideoFrame } from '../../index.js'
+import {
+  EncodedVideoChunk,
+  resetHardwareFallbackState,
+  VideoEncoder,
+  VideoDecoder,
+  VideoFrame,
+} from '../../index.js'
 import type { EncodedVideoChunkMetadata, VideoDecoderConfig, VideoEncoderConfig } from '../../index.js'
-import { hasHardwareAcceleration, type EncodedVideoChunk } from '../helpers/index.js'
+import { hasHardwareAcceleration } from '../helpers/index.js'
 
 // Reset hardware fallback state before each test to ensure test isolation
 test.beforeEach(() => {
@@ -181,6 +187,58 @@ test('roundtrip preserves presentation order and content with B-frames', async (
     t.true(
       Math.abs(averageY - expectedY) <= 2,
       `Frame ${frameIndex} (ts=${frame.timestamp}) average Y ${averageY.toFixed(2)} should be ~${expectedY}`,
+    )
+    frame.close()
+  }
+})
+
+test('decoder pairs duration with the same frame as its timestamp', async (t) => {
+  const { chunks, errors: encErrors, decoderConfig } = await encodeIndexFrames(HEVC_CONFIG)
+  t.is(encErrors.length, 0, 'No encoder errors')
+  t.is(chunks.length, FRAME_COUNT, 'One chunk per input frame')
+
+  // Re-wrap chunks through the public API with per-chunk durations:
+  // explicit 0, explicit 33333µs, and omitted — the pattern external
+  // consumers produce when relaying encoder output.
+  const durationByTimestamp = new Map<number, number | undefined>()
+  const rewrapped = chunks.map((chunk, i) => {
+    const data = new Uint8Array(chunk.byteLength)
+    chunk.copyTo(data)
+    const duration = i % 3 === 0 ? 0 : i % 3 === 1 ? 33333 : undefined
+    durationByTimestamp.set(chunk.timestamp, duration)
+    return new EncodedVideoChunk({
+      type: chunk.type,
+      timestamp: chunk.timestamp,
+      ...(duration !== undefined ? { duration } : {}),
+      data,
+    })
+  })
+
+  const { decoder, frames, errors } = createTestDecoder()
+  decoder.configure({
+    codec: 'hev1.1.6.L93.B0',
+    codedWidth: WIDTH,
+    codedHeight: HEIGHT,
+    hardwareAcceleration: 'prefer-software',
+    description: decoderConfig?.description,
+  })
+
+  // Decode order: chunks arrive reordered, frames exit in presentation order.
+  for (const chunk of rewrapped) {
+    decoder.decode(chunk)
+  }
+  await decoder.flush()
+  decoder.close()
+
+  t.is(errors.length, 0, `No decoder errors, got: ${errors.map((e) => e.message).join(', ')}`)
+  t.is(frames.length, FRAME_COUNT, 'One output frame per input frame')
+
+  for (const frame of frames) {
+    const expected = durationByTimestamp.get(frame.timestamp)
+    t.is(
+      frame.duration ?? undefined,
+      expected,
+      `Frame ts=${frame.timestamp} must carry its own chunk's duration (${expected}), not a neighbor's`,
     )
     frame.close()
   }
