@@ -114,11 +114,22 @@ test('Mp4Muxer: fastStart keeps all tracks demuxable (issue #108)', async (t) =>
   // track survived. Both tracks must demux identically to the non-fastStart
   // control, and moov must precede mdat.
   const videoChunks: EncodedVideoChunk[] = []
+  const videoMetadatas: (EncodedVideoChunkMetadata | undefined)[] = []
   const videoEncoder = new VideoEncoder({
-    output: (chunk) => videoChunks.push(chunk),
+    output: (chunk, metadata) => {
+      videoChunks.push(chunk)
+      videoMetadatas.push(metadata)
+    },
     error: (e) => t.fail(e.message),
   })
-  videoEncoder.configure({ codec: 'avc1.42001E', width: 64, height: 64, bitrate: 100_000, framerate: 30 })
+  videoEncoder.configure({
+    codec: 'avc1.42001E',
+    width: 64,
+    height: 64,
+    bitrate: 100_000,
+    framerate: 30,
+    hardwareAcceleration: 'prefer-software',
+  })
   for (let i = 0; i < 5; i++) {
     const frame = generateSolidColorI420Frame(64, 64, TestColors.green, i * 33333)
     videoEncoder.encode(frame, { keyFrame: i === 0 })
@@ -128,8 +139,12 @@ test('Mp4Muxer: fastStart keeps all tracks demuxable (issue #108)', async (t) =>
   videoEncoder.close()
 
   const audioChunks: EncodedAudioChunk[] = []
+  const audioMetadatas: (EncodedAudioChunkMetadata | undefined)[] = []
   const audioEncoder = new AudioEncoder({
-    output: (chunk) => audioChunks.push(chunk),
+    output: (chunk, metadata) => {
+      audioChunks.push(chunk)
+      audioMetadatas.push(metadata)
+    },
     error: (e) => t.fail(e.message),
   })
   audioEncoder.configure({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 1, bitrate: 96_000 })
@@ -143,10 +158,21 @@ test('Mp4Muxer: fastStart keeps all tracks demuxable (issue #108)', async (t) =>
 
   const mux = (fastStart: boolean) => {
     const muxer = new Mp4Muxer(fastStart ? { fastStart: true } : {})
-    muxer.addVideoTrack({ codec: 'avc1.42001E', width: 64, height: 64, framerate: 30 })
-    muxer.addAudioTrack({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 1 })
-    for (const chunk of videoChunks) muxer.addVideoChunk(chunk)
-    for (const chunk of audioChunks) muxer.addAudioChunk(chunk)
+    muxer.addVideoTrack({
+      codec: 'avc1.42001E',
+      width: 64,
+      height: 64,
+      framerate: 30,
+      description: videoMetadatas[0]?.decoderConfig?.description,
+    })
+    muxer.addAudioTrack({
+      codec: 'mp4a.40.2',
+      sampleRate: 48000,
+      numberOfChannels: 1,
+      description: audioMetadatas[0]?.decoderConfig?.description,
+    })
+    for (let i = 0; i < videoChunks.length; i++) muxer.addVideoChunk(videoChunks[i], videoMetadatas[i])
+    for (let i = 0; i < audioChunks.length; i++) muxer.addAudioChunk(audioChunks[i], audioMetadatas[i])
     muxer.flush()
     const out = muxer.finalize()
     muxer.close()
@@ -154,11 +180,15 @@ test('Mp4Muxer: fastStart keeps all tracks demuxable (issue #108)', async (t) =>
   }
 
   const demux = async (mp4: Uint8Array) => {
-    const video: number[] = []
-    const audio: number[] = []
+    const video: { timestamp: number; size: number; bytes: Uint8Array }[] = []
+    const audio: { timestamp: number; size: number }[] = []
     const demuxer = new Mp4Demuxer({
-      videoOutput: (chunk) => video.push(chunk.timestamp),
-      audioOutput: (chunk) => audio.push(chunk.timestamp),
+      videoOutput: (chunk) => {
+        const bytes = new Uint8Array(chunk.byteLength)
+        chunk.copyTo(bytes)
+        video.push({ timestamp: chunk.timestamp, size: chunk.byteLength, bytes })
+      },
+      audioOutput: (chunk) => audio.push({ timestamp: chunk.timestamp, size: chunk.byteLength }),
       error: (e) => t.fail(`Demuxer error: ${e.message}`),
     })
     await demuxer.loadBuffer(mp4)
@@ -172,8 +202,26 @@ test('Mp4Muxer: fastStart keeps all tracks demuxable (issue #108)', async (t) =>
 
   t.is(fast.video.length, control.video.length, 'fastStart video chunk count')
   t.is(fast.audio.length, control.audio.length, 'fastStart audio chunk count')
-  t.deepEqual(fast.video, control.video, 'fastStart video timestamps')
-  t.deepEqual(fast.audio, control.audio, 'fastStart audio timestamps')
+  t.deepEqual(
+    fast.video.map((c) => c.timestamp),
+    control.video.map((c) => c.timestamp),
+    'fastStart video timestamps',
+  )
+  t.deepEqual(
+    fast.audio.map((c) => c.timestamp),
+    control.audio.map((c) => c.timestamp),
+    'fastStart audio timestamps',
+  )
+  t.deepEqual(
+    fast.video.map((c) => c.size),
+    control.video.map((c) => c.size),
+    'fastStart video payload sizes',
+  )
+  t.deepEqual(
+    fast.video.map((c) => Array.from(c.bytes.slice(0, 8))),
+    control.video.map((c) => Array.from(c.bytes.slice(0, 8))),
+    'fastStart video payload prefixes',
+  )
 
   const fastData = mux(true)
   const text = Buffer.from(fastData).toString('latin1')
