@@ -132,9 +132,10 @@ pub struct MuxerContext {
   finalized: bool,
   /// Container format
   format: ContainerFormat,
-  /// HEVC length-prefix size when the 'hvc1' tag was selected for the video
-  /// stream (None when the tag was left as FFmpeg's default 'hev1')
-  hvc1_nal_len_size: Option<usize>,
+  /// HEVC 'hvc1' parameter-set context: NAL length-prefix size plus the
+  /// VPS/SPS/PPS payloads from the hvcC sample description (None when the
+  /// tag was left as FFmpeg's default 'hev1')
+  hvc1_parameter_sets: Option<(usize, Vec<Vec<u8>>)>,
 }
 
 impl MuxerContext {
@@ -194,7 +195,7 @@ impl MuxerContext {
       header_written: false,
       finalized: false,
       format,
-      hvc1_nal_len_size: None,
+      hvc1_parameter_sets: None,
     })
   }
 
@@ -252,16 +253,16 @@ impl MuxerContext {
       // in the sample description (hvcC) instead of the bitstream. FFmpeg only
       // emits 'hvc1' when the codec tag is set explicitly (its default is
       // 'hev1'); with the tag set, movenc also marks hvcC arrays complete, per
-      // ISO/IEC 14496-15. Only select 'hvc1' when the hvcC record carries a
-      // complete set of VPS/SPS/PPS — otherwise samples may contain parameter
-      // sets that 'hvc1' forbids, so keep 'hev1'. The caller strips in-band
-      // parameter sets from samples using the returned length-prefix size.
+      // ISO/IEC 14496-15. Only select 'hvc1' when the hvcC record is
+      // well-formed and carries a complete set of VPS/SPS/PPS — otherwise keep
+      // 'hev1', which permits in-band parameter sets. The caller strips in-band
+      // sets that duplicate the hvcC using the returned context.
       if self.format == ContainerFormat::Mp4 && config.codec_id == AVCodecID::Hevc {
-        self.hvc1_nal_len_size = config
+        self.hvc1_parameter_sets = config
           .extradata
           .as_deref()
           .and_then(parse_hvcc_parameter_sets_complete);
-        if self.hvc1_nal_len_size.is_some() {
+        if self.hvc1_parameter_sets.is_some() {
           ffcodecpar_set_codec_tag(codecpar, u32::from_le_bytes(*b"hvc1"));
         }
       }
@@ -509,10 +510,13 @@ impl MuxerContext {
     self.video_stream_index
   }
 
-  /// HEVC length-prefix size when the 'hvc1' tag was selected for the video
-  /// stream, or None when 'hev1' is in use
-  pub fn hvc1_nal_len_size(&self) -> Option<usize> {
-    self.hvc1_nal_len_size
+  /// HEVC 'hvc1' parameter-set context: NAL length-prefix size plus the
+  /// VPS/SPS/PPS payloads from the hvcC, or None when 'hev1' is in use
+  pub fn hvc1_parameter_sets(&self) -> Option<(usize, &[Vec<u8>])> {
+    self
+      .hvc1_parameter_sets
+      .as_ref()
+      .map(|(len_size, sets)| (*len_size, sets.as_slice()))
   }
 
   /// Get audio stream index
@@ -659,31 +663,34 @@ impl MuxerContext {
   }
 }
 
-/// Parse an hvcC (HVCDecoderConfigurationRecord) and return its length-prefix
-/// size (1-4 bytes) when the record is well-formed and carries at least one
-/// VPS, SPS, and PPS NAL. Returns None for malformed or incomplete records.
+/// Parse an hvcC (HVCDecoderConfigurationRecord). When the record is
+/// well-formed and carries at least one VPS, SPS, and PPS NAL, return the
+/// length-prefix size (1-4 bytes) together with the parameter-set payloads.
+/// Returns None for malformed or incomplete records.
 ///
-/// Layout per ISO/IEC 14496-15: 23-byte fixed header, byte 21 low 2 bits are
-/// lengthSizeMinusOne, byte 22 is numOfArrays, then per array: 1 header byte
-/// (low 6 bits are the NAL unit type), u16-be numNalus, and per NAL a u16-be
-/// length followed by the NAL data.
-fn parse_hvcc_parameter_sets_complete(extradata: &[u8]) -> Option<usize> {
+/// Layout per ISO/IEC 14496-15: byte 0 is configurationVersion (must be 1) in
+/// a 23-byte fixed header, byte 21 low 2 bits are lengthSizeMinusOne, byte 22
+/// is numOfArrays, then per array: 1 header byte (low 6 bits are the NAL unit
+/// type), u16-be numNalus, and per NAL a u16-be length followed by the NAL
+/// data. Every payload must hold at least the 2-byte NAL header, and its
+/// header type must match the array's declared type.
+fn parse_hvcc_parameter_sets_complete(extradata: &[u8]) -> Option<(usize, Vec<Vec<u8>>)> {
   const NAL_TYPE_VPS: u8 = 32;
   const NAL_TYPE_SPS: u8 = 33;
   const NAL_TYPE_PPS: u8 = 34;
 
-  if extradata.len() < 23 {
+  if extradata.len() < 23 || extradata[0] != 1 {
     return None;
   }
   let len_size = usize::from(extradata[21] & 0x03) + 1;
   let num_arrays = usize::from(extradata[22]);
 
   let mut offset = 23;
-  let mut has_vps = false;
-  let mut has_sps = false;
-  let mut has_pps = false;
+  let mut parameter_sets = Vec::new();
+  let (mut has_vps, mut has_sps, mut has_pps) = (false, false, false);
   for _ in 0..num_arrays {
     let header = *extradata.get(offset)?;
+    let array_type = header & 0x3f;
     let num_nalus = usize::from(u16::from_be_bytes([
       *extradata.get(offset + 1)?,
       *extradata.get(offset + 2)?,
@@ -695,21 +702,29 @@ fn parse_hvcc_parameter_sets_complete(extradata: &[u8]) -> Option<usize> {
         *extradata.get(offset + 1)?,
       ]));
       offset += 2;
-      if nal_len == 0 || extradata.len() - offset < nal_len {
+      if nal_len < 2 || extradata.len() - offset < nal_len {
         return None;
       }
-      match header & 0x3f {
+      let payload = &extradata[offset..offset + nal_len];
+      // The NAL header type must match the array's declared type
+      if (payload[0] >> 1) & 0x3f != array_type {
+        return None;
+      }
+      match array_type {
         NAL_TYPE_VPS => has_vps = true,
         NAL_TYPE_SPS => has_sps = true,
         NAL_TYPE_PPS => has_pps = true,
         _ => {}
+      }
+      if (NAL_TYPE_VPS..=NAL_TYPE_PPS).contains(&array_type) {
+        parameter_sets.push(payload.to_vec());
       }
       offset += nal_len;
     }
   }
 
   if offset == extradata.len() && has_vps && has_sps && has_pps {
-    Some(len_size)
+    Some((len_size, parameter_sets))
   } else {
     None
   }
@@ -755,5 +770,87 @@ mod tests {
   fn test_muxer_creation() {
     let muxer = MuxerContext::new(ContainerFormat::Mp4, MuxerOutput::Buffer);
     assert!(muxer.is_ok());
+  }
+
+  /// Minimal hvcC builder: 23-byte header + arrays of (type, payloads).
+  /// NAL payloads use valid 2-byte headers: [type << 1, 0x01].
+  fn build_hvcc(configuration_version: u8, arrays: &[(u8, Vec<Vec<u8>>)]) -> Vec<u8> {
+    let mut out = vec![0u8; 23];
+    out[0] = configuration_version;
+    out[21] = 0xff; // lengthSizeMinusOne = 3 -> 4-byte prefixes
+    out[22] = arrays.len() as u8;
+    for (nal_type, nals) in arrays {
+      out.push(0x80 | nal_type); // array_completeness | NAL_unit_type
+      out.extend_from_slice(&(nals.len() as u16).to_be_bytes());
+      for nal in nals {
+        out.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+        out.extend_from_slice(nal);
+      }
+    }
+    out
+  }
+
+  fn vps() -> Vec<u8> {
+    vec![0x40, 0x01, 0xaa]
+  }
+  fn sps() -> Vec<u8> {
+    vec![0x42, 0x01, 0xbb]
+  }
+  fn pps() -> Vec<u8> {
+    vec![0x44, 0x01, 0xcc]
+  }
+
+  #[test]
+  fn hvcc_complete_record_parses() {
+    let hvcc = build_hvcc(
+      1,
+      &[(32, vec![vps()]), (33, vec![sps()]), (34, vec![pps()])],
+    );
+    let (len_size, sets) = parse_hvcc_parameter_sets_complete(&hvcc).expect("valid hvcC");
+    assert_eq!(len_size, 4);
+    assert_eq!(sets, vec![vps(), sps(), pps()]);
+  }
+
+  #[test]
+  fn hvcc_incomplete_or_malformed_records_rejected() {
+    // configurationVersion must be 1
+    let v0 = build_hvcc(
+      0,
+      &[(32, vec![vps()]), (33, vec![sps()]), (34, vec![pps()])],
+    );
+    assert!(parse_hvcc_parameter_sets_complete(&v0).is_none());
+
+    // Missing PPS
+    let no_pps = build_hvcc(1, &[(32, vec![vps()]), (33, vec![sps()])]);
+    assert!(parse_hvcc_parameter_sets_complete(&no_pps).is_none());
+
+    // Payload shorter than the 2-byte NAL header
+    let short = build_hvcc(
+      1,
+      &[(32, vec![vec![0x40]]), (33, vec![sps()]), (34, vec![pps()])],
+    );
+    assert!(parse_hvcc_parameter_sets_complete(&short).is_none());
+
+    // Payload NAL header type disagrees with the array's declared type
+    let mismatched = build_hvcc(
+      1,
+      &[(32, vec![pps()]), (33, vec![sps()]), (34, vec![pps()])],
+    );
+    assert!(parse_hvcc_parameter_sets_complete(&mismatched).is_none());
+
+    // Trailing garbage after the arrays
+    let mut trailing = build_hvcc(
+      1,
+      &[(32, vec![vps()]), (33, vec![sps()]), (34, vec![pps()])],
+    );
+    trailing.push(0);
+    assert!(parse_hvcc_parameter_sets_complete(&trailing).is_none());
+
+    // Truncated record
+    let truncated = &build_hvcc(
+      1,
+      &[(32, vec![vps()]), (33, vec![sps()]), (34, vec![pps()])],
+    )[..26];
+    assert!(parse_hvcc_parameter_sets_complete(truncated).is_none());
   }
 }

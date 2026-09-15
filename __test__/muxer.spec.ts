@@ -554,6 +554,140 @@ for (const fragmented of [false, true]) {
   })
 }
 
+/** Rebuild an hvcC with a different configurationVersion, mapping each NAL payload */
+function rebuildHvcc(
+  hvcc: Uint8Array,
+  version: number,
+  mapNal: (nalType: number, nal: Uint8Array) => Uint8Array,
+): Uint8Array {
+  const parts: Uint8Array[] = [hvcc.slice(0, 22)]
+  parts[0][0] = version
+  const numArrays = hvcc[22]
+  const rebuiltArrays: Uint8Array[] = []
+  let off = 23
+  for (let a = 0; a < numArrays; a++) {
+    const headerByte = hvcc[off]
+    const nalType = headerByte & 0x3f
+    const numNalus = (hvcc[off + 1] << 8) | hvcc[off + 2]
+    off += 3
+    const nals: Uint8Array[] = []
+    for (let n = 0; n < numNalus; n++) {
+      const len = (hvcc[off] << 8) | hvcc[off + 1]
+      off += 2
+      nals.push(mapNal(nalType, hvcc.slice(off, off + len)))
+      off += len
+    }
+    rebuiltArrays.push(Uint8Array.of(headerByte, 0, nals.length))
+    for (const nal of nals) {
+      rebuiltArrays.push(Uint8Array.of(0, nal.length))
+      rebuiltArrays.push(nal)
+    }
+  }
+  parts.push(Uint8Array.of(numArrays), ...rebuiltArrays)
+  const out = new Uint8Array(parts.reduce((sum, p) => sum + p.length, 0))
+  let w = 0
+  for (const p of parts) {
+    out.set(p, w)
+    w += p.length
+  }
+  return out
+}
+
+test('Mp4Muxer: rejects in-band HEVC parameter set updates under hvc1', async (t) => {
+  // Track description comes from a 128x128 session; samples carry the 64x64
+  // session's parameter sets in-band — a legal hev1 update that hvc1 cannot
+  // represent, so the muxer must reject rather than silently drop it.
+  const big = await encodeHevcChunks(128, 128, 3)
+  const small = await encodeHevcChunks(64, 64, 3)
+  const bigDescription = big.metadatas[0]?.decoderConfig?.description
+  const smallDescription = small.metadatas[0]?.decoderConfig?.description
+  t.truthy(bigDescription)
+  t.truthy(smallDescription)
+  if (!bigDescription || !smallDescription) return
+
+  const inBandChunks = prependParameterSets(small.chunks, new Uint8Array(smallDescription))
+
+  const muxer = new Mp4Muxer()
+  muxer.addVideoTrack({ codec: 'hev1.1.6.L93.B0', width: 64, height: 64, framerate: 30, description: bigDescription })
+  const err = t.throws(() => muxer.addVideoChunk(inBandChunks[0]), { instanceOf: Error })
+  t.regex(err?.message ?? '', /parameter set update/)
+  muxer.close()
+})
+
+test('Mp4Muxer: malformed hvcC variants keep hev1 and preserve parameter sets', async (t) => {
+  const { chunks, metadatas } = await encodeHevcChunks(128, 128, 3)
+  const description = metadatas[0]?.decoderConfig?.description
+  t.truthy(description, 'Encoder should provide an hvcC description')
+  if (!description) return
+  const hvcc = new Uint8Array(description)
+  const inBandChunks = prependParameterSets(chunks, hvcc)
+
+  const variants: [string, Uint8Array][] = [
+    ['configurationVersion 0', rebuildHvcc(hvcc, 0, (_nalType, nal) => nal)],
+    // VPS array entry shorter than the 2-byte NAL header
+    ['one-byte VPS payload', rebuildHvcc(hvcc, 1, (nalType, nal) => (nalType === 32 ? Uint8Array.of(0x40) : nal))],
+    // PPS payload (header type 34) inside the VPS array (declared type 32)
+    [
+      'payload type mismatch',
+      rebuildHvcc(hvcc, 1, (nalType, nal) => {
+        if (nalType !== 32) return nal
+        const pps = extractHevcParameterSets(hvcc).find((n) => ((n[0] >> 1) & 0x3f) === 34)
+        return pps ?? nal
+      }),
+    ],
+  ]
+
+  for (const [name, desc] of variants) {
+    const muxer = new Mp4Muxer()
+    muxer.addVideoTrack({ codec: 'hev1.1.6.L93.B0', width: 128, height: 128, framerate: 30, description: desc })
+    for (const chunk of inBandChunks) muxer.addVideoChunk(chunk)
+    muxer.flush()
+    const mp4Data = muxer.finalize()
+    muxer.close()
+
+    t.is(getMp4VideoSampleEntryTag(mp4Data), 'hev1', `${name}: malformed hvcC must not select hvc1`)
+    const types = mdatPayloads(mp4Data).flatMap((p) => hevcNalTypes(p))
+    t.true(
+      types.some((nalType) => nalType >= 32 && nalType <= 34),
+      `${name}: hev1 samples should keep in-band parameter sets, got ${JSON.stringify(types)}`,
+    )
+  }
+})
+
+test('Mp4Muxer: rejects malformed HEVC samples under hvc1', async (t) => {
+  const { chunks, metadatas } = await encodeHevcChunks(128, 128, 3)
+  const description = metadatas[0]?.decoderConfig?.description
+  t.truthy(description, 'Encoder should provide an hvcC description')
+  if (!description) return
+
+  const data = new Uint8Array(chunks[0].byteLength)
+  chunks[0].copyTo(data)
+
+  // One stray trailing byte: the length-prefix walk cannot finish cleanly
+  const trailing = new Uint8Array(data.length + 1)
+  trailing.set(data)
+  trailing[trailing.length - 1] = 0xaa
+
+  // A zero-length NAL prefix before the real data
+  const zeroNal = new Uint8Array(4 + data.length)
+  zeroNal.set(data, 4)
+
+  for (const [name, bad] of [
+    ['trailing byte', trailing],
+    ['zero-length NAL', zeroNal],
+  ] as const) {
+    const muxer = new Mp4Muxer()
+    muxer.addVideoTrack({ codec: 'hev1.1.6.L93.B0', width: 128, height: 128, framerate: 30, description })
+    const err = t.throws(
+      () => muxer.addVideoChunk(new EncodedVideoChunk({ type: chunks[0].type, timestamp: chunks[0].timestamp, data: bad })),
+      { instanceOf: Error },
+      name,
+    )
+    t.regex(err?.message ?? '', /malformed HEVC sample/, name)
+    muxer.close()
+  }
+})
+
 test('Mp4Muxer: keeps hev1 and preserves in-band parameter sets when hvcC is incomplete', async (t) => {
   const { chunks, metadatas } = await encodeHevcChunks(128, 128, 3)
   const description = metadatas[0]?.decoderConfig?.description

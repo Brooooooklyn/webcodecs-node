@@ -276,10 +276,11 @@ pub struct MuxerInner<F: MuxerFormat> {
   /// reordered-frame compatibility path advances from the previous packet's
   /// end, not by the duration of the packet currently being written.
   last_video_duration: i64,
-  /// HEVC length-prefix size when the video track uses the 'hvc1' sample
-  /// entry. In-band VPS/SPS/PPS NALs are stripped from samples because 'hvc1'
-  /// forbids them; None when 'hev1' is in use (in-band sets allowed).
-  strip_hevc_ps_len: Option<usize>,
+  /// HEVC 'hvc1' parameter-set context: NAL length-prefix size plus the
+  /// VPS/SPS/PPS payloads from the hvcC. In-band duplicates are stripped from
+  /// samples because 'hvc1' forbids them; None when 'hev1' is in use (in-band
+  /// sets allowed).
+  strip_hevc_ps: Option<(usize, Vec<Vec<u8>>)>,
   /// Phantom data for format type
   _format: PhantomData<F>,
 }
@@ -318,7 +319,7 @@ impl<F: MuxerFormat> MuxerInner<F> {
       video_dts_shift: 0,
       last_video_dts: i64::MIN,
       last_video_duration: 0,
-      strip_hevc_ps_len: None,
+      strip_hevc_ps: None,
       _format: PhantomData,
     })
   }
@@ -357,7 +358,7 @@ impl<F: MuxerFormat> MuxerInner<F> {
       video_dts_shift: 0,
       last_video_dts: i64::MIN,
       last_video_duration: 0,
-      strip_hevc_ps_len: None,
+      strip_hevc_ps: None,
       _format: PhantomData,
     })
   }
@@ -425,8 +426,11 @@ impl<F: MuxerFormat> MuxerInner<F> {
       )
     })?;
 
-    // 'hvc1' forbids in-band parameter sets; strip them from samples below
-    self.strip_hevc_ps_len = self.muxer.hvc1_nal_len_size();
+    // 'hvc1' forbids in-band parameter sets; strip hvcC duplicates below
+    self.strip_hevc_ps = self
+      .muxer
+      .hvc1_parameter_sets()
+      .map(|(len_size, sets)| (len_size, sets.to_vec()));
 
     self.video_track_info = Some(StoredVideoTrackInfo {
       codec: config.codec,
@@ -550,18 +554,21 @@ impl<F: MuxerFormat> MuxerInner<F> {
     // - If chunk has Vec<u8> (from JS): copy data into new packet
     let mut packet = chunk.get_packet_for_muxing()?;
 
-    // 'hvc1' forbids in-band VPS/SPS/PPS; drop them from the sample. Done
-    // before any packet metadata is set so the swap is a plain data replace.
-    if let Some(stripped) = self
-      .strip_hevc_ps_len
-      .and_then(|len_size| strip_hevc_parameter_sets(packet.as_slice(), len_size))
-    {
-      let mut stripped_packet = Packet::new()
-        .map_err(|e| Error::new(Status::GenericFailure, format!("Packet alloc: {}", e)))?;
-      stripped_packet
-        .copy_data_from(&stripped)
-        .map_err(|e| Error::new(Status::GenericFailure, format!("Packet copy: {}", e)))?;
-      packet = stripped_packet;
+    // 'hvc1' forbids in-band VPS/SPS/PPS; drop the ones already carried by the
+    // hvcC. Done before any packet metadata is set so the swap is a plain data
+    // replace. Malformed samples and in-band parameter-set updates (which
+    // 'hvc1' cannot represent) are rejected.
+    if let Some((len_size, ref known)) = self.strip_hevc_ps {
+      let stripped = strip_hevc_parameter_sets(packet.as_slice(), len_size, known)
+        .map_err(|e| Error::new(Status::GenericFailure, e))?;
+      if let Some(stripped) = stripped {
+        let mut stripped_packet = Packet::new()
+          .map_err(|e| Error::new(Status::GenericFailure, format!("Packet alloc: {}", e)))?;
+        stripped_packet
+          .copy_data_from(&stripped)
+          .map_err(|e| Error::new(Status::GenericFailure, format!("Packet copy: {}", e)))?;
+        packet = stripped_packet;
+      }
     }
 
     // Set packet properties
@@ -877,14 +884,21 @@ impl<F: MuxerFormat> MuxerInner<F> {
   }
 }
 
-/// Strip VPS/SPS/PPS NAL units from a length-prefixed HEVC sample.
+/// Strip VPS/SPS/PPS NAL units from a length-prefixed HEVC sample when they
+/// are byte-identical to a parameter set in the hvcC sample description.
 ///
 /// Mirrors `ff_hevc_annexb2mp4` with filter_ps=1 (FFmpeg hevc.c): drops
 /// exactly NAL types 32/33/34, keeps everything else (including AUD).
-/// Returns None — meaning pass the original data through unchanged — when no
-/// parameter sets are present or the buffer does not parse cleanly as
-/// length-prefixed NALs (truncated length, zero-length NAL, trailing bytes).
-fn strip_hevc_parameter_sets(data: &[u8], len_size: usize) -> Option<Vec<u8>> {
+/// Returns Ok(None) — pass the original data through unchanged — when the
+/// sample carries no parameter sets. Errors when the buffer does not parse
+/// cleanly as length-prefixed NALs, or when a parameter set differs from
+/// every hvcC entry: that is an in-band parameter update, which 'hvc1' cannot
+/// represent, and dropping it would silently corrupt the stream.
+fn strip_hevc_parameter_sets(
+  data: &[u8],
+  len_size: usize,
+  known: &[Vec<u8>],
+) -> std::result::Result<Option<Vec<u8>>, String> {
   const NAL_TYPE_VPS: u8 = 32;
   const NAL_TYPE_PPS: u8 = 34;
 
@@ -892,18 +906,29 @@ fn strip_hevc_parameter_sets(data: &[u8], len_size: usize) -> Option<Vec<u8>> {
   let mut out: Option<Vec<u8>> = None;
   while offset < data.len() {
     if data.len() - offset < len_size {
-      return None;
+      return Err("malformed HEVC sample: truncated NAL length prefix".to_string());
     }
     let mut nal_len: usize = 0;
     for &b in &data[offset..offset + len_size] {
       nal_len = (nal_len << 8) | usize::from(b);
     }
     let nal_start = offset + len_size;
-    if nal_len == 0 || data.len() - nal_start < nal_len {
-      return None;
+    if nal_len == 0 {
+      return Err("malformed HEVC sample: zero-length NAL".to_string());
     }
-    let nal_type = (data[nal_start] >> 1) & 0x3f;
+    if data.len() - nal_start < nal_len {
+      return Err("malformed HEVC sample: NAL overruns end of sample".to_string());
+    }
+    let nal = &data[nal_start..nal_start + nal_len];
+    let nal_type = (nal[0] >> 1) & 0x3f;
     let is_ps = (NAL_TYPE_VPS..=NAL_TYPE_PPS).contains(&nal_type);
+    if is_ps && !known.iter().any(|k| k.as_slice() == nal) {
+      return Err(
+        "HEVC sample carries an in-band parameter set update absent from the hvcC \
+         description, which the 'hvc1' sample entry cannot represent"
+          .to_string(),
+      );
+    }
     match out.as_mut() {
       // Already stripping: keep non-parameter-set NALs (prefix + data)
       Some(buf) if !is_ps => buf.extend_from_slice(&data[offset..nal_start + nal_len]),
@@ -913,12 +938,12 @@ fn strip_hevc_parameter_sets(data: &[u8], len_size: usize) -> Option<Vec<u8>> {
     }
     offset = nal_start + nal_len;
   }
-  out
+  Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
-  use super::next_reordered_video_timestamp;
+  use super::{next_reordered_video_timestamp, strip_hevc_parameter_sets};
 
   #[test]
   fn reordered_vfr_timestamps_advance_by_previous_packet_duration() {
@@ -932,5 +957,111 @@ mod tests {
   #[test]
   fn reordered_timestamps_remain_monotonic_without_duration() {
     assert_eq!(next_reordered_video_timestamp(10, 0), 11);
+  }
+
+  fn lp(nal: &[u8]) -> Vec<u8> {
+    let mut out = (nal.len() as u32).to_be_bytes().to_vec();
+    out.extend_from_slice(nal);
+    out
+  }
+
+  // Valid 2-byte NAL headers: [type << 1, 0x01]
+  const VPS: &[u8] = &[0x40, 0x01, 0xaa];
+  const SPS: &[u8] = &[0x42, 0x01, 0xbb];
+  const PPS: &[u8] = &[0x44, 0x01, 0xcc];
+  const IDR: &[u8] = &[0x28, 0x01, 0xdd]; // type 20
+  const AUD: &[u8] = &[0x46, 0x01, 0x50]; // type 35
+
+  fn known_sets() -> Vec<Vec<u8>> {
+    vec![VPS.to_vec(), SPS.to_vec(), PPS.to_vec()]
+  }
+
+  fn concat(parts: &[&[u8]]) -> Vec<u8> {
+    parts.concat()
+  }
+
+  #[test]
+  fn strips_parameter_sets_matching_hvcc() {
+    let sample = concat(&[&lp(VPS), &lp(SPS), &lp(PPS), &lp(IDR)]);
+    let stripped = strip_hevc_parameter_sets(&sample, 4, &known_sets())
+      .unwrap()
+      .expect("parameter sets should be stripped");
+    assert_eq!(stripped, lp(IDR));
+  }
+
+  #[test]
+  fn strip_keeps_aud_and_non_ps_nals() {
+    let sample = concat(&[&lp(AUD), &lp(SPS), &lp(IDR)]);
+    let stripped = strip_hevc_parameter_sets(&sample, 4, &known_sets())
+      .unwrap()
+      .expect("SPS should be stripped");
+    assert_eq!(stripped, concat(&[&lp(AUD), &lp(IDR)]));
+  }
+
+  #[test]
+  fn strip_passes_through_samples_without_parameter_sets() {
+    let sample = concat(&[&lp(IDR), &lp(AUD)]);
+    assert_eq!(
+      strip_hevc_parameter_sets(&sample, 4, &known_sets()).unwrap(),
+      None
+    );
+    assert_eq!(
+      strip_hevc_parameter_sets(&[], 4, &known_sets()).unwrap(),
+      None
+    );
+  }
+
+  #[test]
+  fn strip_rejects_parameter_set_updates_absent_from_hvcc() {
+    let updated_sps: &[u8] = &[0x42, 0x01, 0x99]; // same type, different payload
+    let sample = concat(&[&lp(VPS), &lp(updated_sps), &lp(IDR)]);
+    let err = strip_hevc_parameter_sets(&sample, 4, &known_sets()).unwrap_err();
+    assert!(err.contains("parameter set update"), "{err}");
+  }
+
+  #[test]
+  fn strip_rejects_malformed_samples() {
+    // Trailing byte
+    let mut trailing = lp(IDR);
+    trailing.push(0xaa);
+    assert!(strip_hevc_parameter_sets(&trailing, 4, &known_sets()).is_err());
+
+    // Zero-length NAL
+    let mut zero = 0u32.to_be_bytes().to_vec();
+    zero.extend_from_slice(&lp(IDR));
+    assert!(strip_hevc_parameter_sets(&zero, 4, &known_sets()).is_err());
+
+    // NAL overruns end of sample
+    let mut overrun = 0u32.to_be_bytes().to_vec();
+    overrun[3] = 10;
+    overrun.extend_from_slice(IDR);
+    assert!(strip_hevc_parameter_sets(&overrun, 4, &known_sets()).is_err());
+  }
+
+  #[test]
+  fn strip_supports_short_length_prefixes() {
+    // 1-byte prefix
+    let mut sample = vec![SPS.len() as u8];
+    sample.extend_from_slice(SPS);
+    sample.push(IDR.len() as u8);
+    sample.extend_from_slice(IDR);
+    let stripped = strip_hevc_parameter_sets(&sample, 1, &known_sets())
+      .unwrap()
+      .expect("SPS should be stripped");
+    let mut expected = vec![IDR.len() as u8];
+    expected.extend_from_slice(IDR);
+    assert_eq!(stripped, expected);
+
+    // 2-byte prefix
+    let mut sample = (SPS.len() as u16).to_be_bytes().to_vec();
+    sample.extend_from_slice(SPS);
+    sample.extend_from_slice(&(IDR.len() as u16).to_be_bytes());
+    sample.extend_from_slice(IDR);
+    let stripped = strip_hevc_parameter_sets(&sample, 2, &known_sets())
+      .unwrap()
+      .expect("SPS should be stripped");
+    let mut expected = (IDR.len() as u16).to_be_bytes().to_vec();
+    expected.extend_from_slice(IDR);
+    assert_eq!(stripped, expected);
   }
 }
