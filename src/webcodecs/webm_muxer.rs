@@ -201,6 +201,7 @@ impl WebMMuxer {
       framerate: config.framerate.unwrap_or(30.0),
       extradata: config.description.as_ref().map(|d| d.to_vec()),
       has_alpha: config.alpha.unwrap_or(false),
+      hevc_sample_entry: Default::default(),
     };
 
     inner.add_video_track(generic_config)

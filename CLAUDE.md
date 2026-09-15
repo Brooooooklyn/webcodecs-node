@@ -612,7 +612,7 @@ if let Some(handle) = self.worker_handle.take() {
 - `encode()/decode()`: Increments queue size under lock, sends command (non-blocking)
 - `flush()`: Sends Flush command with response channel, waits via `spawn_blocking`
 - Worker: Holds mutex during FFmpeg operations, uses `saturating_sub` for queue decrement
-- AV1 special case: Drains encoder/decoder before context drop (libaom thread safety)
+- AV1 cleanup: no drain needed; vendored libaom v3.13.1 contains the CVE-2025-8879 fix
 
 ### Drop Behavior (Non-Blocking)
 
@@ -665,11 +665,7 @@ src/codec/context.rs:339,362  # Set extradata if provided (non-critical)
 
 **Location:** Native code in libaom library
 **Symptom:** Occasional segmentation fault during AV1 encoder/decoder cleanup (CVE-2025-8879)
-**Workaround:**
-
-- **Windows x64 MSVC:** Uses rav1e (encoder) + dav1d (decoder) instead of libaom
-- **Other platforms:** AV1 encoder/decoder implementations drain all frames before dropping context
-  **Status:** Fully resolved on Windows x64; mitigated with drain workaround elsewhere (`video_encoder.rs`, `video_decoder.rs`)
+**Status:** Resolved. The upstream fix (`820b499`, "rtc: Restrict usage of src_sad_blk_64x64 to single spatial layer") ships in libaom v3.13.0, and the vendored libaom is v3.13.1. The drain-before-drop workaround has been removed; Windows x64 MSVC still uses rav1e (encoder) + dav1d (decoder).
 
 ## Known Limitations
 

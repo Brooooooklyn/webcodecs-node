@@ -105,6 +105,19 @@ pub fn record_hw_encoding_success() {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::sync::Mutex;
+
+  /// These tests share the process-global HW_STATE, so they must not run
+  /// concurrently: a sibling's reset could clear encoding_disabled_at (or
+  /// another test's failures could bump the count) between assertions.
+  static TEST_GUARD: Mutex<()> = Mutex::new(());
+
+  fn lock_state() -> std::sync::MutexGuard<'static, ()> {
+    // Recover from a previous test's panic so the guard cannot cascade
+    TEST_GUARD
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+  }
 
   fn reset_state() {
     reset_hardware_fallback_state();
@@ -112,6 +125,7 @@ mod tests {
 
   #[test]
   fn test_encoding_failure_threshold() {
+    let _guard = lock_state();
     reset_state();
 
     assert!(!is_hw_encoding_disabled());
@@ -126,6 +140,7 @@ mod tests {
 
   #[test]
   fn test_encoding_success_resets_count() {
+    let _guard = lock_state();
     reset_state();
 
     // Record some failures (but not enough to disable)
@@ -144,6 +159,7 @@ mod tests {
 
   #[test]
   fn test_reset_clears_state() {
+    let _guard = lock_state();
     reset_state();
 
     // Disable encoding
@@ -161,6 +177,7 @@ mod tests {
 
   #[test]
   fn test_additional_failures_dont_restart_timer() {
+    let _guard = lock_state();
     reset_state();
 
     // Record failures to hit threshold

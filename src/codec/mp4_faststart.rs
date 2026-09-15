@@ -141,25 +141,31 @@ fn parse_atoms(data: &[u8]) -> Result<Vec<AtomInfo>, FastStartError> {
 /// Update chunk offsets in moov atom
 fn update_chunk_offsets(moov_data: &[u8], adjustment: i64) -> Result<Vec<u8>, FastStartError> {
   let mut result = moov_data.to_vec();
-  update_chunk_offsets_recursive(&mut result, 8, adjustment)?;
+  let end = result.len();
+  update_chunk_offsets_recursive(&mut result, 8, end, adjustment)?;
   Ok(result)
 }
 
 /// Recursively update chunk offsets in moov sub-atoms
+///
+/// `end` bounds the walk to the containing atom: without it the loop would
+/// run into sibling atoms past the container, updating their stco/co64
+/// entries once per nesting level (a second track's offsets shifted by
+/// N x adjustment, corrupting the file).
 fn update_chunk_offsets_recursive(
   data: &mut [u8],
   start: usize,
+  end: usize,
   adjustment: i64,
 ) -> Result<(), FastStartError> {
   let mut pos = start;
-  let len = data.len();
 
-  while pos + 8 <= len {
+  while pos + 8 <= end {
     // Read atom size
     let size_bytes: [u8; 4] = data[pos..pos + 4].try_into().unwrap();
     let size = u32::from_be_bytes(size_bytes) as usize;
 
-    if size < 8 || pos + size > len {
+    if size < 8 || pos + size > end {
       break;
     }
 
@@ -177,7 +183,7 @@ fn update_chunk_offsets_recursive(
       }
       // Container atoms that may contain stco/co64
       b"trak" | b"mdia" | b"minf" | b"stbl" | b"moov" => {
-        update_chunk_offsets_recursive(data, pos + 8, adjustment)?;
+        update_chunk_offsets_recursive(data, pos + 8, pos + size, adjustment)?;
       }
       _ => {}
     }
@@ -268,6 +274,47 @@ pub enum FastStartError {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  fn atom(typ: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut out = (8 + body.len() as u32).to_be_bytes().to_vec();
+    out.extend_from_slice(typ);
+    out.extend_from_slice(body);
+    out
+  }
+
+  /// moov with two traks, each holding an stco with the given offsets
+  fn two_trak_moov(video_offsets: &[u32], audio_offsets: &[u32]) -> Vec<u8> {
+    fn trak(offsets: &[u32]) -> Vec<u8> {
+      let mut stco_body = 0u32.to_be_bytes().to_vec(); // version/flags
+      stco_body.extend_from_slice(&(offsets.len() as u32).to_be_bytes());
+      for o in offsets {
+        stco_body.extend_from_slice(&o.to_be_bytes());
+      }
+      let stbl = atom(b"stbl", &atom(b"stco", &stco_body));
+      let minf = atom(b"minf", &stbl);
+      let mdia = atom(b"mdia", &minf);
+      atom(b"trak", &mdia)
+    }
+    let mut moov_body = Vec::new();
+    moov_body.extend_from_slice(&atom(b"mvhd", &[0; 4]));
+    moov_body.extend_from_slice(&trak(video_offsets));
+    moov_body.extend_from_slice(&trak(audio_offsets));
+    atom(b"moov", &moov_body)
+  }
+
+  #[test]
+  fn chunk_offsets_updated_once_per_track() {
+    // Regression: the recursive walk once ran to the end of the moov slice
+    // instead of the containing atom, so the first trak's walk bled into the
+    // second trak and its stco was adjusted once per nesting level (5x for
+    // the classic trak>mdia>minf>stbl chain). Every offset must move by
+    // exactly the adjustment, regardless of track count or position.
+    let moov = two_trak_moov(&[100, 200], &[300]);
+    let updated = update_chunk_offsets(&moov, 1547).unwrap();
+
+    let video = two_trak_moov(&[100 + 1547, 200 + 1547], &[300 + 1547]);
+    assert_eq!(updated, video);
+  }
 
   #[test]
   fn test_parse_atoms() {

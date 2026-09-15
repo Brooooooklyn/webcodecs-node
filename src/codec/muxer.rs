@@ -7,10 +7,11 @@ use super::avio_context::CustomIOContext;
 use super::io_buffer::StreamingBufferHandle;
 use crate::ffi::accessors::{
   ffcodecpar_set_bit_rate, ffcodecpar_set_channels, ffcodecpar_set_codec_id,
-  ffcodecpar_set_codec_type, ffcodecpar_set_extradata, ffcodecpar_set_format,
-  ffcodecpar_set_frame_size, ffcodecpar_set_height, ffcodecpar_set_sample_rate,
-  ffcodecpar_set_width, fffmt_get_oformat_flags, fffmt_get_stream, fffmt_set_pb,
-  ffstream_get_codecpar, ffstream_get_index, ffstream_get_time_base, ffstream_set_time_base,
+  ffcodecpar_set_codec_tag, ffcodecpar_set_codec_type, ffcodecpar_set_extradata,
+  ffcodecpar_set_format, ffcodecpar_set_frame_size, ffcodecpar_set_height,
+  ffcodecpar_set_sample_rate, ffcodecpar_set_width, fffmt_get_oformat_flags, fffmt_get_stream,
+  fffmt_set_pb, ffstream_get_codecpar, ffstream_get_index, ffstream_get_time_base,
+  ffstream_set_time_base,
 };
 use crate::ffi::avformat::{
   AVFormatContext, av_interleaved_write_frame, av_write_trailer, avfmt_flag,
@@ -61,6 +62,21 @@ pub enum MuxerOutput {
   Streaming(usize),
 }
 
+/// HEVC sample-entry override for MP4 muxing
+///
+/// Selects the fourcc written into the MP4 sample description for an HEVC
+/// track. The default, `Auto`, picks 'hvc1' when the hvcC record is
+/// well-formed, single-layer, and complete; `Hev1` keeps 'hev1' so streams
+/// that legally carry in-band parameter-set additions remux without
+/// rejection; `Hvc1` forces 'hvc1' and requires a qualifying description.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HevcSampleEntry {
+  #[default]
+  Auto,
+  Hev1,
+  Hvc1,
+}
+
 /// Video stream configuration
 #[derive(Debug, Clone)]
 pub struct VideoStreamConfig {
@@ -78,6 +94,8 @@ pub struct VideoStreamConfig {
   pub bitrate: Option<u64>,
   /// Codec extradata (avcC, hvcC, av1C, etc.)
   pub extradata: Option<Vec<u8>>,
+  /// HEVC sample-entry override (MP4 only; ignored for other codecs)
+  pub hevc_sample_entry: HevcSampleEntry,
 }
 
 /// Audio stream configuration
@@ -113,6 +131,21 @@ pub struct MuxerOptions {
   pub live: bool,
 }
 
+/// HEVC 'hvc1' selection context
+///
+/// Captured when the MP4 muxer selects the 'hvc1' sample entry: the NAL
+/// length-prefix size and parameter-set payloads parsed from the hvcC, plus
+/// the raw hvcC bytes so mid-stream description changes can be detected.
+#[derive(Debug, Clone)]
+pub struct Hvc1Context {
+  /// NAL length-prefix size from the hvcC record (1-4 bytes)
+  pub nal_len_size: usize,
+  /// VPS/SPS/PPS payloads from the hvcC
+  pub parameter_sets: Vec<Vec<u8>>,
+  /// Raw hvcC bytes from the track configuration
+  pub extradata: Vec<u8>,
+}
+
 /// Muxer context wrapper
 ///
 /// Provides RAII wrapper around AVFormatContext for muxing operations.
@@ -131,6 +164,9 @@ pub struct MuxerContext {
   finalized: bool,
   /// Container format
   format: ContainerFormat,
+  /// HEVC 'hvc1' selection context (None when the tag was left as FFmpeg's
+  /// default 'hev1')
+  hvc1: Option<Hvc1Context>,
 }
 
 impl MuxerContext {
@@ -190,6 +226,7 @@ impl MuxerContext {
       header_written: false,
       finalized: false,
       format,
+      hvc1: None,
     })
   }
 
@@ -201,6 +238,40 @@ impl MuxerContext {
       return Err(CodecError::InvalidState(
         "Cannot add stream after header is written".to_string(),
       ));
+    }
+
+    // Select the HEVC sample-entry context before mutating anything, so a
+    // rejected forced 'hvc1' leaves no stream behind for retries.
+    // 'Auto' selects 'hvc1' when the hvcC record is well-formed, single-layer,
+    // within movenc's parameter-set count limits, and carries a complete set
+    // of VPS/SPS/PPS — otherwise keep 'hev1', which permits in-band parameter
+    // sets. Input completeness bits are not consulted: x265/FFmpeg emitters
+    // write array_completeness=0 while never sending in-band sets, so the bit
+    // does not predict them (and movenc itself ignores it when declaring
+    // output arrays complete). The caller strips in-band sets that duplicate
+    // the hvcC using the returned context; streams with in-band additions are
+    // rejected loudly, and callers who need to remux such streams can force
+    // 'hev1'.
+    let mut hvc1 = None;
+    if self.format == ContainerFormat::Mp4
+      && config.codec_id == AVCodecID::Hevc
+      && config.hevc_sample_entry != HevcSampleEntry::Hev1
+    {
+      hvc1 = config.extradata.as_deref().and_then(|extradata| {
+        parse_hvcc_parameter_sets_complete(extradata).map(|(nal_len_size, parameter_sets)| {
+          Hvc1Context {
+            nal_len_size,
+            parameter_sets,
+            extradata: extradata.to_vec(),
+          }
+        })
+      });
+      if config.hevc_sample_entry == HevcSampleEntry::Hvc1 && hvc1.is_none() {
+        return Err(CodecError::InvalidConfig(
+          "hvc1 sample entry requested but the description is not a well-formed, complete, single-layer hvcC"
+            .to_string(),
+        ));
+      }
     }
 
     // Validate codec for format
@@ -243,6 +314,13 @@ impl MuxerContext {
         }
       }
 
+      // MP4/HEVC: FFmpeg only emits 'hvc1' when the codec tag is set
+      // explicitly (its default is 'hev1'); with the tag set, movenc also
+      // marks hvcC arrays complete, per ISO/IEC 14496-15.
+      if hvc1.is_some() {
+        ffcodecpar_set_codec_tag(codecpar, u32::from_le_bytes(*b"hvc1"));
+      }
+
       // Set time base on stream
       ffstream_set_time_base(stream, config.time_base.num, config.time_base.den);
     }
@@ -250,6 +328,7 @@ impl MuxerContext {
     // Get stream index
     let index = unsafe { ffstream_get_index(stream) };
     self.video_stream_index = Some(index);
+    self.hvc1 = hvc1;
 
     Ok(index)
   }
@@ -486,6 +565,11 @@ impl MuxerContext {
     self.video_stream_index
   }
 
+  /// HEVC 'hvc1' selection context, or None when 'hev1' is in use
+  pub fn hvc1_context(&self) -> Option<&Hvc1Context> {
+    self.hvc1.as_ref()
+  }
+
   /// Get audio stream index
   pub fn audio_stream_index(&self) -> Option<i32> {
     self.audio_stream_index
@@ -630,6 +714,105 @@ impl MuxerContext {
   }
 }
 
+/// Parse an hvcC (HVCDecoderConfigurationRecord). When the record is
+/// well-formed and carries at least one VPS, SPS, and PPS NAL, return the
+/// length-prefix size (1-4 bytes) together with the parameter-set payloads.
+/// Returns None for malformed or incomplete records.
+///
+/// Layout per ISO/IEC 14496-15: byte 0 is configurationVersion (must be 1) in
+/// a 23-byte fixed header, byte 21 low 2 bits are lengthSizeMinusOne, byte 22
+/// is numOfArrays, then per array: 1 header byte (low 6 bits are the NAL unit
+/// type), u16-be numNalus, and per NAL a u16-be length followed by the NAL
+/// data. Every payload must hold at least the 2-byte NAL header, and its
+/// header type must match the array's declared type. Multi-layer records
+/// (nuh_layer_id != 0 in any parameter set, e.g. HEVC alpha) are rejected:
+/// movenc drops nonzero-layer arrays when writing hvcC, so 'hvc1' would lose
+/// the additional layers and 'hev1' must be used instead. Records exceeding
+/// movenc's parameter-set count limits (16 VPS, 16 SPS, 64 PPS) are likewise
+/// rejected: FFmpeg's hvcc_write fails on them and mov_write_hvcc_tag ignores
+/// that error, producing an empty hvcC box.
+fn parse_hvcc_parameter_sets_complete(extradata: &[u8]) -> Option<(usize, Vec<Vec<u8>>)> {
+  const NAL_TYPE_VPS: u8 = 32;
+  const NAL_TYPE_SPS: u8 = 33;
+  const NAL_TYPE_PPS: u8 = 34;
+  // FFmpeg's HEVC_MAX_VPS_COUNT / HEVC_MAX_SPS_COUNT / HEVC_MAX_PPS_COUNT
+  const MAX_VPS_COUNT: usize = 16;
+  const MAX_SPS_COUNT: usize = 16;
+  const MAX_PPS_COUNT: usize = 64;
+
+  if extradata.len() < 23 || extradata[0] != 1 {
+    return None;
+  }
+  let len_size = usize::from(extradata[21] & 0x03) + 1;
+  let num_arrays = usize::from(extradata[22]);
+
+  let mut offset = 23;
+  let mut parameter_sets = Vec::new();
+  let (mut has_vps, mut has_sps, mut has_pps) = (false, false, false);
+  let (mut vps_count, mut sps_count, mut pps_count) = (0usize, 0usize, 0usize);
+  for _ in 0..num_arrays {
+    let header = *extradata.get(offset)?;
+    let array_type = header & 0x3f;
+    let num_nalus = usize::from(u16::from_be_bytes([
+      *extradata.get(offset + 1)?,
+      *extradata.get(offset + 2)?,
+    ]));
+    offset += 3;
+    for _ in 0..num_nalus {
+      let nal_len = usize::from(u16::from_be_bytes([
+        *extradata.get(offset)?,
+        *extradata.get(offset + 1)?,
+      ]));
+      offset += 2;
+      if nal_len < 2 || extradata.len() - offset < nal_len {
+        return None;
+      }
+      let payload = &extradata[offset..offset + nal_len];
+      // The NAL header type must match the array's declared type
+      if (payload[0] >> 1) & 0x3f != array_type {
+        return None;
+      }
+      // Reject multi-layer records ('hev1'): movenc drops nonzero-layer
+      // arrays when writing hvcC, which would lose e.g. the alpha layer
+      let nuh_layer_id = (u32::from(payload[0] & 0x01) << 5) | u32::from(payload[1] >> 3);
+      if (NAL_TYPE_VPS..=NAL_TYPE_PPS).contains(&array_type) && nuh_layer_id != 0 {
+        return None;
+      }
+      match array_type {
+        NAL_TYPE_VPS => {
+          has_vps = true;
+          vps_count += 1;
+        }
+        NAL_TYPE_SPS => {
+          has_sps = true;
+          sps_count += 1;
+        }
+        NAL_TYPE_PPS => {
+          has_pps = true;
+          pps_count += 1;
+        }
+        _ => {}
+      }
+      if (NAL_TYPE_VPS..=NAL_TYPE_PPS).contains(&array_type) {
+        parameter_sets.push(payload.to_vec());
+      }
+      offset += nal_len;
+    }
+  }
+
+  // movenc's hvcc_write rejects records over these limits and the caller
+  // ignores the error, yielding an empty hvcC box
+  if vps_count > MAX_VPS_COUNT || sps_count > MAX_SPS_COUNT || pps_count > MAX_PPS_COUNT {
+    return None;
+  }
+
+  if offset == extradata.len() && has_vps && has_sps && has_pps {
+    Some((len_size, parameter_sets))
+  } else {
+    None
+  }
+}
+
 impl Drop for MuxerContext {
   fn drop(&mut self) {
     // Write trailer if not already done
@@ -670,5 +853,195 @@ mod tests {
   fn test_muxer_creation() {
     let muxer = MuxerContext::new(ContainerFormat::Mp4, MuxerOutput::Buffer);
     assert!(muxer.is_ok());
+  }
+
+  /// Minimal hvcC builder: 23-byte header + arrays of (type, payloads).
+  /// NAL payloads use valid 2-byte headers: [type << 1, 0x01].
+  fn build_hvcc(configuration_version: u8, arrays: &[(u8, Vec<Vec<u8>>)]) -> Vec<u8> {
+    let mut out = vec![0u8; 23];
+    out[0] = configuration_version;
+    out[21] = 0xff; // lengthSizeMinusOne = 3 -> 4-byte prefixes
+    out[22] = arrays.len() as u8;
+    for (nal_type, nals) in arrays {
+      out.push(0x80 | nal_type); // array_completeness | NAL_unit_type
+      out.extend_from_slice(&(nals.len() as u16).to_be_bytes());
+      for nal in nals {
+        out.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+        out.extend_from_slice(nal);
+      }
+    }
+    out
+  }
+
+  fn vps() -> Vec<u8> {
+    vec![0x40, 0x01, 0xaa]
+  }
+  fn sps() -> Vec<u8> {
+    vec![0x42, 0x01, 0xbb]
+  }
+  fn pps() -> Vec<u8> {
+    vec![0x44, 0x01, 0xcc]
+  }
+
+  #[test]
+  fn hvcc_complete_record_parses() {
+    let hvcc = build_hvcc(
+      1,
+      &[(32, vec![vps()]), (33, vec![sps()]), (34, vec![pps()])],
+    );
+    let (len_size, sets) = parse_hvcc_parameter_sets_complete(&hvcc).expect("valid hvcC");
+    assert_eq!(len_size, 4);
+    assert_eq!(sets, vec![vps(), sps(), pps()]);
+  }
+
+  #[test]
+  fn hvcc_incomplete_or_malformed_records_rejected() {
+    // configurationVersion must be 1
+    let v0 = build_hvcc(
+      0,
+      &[(32, vec![vps()]), (33, vec![sps()]), (34, vec![pps()])],
+    );
+    assert!(parse_hvcc_parameter_sets_complete(&v0).is_none());
+
+    // Missing PPS
+    let no_pps = build_hvcc(1, &[(32, vec![vps()]), (33, vec![sps()])]);
+    assert!(parse_hvcc_parameter_sets_complete(&no_pps).is_none());
+
+    // Payload shorter than the 2-byte NAL header
+    let short = build_hvcc(
+      1,
+      &[(32, vec![vec![0x40]]), (33, vec![sps()]), (34, vec![pps()])],
+    );
+    assert!(parse_hvcc_parameter_sets_complete(&short).is_none());
+
+    // Payload NAL header type disagrees with the array's declared type
+    let mismatched = build_hvcc(
+      1,
+      &[(32, vec![pps()]), (33, vec![sps()]), (34, vec![pps()])],
+    );
+    assert!(parse_hvcc_parameter_sets_complete(&mismatched).is_none());
+
+    // Trailing garbage after the arrays
+    let mut trailing = build_hvcc(
+      1,
+      &[(32, vec![vps()]), (33, vec![sps()]), (34, vec![pps()])],
+    );
+    trailing.push(0);
+    assert!(parse_hvcc_parameter_sets_complete(&trailing).is_none());
+
+    // Truncated record
+    let truncated = &build_hvcc(
+      1,
+      &[(32, vec![vps()]), (33, vec![sps()]), (34, vec![pps()])],
+    )[..26];
+    assert!(parse_hvcc_parameter_sets_complete(truncated).is_none());
+  }
+
+  #[test]
+  fn hvcc_multi_layer_records_rejected() {
+    // nuh_layer_id = 1: payload[0] low bit set, payload[1] high 5 bits zero
+    let layer1_sps = vec![0x42 | 0x01, 0x01, 0xbb];
+    let multi = build_hvcc(
+      1,
+      &[
+        (32, vec![vps()]),
+        (33, vec![sps(), layer1_sps]),
+        (34, vec![pps()]),
+      ],
+    );
+    assert!(
+      parse_hvcc_parameter_sets_complete(&multi).is_none(),
+      "multi-layer hvcC must keep hev1: movenc would drop the nonzero-layer arrays"
+    );
+  }
+
+  fn hevc_stream_config(extradata: Vec<u8>, sample_entry: HevcSampleEntry) -> VideoStreamConfig {
+    VideoStreamConfig {
+      codec_id: crate::ffi::AVCodecID::Hevc,
+      width: 64,
+      height: 64,
+      pixel_format: crate::ffi::AVPixelFormat::Yuv420p,
+      time_base: AVRational::new(1, 15360),
+      bitrate: None,
+      extradata: Some(extradata),
+      hevc_sample_entry: sample_entry,
+    }
+  }
+
+  #[test]
+  fn hevc_sample_entry_override() {
+    let hvcc = build_hvcc(
+      1,
+      &[(32, vec![vps()]), (33, vec![sps()]), (34, vec![pps()])],
+    );
+
+    // Forced 'hev1' keeps the default tag even for a qualifying description
+    let mut muxer = MuxerContext::new(ContainerFormat::Mp4, MuxerOutput::Buffer).unwrap();
+    muxer
+      .add_video_stream(&hevc_stream_config(hvcc.clone(), HevcSampleEntry::Hev1))
+      .unwrap();
+    assert!(muxer.hvc1_context().is_none());
+
+    // Forced 'hvc1' selects the tag for a qualifying description
+    let mut muxer = MuxerContext::new(ContainerFormat::Mp4, MuxerOutput::Buffer).unwrap();
+    muxer
+      .add_video_stream(&hevc_stream_config(hvcc.clone(), HevcSampleEntry::Hvc1))
+      .unwrap();
+    assert!(muxer.hvc1_context().is_some());
+
+    // Forced 'hvc1' with an incomplete description is an error, not a
+    // fallback — and must leave no stream behind so retries are clean
+    let incomplete = build_hvcc(1, &[(32, vec![vps()]), (33, vec![sps()])]);
+    let mut muxer = MuxerContext::new(ContainerFormat::Mp4, MuxerOutput::Buffer).unwrap();
+    let err = muxer.add_video_stream(&hevc_stream_config(incomplete, HevcSampleEntry::Hvc1));
+    assert!(err.is_err());
+    assert!(muxer.video_stream_index().is_none());
+    assert!(muxer.hvc1_context().is_none());
+    // Retry with a valid forced 'hev1' track succeeds on a clean context
+    muxer
+      .add_video_stream(&hevc_stream_config(hvcc.clone(), HevcSampleEntry::Hev1))
+      .unwrap();
+    assert!(muxer.video_stream_index().is_some());
+    assert!(muxer.hvc1_context().is_none());
+
+    // 'Auto' still selects from content
+    let mut muxer = MuxerContext::new(ContainerFormat::Mp4, MuxerOutput::Buffer).unwrap();
+    muxer
+      .add_video_stream(&hevc_stream_config(hvcc, HevcSampleEntry::Auto))
+      .unwrap();
+    assert!(muxer.hvc1_context().is_some());
+  }
+
+  #[test]
+  fn hvcc_over_count_records_rejected() {
+    // movenc's hvcc_write caps arrays at 16 VPS / 16 SPS / 64 PPS and writes
+    // an empty hvcC box beyond that, so the gate must keep hev1
+    let ok = build_hvcc(
+      1,
+      &[
+        (32, vec![vps(); 16]),
+        (33, vec![sps(); 16]),
+        (34, vec![pps(); 64]),
+      ],
+    );
+    assert!(parse_hvcc_parameter_sets_complete(&ok).is_some());
+
+    let too_many_vps = build_hvcc(
+      1,
+      &[(32, vec![vps(); 17]), (33, vec![sps()]), (34, vec![pps()])],
+    );
+    assert!(parse_hvcc_parameter_sets_complete(&too_many_vps).is_none());
+
+    let too_many_sps = build_hvcc(
+      1,
+      &[(32, vec![vps()]), (33, vec![sps(); 17]), (34, vec![pps()])],
+    );
+    assert!(parse_hvcc_parameter_sets_complete(&too_many_sps).is_none());
+
+    let too_many_pps = build_hvcc(
+      1,
+      &[(32, vec![vps()]), (33, vec![sps()]), (34, vec![pps(); 65])],
+    );
+    assert!(parse_hvcc_parameter_sets_complete(&too_many_pps).is_none());
   }
 }

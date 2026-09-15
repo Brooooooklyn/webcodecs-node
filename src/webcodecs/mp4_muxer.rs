@@ -3,7 +3,7 @@
 //! Provides a JavaScript-friendly API for muxing encoded video and audio
 //! chunks into MP4 container format.
 
-use crate::codec::muxer::{ContainerFormat, MuxerOptions};
+use crate::codec::muxer::{ContainerFormat, HevcSampleEntry, MuxerOptions};
 use crate::ffi::AVCodecID;
 use crate::webcodecs::codec_string::parse_codec_string;
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunk;
@@ -124,6 +124,18 @@ pub struct Mp4MuxerOptions {
 // Track Configuration Types
 // ============================================================================
 
+/// HEVC sample-entry override for the MP4 muxer
+#[napi(string_enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HevcSampleEntryJs {
+  /// Force the 'hvc1' sample entry; requires a qualifying hvcC description
+  #[napi(value = "hvc1")]
+  Hvc1,
+  /// Force the 'hev1' sample entry; permits in-band parameter sets
+  #[napi(value = "hev1")]
+  Hev1,
+}
+
 /// Video track configuration for MP4 muxer
 #[napi(object)]
 pub struct Mp4VideoTrackConfig {
@@ -137,6 +149,11 @@ pub struct Mp4VideoTrackConfig {
   pub framerate: Option<f64>,
   /// Codec-specific description data (avcC/hvcC/av1C from encoder metadata)
   pub description: Option<Uint8Array>,
+  /// HEVC sample-entry override. Default picks "hvc1" when the hvcC
+  /// description is well-formed, single-layer, and complete; "hev1" permits
+  /// in-band parameter sets (e.g. remuxing hev1 streams with parameter-set
+  /// updates); "hvc1" forces the tag and requires a qualifying description.
+  pub sample_entry: Option<HevcSampleEntryJs>,
 }
 
 /// Audio track configuration for MP4 muxer
@@ -233,6 +250,18 @@ impl Mp4Muxer {
       ));
     }
 
+    let hevc_sample_entry = match config.sample_entry {
+      None => HevcSampleEntry::Auto,
+      Some(HevcSampleEntryJs::Hev1) => HevcSampleEntry::Hev1,
+      Some(HevcSampleEntryJs::Hvc1) => HevcSampleEntry::Hvc1,
+    };
+    if hevc_sample_entry != HevcSampleEntry::Auto && codec_id != AVCodecID::Hevc {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "sampleEntry is only supported for HEVC video tracks",
+      ));
+    }
+
     let generic_config = GenericVideoTrackConfig {
       codec: config.codec,
       codec_id,
@@ -241,6 +270,7 @@ impl Mp4Muxer {
       framerate: config.framerate.unwrap_or(30.0),
       extradata: config.description.as_ref().map(|d| d.to_vec()),
       has_alpha: false, // TODO: Add alpha support for MKV if needed
+      hevc_sample_entry,
     };
 
     inner.add_video_track(generic_config)
