@@ -206,6 +206,27 @@ impl Packet {
     }
   }
 
+  /// Get NEW_EXTRADATA side data (mid-stream description change)
+  ///
+  /// Demuxed packets carry the new codec description here when the
+  /// bitstream parameter sets change between samples; muxers act on it to
+  /// update the track description.
+  pub fn new_extradata(&self) -> Option<&[u8]> {
+    let mut size: usize = 0;
+    let data = unsafe {
+      av_packet_get_side_data(
+        self.as_ptr(),
+        pkt_side_data_type::AV_PKT_DATA_NEW_EXTRADATA,
+        &mut size,
+      )
+    };
+    if data.is_null() || size == 0 {
+      None
+    } else {
+      Some(unsafe { std::slice::from_raw_parts(data, size) })
+    }
+  }
+
   /// Add Matroska BlockAdditional side data (used for VP9 alpha)
   ///
   /// This is used to attach alpha channel data to a packet for VP9 alpha.

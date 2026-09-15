@@ -5,6 +5,11 @@
  */
 
 import test from 'ava'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
 
 import {
   Mp4Muxer,
@@ -782,6 +787,126 @@ test('Mp4Muxer: rejects malformed HEVC samples under hvc1', async (t) => {
     t.regex(err?.message ?? '', /malformed HEVC sample/, name)
     muxer.close()
   }
+})
+
+/** hvcC with one parameter-set array padded to `count` entries (first repeated) */
+function hvccWithPsCount(hvcc: Uint8Array, nalType: number, count: number): Uint8Array {
+  const header = hvcc.slice(0, 22)
+  const numArrays = hvcc[22]
+  const arrays: Uint8Array[] = []
+  let off = 23
+  for (let a = 0; a < numArrays; a++) {
+    const start = off
+    const type = hvcc[off] & 0x3f
+    const numNalus = (hvcc[off + 1] << 8) | hvcc[off + 2]
+    off += 3
+    const nals: Uint8Array[] = []
+    for (let n = 0; n < numNalus; n++) {
+      const len = (hvcc[off] << 8) | hvcc[off + 1]
+      off += 2
+      nals.push(hvcc.slice(off, off + len))
+      off += len
+    }
+    if (type === nalType) {
+      while (nals.length < count) nals.push(nals[0])
+    }
+    arrays.push(Uint8Array.of(hvcc[start], 0, nals.length))
+    for (const nal of nals) {
+      arrays.push(Uint8Array.of(0, nal.length))
+      arrays.push(nal)
+    }
+  }
+  const parts = [header, Uint8Array.of(numArrays), ...arrays]
+  const out = new Uint8Array(parts.reduce((sum, p) => sum + p.length, 0))
+  let w = 0
+  for (const p of parts) {
+    out.set(p, w)
+    w += p.length
+  }
+  return out
+}
+
+test('Mp4Muxer: hvc1 honors movenc parameter-set count limits', async (t) => {
+  const { chunks, metadatas } = await encodeHevcChunks(128, 128, 3)
+  const description = metadatas[0]?.decoderConfig?.description
+  t.truthy(description, 'Encoder should provide an hvcC description')
+  if (!description) return
+  const hvcc = new Uint8Array(description)
+
+  // movenc's hvcc_write rejects records over 16 VPS / 16 SPS / 64 PPS and
+  // writes an empty hvcC box; the gate must fall back to hev1 past the limit
+  for (const [nalType, atLimit, overLimit] of [
+    [32, 16, 17],
+    [33, 16, 17],
+    [34, 64, 65],
+  ] as const) {
+    for (const [count, expect] of [
+      [atLimit, 'hvc1'],
+      [overLimit, 'hev1'],
+    ] as const) {
+      const muxer = new Mp4Muxer()
+      muxer.addVideoTrack({
+        codec: 'hev1.1.6.L93.B0',
+        width: 128,
+        height: 128,
+        framerate: 30,
+        description: hvccWithPsCount(hvcc, nalType, count),
+      })
+      for (const chunk of chunks) muxer.addVideoChunk(chunk)
+      muxer.flush()
+      const mp4Data = muxer.finalize()
+      muxer.close()
+      t.is(
+        getMp4VideoSampleEntryTag(mp4Data),
+        expect,
+        `NAL type ${nalType} x ${count} should select ${expect}`,
+      )
+    }
+  }
+})
+
+test('Mp4Muxer: rejects mid-stream HEVC description changes under hvc1', async (t) => {
+  // Fixture: 6 samples at 128x128 then samples referencing a second sample
+  // description at 64x64, so mov.c emits AV_PKT_DATA_NEW_EXTRADATA on the
+  // first boundary sample. The muxer must reject the change under hvc1
+  // instead of dropping the side data and writing the stale description.
+  const fixture = readFileSync(join(__dirname, 'fixtures/hevc-midstream-description-change.mp4'))
+
+  const demuxedChunks: EncodedVideoChunk[] = []
+  const demuxer = new Mp4Demuxer({
+    videoOutput: (chunk) => demuxedChunks.push(chunk),
+    error: (e) => t.fail(`Demuxer error: ${e.message}`),
+  })
+  await demuxer.loadBuffer(fixture)
+  const config = demuxer.videoDecoderConfig
+  t.truthy(config, 'Fixture should expose a video decoder config')
+  if (!config) {
+    demuxer.close()
+    return
+  }
+  await demuxer.demuxAsync()
+  demuxer.close()
+  t.true(demuxedChunks.length > 6, 'Fixture should demux the pre-change samples plus the boundary sample')
+
+  const muxer = new Mp4Muxer()
+  muxer.addVideoTrack({
+    codec: config.codec,
+    width: config.codedWidth,
+    height: config.codedHeight,
+    framerate: 30,
+    description: config.description,
+  })
+  // Pre-change samples carry no side data and mux normally
+  for (let i = 0; i < demuxedChunks.length - 1; i++) {
+    muxer.addVideoChunk(demuxedChunks[i])
+  }
+  // The boundary sample carries the new description and must be rejected
+  const err = t.throws(
+    () => muxer.addVideoChunk(demuxedChunks[demuxedChunks.length - 1]),
+    { instanceOf: Error },
+  )
+  t.regex(err?.message ?? '', /description changed mid-stream/)
+  muxer.close()
 })
 
 test('Mp4Muxer: keeps hev1 and preserves in-band parameter sets when hvcC is incomplete', async (t) => {

@@ -6,7 +6,8 @@
 use crate::codec::Packet;
 use crate::codec::io_buffer::StreamingBufferHandle;
 use crate::codec::muxer::{
-  AudioStreamConfig, ContainerFormat, MuxerContext, MuxerOptions, MuxerOutput, VideoStreamConfig,
+  AudioStreamConfig, ContainerFormat, Hvc1Context, MuxerContext, MuxerOptions, MuxerOutput,
+  VideoStreamConfig,
 };
 use crate::ffi::{AVCodecID, AVPixelFormat, AVRational, AVSampleFormat};
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunk;
@@ -276,11 +277,10 @@ pub struct MuxerInner<F: MuxerFormat> {
   /// reordered-frame compatibility path advances from the previous packet's
   /// end, not by the duration of the packet currently being written.
   last_video_duration: i64,
-  /// HEVC 'hvc1' parameter-set context: NAL length-prefix size plus the
-  /// VPS/SPS/PPS payloads from the hvcC. In-band duplicates are stripped from
-  /// samples because 'hvc1' forbids them; None when 'hev1' is in use (in-band
-  /// sets allowed).
-  strip_hevc_ps: Option<(usize, Vec<Vec<u8>>)>,
+  /// HEVC 'hvc1' selection context. In-band parameter sets that duplicate the
+  /// hvcC are stripped from samples because 'hvc1' forbids them; None when
+  /// 'hev1' is in use (in-band sets allowed).
+  strip_hevc_ps: Option<Hvc1Context>,
   /// Phantom data for format type
   _format: PhantomData<F>,
 }
@@ -427,10 +427,7 @@ impl<F: MuxerFormat> MuxerInner<F> {
     })?;
 
     // 'hvc1' forbids in-band parameter sets; strip hvcC duplicates below
-    self.strip_hevc_ps = self
-      .muxer
-      .hvc1_parameter_sets()
-      .map(|(len_size, sets)| (len_size, sets.to_vec()));
+    self.strip_hevc_ps = self.muxer.hvc1_context().cloned();
 
     self.video_track_info = Some(StoredVideoTrackInfo {
       codec: config.codec,
@@ -558,9 +555,23 @@ impl<F: MuxerFormat> MuxerInner<F> {
     // hvcC. Done before any packet metadata is set so the swap is a plain data
     // replace. Malformed samples and in-band parameter-set updates (which
     // 'hvc1' cannot represent) are rejected.
-    if let Some((len_size, ref known)) = self.strip_hevc_ps {
-      let stripped = strip_hevc_parameter_sets(packet.as_slice(), len_size, known)
-        .map_err(|e| Error::new(Status::GenericFailure, e))?;
+    if let Some(hvc1) = &self.strip_hevc_ps {
+      // A packet carrying a new description (AV_PKT_DATA_NEW_EXTRADATA) means
+      // the stream's parameter sets changed mid-stream. The stripping context
+      // is fixed at track-add time and cannot follow the change — and the
+      // packet replacement below would drop the side data — so reject
+      // anything but a redundant re-send of the same hvcC.
+      if let Some(new_extradata) = packet.new_extradata()
+        && new_extradata != hvc1.extradata.as_slice()
+      {
+        return Err(Error::new(
+          Status::GenericFailure,
+          "HEVC description changed mid-stream, which the 'hvc1' sample entry cannot represent",
+        ));
+      }
+      let stripped =
+        strip_hevc_parameter_sets(packet.as_slice(), hvc1.nal_len_size, &hvc1.parameter_sets)
+          .map_err(|e| Error::new(Status::GenericFailure, e))?;
       if let Some(stripped) = stripped {
         let mut stripped_packet = Packet::new()
           .map_err(|e| Error::new(Status::GenericFailure, format!("Packet alloc: {}", e)))?;
