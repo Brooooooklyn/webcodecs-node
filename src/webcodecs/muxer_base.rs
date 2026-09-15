@@ -953,8 +953,9 @@ fn strip_hevc_parameter_sets(
       nal_len = (nal_len << 8) | usize::from(b);
     }
     let nal_start = offset + len_size;
-    if nal_len == 0 {
-      return Err("malformed HEVC sample: zero-length NAL".to_string());
+    // HEVC NAL units carry a two-byte header; shorter payloads are malformed
+    if nal_len < 2 {
+      return Err("malformed HEVC sample: NAL shorter than the 2-byte header".to_string());
     }
     if data.len() - nal_start < nal_len {
       return Err("malformed HEVC sample: NAL overruns end of sample".to_string());
@@ -1070,6 +1071,11 @@ mod tests {
     let mut zero = 0u32.to_be_bytes().to_vec();
     zero.extend_from_slice(&lp(IDR));
     assert!(strip_hevc_parameter_sets(&zero, 4, &known_sets()).is_err());
+
+    // One-byte NAL: shorter than the mandatory two-byte NAL header
+    let mut one = 1u32.to_be_bytes().to_vec();
+    one.push(0x28);
+    assert!(strip_hevc_parameter_sets(&one, 4, &known_sets()).is_err());
 
     // NAL overruns end of sample
     let mut overrun = 0u32.to_be_bytes().to_vec();

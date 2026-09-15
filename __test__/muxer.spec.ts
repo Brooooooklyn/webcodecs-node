@@ -897,9 +897,16 @@ test('Mp4Muxer: rejects malformed HEVC samples under hvc1', async (t) => {
   const zeroNal = new Uint8Array(4 + data.length)
   zeroNal.set(data, 4)
 
+  // A one-byte NAL: shorter than the mandatory two-byte NAL header
+  const oneByteNal = new Uint8Array(4 + 1 + data.length)
+  new DataView(oneByteNal.buffer).setUint32(0, 1)
+  oneByteNal[4] = 0x28 // slice NAL type, incomplete header
+  oneByteNal.set(data, 5)
+
   for (const [name, bad] of [
     ['trailing byte', trailing],
     ['zero-length NAL', zeroNal],
+    ['one-byte NAL', oneByteNal],
   ] as const) {
     const muxer = new Mp4Muxer()
     muxer.addVideoTrack({ codec: 'hev1.1.6.L93.B0', width: 128, height: 128, framerate: 30, description })
