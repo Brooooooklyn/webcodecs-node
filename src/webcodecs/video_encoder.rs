@@ -8,7 +8,8 @@ use crate::codec::{
   HwDeviceContext, HwFrameConfig, HwFrameContext, Packet, Scaler,
 };
 use crate::ffi::{
-  AVCodecID, AVHWDeviceType, AVPictureType, AVPixelFormat, AVRational, avutil::av_rescale_q,
+  AV_NOPTS_VALUE, AVCodecID, AVHWDeviceType, AVPictureType, AVPixelFormat, AVRational,
+  avutil::av_rescale_q,
 };
 use crate::webcodecs::codec_pressure;
 use crate::webcodecs::error::DOMExceptionName;
@@ -34,7 +35,7 @@ use napi::threadsafe_function::{
 };
 use napi_derive::napi;
 use parking_lot::RwLock as ParkingLotRwLock;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -364,9 +365,10 @@ struct VideoEncoderInner {
   had_error: bool,
   /// Pending flush operations, tracked independently for overlapping calls.
   flushes: FlushTracker,
-  /// Queue of input timestamps for correlation with output packets
-  /// (needed because FFmpeg may buffer frames internally and reorder)
-  timestamp_queue: std::collections::VecDeque<i64>,
+  /// Maps frame PTS (encoder time_base units) to input timestamps (µs).
+  /// B-frame encoders emit packets in decode order, so a FIFO misattributes
+  /// timestamps; keying by packet PTS keeps each label on its own frame.
+  timestamp_map: BTreeMap<i64, VecDeque<i64>>,
 
   // ========================================================================
   // Hardware acceleration tracking (for Chromium-aligned fallback behavior)
@@ -602,7 +604,7 @@ impl VideoEncoder {
       error_callback: init.error,
       had_error: false,
       flushes: FlushTracker::default(),
-      timestamp_queue: std::collections::VecDeque::new(),
+      timestamp_map: BTreeMap::new(),
       // Hardware acceleration tracking
       is_hardware: false,
       encoder_name: String::new(),
@@ -902,9 +904,9 @@ impl VideoEncoder {
       // If upload failed, use_hw_frames is set to false and we continue with CPU frame
     }
 
-    // Push timestamp to queue for correlation with output packets
-    // (FFmpeg may modify PTS internally, so we track input timestamps separately)
-    guard.timestamp_queue.push_back(timestamp);
+    // Key the input timestamp by the frame's PTS so B-frame-reordered output
+    // packets can be matched back to their own input frame.
+    Self::push_timestamp(&mut guard.timestamp_map, pts_in_timebase, timestamp);
 
     // Encode the frame
     let context = match guard.context.as_mut() {
@@ -955,6 +957,7 @@ impl VideoEncoder {
                 buffered_ts
               };
               frame_to_reencode.set_pts(pts_in_timebase);
+              Self::push_timestamp(&mut guard.timestamp_map, pts_in_timebase, buffered_ts);
 
               // Increment frame_count so flush() knows to drain the encoder
               guard.frame_count += 1;
@@ -970,10 +973,12 @@ impl VideoEncoder {
                     None
                   };
                   let packet_is_key = packet.is_key();
-                  // Use buffered_ts (the original input timestamp) instead of packet.pts()
+                  // Match the packet's PTS back to its input frame's timestamp
+                  let output_timestamp =
+                    Self::match_timestamp(&mut guard.timestamp_map, packet.pts());
                   let chunk = EncodedVideoChunk::from_packet_with_format(
                     packet,
-                    Some(buffered_ts),
+                    output_timestamp,
                     guard.use_avcc_format,
                     enc_tb,
                   );
@@ -1138,6 +1143,7 @@ impl VideoEncoder {
                   buffered_ts
                 };
                 frame_to_reencode.set_pts(pts_in_timebase);
+                Self::push_timestamp(&mut guard.timestamp_map, pts_in_timebase, buffered_ts);
 
                 // Increment frame_count so flush() knows to drain the encoder
                 guard.frame_count += 1;
@@ -1155,10 +1161,12 @@ impl VideoEncoder {
                     };
                     let packet_is_key = packet.is_key();
 
-                    // Use buffered_ts (the original input timestamp) instead of packet.pts()
+                    // Match the packet's PTS back to its input frame's timestamp
+                    let output_timestamp =
+                      Self::match_timestamp(&mut guard.timestamp_map, packet.pts());
                     let chunk = EncodedVideoChunk::from_packet_with_format(
                       packet,
-                      Some(buffered_ts),
+                      output_timestamp,
                       guard.use_avcc_format,
                       enc_tb,
                     );
@@ -1273,9 +1281,9 @@ impl VideoEncoder {
 
     // Process output packets - call callback for each
     for packet in packets {
-      // Pop timestamp from queue to preserve original input timestamp
-      // (FFmpeg may modify PTS internally during encoding)
-      let output_timestamp = guard.timestamp_queue.pop_front();
+      // Match the packet's PTS back to its input frame's timestamp
+      // (packets arrive in decode order under B-frame reordering)
+      let output_timestamp = Self::match_timestamp(&mut guard.timestamp_map, packet.pts());
 
       // Extract alpha side data for VP9 only (HEVC alpha is embedded in bitstream)
       let alpha_side_data = if guard.codec_id == Some(AVCodecID::Vp9) {
@@ -1520,8 +1528,8 @@ impl VideoEncoder {
       .unwrap_or(AVRational::MICROSECONDS);
 
     for packet in packets {
-      // Pop timestamp from queue to preserve original input timestamp
-      let output_timestamp = guard.timestamp_queue.pop_front();
+      // Match the packet's PTS back to its input frame's timestamp
+      let output_timestamp = Self::match_timestamp(&mut guard.timestamp_map, packet.pts());
       // Extract alpha side data for VP9 only (HEVC alpha is embedded in bitstream)
       let alpha_side_data = if guard.codec_id == Some(AVCodecID::Vp9) {
         extract_alpha_side_data(&packet, guard.use_alpha)
@@ -1674,8 +1682,8 @@ impl VideoEncoder {
       guard.pending_chunks.push((chunk, metadata));
     }
 
-    // Clear any remaining timestamps in queue after flush
-    guard.timestamp_queue.clear();
+    // Clear any remaining timestamp mappings after flush
+    guard.timestamp_map.clear();
 
     // Reset encoder state so it can accept more frames
     // Some encoders (like libvpx) don't properly support reuse after flush_encoder().
@@ -1794,7 +1802,7 @@ impl VideoEncoder {
 
     // Clear codec-local work state. Do not reset encode_queue_size here:
     // main-thread encode() calls after this FIFO command are already counted.
-    guard.timestamp_queue.clear();
+    guard.timestamp_map.clear();
     guard.frame_count = 0;
     guard.extradata_sent = false;
     guard.output_frame_count = 0;
@@ -2097,6 +2105,53 @@ impl VideoEncoder {
     guard.hw_frame_ctx = None;
     guard.use_hw_frames = false;
     guard.nv12_scaler = None;
+  }
+
+  /// Record an input timestamp keyed by the frame's PTS (encoder time_base units).
+  /// Multiple timestamps per key tolerate time_base rounding collisions.
+  fn push_timestamp(map: &mut BTreeMap<i64, VecDeque<i64>>, pts_tb: i64, ts_us: i64) {
+    map.entry(pts_tb).or_default().push_back(ts_us);
+  }
+
+  /// Match an output packet's PTS back to the original input timestamp.
+  /// Exact hit first; otherwise nearest key within 2 time_base ticks (covers
+  /// hardware encoders that slightly shift PTS, e.g. VideoToolbox); otherwise
+  /// pop the oldest pending entry (NOPTS packets); otherwise None.
+  fn match_timestamp(map: &mut BTreeMap<i64, VecDeque<i64>>, packet_pts: i64) -> Option<i64> {
+    fn pop_at(map: &mut BTreeMap<i64, VecDeque<i64>>, key: i64) -> Option<i64> {
+      let ts = map.get_mut(&key)?.pop_front();
+      if map.get(&key).is_some_and(|q| q.is_empty()) {
+        map.remove(&key);
+      }
+      ts
+    }
+    if packet_pts == AV_NOPTS_VALUE {
+      let oldest = map.keys().next().copied();
+      return oldest.and_then(|k| pop_at(map, k));
+    }
+    if map.contains_key(&packet_pts) {
+      return pop_at(map, packet_pts);
+    }
+    // Nearest key within tolerance
+    let next = map.range(packet_pts..).next().map(|(k, _)| *k);
+    let prev = map.range(..=packet_pts).next_back().map(|(k, _)| *k);
+    let candidate = match (prev, next) {
+      (Some(p), Some(n)) => Some(if p.abs_diff(packet_pts) <= n.abs_diff(packet_pts) {
+        p
+      } else {
+        n
+      }),
+      (Some(p), None) => Some(p),
+      (None, Some(n)) => Some(n),
+      (None, None) => None,
+    };
+    candidate.and_then(|k| {
+      if k.abs_diff(packet_pts) <= 2 {
+        pop_at(map, k)
+      } else {
+        None
+      }
+    })
   }
 
   /// Report an error via callback and close the encoder
@@ -3327,7 +3382,7 @@ impl VideoEncoder {
     inner.silent_encode_count = 0;
     inner.first_output_produced = false;
     inner.pending_frames.clear();
-    inner.timestamp_queue.clear();
+    inner.timestamp_map.clear();
     inner.input_color_space = None;
 
     // Reset temporal SVC tracking

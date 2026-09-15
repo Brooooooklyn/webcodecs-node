@@ -4,7 +4,7 @@
 //! See: https://w3c.github.io/webcodecs/#videodecoder-interface
 
 use crate::codec::{CodecContext, DecoderConfig, Frame, Packet, download_hw_frame};
-use crate::ffi::{AVCodecID, AVHWDeviceType, accessors::ffctx_set_hw_get_format};
+use crate::ffi::{AV_NOPTS_VALUE, AVCodecID, AVHWDeviceType, accessors::ffctx_set_hw_get_format};
 use crate::webcodecs::encoded_video_chunk::InternalSlice;
 use crate::webcodecs::error::{
   DOMExceptionName, native_dom_exception_error, throw_data_error, throw_invalid_state_error,
@@ -673,12 +673,21 @@ impl VideoDecoder {
 
     // Convert internal frames to VideoFrames and deliver
     for frame in frames {
-      // Pop timestamp from queue to preserve original input timestamp
-      // (FFmpeg may modify PTS internally during decoding)
-      let (output_timestamp, output_duration) = guard
-        .timestamp_queue
-        .pop_front()
-        .unwrap_or((timestamp, duration));
+      // Prefer the frame's own PTS: decoders propagate the input chunk's
+      // timestamp to the output frame, so it stays correct under B-frame
+      // reordering. The FIFO queue is only a fallback for NOPTS frames.
+      let queued = guard.timestamp_queue.pop_front();
+      let frame_pts = frame.pts();
+      let (output_timestamp, output_duration) = if frame_pts != AV_NOPTS_VALUE {
+        let dur = if frame.duration() > 0 {
+          Some(frame.duration())
+        } else {
+          queued.and_then(|(_, d)| d)
+        };
+        (frame_pts, dur)
+      } else {
+        queued.unwrap_or((timestamp, duration))
+      };
 
       // Download hardware frames to CPU memory if needed
       let output_frame = if frame.format().is_hardware() {
@@ -918,19 +927,20 @@ impl VideoDecoder {
     // Queue remaining frames for delivery (always queue during flush for synchronous delivery)
     tracing::debug!(target: "webcodecs", "process_flush: processing {} flushed frames", frames.len());
     for frame in frames.into_iter() {
-      // Pop timestamp from queue to preserve original input timestamp
-      // (FFmpeg may modify PTS internally during decoding)
-      let (output_timestamp, output_duration) =
-        guard.timestamp_queue.pop_front().unwrap_or_else(|| {
-          // Fallback to FFmpeg's PTS if queue is empty
-          let pts = frame.pts();
-          let dur = if frame.duration() > 0 {
-            Some(frame.duration())
-          } else {
-            None
-          };
-          (pts, dur)
-        });
+      // Prefer the frame's own PTS (propagated from the input chunk's
+      // timestamp); fall back to the FIFO queue for NOPTS frames.
+      let queued = guard.timestamp_queue.pop_front();
+      let frame_pts = frame.pts();
+      let (output_timestamp, output_duration) = if frame_pts != AV_NOPTS_VALUE {
+        let dur = if frame.duration() > 0 {
+          Some(frame.duration())
+        } else {
+          queued.and_then(|(_, d)| d)
+        };
+        (frame_pts, dur)
+      } else {
+        queued.unwrap_or((0, None))
+      };
 
       // Download hardware frames to CPU memory if needed
       let output_frame = if frame.format().is_hardware() {

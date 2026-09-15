@@ -114,7 +114,7 @@ async function runFullCycleTest(
     },
   })
 
-  let nextEncodeTs = 0
+  const encodedTimestamps: number[] = []
   const encoder = new VideoEncoder({
     output: (chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadata) => {
       const decoderConfig = metadata?.decoderConfig as VideoDecoderConfig | undefined
@@ -149,10 +149,7 @@ async function runFullCycleTest(
 
       decoder.decode(chunk)
       framesEncoded++
-
-      if (!options.realTimeLatencyMode) {
-        t.is(chunk.timestamp, nextEncodeTs++, 'encode timestamp')
-      }
+      encodedTimestamps.push(chunk.timestamp)
     },
     error: (e: Error) => {
       t.fail(`Encoder error: ${e.message}`)
@@ -208,6 +205,14 @@ async function runFullCycleTest(
     t.true(framesEncoded > 0, 'frames_encoded > 0')
   } else {
     t.is(framesEncoded, framesToEncode, 'frames_encoded')
+    // Encoders with B-frames emit chunks in decode order, and each chunk carries
+    // the presentation timestamp of its own frame, so emitted timestamps are a
+    // permutation of the input timestamps rather than necessarily sequential.
+    t.deepEqual(
+      [...encodedTimestamps].sort((a, b) => a - b),
+      Array.from({ length: framesToEncode }, (_, i) => i),
+      'encode timestamps (sorted)',
+    )
   }
   t.is(framesDecoded, framesEncoded, 'frames_decoded')
 }
