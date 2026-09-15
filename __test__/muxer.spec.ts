@@ -22,7 +22,7 @@ import {
   type EncodedAudioChunkMetadata,
   type VideoFrame,
 } from '../index.js'
-import { generateSolidColorI420Frame, generateSilence, TestColors } from './helpers/index.js'
+import { generateSolidColorI420Frame, generateSolidColorI420AFrame, generateSilence, TestColors } from './helpers/index.js'
 
 test('WebMMuxer: preserves sparse source timestamps through demux', async (t) => {
   const chunks: EncodedVideoChunk[] = []
@@ -651,6 +651,102 @@ test('Mp4Muxer: malformed hvcC variants keep hev1 and preserve parameter sets', 
       types.some((nalType) => nalType >= 32 && nalType <= 34),
       `${name}: hev1 samples should keep in-band parameter sets, got ${JSON.stringify(types)}`,
     )
+  }
+})
+
+test('Mp4Muxer: multi-layer HEVC alpha keeps hev1 and preserves alpha pixels', async (t) => {
+  // Alpha HEVC carries its alpha layer as nonzero nuh_layer_id arrays in the
+  // hvcC. movenc drops those arrays when re-writing hvcC (both tags), so the
+  // muxer must select hev1 and keep parameter sets in-band — the decoder then
+  // recovers the alpha layer from the samples instead of the description.
+  const width = 128
+  const height = 128
+  const alpha = 64
+  const chunks: EncodedVideoChunk[] = []
+  const metadatas: (EncodedVideoChunkMetadata | undefined)[] = []
+  const encoder = new VideoEncoder({
+    output: (chunk, metadata) => {
+      chunks.push(chunk)
+      metadatas.push(metadata)
+    },
+    error: (e) => t.fail(e.message),
+  })
+  encoder.configure({
+    codec: 'hev1.1.6.L93.B0',
+    width,
+    height,
+    bitrate: 500_000,
+    framerate: 30,
+    alpha: 'keep',
+    hardwareAcceleration: 'prefer-software',
+  })
+  for (let i = 0; i < 3; i++) {
+    const frame = generateSolidColorI420AFrame(width, height, TestColors.green, alpha, i * 33333)
+    encoder.encode(frame, { keyFrame: i === 0 })
+    frame.close()
+  }
+  await encoder.flush()
+  encoder.close()
+
+  const description = metadatas[0]?.decoderConfig?.description
+  t.truthy(description, 'HEVC alpha encoder should provide an hvcC description')
+  if (!description) return
+
+  const inBandChunks = prependParameterSets(chunks, new Uint8Array(description))
+
+  for (const fragmented of [false, true]) {
+    const muxer = new Mp4Muxer(fragmented ? { fragmented: true } : {})
+    muxer.addVideoTrack({ codec: 'hev1.1.6.L93.B0', width, height, framerate: 30, description })
+    for (const chunk of inBandChunks) muxer.addVideoChunk(chunk)
+    muxer.flush()
+    const mp4Data = muxer.finalize()
+    muxer.close()
+
+    t.is(
+      getMp4VideoSampleEntryTag(mp4Data),
+      'hev1',
+      `fragmented=${fragmented}: multi-layer hvcC must not select hvc1`,
+    )
+
+    const demuxedChunks: EncodedVideoChunk[] = []
+    const demuxer = new Mp4Demuxer({
+      videoOutput: (chunk) => demuxedChunks.push(chunk),
+      error: (e) => t.fail(`Demuxer error: ${e.message}`),
+    })
+    await demuxer.loadBuffer(mp4Data)
+    const config = demuxer.videoDecoderConfig
+    t.truthy(config)
+    if (!config) {
+      demuxer.close()
+      continue
+    }
+    await demuxer.demuxAsync()
+    demuxer.close()
+
+    const decodedFrames: VideoFrame[] = []
+    const decoder = new VideoDecoder({
+      output: (frame) => decodedFrames.push(frame),
+      error: (e) => t.fail(`Decoder error: ${e.message}`),
+    })
+    decoder.configure({
+      codec: config.codec,
+      codedWidth: config.codedWidth,
+      codedHeight: config.codedHeight,
+      description: config.description,
+    })
+    for (const chunk of demuxedChunks) decoder.decode(chunk)
+    await decoder.flush()
+    decoder.close()
+
+    t.is(decodedFrames.length, 3, `fragmented=${fragmented}: all frames decode`)
+    t.is(decodedFrames[0]?.format, 'I420A', `fragmented=${fragmented}: alpha format survives`)
+    if (decodedFrames[0]?.format === 'I420A') {
+      const plane = new Uint8Array(decodedFrames[0].allocationSize({ format: 'I420A' }))
+      await decodedFrames[0].copyTo(plane, { format: 'I420A' })
+      const alphaOffset = width * height * 1.5
+      t.is(plane[alphaOffset], alpha, `fragmented=${fragmented}: alpha pixel preserved`)
+    }
+    for (const frame of decodedFrames) frame.close()
   }
 })
 

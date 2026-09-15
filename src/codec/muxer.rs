@@ -673,7 +673,10 @@ impl MuxerContext {
 /// is numOfArrays, then per array: 1 header byte (low 6 bits are the NAL unit
 /// type), u16-be numNalus, and per NAL a u16-be length followed by the NAL
 /// data. Every payload must hold at least the 2-byte NAL header, and its
-/// header type must match the array's declared type.
+/// header type must match the array's declared type. Multi-layer records
+/// (nuh_layer_id != 0 in any parameter set, e.g. HEVC alpha) are rejected:
+/// movenc drops nonzero-layer arrays when writing hvcC, so 'hvc1' would lose
+/// the additional layers and 'hev1' must be used instead.
 fn parse_hvcc_parameter_sets_complete(extradata: &[u8]) -> Option<(usize, Vec<Vec<u8>>)> {
   const NAL_TYPE_VPS: u8 = 32;
   const NAL_TYPE_SPS: u8 = 33;
@@ -708,6 +711,12 @@ fn parse_hvcc_parameter_sets_complete(extradata: &[u8]) -> Option<(usize, Vec<Ve
       let payload = &extradata[offset..offset + nal_len];
       // The NAL header type must match the array's declared type
       if (payload[0] >> 1) & 0x3f != array_type {
+        return None;
+      }
+      // Reject multi-layer records ('hev1'): movenc drops nonzero-layer
+      // arrays when writing hvcC, which would lose e.g. the alpha layer
+      let nuh_layer_id = (u32::from(payload[0] & 0x01) << 5) | u32::from(payload[1] >> 3);
+      if (NAL_TYPE_VPS..=NAL_TYPE_PPS).contains(&array_type) && nuh_layer_id != 0 {
         return None;
       }
       match array_type {
@@ -852,5 +861,23 @@ mod tests {
       &[(32, vec![vps()]), (33, vec![sps()]), (34, vec![pps()])],
     )[..26];
     assert!(parse_hvcc_parameter_sets_complete(truncated).is_none());
+  }
+
+  #[test]
+  fn hvcc_multi_layer_records_rejected() {
+    // nuh_layer_id = 1: payload[0] low bit set, payload[1] high 5 bits zero
+    let layer1_sps = vec![0x42 | 0x01, 0x01, 0xbb];
+    let multi = build_hvcc(
+      1,
+      &[
+        (32, vec![vps()]),
+        (33, vec![sps(), layer1_sps]),
+        (34, vec![pps()]),
+      ],
+    );
+    assert!(
+      parse_hvcc_parameter_sets_complete(&multi).is_none(),
+      "multi-layer hvcC must keep hev1: movenc would drop the nonzero-layer arrays"
+    );
   }
 }
