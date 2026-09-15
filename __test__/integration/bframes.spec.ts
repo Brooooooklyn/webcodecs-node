@@ -244,6 +244,82 @@ test('decoder pairs duration with the same frame as its timestamp', async (t) =>
   }
 })
 
+test('decoder pairs duration with the exact chunk under duplicate timestamps', async (t) => {
+  const { chunks, errors: encErrors, decoderConfig } = await encodeIndexFrames(HEVC_CONFIG)
+  t.is(encErrors.length, 0, 'No encoder errors')
+  t.is(chunks.length, FRAME_COUNT, 'One chunk per input frame')
+
+  // Force the chunks carrying content frames 3 (Y≈30) and 4 (Y≈40) to share
+  // one timestamp, with different durations (0 and 50000). Identity through
+  // reordering is then unrecoverable from PTS alone — this is the SVC/field
+  // picture case. Chunks arrive in decode order: ts 100000 is content 3,
+  // ts 133333 is content 4.
+  const DUP_TS = TIMESTAMPS[3]
+  const expectedByContent = new Map<number, { ts: number; duration: number | undefined }>()
+  const rewrapped = chunks.map((chunk) => {
+    const data = new Uint8Array(chunk.byteLength)
+    chunk.copyTo(data)
+    const contentIndex = Math.round((chunk.timestamp * 30) / 1_000_000)
+    let ts = chunk.timestamp
+    let duration: number | undefined = 33333
+    if (chunk.timestamp === TIMESTAMPS[3]) {
+      ts = DUP_TS
+      duration = 0 // content frame 3
+    } else if (chunk.timestamp === TIMESTAMPS[4]) {
+      ts = DUP_TS
+      duration = 50000 // content frame 4
+    }
+    expectedByContent.set(contentIndex, { ts, duration })
+    return new EncodedVideoChunk({
+      type: chunk.type,
+      timestamp: ts,
+      duration,
+      data,
+    })
+  })
+
+  const { decoder, frames, errors } = createTestDecoder()
+  decoder.configure({
+    codec: 'hev1.1.6.L93.B0',
+    codedWidth: WIDTH,
+    codedHeight: HEIGHT,
+    hardwareAcceleration: 'prefer-software',
+    description: decoderConfig?.description,
+  })
+
+  for (const chunk of rewrapped) {
+    decoder.decode(chunk)
+  }
+  await decoder.flush()
+  decoder.close()
+
+  t.is(errors.length, 0, `No decoder errors, got: ${errors.map((e) => e.message).join(', ')}`)
+  t.is(frames.length, FRAME_COUNT, 'One output frame per input frame')
+
+  // Correlate by pixel content, not timestamp: the two duplicate-timestamp
+  // frames are indistinguishable by ts, which is the point of this test.
+  for (const frame of frames) {
+    const data = new Uint8Array(frame.allocationSize())
+    await frame.copyTo(data)
+    const yPlane = data.subarray(0, WIDTH * HEIGHT)
+    let sum = 0
+    for (const value of yPlane) {
+      sum += value
+    }
+    const averageY = sum / yPlane.length
+    const contentIndex = Math.round(averageY / 10)
+    const expected = expectedByContent.get(contentIndex)
+    t.truthy(expected, `frame with Y≈${averageY.toFixed(1)} maps to content frame ${contentIndex}`)
+    t.is(frame.timestamp, expected!.ts, `content frame ${contentIndex} timestamp`)
+    t.is(
+      frame.duration ?? undefined,
+      expected!.duration,
+      `content frame ${contentIndex} (Y≈${averageY.toFixed(1)}) must carry duration ${expected!.duration}, not the other duplicate's`,
+    )
+    frame.close()
+  }
+})
+
 // VideoToolbox B-frame attribution (macOS only)
 const testOnDarwin = process.platform === 'darwin' ? test : test.skip
 

@@ -201,9 +201,12 @@ pub struct VideoDecoderSupport {
 /// while still detecting genuinely failing decoders within ~333ms at 30fps.
 const SILENT_FAILURE_THRESHOLD: u32 = 10;
 
-/// Chunk timestamp (µs) -> durations of chunks carrying that timestamp,
-/// in arrival order. VecDeque per key tolerates duplicate timestamps.
-type DurationMap = std::collections::BTreeMap<i64, std::collections::VecDeque<Option<i64>>>;
+/// Chunk sequence number -> (timestamp µs, duration) for in-flight chunks.
+/// The sequence number travels through FFmpeg as the packet/frame opaque
+/// pointer, giving exact chunk identity through B-frame reordering, even for
+/// duplicate timestamps. Decoders that do not propagate opaque (VideoToolbox)
+/// fall back to matching by frame PTS.
+type ChunkMetaMap = std::collections::BTreeMap<u64, (i64, Option<i64>)>;
 
 /// Internal decoder state
 struct VideoDecoderInner {
@@ -224,11 +227,10 @@ struct VideoDecoderInner {
   had_error: bool,
   /// Pending flush operations, tracked independently for overlapping calls.
   flushes: FlushTracker,
-  /// Maps input chunk timestamps (µs) to their durations, in arrival order.
-  /// Decoders emit frames in presentation order while chunks arrive in decode
-  /// order, so a FIFO pairs metadata with the wrong frame under B-frame
-  /// reordering; keying by chunk timestamp keeps each duration on its own frame.
-  duration_map: DurationMap,
+  /// Next chunk sequence number for opaque identity tagging (1-based)
+  next_chunk_seq: u64,
+  /// Sequence number -> (timestamp, duration) for chunks in flight
+  chunk_meta: ChunkMetaMap,
   /// Queue of decoded frames waiting to be delivered via output callback
   /// Worker pushes frames here during flush; flush() drains them synchronously via FunctionRef
   pending_frames: Vec<VideoFrame>,
@@ -371,7 +373,8 @@ impl VideoDecoder {
       keyframe_received: false,
       had_error: false,
       flushes: FlushTracker::default(),
-      duration_map: DurationMap::new(),
+      next_chunk_seq: 1,
+      chunk_meta: ChunkMetaMap::new(),
       pending_frames: Vec::new(),
       // Hardware acceleration tracking (Chromium-aligned)
       is_hardware: false,
@@ -552,13 +555,12 @@ impl VideoDecoder {
       }
     };
 
-    // Key the chunk's duration by its timestamp so presentation-ordered
-    // output frames can be matched back to their own chunk (B-frame reorder).
-    guard
-      .duration_map
-      .entry(timestamp)
-      .or_default()
-      .push_back(duration);
+    // Tag the chunk with a sequence number carried through FFmpeg as the
+    // packet/frame opaque pointer: exact identity through B-frame reordering,
+    // even for duplicate timestamps.
+    let seq = guard.next_chunk_seq;
+    guard.next_chunk_seq += 1;
+    guard.chunk_meta.insert(seq, (timestamp, duration));
 
     // Buffer chunk during silent failure detection period (for re-decoding on fallback)
     if guard.is_hardware && !guard.first_output_produced {
@@ -580,7 +582,7 @@ impl VideoDecoder {
     };
 
     // Decode
-    let frames = match decode_chunk_data(context, &data, timestamp, duration) {
+    let frames = match decode_chunk_data(context, &data, timestamp, duration, seq) {
       Ok(f) => f,
       Err(e) => {
         // Handle decode error - may trigger fallback for hardware decoder
@@ -683,22 +685,10 @@ impl VideoDecoder {
 
     // Convert internal frames to VideoFrames and deliver
     for frame in frames {
-      // Prefer the frame's own PTS: decoders propagate the input chunk's
-      // timestamp to the output frame, so it stays correct under B-frame
-      // reordering. Duration is matched by that same timestamp.
-      let frame_pts = frame.pts();
-      let (output_timestamp, output_duration) = if frame_pts != AV_NOPTS_VALUE {
-        let mapped = Self::pop_duration(&mut guard.duration_map, frame_pts).flatten();
-        let dur = if frame.duration() > 0 {
-          Some(frame.duration())
-        } else {
-          mapped
-        };
-        (frame_pts, dur)
-      } else {
-        // NOPTS frame: attribute the oldest pending chunk
-        Self::pop_oldest_duration(&mut guard.duration_map).unwrap_or((timestamp, duration))
-      };
+      // Resolve the chunk this frame came from: exact identity via the opaque
+      // sequence tag, else frame PTS, else oldest pending chunk.
+      let (output_timestamp, output_duration) =
+        Self::resolve_frame_metadata(&mut guard, &frame, (timestamp, duration));
 
       // Download hardware frames to CPU memory if needed
       let output_frame = if frame.format().is_hardware() {
@@ -829,13 +819,19 @@ impl VideoDecoder {
         }
       };
 
+      // Re-tag the chunk with a fresh sequence number; the original tag's
+      // entry is still pending (hardware produced no frames before fallback).
+      let seq = guard.next_chunk_seq;
+      guard.next_chunk_seq += 1;
+      guard.chunk_meta.insert(seq, (timestamp, duration));
+
       // Decode with software decoder
       let context = match guard.context.as_mut() {
         Some(ctx) => ctx,
         None => return,
       };
 
-      let frames = match decode_chunk_data(context, &data, timestamp, duration) {
+      let frames = match decode_chunk_data(context, &data, timestamp, duration, seq) {
         Ok(f) => f,
         Err(_) => continue, // Skip failed chunks during re-decode
       };
@@ -850,23 +846,10 @@ impl VideoDecoder {
 
       // Deliver frames (queue during flush, NonBlocking otherwise)
       for frame in frames {
-        // Match each frame to its own chunk via PTS: B-frame reordering means
+        // Resolve the chunk this frame came from: B-frame reordering means
         // output frames do not correspond to the chunk just decoded.
-        let frame_pts = frame.pts();
-        let frame_duration = frame.duration();
-        let (output_timestamp, output_duration) = if frame_pts != AV_NOPTS_VALUE {
-          let mapped = Self::pop_duration(&mut guard.duration_map, frame_pts).flatten();
-          (
-            frame_pts,
-            if frame_duration > 0 {
-              Some(frame_duration)
-            } else {
-              mapped
-            },
-          )
-        } else {
-          Self::pop_oldest_duration(&mut guard.duration_map).unwrap_or((timestamp, duration))
-        };
+        let (output_timestamp, output_duration) =
+          Self::resolve_frame_metadata(&mut guard, &frame, (timestamp, duration));
 
         // Download hardware frames to CPU memory if needed
         // (shouldn't happen in fallback path but handle for safety)
@@ -956,21 +939,9 @@ impl VideoDecoder {
     // Queue remaining frames for delivery (always queue during flush for synchronous delivery)
     tracing::debug!(target: "webcodecs", "process_flush: processing {} flushed frames", frames.len());
     for frame in frames.into_iter() {
-      // Prefer the frame's own PTS (propagated from the input chunk's
-      // timestamp); duration is matched by that same timestamp.
-      let frame_pts = frame.pts();
-      let (output_timestamp, output_duration) = if frame_pts != AV_NOPTS_VALUE {
-        let mapped = Self::pop_duration(&mut guard.duration_map, frame_pts).flatten();
-        let dur = if frame.duration() > 0 {
-          Some(frame.duration())
-        } else {
-          mapped
-        };
-        (frame_pts, dur)
-      } else {
-        // NOPTS frame: attribute the oldest pending chunk
-        Self::pop_oldest_duration(&mut guard.duration_map).unwrap_or((0, None))
-      };
+      // Resolve the chunk this frame came from (opaque tag, else PTS match).
+      let (output_timestamp, output_duration) =
+        Self::resolve_frame_metadata(&mut guard, &frame, (0, None));
 
       // Download hardware frames to CPU memory if needed
       let output_frame = if frame.format().is_hardware() {
@@ -1002,7 +973,7 @@ impl VideoDecoder {
     }
 
     // Clear any remaining duration mappings after flush
-    guard.duration_map.clear();
+    guard.chunk_meta.clear();
 
     // Reset decoder state so it can accept more data (per W3C spec, flush should leave
     // decoder in configured state, ready for more decode() calls)
@@ -1043,7 +1014,7 @@ impl VideoDecoder {
 
     // Clear codec-local work state. Do not reset decode_queue_size here:
     // main-thread decode() calls after this FIFO command are already counted.
-    guard.duration_map.clear();
+    guard.chunk_meta.clear();
     guard.keyframe_received = false;
     guard.silent_decode_count = 0;
     guard.first_output_produced = false;
@@ -1194,21 +1165,50 @@ impl VideoDecoder {
     guard.config_color_space = config.color_space;
   }
 
-  /// Pop the duration recorded for a chunk timestamp (µs).
-  /// Outer None: no pending entry; inner None: chunk had no duration.
-  fn pop_duration(map: &mut DurationMap, timestamp: i64) -> Option<Option<i64>> {
-    let dur = map.get_mut(&timestamp)?.pop_front()?;
-    if map.get(&timestamp).is_some_and(|q| q.is_empty()) {
-      map.remove(&timestamp);
+  /// Resolve the (timestamp, duration) pair belonging to a decoded frame.
+  ///
+  /// Resolution tiers:
+  /// 1. Exact chunk identity via the opaque sequence tag (software decoders,
+  ///    which propagate packet opaque to frame under AV_CODEC_FLAG_COPY_OPAQUE).
+  /// 2. Frame PTS matched against pending chunk timestamps (VideoToolbox).
+  /// 3. Oldest pending chunk (NOPTS frames), else the given fallback.
+  fn resolve_frame_metadata(
+    guard: &mut VideoDecoderInner,
+    frame: &Frame,
+    fallback: (i64, Option<i64>),
+  ) -> (i64, Option<i64>) {
+    let opaque_seq = frame.opaque() as u64;
+    if opaque_seq != 0
+      && let Some(meta) = guard.chunk_meta.remove(&opaque_seq)
+    {
+      return meta;
     }
-    Some(dur)
-  }
 
-  /// Pop the oldest pending (timestamp, duration) pair, used for NOPTS frames.
-  fn pop_oldest_duration(map: &mut DurationMap) -> Option<(i64, Option<i64>)> {
-    let oldest = map.keys().next().copied()?;
-    let dur = Self::pop_duration(map, oldest)?;
-    Some((oldest, dur))
+    let frame_pts = frame.pts();
+    if frame_pts != AV_NOPTS_VALUE {
+      // Match the oldest pending chunk carrying this PTS. FFmpeg-propagated
+      // frame.duration reflects the same chunk, so prefer it when present.
+      let seq = guard
+        .chunk_meta
+        .iter()
+        .find(|(_, (ts, _))| *ts == frame_pts)
+        .map(|(seq, _)| *seq);
+      let mapped = seq
+        .and_then(|s| guard.chunk_meta.remove(&s))
+        .and_then(|(_, d)| d);
+      let dur = if frame.duration() > 0 {
+        Some(frame.duration())
+      } else {
+        mapped
+      };
+      return (frame_pts, dur);
+    }
+
+    if let Some((&seq, &meta)) = guard.chunk_meta.first_key_value() {
+      guard.chunk_meta.remove(&seq);
+      return meta;
+    }
+    fallback
   }
 
   /// Report an error via callback and close the decoder
@@ -1872,7 +1872,7 @@ impl VideoDecoder {
     inner.silent_decode_count = 0;
     inner.first_output_produced = false;
     inner.pending_chunks.clear();
-    inner.duration_map.clear();
+    inner.chunk_meta.clear();
 
     // Clear flush-related state
     inner.flushes.clear();
@@ -2495,6 +2495,7 @@ fn decode_chunk_data(
   data: &[u8],
   timestamp: i64,
   duration: Option<i64>,
+  seq: u64,
 ) -> Result<Vec<Frame>> {
   // W3C spec: Empty data should trigger EncodingError
   if data.is_empty() {
@@ -2525,6 +2526,9 @@ fn decode_chunk_data(
   // Set packet timestamps AFTER copying data (unref in copy_data_from resets timestamps)
   packet.set_pts(timestamp);
   packet.set_dts(timestamp);
+  // Carry chunk identity through decoder reordering (opaque is also reset by
+  // the unref in copy_data_from, so set it here too)
+  packet.set_opaque(seq as usize);
   if let Some(dur) = duration {
     packet.set_duration(dur);
   }

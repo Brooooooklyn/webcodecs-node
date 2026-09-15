@@ -114,6 +114,9 @@ unsafe extern "C" {
   pub fn ffframe_set_height(frame: *mut AVFrame, height: c_int);
   pub fn ffframe_set_format(frame: *mut AVFrame, format: c_int);
   pub fn ffframe_set_pts(frame: *mut AVFrame, pts: i64);
+  pub fn ffframe_get_opaque(frame: *const AVFrame) -> *mut std::ffi::c_void;
+  pub fn ffpkt_get_opaque(pkt: *const AVPacket) -> *mut std::ffi::c_void;
+  pub fn ffpkt_set_opaque(pkt: *mut AVPacket, opaque: *mut std::ffi::c_void);
   pub fn ffframe_set_duration(frame: *mut AVFrame, duration: i64);
   pub fn ffframe_set_pkt_dts(frame: *mut AVFrame, pkt_dts: i64);
   pub fn ffframe_set_time_base(frame: *mut AVFrame, num: c_int, den: c_int);
@@ -373,6 +376,9 @@ pub mod codec_flag {
 
   /// Don't output frames whose parameters differ from first decoded frame
   pub const DROPCHANGED: c_int = 1 << 5;
+
+  /// Propagate AVPacket.opaque to decoded AVFrame.opaque
+  pub const COPY_OPAQUE: c_int = 1 << 7;
 
   /// Use only bitexact stuff (except (I)DCT)
   pub const BITEXACT: c_int = 1 << 23;

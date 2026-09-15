@@ -21,6 +21,7 @@ use crate::ffi::{
     ffframe_get_key_frame,
     // Audio accessors
     ffframe_get_nb_samples,
+    ffframe_get_opaque,
     ffframe_get_pict_type,
     ffframe_get_pts,
     ffframe_get_quality,
@@ -198,6 +199,14 @@ impl Frame {
   #[inline]
   pub fn set_duration(&mut self, duration: i64) {
     unsafe { ffframe_set_duration(self.as_mut_ptr(), duration) }
+  }
+
+  /// Get the opaque user data propagated from the input packet (requires
+  /// AV_CODEC_FLAG_COPY_OPAQUE on the decoder). Zero when unset or when the
+  /// decoder does not propagate it (e.g. VideoToolbox).
+  #[inline]
+  pub fn opaque(&self) -> usize {
+    unsafe { ffframe_get_opaque(self.as_ptr()) as usize }
   }
 
   // ========================================================================

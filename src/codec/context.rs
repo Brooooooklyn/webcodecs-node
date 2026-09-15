@@ -844,6 +844,11 @@ impl CodecContext {
       // Important for B-frame content where frame ordering can be complex
       flags |= ffi::accessors::codec_flag::OUTPUT_CORRUPT;
 
+      // Propagate packet opaque to output frames so callers can recover exact
+      // chunk identity through B-frame reordering (not all decoders honor it;
+      // VideoToolbox does not, callers must keep a pts-based fallback).
+      flags |= ffi::accessors::codec_flag::COPY_OPAQUE;
+
       if flags != 0 {
         ffi::accessors::ffctx_set_flags(ctx, flags);
       }

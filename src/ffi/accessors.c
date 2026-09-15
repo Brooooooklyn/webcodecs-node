@@ -275,6 +275,10 @@ void ffframe_set_pts(AVFrame* frame, int64_t pts) {
     frame->pts = pts;
 }
 
+void* ffframe_get_opaque(const AVFrame* frame) {
+    return frame ? frame->opaque : NULL;
+}
+
 void ffframe_set_duration(AVFrame* frame, int64_t duration) {
     frame->duration = duration;
 }
@@ -487,6 +491,14 @@ void ffpkt_set_pts(AVPacket* pkt, int64_t pts) {
 
 void ffpkt_set_dts(AVPacket* pkt, int64_t dts) {
     pkt->dts = dts;
+}
+
+void* ffpkt_get_opaque(const AVPacket* pkt) {
+    return pkt ? pkt->opaque : NULL;
+}
+
+void ffpkt_set_opaque(AVPacket* pkt, void* opaque) {
+    if (pkt) pkt->opaque = opaque;
 }
 
 void ffpkt_set_duration(AVPacket* pkt, int64_t duration) {
