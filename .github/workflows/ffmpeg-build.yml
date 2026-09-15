@@ -999,7 +999,7 @@ jobs:
       - name: Setup cmake
         uses: jwlawson/actions-setup-cmake@v2
         with:
-          cmake-version: '3.x'
+          cmake-version: 'v4.4.3'
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -1067,7 +1067,7 @@ jobs:
       - name: Setup cmake
         uses: jwlawson/actions-setup-cmake@v2
         with:
-          cmake-version: '3.x'
+          cmake-version: 'v4.4.3'
 
       - name: Setup nasm
         uses: ilammy/setup-nasm@v1
@@ -1126,7 +1126,7 @@ jobs:
       - name: Setup cmake
         uses: jwlawson/actions-setup-cmake@v2
         with:
-          cmake-version: '3.x'
+          cmake-version: 'v4.4.3'
 
       - name: Install build dependencies
         run: |
