@@ -320,6 +320,158 @@ test('decoder pairs duration with the exact chunk under duplicate timestamps', a
   }
 })
 
+// VP9 show_existing_frame attribution. A show_existing packet re-displays a
+// stored reference frame; FFmpeg hands back a copy of that reference carrying
+// the reference's inherited metadata. The decoder must attribute the output
+// to the display chunk (its own timestamp and duration), not the reference.
+
+const VP9_CONFIG = {
+  codec: 'vp09.00.10.08',
+  width: WIDTH,
+  height: HEIGHT,
+  bitrate: 1_000_000,
+  framerate: 30,
+  hardwareAcceleration: 'prefer-software' as const,
+}
+
+async function encodeSingleVp9Keyframe(t: ExecutionContext): Promise<Uint8Array> {
+  const { encoder, chunks, errors } = createTestEncoder()
+  encoder.configure(VP9_CONFIG)
+  const frame = generateIndexFrame(20, 0) // Y = 200
+  encoder.encode(frame, { keyFrame: true })
+  frame.close()
+  await encoder.flush()
+  encoder.close()
+
+  t.is(errors.length, 0, `No encoder errors, got: ${errors.map((e) => e.message).join(', ')}`)
+  t.is(chunks.length, 1, 'Single keyframe chunk')
+  t.is(chunks[0].type, 'key')
+
+  const data = new Uint8Array(chunks[0].byteLength)
+  chunks[0].copyTo(data)
+
+  // VP9 uncompressed header, byte 0 (MSB first): frame_marker(2)=2,
+  // profile(2)=0, show_existing_frame(1)=0, frame_type(1)=0 (key),
+  // show_frame(1)=1, error_resilient(1).
+  t.is(data[0] & 0xc0, 0x80, 'VP9 frame marker')
+  t.is(data[0] & 0x30, 0, 'VP9 profile 0')
+  t.is(data[0] & 0x0c, 0, 'not show_existing, keyframe')
+  t.is(data[0] & 0x02, 0x02, 'visible keyframe (show_frame=1)')
+  return data
+}
+
+/** Same keyframe with show_frame cleared: decodes into the reference buffer without producing output */
+function invisibleVariant(keyframe: Uint8Array): Uint8Array {
+  const data = new Uint8Array(keyframe)
+  data[0] &= ~0x02
+  return data
+}
+
+/** Raw show_existing_frame packet: marker=2, profile=0, show_existing_frame=1, frame_to_show_map_idx */
+function showExistingPacket(refIndex = 0): Uint8Array {
+  return new Uint8Array([0x88 | (refIndex & 0x7)])
+}
+
+interface ChunkSpec {
+  type: 'key' | 'delta'
+  timestamp: number
+  duration?: number
+  data: Uint8Array
+}
+
+async function decodeChunkSpecs(specs: ChunkSpec[]) {
+  const { decoder, frames, errors } = createTestDecoder()
+  decoder.configure({
+    codec: VP9_CONFIG.codec,
+    codedWidth: WIDTH,
+    codedHeight: HEIGHT,
+    hardwareAcceleration: 'prefer-software',
+  })
+  for (const spec of specs) {
+    decoder.decode(
+      new EncodedVideoChunk({
+        type: spec.type,
+        timestamp: spec.timestamp,
+        ...(spec.duration !== undefined ? { duration: spec.duration } : {}),
+        data: spec.data,
+      }),
+    )
+  }
+  await decoder.flush()
+  decoder.close()
+  return { frames, errors }
+}
+
+async function assertRepeatedFrames(
+  t: ExecutionContext,
+  frames: VideoFrame[],
+  errors: Error[],
+  expected: Array<{ ts: number; duration: number | undefined }>,
+) {
+  t.is(errors.length, 0, `No decoder errors, got: ${errors.map((e) => e.message).join(', ')}`)
+  t.is(frames.length, expected.length, 'One output frame per display event')
+
+  for (const [i, frame] of frames.entries()) {
+    t.is(frame.timestamp, expected[i].ts, `frame ${i} timestamp`)
+    t.is(
+      frame.duration ?? undefined,
+      expected[i].duration,
+      `frame ${i} must carry the display chunk's duration (${expected[i].duration}), not the reference's`,
+    )
+
+    // Every output is the stored reference image (Y ≈ 200)
+    const data = new Uint8Array(frame.allocationSize())
+    await frame.copyTo(data)
+    const yPlane = data.subarray(0, WIDTH * HEIGHT)
+    let sum = 0
+    for (const value of yPlane) {
+      sum += value
+    }
+    const averageY = sum / yPlane.length
+    t.true(Math.abs(averageY - 200) <= 2, `frame ${i} average Y ${averageY.toFixed(2)} should be ~200`)
+    frame.close()
+  }
+}
+
+test('decoder attributes show_existing_frame repeats to the display chunk (visible reference)', async (t) => {
+  const keyframe = await encodeSingleVp9Keyframe(t)
+  const showExisting = showExistingPacket()
+
+  const { frames, errors } = await decodeChunkSpecs([
+    { type: 'key', timestamp: 100, duration: 111, data: keyframe },
+    { type: 'delta', timestamp: 200, duration: 222, data: showExisting },
+    { type: 'delta', timestamp: 300, duration: 0, data: showExisting },
+    { type: 'delta', timestamp: 400, data: showExisting },
+  ])
+
+  await assertRepeatedFrames(t, frames, errors, [
+    { ts: 100, duration: 111 },
+    { ts: 200, duration: 222 },
+    { ts: 300, duration: 0 },
+    { ts: 400, duration: undefined },
+  ])
+})
+
+test('decoder attributes show_existing_frame repeats to the display chunk (invisible reference)', async (t) => {
+  const keyframe = await encodeSingleVp9Keyframe(t)
+  const showExisting = showExistingPacket()
+
+  // The invisible reference produces no output itself; each show_existing
+  // packet re-displays it and must carry its own chunk's metadata.
+  const { frames, errors } = await decodeChunkSpecs([
+    { type: 'key', timestamp: 100, duration: 111, data: invisibleVariant(keyframe) },
+    { type: 'delta', timestamp: 200, duration: 222, data: showExisting },
+    { type: 'delta', timestamp: 300, duration: 0, data: showExisting },
+    { type: 'delta', timestamp: 400, data: showExisting },
+  ])
+
+  await assertRepeatedFrames(t, frames, errors, [
+    { ts: 200, duration: 222 },
+    { ts: 300, duration: 0 },
+    { ts: 400, duration: undefined },
+  ])
+})
+
 // VideoToolbox B-frame attribution (macOS only)
 const testOnDarwin = process.platform === 'darwin' ? test : test.skip
 

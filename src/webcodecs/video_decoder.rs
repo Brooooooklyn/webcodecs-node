@@ -1177,17 +1177,38 @@ impl VideoDecoder {
     frame: &Frame,
     fallback: (i64, Option<i64>),
   ) -> (i64, Option<i64>) {
+    let frame_pts = frame.pts();
     let opaque_seq = frame.opaque() as u64;
-    if opaque_seq != 0
-      && let Some(meta) = guard.chunk_meta.remove(&opaque_seq)
-    {
+    let opaque_meta = if opaque_seq != 0 {
+      guard.chunk_meta.get(&opaque_seq).copied()
+    } else {
+      None
+    };
+
+    // VP9/AV1 show_existing_frame packets re-emit a stored reference frame:
+    // FFmpeg overrides pts/pkt_dts with the display packet's but the frame
+    // keeps the reference's inherited opaque and duration (vp9.c
+    // show_existing path). Such a frame carries an opaque tag whose chunk
+    // entry is already gone (reference was visible) or whose timestamp
+    // contradicts the frame PTS (reference was invisible). The inherited
+    // frame.duration belongs to the reference chunk and must not be
+    // trusted either.
+    let reemitted = opaque_seq != 0
+      && match opaque_meta {
+        Some((ts, _)) => frame_pts != AV_NOPTS_VALUE && ts != frame_pts,
+        None => true,
+      };
+
+    if !reemitted && let Some(meta) = opaque_meta {
+      guard.chunk_meta.remove(&opaque_seq);
       return meta;
     }
-
-    let frame_pts = frame.pts();
     if frame_pts != AV_NOPTS_VALUE {
       // Match the oldest pending chunk carrying this PTS. FFmpeg-propagated
-      // frame.duration reflects the same chunk, so prefer it when present.
+      // frame.duration reflects the same chunk, so prefer it when present —
+      // except for re-emitted reference frames, where it is inherited from
+      // the reference chunk and the matched chunk's duration always wins
+      // (including explicit zero and None).
       let seq = guard
         .chunk_meta
         .iter()
@@ -1196,7 +1217,9 @@ impl VideoDecoder {
       let mapped = seq
         .and_then(|s| guard.chunk_meta.remove(&s))
         .and_then(|(_, d)| d);
-      let dur = if frame.duration() > 0 {
+      let dur = if reemitted {
+        mapped
+      } else if frame.duration() > 0 {
         Some(frame.duration())
       } else {
         mapped
