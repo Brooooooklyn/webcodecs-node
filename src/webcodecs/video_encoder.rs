@@ -871,15 +871,22 @@ impl VideoEncoder {
 
     // Set frame duration in encoder time_base units (same rescale as PTS).
     // AV_CODEC_FLAG_FRAME_DURATION keeps avcodec_send_frame from zeroing it;
-    // software encoder wrappers then propagate it to pkt->duration.
-    if let Some(duration_us) = duration {
-      let duration_in_timebase = if let Some(tb) = encoder_time_base {
-        unsafe { av_rescale_q(duration_us, AVRational::MICROSECONDS, tb) }
-      } else {
-        duration_us
-      };
-      frame_to_encode.set_duration(duration_in_timebase);
-    }
+    // software encoder wrappers then propagate it to pkt->duration. Write it
+    // unconditionally: a decoded input frame can carry a stale internal
+    // duration (e.g. a VP9 show_existing output inherits its reference's)
+    // while its public VideoFrame duration is null, and FRAME_DURATION would
+    // otherwise propagate that stale value into the chunk.
+    let duration_in_timebase = match duration {
+      Some(duration_us) => {
+        if let Some(tb) = encoder_time_base {
+          unsafe { av_rescale_q(duration_us, AVRational::MICROSECONDS, tb) }
+        } else {
+          duration_us
+        }
+      }
+      None => 0,
+    };
+    frame_to_encode.set_duration(duration_in_timebase);
 
     // Force keyframe if requested via encode options (W3C WebCodecs spec)
     if options.as_ref().is_some_and(|o| o.key_frame == Some(true)) {
@@ -1000,6 +1007,20 @@ impl VideoEncoder {
                 buffered_ts
               };
               frame_to_reencode.set_pts(pts_in_timebase);
+              // Same unconditional duration write as the main encode path:
+              // zero when the input frame had none, so a stale internal
+              // duration on the buffered frame cannot leak into the chunk.
+              let duration_in_timebase = match buffered_duration {
+                Some(duration_us) => {
+                  if let Some(tb) = sw_encoder_time_base {
+                    unsafe { av_rescale_q(duration_us, AVRational::MICROSECONDS, tb) }
+                  } else {
+                    duration_us
+                  }
+                }
+                None => 0,
+              };
+              frame_to_reencode.set_duration(duration_in_timebase);
               Self::push_timestamp(
                 &mut guard.timestamp_map,
                 pts_in_timebase,
@@ -1211,6 +1232,20 @@ impl VideoEncoder {
                   buffered_ts
                 };
                 frame_to_reencode.set_pts(pts_in_timebase);
+                // Same unconditional duration write as the main encode path:
+                // zero when the input frame had none, so a stale internal
+                // duration on the buffered frame cannot leak into the chunk.
+                let duration_in_timebase = match buffered_duration {
+                  Some(duration_us) => {
+                    if let Some(tb) = sw_encoder_time_base {
+                      unsafe { av_rescale_q(duration_us, AVRational::MICROSECONDS, tb) }
+                    } else {
+                      duration_us
+                    }
+                  }
+                  None => 0,
+                };
+                frame_to_reencode.set_duration(duration_in_timebase);
                 Self::push_timestamp(
                   &mut guard.timestamp_map,
                   pts_in_timebase,

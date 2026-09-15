@@ -21,7 +21,12 @@ import {
   VideoDecoder,
   VideoFrame,
 } from '../../index.js'
-import type { EncodedVideoChunkMetadata, VideoDecoderConfig, VideoEncoderConfig } from '../../index.js'
+import type {
+  EncodedVideoChunkMetadata,
+  VideoDecoderConfig,
+  VideoEncoderConfig,
+  VideoPixelFormat,
+} from '../../index.js'
 import { hasHardwareAcceleration, waitFor } from '../helpers/index.js'
 
 // Reset hardware fallback state before each test to ensure test isolation
@@ -247,10 +252,14 @@ test('decoder pairs duration with the same frame as its timestamp', async (t) =>
   }
 })
 
-async function assertDuplicateTsPairing(
-  t: ExecutionContext,
-  decoderHw: VideoDecoderConfig['hardwareAcceleration'],
-) {
+interface DupTsResult {
+  contentIndex: number
+  timestamp: number
+  duration: number | undefined
+  format: VideoPixelFormat | null
+}
+
+async function decodeDuplicateTsChunks(t: ExecutionContext, decoderHw: VideoDecoderConfig['hardwareAcceleration']) {
   const { chunks, errors: encErrors, decoderConfig } = await encodeIndexFrames(HEVC_CONFIG)
   t.is(encErrors.length, 0, 'No encoder errors')
   t.is(chunks.length, FRAME_COUNT, 'One chunk per input frame')
@@ -304,6 +313,7 @@ async function assertDuplicateTsPairing(
 
   // Correlate by pixel content, not timestamp: the two duplicate-timestamp
   // frames are indistinguishable by ts, which is the point of this test.
+  const results: DupTsResult[] = []
   for (const frame of frames) {
     const data = new Uint8Array(frame.allocationSize())
     await frame.copyTo(data)
@@ -312,22 +322,37 @@ async function assertDuplicateTsPairing(
     for (const value of yPlane) {
       sum += value
     }
-    const averageY = sum / yPlane.length
-    const contentIndex = Math.round(averageY / 10)
-    const expected = expectedByContent.get(contentIndex)
-    t.truthy(expected, `frame with Y≈${averageY.toFixed(1)} maps to content frame ${contentIndex}`)
-    t.is(frame.timestamp, expected!.ts, `content frame ${contentIndex} timestamp`)
-    t.is(
-      frame.duration ?? undefined,
-      expected!.duration,
-      `content frame ${contentIndex} (Y≈${averageY.toFixed(1)}) must carry duration ${expected!.duration}, not the other duplicate's`,
-    )
+    results.push({
+      contentIndex: Math.round(sum / yPlane.length / 10),
+      timestamp: frame.timestamp,
+      duration: frame.duration ?? undefined,
+      format: frame.format,
+    })
     frame.close()
+  }
+  return { results, expectedByContent }
+}
+
+function assertDuplicateTsResults(
+  t: ExecutionContext,
+  results: DupTsResult[],
+  expectedByContent: Map<number, { ts: number; duration: number | undefined }>,
+) {
+  for (const result of results) {
+    const expected = expectedByContent.get(result.contentIndex)
+    t.truthy(expected, `frame maps to content frame ${result.contentIndex}`)
+    t.is(result.timestamp, expected!.ts, `content frame ${result.contentIndex} timestamp`)
+    t.is(
+      result.duration,
+      expected!.duration,
+      `content frame ${result.contentIndex} must carry duration ${expected!.duration}, not the other duplicate's`,
+    )
   }
 }
 
 test('decoder pairs duration with the exact chunk under duplicate timestamps', async (t) => {
-  await assertDuplicateTsPairing(t, 'prefer-software')
+  const { results, expectedByContent } = await decodeDuplicateTsChunks(t, 'prefer-software')
+  assertDuplicateTsResults(t, results, expectedByContent)
 })
 
 // VideoToolbox decoder attribution (macOS only). VT decode is a hwaccel
@@ -342,7 +367,18 @@ testVTDecoder('VideoToolbox decoder pairs duration with the exact chunk under du
     t.pass('No usable hardware accelerator available, skipping')
     return
   }
-  await assertDuplicateTsPairing(t, 'prefer-hardware')
+  const { results, expectedByContent } = await decodeDuplicateTsChunks(t, 'prefer-hardware')
+
+  // prefer-hardware still permits FFmpeg to fall back to software when
+  // hwaccel init fails at decode time, even on capable machines. VT
+  // downloads 8-bit frames as NV12 while software decode yields I420, so
+  // only assert attribution when VT frames were actually seen — otherwise
+  // this would record a VT pass it never exercised.
+  if (!results.some((r) => r.format === 'NV12')) {
+    t.pass('VideoToolbox hwaccel did not engage (software fallback), skipping')
+    return
+  }
+  assertDuplicateTsResults(t, results, expectedByContent)
 })
 
 // AV1 show_existing attribution through FFmpeg's libdav1d wrapper. The

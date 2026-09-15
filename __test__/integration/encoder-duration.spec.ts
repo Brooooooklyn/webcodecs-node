@@ -16,9 +16,10 @@ import {
   Mp4Demuxer,
   Mp4Muxer,
   resetHardwareFallbackState,
+  VideoDecoder,
   VideoEncoder,
 } from '../../index.js'
-import type { EncodedVideoChunkMetadata, VideoEncoderConfig } from '../../index.js'
+import type { EncodedVideoChunkMetadata, VideoEncoderConfig, VideoFrame } from '../../index.js'
 import { generateGradientI420Frame, hasHardwareAcceleration } from '../helpers/index.js'
 
 // Reset hardware fallback state before each test to ensure test isolation
@@ -133,6 +134,80 @@ test('frames without duration produce chunks with null duration', async (t) => {
   for (const chunk of chunks) {
     t.is(chunk.duration, null, `Chunk ts=${chunk.timestamp} must have null duration`)
   }
+})
+
+// A decoded frame can carry a stale internal AVFrame duration even when its
+// public VideoFrame duration is null: a VP9 show_existing output inherits
+// its reference frame's duration. With FRAME_DURATION enabled the encoder
+// must write the public duration (zero when null) onto the frame, or the
+// stale value bypasses the packet fallback guard and leaks into the chunk.
+test('decode→encode transcode does not leak a stale reference duration', async (t) => {
+  // Encode a single VP9 keyframe (the reference)
+  const vp9Chunks: EncodedVideoChunk[] = []
+  const vp9Encoder = new VideoEncoder({
+    output: (chunk) => vp9Chunks.push(chunk),
+    error: (e) => t.fail(`VP9 encoder error: ${e.message}`),
+  })
+  vp9Encoder.configure(makeConfig('vp09.00.10.08'))
+  const srcFrame = generateGradientI420Frame(WIDTH, HEIGHT, 0, 11111)
+  vp9Encoder.encode(srcFrame, { keyFrame: true })
+  srcFrame.close()
+  await vp9Encoder.flush()
+  vp9Encoder.close()
+  t.is(vp9Chunks.length, 1, 'Single VP9 keyframe chunk')
+
+  const keyData = new Uint8Array(vp9Chunks[0].byteLength)
+  vp9Chunks[0].copyTo(keyData)
+  // Raw show_existing_frame packet: marker=2, profile=0, show_existing=1, idx=0
+  const showExisting = new Uint8Array([0x88])
+
+  // Decode: reference chunk with duration, display chunk without one
+  const decodedFrames: VideoFrame[] = []
+  const decoder = new VideoDecoder({
+    output: (frame) => decodedFrames.push(frame),
+    error: (e) => t.fail(`VP9 decoder error: ${e.message}`),
+  })
+  decoder.configure({
+    codec: 'vp09.00.10.08',
+    codedWidth: WIDTH,
+    codedHeight: HEIGHT,
+    hardwareAcceleration: 'prefer-software',
+  })
+  decoder.decode(new EncodedVideoChunk({ type: 'key', timestamp: 0, duration: 11111, data: keyData }))
+  decoder.decode(new EncodedVideoChunk({ type: 'delta', timestamp: 33333, data: showExisting }))
+  await decoder.flush()
+  decoder.close()
+  t.is(decodedFrames.length, 2, 'show_existing re-displays the reference')
+  t.deepEqual(
+    decodedFrames.map((f) => f.duration),
+    [11111, null],
+    'Decoded public durations: the display chunk had no duration',
+  )
+
+  // Re-encode both decoded frames to H.264
+  const h264Chunks: EncodedVideoChunk[] = []
+  const h264Errors: Error[] = []
+  const h264Encoder = new VideoEncoder({
+    output: (chunk) => h264Chunks.push(chunk),
+    error: (e) => h264Errors.push(e),
+  })
+  h264Encoder.configure(makeConfig('avc1.42001E'))
+  for (const [i, frame] of decodedFrames.entries()) {
+    h264Encoder.encode(frame, i === 0 ? { keyFrame: true } : undefined)
+    frame.close()
+  }
+  await h264Encoder.flush()
+  h264Encoder.close()
+
+  t.is(h264Errors.length, 0, `No encoder errors, got: ${h264Errors.map((e) => e.message).join(', ')}`)
+  t.is(h264Chunks.length, 2, 'One chunk per transcoded frame')
+  const durationByTimestamp = new Map(h264Chunks.map((c) => [c.timestamp, c.duration]))
+  t.is(durationByTimestamp.get(0), 11111, 'Reference frame keeps its public duration')
+  t.is(
+    durationByTimestamp.get(33333) ?? null,
+    null,
+    'Duration-less show_existing frame must not leak the reference\u2019s stale internal duration',
+  )
 })
 
 // VideoToolbox never sets pkt->duration; this exercises the fallback that
