@@ -38,6 +38,7 @@ use crate::ffi::{
     ffframe_set_format,
     ffframe_set_height,
     ffframe_set_nb_samples,
+    ffframe_set_opaque,
     ffframe_set_pict_type,
     ffframe_set_pts,
     ffframe_set_quality,
@@ -203,10 +204,17 @@ impl Frame {
 
   /// Get the opaque user data propagated from the input packet (requires
   /// AV_CODEC_FLAG_COPY_OPAQUE on the decoder). Zero when unset or when the
-  /// decoder does not propagate it (e.g. VideoToolbox).
+  /// decoder sets frame props itself without copying opaque (e.g. cuvid,
+  /// mediacodec).
   #[inline]
   pub fn opaque(&self) -> usize {
     unsafe { ffframe_get_opaque(self.as_ptr()) as usize }
+  }
+
+  /// Set the opaque user data (see [`Frame::opaque`])
+  #[inline]
+  pub fn set_opaque(&mut self, opaque: usize) {
+    unsafe { ffframe_set_opaque(self.as_mut_ptr(), opaque as *mut std::ffi::c_void) }
   }
 
   // ========================================================================

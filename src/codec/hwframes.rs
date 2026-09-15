@@ -295,6 +295,8 @@ pub fn download_hw_frame(hw_frame: &Frame) -> CodecResult<Frame> {
   // Copy timestamp metadata from source frame
   sw_frame.set_pts(hw_frame.pts());
   sw_frame.set_duration(hw_frame.duration());
+  // Keep the chunk identity tag readable on the downloaded frame too
+  sw_frame.set_opaque(hw_frame.opaque());
 
   // Copy color space metadata from source frame
   sw_frame.set_color_primaries(hw_frame.color_primaries());

@@ -279,6 +279,10 @@ void* ffframe_get_opaque(const AVFrame* frame) {
     return frame ? frame->opaque : NULL;
 }
 
+void ffframe_set_opaque(AVFrame* frame, void* opaque) {
+    if (frame) frame->opaque = opaque;
+}
+
 void ffframe_set_duration(AVFrame* frame, int64_t duration) {
     frame->duration = duration;
 }

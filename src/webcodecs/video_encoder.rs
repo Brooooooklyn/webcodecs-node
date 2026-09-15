@@ -185,6 +185,8 @@ struct VideoEncodeRequest {
   /// Shared reference to the frame data (via Arc for Rust-level sharing)
   frame: Arc<ParkingLotRwLock<Frame>>,
   timestamp: i64,
+  /// Duration in microseconds from the input VideoFrame
+  duration: Option<i64>,
   options: Option<VideoEncoderEncodeOptions>,
   /// Rotation from input VideoFrame (for metadata output)
   rotation: f64,
@@ -194,6 +196,17 @@ struct VideoEncodeRequest {
   /// after each FIFO-ordered configuration change.
   color_space: Option<VideoColorSpaceInit>,
 }
+
+/// Frame buffered for re-encoding after a hardware→software fallback.
+/// Fields: (frame, timestamp µs, duration µs, encode options, rotation, flip).
+type PendingFrame = (
+  Frame,
+  i64,
+  Option<i64>,
+  Option<VideoEncoderEncodeOptions>,
+  f64,
+  bool,
+);
 
 /// Commands sent to the worker thread
 enum EncoderCommand {
@@ -365,10 +378,12 @@ struct VideoEncoderInner {
   had_error: bool,
   /// Pending flush operations, tracked independently for overlapping calls.
   flushes: FlushTracker,
-  /// Maps frame PTS (encoder time_base units) to input timestamps (µs).
-  /// B-frame encoders emit packets in decode order, so a FIFO misattributes
-  /// timestamps; keying by packet PTS keeps each label on its own frame.
-  timestamp_map: BTreeMap<i64, VecDeque<i64>>,
+  /// Maps frame PTS (encoder time_base units) to input timestamps (µs) and
+  /// durations (µs). B-frame encoders emit packets in decode order, so a FIFO
+  /// misattributes timestamps; keying by packet PTS keeps each label on its
+  /// own frame. The duration is used for packets whose encoder left
+  /// pkt->duration unset (e.g. VideoToolbox).
+  timestamp_map: BTreeMap<i64, VecDeque<(i64, Option<i64>)>>,
 
   // ========================================================================
   // Hardware acceleration tracking (for Chromium-aligned fallback behavior)
@@ -384,8 +399,7 @@ struct VideoEncoderInner {
   /// Whether first output has been produced (disables silent failure detection after)
   first_output_produced: bool,
   /// Buffered frames during silent failure detection period (for re-encoding on fallback)
-  /// Tuple: (Frame, timestamp, options, rotation, flip)
-  pending_frames: Vec<(Frame, i64, Option<VideoEncoderEncodeOptions>, f64, bool)>,
+  pending_frames: Vec<PendingFrame>,
   /// Queue of encoded chunks waiting to be delivered via output callback
   /// Worker pushes chunks here during flush; flush() drains them synchronously via FunctionRef
   pending_chunks: Vec<(EncodedVideoChunk, EncodedVideoChunkMetadata)>,
@@ -716,6 +730,7 @@ impl VideoEncoder {
     let VideoEncodeRequest {
       frame: frame_arc,
       timestamp,
+      duration,
       options,
       rotation,
       flip,
@@ -854,6 +869,18 @@ impl VideoEncoder {
     };
     frame_to_encode.set_pts(pts_in_timebase);
 
+    // Set frame duration in encoder time_base units (same rescale as PTS).
+    // AV_CODEC_FLAG_FRAME_DURATION keeps avcodec_send_frame from zeroing it;
+    // software encoder wrappers then propagate it to pkt->duration.
+    if let Some(duration_us) = duration {
+      let duration_in_timebase = if let Some(tb) = encoder_time_base {
+        unsafe { av_rescale_q(duration_us, AVRational::MICROSECONDS, tb) }
+      } else {
+        duration_us
+      };
+      frame_to_encode.set_duration(duration_in_timebase);
+    }
+
     // Force keyframe if requested via encode options (W3C WebCodecs spec)
     if options.as_ref().is_some_and(|o| o.key_frame == Some(true)) {
       frame_to_encode.set_pict_type(AVPictureType::I);
@@ -906,7 +933,12 @@ impl VideoEncoder {
 
     // Key the input timestamp by the frame's PTS so B-frame-reordered output
     // packets can be matched back to their own input frame.
-    Self::push_timestamp(&mut guard.timestamp_map, pts_in_timebase, timestamp);
+    Self::push_timestamp(
+      &mut guard.timestamp_map,
+      pts_in_timebase,
+      timestamp,
+      duration,
+    );
 
     // Encode the frame
     let context = match guard.context.as_mut() {
@@ -937,17 +969,28 @@ impl VideoEncoder {
             .and_then(|f| f.shallow_clone().ok())
             .or_else(|| frame_to_encode.shallow_clone().ok());
           if let Some(buffered) = frame_to_buffer {
-            guard
-              .pending_frames
-              .push((buffered, timestamp, options.clone(), rotation, flip));
+            guard.pending_frames.push((
+              buffered,
+              timestamp,
+              duration,
+              options.clone(),
+              rotation,
+              flip,
+            ));
           }
           let pending_frames = std::mem::take(&mut guard.pending_frames);
 
           if Self::fallback_to_software(&mut guard) {
             // Re-encode all buffered frames with software encoder
             let sw_encoder_time_base = guard.context.as_ref().map(|ctx| ctx.time_base());
-            for (buffered_frame, buffered_ts, _buffered_opts, buffered_rotation, buffered_flip) in
-              pending_frames
+            for (
+              buffered_frame,
+              buffered_ts,
+              buffered_duration,
+              _buffered_opts,
+              buffered_rotation,
+              buffered_flip,
+            ) in pending_frames
             {
               let mut frame_to_reencode = buffered_frame;
               // Convert microseconds to encoder time_base units
@@ -957,7 +1000,12 @@ impl VideoEncoder {
                 buffered_ts
               };
               frame_to_reencode.set_pts(pts_in_timebase);
-              Self::push_timestamp(&mut guard.timestamp_map, pts_in_timebase, buffered_ts);
+              Self::push_timestamp(
+                &mut guard.timestamp_map,
+                pts_in_timebase,
+                buffered_ts,
+                buffered_duration,
+              );
 
               // Increment frame_count so flush() knows to drain the encoder
               guard.frame_count += 1;
@@ -965,7 +1013,7 @@ impl VideoEncoder {
                 && let Ok(pkts) = ctx.encode(Some(&frame_to_reencode))
               {
                 let enc_tb = ctx.time_base();
-                for packet in pkts {
+                for mut packet in pkts {
                   // Extract alpha side data for VP9 only (HEVC alpha is embedded in bitstream)
                   let alpha_side_data = if guard.codec_id == Some(AVCodecID::Vp9) {
                     extract_alpha_side_data(&packet, guard.use_alpha)
@@ -974,8 +1022,17 @@ impl VideoEncoder {
                   };
                   let packet_is_key = packet.is_key();
                   // Match the packet's PTS back to its input frame's timestamp
-                  let output_timestamp =
-                    Self::match_timestamp(&mut guard.timestamp_map, packet.pts());
+                  let matched = Self::match_timestamp(&mut guard.timestamp_map, packet.pts());
+                  let output_timestamp = matched.map(|(ts, _)| ts);
+                  // Encoders that never set pkt->duration (VideoToolbox) get the
+                  // input frame's duration; encoder-provided values are kept.
+                  if packet.duration() <= 0
+                    && let Some(duration_us) = matched.and_then(|(_, d)| d)
+                  {
+                    packet.set_duration(unsafe {
+                      av_rescale_q(duration_us, AVRational::MICROSECONDS, enc_tb)
+                    });
+                  }
                   let chunk = EncodedVideoChunk::from_packet_with_format(
                     packet,
                     output_timestamp,
@@ -1093,9 +1150,14 @@ impl VideoEncoder {
         .and_then(|f| f.shallow_clone().ok())
         .or_else(|| frame_to_encode.shallow_clone().ok());
       if let Some(buffered) = frame_to_buffer {
-        guard
-          .pending_frames
-          .push((buffered, timestamp, options.clone(), rotation, flip));
+        guard.pending_frames.push((
+          buffered,
+          timestamp,
+          duration,
+          options.clone(),
+          rotation,
+          flip,
+        ));
       }
       guard.silent_encode_count += 1;
 
@@ -1132,8 +1194,14 @@ impl VideoEncoder {
             if Self::fallback_to_software(&mut guard) {
               // Re-encode all buffered frames with software encoder
               let sw_encoder_time_base = guard.context.as_ref().map(|ctx| ctx.time_base());
-              for (buffered_frame, buffered_ts, _buffered_opts, buffered_rotation, buffered_flip) in
-                pending_frames
+              for (
+                buffered_frame,
+                buffered_ts,
+                buffered_duration,
+                _buffered_opts,
+                buffered_rotation,
+                buffered_flip,
+              ) in pending_frames
               {
                 let mut frame_to_reencode = buffered_frame;
                 // Convert microseconds to encoder time_base units
@@ -1143,7 +1211,12 @@ impl VideoEncoder {
                   buffered_ts
                 };
                 frame_to_reencode.set_pts(pts_in_timebase);
-                Self::push_timestamp(&mut guard.timestamp_map, pts_in_timebase, buffered_ts);
+                Self::push_timestamp(
+                  &mut guard.timestamp_map,
+                  pts_in_timebase,
+                  buffered_ts,
+                  buffered_duration,
+                );
 
                 // Increment frame_count so flush() knows to drain the encoder
                 guard.frame_count += 1;
@@ -1152,7 +1225,7 @@ impl VideoEncoder {
                 {
                   let enc_tb = ctx.time_base();
                   // Process any output packets from re-encoding
-                  for packet in pkts {
+                  for mut packet in pkts {
                     // Extract alpha side data for VP9 only (HEVC alpha is embedded in bitstream)
                     let alpha_side_data = if guard.codec_id == Some(AVCodecID::Vp9) {
                       extract_alpha_side_data(&packet, guard.use_alpha)
@@ -1162,8 +1235,17 @@ impl VideoEncoder {
                     let packet_is_key = packet.is_key();
 
                     // Match the packet's PTS back to its input frame's timestamp
-                    let output_timestamp =
-                      Self::match_timestamp(&mut guard.timestamp_map, packet.pts());
+                    let matched = Self::match_timestamp(&mut guard.timestamp_map, packet.pts());
+                    let output_timestamp = matched.map(|(ts, _)| ts);
+                    // Encoders that never set pkt->duration (VideoToolbox) get the
+                    // input frame's duration; encoder-provided values are kept.
+                    if packet.duration() <= 0
+                      && let Some(duration_us) = matched.and_then(|(_, d)| d)
+                    {
+                      packet.set_duration(unsafe {
+                        av_rescale_q(duration_us, AVRational::MICROSECONDS, enc_tb)
+                      });
+                    }
                     let chunk = EncodedVideoChunk::from_packet_with_format(
                       packet,
                       output_timestamp,
@@ -1280,10 +1362,21 @@ impl VideoEncoder {
       .unwrap_or(AVRational::MICROSECONDS);
 
     // Process output packets - call callback for each
-    for packet in packets {
+    for mut packet in packets {
       // Match the packet's PTS back to its input frame's timestamp
       // (packets arrive in decode order under B-frame reordering)
-      let output_timestamp = Self::match_timestamp(&mut guard.timestamp_map, packet.pts());
+      let matched = Self::match_timestamp(&mut guard.timestamp_map, packet.pts());
+      let output_timestamp = matched.map(|(ts, _)| ts);
+
+      // Encoders that never set pkt->duration (VideoToolbox) get the input
+      // frame's duration; encoder-provided values are kept.
+      if packet.duration() <= 0
+        && let Some(duration_us) = matched.and_then(|(_, d)| d)
+      {
+        packet.set_duration(unsafe {
+          av_rescale_q(duration_us, AVRational::MICROSECONDS, encoder_time_base)
+        });
+      }
 
       // Extract alpha side data for VP9 only (HEVC alpha is embedded in bitstream)
       let alpha_side_data = if guard.codec_id == Some(AVCodecID::Vp9) {
@@ -1527,9 +1620,21 @@ impl VideoEncoder {
       .map(|ctx| ctx.time_base())
       .unwrap_or(AVRational::MICROSECONDS);
 
-    for packet in packets {
+    for mut packet in packets {
       // Match the packet's PTS back to its input frame's timestamp
-      let output_timestamp = Self::match_timestamp(&mut guard.timestamp_map, packet.pts());
+      let matched = Self::match_timestamp(&mut guard.timestamp_map, packet.pts());
+      let output_timestamp = matched.map(|(ts, _)| ts);
+
+      // Encoders that never set pkt->duration (VideoToolbox) get the input
+      // frame's duration; encoder-provided values are kept.
+      if packet.duration() <= 0
+        && let Some(duration_us) = matched.and_then(|(_, d)| d)
+      {
+        packet.set_duration(unsafe {
+          av_rescale_q(duration_us, AVRational::MICROSECONDS, encoder_time_base)
+        });
+      }
+
       // Extract alpha side data for VP9 only (HEVC alpha is embedded in bitstream)
       let alpha_side_data = if guard.codec_id == Some(AVCodecID::Vp9) {
         extract_alpha_side_data(&packet, guard.use_alpha)
@@ -2107,23 +2212,38 @@ impl VideoEncoder {
     guard.nv12_scaler = None;
   }
 
-  /// Record an input timestamp keyed by the frame's PTS (encoder time_base units).
-  /// Multiple timestamps per key tolerate time_base rounding collisions.
-  fn push_timestamp(map: &mut BTreeMap<i64, VecDeque<i64>>, pts_tb: i64, ts_us: i64) {
-    map.entry(pts_tb).or_default().push_back(ts_us);
+  /// Record an input timestamp and duration keyed by the frame's PTS (encoder
+  /// time_base units). Multiple entries per key tolerate time_base rounding
+  /// collisions.
+  fn push_timestamp(
+    map: &mut BTreeMap<i64, VecDeque<(i64, Option<i64>)>>,
+    pts_tb: i64,
+    ts_us: i64,
+    duration_us: Option<i64>,
+  ) {
+    map
+      .entry(pts_tb)
+      .or_default()
+      .push_back((ts_us, duration_us));
   }
 
-  /// Match an output packet's PTS back to the original input timestamp.
-  /// Exact hit first; otherwise nearest key within 2 time_base ticks (covers
-  /// hardware encoders that slightly shift PTS, e.g. VideoToolbox); otherwise
-  /// pop the oldest pending entry (NOPTS packets); otherwise None.
-  fn match_timestamp(map: &mut BTreeMap<i64, VecDeque<i64>>, packet_pts: i64) -> Option<i64> {
-    fn pop_at(map: &mut BTreeMap<i64, VecDeque<i64>>, key: i64) -> Option<i64> {
-      let ts = map.get_mut(&key)?.pop_front();
+  /// Match an output packet's PTS back to the original input timestamp and
+  /// duration. Exact hit first; otherwise nearest key within 2 time_base ticks
+  /// (covers hardware encoders that slightly shift PTS, e.g. VideoToolbox);
+  /// otherwise pop the oldest pending entry (NOPTS packets); otherwise None.
+  fn match_timestamp(
+    map: &mut BTreeMap<i64, VecDeque<(i64, Option<i64>)>>,
+    packet_pts: i64,
+  ) -> Option<(i64, Option<i64>)> {
+    fn pop_at(
+      map: &mut BTreeMap<i64, VecDeque<(i64, Option<i64>)>>,
+      key: i64,
+    ) -> Option<(i64, Option<i64>)> {
+      let entry = map.get_mut(&key)?.pop_front();
       if map.get(&key).is_some_and(|q| q.is_empty()) {
         map.remove(&key);
       }
-      ts
+      entry
     }
     if packet_pts == AV_NOPTS_VALUE {
       let oldest = map.keys().next().copied();
@@ -3095,7 +3215,7 @@ impl VideoEncoder {
     }
 
     // Get Arc reference to frame and metadata on main thread (no pixel copy)
-    let (frame_arc, timestamp, rotation, flip, color_space) = {
+    let (frame_arc, timestamp, duration, rotation, flip, color_space) = {
       let mut inner = self
         .inner
         .lock()
@@ -3127,6 +3247,9 @@ impl VideoEncoder {
         }
       };
 
+      // Get duration (µs) for propagation to the encoded chunk
+      let duration = frame.duration().ok().flatten();
+
       // Get rotation and flip for metadata output (W3C WebCodecs spec)
       let rotation = frame.rotation().unwrap_or(0.0);
       let flip = frame.flip().unwrap_or(false);
@@ -3136,7 +3259,7 @@ impl VideoEncoder {
       // Increment queue size (pending operation)
       inner.encode_queue_size += 1;
 
-      (frame_arc, timestamp, rotation, flip, color_space)
+      (frame_arc, timestamp, duration, rotation, flip, color_space)
     };
 
     // Send encode command to worker thread via microtask for W3C spec FIFO ordering
@@ -3153,6 +3276,7 @@ impl VideoEncoder {
           let _ = sender.send(EncoderCommand::Encode(VideoEncodeRequest {
             frame: frame_arc,
             timestamp,
+            duration,
             options,
             rotation,
             flip,
