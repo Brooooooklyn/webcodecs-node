@@ -472,6 +472,44 @@ test('decoder attributes show_existing_frame repeats to the display chunk (invis
   ])
 })
 
+test('decoder attributes show_existing_frame repeats when the display ts collides with the reference ts', async (t) => {
+  const keyframe = await encodeSingleVp9Keyframe(t)
+  const showExisting = showExistingPacket()
+
+  // The first repeat shares the invisible reference's timestamp, so the
+  // frame's inherited opaque tag does not contradict its PTS. The display
+  // chunk's own metadata must still win.
+  const { frames, errors } = await decodeChunkSpecs([
+    { type: 'key', timestamp: 200, duration: 111, data: invisibleVariant(keyframe) },
+    { type: 'delta', timestamp: 200, duration: 0, data: showExisting },
+    { type: 'delta', timestamp: 300, duration: 333, data: showExisting },
+  ])
+
+  await assertRepeatedFrames(t, frames, errors, [
+    { ts: 200, duration: 0 },
+    { ts: 300, duration: 333 },
+  ])
+})
+
+test('decoder ignores invisible-reference entries when a later frame occupies the reference slots', async (t) => {
+  const keyframe = await encodeSingleVp9Keyframe(t)
+  const showExisting = showExistingPacket()
+
+  // The visible keyframe refreshes every reference slot, so the repeat
+  // re-displays it (not the earlier invisible frame). The invisible chunk's
+  // lingering entry must not win the PTS match against the display chunk.
+  const { frames, errors } = await decodeChunkSpecs([
+    { type: 'key', timestamp: 200, duration: 111, data: invisibleVariant(keyframe) },
+    { type: 'key', timestamp: 100, duration: 222, data: keyframe },
+    { type: 'delta', timestamp: 200, duration: 0, data: showExisting },
+  ])
+
+  await assertRepeatedFrames(t, frames, errors, [
+    { ts: 100, duration: 222 },
+    { ts: 200, duration: 0 },
+  ])
+})
+
 // VideoToolbox B-frame attribution (macOS only)
 const testOnDarwin = process.platform === 'darwin' ? test : test.skip
 

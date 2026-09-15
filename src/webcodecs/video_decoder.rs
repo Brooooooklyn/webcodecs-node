@@ -557,10 +557,16 @@ impl VideoDecoder {
 
     // Tag the chunk with a sequence number carried through FFmpeg as the
     // packet/frame opaque pointer: exact identity through B-frame reordering,
-    // even for duplicate timestamps.
+    // even for duplicate timestamps. Invisible VP9 frames (show_frame=0)
+    // never produce their own output frame — they are stored as references
+    // and only re-emitted by show_existing_frame packets — so their entry is
+    // skipped: it could otherwise win PTS matching against the real display
+    // chunk.
     let seq = guard.next_chunk_seq;
     guard.next_chunk_seq += 1;
-    guard.chunk_meta.insert(seq, (timestamp, duration));
+    if !is_invisible_vp9_chunk(&guard.codec_string, encoded_chunk.data.as_slice()) {
+      guard.chunk_meta.insert(seq, (timestamp, duration));
+    }
 
     // Buffer chunk during silent failure detection period (for re-decoding on fallback)
     if guard.is_hardware && !guard.first_output_produced {
@@ -823,7 +829,9 @@ impl VideoDecoder {
       // entry is still pending (hardware produced no frames before fallback).
       let seq = guard.next_chunk_seq;
       guard.next_chunk_seq += 1;
-      guard.chunk_meta.insert(seq, (timestamp, duration));
+      if !is_invisible_vp9_chunk(&guard.codec_string, raw_data.as_slice()) {
+        guard.chunk_meta.insert(seq, (timestamp, duration));
+      }
 
       // Decode with software decoder
       let context = match guard.context.as_mut() {
@@ -2513,6 +2521,40 @@ fn parse_codec_string(codec: &str) -> Result<AVCodecID> {
 }
 
 /// Decode chunk data using FFmpeg
+/// VP9 uncompressed-header visibility flags, MSB-first within each byte:
+/// frame_marker(2), profile(2, +1 when 3), show_existing_frame(1),
+/// frame_type(1), show_frame(1). Returns (show_existing, show_frame), or
+/// None for malformed or short headers — callers must treat those as visible.
+fn vp9_visibility(data: &[u8]) -> Option<(bool, bool)> {
+  let bit = |i: usize| -> Option<bool> { Some(data.get(i / 8)? & (0x80 >> (i % 8)) != 0) };
+  if !bit(0)? || bit(1)? {
+    return None; // frame marker must be 0b10
+  }
+  let profile = bit(2)? as u8 | (bit(3)? as u8) << 1;
+  let mut pos = 4 + usize::from(profile == 3);
+  let show_existing = bit(pos)?;
+  pos += 1;
+  if show_existing {
+    // Re-displays a stored reference: a display event of its own.
+    return Some((true, true));
+  }
+  let _frame_type = bit(pos)?;
+  pos += 1;
+  let show_frame = bit(pos)?;
+  Some((false, show_frame))
+}
+
+/// True for VP9 chunks that are decoded into the reference buffer without
+/// being shown (show_frame=0). Only VP9 is parsed: its visibility flags sit
+/// in the first byte, and its decoder (vp9.c) is the one re-emitting stored
+/// references with inherited metadata.
+fn is_invisible_vp9_chunk(codec: &str, data: &[u8]) -> bool {
+  if codec != "vp9" && !codec.starts_with("vp09") {
+    return false;
+  }
+  matches!(vp9_visibility(data), Some((false, false)))
+}
+
 fn decode_chunk_data(
   context: &mut CodecContext,
   data: &[u8],
