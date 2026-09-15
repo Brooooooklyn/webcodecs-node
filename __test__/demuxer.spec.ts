@@ -194,20 +194,23 @@ runTest('Mp4Demuxer: seek and demux', async (t) => {
         // Demux after seek
         demuxer.demux(10)
 
-        setTimeout(() => {
-          if (!errorOccurred) {
-            t.true(videoChunks.length > 0, 'Should have demuxed chunks after seek')
+        // Poll instead of assuming a fixed wall-clock budget is enough to
+        // drain the native worker (a fixed timeout fails under parallel CI
+        // load and the assertion would run outside the test context)
+        waitFor(() => errorOccurred || videoChunks.length > 0, 'demuxed chunks after seek')
+          .then(() => {
+            if (!errorOccurred) {
+              t.true(videoChunks.length > 0, 'Should have demuxed chunks after seek')
 
-            // First chunk after seek should have timestamp >= 1 second
-            // (may be earlier due to keyframe seeking)
-            if (videoChunks.length > 0) {
+              // First chunk after seek should have timestamp >= 1 second
+              // (may be earlier due to keyframe seeking)
               t.true(videoChunks[0].timestamp >= 0, 'Timestamp should be non-negative')
-            }
 
-            demuxer.close()
-            resolve()
-          }
-        }, 500)
+              demuxer.close()
+              resolve()
+            }
+          })
+          .catch(reject)
       })
       .catch(reject)
   })
@@ -712,17 +715,17 @@ runTest('WebMDemuxer: demux Opus audio chunks', async (t) => {
       .then(() => {
         demuxer.demux(20)
 
-        setTimeout(() => {
-          if (!errorOccurred) {
-            t.true(audioChunks.length > 0, 'Should have demuxed audio chunks')
-            if (audioChunks.length > 0) {
+        waitFor(() => errorOccurred || audioChunks.length > 0, 'demuxed audio chunks')
+          .then(() => {
+            if (!errorOccurred) {
+              t.true(audioChunks.length > 0, 'Should have demuxed audio chunks')
               t.truthy(audioChunks[0].type, 'Chunk should have type')
               t.true(audioChunks[0].byteLength > 0, 'Chunk should have data')
+              demuxer.close()
+              resolve()
             }
-            demuxer.close()
-            resolve()
-          }
-        }, 500)
+          })
+          .catch(reject)
       })
       .catch(reject)
   })
@@ -1077,17 +1080,17 @@ runTest('MkvDemuxer: demux AAC audio chunks', async (t) => {
       .then(() => {
         demuxer.demux(20)
 
-        setTimeout(() => {
-          if (!errorOccurred) {
-            t.true(audioChunks.length > 0, 'Should have demuxed audio chunks')
-            if (audioChunks.length > 0) {
+        waitFor(() => errorOccurred || audioChunks.length > 0, 'demuxed audio chunks')
+          .then(() => {
+            if (!errorOccurred) {
+              t.true(audioChunks.length > 0, 'Should have demuxed audio chunks')
               t.truthy(audioChunks[0].type, 'Chunk should have type')
               t.true(audioChunks[0].byteLength > 0, 'Chunk should have data')
+              demuxer.close()
+              resolve()
             }
-            demuxer.close()
-            resolve()
-          }
-        }, 500)
+          })
+          .catch(reject)
       })
       .catch(reject)
   })

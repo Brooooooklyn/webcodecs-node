@@ -956,9 +956,19 @@ fn strip_hevc_parameter_sets(
       nal_len = (nal_len << 8) | usize::from(b);
     }
     let nal_start = offset + len_size;
-    // HEVC NAL units carry a two-byte header; shorter payloads are malformed
+    // HEVC NAL units carry a two-byte header; shorter payloads are malformed.
+    // A four-byte Annex-B start code reads as a length of 1, so call it out
+    // explicitly — such samples need an Annex-B description (movenc converts
+    // them only when the track extradata is start-code formatted), not hvc1.
     if nal_len < 2 {
-      return Err("malformed HEVC sample: NAL shorter than the 2-byte header".to_string());
+      let annexb_start_code = data.len() - offset >= 4 && data[offset..offset + 4] == [0, 0, 0, 1];
+      return Err(if annexb_start_code {
+        "sample looks like Annex-B (start code) but the track description is an hvcC; \
+         mux Annex-B samples with an Annex-B description or convert them to length-prefixed NALs"
+          .to_string()
+      } else {
+        "malformed HEVC sample: NAL shorter than the 2-byte header".to_string()
+      });
     }
     if data.len() - nal_start < nal_len {
       return Err("malformed HEVC sample: NAL overruns end of sample".to_string());

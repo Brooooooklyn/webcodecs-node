@@ -124,6 +124,18 @@ pub struct Mp4MuxerOptions {
 // Track Configuration Types
 // ============================================================================
 
+/// HEVC sample-entry override for the MP4 muxer
+#[napi(string_enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HevcSampleEntryJs {
+  /// Force the 'hvc1' sample entry; requires a qualifying hvcC description
+  #[napi(value = "hvc1")]
+  Hvc1,
+  /// Force the 'hev1' sample entry; permits in-band parameter sets
+  #[napi(value = "hev1")]
+  Hev1,
+}
+
 /// Video track configuration for MP4 muxer
 #[napi(object)]
 pub struct Mp4VideoTrackConfig {
@@ -137,12 +149,11 @@ pub struct Mp4VideoTrackConfig {
   pub framerate: Option<f64>,
   /// Codec-specific description data (avcC/hvcC/av1C from encoder metadata)
   pub description: Option<Uint8Array>,
-  /// HEVC sample-entry override: "hvc1" or "hev1". Default picks "hvc1" when
-  /// the hvcC description is well-formed, single-layer, and complete;
-  /// "hev1" permits in-band parameter sets (e.g. remuxing hev1 streams with
-  /// parameter-set updates); "hvc1" forces the tag and requires a qualifying
-  /// description.
-  pub sample_entry: Option<String>,
+  /// HEVC sample-entry override. Default picks "hvc1" when the hvcC
+  /// description is well-formed, single-layer, and complete; "hev1" permits
+  /// in-band parameter sets (e.g. remuxing hev1 streams with parameter-set
+  /// updates); "hvc1" forces the tag and requires a qualifying description.
+  pub sample_entry: Option<HevcSampleEntryJs>,
 }
 
 /// Audio track configuration for MP4 muxer
@@ -239,16 +250,10 @@ impl Mp4Muxer {
       ));
     }
 
-    let hevc_sample_entry = match config.sample_entry.as_deref() {
+    let hevc_sample_entry = match config.sample_entry {
       None => HevcSampleEntry::Auto,
-      Some("hev1") => HevcSampleEntry::Hev1,
-      Some("hvc1") => HevcSampleEntry::Hvc1,
-      Some(other) => {
-        return Err(Error::new(
-          Status::GenericFailure,
-          format!("sampleEntry must be 'hvc1' or 'hev1', got '{}'", other),
-        ));
-      }
+      Some(HevcSampleEntryJs::Hev1) => HevcSampleEntry::Hev1,
+      Some(HevcSampleEntryJs::Hvc1) => HevcSampleEntry::Hvc1,
     };
     if hevc_sample_entry != HevcSampleEntry::Auto && codec_id != AVCodecID::Hevc {
       return Err(Error::new(

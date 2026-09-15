@@ -879,6 +879,7 @@ module.exports.getHardwareAccelerators = nativeBinding.getHardwareAccelerators
 module.exports.getPreferredHardwareAccelerator = nativeBinding.getPreferredHardwareAccelerator
 module.exports.HardwareAcceleration = nativeBinding.HardwareAcceleration
 module.exports.HevcBitstreamFormat = nativeBinding.HevcBitstreamFormat
+module.exports.HevcSampleEntryJs = nativeBinding.HevcSampleEntryJs
 module.exports.isHardwareAcceleratorAvailable = nativeBinding.isHardwareAcceleratorAvailable
 module.exports.LatencyMode = nativeBinding.LatencyMode
 module.exports.OpusApplication = nativeBinding.OpusApplication

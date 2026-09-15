@@ -897,16 +897,16 @@ test('Mp4Muxer: rejects malformed HEVC samples under hvc1', async (t) => {
   const zeroNal = new Uint8Array(4 + data.length)
   zeroNal.set(data, 4)
 
-  // A one-byte NAL: shorter than the mandatory two-byte NAL header
-  const oneByteNal = new Uint8Array(4 + 1 + data.length)
-  new DataView(oneByteNal.buffer).setUint32(0, 1)
-  oneByteNal[4] = 0x28 // slice NAL type, incomplete header
-  oneByteNal.set(data, 5)
+  // Annex-B input under an hvcC track: the four-byte start code reads as a
+  // NAL length of 1 and gets a targeted error instead of the generic one
+  const annexb = new Uint8Array(4 + data.length)
+  annexb.set([0, 0, 0, 1])
+  annexb.set(data, 4)
 
-  for (const [name, bad] of [
-    ['trailing byte', trailing],
-    ['zero-length NAL', zeroNal],
-    ['one-byte NAL', oneByteNal],
+  for (const [name, bad, expected] of [
+    ['trailing byte', trailing, /malformed HEVC sample/],
+    ['zero-length NAL', zeroNal, /malformed HEVC sample/],
+    ['Annex-B start code', annexb, /Annex-B/],
   ] as const) {
     const muxer = new Mp4Muxer()
     muxer.addVideoTrack({ codec: 'hev1.1.6.L93.B0', width: 128, height: 128, framerate: 30, description })
@@ -915,7 +915,7 @@ test('Mp4Muxer: rejects malformed HEVC samples under hvc1', async (t) => {
       { instanceOf: Error },
       name,
     )
-    t.regex(err?.message ?? '', /malformed HEVC sample/, name)
+    t.regex(err?.message ?? '', expected, name)
     muxer.close()
   }
 })
@@ -1388,9 +1388,10 @@ test('Mp4Muxer: sampleEntry override validation', async (t) => {
           codec: 'hev1.1.6.L93.B0',
           width: 128,
           height: 128,
+          // @ts-expect-error runtime guard for the TS-rejected literal
           sampleEntry: 'avc1',
         }),
-      { instanceOf: Error, message: /must be 'hvc1' or 'hev1'/ },
+      { instanceOf: Error },
     )
     t.throws(
       () =>
@@ -1404,6 +1405,7 @@ test('Mp4Muxer: sampleEntry override validation', async (t) => {
     )
     muxer.close()
   }
+
 })
 
 test('Mp4Muxer: keeps hev1 and preserves in-band parameter sets when hvcC is incomplete', async (t) => {
