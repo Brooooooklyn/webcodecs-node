@@ -527,16 +527,6 @@ impl<F: MuxerFormat> MuxerInner<F> {
       .video_stream_index()
       .ok_or_else(|| Error::new(Status::GenericFailure, "No video track added"))?;
 
-    // Write header if needed
-    self.ensure_header_written()?;
-
-    if self.state != MuxerState::Muxing {
-      return Err(Error::new(
-        Status::GenericFailure,
-        "Muxer is not in muxing state",
-      ));
-    }
-
     // Get chunk data and metadata
     let chunk_type = chunk.chunk_type()?;
     let timestamp = chunk.timestamp()?;
@@ -552,9 +542,11 @@ impl<F: MuxerFormat> MuxerInner<F> {
     let mut packet = chunk.get_packet_for_muxing()?;
 
     // 'hvc1' forbids in-band VPS/SPS/PPS; drop the ones already carried by the
-    // hvcC. Done before any packet metadata is set so the swap is a plain data
-    // replace. Malformed samples and in-band parameter-set updates (which
-    // 'hvc1' cannot represent) are rejected.
+    // hvcC. Done before the header is written below so a rejected chunk leaves
+    // the muxer in the configuring state (tracks can still be added, streaming
+    // output stays empty). Also a plain data replace: no packet metadata is
+    // set yet. Malformed samples, in-band parameter-set updates, and mid-stream
+    // description changes (which 'hvc1' cannot represent) are rejected here.
     if let Some(hvc1) = &self.strip_hevc_ps {
       // A packet carrying a new description (AV_PKT_DATA_NEW_EXTRADATA) means
       // the stream's parameter sets changed mid-stream. The stripping context
@@ -602,6 +594,17 @@ impl<F: MuxerFormat> MuxerInner<F> {
         stripped_packet.set_flags(packet.flags());
         packet = stripped_packet;
       }
+    }
+
+    // Write header if needed — only after validation above, so a rejected
+    // chunk does not commit the header or flip the state out of configuring
+    self.ensure_header_written()?;
+
+    if self.state != MuxerState::Muxing {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "Muxer is not in muxing state",
+      ));
     }
 
     // Set packet properties

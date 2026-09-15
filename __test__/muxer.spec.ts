@@ -1086,6 +1086,28 @@ test('Mp4Muxer: rejects metadata description changes under hvc1', async (t) => {
   const mvhd = text.indexOf('mvhd')
   const durationMs = (view.getUint32(mvhd + 20) / view.getUint32(mvhd + 16)) * 1000
   t.true(durationMs > 50 && durationMs < 150, `output should stay 3 frames (~100ms), got ${durationMs}ms`)
+
+  // A rejected FIRST chunk must not commit the header: the muxer stays in
+  // the configuring state, streaming output stays empty, and tracks can
+  // still be added.
+  const streaming = new Mp4Muxer({ fragmented: true, streaming: { bufferCapacity: 64 * 1024 } })
+  streaming.addVideoTrack({
+    codec: 'hev1.1.6.L93.B0',
+    width: 128,
+    height: 128,
+    framerate: 30,
+    description,
+  })
+  t.throws(
+    () => streaming.addVideoChunk(small.chunks[0], small.metadatas[0]),
+    { instanceOf: Error },
+  )
+  t.is(streaming.state, 'configuring', 'rejected first chunk must leave the muxer configuring')
+  t.falsy(streaming.read(), 'no header bytes may be emitted before a chunk is accepted')
+  t.notThrows(() => {
+    streaming.addAudioTrack({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2 })
+  }, 'tracks must still be addable after a rejected first chunk')
+  streaming.close()
 })
 
 test('Mp4Muxer: keeps hev1 and preserves in-band parameter sets when hvcC is incomplete', async (t) => {
