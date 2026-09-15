@@ -77,14 +77,11 @@ test('VideoEncoder: encode frame with orientation', async (t) => {
 // ============================================================================
 // Different Orientation Tests (Non-Fatal Failures)
 // WPT: "Encode video frames with different orientation has non-fatal failures"
-// NOTE: Current implementation does not validate orientation consistency per W3C spec.
-//       This test documents the expected behavior but uses skip for unimplemented features.
 // ============================================================================
 
-test.skip('VideoEncoder: different orientations throw DataError', async (t) => {
+test('VideoEncoder: different orientations throw DataError', async (t) => {
   // WPT expects that encoding frames with different orientations in the same
-  // encode session throws DataError. Current implementation does not enforce this.
-  // TODO: Implement orientation consistency validation per W3C spec.
+  // encode session throws DataError (non-fatal failure).
 
   const { init, outputs } = createCollectingCodecInit<EncodedVideoChunk>()
   let decoderConfig: Record<string, unknown> | null = null
