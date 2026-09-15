@@ -6,8 +6,8 @@
 use crate::codec::Packet;
 use crate::codec::io_buffer::StreamingBufferHandle;
 use crate::codec::muxer::{
-  AudioStreamConfig, ContainerFormat, Hvc1Context, MuxerContext, MuxerOptions, MuxerOutput,
-  VideoStreamConfig,
+  AudioStreamConfig, ContainerFormat, HevcSampleEntry, Hvc1Context, MuxerContext, MuxerOptions,
+  MuxerOutput, VideoStreamConfig,
 };
 use crate::ffi::{AVCodecID, AVPixelFormat, AVRational, AVSampleFormat};
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunk;
@@ -198,6 +198,8 @@ pub struct GenericVideoTrackConfig {
   pub extradata: Option<Vec<u8>>,
   /// Whether this track has alpha channel (VP9 alpha support)
   pub has_alpha: bool,
+  /// HEVC sample-entry override (MP4 only; ignored for other containers/codecs)
+  pub hevc_sample_entry: HevcSampleEntry,
 }
 
 /// Generic audio track configuration passed to base implementation
@@ -417,6 +419,7 @@ impl<F: MuxerFormat> MuxerInner<F> {
       time_base,
       bitrate: None,
       extradata: config.extradata,
+      hevc_sample_entry: config.hevc_sample_entry,
     };
 
     self.muxer.add_video_stream(&stream_config).map_err(|e| {

@@ -62,6 +62,21 @@ pub enum MuxerOutput {
   Streaming(usize),
 }
 
+/// HEVC sample-entry override for MP4 muxing
+///
+/// Selects the fourcc written into the MP4 sample description for an HEVC
+/// track. The default, `Auto`, picks 'hvc1' when the hvcC record is
+/// well-formed, single-layer, and complete; `Hev1` keeps 'hev1' so streams
+/// that legally carry in-band parameter-set additions remux without
+/// rejection; `Hvc1` forces 'hvc1' and requires a qualifying description.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HevcSampleEntry {
+  #[default]
+  Auto,
+  Hev1,
+  Hvc1,
+}
+
 /// Video stream configuration
 #[derive(Debug, Clone)]
 pub struct VideoStreamConfig {
@@ -79,6 +94,8 @@ pub struct VideoStreamConfig {
   pub bitrate: Option<u64>,
   /// Codec extradata (avcC, hvcC, av1C, etc.)
   pub extradata: Option<Vec<u8>>,
+  /// HEVC sample-entry override (MP4 only; ignored for other codecs)
+  pub hevc_sample_entry: HevcSampleEntry,
 }
 
 /// Audio stream configuration
@@ -267,23 +284,39 @@ impl MuxerContext {
       // in the sample description (hvcC) instead of the bitstream. FFmpeg only
       // emits 'hvc1' when the codec tag is set explicitly (its default is
       // 'hev1'); with the tag set, movenc also marks hvcC arrays complete, per
-      // ISO/IEC 14496-15. Only select 'hvc1' when the hvcC record is
+      // ISO/IEC 14496-15. 'Auto' selects 'hvc1' when the hvcC record is
       // well-formed, single-layer, within movenc's parameter-set count limits,
       // and carries a complete set of VPS/SPS/PPS — otherwise keep 'hev1',
-      // which permits in-band parameter sets. The caller strips in-band sets
-      // that duplicate the hvcC using the returned context.
+      // which permits in-band parameter sets. Input completeness bits are not
+      // consulted: x265/FFmpeg emitters write array_completeness=0 while never
+      // sending in-band sets, so the bit does not predict them (and movenc
+      // itself ignores it when declaring output arrays complete). The caller
+      // strips in-band sets that duplicate the hvcC using the returned
+      // context; streams with in-band additions are rejected loudly, and
+      // callers who need to remux such streams can force 'hev1'.
       if self.format == ContainerFormat::Mp4 && config.codec_id == AVCodecID::Hevc {
-        self.hvc1 = config.extradata.as_deref().and_then(|extradata| {
-          parse_hvcc_parameter_sets_complete(extradata).map(|(nal_len_size, parameter_sets)| {
-            Hvc1Context {
-              nal_len_size,
-              parameter_sets,
-              extradata: extradata.to_vec(),
-            }
-          })
-        });
-        if self.hvc1.is_some() {
-          ffcodecpar_set_codec_tag(codecpar, u32::from_le_bytes(*b"hvc1"));
+        if config.hevc_sample_entry == HevcSampleEntry::Hev1 {
+          // Explicit 'hev1': permit in-band parameter sets, no stripping
+          self.hvc1 = None;
+        } else {
+          self.hvc1 = config.extradata.as_deref().and_then(|extradata| {
+            parse_hvcc_parameter_sets_complete(extradata).map(|(nal_len_size, parameter_sets)| {
+              Hvc1Context {
+                nal_len_size,
+                parameter_sets,
+                extradata: extradata.to_vec(),
+              }
+            })
+          });
+          if config.hevc_sample_entry == HevcSampleEntry::Hvc1 && self.hvc1.is_none() {
+            return Err(CodecError::InvalidConfig(
+              "hvc1 sample entry requested but the description is not a well-formed, complete, single-layer hvcC"
+                .to_string(),
+            ));
+          }
+          if self.hvc1.is_some() {
+            ffcodecpar_set_codec_tag(codecpar, u32::from_le_bytes(*b"hvc1"));
+          }
         }
       }
 
@@ -918,6 +951,54 @@ mod tests {
       parse_hvcc_parameter_sets_complete(&multi).is_none(),
       "multi-layer hvcC must keep hev1: movenc would drop the nonzero-layer arrays"
     );
+  }
+
+  fn hevc_stream_config(extradata: Vec<u8>, sample_entry: HevcSampleEntry) -> VideoStreamConfig {
+    VideoStreamConfig {
+      codec_id: crate::ffi::AVCodecID::Hevc,
+      width: 64,
+      height: 64,
+      pixel_format: crate::ffi::AVPixelFormat::Yuv420p,
+      time_base: AVRational::new(1, 15360),
+      bitrate: None,
+      extradata: Some(extradata),
+      hevc_sample_entry: sample_entry,
+    }
+  }
+
+  #[test]
+  fn hevc_sample_entry_override() {
+    let hvcc = build_hvcc(
+      1,
+      &[(32, vec![vps()]), (33, vec![sps()]), (34, vec![pps()])],
+    );
+
+    // Forced 'hev1' keeps the default tag even for a qualifying description
+    let mut muxer = MuxerContext::new(ContainerFormat::Mp4, MuxerOutput::Buffer).unwrap();
+    muxer
+      .add_video_stream(&hevc_stream_config(hvcc.clone(), HevcSampleEntry::Hev1))
+      .unwrap();
+    assert!(muxer.hvc1_context().is_none());
+
+    // Forced 'hvc1' selects the tag for a qualifying description
+    let mut muxer = MuxerContext::new(ContainerFormat::Mp4, MuxerOutput::Buffer).unwrap();
+    muxer
+      .add_video_stream(&hevc_stream_config(hvcc.clone(), HevcSampleEntry::Hvc1))
+      .unwrap();
+    assert!(muxer.hvc1_context().is_some());
+
+    // Forced 'hvc1' with an incomplete description is an error, not a fallback
+    let incomplete = build_hvcc(1, &[(32, vec![vps()]), (33, vec![sps()])]);
+    let mut muxer = MuxerContext::new(ContainerFormat::Mp4, MuxerOutput::Buffer).unwrap();
+    let err = muxer.add_video_stream(&hevc_stream_config(incomplete, HevcSampleEntry::Hvc1));
+    assert!(err.is_err());
+
+    // 'Auto' still selects from content
+    let mut muxer = MuxerContext::new(ContainerFormat::Mp4, MuxerOutput::Buffer).unwrap();
+    muxer
+      .add_video_stream(&hevc_stream_config(hvcc, HevcSampleEntry::Auto))
+      .unwrap();
+    assert!(muxer.hvc1_context().is_some());
   }
 
   #[test]

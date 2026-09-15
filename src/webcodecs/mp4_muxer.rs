@@ -3,7 +3,7 @@
 //! Provides a JavaScript-friendly API for muxing encoded video and audio
 //! chunks into MP4 container format.
 
-use crate::codec::muxer::{ContainerFormat, MuxerOptions};
+use crate::codec::muxer::{ContainerFormat, HevcSampleEntry, MuxerOptions};
 use crate::ffi::AVCodecID;
 use crate::webcodecs::codec_string::parse_codec_string;
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunk;
@@ -137,6 +137,12 @@ pub struct Mp4VideoTrackConfig {
   pub framerate: Option<f64>,
   /// Codec-specific description data (avcC/hvcC/av1C from encoder metadata)
   pub description: Option<Uint8Array>,
+  /// HEVC sample-entry override: "hvc1" or "hev1". Default picks "hvc1" when
+  /// the hvcC description is well-formed, single-layer, and complete;
+  /// "hev1" permits in-band parameter sets (e.g. remuxing hev1 streams with
+  /// parameter-set updates); "hvc1" forces the tag and requires a qualifying
+  /// description.
+  pub sample_entry: Option<String>,
 }
 
 /// Audio track configuration for MP4 muxer
@@ -233,6 +239,24 @@ impl Mp4Muxer {
       ));
     }
 
+    let hevc_sample_entry = match config.sample_entry.as_deref() {
+      None => HevcSampleEntry::Auto,
+      Some("hev1") => HevcSampleEntry::Hev1,
+      Some("hvc1") => HevcSampleEntry::Hvc1,
+      Some(other) => {
+        return Err(Error::new(
+          Status::GenericFailure,
+          format!("sampleEntry must be 'hvc1' or 'hev1', got '{}'", other),
+        ));
+      }
+    };
+    if hevc_sample_entry != HevcSampleEntry::Auto && codec_id != AVCodecID::Hevc {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "sampleEntry is only supported for HEVC video tracks",
+      ));
+    }
+
     let generic_config = GenericVideoTrackConfig {
       codec: config.codec,
       codec_id,
@@ -241,6 +265,7 @@ impl Mp4Muxer {
       framerate: config.framerate.unwrap_or(30.0),
       extradata: config.description.as_ref().map(|d| d.to_vec()),
       has_alpha: false, // TODO: Add alpha support for MKV if needed
+      hevc_sample_entry,
     };
 
     inner.add_video_track(generic_config)

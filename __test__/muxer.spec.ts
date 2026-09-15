@@ -1241,6 +1241,145 @@ test('Mp4Muxer: rejects metadata description changes under hvc1', async (t) => {
   streaming.close()
 })
 
+test('Mp4Muxer: sampleEntry hev1 permits in-band parameter set updates (remux use case)', async (t) => {
+  // The auto hvc1 gate rejects streams with in-band parameter-set updates
+  // (unrepresentable under 'hvc1'); an explicit 'hev1' override keeps such
+  // streams muxable, e.g. remuxing an hev1 file whose later samples carry
+  // parameter sets not present in the description.
+  const big = await encodeHevcChunks(128, 128, 3)
+  const small = await encodeHevcChunks(64, 64, 3)
+  const bigDescription = big.metadatas[0]?.decoderConfig?.description
+  const smallDescription = small.metadatas[0]?.decoderConfig?.description
+  t.truthy(bigDescription)
+  t.truthy(smallDescription)
+  if (!bigDescription || !smallDescription) return
+
+  const inBandChunks = prependParameterSets(small.chunks, new Uint8Array(smallDescription))
+
+  const muxer = new Mp4Muxer()
+  muxer.addVideoTrack({
+    codec: 'hev1.1.6.L93.B0',
+    width: 64,
+    height: 64,
+    framerate: 30,
+    description: bigDescription,
+    sampleEntry: 'hev1',
+  })
+  t.notThrows(() => {
+    for (const chunk of inBandChunks) muxer.addVideoChunk(chunk)
+  }, 'in-band parameter set updates must mux under forced hev1')
+  muxer.flush()
+  const mp4Data = muxer.finalize()
+  muxer.close()
+
+  t.is(getMp4VideoSampleEntryTag(mp4Data), 'hev1', 'forced hev1 must keep the hev1 tag')
+
+  // The update survives: all three 64x64 frames decode
+  const demuxedChunks: EncodedVideoChunk[] = []
+  const demuxer = new Mp4Demuxer({
+    videoOutput: (chunk) => demuxedChunks.push(chunk),
+    error: (e) => t.fail(`Demuxer error: ${e.message}`),
+  })
+  await demuxer.loadBuffer(mp4Data)
+  const config = demuxer.videoDecoderConfig
+  t.truthy(config)
+  if (!config) {
+    demuxer.close()
+    return
+  }
+  await demuxer.demuxAsync()
+  demuxer.close()
+
+  const decodedFrames: VideoFrame[] = []
+  const decoder = new VideoDecoder({
+    output: (frame) => decodedFrames.push(frame),
+    error: (e) => t.fail(`Decoder error: ${e.message}`),
+  })
+  decoder.configure({
+    codec: config.codec,
+    codedWidth: config.codedWidth,
+    codedHeight: config.codedHeight,
+    description: config.description,
+  })
+  for (const chunk of demuxedChunks) decoder.decode(chunk)
+  await decoder.flush()
+  decoder.close()
+
+  t.is(decodedFrames.length, 3, 'all updated frames decode under hev1')
+  t.is(decodedFrames[0]?.codedWidth, 64, 'the in-band update takes effect')
+  for (const frame of decodedFrames) frame.close()
+})
+
+test('Mp4Muxer: sampleEntry override validation', async (t) => {
+  const { chunks, metadatas } = await encodeHevcChunks(128, 128, 3)
+  const description = metadatas[0]?.decoderConfig?.description
+  t.truthy(description)
+  if (!description) return
+  const hvcc = new Uint8Array(description)
+
+  // Forced 'hvc1' with a qualifying description selects hvc1 like Auto
+  {
+    const muxer = new Mp4Muxer()
+    muxer.addVideoTrack({
+      codec: 'hev1.1.6.L93.B0',
+      width: 128,
+      height: 128,
+      framerate: 30,
+      description,
+      sampleEntry: 'hvc1',
+    })
+    for (const chunk of chunks) muxer.addVideoChunk(chunk)
+    muxer.flush()
+    const mp4Data = muxer.finalize()
+    muxer.close()
+    t.is(getMp4VideoSampleEntryTag(mp4Data), 'hvc1', "forced 'hvc1' selects hvc1")
+  }
+
+  // Forced 'hvc1' with an incomplete description is an error, not a fallback
+  {
+    const muxer = new Mp4Muxer()
+    t.throws(
+      () =>
+        muxer.addVideoTrack({
+          codec: 'hev1.1.6.L93.B0',
+          width: 128,
+          height: 128,
+          framerate: 30,
+          description: hvccWithoutPps(hvcc),
+          sampleEntry: 'hvc1',
+        }),
+      { instanceOf: Error, message: /hvc1 sample entry requested/ },
+    )
+    muxer.close()
+  }
+
+  // Unknown values and non-HEVC tracks are rejected
+  {
+    const muxer = new Mp4Muxer()
+    t.throws(
+      () =>
+        muxer.addVideoTrack({
+          codec: 'hev1.1.6.L93.B0',
+          width: 128,
+          height: 128,
+          sampleEntry: 'avc1',
+        }),
+      { instanceOf: Error, message: /must be 'hvc1' or 'hev1'/ },
+    )
+    t.throws(
+      () =>
+        muxer.addVideoTrack({
+          codec: 'avc1.42001E',
+          width: 128,
+          height: 128,
+          sampleEntry: 'hev1',
+        }),
+      { instanceOf: Error, message: /only supported for HEVC/ },
+    )
+    muxer.close()
+  }
+})
+
 test('Mp4Muxer: keeps hev1 and preserves in-band parameter sets when hvcC is incomplete', async (t) => {
   const { chunks, metadatas } = await encodeHevcChunks(128, 128, 3)
   const description = metadatas[0]?.decoderConfig?.description

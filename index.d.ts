@@ -1594,6 +1594,14 @@ export interface Mp4VideoTrackConfig {
   framerate?: number
   /** Codec-specific description data (avcC/hvcC/av1C from encoder metadata) */
   description?: Uint8Array
+  /**
+   * HEVC sample-entry override: "hvc1" or "hev1". Default picks "hvc1" when
+   * the hvcC description is well-formed, single-layer, and complete;
+   * "hev1" permits in-band parameter sets (e.g. remuxing hev1 streams with
+   * parameter-set updates); "hvc1" forces the tag and requires a qualifying
+   * description.
+   */
+  sampleEntry?: string
 }
 
 /** Opus application mode (W3C WebCodecs Opus Registration) */
