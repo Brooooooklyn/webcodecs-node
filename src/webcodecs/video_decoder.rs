@@ -2544,15 +2544,55 @@ fn vp9_visibility(data: &[u8]) -> Option<(bool, bool)> {
   Some((false, show_frame))
 }
 
-/// True for VP9 chunks that are decoded into the reference buffer without
-/// being shown (show_frame=0). Only VP9 is parsed: its visibility flags sit
-/// in the first byte, and its decoder (vp9.c) is the one re-emitting stored
-/// references with inherited metadata.
+/// VP9 superframe constituent ranges, per the vp9_superframe_split layout:
+/// the packet ends with [marker][LE frame sizes][marker]; the marker holds
+/// 0b110 in bits 7-5, (length_size-1) in bits 4-3 and (nb_frames-1) in
+/// bits 2-0. None when the packet is not a well-formed superframe.
+fn vp9_superframe_constituents(data: &[u8]) -> Option<Vec<(usize, usize)>> {
+  let &marker = data.last()?;
+  if marker & 0xe0 != 0xc0 {
+    return None;
+  }
+  let length_size = 1 + ((marker as usize >> 3) & 0x3);
+  let nb_frames = 1 + (marker as usize & 0x7);
+  let idx_size = 2 + nb_frames * length_size;
+  if data.len() < idx_size || data[data.len() - idx_size] != marker {
+    return None;
+  }
+  let sizes_start = data.len() - idx_size + 1;
+  let mut ranges = Vec::with_capacity(nb_frames);
+  let mut offset = 0usize;
+  for i in 0..nb_frames {
+    let at = sizes_start + i * length_size;
+    let mut size = 0usize;
+    for (j, b) in data[at..at + length_size].iter().enumerate() {
+      size |= (*b as usize) << (j * 8);
+    }
+    let end = offset.checked_add(size)?;
+    if size == 0 || end > data.len() - idx_size {
+      return None;
+    }
+    ranges.push((offset, end));
+    offset = end;
+  }
+  Some(ranges)
+}
+
+/// True for VP9 chunks that produce no display event of their own: every
+/// constituent frame is stored into the reference buffer without being
+/// shown (show_frame=0). Only VP9 is parsed: its visibility flags sit in
+/// the first byte of each frame, and its decoder (vp9.c) is the one
+/// re-emitting stored references with inherited metadata.
 fn is_invisible_vp9_chunk(codec: &str, data: &[u8]) -> bool {
   if codec != "vp9" && !codec.starts_with("vp09") {
     return false;
   }
-  matches!(vp9_visibility(data), Some((false, false)))
+  match vp9_superframe_constituents(data) {
+    Some(ranges) => ranges
+      .iter()
+      .all(|&(start, end)| matches!(vp9_visibility(&data[start..end]), Some((false, false)))),
+    None => matches!(vp9_visibility(data), Some((false, false))),
+  }
 }
 
 fn decode_chunk_data(

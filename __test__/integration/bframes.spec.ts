@@ -372,6 +372,31 @@ function showExistingPacket(refIndex = 0): Uint8Array {
   return new Uint8Array([0x88 | (refIndex & 0x7)])
 }
 
+/**
+ * VP9 superframe: constituent frames followed by the index —
+ * marker, little-endian sizes, marker again. The marker byte holds 0b110
+ * in bits 7-5, (length_size-1) in bits 4-3 and (nb_frames-1) in bits 2-0.
+ */
+function makeSuperframe(...parts: Uint8Array[]): Uint8Array {
+  const sizeBytes = 2
+  const marker = 0xc0 | ((sizeBytes - 1) << 3) | (parts.length - 1)
+  const total = parts.reduce((a, p) => a + p.length, 0)
+  const out = new Uint8Array(total + 2 + parts.length * sizeBytes)
+  let off = 0
+  for (const p of parts) {
+    out.set(p, off)
+    off += p.length
+  }
+  out[off++] = marker
+  for (const p of parts) {
+    for (let j = 0; j < sizeBytes; j++) {
+      out[off++] = (p.length >> (j * 8)) & 0xff
+    }
+  }
+  out[off] = marker
+  return out
+}
+
 interface ChunkSpec {
   type: 'key' | 'delta'
   timestamp: number
@@ -508,6 +533,36 @@ test('decoder ignores invisible-reference entries when a later frame occupies th
     { ts: 100, duration: 222 },
     { ts: 200, duration: 0 },
   ])
+})
+
+// Superframes: libvpx packs invisible frames before a visible frame (or a
+// show_existing repeat) in one chunk. The chunk's metadata must be kept as
+// long as any constituent produces a display event.
+const DURATION_VARIANTS = [777, 0, undefined] as const
+
+test('decoder keeps metadata for superframes packing an invisible frame before a visible frame', async (t) => {
+  const keyframe = await encodeSingleVp9Keyframe(t)
+  const invisible = invisibleVariant(keyframe)
+
+  for (const duration of DURATION_VARIANTS) {
+    const { frames, errors } = await decodeChunkSpecs([
+      { type: 'key', timestamp: 500, ...(duration !== undefined ? { duration } : {}), data: makeSuperframe(invisible, keyframe) },
+    ])
+    await assertRepeatedFrames(t, frames, errors, [{ ts: 500, duration }])
+  }
+})
+
+test('decoder keeps metadata for superframes packing an invisible frame before a show_existing repeat', async (t) => {
+  const keyframe = await encodeSingleVp9Keyframe(t)
+  const invisible = invisibleVariant(keyframe)
+  const showExisting = showExistingPacket()
+
+  for (const duration of DURATION_VARIANTS) {
+    const { frames, errors } = await decodeChunkSpecs([
+      { type: 'key', timestamp: 600, ...(duration !== undefined ? { duration } : {}), data: makeSuperframe(invisible, showExisting) },
+    ])
+    await assertRepeatedFrames(t, frames, errors, [{ ts: 600, duration }])
+  }
 })
 
 // VideoToolbox B-frame attribution (macOS only)
