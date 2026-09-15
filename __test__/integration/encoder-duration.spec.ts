@@ -58,7 +58,7 @@ interface EncodeResult {
 
 async function encodeFrames(
   config: VideoEncoderConfig,
-  withDurations: number[] | null,
+  withDurations: (number | undefined)[] | null,
   timestamps: number[] = TIMESTAMPS,
 ): Promise<EncodeResult> {
   const chunks: EncodedVideoChunk[] = []
@@ -124,6 +124,28 @@ test('HEVC B-frame reordering keeps duration paired with its own frame', async (
   t.false(monotonic, 'B-frame reordering should emit chunks out of presentation order')
 
   assertDurationsMatchInputs(t, chunks, errors)
+})
+
+// Frames 3 and 4 share one timestamp with durations 11111 and none. Under
+// B-frame reorder the pair can be emitted in either order, so the PTS-keyed
+// map cannot pair durations FIFO; backfill is withheld for the ambiguous
+// key and each chunk keeps only its encoder-propagated duration. Asserting
+// the {11111, null} multiset makes the check immune to the emission order.
+test('duplicate-timestamp frames do not trade durations under B-frame reorder', async (t) => {
+  const dupTs = TIMESTAMPS[3]
+  const timestamps = TIMESTAMPS.map((ts, i) => (i === 4 ? dupTs : ts))
+  const durations = FRAME_DURATIONS.map((d, i) => (i === 3 ? 11111 : i === 4 ? undefined : d))
+
+  const { chunks, errors } = await encodeFrames(makeConfig('hev1.1.6.L93.B0'), durations, timestamps)
+  t.is(errors.length, 0, `No encoder errors, got: ${errors.map((e) => e.message).join(', ')}`)
+
+  const dupChunks = chunks.filter((c) => c.timestamp === dupTs)
+  t.is(dupChunks.length, 2, 'Both duplicate-timestamp frames emitted')
+  t.deepEqual(
+    dupChunks.map((c) => c.duration ?? -1).sort((a, b) => a - b),
+    [-1, 11111],
+    'Duplicate pair keeps {null, 11111}: neither frame inherits the other’s duration',
+  )
 })
 
 test('frames without duration produce chunks with null duration', async (t) => {

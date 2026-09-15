@@ -208,6 +208,19 @@ type PendingFrame = (
   bool,
 );
 
+/// Pending input metadata for one PTS key. Multiple entries per key tolerate
+/// genuinely duplicate input timestamps (SVC/field pictures).
+#[derive(Default)]
+struct TimestampQueue {
+  /// FIFO of (input timestamp µs, input duration µs)
+  entries: VecDeque<(i64, Option<i64>)>,
+  /// Set when entries with differing durations share the key. B-frame
+  /// reordering can emit the pair in either order, so FIFO can no longer
+  /// pair a duration with its own frame and backfill must stay off.
+  /// Timestamps are unaffected: every entry under the key shares its PTS.
+  duration_ambiguous: bool,
+}
+
 /// Commands sent to the worker thread
 enum EncoderCommand {
   /// Encode a video frame
@@ -383,7 +396,7 @@ struct VideoEncoderInner {
   /// misattributes timestamps; keying by packet PTS keeps each label on its
   /// own frame. The duration is used for packets whose encoder left
   /// pkt->duration unset (e.g. VideoToolbox).
-  timestamp_map: BTreeMap<i64, VecDeque<(i64, Option<i64>)>>,
+  timestamp_map: BTreeMap<i64, TimestampQueue>,
 
   // ========================================================================
   // Hardware acceleration tracking (for Chromium-aligned fallback behavior)
@@ -2248,37 +2261,48 @@ impl VideoEncoder {
   }
 
   /// Record an input timestamp and duration keyed by the frame's PTS (encoder
-  /// time_base units). Multiple entries per key tolerate time_base rounding
-  /// collisions.
+  /// time_base units). Multiple entries per key tolerate genuinely duplicate
+  /// input timestamps (SVC/field pictures).
   fn push_timestamp(
-    map: &mut BTreeMap<i64, VecDeque<(i64, Option<i64>)>>,
+    map: &mut BTreeMap<i64, TimestampQueue>,
     pts_tb: i64,
     ts_us: i64,
     duration_us: Option<i64>,
   ) {
-    map
-      .entry(pts_tb)
-      .or_default()
-      .push_back((ts_us, duration_us));
+    let queue = map.entry(pts_tb).or_default();
+    if let Some((_, first_duration)) = queue.entries.front()
+      && *first_duration != duration_us
+    {
+      queue.duration_ambiguous = true;
+    }
+    queue.entries.push_back((ts_us, duration_us));
   }
 
   /// Match an output packet's PTS back to the original input timestamp and
   /// duration. Exact hit first; otherwise nearest key within 2 time_base ticks
   /// (covers hardware encoders that slightly shift PTS, e.g. VideoToolbox);
   /// otherwise pop the oldest pending entry (NOPTS packets); otherwise None.
+  /// The returned duration is None for ambiguous keys (duplicate timestamps
+  /// with differing durations): reordering can emit the pair in either order,
+  /// so FIFO cannot pair a duration with its own frame and backfill is
+  /// withheld — only the encoder-propagated duration survives.
   fn match_timestamp(
-    map: &mut BTreeMap<i64, VecDeque<(i64, Option<i64>)>>,
+    map: &mut BTreeMap<i64, TimestampQueue>,
     packet_pts: i64,
   ) -> Option<(i64, Option<i64>)> {
-    fn pop_at(
-      map: &mut BTreeMap<i64, VecDeque<(i64, Option<i64>)>>,
-      key: i64,
-    ) -> Option<(i64, Option<i64>)> {
-      let entry = map.get_mut(&key)?.pop_front();
-      if map.get(&key).is_some_and(|q| q.is_empty()) {
+    fn pop_at(map: &mut BTreeMap<i64, TimestampQueue>, key: i64) -> Option<(i64, Option<i64>)> {
+      let (entry, ambiguous, now_empty) = {
+        let queue = map.get_mut(&key)?;
+        (
+          queue.entries.pop_front(),
+          queue.duration_ambiguous,
+          queue.entries.is_empty(),
+        )
+      };
+      if now_empty {
         map.remove(&key);
       }
-      entry
+      entry.map(|(ts, duration)| (ts, if ambiguous { None } else { duration }))
     }
     if packet_pts == AV_NOPTS_VALUE {
       let oldest = map.keys().next().copied();
@@ -2457,6 +2481,12 @@ impl VideoEncoder {
     inner.silent_encode_count = 0;
     inner.first_output_produced = false;
     inner.extradata_sent = false;
+
+    // Drop entries queued for the abandoned hardware attempt; the replay
+    // loop re-pushes them. Leftover duplicates would linger after the replay
+    // packets consume their first copies, and later same-PTS frames (or
+    // NOPTS packets popping the oldest entry) could consume the stale ones.
+    inner.timestamp_map.clear();
 
     // Disable hardware frame upload - software encoder can't handle GPU frames
     inner.use_hw_frames = false;
