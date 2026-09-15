@@ -565,6 +565,54 @@ test('decoder keeps metadata for superframes packing an invisible frame before a
   }
 })
 
+// Multiple visible constituents in one superframe share the chunk's opaque
+// tag and timestamp; the chunk's metadata must cover every output, not just
+// the first.
+
+test('decoder attributes every visible superframe constituent to the chunk', async (t) => {
+  const keyframe = await encodeSingleVp9Keyframe(t)
+
+  for (const duration of DURATION_VARIANTS) {
+    const { frames, errors } = await decodeChunkSpecs([
+      { type: 'key', timestamp: 500, ...(duration !== undefined ? { duration } : {}), data: makeSuperframe(keyframe, keyframe) },
+    ])
+    await assertRepeatedFrames(t, frames, errors, [
+      { ts: 500, duration },
+      { ts: 500, duration },
+    ])
+  }
+})
+
+test('decoder attributes a visible plus show_existing superframe to the chunk', async (t) => {
+  const keyframe = await encodeSingleVp9Keyframe(t)
+  const showExisting = showExistingPacket()
+
+  for (const duration of DURATION_VARIANTS) {
+    const { frames, errors } = await decodeChunkSpecs([
+      { type: 'key', timestamp: 600, ...(duration !== undefined ? { duration } : {}), data: makeSuperframe(keyframe, showExisting) },
+    ])
+    await assertRepeatedFrames(t, frames, errors, [
+      { ts: 600, duration },
+      { ts: 600, duration },
+    ])
+  }
+})
+
+test('decoder does not let extra superframe outputs steal a following chunk’s metadata', async (t) => {
+  const keyframe = await encodeSingleVp9Keyframe(t)
+
+  const { frames, errors } = await decodeChunkSpecs([
+    { type: 'key', timestamp: 500, duration: 777, data: makeSuperframe(keyframe, keyframe) },
+    { type: 'key', timestamp: 500, duration: 999, data: keyframe },
+  ])
+
+  await assertRepeatedFrames(t, frames, errors, [
+    { ts: 500, duration: 777 },
+    { ts: 500, duration: 777 },
+    { ts: 500, duration: 999 },
+  ])
+})
+
 // VideoToolbox B-frame attribution (macOS only)
 const testOnDarwin = process.platform === 'darwin' ? test : test.skip
 

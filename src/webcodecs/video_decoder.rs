@@ -201,12 +201,34 @@ pub struct VideoDecoderSupport {
 /// while still detecting genuinely failing decoders within ~333ms at 30fps.
 const SILENT_FAILURE_THRESHOLD: u32 = 10;
 
-/// Chunk sequence number -> (timestamp µs, duration) for in-flight chunks.
-/// The sequence number travels through FFmpeg as the packet/frame opaque
-/// pointer, giving exact chunk identity through B-frame reordering, even for
-/// duplicate timestamps. Decoders that do not propagate opaque (VideoToolbox)
-/// fall back to matching by frame PTS.
-type ChunkMetaMap = std::collections::BTreeMap<u64, (i64, Option<i64>)>;
+/// Metadata for one in-flight chunk, keyed by its opaque sequence tag.
+/// The tag travels through FFmpeg as the packet/frame opaque pointer, giving
+/// exact chunk identity through B-frame reordering, even for duplicate
+/// timestamps. Decoders that do not propagate opaque (VideoToolbox) fall
+/// back to matching by frame PTS.
+#[derive(Clone, Copy)]
+struct ChunkMeta {
+  timestamp: i64,
+  duration: Option<i64>,
+  /// Display events the chunk will still produce. VP9 superframes emit one
+  /// output per visible constituent, all carrying the same opaque tag, so
+  /// the entry is consumed only after the last expected output.
+  remaining: u32,
+}
+
+/// Consume one display event from a chunk's entry, removing it once no
+/// further output is expected. Returns the chunk's metadata.
+fn consume_chunk_meta(map: &mut ChunkMetaMap, seq: u64) -> Option<ChunkMeta> {
+  let meta = *map.get(&seq)?;
+  if meta.remaining <= 1 {
+    map.remove(&seq);
+  } else if let Some(entry) = map.get_mut(&seq) {
+    entry.remaining -= 1;
+  }
+  Some(meta)
+}
+
+type ChunkMetaMap = std::collections::BTreeMap<u64, ChunkMeta>;
 
 /// Internal decoder state
 struct VideoDecoderInner {
@@ -557,15 +579,21 @@ impl VideoDecoder {
 
     // Tag the chunk with a sequence number carried through FFmpeg as the
     // packet/frame opaque pointer: exact identity through B-frame reordering,
-    // even for duplicate timestamps. Invisible VP9 frames (show_frame=0)
-    // never produce their own output frame — they are stored as references
-    // and only re-emitted by show_existing_frame packets — so their entry is
-    // skipped: it could otherwise win PTS matching against the real display
-    // chunk.
+    // even for duplicate timestamps. Chunks that produce no display event of
+    // their own (invisible VP9 reference frames) record nothing: their entry
+    // could otherwise win PTS matching against the real display chunk.
     let seq = guard.next_chunk_seq;
     guard.next_chunk_seq += 1;
-    if !is_invisible_vp9_chunk(&guard.codec_string, encoded_chunk.data.as_slice()) {
-      guard.chunk_meta.insert(seq, (timestamp, duration));
+    let remaining = display_event_count(&guard.codec_string, encoded_chunk.data.as_slice());
+    if remaining > 0 {
+      guard.chunk_meta.insert(
+        seq,
+        ChunkMeta {
+          timestamp,
+          duration,
+          remaining,
+        },
+      );
     }
 
     // Buffer chunk during silent failure detection period (for re-decoding on fallback)
@@ -829,8 +857,16 @@ impl VideoDecoder {
       // entry is still pending (hardware produced no frames before fallback).
       let seq = guard.next_chunk_seq;
       guard.next_chunk_seq += 1;
-      if !is_invisible_vp9_chunk(&guard.codec_string, raw_data.as_slice()) {
-        guard.chunk_meta.insert(seq, (timestamp, duration));
+      let remaining = display_event_count(&guard.codec_string, raw_data.as_slice());
+      if remaining > 0 {
+        guard.chunk_meta.insert(
+          seq,
+          ChunkMeta {
+            timestamp,
+            duration,
+            remaining,
+          },
+        );
       }
 
       // Decode with software decoder
@@ -1197,19 +1233,20 @@ impl VideoDecoder {
     // FFmpeg overrides pts/pkt_dts with the display packet's but the frame
     // keeps the reference's inherited opaque and duration (vp9.c
     // show_existing path). Such a frame carries an opaque tag whose chunk
-    // entry is already gone (reference was visible) or whose timestamp
+    // entry is already exhausted (reference was visible) or whose timestamp
     // contradicts the frame PTS (reference was invisible). The inherited
     // frame.duration belongs to the reference chunk and must not be
-    // trusted either.
+    // trusted either. A tag with a live entry is never a re-emission: VP9
+    // superframe constituents share one tag and entry across one output
+    // each (tracked by ChunkMeta::remaining).
     let reemitted = opaque_seq != 0
       && match opaque_meta {
-        Some((ts, _)) => frame_pts != AV_NOPTS_VALUE && ts != frame_pts,
+        Some(meta) => frame_pts != AV_NOPTS_VALUE && meta.timestamp != frame_pts,
         None => true,
       };
 
-    if !reemitted && let Some(meta) = opaque_meta {
-      guard.chunk_meta.remove(&opaque_seq);
-      return meta;
+    if !reemitted && let Some(meta) = consume_chunk_meta(&mut guard.chunk_meta, opaque_seq) {
+      return (meta.timestamp, meta.duration);
     }
     if frame_pts != AV_NOPTS_VALUE {
       // Match the oldest pending chunk carrying this PTS. FFmpeg-propagated
@@ -1220,11 +1257,11 @@ impl VideoDecoder {
       let seq = guard
         .chunk_meta
         .iter()
-        .find(|(_, (ts, _))| *ts == frame_pts)
+        .find(|(_, meta)| meta.timestamp == frame_pts)
         .map(|(seq, _)| *seq);
       let mapped = seq
-        .and_then(|s| guard.chunk_meta.remove(&s))
-        .and_then(|(_, d)| d);
+        .and_then(|s| consume_chunk_meta(&mut guard.chunk_meta, s))
+        .and_then(|meta| meta.duration);
       let dur = if reemitted {
         mapped
       } else if frame.duration() > 0 {
@@ -1235,9 +1272,11 @@ impl VideoDecoder {
       return (frame_pts, dur);
     }
 
-    if let Some((&seq, &meta)) = guard.chunk_meta.first_key_value() {
-      guard.chunk_meta.remove(&seq);
-      return meta;
+    if let Some(&seq) = guard.chunk_meta.keys().next() {
+      let meta = consume_chunk_meta(&mut guard.chunk_meta, seq);
+      if let Some(meta) = meta {
+        return (meta.timestamp, meta.duration);
+      }
     }
     fallback
   }
@@ -2578,20 +2617,26 @@ fn vp9_superframe_constituents(data: &[u8]) -> Option<Vec<(usize, usize)>> {
   Some(ranges)
 }
 
-/// True for VP9 chunks that produce no display event of their own: every
-/// constituent frame is stored into the reference buffer without being
-/// shown (show_frame=0). Only VP9 is parsed: its visibility flags sit in
-/// the first byte of each frame, and its decoder (vp9.c) is the one
-/// re-emitting stored references with inherited metadata.
-fn is_invisible_vp9_chunk(codec: &str, data: &[u8]) -> bool {
+/// Display events a chunk produces. VP9 chunks whose constituents are all
+/// invisible (show_frame=0) produce none: they are stored as references and
+/// only re-emitted by show_existing_frame packets. A VP9 superframe
+/// produces one per visible or show_existing constituent
+/// (vp9_superframe_split emits one packet per constituent, visible ones
+/// carrying the chunk's opaque tag). Everything else produces one. Only VP9
+/// is parsed: its visibility flags sit in the first byte of each frame, and
+/// its decoder (vp9.c) is the one re-emitting stored references with
+/// inherited metadata.
+fn display_event_count(codec: &str, data: &[u8]) -> u32 {
   if codec != "vp9" && !codec.starts_with("vp09") {
-    return false;
+    return 1;
   }
+  let is_display = |frame: &[u8]| !matches!(vp9_visibility(frame), Some((false, false)));
   match vp9_superframe_constituents(data) {
     Some(ranges) => ranges
       .iter()
-      .all(|&(start, end)| matches!(vp9_visibility(&data[start..end]), Some((false, false)))),
-    None => matches!(vp9_visibility(data), Some((false, false))),
+      .filter(|&&(start, end)| is_display(&data[start..end]))
+      .count() as u32,
+    None => u32::from(is_display(data)),
   }
 }
 
