@@ -8,16 +8,19 @@ import test from 'ava'
 
 import {
   Mp4Muxer,
+  Mp4Demuxer,
   WebMMuxer,
   WebMDemuxer,
   MkvMuxer,
   VideoEncoder,
+  VideoDecoder,
   AudioEncoder,
   resetHardwareFallbackState,
   type EncodedVideoChunk,
   type EncodedAudioChunk,
   type EncodedVideoChunkMetadata,
   type EncodedAudioChunkMetadata,
+  type VideoFrame,
 } from '../index.js'
 import { generateSolidColorI420Frame, generateSilence, TestColors } from './helpers/index.js'
 
@@ -187,6 +190,205 @@ test('Mp4Muxer: muxes video chunks and produces valid MP4', async (t) => {
   // Check MP4 magic bytes (ftyp box)
   const ftypOffset = mp4Data.indexOf(0x66) // 'f'
   t.true(ftypOffset >= 0, 'Should have ftyp box')
+})
+
+// ============================================================================
+// Mp4Muxer HEVC Sample Entry Tests (hvc1 preferred over hev1, issue #22)
+// ============================================================================
+
+/**
+ * Walk ISO-BMFF box structure to locate a nested box.
+ * Returns the offset of the box header (size field) or -1 when not found.
+ */
+function findMp4Box(data: Uint8Array, path: string[], start: number, end: number): number {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+  let offset = start
+  while (offset + 8 <= end) {
+    const size = view.getUint32(offset)
+    const type = String.fromCharCode(data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7])
+    const boxEnd = size === 0 ? end : offset + size
+    if (type === path[0]) {
+      if (path.length === 1) return offset
+      const child = findMp4Box(data, path.slice(1), offset + 8, boxEnd)
+      if (child >= 0) return child
+    }
+    if (size === 0) break
+    offset = boxEnd
+  }
+  return -1
+}
+
+/** Read the fourcc of the first video sample entry in moov/trak/mdia/minf/stbl/stsd */
+function getMp4VideoSampleEntryTag(data: Uint8Array): string | null {
+  const stsd = findMp4Box(data, ['moov', 'trak', 'mdia', 'minf', 'stbl', 'stsd'], 0, data.length)
+  if (stsd < 0) return null
+  // stsd payload: 4-byte version/flags + 4-byte entry count, then entries as size+fourcc
+  const entry = stsd + 8 + 4 + 4
+  return String.fromCharCode(data[entry + 4], data[entry + 5], data[entry + 6], data[entry + 7])
+}
+
+/** Encode HEVC frames with the software encoder and return chunks plus per-chunk metadata */
+async function encodeHevcChunks(width: number, height: number, frameCount: number) {
+  const chunks: EncodedVideoChunk[] = []
+  const metadatas: (EncodedVideoChunkMetadata | undefined)[] = []
+  const errors: Error[] = []
+
+  const encoder = new VideoEncoder({
+    output: (chunk, metadata) => {
+      chunks.push(chunk)
+      metadatas.push(metadata)
+    },
+    error: (e) => errors.push(e),
+  })
+  encoder.configure({
+    codec: 'hev1.1.6.L93.B0',
+    width,
+    height,
+    bitrate: 500_000,
+    framerate: 30,
+    hardwareAcceleration: 'prefer-software',
+  })
+
+  for (let i = 0; i < frameCount; i++) {
+    const frame = generateSolidColorI420Frame(width, height, TestColors.green, i * 33333)
+    encoder.encode(frame, { keyFrame: i === 0 })
+    frame.close()
+  }
+  await encoder.flush()
+  encoder.close()
+
+  if (errors.length > 0) throw errors[0]
+  if (chunks.length === 0) throw new Error('HEVC encoder produced no chunks')
+  return { chunks, metadatas }
+}
+
+test('Mp4Muxer: writes hvc1 sample entry for HEVC with description', async (t) => {
+  const { chunks, metadatas } = await encodeHevcChunks(128, 128, 10)
+
+  const muxer = new Mp4Muxer()
+  muxer.addVideoTrack({
+    codec: 'hev1.1.6.L93.B0',
+    width: 128,
+    height: 128,
+    framerate: 30,
+    description: metadatas[0]?.decoderConfig?.description,
+  })
+  for (let i = 0; i < chunks.length; i++) {
+    muxer.addVideoChunk(chunks[i], metadatas[i])
+  }
+  muxer.flush()
+  const mp4Data = muxer.finalize()
+  muxer.close()
+
+  t.true(mp4Data.length > 0, 'Should have MP4 data')
+  // hvc1 signals parameter sets live in the sample description (hvcC), not the bitstream
+  t.is(getMp4VideoSampleEntryTag(mp4Data), 'hvc1', 'HEVC sample entry should be hvc1')
+
+  // The hvcC box must be inside the hvc1 sample entry (extradata-based parameter sets)
+  const stsd = findMp4Box(mp4Data, ['moov', 'trak', 'mdia', 'minf', 'stbl', 'stsd'], 0, mp4Data.length)
+  t.true(stsd >= 0, 'stsd box should exist')
+  const entry = stsd + 8 + 4 + 4
+  const view = new DataView(mp4Data.buffer, mp4Data.byteOffset, mp4Data.byteLength)
+  const entrySize = view.getUint32(entry)
+  const entryEnd = Math.min(entry + entrySize, mp4Data.length)
+  let hvcC = -1
+  for (let i = entry + 8; i + 4 <= entryEnd; i++) {
+    if (mp4Data[i] === 0x68 && mp4Data[i + 1] === 0x76 && mp4Data[i + 2] === 0x63 && mp4Data[i + 3] === 0x43) {
+      hvcC = i
+      break
+    }
+  }
+  t.true(hvcC >= 0, 'hvcC box should exist inside the hvc1 sample entry')
+})
+
+test('Mp4Muxer: writes hvc1 sample entry in fragmented MP4', async (t) => {
+  const { chunks, metadatas } = await encodeHevcChunks(128, 128, 6)
+
+  const muxer = new Mp4Muxer({ fragmented: true })
+  muxer.addVideoTrack({
+    codec: 'hev1.1.6.L93.B0',
+    width: 128,
+    height: 128,
+    framerate: 30,
+    description: metadatas[0]?.decoderConfig?.description,
+  })
+  for (let i = 0; i < chunks.length; i++) {
+    muxer.addVideoChunk(chunks[i], metadatas[i])
+  }
+  muxer.flush()
+  const mp4Data = muxer.finalize()
+  muxer.close()
+
+  t.true(mp4Data.length > 0, 'Should have fragmented MP4 data')
+  t.is(getMp4VideoSampleEntryTag(mp4Data), 'hvc1', 'Fragmented HEVC sample entry should be hvc1')
+})
+
+test('Mp4Muxer: hvc1 HEVC output round-trips through Mp4Demuxer and VideoDecoder', async (t) => {
+  const frameCount = 10
+  const { chunks, metadatas } = await encodeHevcChunks(128, 128, frameCount)
+
+  const muxer = new Mp4Muxer()
+  muxer.addVideoTrack({
+    codec: 'hev1.1.6.L93.B0',
+    width: 128,
+    height: 128,
+    framerate: 30,
+    description: metadatas[0]?.decoderConfig?.description,
+  })
+  for (let i = 0; i < chunks.length; i++) {
+    muxer.addVideoChunk(chunks[i], metadatas[i])
+  }
+  muxer.flush()
+  const mp4Data = muxer.finalize()
+  muxer.close()
+
+  t.is(getMp4VideoSampleEntryTag(mp4Data), 'hvc1', 'Precondition: sample entry is hvc1')
+
+  // Demux the hvc1 file
+  const demuxedChunks: EncodedVideoChunk[] = []
+  const demuxer = new Mp4Demuxer({
+    videoOutput: (chunk) => demuxedChunks.push(chunk),
+    error: (e) => t.fail(`Demuxer error: ${e.message}`),
+  })
+  await demuxer.loadBuffer(mp4Data)
+
+  const config = demuxer.videoDecoderConfig
+  t.truthy(config, 'Should expose a video decoder config')
+  if (!config) return
+  t.true(config.codec.startsWith('hev1'), 'JS-facing codec string stays hev1-prefixed')
+  t.is(config.codedWidth, 128)
+  t.is(config.codedHeight, 128)
+  t.truthy(config.description, 'Config should carry the hvcC description')
+
+  await demuxer.demuxAsync()
+  demuxer.close()
+
+  t.is(demuxedChunks.length, chunks.length, 'All chunks should demux')
+
+  // Decode the demuxed chunks with the demuxer's config
+  const decodedFrames: VideoFrame[] = []
+  const decoder = new VideoDecoder({
+    output: (frame) => decodedFrames.push(frame),
+    error: (e) => t.fail(`Decoder error: ${e.message}`),
+  })
+  decoder.configure({
+    codec: config.codec,
+    codedWidth: config.codedWidth,
+    codedHeight: config.codedHeight,
+    description: config.description,
+  })
+  for (const chunk of demuxedChunks) {
+    decoder.decode(chunk)
+  }
+  await decoder.flush()
+  decoder.close()
+
+  t.is(decodedFrames.length, frameCount, 'Every encoded frame should decode')
+  for (const frame of decodedFrames) {
+    t.is(frame.codedWidth, 128)
+    t.is(frame.codedHeight, 128)
+    frame.close()
+  }
 })
 
 // ============================================================================

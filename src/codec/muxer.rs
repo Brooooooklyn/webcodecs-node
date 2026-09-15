@@ -7,10 +7,11 @@ use super::avio_context::CustomIOContext;
 use super::io_buffer::StreamingBufferHandle;
 use crate::ffi::accessors::{
   ffcodecpar_set_bit_rate, ffcodecpar_set_channels, ffcodecpar_set_codec_id,
-  ffcodecpar_set_codec_type, ffcodecpar_set_extradata, ffcodecpar_set_format,
-  ffcodecpar_set_frame_size, ffcodecpar_set_height, ffcodecpar_set_sample_rate,
-  ffcodecpar_set_width, fffmt_get_oformat_flags, fffmt_get_stream, fffmt_set_pb,
-  ffstream_get_codecpar, ffstream_get_index, ffstream_get_time_base, ffstream_set_time_base,
+  ffcodecpar_set_codec_tag, ffcodecpar_set_codec_type, ffcodecpar_set_extradata,
+  ffcodecpar_set_format, ffcodecpar_set_frame_size, ffcodecpar_set_height,
+  ffcodecpar_set_sample_rate, ffcodecpar_set_width, fffmt_get_oformat_flags, fffmt_get_stream,
+  fffmt_set_pb, ffstream_get_codecpar, ffstream_get_index, ffstream_get_time_base,
+  ffstream_set_time_base,
 };
 use crate::ffi::avformat::{
   AVFormatContext, av_interleaved_write_frame, av_write_trailer, avfmt_flag,
@@ -241,6 +242,18 @@ impl MuxerContext {
         if ret < 0 {
           return Err(CodecError::Ffmpeg(crate::ffi::FFmpegError::from_code(ret)));
         }
+      }
+
+      // MP4/HEVC: write the 'hvc1' sample entry when parameter sets are carried
+      // in the sample description (hvcC) instead of the bitstream. FFmpeg only
+      // emits 'hvc1' when the codec tag is set explicitly (its default is
+      // 'hev1'); with the tag set, movenc also strips in-band parameter sets
+      // and marks hvcC arrays complete, per ISO/IEC 14496-15.
+      if self.format == ContainerFormat::Mp4
+        && config.codec_id == AVCodecID::Hevc
+        && config.extradata.as_ref().is_some_and(|e| !e.is_empty())
+      {
+        ffcodecpar_set_codec_tag(codecpar, u32::from_le_bytes(*b"hvc1"));
       }
 
       // Set time base on stream
