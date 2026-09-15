@@ -6,8 +6,8 @@ use crate::ffi::{
   self, AVPacket,
   accessors::{
     ffpkt_data, ffpkt_dts, ffpkt_duration, ffpkt_flags, ffpkt_pts, ffpkt_set_dts,
-    ffpkt_set_duration, ffpkt_set_flags, ffpkt_set_pts, ffpkt_set_stream_index, ffpkt_size,
-    ffpkt_stream_index,
+    ffpkt_set_duration, ffpkt_set_flags, ffpkt_set_opaque, ffpkt_set_pts, ffpkt_set_stream_index,
+    ffpkt_size, ffpkt_stream_index,
   },
   avcodec::{
     av_new_packet, av_packet_alloc, av_packet_free, av_packet_get_side_data,
@@ -131,6 +131,14 @@ impl Packet {
   #[inline]
   pub fn set_dts(&mut self, dts: i64) {
     unsafe { ffpkt_set_dts(self.as_mut_ptr(), dts) }
+  }
+
+  /// Set opaque user data, propagated to decoded frames' `opaque` when the
+  /// decoder context has AV_CODEC_FLAG_COPY_OPAQUE set. Used to carry chunk
+  /// identity through decoder reordering.
+  #[inline]
+  pub fn set_opaque(&mut self, opaque: usize) {
+    unsafe { ffpkt_set_opaque(self.as_mut_ptr(), opaque as *mut std::ffi::c_void) }
   }
 
   /// Get duration

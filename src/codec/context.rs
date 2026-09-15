@@ -391,12 +391,11 @@ impl CodecContext {
         }
       }
 
-      // Time base (inverse of framerate for encoding)
-      ffctx_set_time_base(
-        ctx,
-        config.framerate_den as i32,
-        config.framerate_num as i32,
-      );
+      // Time base in microseconds. WebCodecs timestamps are µs, so a µs time
+      // base lets frame PTS carry input timestamps exactly; a 1/fps base would
+      // round distinct frames onto the same tick, making B-frame-reordered
+      // output packets impossible to attribute back to their input frame.
+      ffctx_set_time_base(ctx, 1, 1_000_000);
 
       // Framerate
       ffctx_set_framerate(
@@ -844,6 +843,11 @@ impl CodecContext {
       // This ensures we get all frames even if the decoder thinks some are invalid
       // Important for B-frame content where frame ordering can be complex
       flags |= ffi::accessors::codec_flag::OUTPUT_CORRUPT;
+
+      // Propagate packet opaque to output frames so callers can recover exact
+      // chunk identity through B-frame reordering (not all decoders honor it;
+      // VideoToolbox does not, callers must keep a pts-based fallback).
+      flags |= ffi::accessors::codec_flag::COPY_OPAQUE;
 
       if flags != 0 {
         ffi::accessors::ffctx_set_flags(ctx, flags);
