@@ -154,6 +154,104 @@ test('VideoDecoder: decode non-key frame first fails', async (t) => {
   decoder.close()
 })
 
+// Spec: flush() synchronously sets [[key chunk required]] = true
+test('VideoDecoder: decode delta chunk after flush throws DataError', async (t) => {
+  const { chunks, config } = await createEncodedChunks('vp8', 320, 240, 20)
+
+  if (chunks.length === 0) {
+    t.pass('No chunks produced')
+    return
+  }
+
+  const data = new Uint8Array(chunks[0].byteLength)
+  chunks[0].copyTo(data)
+  const deltaChunk = new EncodedVideoChunk({ type: 'delta', timestamp: 1000, data })
+
+  const decoder = new VideoDecoder({
+    output: () => {},
+    error: () => {},
+  })
+  decoder.configure(config)
+  decoder.decode(chunks[0])
+  await decoder.flush()
+
+  try {
+    decoder.decode(deltaChunk)
+    t.fail('decode delta after flush should throw DataError')
+  } catch (error) {
+    t.is((error as DOMException).name, 'DataError', 'error name should be DataError')
+  }
+
+  decoder.close()
+})
+
+// Spec: configure() synchronously sets [[key chunk required]] = true
+test('VideoDecoder: decode delta chunk after reconfigure throws DataError', async (t) => {
+  const { chunks, config } = await createEncodedChunks('vp8', 320, 240, 20)
+
+  if (chunks.length === 0) {
+    t.pass('No chunks produced')
+    return
+  }
+
+  const data = new Uint8Array(chunks[0].byteLength)
+  chunks[0].copyTo(data)
+  const deltaChunk = new EncodedVideoChunk({ type: 'delta', timestamp: 1000, data })
+
+  const decoder = new VideoDecoder({
+    output: () => {},
+    error: () => {},
+  })
+  decoder.configure(config)
+  decoder.decode(chunks[0])
+
+  // Reconfigure re-arms the key-chunk requirement synchronously
+  decoder.configure(config)
+
+  try {
+    decoder.decode(deltaChunk)
+    t.fail('decode delta after reconfigure should throw DataError')
+  } catch (error) {
+    t.is((error as DOMException).name, 'DataError', 'error name should be DataError')
+  }
+
+  decoder.close()
+})
+
+// Spec: [[key chunk required]] is main-thread state — the worker's reconfigure
+// step must not clear a key chunk already accepted by decode()
+test('VideoDecoder: reconfigure does not clobber accepted key chunk', async (t) => {
+  const { chunks, config } = await createEncodedChunks('vp8', 320, 240, 20)
+
+  if (chunks.length === 0) {
+    t.pass('No chunks produced')
+    return
+  }
+
+  const data = new Uint8Array(chunks[0].byteLength)
+  chunks[0].copyTo(data)
+  const keyChunk = new EncodedVideoChunk({ type: 'key', timestamp: 0, data })
+  const deltaChunk = new EncodedVideoChunk({ type: 'delta', timestamp: 1000, data })
+
+  const decoder = new VideoDecoder({
+    output: (frame) => frame.close(),
+    error: () => {},
+  })
+  decoder.configure(config)
+
+  // Reconfigure re-arms the requirement, then a key chunk satisfies it
+  decoder.configure(config)
+  decoder.decode(keyChunk)
+
+  // Queue drain proves the worker ran the queued Reconfigure then the Decode
+  await waitFor(() => decoder.decodeQueueSize === 0, 'decode queue drained', 30_000)
+
+  // The key was already accepted — a later delta must not throw
+  t.notThrows(() => decoder.decode(deltaChunk), 'delta after accepted key should not throw')
+
+  decoder.close()
+})
+
 // ============================================================================
 // Reset Tests
 // ============================================================================
