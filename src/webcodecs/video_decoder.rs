@@ -1403,7 +1403,7 @@ impl VideoDecoder {
   /// - `no-preference`: Try hardware first, silently fall back to software
   /// - `prefer-software`: Use software only
   #[napi]
-  pub fn configure(&mut self, env: Env, config: VideoDecoderConfig) -> Result<()> {
+  pub fn configure(&mut self, env: Env, mut config: VideoDecoderConfig) -> Result<()> {
     // W3C WebCodecs spec: Validate config synchronously, throw TypeError for invalid
     // https://w3c.github.io/webcodecs/#dom-videodecoder-configure
 
@@ -1457,6 +1457,13 @@ impl VideoDecoder {
           &format!("NotSupportedError: Invalid codec: {}", codec),
         );
         return Ok(());
+      }
+
+      // Snapshot the description before queueing: it borrows the caller's
+      // ArrayBuffer and is only copied in process_reconfigure() on the worker
+      // thread, so a post-configure() write would race the applied extradata.
+      if let Some(desc) = config.description.as_mut() {
+        *desc = Uint8Array::new(desc.to_vec());
       }
 
       // Queue reconfigure via microtask (runs AFTER pending decode microtasks)
