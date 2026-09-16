@@ -282,9 +282,9 @@ export declare class AudioDecoder {
    * The dequeue event fires when decodeQueueSize decreases,
    * allowing backpressure management.
    */
-  set ondequeue(callback: (() => unknown) | undefined | null)
+  set ondequeue(callback: ((event: Event) => unknown) | undefined | null)
   /** Get the dequeue event handler (per WebCodecs spec) */
-  get ondequeue(): (() => unknown) | null
+  get ondequeue(): ((event: Event) => unknown) | null
   /** Configure the decoder */
   configure(config: AudioDecoderConfig): void
   /** Decode an encoded audio chunk */
@@ -313,13 +313,13 @@ export declare class AudioDecoder {
   /** Add an event listener for the specified event type */
   addEventListener(
     eventType: string,
-    callback: () => unknown,
+    callback: (event: Event) => unknown,
     options?: AudioDecoderAddEventListenerOptions | undefined | null,
   ): void
   /** Remove an event listener for the specified event type */
   removeEventListener(
     eventType: string,
-    callback: () => unknown,
+    callback: (event: Event) => unknown,
     options?: AudioDecoderEventListenerOptions | undefined | null,
   ): void
   /** Dispatch an event to all registered listeners */
@@ -370,9 +370,9 @@ export declare class AudioEncoder {
    * The dequeue event fires when encodeQueueSize decreases,
    * allowing backpressure management.
    */
-  set ondequeue(callback: (() => unknown) | undefined | null)
+  set ondequeue(callback: ((event: Event) => unknown) | undefined | null)
   /** Get the dequeue event handler (per WebCodecs spec) */
-  get ondequeue(): (() => unknown) | null
+  get ondequeue(): ((event: Event) => unknown) | null
   /** Configure the encoder */
   configure(config: AudioEncoderConfig): void
   /** Encode audio data */
@@ -404,13 +404,13 @@ export declare class AudioEncoder {
    */
   addEventListener(
     eventType: string,
-    callback: () => unknown,
+    callback: (event: Event) => unknown,
     options?: AudioEncoderAddEventListenerOptions | undefined | null,
   ): void
   /** Remove an event listener for the specified event type */
   removeEventListener(
     eventType: string,
-    callback: () => unknown,
+    callback: (event: Event) => unknown,
     options?: AudioEncoderEventListenerOptions | undefined | null,
   ): void
   /** Dispatch an event to all registered listeners */
@@ -906,9 +906,9 @@ export declare class VideoDecoder {
    * The dequeue event fires when decodeQueueSize decreases,
    * allowing backpressure management.
    */
-  set ondequeue(callback: (() => unknown) | undefined | null)
+  set ondequeue(callback: ((event: Event) => unknown) | undefined | null)
   /** Get the dequeue event handler (per WebCodecs spec) */
-  get ondequeue(): (() => unknown) | null
+  get ondequeue(): ((event: Event) => unknown) | null
   /**
    * Configure the decoder
    *
@@ -947,13 +947,13 @@ export declare class VideoDecoder {
    */
   addEventListener(
     eventType: string,
-    callback: () => unknown,
+    callback: (event: Event) => unknown,
     options?: VideoDecoderAddEventListenerOptions | undefined | null,
   ): void
   /** Remove an event listener for the specified event type */
   removeEventListener(
     eventType: string,
-    callback: () => unknown,
+    callback: (event: Event) => unknown,
     options?: VideoDecoderEventListenerOptions | undefined | null,
   ): void
   /** Dispatch an event to all registered listeners */
@@ -1005,9 +1005,9 @@ export declare class VideoEncoder {
    * The dequeue event fires when encodeQueueSize decreases,
    * allowing backpressure management.
    */
-  set ondequeue(callback: (() => unknown) | undefined | null)
+  set ondequeue(callback: ((event: Event) => unknown) | undefined | null)
   /** Get the dequeue event handler (per WebCodecs spec) */
-  get ondequeue(): (() => unknown) | null
+  get ondequeue(): ((event: Event) => unknown) | null
   /** Configure the encoder */
   configure(config: VideoEncoderConfig): void
   /** Encode a frame */
@@ -1031,13 +1031,13 @@ export declare class VideoEncoder {
    */
   addEventListener(
     eventType: string,
-    callback: () => unknown,
+    callback: (event: Event) => unknown,
     options?: AddEventListenerOptions | undefined | null,
   ): void
   /** Remove an event listener for the specified event type */
   removeEventListener(
     eventType: string,
-    callback: () => unknown,
+    callback: (event: Event) => unknown,
     options?: EventListenerOptions | undefined | null,
   ): void
   /** Dispatch an event to all registered listeners */

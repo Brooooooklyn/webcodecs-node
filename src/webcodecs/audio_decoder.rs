@@ -7,8 +7,8 @@ use crate::codec::{AudioDecoderConfig as InternalAudioDecoderConfig, CodecContex
 use crate::ffi::AVCodecID;
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunkInner;
 use crate::webcodecs::error::{
-  DOMExceptionName, native_dom_exception_error, throw_data_error, throw_invalid_state_error,
-  throw_type_error_unit,
+  DOMExceptionName, error_as_dom_exception, native_dom_exception_error, new_event,
+  throw_data_error, throw_invalid_state_error, throw_type_error_unit,
 };
 use crate::webcodecs::flush_tracker::FlushTracker;
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
@@ -33,20 +33,22 @@ type OutputCallback =
   ThreadsafeFunction<AudioData, UnknownReturnValue, AudioData, Status, false, true>;
 
 /// Type alias for error callback (takes Error object)
-/// Using CalleeHandled: false because WebCodecs error callback receives Error directly,
-/// not error-first (err, result) style
-type ErrorCallback = ThreadsafeFunction<Error, UnknownReturnValue, Error, Status, false, true>;
+/// Using CalleeHandled: false because WebCodecs error callback receives the
+/// error directly, not error-first (err, result) style. The Error payload is
+/// converted to a native DOMException in the JS-side callback.
+type ErrorCallback =
+  ThreadsafeFunction<Error, UnknownReturnValue, Unknown<'static>, Status, false, true>;
 
 // Note: For ondequeue, we use FunctionRef instead of ThreadsafeFunction
 // to support both getter and setter per WebCodecs spec
 
 /// Type alias for weak event listener callback (allows Node.js process to exit)
 type WeakEventListenerCallback =
-  ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, true>;
+  ThreadsafeFunction<(), UnknownReturnValue, Unknown<'static>, Status, false, true>;
 
 /// Type alias for strong event listener callback (keeps Node.js alive until called)
 type StrongEventListenerCallback =
-  ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, false>;
+  ThreadsafeFunction<(), UnknownReturnValue, Unknown<'static>, Status, false, false>;
 
 /// Backwards compatibility alias for dequeue callback
 type EventListenerCallback = WeakEventListenerCallback;
@@ -66,8 +68,9 @@ struct EventListenerEntry {
   id: u64,
   callback: EventListenerCallbackType,
   once: bool,
-  /// Only needed for Weak variant - Strong TSF keeps the function alive automatically
-  _prevent_gc: Option<FunctionRef<(), UnknownReturnValue>>,
+  /// Reference to the original JS callback — prevents GC while the listener is
+  /// registered (Weak TSF) and identifies the listener for removeEventListener
+  identity: FunctionRef<(), UnknownReturnValue>,
 }
 
 /// State for EventTarget interface, separate from main decoder state
@@ -168,12 +171,14 @@ impl FromNapiValue for AudioDecoderInit {
     // Create FunctionRef to prevent GC from collecting the error callback
     let error_ref = error_func.create_ref()?;
 
-    // Create ThreadsafeFunction for async calls from worker thread
+    // Create ThreadsafeFunction for async calls from worker thread.
+    // The JS-side callback converts the Error payload into a native
+    // DOMException (WebCodecsErrorCallback receives DOMException per spec).
     let error: ErrorCallback = error_func
       .build_threadsafe_function()
       .callee_handled::<false>()
       .weak::<true>()
-      .build()?;
+      .build_callback(|ctx| error_as_dom_exception(&ctx.env, ctx.value))?;
 
     Ok(AudioDecoderInit {
       output,
@@ -856,7 +861,10 @@ impl AudioDecoder {
   ///
   /// The dequeue event fires when decodeQueueSize decreases,
   /// allowing backpressure management.
-  #[napi(setter)]
+  #[napi(
+    setter,
+    ts_args_type = "callback: ((event: Event) => unknown) | undefined | null"
+  )]
   pub fn set_ondequeue(
     &mut self,
     env: &Env,
@@ -875,7 +883,7 @@ impl AudioDecoder {
           .build_threadsafe_function()
           .callee_handled::<false>()
           .weak::<true>() // Weak to allow Node.js process to exit
-          .build()?;
+          .build_callback(|ctx| new_event(&ctx.env, "dequeue"))?;
         Some(Arc::new(tsf))
       }
       None => None,
@@ -888,7 +896,7 @@ impl AudioDecoder {
   }
 
   /// Get the dequeue event handler (per WebCodecs spec)
-  #[napi(getter)]
+  #[napi(getter, ts_return_type = "((event: Event) => unknown) | null")]
   pub fn get_ondequeue<'env>(
     &self,
     env: &'env Env,
@@ -1475,7 +1483,9 @@ impl AudioDecoder {
   // ============================================================================
 
   /// Add an event listener for the specified event type
-  #[napi]
+  #[napi(
+    ts_args_type = "eventType: string, callback: (event: Event) => unknown, options?: AudioDecoderAddEventListenerOptions | undefined | null"
+  )]
   pub fn add_event_listener(
     &self,
     env: Env,
@@ -1495,36 +1505,41 @@ impl AudioDecoder {
     let once = options.as_ref().and_then(|o| o.once).unwrap_or(false);
     let func = callback.borrow_back(&env)?;
 
+    // Reference to the original JS callback for GC prevention and identity
+    // comparison in removeEventListener
+    let identity = func.create_ref()?;
+
+    // Listeners receive a real Event object whose type matches event_type
+    let event_type_for_cb = event_type.clone();
     // Create either weak TSF (regular) or strong TSF (once) based on listener type
-    let (callback_type, prevent_gc) = if once {
+    let callback_type = if once {
       // Once listeners: use strong TSF (keeps Node.js alive until callback fires)
-      // No need for _prevent_gc since strong TSF keeps function alive
+      // Strong TSF holds reference to JS function directly
       let tsf = Arc::new(
         func
           .build_threadsafe_function()
           .callee_handled::<false>()
           .weak::<false>() // Strong - keeps Node.js alive
-          .build()?,
+          .build_callback(move |ctx| new_event(&ctx.env, &event_type_for_cb))?,
       );
-      (EventListenerCallbackType::Strong(tsf), None)
+      EventListenerCallbackType::Strong(tsf)
     } else {
-      // Regular listeners: use weak TSF with _prevent_gc
-      let prevent_gc = func.create_ref()?;
+      // Regular listeners: use weak TSF (allows Node.js to exit)
       let tsf = Arc::new(
         func
           .build_threadsafe_function()
           .callee_handled::<false>()
           .weak::<true>() // Weak - allows Node.js to exit
-          .build()?,
+          .build_callback(move |ctx| new_event(&ctx.env, &event_type_for_cb))?,
       );
-      (EventListenerCallbackType::Weak(tsf), Some(prevent_gc))
+      EventListenerCallbackType::Weak(tsf)
     };
 
     let entry = EventListenerEntry {
       id,
       callback: callback_type,
       once,
-      _prevent_gc: prevent_gc,
+      identity,
     };
 
     state
@@ -1536,11 +1551,14 @@ impl AudioDecoder {
   }
 
   /// Remove an event listener for the specified event type
-  #[napi]
+  #[napi(
+    ts_args_type = "eventType: string, callback: (event: Event) => unknown, options?: AudioDecoderEventListenerOptions | undefined | null"
+  )]
   pub fn remove_event_listener(
     &self,
+    env: Env,
     event_type: String,
-    _callback: FunctionRef<(), UnknownReturnValue>,
+    callback: FunctionRef<(), UnknownReturnValue>,
     _options: Option<AudioDecoderEventListenerOptions>,
   ) -> Result<()> {
     // Use event_state instead of inner
@@ -1549,10 +1567,17 @@ impl AudioDecoder {
       .write()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    // Note: We can't compare function references directly, so we remove the last added listener
-    // for simplicity. A more complete implementation would need to track callback identity.
+    // DOM spec: remove the first registered listener whose callback === the
+    // one passed here
     if let Some(listeners) = state.event_listeners.get_mut(&event_type) {
-      listeners.pop();
+      if let Some(pos) = listeners.iter().position(|entry| {
+        match (entry.identity.borrow_back(&env), callback.borrow_back(&env)) {
+          (Ok(registered), Ok(passed)) => env.strict_equals(registered, passed).unwrap_or(false),
+          _ => false,
+        }
+      }) {
+        listeners.remove(pos);
+      }
       if listeners.is_empty() {
         state.event_listeners.remove(&event_type);
       }

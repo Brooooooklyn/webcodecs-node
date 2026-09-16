@@ -12,6 +12,7 @@ import {
   AudioData,
   AudioDecoder,
   AudioEncoder,
+  EncodedVideoChunk,
   EncodedVideoChunkMetadata,
   resetHardwareFallbackState,
   VideoDecoder,
@@ -22,7 +23,6 @@ import {
   generateSolidColorI420Frame,
   generateFrameSequence,
   TestColors,
-  type EncodedVideoChunk,
   type EncodedAudioChunk,
 } from './helpers/index.js'
 import { createEncoderConfig } from './helpers/codec-matrix.js'
@@ -87,7 +87,7 @@ test('VideoEncoder: addEventListener dequeue fires when queue decreases', async 
   encoder.configure(createEncoderConfig('h264', 320, 240))
 
   // Set up the listener BEFORE encoding to ensure we don't miss the event
-  const dequeuePromise = new Promise<void>((resolve) => encoder.addEventListener('dequeue', resolve, { once: true }))
+  const dequeuePromise = new Promise<void>((resolve) => encoder.addEventListener('dequeue', () => resolve(), { once: true }))
 
   const frame = generateSolidColorI420Frame(320, 240, TestColors.red, 0)
   encoder.encode(frame)
@@ -198,7 +198,7 @@ test('VideoDecoder: addEventListener dequeue fires when queue decreases', async 
   })
 
   // Set up the listener BEFORE decoding to ensure we don't miss the event
-  const dequeuePromise = new Promise<void>((resolve) => decoder.addEventListener('dequeue', resolve, { once: true }))
+  const dequeuePromise = new Promise<void>((resolve) => decoder.addEventListener('dequeue', () => resolve(), { once: true }))
 
   decoder.decode(chunks[0].chunk)
 
@@ -309,7 +309,7 @@ test('AudioEncoder: addEventListener dequeue fires when queue decreases', async 
   })
 
   // Set up the listener BEFORE encoding to ensure we don't miss the event
-  const dequeuePromise = new Promise<void>((resolve) => encoder.addEventListener('dequeue', resolve, { once: true }))
+  const dequeuePromise = new Promise<void>((resolve) => encoder.addEventListener('dequeue', () => resolve(), { once: true }))
 
   const audioData = createTestAudioData(0)
   encoder.encode(audioData)
@@ -420,7 +420,7 @@ test('AudioDecoder: addEventListener dequeue fires when queue decreases', async 
   })
 
   // Set up the listener BEFORE decoding to ensure we don't miss the event
-  const dequeuePromise = new Promise<void>((resolve) => decoder.addEventListener('dequeue', resolve, { once: true }))
+  const dequeuePromise = new Promise<void>((resolve) => decoder.addEventListener('dequeue', () => resolve(), { once: true }))
 
   decoder.decode(encodedChunks[0])
 
@@ -513,4 +513,163 @@ test('AudioDecoder: multiple dequeue listeners all fire', async (t) => {
   for (const audio of decodedAudio) {
     ;(audio as { close: () => void }).close()
   }
+})
+
+// ============================================================================
+// Event object / listener identity / DOMException regression tests
+// ============================================================================
+
+test('VideoEncoder: dequeue listener receives an Event with type dequeue', async (t) => {
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: (e) => {
+      t.fail(`Encoder error: ${e.message}`)
+    },
+  })
+
+  encoder.configure(createEncoderConfig('h264', 320, 240))
+
+  const eventPromise = new Promise<unknown>((resolve) =>
+    encoder.addEventListener('dequeue', resolve, { once: true }),
+  )
+
+  const frame = generateSolidColorI420Frame(320, 240, TestColors.red, 0)
+  encoder.encode(frame)
+  frame.close()
+
+  const event = await eventPromise
+
+  t.true(event instanceof Event, 'listener arg should be an Event')
+  t.is((event as Event).type, 'dequeue')
+
+  await encoder.flush()
+  encoder.close()
+})
+
+test('VideoEncoder: ondequeue receives an Event with type dequeue', async (t) => {
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: (e) => {
+      t.fail(`Encoder error: ${e.message}`)
+    },
+  })
+
+  encoder.configure(createEncoderConfig('h264', 320, 240))
+
+  const eventPromise = new Promise<unknown>((resolve) => {
+    encoder.ondequeue = resolve
+  })
+
+  const frame = generateSolidColorI420Frame(320, 240, TestColors.blue, 0)
+  encoder.encode(frame)
+  frame.close()
+
+  const event = await eventPromise
+
+  t.true(event instanceof Event, 'ondequeue arg should be an Event')
+  t.is((event as Event).type, 'dequeue')
+
+  await encoder.flush()
+  encoder.close()
+})
+
+test('VideoEncoder: removeEventListener removes the requested listener', async (t) => {
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: (e) => {
+      t.fail(`Encoder error: ${e.message}`)
+    },
+  })
+
+  encoder.configure(createEncoderConfig('h264', 320, 240))
+
+  let listener1Count = 0
+  let listener2Count = 0
+  const listener1 = () => {
+    listener1Count++
+  }
+  const listener2 = () => {
+    listener2Count++
+  }
+
+  encoder.addEventListener('dequeue', listener1)
+  encoder.addEventListener('dequeue', listener2)
+  // Removing listener1 must not remove listener2 (registration order must not matter)
+  encoder.removeEventListener('dequeue', listener1)
+
+  const frame = generateSolidColorI420Frame(320, 240, TestColors.green, 0)
+  encoder.encode(frame)
+  frame.close()
+
+  await encoder.flush()
+
+  t.is(listener1Count, 0, 'removed listener1 should not fire')
+  t.true(listener2Count >= 1, 'listener2 should still fire')
+
+  encoder.close()
+})
+
+test('VideoEncoder: removeEventListener with unregistered callback removes nothing', async (t) => {
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: (e) => {
+      t.fail(`Encoder error: ${e.message}`)
+    },
+  })
+
+  encoder.configure(createEncoderConfig('h264', 320, 240))
+
+  let listenerCount = 0
+  encoder.addEventListener('dequeue', () => {
+    listenerCount++
+  })
+  // A callback that was never registered must not remove the registered one
+  // oxlint-disable-next-line no-invalid-remove-event-listener -- intentionally unregistered
+  encoder.removeEventListener('dequeue', () => {})
+
+  const frame = generateSolidColorI420Frame(320, 240, TestColors.green, 0)
+  encoder.encode(frame)
+  frame.close()
+
+  await encoder.flush()
+
+  t.true(listenerCount >= 1, 'registered listener should still fire')
+
+  encoder.close()
+})
+
+test('VideoDecoder: error callback receives a DOMException', async (t) => {
+  const errorPromise = new Promise<unknown>((resolve) => {
+    const decoder = new VideoDecoder({
+      output: (frame) => {
+        frame.close()
+      },
+      error: resolve,
+    })
+
+    decoder.configure({
+      codec: 'avc1.42001f',
+      codedWidth: 320,
+      codedHeight: 240,
+    })
+
+    // Garbage payload makes the decoder worker fail asynchronously
+    const badChunk = new EncodedVideoChunk({
+      type: 'key',
+      timestamp: 0,
+      data: new Uint8Array([0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]),
+    })
+    try {
+      decoder.decode(badChunk)
+    } catch {
+      // synchronous rejection also satisfies the test intent
+    }
+    void decoder.flush().catch(() => {})
+  })
+
+  const error = await errorPromise
+
+  t.true(error instanceof DOMException, 'error callback arg should be a DOMException')
+  t.true(error instanceof Error, 'DOMException should also be an Error')
+  t.is((error as DOMException).name, 'EncodingError')
 })

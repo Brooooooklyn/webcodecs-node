@@ -119,6 +119,78 @@ pub fn native_range_error(env: &Env, message: &str) -> Result<Error> {
   Ok(Error::from(error))
 }
 
+/// Standard DOMException names that may prefix codec error messages.
+const DOM_EXCEPTION_NAMES: &[&str] = &[
+  "AbortError",
+  "ConstraintError",
+  "DataCloneError",
+  "DataError",
+  "EncodingError",
+  "HierarchyRequestError",
+  "InUseAttributeError",
+  "InvalidAccessError",
+  "InvalidCharacterError",
+  "InvalidModificationError",
+  "InvalidNodeTypeError",
+  "InvalidStateError",
+  "NamespaceError",
+  "NetworkError",
+  "NoModificationAllowedError",
+  "NotAllowedError",
+  "NotFoundError",
+  "NotReadableError",
+  "NotSupportedError",
+  "OperationError",
+  "OptOutError",
+  "QuotaExceededError",
+  "ReadError",
+  "SecurityError",
+  "SyntaxError",
+  "TimeoutError",
+  "TransactionInactiveError",
+  "TypeMismatchError",
+  "UnknownError",
+  "URLMismatchError",
+  "VersionError",
+  "WrongDocumentError",
+];
+
+/// Convert a plain napi Error into a native DOMException for codec error
+/// callbacks (WebCodecsErrorCallback receives DOMException, not Error).
+///
+/// Many report_error() call sites embed the DOMException name as a
+/// `"NameError: message"` prefix; recover it when present, otherwise
+/// default to EncodingError (the spec's generic codec-processing error).
+pub fn error_as_dom_exception(env: &Env, error: Error) -> Result<Unknown<'static>> {
+  let message = error.reason;
+  let (name, detail) = match message.split_once(':') {
+    Some((prefix, rest)) if DOM_EXCEPTION_NAMES.contains(&prefix.trim()) => {
+      (prefix.trim().to_string(), rest.trim_start().to_string())
+    }
+    // A bare exception name with no message
+    _ if DOM_EXCEPTION_NAMES.contains(&message.trim()) => {
+      (message.trim().to_string(), String::new())
+    }
+    _ => ("EncodingError".to_string(), message),
+  };
+
+  let global = env.get_global()?;
+  let dom_exception_constructor =
+    global.get_named_property_unchecked::<Function<FnArgs<(String, String)>>>("DOMException")?;
+  dom_exception_constructor.new_instance((detail, name).into())
+}
+
+/// Create a native JavaScript Event for EventTarget dispatch (dequeue, etc.).
+///
+/// Listeners registered via addEventListener/ondequeue must receive an Event
+/// object whose type matches the event name, per DOM/WebCodecs spec.
+pub fn new_event(env: &Env, event_type: &str) -> Result<Unknown<'static>> {
+  let global = env.get_global()?;
+  let event_constructor =
+    global.get_named_property_unchecked::<Function<FnArgs<(String,)>>>("Event")?;
+  event_constructor.new_instance((event_type.to_string(),).into())
+}
+
 // ============================================================================
 // Native DOMException Throwing Helpers
 // ============================================================================
