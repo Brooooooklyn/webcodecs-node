@@ -539,6 +539,236 @@ test('AudioData: allocationSize invalid planeIndex throws', (t) => {
 })
 
 // ============================================================================
+// frameOffset / frameCount Bounds Tests (W3C spec: Compute Copy Element Count)
+// ============================================================================
+
+test('AudioData: copyTo frameOffset >= numberOfFrames throws RangeError', (t) => {
+  const audioData = new AudioData({
+    data: new Uint8Array(8),
+    format: 'u8',
+    sampleRate: 44100,
+    numberOfFrames: 4,
+    numberOfChannels: 2,
+    timestamp: 0,
+  })
+
+  // frameOffset == numberOfFrames leaves zero frames — RangeError per spec
+  t.throws(
+    () => {
+      audioData.copyTo(new Uint8Array(8), { planeIndex: 0, frameOffset: 4 })
+    },
+    { instanceOf: RangeError },
+  )
+
+  // frameOffset beyond numberOfFrames must not underflow into a huge copy
+  t.throws(
+    () => {
+      audioData.copyTo(new Uint8Array(8), { planeIndex: 0, frameOffset: 100 })
+    },
+    { instanceOf: RangeError },
+  )
+
+  audioData.close()
+})
+
+test('AudioData: copyTo frameCount exceeding remaining frames throws RangeError', (t) => {
+  const audioData = new AudioData({
+    data: new Uint8Array(8),
+    format: 'u8',
+    sampleRate: 44100,
+    numberOfFrames: 4,
+    numberOfChannels: 2,
+    timestamp: 0,
+  })
+
+  t.throws(
+    () => {
+      audioData.copyTo(new Uint8Array(8), { planeIndex: 0, frameOffset: 2, frameCount: 3 })
+    },
+    { instanceOf: RangeError },
+  )
+
+  audioData.close()
+})
+
+test('AudioData: copyTo with frameOffset and frameCount', (t) => {
+  const audioData = new AudioData({
+    data: new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]),
+    format: 'u8',
+    sampleRate: 44100,
+    numberOfFrames: 4,
+    numberOfChannels: 2,
+    timestamp: 0,
+  })
+
+  // Copy frames 1..2 (interleaved: samples 2..5)
+  const dest = new Uint8Array(4)
+  audioData.copyTo(dest, { planeIndex: 0, frameOffset: 1, frameCount: 2 })
+  t.deepEqual(Array.from(dest), [3, 4, 5, 6])
+
+  audioData.close()
+})
+
+test('AudioData: allocationSize frameOffset >= numberOfFrames throws RangeError', (t) => {
+  const audioData = new AudioData({
+    data: new Uint8Array(8),
+    format: 'u8',
+    sampleRate: 44100,
+    numberOfFrames: 4,
+    numberOfChannels: 2,
+    timestamp: 0,
+  })
+
+  t.throws(
+    () => {
+      audioData.allocationSize({ planeIndex: 0, frameOffset: 4 })
+    },
+    { instanceOf: RangeError },
+  )
+
+  t.throws(
+    () => {
+      audioData.allocationSize({ planeIndex: 0, frameOffset: 100 })
+    },
+    { instanceOf: RangeError },
+  )
+
+  audioData.close()
+})
+
+test('AudioData: allocationSize with frameOffset and frameCount', (t) => {
+  const audioData = new AudioData({
+    data: new Uint8Array(8),
+    format: 'u8',
+    sampleRate: 44100,
+    numberOfFrames: 4,
+    numberOfChannels: 2,
+    timestamp: 0,
+  })
+
+  // 2 remaining frames after offset 2, interleaved 2ch u8 = 4 bytes
+  t.is(audioData.allocationSize({ planeIndex: 0, frameOffset: 2 }), 4)
+  t.is(audioData.allocationSize({ planeIndex: 0, frameOffset: 1, frameCount: 2 }), 4)
+
+  audioData.close()
+})
+
+// ============================================================================
+// Format Conversion Tests (W3C spec: conversion via normalized sample domain)
+// ============================================================================
+
+test('AudioData: copyTo converts s16 to f32', (t) => {
+  const src = new Int16Array([0, 16384, -16384, 32767])
+  const audioData = new AudioData({
+    data: new Uint8Array(src.buffer),
+    format: 's16',
+    sampleRate: 48000,
+    numberOfFrames: 4,
+    numberOfChannels: 1,
+    timestamp: 0,
+  })
+
+  // Destination size is in the destination format's units
+  t.is(audioData.allocationSize({ planeIndex: 0, format: 'f32' }), 16)
+
+  const dest = new Float32Array(4)
+  audioData.copyTo(new Uint8Array(dest.buffer), { planeIndex: 0, format: 'f32' })
+
+  const expected = [0, 0.5, -0.5, 32767 / 32768]
+  for (let i = 0; i < 4; i++) {
+    t.true(Math.abs(dest[i] - expected[i]) < 1e-6, `sample ${i}: ${dest[i]} != ${expected[i]}`)
+  }
+
+  audioData.close()
+})
+
+test('AudioData: copyTo converts f32 to s16 with clipping', (t) => {
+  const src = new Float32Array([0, 0.5, -0.5, 1.0, 1.5, -1.5])
+  const audioData = new AudioData({
+    data: new Uint8Array(src.buffer),
+    format: 'f32',
+    sampleRate: 48000,
+    numberOfFrames: 6,
+    numberOfChannels: 1,
+    timestamp: 0,
+  })
+
+  const dest = new Int16Array(6)
+  audioData.copyTo(new Uint8Array(dest.buffer), { planeIndex: 0, format: 's16' })
+  t.deepEqual(Array.from(dest), [0, 16384, -16384, 32767, 32767, -32768])
+
+  audioData.close()
+})
+
+test('AudioData: copyTo converts interleaved s16 to planar f32 channel', (t) => {
+  // Interleaved stereo: L=100,200,300 R=-100,-200,-300
+  const src = new Int16Array([100, -100, 200, -200, 300, -300])
+  const audioData = new AudioData({
+    data: new Uint8Array(src.buffer),
+    format: 's16',
+    sampleRate: 48000,
+    numberOfFrames: 3,
+    numberOfChannels: 2,
+    timestamp: 0,
+  })
+
+  const dest = new Float32Array(3)
+  audioData.copyTo(new Uint8Array(dest.buffer), { planeIndex: 1, format: 'f32-planar' })
+
+  const expected = [-100 / 32768, -200 / 32768, -300 / 32768]
+  for (let i = 0; i < 3; i++) {
+    t.true(Math.abs(dest[i] - expected[i]) < 1e-6, `sample ${i}: ${dest[i]} != ${expected[i]}`)
+  }
+
+  audioData.close()
+})
+
+test('AudioData: copyTo converts planar f32 to interleaved s16', (t) => {
+  const left = new Float32Array([0.5, -0.5, 0.25])
+  const right = new Float32Array([-0.5, 0.5, -0.25])
+  const data = new Uint8Array(left.byteLength + right.byteLength)
+  data.set(new Uint8Array(left.buffer), 0)
+  data.set(new Uint8Array(right.buffer), left.byteLength)
+
+  const audioData = new AudioData({
+    data,
+    format: 'f32-planar',
+    sampleRate: 48000,
+    numberOfFrames: 3,
+    numberOfChannels: 2,
+    timestamp: 0,
+  })
+
+  const dest = new Int16Array(6)
+  audioData.copyTo(new Uint8Array(dest.buffer), { planeIndex: 0, format: 's16' })
+  t.deepEqual(Array.from(dest), [16384, -16384, -16384, 16384, 8192, -8192])
+
+  audioData.close()
+})
+
+test('AudioData: copyTo conversion requires dest sized for dest format', (t) => {
+  const src = new Int16Array(4)
+  const audioData = new AudioData({
+    data: new Uint8Array(src.buffer),
+    format: 's16',
+    sampleRate: 48000,
+    numberOfFrames: 4,
+    numberOfChannels: 1,
+    timestamp: 0,
+  })
+
+  // s16 source is 8 bytes but f32 destination needs 16
+  t.throws(
+    () => {
+      audioData.copyTo(new Uint8Array(8), { planeIndex: 0, format: 'f32' })
+    },
+    { instanceOf: RangeError },
+  )
+
+  audioData.close()
+})
+
+// ============================================================================
 // Duration Tests
 // ============================================================================
 

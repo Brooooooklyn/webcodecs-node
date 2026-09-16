@@ -869,6 +869,74 @@ test('VideoFrame: visibleRect exceeding bounds throws TypeError', (t) => {
   t.true(error?.message.includes('exceeds'))
 })
 
+test('VideoFrame: visibleRect huge coordinates throw instead of overflowing u32', (t) => {
+  const data = new Uint8Array(64 * 64 * 4) // RGBA
+
+  // x as u32 saturates to u32::MAX; the old u32 bounds check wrapped past
+  // the limit and admitted an out-of-bounds rect (panic in debug, OOB read
+  // in release). Bounds must be validated on the raw doubles first.
+  const error = t.throws(() => {
+    new VideoFrame(data, {
+      format: 'RGBA',
+      codedWidth: 64,
+      codedHeight: 64,
+      timestamp: 0,
+      visibleRect: { x: 5e9, y: 0, width: 1, height: 1 },
+    })
+  })
+  t.true(error?.message.includes('TypeError'))
+
+  // x + width must not wrap in u32 arithmetic (u32::MAX - 1 + 4 wraps to 1)
+  const wrapError = t.throws(() => {
+    new VideoFrame(data, {
+      format: 'RGBA',
+      codedWidth: 64,
+      codedHeight: 64,
+      timestamp: 0,
+      visibleRect: { x: 4294967294, y: 0, width: 4, height: 1 },
+    })
+  })
+  t.true(wrapError?.message.includes('TypeError'))
+})
+
+test('VideoFrame: visibleRect non-finite and negative values throw', (t) => {
+  const data = new Uint8Array(64 * 64 * 4) // RGBA
+
+  for (const rect of [
+    { x: -1, y: 0, width: 10, height: 10 },
+    { x: 0, y: 0, width: Infinity, height: 10 },
+    { x: Number.NaN, y: 0, width: 10, height: 10 },
+  ]) {
+    const error = t.throws(() => {
+      new VideoFrame(data, {
+        format: 'RGBA',
+        codedWidth: 64,
+        codedHeight: 64,
+        timestamp: 0,
+        visibleRect: rect,
+      })
+    })
+    t.true(error?.message.includes('TypeError'))
+  }
+})
+
+test('VideoFrame: visibleRect fractional offset fails subsampling alignment', (t) => {
+  const data = new Uint8Array(64 * 64 * 1.5) // I420
+
+  // Alignment is checked on the untruncated value per spec: x=1.5 truncates
+  // to 1 (odd for I420's 2x2 factors) but is not a multiple of 2 either way
+  const error = t.throws(() => {
+    new VideoFrame(data, {
+      format: 'I420',
+      codedWidth: 64,
+      codedHeight: 64,
+      timestamp: 0,
+      visibleRect: { x: 1.5, y: 0, width: 10, height: 10 },
+    })
+  })
+  t.true(error?.message.includes('TypeError'))
+})
+
 test('VideoFrame constructor (from VideoFrame): with visibleRect crops', (t) => {
   const width = 8
   const height = 8

@@ -1079,15 +1079,6 @@ fn get_subsampling_factors(format: VideoPixelFormat) -> (u32, u32) {
   }
 }
 
-/// Per W3C spec: Verify Rect Offset Alignment
-/// Returns true if rect offset is properly aligned for the format's subsampling
-fn verify_rect_offset_alignment(format: VideoPixelFormat, x: u32, y: u32) -> bool {
-  let (h_factor, v_factor) = get_subsampling_factors(format);
-  // For each plane, x must be multiple of horizontal factor
-  // and y must be multiple of vertical factor
-  x.is_multiple_of(h_factor) && y.is_multiple_of(v_factor)
-}
-
 /// Calculate plane end offset with overflow checking
 ///
 /// Computes `offset + stride * height` using u64 to prevent u32 overflow.
@@ -1151,37 +1142,40 @@ fn parse_visible_rect(
     ));
   }
 
-  // Truncate to integer (per spec)
-  let x = x as u32;
-  let y = y as u32;
-  let width = width as u32;
-  let height = height as u32;
-
-  // Validate bounds
-  if x + width > coded_width {
+  // Validate bounds on the raw doubles — computing x + width in u32 wraps
+  // for large inputs (e.g. x = 5e9 saturates to u32::MAX, then + 1 wraps to
+  // 0), admitting out-of-bounds rectangles that later read OOB in copyTo
+  if x + width > f64::from(coded_width) {
     return Err(Error::new(
       Status::InvalidArg,
       "TypeError: visibleRect.x + width exceeds codedWidth",
     ));
   }
-  if y + height > coded_height {
+  if y + height > f64::from(coded_height) {
     return Err(Error::new(
       Status::InvalidArg,
       "TypeError: visibleRect.y + height exceeds codedHeight",
     ));
   }
 
-  // Verify alignment for subsampled formats
-  if !verify_rect_offset_alignment(format, x, y) {
-    let (h, v) = get_subsampling_factors(format);
+  // Verify alignment on the untruncated offsets: a fractional offset is not
+  // a multiple of the subsampling factor (x % 1 != 0 for RGBA too)
+  let (h_factor, v_factor) = get_subsampling_factors(format);
+  if x % f64::from(h_factor) != 0.0 || y % f64::from(v_factor) != 0.0 {
     return Err(Error::new(
       Status::InvalidArg,
       format!(
         "TypeError: visibleRect offset ({}, {}) not aligned for format {:?} (requires {}x{} alignment)",
-        x, y, format, h, v
+        x, y, format, h_factor, v_factor
       ),
     ));
   }
+
+  // Safe to truncate: validated finite, non-negative, in coded bounds
+  let x = x as u32;
+  let y = y as u32;
+  let width = width as u32;
+  let height = height as u32;
 
   Ok((x, y, width, height))
 }
