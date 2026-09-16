@@ -513,6 +513,45 @@ test('AudioDecoder: decode delta chunk after reconfigure throws DataError', asyn
   decoder.close()
 })
 
+// Spec: [[key chunk required]] is main-thread state — the worker's reconfigure
+// step must not clear a key chunk already accepted by decode()
+test('AudioDecoder: reconfigure does not clobber accepted key chunk', async (t) => {
+  const { chunks, config } = await createEncodedChunks('opus', 48000, 2, 1)
+
+  if (chunks.length === 0) {
+    t.pass('No chunks produced')
+    return
+  }
+
+  const data = new Uint8Array(chunks[0].byteLength)
+  chunks[0].copyTo(data)
+  const keyChunk = new EncodedAudioChunk({ type: 'key', timestamp: 0, data })
+  const deltaChunk = new EncodedAudioChunk({ type: 'delta', timestamp: 1000, data })
+
+  const { init, outputs } = createCollectingCodecInit<AudioData>()
+  const decoder = new AudioDecoder({
+    output: (d) => {
+      outputs.push(d)
+    },
+    error: init.error,
+  })
+  decoder.configure(config)
+
+  // Reconfigure re-arms the requirement, then a key chunk satisfies it
+  decoder.configure(config)
+  decoder.decode(keyChunk)
+
+  // Opus packets are self-contained: output proves the worker has processed
+  // both the queued Reconfigure and the Decode command
+  await waitFor(() => outputs.length > 0, 'output after reconfigure', 30_000)
+
+  // The key was already accepted — a later delta must not throw
+  t.notThrows(() => decoder.decode(deltaChunk), 'delta after accepted key should not throw')
+
+  outputs.forEach((d) => d.close())
+  decoder.close()
+})
+
 // ============================================================================
 // Empty Frame Tests
 // ============================================================================

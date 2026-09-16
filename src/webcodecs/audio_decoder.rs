@@ -672,9 +672,11 @@ impl AudioDecoder {
 
     // Clear codec-local work state. Do not reset decode_queue_size here:
     // main-thread decode() calls after this FIFO command are already counted.
+    // keyframe_received is intentionally not cleared here: configure() already
+    // resets it synchronously on the main thread, and clearing it again on the
+    // worker would clobber a key chunk accepted after configure() returned.
     guard.timestamp_queue.clear();
     guard.frame_count = 0;
-    guard.keyframe_received = false;
 
     // Parse codec string
     let codec = match &config.codec {
