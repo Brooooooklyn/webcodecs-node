@@ -724,7 +724,8 @@ impl MuxerContext {
 /// 0, 1, 3 are defined — 2 is reserved and rejected), byte 22
 /// is numOfArrays, then per array: 1 header byte (low 6 bits are the NAL unit
 /// type), u16-be numNalus, and per NAL a u16-be length followed by the NAL
-/// data. Every payload must hold at least the 2-byte NAL header, and its
+/// data. Every payload must hold at least the 2-byte NAL header, with
+/// forbidden_zero_bit clear and nuh_temporal_id_plus1 nonzero, and its
 /// header type must match the array's declared type. Multi-layer records
 /// (nuh_layer_id != 0 in any parameter set, e.g. HEVC alpha) are rejected:
 /// movenc drops nonzero-layer arrays when writing hvcC, so 'hvc1' would lose
@@ -776,6 +777,14 @@ fn parse_hvcc_parameter_sets_complete(extradata: &[u8]) -> Option<(usize, Vec<Ve
         return None;
       }
       let payload = &extradata[offset..offset + nal_len];
+      // The NAL header must itself be valid — forbidden_zero_bit clear and
+      // nuh_temporal_id_plus1 nonzero. A malformed header still type-matches
+      // (the forbidden bit is masked off below) but poisons the cached
+      // parameter sets: valid in-band copies then differ and get rejected
+      // instead of being preserved under the 'hev1' fallback
+      if payload[0] & 0x80 != 0 || payload[1] & 0x07 == 0 {
+        return None;
+      }
       // The NAL header type must match the array's declared type
       if (payload[0] >> 1) & 0x3f != array_type {
         return None;
@@ -952,6 +961,30 @@ mod tests {
     );
     reserved_len_size[21] = 0xfc | 2;
     assert!(parse_hvcc_parameter_sets_complete(&reserved_len_size).is_none());
+
+    // forbidden_zero_bit set: the type bits still match (the forbidden bit
+    // is masked off the type field) but the NAL header is invalid
+    let fzb_set = build_hvcc(
+      1,
+      &[
+        (32, vec![vec![0x40 | 0x80, 0x01, 0xaa]]),
+        (33, vec![sps()]),
+        (34, vec![pps()]),
+      ],
+    );
+    assert!(parse_hvcc_parameter_sets_complete(&fzb_set).is_none());
+
+    // nuh_temporal_id_plus1 == 0 (payload[1] low 3 bits): type and layer
+    // checks pass, but the NAL header is invalid
+    let tid_zero = build_hvcc(
+      1,
+      &[
+        (32, vec![vps()]),
+        (33, vec![vec![0x42, 0x00, 0xbb]]),
+        (34, vec![pps()]),
+      ],
+    );
+    assert!(parse_hvcc_parameter_sets_complete(&tid_zero).is_none());
   }
 
   #[test]
