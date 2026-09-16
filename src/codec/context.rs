@@ -802,7 +802,22 @@ impl CodecContext {
         ffctx_set_thread_count(ctx, 0);
       }
 
-      // TODO: Set extradata if provided
+      // Set extradata if provided (e.g., STREAMINFO for FLAC, OpusHead for
+      // Opus, AudioSpecificConfig for AAC, header packets for Vorbis).
+      // Vorbis and >2-channel Opus cannot initialize without it — the
+      // WebCodecs `description` field was parsed but silently dropped here.
+      if let Some(ref extradata) = config.extradata
+        && !extradata.is_empty()
+      {
+        let ret =
+          ffi::accessors::ffctx_set_extradata(ctx, extradata.as_ptr(), extradata.len() as i32);
+        if ret < 0 {
+          return Err(CodecError::HardwareError(format!(
+            "Failed to set extradata: {}",
+            ffi::FFmpegError::from_code(ret)
+          )));
+        }
+      }
     }
 
     Ok(())
