@@ -3,9 +3,11 @@
 //! This module provides common functionality for Mp4Muxer, WebMMuxer, and MkvMuxer
 //! to eliminate code duplication across the three implementations.
 
+use crate::codec::Packet;
 use crate::codec::io_buffer::StreamingBufferHandle;
 use crate::codec::muxer::{
-  AudioStreamConfig, ContainerFormat, MuxerContext, MuxerOptions, MuxerOutput, VideoStreamConfig,
+  AudioStreamConfig, ContainerFormat, HevcSampleEntry, Hvc1Context, MuxerContext, MuxerOptions,
+  MuxerOutput, VideoStreamConfig,
 };
 use crate::ffi::{AVCodecID, AVPixelFormat, AVRational, AVSampleFormat};
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunk;
@@ -196,6 +198,8 @@ pub struct GenericVideoTrackConfig {
   pub extradata: Option<Vec<u8>>,
   /// Whether this track has alpha channel (VP9 alpha support)
   pub has_alpha: bool,
+  /// HEVC sample-entry override (MP4 only; ignored for other containers/codecs)
+  pub hevc_sample_entry: HevcSampleEntry,
 }
 
 /// Generic audio track configuration passed to base implementation
@@ -275,6 +279,10 @@ pub struct MuxerInner<F: MuxerFormat> {
   /// reordered-frame compatibility path advances from the previous packet's
   /// end, not by the duration of the packet currently being written.
   last_video_duration: i64,
+  /// HEVC 'hvc1' selection context. In-band parameter sets that duplicate the
+  /// hvcC are stripped from samples because 'hvc1' forbids them; None when
+  /// 'hev1' is in use (in-band sets allowed).
+  strip_hevc_ps: Option<Hvc1Context>,
   /// Phantom data for format type
   _format: PhantomData<F>,
 }
@@ -313,6 +321,7 @@ impl<F: MuxerFormat> MuxerInner<F> {
       video_dts_shift: 0,
       last_video_dts: i64::MIN,
       last_video_duration: 0,
+      strip_hevc_ps: None,
       _format: PhantomData,
     })
   }
@@ -351,6 +360,7 @@ impl<F: MuxerFormat> MuxerInner<F> {
       video_dts_shift: 0,
       last_video_dts: i64::MIN,
       last_video_duration: 0,
+      strip_hevc_ps: None,
       _format: PhantomData,
     })
   }
@@ -409,6 +419,7 @@ impl<F: MuxerFormat> MuxerInner<F> {
       time_base,
       bitrate: None,
       extradata: config.extradata,
+      hevc_sample_entry: config.hevc_sample_entry,
     };
 
     self.muxer.add_video_stream(&stream_config).map_err(|e| {
@@ -417,6 +428,9 @@ impl<F: MuxerFormat> MuxerInner<F> {
         format!("Failed to add video stream: {}", e),
       )
     })?;
+
+    // 'hvc1' forbids in-band parameter sets; strip hvcC duplicates below
+    self.strip_hevc_ps = self.muxer.hvc1_context().cloned();
 
     self.video_track_info = Some(StoredVideoTrackInfo {
       codec: config.codec,
@@ -516,16 +530,6 @@ impl<F: MuxerFormat> MuxerInner<F> {
       .video_stream_index()
       .ok_or_else(|| Error::new(Status::GenericFailure, "No video track added"))?;
 
-    // Write header if needed
-    self.ensure_header_written()?;
-
-    if self.state != MuxerState::Muxing {
-      return Err(Error::new(
-        Status::GenericFailure,
-        "Muxer is not in muxing state",
-      ));
-    }
-
     // Get chunk data and metadata
     let chunk_type = chunk.chunk_type()?;
     let timestamp = chunk.timestamp()?;
@@ -539,6 +543,72 @@ impl<F: MuxerFormat> MuxerInner<F> {
     // - If chunk has Packet (from encoder): shallow_clone shares buffer (zero-copy)
     // - If chunk has Vec<u8> (from JS): copy data into new packet
     let mut packet = chunk.get_packet_for_muxing()?;
+
+    // 'hvc1' forbids in-band VPS/SPS/PPS; drop the ones already carried by the
+    // hvcC. Done before the header is written below so a rejected chunk leaves
+    // the muxer in the configuring state (tracks can still be added, streaming
+    // output stays empty). Also a plain data replace: no packet metadata is
+    // set yet. Malformed samples, in-band parameter-set updates, and mid-stream
+    // description changes (which 'hvc1' cannot represent) are rejected here.
+    if let Some(hvc1) = &self.strip_hevc_ps {
+      // A packet carrying a new description (AV_PKT_DATA_NEW_EXTRADATA) means
+      // the stream's parameter sets changed mid-stream. The stripping context
+      // is fixed at track-add time and cannot follow the change — and the
+      // packet replacement below would drop the side data — so reject
+      // anything but a redundant re-send of the same hvcC.
+      if let Some(new_extradata) = packet.new_extradata()
+        && new_extradata != hvc1.extradata.as_slice()
+      {
+        return Err(Error::new(
+          Status::GenericFailure,
+          "HEVC description changed mid-stream, which the 'hvc1' sample entry cannot represent",
+        ));
+      }
+      // The same change can arrive via metadata.decoderConfig.description
+      // (e.g. chunks from a second encoder session). Reject it here, before
+      // any timestamp state is touched, so the muxer stays usable afterwards.
+      let metadata_desc: Option<&[u8]> = metadata
+        .as_ref()
+        .and_then(|m| m.decoder_config.as_ref())
+        .and_then(|c| c.description.as_ref())
+        .map(|d| &d[..]);
+      if let Some(desc_data) = metadata_desc
+        && !desc_data.is_empty()
+        && desc_data != hvc1.extradata.as_slice()
+      {
+        return Err(Error::new(
+          Status::GenericFailure,
+          "HEVC description changed mid-stream, which the 'hvc1' sample entry cannot represent",
+        ));
+      }
+      let stripped =
+        strip_hevc_parameter_sets(packet.as_slice(), hvc1.nal_len_size, &hvc1.parameter_sets)
+          .map_err(|e| Error::new(Status::GenericFailure, e))?;
+      if let Some(stripped) = stripped {
+        let mut stripped_packet = Packet::new()
+          .map_err(|e| Error::new(Status::GenericFailure, format!("Packet alloc: {}", e)))?;
+        stripped_packet
+          .copy_data_from(&stripped)
+          .map_err(|e| Error::new(Status::GenericFailure, format!("Packet copy: {}", e)))?;
+        // Preserve the source packet's flags — notably AV_PKT_FLAG_DISCARD,
+        // which mov.c sets for edit-list-trimmed samples and movenc uses to
+        // keep trimmed tails out of the output edit list. The keyframe-flag
+        // logic below only ever adds KEY, so this must carry over explicitly.
+        stripped_packet.set_flags(packet.flags());
+        packet = stripped_packet;
+      }
+    }
+
+    // Write header if needed — only after validation above, so a rejected
+    // chunk does not commit the header or flip the state out of configuring
+    self.ensure_header_written()?;
+
+    if self.state != MuxerState::Muxing {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "Muxer is not in muxing state",
+      ));
+    }
 
     // Set packet properties
     packet.set_stream_index(video_index);
@@ -615,23 +685,26 @@ impl<F: MuxerFormat> MuxerInner<F> {
     packet.set_dts(final_dts);
     packet.set_duration(dur);
 
-    // Set keyframe flag
+    // Set keyframe flag, preserving flags the packet already carries
+    // (e.g. AV_PKT_FLAG_DISCARD on edit-list-trimmed samples)
     if chunk_type == EncodedVideoChunkType::Key {
-      packet.set_flags(crate::ffi::pkt_flag::KEY);
+      packet.set_flags(packet.flags() | crate::ffi::pkt_flag::KEY);
     }
 
-    // Handle metadata - extract description if present
-    if let Some(description) = metadata
-      .as_ref()
-      .and_then(|m| m.decoder_config.as_ref())
-      .and_then(|c| c.description.as_ref())
+    // Handle metadata - extract description if present. Under 'hvc1' a changed
+    // description was already validated above (identical re-sends are no-ops);
+    // under 'hev1' dynamic updates remain allowed.
+    if self.strip_hevc_ps.is_none()
+      && let Some(description) = metadata
+        .as_ref()
+        .and_then(|m| m.decoder_config.as_ref())
+        .and_then(|c| c.description.as_ref())
     {
       let desc_data: &[u8] = description;
-      if !desc_data.is_empty() {
-        // Update extradata dynamically if available
-        if let Err(e) = self.muxer.update_video_extradata(desc_data) {
-          tracing::warn!(target: "webcodecs", "Failed to update video extradata: {}", e);
-        }
+      if !desc_data.is_empty()
+        && let Err(e) = self.muxer.update_video_extradata(desc_data)
+      {
+        tracing::warn!(target: "webcodecs", "Failed to update video extradata: {}", e);
       }
     }
 
@@ -736,8 +809,9 @@ impl<F: MuxerFormat> MuxerInner<F> {
       }
     }
 
-    // Audio packets are typically all keyframes
-    packet.set_flags(crate::ffi::pkt_flag::KEY);
+    // Audio packets are typically all keyframes; OR (not assign) so any
+    // carried flags survive
+    packet.set_flags(packet.flags() | crate::ffi::pkt_flag::KEY);
 
     // Write packet
     self.muxer.write_packet(&mut packet).map_err(|e| {
@@ -853,9 +927,77 @@ impl<F: MuxerFormat> MuxerInner<F> {
   }
 }
 
+/// Strip VPS/SPS/PPS NAL units from a length-prefixed HEVC sample when they
+/// are byte-identical to a parameter set in the hvcC sample description.
+///
+/// Mirrors `ff_hevc_annexb2mp4` with filter_ps=1 (FFmpeg hevc.c): drops
+/// exactly NAL types 32/33/34, keeps everything else (including AUD).
+/// Returns Ok(None) — pass the original data through unchanged — when the
+/// sample carries no parameter sets. Errors when the buffer does not parse
+/// cleanly as length-prefixed NALs, or when a parameter set differs from
+/// every hvcC entry: that is an in-band parameter update, which 'hvc1' cannot
+/// represent, and dropping it would silently corrupt the stream.
+fn strip_hevc_parameter_sets(
+  data: &[u8],
+  len_size: usize,
+  known: &[Vec<u8>],
+) -> std::result::Result<Option<Vec<u8>>, String> {
+  const NAL_TYPE_VPS: u8 = 32;
+  const NAL_TYPE_PPS: u8 = 34;
+
+  let mut offset = 0;
+  let mut out: Option<Vec<u8>> = None;
+  while offset < data.len() {
+    if data.len() - offset < len_size {
+      return Err("malformed HEVC sample: truncated NAL length prefix".to_string());
+    }
+    let mut nal_len: usize = 0;
+    for &b in &data[offset..offset + len_size] {
+      nal_len = (nal_len << 8) | usize::from(b);
+    }
+    let nal_start = offset + len_size;
+    // HEVC NAL units carry a two-byte header; shorter payloads are malformed.
+    // A four-byte Annex-B start code reads as a length of 1, so call it out
+    // explicitly — such samples need an Annex-B description (movenc converts
+    // them only when the track extradata is start-code formatted), not hvc1.
+    if nal_len < 2 {
+      let annexb_start_code = data.len() - offset >= 4 && data[offset..offset + 4] == [0, 0, 0, 1];
+      return Err(if annexb_start_code {
+        "sample looks like Annex-B (start code) but the track description is an hvcC; \
+         mux Annex-B samples with an Annex-B description or convert them to length-prefixed NALs"
+          .to_string()
+      } else {
+        "malformed HEVC sample: NAL shorter than the 2-byte header".to_string()
+      });
+    }
+    if data.len() - nal_start < nal_len {
+      return Err("malformed HEVC sample: NAL overruns end of sample".to_string());
+    }
+    let nal = &data[nal_start..nal_start + nal_len];
+    let nal_type = (nal[0] >> 1) & 0x3f;
+    let is_ps = (NAL_TYPE_VPS..=NAL_TYPE_PPS).contains(&nal_type);
+    if is_ps && !known.iter().any(|k| k.as_slice() == nal) {
+      return Err(
+        "HEVC sample carries an in-band parameter set update absent from the hvcC \
+         description, which the 'hvc1' sample entry cannot represent"
+          .to_string(),
+      );
+    }
+    match out.as_mut() {
+      // Already stripping: keep non-parameter-set NALs (prefix + data)
+      Some(buf) if !is_ps => buf.extend_from_slice(&data[offset..nal_start + nal_len]),
+      // First parameter-set NAL: start the output with everything before it
+      None if is_ps => out = Some(data[..offset].to_vec()),
+      _ => {}
+    }
+    offset = nal_start + nal_len;
+  }
+  Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
-  use super::next_reordered_video_timestamp;
+  use super::{next_reordered_video_timestamp, strip_hevc_parameter_sets};
 
   #[test]
   fn reordered_vfr_timestamps_advance_by_previous_packet_duration() {
@@ -869,5 +1011,116 @@ mod tests {
   #[test]
   fn reordered_timestamps_remain_monotonic_without_duration() {
     assert_eq!(next_reordered_video_timestamp(10, 0), 11);
+  }
+
+  fn lp(nal: &[u8]) -> Vec<u8> {
+    let mut out = (nal.len() as u32).to_be_bytes().to_vec();
+    out.extend_from_slice(nal);
+    out
+  }
+
+  // Valid 2-byte NAL headers: [type << 1, 0x01]
+  const VPS: &[u8] = &[0x40, 0x01, 0xaa];
+  const SPS: &[u8] = &[0x42, 0x01, 0xbb];
+  const PPS: &[u8] = &[0x44, 0x01, 0xcc];
+  const IDR: &[u8] = &[0x28, 0x01, 0xdd]; // type 20
+  const AUD: &[u8] = &[0x46, 0x01, 0x50]; // type 35
+
+  fn known_sets() -> Vec<Vec<u8>> {
+    vec![VPS.to_vec(), SPS.to_vec(), PPS.to_vec()]
+  }
+
+  fn concat(parts: &[&[u8]]) -> Vec<u8> {
+    parts.concat()
+  }
+
+  #[test]
+  fn strips_parameter_sets_matching_hvcc() {
+    let sample = concat(&[&lp(VPS), &lp(SPS), &lp(PPS), &lp(IDR)]);
+    let stripped = strip_hevc_parameter_sets(&sample, 4, &known_sets())
+      .unwrap()
+      .expect("parameter sets should be stripped");
+    assert_eq!(stripped, lp(IDR));
+  }
+
+  #[test]
+  fn strip_keeps_aud_and_non_ps_nals() {
+    let sample = concat(&[&lp(AUD), &lp(SPS), &lp(IDR)]);
+    let stripped = strip_hevc_parameter_sets(&sample, 4, &known_sets())
+      .unwrap()
+      .expect("SPS should be stripped");
+    assert_eq!(stripped, concat(&[&lp(AUD), &lp(IDR)]));
+  }
+
+  #[test]
+  fn strip_passes_through_samples_without_parameter_sets() {
+    let sample = concat(&[&lp(IDR), &lp(AUD)]);
+    assert_eq!(
+      strip_hevc_parameter_sets(&sample, 4, &known_sets()).unwrap(),
+      None
+    );
+    assert_eq!(
+      strip_hevc_parameter_sets(&[], 4, &known_sets()).unwrap(),
+      None
+    );
+  }
+
+  #[test]
+  fn strip_rejects_parameter_set_updates_absent_from_hvcc() {
+    let updated_sps: &[u8] = &[0x42, 0x01, 0x99]; // same type, different payload
+    let sample = concat(&[&lp(VPS), &lp(updated_sps), &lp(IDR)]);
+    let err = strip_hevc_parameter_sets(&sample, 4, &known_sets()).unwrap_err();
+    assert!(err.contains("parameter set update"), "{err}");
+  }
+
+  #[test]
+  fn strip_rejects_malformed_samples() {
+    // Trailing byte
+    let mut trailing = lp(IDR);
+    trailing.push(0xaa);
+    assert!(strip_hevc_parameter_sets(&trailing, 4, &known_sets()).is_err());
+
+    // Zero-length NAL
+    let mut zero = 0u32.to_be_bytes().to_vec();
+    zero.extend_from_slice(&lp(IDR));
+    assert!(strip_hevc_parameter_sets(&zero, 4, &known_sets()).is_err());
+
+    // One-byte NAL: shorter than the mandatory two-byte NAL header
+    let mut one = 1u32.to_be_bytes().to_vec();
+    one.push(0x28);
+    assert!(strip_hevc_parameter_sets(&one, 4, &known_sets()).is_err());
+
+    // NAL overruns end of sample
+    let mut overrun = 0u32.to_be_bytes().to_vec();
+    overrun[3] = 10;
+    overrun.extend_from_slice(IDR);
+    assert!(strip_hevc_parameter_sets(&overrun, 4, &known_sets()).is_err());
+  }
+
+  #[test]
+  fn strip_supports_short_length_prefixes() {
+    // 1-byte prefix
+    let mut sample = vec![SPS.len() as u8];
+    sample.extend_from_slice(SPS);
+    sample.push(IDR.len() as u8);
+    sample.extend_from_slice(IDR);
+    let stripped = strip_hevc_parameter_sets(&sample, 1, &known_sets())
+      .unwrap()
+      .expect("SPS should be stripped");
+    let mut expected = vec![IDR.len() as u8];
+    expected.extend_from_slice(IDR);
+    assert_eq!(stripped, expected);
+
+    // 2-byte prefix
+    let mut sample = (SPS.len() as u16).to_be_bytes().to_vec();
+    sample.extend_from_slice(SPS);
+    sample.extend_from_slice(&(IDR.len() as u16).to_be_bytes());
+    sample.extend_from_slice(IDR);
+    let stripped = strip_hevc_parameter_sets(&sample, 2, &known_sets())
+      .unwrap()
+      .expect("SPS should be stripped");
+    let mut expected = (IDR.len() as u16).to_be_bytes().to_vec();
+    expected.extend_from_slice(IDR);
+    assert_eq!(stripped, expected);
   }
 }

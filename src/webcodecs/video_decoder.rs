@@ -360,18 +360,6 @@ impl Drop for VideoDecoder {
     if let Some(handle) = self.worker_handle.take() {
       let _ = handle.join();
     }
-
-    // Drain decoder to ensure libaom/AV1 threads finish before context drops.
-    // This prevents SIGSEGV when avcodec_free_context is called while libaom
-    // still has internal threads running.
-    if let Ok(mut inner) = self.inner.lock()
-      && let Some(ctx) = inner.context.as_mut()
-    {
-      // Flush internal buffers first - this synchronizes libaom's thread pool
-      ctx.flush();
-      let _ = ctx.send_packet(None);
-      while ctx.receive_frame().ok().flatten().is_some() {}
-    }
   }
 }
 
@@ -772,13 +760,6 @@ impl VideoDecoder {
       .ok_or_else(|| Error::new(Status::GenericFailure, "No decoder config"))?
       .clone();
 
-    // Drain existing decoder before dropping (AV1 safety)
-    if let Some(ctx) = inner.context.as_mut() {
-      ctx.flush();
-      let _ = ctx.send_packet(None);
-      while ctx.receive_frame().ok().flatten().is_some() {}
-    }
-
     // Create software decoder
     let mut context = CodecContext::new_decoder(decoder_config.codec_id).map_err(|e| {
       Error::new(
@@ -1031,7 +1012,7 @@ impl VideoDecoder {
   }
 
   /// Process a reconfigure command on the worker thread
-  /// Drains old context and creates new one with updated config
+  /// Replaces the old context with a new one with updated config
   fn process_reconfigure(
     inner: &Arc<Mutex<VideoDecoderInner>>,
     config: VideoDecoderConfig,
@@ -1049,13 +1030,6 @@ impl VideoDecoder {
     // Don't reconfigure if decoder is closed
     if guard.state == CodecState::Closed {
       return;
-    }
-
-    // Drain old context (AV1/libaom thread safety)
-    if let Some(ctx) = guard.context.as_mut() {
-      ctx.flush();
-      let _ = ctx.send_packet(None);
-      while ctx.receive_frame().ok().flatten().is_some() {}
     }
 
     // Clear codec-local work state. Do not reset decode_queue_size here:
@@ -1923,13 +1897,6 @@ impl VideoDecoder {
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    // Drain decoder before dropping to ensure libaom/AV1 threads finish
-    if let Some(ctx) = inner.context.as_mut() {
-      ctx.flush();
-      let _ = ctx.send_packet(None);
-      while ctx.receive_frame().ok().flatten().is_some() {}
-    }
-
     // Drop existing context
     inner.context = None;
     inner.config = None;
@@ -2017,14 +1984,6 @@ impl VideoDecoder {
       .inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    // Drain decoder before dropping to ensure libaom/AV1 threads finish
-    if let Some(ctx) = inner.context.as_mut() {
-      // Flush internal buffers first - this synchronizes libaom's thread pool
-      ctx.flush();
-      let _ = ctx.send_packet(None);
-      while ctx.receive_frame().ok().flatten().is_some() {}
-    }
 
     inner.context = None;
     inner.config = None;

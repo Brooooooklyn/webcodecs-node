@@ -14,7 +14,7 @@ use crate::ffi::{
 use crate::webcodecs::codec_pressure;
 use crate::webcodecs::error::DOMExceptionName;
 use crate::webcodecs::error::{
-  native_dom_exception_error, throw_invalid_state_error, throw_type_error_unit,
+  native_dom_exception_error, throw_data_error, throw_invalid_state_error, throw_type_error_unit,
 };
 use crate::webcodecs::flush_tracker::FlushTracker;
 use crate::webcodecs::hw_fallback::{
@@ -471,6 +471,14 @@ struct VideoEncoderInner {
   codec_id: Option<AVCodecID>,
 
   // ========================================================================
+  // Session orientation tracking (W3C orientation consistency validation)
+  // ========================================================================
+  /// Orientation (rotation, flip) established by the first frame encoded after
+  /// configure()/reset(). Encoding a frame with a different orientation throws
+  /// a non-fatal DataError. Cleared on configure(), reset(), and close().
+  session_orientation: Option<(f64, bool)>,
+
+  // ========================================================================
   // Hardware encoder pressure tracking
   // ========================================================================
   /// Whether we acquired a hardware encoder slot from the pressure gauge
@@ -587,22 +595,12 @@ impl Drop for VideoEncoder {
       let _ = handle.join();
     }
 
-    // Drain encoder to ensure libaom/AV1 threads finish before context drops.
-    // This prevents SIGSEGV when avcodec_free_context is called while libaom
-    // still has internal threads running.
+    // Release the hardware encoder slot if we acquired one
     if let Ok(mut inner) = self.inner.lock()
-      && let Some(ctx) = inner.context.as_mut()
+      && inner.acquired_hw_slot
     {
-      // Flush internal buffers first - this synchronizes libaom's thread pool
-      ctx.flush();
-      let _ = ctx.send_frame(None);
-      while ctx.receive_packet().ok().flatten().is_some() {}
-
-      // Release the hardware encoder slot if we acquired one
-      if inner.acquired_hw_slot {
-        codec_pressure::gauge().release_hw_encoder();
-        inner.acquired_hw_slot = false;
-      }
+      codec_pressure::gauge().release_hw_encoder();
+      inner.acquired_hw_slot = false;
     }
   }
 }
@@ -657,6 +655,8 @@ impl VideoEncoder {
       pixel_format: AVPixelFormat::Yuv420p,
       // Codec identification (set during configure)
       codec_id: None,
+      // Session orientation tracking (established by first encoded frame)
+      session_orientation: None,
       // Hardware encoder pressure tracking (managed by codec_pressure gauge)
       acquired_hw_slot: false,
     };
@@ -1920,7 +1920,7 @@ impl VideoEncoder {
   }
 
   /// Process a reconfigure command on the worker thread
-  /// Drains old context and creates new one with updated config
+  /// Replaces the old context with a new one with updated config
   fn process_reconfigure(
     inner: &Arc<Mutex<VideoEncoderInner>>,
     config: VideoEncoderConfig,
@@ -1938,13 +1938,6 @@ impl VideoEncoder {
     // Don't reconfigure if encoder is closed
     if guard.state == CodecState::Closed {
       return;
-    }
-
-    // Drain old context (libaom/AV1 thread safety)
-    if let Some(ctx) = guard.context.as_mut() {
-      ctx.flush();
-      let _ = ctx.send_frame(None);
-      while ctx.receive_packet().ok().flatten().is_some() {}
     }
 
     // Release the old hardware encoder slot (we're replacing the encoder)
@@ -2812,6 +2805,11 @@ impl VideoEncoder {
         return Ok(());
       }
 
+      // W3C spec: reconfigure starts a new encode session, so clear the
+      // session orientation synchronously - a main-thread encode() right after
+      // configure() runs before the queued reconfigure command below.
+      inner.session_orientation = None;
+
       // Queue reconfigure via microtask (runs AFTER pending encode microtasks)
       // Use Weak reference to allow close() to immediately close channel without deadlock
       drop(inner); // Release lock before scheduling microtask
@@ -3213,6 +3211,9 @@ impl VideoEncoder {
       .and_then(|mode| parse_temporal_layer_count(mode));
     inner.output_frame_count = 0;
 
+    // New encode session - the next encoded frame establishes the orientation
+    inner.session_orientation = None;
+
     // Bitstream format conversion - determine if AVCC/HVCC format is needed
     // W3C spec: Default is AVCC/HVCC format (length-prefixed NAL units)
     // Use Annex B only if explicitly requested via avc.format or hevc.format
@@ -3318,6 +3319,23 @@ impl VideoEncoder {
       // Get rotation and flip for metadata output (W3C WebCodecs spec)
       let rotation = frame.rotation().unwrap_or(0.0);
       let flip = frame.flip().unwrap_or(false);
+
+      // W3C spec: the first frame encoded after configure() establishes the
+      // session orientation; a frame with a different orientation is rejected
+      // with a non-fatal DataError (thrown synchronously, before queueing).
+      match inner.session_orientation {
+        Some((session_rotation, session_flip)) => {
+          if session_rotation != rotation || session_flip != flip {
+            return throw_data_error(
+              &env,
+              "Frame orientation differs from the session orientation",
+            );
+          }
+        }
+        None => {
+          inner.session_orientation = Some((rotation, flip));
+        }
+      }
 
       let color_space = frame.color_space().ok().map(|value| value.to_init());
 
@@ -3541,13 +3559,6 @@ impl VideoEncoder {
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    // Drain encoder before dropping to ensure libaom/AV1 threads finish
-    if let Some(ctx) = inner.context.as_mut() {
-      ctx.flush();
-      let _ = ctx.send_frame(None);
-      while ctx.receive_packet().ok().flatten().is_some() {}
-    }
-
     // Drop existing context
     inner.context = None;
     inner.scaler = None;
@@ -3573,6 +3584,7 @@ impl VideoEncoder {
     inner.pending_frames.clear();
     inner.timestamp_map.clear();
     inner.input_color_space = None;
+    inner.session_orientation = None;
 
     // Reset temporal SVC tracking
     inner.temporal_layer_count = None;
@@ -3644,17 +3656,6 @@ impl VideoEncoder {
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    // Drain encoder before dropping to ensure libaom/AV1 threads finish
-    // This prevents SIGSEGV crashes during cleanup
-    if let Some(ctx) = inner.context.as_mut() {
-      // Flush internal buffers first - this synchronizes libaom's thread pool
-      ctx.flush();
-      // Send NULL frame to signal end of stream
-      let _ = ctx.send_frame(None);
-      // Drain all remaining packets
-      while ctx.receive_packet().ok().flatten().is_some() {}
-    }
-
     // Release the hardware encoder slot if we acquired one
     if inner.acquired_hw_slot {
       codec_pressure::gauge().release_hw_encoder();
@@ -3665,6 +3666,7 @@ impl VideoEncoder {
     inner.scaler = None;
     inner.config = None;
     inner.input_color_space = None;
+    inner.session_orientation = None;
     inner.state = CodecState::Closed;
     inner.encode_queue_size = 0;
 
