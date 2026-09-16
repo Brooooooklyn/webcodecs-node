@@ -720,7 +720,8 @@ impl MuxerContext {
 /// Returns None for malformed or incomplete records.
 ///
 /// Layout per ISO/IEC 14496-15: byte 0 is configurationVersion (must be 1) in
-/// a 23-byte fixed header, byte 21 low 2 bits are lengthSizeMinusOne, byte 22
+/// a 23-byte fixed header, byte 21 low 2 bits are lengthSizeMinusOne (only
+/// 0, 1, 3 are defined — 2 is reserved and rejected), byte 22
 /// is numOfArrays, then per array: 1 header byte (low 6 bits are the NAL unit
 /// type), u16-be numNalus, and per NAL a u16-be length followed by the NAL
 /// data. Every payload must hold at least the 2-byte NAL header, and its
@@ -743,7 +744,14 @@ fn parse_hvcc_parameter_sets_complete(extradata: &[u8]) -> Option<(usize, Vec<Ve
   if extradata.len() < 23 || extradata[0] != 1 {
     return None;
   }
-  let len_size = usize::from(extradata[21] & 0x03) + 1;
+  // lengthSizeMinusOne is unsigned int(2): only 0/1/3 (1/2/4-byte prefixes)
+  // are defined; the reserved value 2 would misparse ordinary samples as
+  // 3-byte-prefixed NALs under 'hvc1'
+  let len_size_minus_one = extradata[21] & 0x03;
+  if len_size_minus_one == 2 {
+    return None;
+  }
+  let len_size = usize::from(len_size_minus_one) + 1;
   let num_arrays = usize::from(extradata[22]);
 
   let mut offset = 23;
@@ -935,6 +943,15 @@ mod tests {
       &[(32, vec![vps()]), (33, vec![sps()]), (34, vec![pps()])],
     )[..26];
     assert!(parse_hvcc_parameter_sets_complete(truncated).is_none());
+
+    // lengthSizeMinusOne == 2 is reserved: hvcC defines only 1/2/4-byte
+    // prefixes, so the record is malformed and must keep 'hev1'
+    let mut reserved_len_size = build_hvcc(
+      1,
+      &[(32, vec![vps()]), (33, vec![sps()]), (34, vec![pps()])],
+    );
+    reserved_len_size[21] = 0xfc | 2;
+    assert!(parse_hvcc_parameter_sets_complete(&reserved_len_size).is_none());
   }
 
   #[test]
