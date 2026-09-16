@@ -615,6 +615,84 @@ test('AudioDecoder: Vorbis decodes with description', async (t) => {
   decoder.close()
 })
 
+test('AudioDecoder: reconfigure snapshots description at configure() time', async (t) => {
+  let vorbisData: Buffer
+  try {
+    vorbisData = readFileSync(join(fixturesPath, 'sfx-vorbis.ogg'))
+  } catch {
+    t.pass('Vorbis fixture not available')
+    return
+  }
+
+  const packets = parseOggPackets(vorbisData)
+  if (packets.length <= 3) {
+    t.pass('ogg contains header packets + audio packets')
+    return
+  }
+
+  const [id, comment, setup] = packets.slice(0, 3).map((p) => p.data)
+  const buildDescription = () =>
+    new Uint8Array(
+      Buffer.concat([
+        Buffer.from([2, ...oggLace(id.length), ...oggLace(comment.length)]),
+        id,
+        comment,
+        setup,
+      ]),
+    )
+  const sampleRate = id.readUInt32LE(12)
+  const channels = id[11]
+
+  const { init, outputs, errors } = createCollectingCodecInit<AudioData>()
+  const decoder = new AudioDecoder({
+    output: (data) => {
+      init.output(data)
+      data.close()
+    },
+    error: init.error,
+  })
+
+  decoder.configure({
+    codec: 'vorbis',
+    sampleRate,
+    numberOfChannels: channels,
+    description: buildDescription(),
+  })
+  t.is(decoder.state, 'configured')
+
+  // Reconfigure queues the config for the worker via microtask; the
+  // description must be snapshotted synchronously because a caller write after
+  // configure() returns still precedes the worker's copy.
+  const mutableDescription = buildDescription()
+  decoder.configure({
+    codec: 'vorbis',
+    sampleRate,
+    numberOfChannels: channels,
+    description: mutableDescription,
+  })
+  mutableDescription.fill(0xff)
+
+  for (const packet of packets.slice(3)) {
+    if (packet.data.length === 0) continue
+    decoder.decode(
+      new EncodedAudioChunk({
+        type: 'key',
+        timestamp: (packet.granule * 1e6) / sampleRate,
+        data: new Uint8Array(packet.data),
+      }),
+    )
+  }
+  await decoder.flush()
+
+  t.deepEqual(
+    errors.map((e) => e.message),
+    [],
+    'no decoder errors after mutating reconfigure description',
+  )
+  t.true(outputs.length > 0, 'vorbis decode produced output frames')
+  decoder.close()
+})
+
 // ============================================================================
 // Audio Codec Tests - PCM/WAV
 // ============================================================================
