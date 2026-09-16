@@ -6,7 +6,7 @@
 use crate::codec::Frame;
 use crate::ffi::AVSampleFormat;
 use crate::webcodecs::error::{
-  enforce_range_long_long, invalid_state_error, throw_invalid_state_error,
+  enforce_range_long_long, invalid_state_error, native_range_error, throw_invalid_state_error,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -95,6 +95,136 @@ impl AudioSampleFormat {
         | AudioSampleFormat::F32Planar
     )
   }
+
+  /// Base sample type with planarity stripped (u8-planar → u8, etc.)
+  fn base(&self) -> AudioSampleFormat {
+    match self {
+      AudioSampleFormat::U8 | AudioSampleFormat::U8Planar => AudioSampleFormat::U8,
+      AudioSampleFormat::S16 | AudioSampleFormat::S16Planar => AudioSampleFormat::S16,
+      AudioSampleFormat::S32 | AudioSampleFormat::S32Planar => AudioSampleFormat::S32,
+      AudioSampleFormat::F32 | AudioSampleFormat::F32Planar => AudioSampleFormat::F32,
+    }
+  }
+}
+
+/// Read one sample normalized to the [-1, 1] domain per the spec's
+/// "Magnitude of the audio samples" table (u8 bias 128, s16/s32 signed,
+/// f32 native). All format conversion goes through this representation.
+fn read_sample(buf: &[u8], index: usize, format: AudioSampleFormat) -> f64 {
+  match format.base() {
+    AudioSampleFormat::U8 => (f64::from(buf[index]) - 128.0) / 128.0,
+    AudioSampleFormat::S16 => {
+      f64::from(i16::from_le_bytes([buf[index * 2], buf[index * 2 + 1]])) / 32768.0
+    }
+    AudioSampleFormat::S32 => {
+      i32::from_le_bytes(buf[index * 4..index * 4 + 4].try_into().unwrap()) as f64 / 2147483648.0
+    }
+    AudioSampleFormat::F32 => {
+      f32::from_le_bytes(buf[index * 4..index * 4 + 4].try_into().unwrap()) as f64
+    }
+    _ => unreachable!(),
+  }
+}
+
+/// Write one normalized [-1, 1] sample in `format`, clipping to the type's
+/// minimum/maximum values. f32 output is not clipped per the spec note that
+/// implementations should not clip internally when handling f32 samples.
+fn write_sample(buf: &mut [u8], index: usize, format: AudioSampleFormat, value: f64) {
+  match format.base() {
+    AudioSampleFormat::U8 => {
+      buf[index] = (value * 128.0 + 128.0).round().clamp(0.0, 255.0) as u8;
+    }
+    AudioSampleFormat::S16 => {
+      buf[index * 2..index * 2 + 2].copy_from_slice(
+        &((value * 32768.0).round().clamp(-32768.0, 32767.0) as i16).to_le_bytes(),
+      );
+    }
+    AudioSampleFormat::S32 => {
+      buf[index * 4..index * 4 + 4].copy_from_slice(
+        &((value * 2147483648.0)
+          .round()
+          .clamp(-2147483648.0, 2147483647.0) as i32)
+          .to_le_bytes(),
+      );
+    }
+    AudioSampleFormat::F32 => {
+      buf[index * 4..index * 4 + 4].copy_from_slice(&(value as f32).to_le_bytes());
+    }
+    _ => unreachable!(),
+  }
+}
+
+/// Result of the spec's "Compute Copy Element Count" algorithm, plus the
+/// resolved destination format. Shared by allocationSize() and copyTo().
+struct CopyPlan {
+  /// Destination sample format (options.format ?? the AudioData's format)
+  dest_format: AudioSampleFormat,
+  /// Number of frames to copy (validated against frameOffset/frameCount)
+  copy_frames: usize,
+  /// Total sample count to copy — frames × channels for interleaved dests
+  element_count: usize,
+}
+
+/// Compute Copy Element Count per W3C WebCodecs spec: planeIndex is bounded
+/// by the *destination* format's planarity (interleaved dests have exactly
+/// one plane, planar dests one per channel); frameOffset >= numberOfFrames
+/// and oversized frameCount are RangeErrors.
+fn compute_copy_plan(
+  env: &Env,
+  inner: &AudioDataInner,
+  frame: &Frame,
+  options: &AudioDataCopyToOptions,
+) -> Result<CopyPlan> {
+  let dest_format = options.format.unwrap_or(inner.format);
+  let channels = frame.channels();
+
+  let num_planes = if dest_format.is_planar() { channels } else { 1 };
+  if options.plane_index >= num_planes {
+    return Err(native_range_error(
+      env,
+      &format!(
+        "planeIndex {} is out of bounds (numberOfPlanes is {})",
+        options.plane_index, num_planes
+      ),
+    )?);
+  }
+
+  let frame_count = frame.nb_samples();
+  let frame_offset = options.frame_offset.unwrap_or(0);
+  if frame_offset >= frame_count {
+    return Err(native_range_error(
+      env,
+      &format!(
+        "frameOffset {} is out of bounds (numberOfFrames is {})",
+        frame_offset, frame_count
+      ),
+    )?);
+  }
+  let mut copy_frames = frame_count - frame_offset;
+  if let Some(frame_count_opt) = options.frame_count {
+    if frame_count_opt > copy_frames {
+      return Err(native_range_error(
+        env,
+        &format!(
+          "frameCount {} exceeds the {} frames available after frameOffset",
+          frame_count_opt, copy_frames
+        ),
+      )?);
+    }
+    copy_frames = frame_count_opt;
+  }
+
+  let element_count = if dest_format.is_planar() {
+    copy_frames as usize
+  } else {
+    copy_frames as usize * channels as usize
+  };
+
+  Ok(CopyPlan {
+    dest_format,
+    copy_frames: copy_frames as usize,
+    element_count,
+  })
 }
 
 /// Options for creating an AudioData (W3C WebCodecs spec)
@@ -560,48 +690,21 @@ impl AudioData {
       None => return throw_invalid_state_error(&env, "AudioData is closed"),
     };
 
-    let format = options.format.unwrap_or(inner.format);
-
     // Acquire read lock on the shared frame
     let frame_guard = inner.frame.read();
 
-    // Validate planeIndex (throws RangeError per W3C spec)
-    let num_planes = if format.is_planar() {
-      frame_guard.channels()
-    } else {
-      1
-    };
-    if options.plane_index >= num_planes {
-      env.throw_range_error(
-        &format!(
-          "planeIndex {} is out of bounds (numberOfPlanes is {})",
-          options.plane_index, num_planes
-        ),
-        None,
-      )?;
-      return Err(Error::new(
+    // Compute Copy Element Count: validates planeIndex against the
+    // destination layout, frameOffset/frameCount against the frame's
+    // numberOfFrames (throws RangeError per W3C spec)
+    let plan = compute_copy_plan(&env, inner, &frame_guard, &options)?;
+
+    let byte_size = plan.element_count * plan.dest_format.bytes_per_sample();
+    u32::try_from(byte_size).map_err(|_| {
+      Error::new(
         Status::InvalidArg,
-        format!(
-          "planeIndex {} is out of bounds (numberOfPlanes is {})",
-          options.plane_index, num_planes
-        ),
-      ));
-    }
-
-    let frame_offset = options.frame_offset.unwrap_or(0);
-    let num_frames = options
-      .frame_count
-      .unwrap_or(frame_guard.nb_samples() - frame_offset);
-
-    let bytes_per_sample = format.bytes_per_sample() as u32;
-
-    if format.is_planar() {
-      // Planar: one plane per channel
-      Ok(num_frames * bytes_per_sample)
-    } else {
-      // Interleaved: all channels in one buffer
-      Ok(num_frames * frame_guard.channels() * bytes_per_sample)
-    }
+        "RangeError: allocation size does not fit in u32",
+      )
+    })
   }
 
   /// Copy audio data to a buffer (W3C WebCodecs spec)
@@ -624,38 +727,19 @@ impl AudioData {
       None => return throw_invalid_state_error(&env, "AudioData is closed"),
     };
 
-    let format = options.format.unwrap_or(inner.format);
-    let plane_index = options.plane_index as usize;
-    let frame_offset = options.frame_offset.unwrap_or(0) as usize;
-
     // Acquire read lock on the shared frame
     let frame_guard = inner.frame.read();
 
-    let num_frames = options
-      .frame_count
-      .unwrap_or(frame_guard.nb_samples() - frame_offset as u32) as usize;
+    // Compute Copy Element Count: validates planeIndex against the
+    // destination layout, frameOffset/frameCount against the frame's
+    // numberOfFrames (throws RangeError per W3C spec)
+    let plan = compute_copy_plan(&env, inner, &frame_guard, &options)?;
 
-    let bytes_per_sample = format.bytes_per_sample();
+    let dest_format = plan.dest_format;
+    let plane_index = options.plane_index as usize;
+    let frame_offset = options.frame_offset.unwrap_or(0) as usize;
+    let num_frames = plan.copy_frames;
     let channels = frame_guard.channels() as usize;
-
-    // Validate planeIndex (throws RangeError per W3C spec)
-    let num_planes = if format.is_planar() { channels } else { 1 };
-    if plane_index >= num_planes {
-      env.throw_range_error(
-        &format!(
-          "planeIndex {} is out of bounds (numberOfPlanes is {})",
-          plane_index, num_planes
-        ),
-        None,
-      )?;
-      return Err(Error::new(
-        Status::InvalidArg,
-        format!(
-          "planeIndex {} is out of bounds (numberOfPlanes is {})",
-          plane_index, num_planes
-        ),
-      ));
-    }
 
     // Extract the underlying buffer from AllowSharedBufferSource (TypedArray, DataView, or ArrayBuffer)
     let typed_array = destination
@@ -690,76 +774,112 @@ impl AudioData {
     let full_buffer = unsafe { buffer.as_mut() };
     let dest_slice = &mut full_buffer[byte_offset..byte_offset + byte_length];
 
-    if format.is_planar() {
-      let copy_size = num_frames * bytes_per_sample;
-      if dest_slice.len() < copy_size {
-        env.throw_range_error(
-          &format!(
-            "destination buffer too small: need {} bytes, got {}",
-            copy_size,
-            dest_slice.len()
-          ),
-          None,
-        )?;
-        return Err(Error::new(
-          Status::InvalidArg,
-          "Destination buffer too small",
-        ));
-      }
+    // The destination must hold element_count samples in the destination
+    // format — not the source format's byte size (RangeError per W3C spec)
+    let copy_size = plan.element_count * dest_format.bytes_per_sample();
+    if dest_slice.len() < copy_size {
+      env.throw_range_error(
+        &format!(
+          "destination buffer too small: need {} bytes, got {}",
+          copy_size,
+          dest_slice.len()
+        ),
+        None,
+      )?;
+      return Err(Error::new(
+        Status::InvalidArg,
+        "Destination buffer too small",
+      ));
+    }
 
-      // Get source data
-      if inner.format.is_planar() {
-        // Source is planar too
-        if let Some(src) = frame_guard.audio_channel_data(plane_index) {
-          let src_offset = frame_offset * bytes_per_sample;
-          dest_slice[..copy_size].copy_from_slice(&src[src_offset..src_offset + copy_size]);
-        }
-      } else {
-        // Source is interleaved, need to extract one channel
-        if let Some(src) = frame_guard.audio_channel_data(0) {
-          for i in 0..num_frames {
-            let src_offset = ((frame_offset + i) * channels + plane_index) * bytes_per_sample;
-            let dst_offset = i * bytes_per_sample;
-            dest_slice[dst_offset..dst_offset + bytes_per_sample]
-              .copy_from_slice(&src[src_offset..src_offset + bytes_per_sample]);
+    let src_format = inner.format;
+    if src_format.base() == dest_format.base() {
+      // Same base sample type (planarity may still differ) — verbatim byte
+      // copy; source indexing uses the source format's byte size
+      let bytes_per_sample = dest_format.bytes_per_sample();
+      if dest_format.is_planar() {
+        if src_format.is_planar() {
+          // Source is planar too
+          if let Some(src) = frame_guard.audio_channel_data(plane_index) {
+            let src_offset = frame_offset * bytes_per_sample;
+            dest_slice[..copy_size].copy_from_slice(&src[src_offset..src_offset + copy_size]);
           }
-        }
-      }
-    } else {
-      // Interleaved output
-      let copy_size = num_frames * channels * bytes_per_sample;
-      if dest_slice.len() < copy_size {
-        env.throw_range_error(
-          &format!(
-            "destination buffer too small: need {} bytes, got {}",
-            copy_size,
-            dest_slice.len()
-          ),
-          None,
-        )?;
-        return Err(Error::new(
-          Status::InvalidArg,
-          "Destination buffer too small",
-        ));
-      }
-
-      if inner.format.is_planar() {
-        // Source is planar, need to interleave
-        for i in 0..num_frames {
-          for ch in 0..channels {
-            if let Some(src) = frame_guard.audio_channel_data(ch) {
-              let src_offset = (frame_offset + i) * bytes_per_sample;
-              let dst_offset = (i * channels + ch) * bytes_per_sample;
+        } else {
+          // Source is interleaved, need to extract one channel
+          if let Some(src) = frame_guard.audio_channel_data(0) {
+            for i in 0..num_frames {
+              let src_offset = ((frame_offset + i) * channels + plane_index) * bytes_per_sample;
+              let dst_offset = i * bytes_per_sample;
               dest_slice[dst_offset..dst_offset + bytes_per_sample]
                 .copy_from_slice(&src[src_offset..src_offset + bytes_per_sample]);
             }
           }
         }
       } else {
-        // Both interleaved
-        if let Some(src) = frame_guard.audio_channel_data(0) {
-          let src_offset = frame_offset * channels * bytes_per_sample;
-          dest_slice[..copy_size].copy_from_slice(&src[src_offset..src_offset + copy_size]);
+        // Interleaved output
+        if src_format.is_planar() {
+          // Source is planar, need to interleave
+          for i in 0..num_frames {
+            for ch in 0..channels {
+              if let Some(src) = frame_guard.audio_channel_data(ch) {
+                let src_offset = (frame_offset + i) * bytes_per_sample;
+                let dst_offset = (i * channels + ch) * bytes_per_sample;
+                dest_slice[dst_offset..dst_offset + bytes_per_sample]
+                  .copy_from_slice(&src[src_offset..src_offset + bytes_per_sample]);
+              }
+            }
+          }
+        } else {
+          // Both interleaved
+          if let Some(src) = frame_guard.audio_channel_data(0) {
+            let src_offset = frame_offset * channels * bytes_per_sample;
+            dest_slice[..copy_size].copy_from_slice(&src[src_offset..src_offset + copy_size]);
+          }
+        }
+      }
+    } else {
+      // Base sample types differ — per-sample conversion through the
+      // normalized [-1, 1] domain per the spec's magnitude table
+      if dest_format.is_planar() {
+        let src = frame_guard
+          .audio_channel_data(if src_format.is_planar() {
+            plane_index
+          } else {
+            0
+          })
+          .ok_or_else(|| Error::new(Status::GenericFailure, "missing audio channel data"))?;
+        for i in 0..num_frames {
+          let src_index = if src_format.is_planar() {
+            frame_offset + i
+          } else {
+            (frame_offset + i) * channels + plane_index
+          };
+          write_sample(
+            dest_slice,
+            i,
+            dest_format,
+            read_sample(src, src_index, src_format),
+          );
+        }
+      } else {
+        // Interleaved destination — all channels are written
+        for ch in 0..channels {
+          let src = frame_guard
+            .audio_channel_data(if src_format.is_planar() { ch } else { 0 })
+            .ok_or_else(|| Error::new(Status::GenericFailure, "missing audio channel data"))?;
+          for i in 0..num_frames {
+            let src_index = if src_format.is_planar() {
+              frame_offset + i
+            } else {
+              (frame_offset + i) * channels + ch
+            };
+            write_sample(
+              dest_slice,
+              i * channels + ch,
+              dest_format,
+              read_sample(src, src_index, src_format),
+            );
+          }
         }
       }
     }
