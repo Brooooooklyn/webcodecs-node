@@ -515,6 +515,106 @@ test('AudioDecoder: Vorbis file', async (t) => {
   t.true(vorbisData.length > 0, 'fixture loaded')
 })
 
+// Minimal Ogg page parser — reassembles packets across page lacing
+function parseOggPackets(buf: Buffer): { data: Buffer; granule: number }[] {
+  const packets: { data: Buffer; granule: number }[] = []
+  let pos = 0
+  let cur: Buffer[] = []
+  while (pos + 27 <= buf.length) {
+    if (buf.toString('latin1', pos, pos + 4) !== 'OggS') break
+    const granule = Number(buf.readBigInt64LE(pos + 6))
+    const nSeg = buf[pos + 26]
+    let off = pos + 27 + nSeg
+    for (let s = 0; s < nSeg; s++) {
+      const len = buf[pos + 27 + s]
+      cur.push(buf.subarray(off, off + len))
+      off += len
+      if (len < 255) {
+        packets.push({ data: Buffer.concat(cur), granule })
+        cur = []
+      }
+    }
+    pos = off
+  }
+  return packets
+}
+
+// Ogg lacing: each packet emits floor(len/255) 0xFF bytes then len%255
+function oggLace(len: number): number[] {
+  const out: number[] = []
+  while (len >= 255) {
+    out.push(255)
+    len -= 255
+  }
+  out.push(len)
+  return out
+}
+
+test('AudioDecoder: Vorbis decodes with description', async (t) => {
+  let vorbisData: Buffer
+  try {
+    vorbisData = readFileSync(join(fixturesPath, 'sfx-vorbis.ogg'))
+  } catch {
+    t.pass('Vorbis fixture not available')
+    return
+  }
+
+  const packets = parseOggPackets(vorbisData)
+  t.true(packets.length > 3, 'ogg contains header packets + audio packets')
+  if (packets.length <= 3) return
+
+  const [id, comment, setup] = packets.slice(0, 3).map((p) => p.data)
+  t.is(id.subarray(1, 7).toString('latin1'), 'vorbis', 'first header is vorbis id')
+
+  // WebCodecs Vorbis description = Xiph extradata format:
+  // [0x02][laced len id][laced len comment][id][comment][setup]
+  const description = Buffer.concat([
+    Buffer.from([2, ...oggLace(id.length), ...oggLace(comment.length)]),
+    id,
+    comment,
+    setup,
+  ])
+
+  const sampleRate = id.readUInt32LE(12)
+  const channels = id[11]
+
+  const { init, outputs } = createCollectingCodecInit<AudioData>()
+  const decoder = new AudioDecoder({
+    output: (data) => {
+      outputs.push(data)
+      data.close()
+    },
+    error: init.error,
+  })
+
+  decoder.configure({
+    codec: 'vorbis',
+    sampleRate,
+    numberOfChannels: channels,
+    description: new Uint8Array(description),
+  })
+
+  // Vorbis cannot initialize without the header packets in description —
+  // before the extradata fix this errored at avcodec_open2 and closed the codec
+  t.is(decoder.state, 'configured')
+
+  for (const packet of packets.slice(3)) {
+    if (packet.data.length === 0) continue
+    decoder.decode(
+      new EncodedAudioChunk({
+        type: 'key',
+        timestamp: (packet.granule * 1e6) / sampleRate,
+        data: new Uint8Array(packet.data),
+      }),
+    )
+  }
+
+  await decoder.flush()
+
+  t.true(outputs.length > 0, 'vorbis decode produced output frames')
+  decoder.close()
+})
+
 // ============================================================================
 // Audio Codec Tests - PCM/WAV
 // ============================================================================
