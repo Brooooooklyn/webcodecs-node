@@ -673,3 +673,168 @@ test('VideoDecoder: error callback receives a DOMException', async (t) => {
   t.true(error instanceof Error, 'DOMException should also be an Error')
   t.is((error as DOMException).name, 'EncodingError')
 })
+
+// ============================================================================
+// DOM dispatch semantics: shared Event identity, target/currentTarget/this
+// ============================================================================
+
+test('VideoEncoder: all listeners in one dispatch share the same Event object', async (t) => {
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: () => {},
+  })
+
+  const seen: Event[] = []
+  encoder.addEventListener('dequeue', (e) => {
+    seen.push(e)
+  })
+  encoder.addEventListener('dequeue', (e) => {
+    seen.push(e)
+  })
+
+  encoder.configure(createEncoderConfig('h264', 64, 64))
+  const frame = generateSolidColorI420Frame(64, 64, TestColors.green, 0)
+  encoder.encode(frame, { keyFrame: true })
+  frame.close()
+
+  await new Promise<void>((resolve) => {
+    const check = () => (seen.length >= 2 ? resolve() : setTimeout(check, 10))
+    check()
+  })
+
+  t.true(seen.every((e) => e === seen[0]), 'listeners should share one Event instance')
+  t.is(seen[0].type, 'dequeue')
+  encoder.close()
+})
+
+test('VideoEncoder: event.target/currentTarget/this resolve to the codec', async (t) => {
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: () => {},
+  })
+
+  let observed: {
+    target: EventTarget | null
+    currentTarget: EventTarget | null
+    self: unknown
+    captured: Event
+  } | null = null
+
+  encoder.addEventListener('dequeue', function (this: VideoEncoder, e) {
+    observed = {
+      target: e.target,
+      currentTarget: e.currentTarget,
+      // eslint-disable-next-line @typescript-eslint/no-this-alias
+      self: this,
+      captured: e,
+    }
+  })
+
+  encoder.configure(createEncoderConfig('h264', 64, 64))
+  const frame = generateSolidColorI420Frame(64, 64, TestColors.green, 0)
+  encoder.encode(frame, { keyFrame: true })
+  frame.close()
+
+  await new Promise<void>((resolve) => {
+    const check = () => (observed ? resolve() : setTimeout(check, 10))
+    check()
+  })
+
+  t.is(observed!.target as unknown, encoder)
+  t.is(observed!.currentTarget as unknown, encoder)
+  t.is(observed!.self, encoder)
+  // DOM: currentTarget is null once dispatch completes
+  t.is(observed!.captured.currentTarget, null)
+  encoder.close()
+})
+
+test('VideoEncoder: listener removed during dispatch does not run', async (t) => {
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: () => {},
+  })
+
+  const fired: string[] = []
+  const l2 = () => {
+    fired.push('l2')
+  }
+  encoder.addEventListener('dequeue', () => {
+    fired.push('l1')
+    encoder.removeEventListener('dequeue', l2)
+  })
+  encoder.addEventListener('dequeue', l2)
+
+  encoder.configure(createEncoderConfig('h264', 64, 64))
+  const frame = generateSolidColorI420Frame(64, 64, TestColors.green, 0)
+  encoder.encode(frame, { keyFrame: true })
+  frame.close()
+
+  await new Promise<void>((resolve) => {
+    const check = () => (fired.length >= 1 ? resolve() : setTimeout(check, 10))
+    check()
+  })
+  // Give the second dequeue event (if any) a chance to disprove
+  await new Promise((r) => setTimeout(r, 50))
+
+  t.deepEqual(fired, ['l1'])
+  encoder.close()
+})
+
+test('VideoEncoder: listener added during dispatch runs on next dispatch only', async (t) => {
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: () => {},
+  })
+
+  const fired: string[] = []
+  encoder.addEventListener('dequeue', () => {
+    fired.push('l1')
+    encoder.addEventListener('dequeue', () => {
+      fired.push('l2')
+    })
+  })
+
+  encoder.configure(createEncoderConfig('h264', 64, 64))
+  const frames = generateFrameSequence(64, 64, 2)
+  for (const f of frames) {
+    encoder.encode(f, { keyFrame: true })
+    f.close()
+  }
+
+  await new Promise<void>((resolve) => {
+    const check = () => (fired.length >= 3 ? resolve() : setTimeout(check, 10))
+    check()
+  })
+
+  // Two dispatches: first runs l1 only, second runs l1 + l2
+  t.deepEqual(fired.slice(0, 3), ['l1', 'l1', 'l2'])
+  encoder.close()
+})
+
+test('VideoEncoder: re-registering the same callback is a no-op', async (t) => {
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: () => {},
+  })
+
+  let count = 0
+  const listener = () => {
+    count++
+  }
+  encoder.addEventListener('dequeue', listener)
+  encoder.addEventListener('dequeue', listener)
+
+  encoder.configure(createEncoderConfig('h264', 64, 64))
+  const frame = generateSolidColorI420Frame(64, 64, TestColors.green, 0)
+  encoder.encode(frame, { keyFrame: true })
+  frame.close()
+
+  await new Promise<void>((resolve) => {
+    const check = () => (count >= 1 ? resolve() : setTimeout(check, 10))
+    check()
+  })
+  await new Promise((r) => setTimeout(r, 50))
+
+  t.is(count, 1, 'duplicate registration should not double-fire per dispatch')
+  encoder.close()
+})

@@ -7,8 +7,8 @@ use crate::codec::{AudioDecoderConfig as InternalAudioDecoderConfig, CodecContex
 use crate::ffi::AVCodecID;
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunkInner;
 use crate::webcodecs::error::{
-  DOMExceptionName, error_as_dom_exception, native_dom_exception_error, new_event,
-  throw_data_error, throw_invalid_state_error, throw_type_error_unit,
+  DOMExceptionName, error_as_dom_exception, native_dom_exception_error, throw_data_error,
+  throw_invalid_state_error, throw_type_error_unit,
 };
 use crate::webcodecs::flush_tracker::FlushTracker;
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
@@ -19,12 +19,12 @@ use napi::threadsafe_function::{
   ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
 };
 use napi_derive::napi;
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
+use super::event_target::CodecEventState;
 use super::video_encoder::CodecState;
 
 /// Type alias for output callback (takes AudioData)
@@ -38,52 +38,6 @@ type OutputCallback =
 /// converted to a native DOMException in the JS-side callback.
 type ErrorCallback =
   ThreadsafeFunction<Error, UnknownReturnValue, Unknown<'static>, Status, false, true>;
-
-// Note: For ondequeue, we use FunctionRef instead of ThreadsafeFunction
-// to support both getter and setter per WebCodecs spec
-
-/// Type alias for weak event listener callback (allows Node.js process to exit)
-type WeakEventListenerCallback =
-  ThreadsafeFunction<(), UnknownReturnValue, Unknown<'static>, Status, false, true>;
-
-/// Type alias for strong event listener callback (keeps Node.js alive until called)
-type StrongEventListenerCallback =
-  ThreadsafeFunction<(), UnknownReturnValue, Unknown<'static>, Status, false, false>;
-
-/// Backwards compatibility alias for dequeue callback
-type EventListenerCallback = WeakEventListenerCallback;
-
-/// Enum to hold either weak or strong TSF for event listeners
-enum EventListenerCallbackType {
-  /// Weak TSF for regular listeners (doesn't prevent Node.js exit)
-  Weak(Arc<WeakEventListenerCallback>),
-  /// Strong TSF for once listeners (keeps Node.js alive until callback fires)
-  /// Wrapped in Arc to allow cloning for the callback closure
-  Strong(Arc<StrongEventListenerCallback>),
-}
-
-/// Entry for tracking event listeners
-/// Stores either weak TSF (for regular) or strong TSF (for once) listeners
-struct EventListenerEntry {
-  id: u64,
-  callback: EventListenerCallbackType,
-  once: bool,
-  /// Reference to the original JS callback — prevents GC while the listener is
-  /// registered (Weak TSF) and identifies the listener for removeEventListener
-  identity: FunctionRef<(), UnknownReturnValue>,
-}
-
-/// State for EventTarget interface, separate from main decoder state
-/// to avoid lock contention during decoding operations
-#[derive(Default)]
-struct EventListenerState {
-  /// Event listeners registry (event type -> list of listeners)
-  event_listeners: HashMap<String, Vec<EventListenerEntry>>,
-  /// Counter for generating unique listener IDs
-  next_listener_id: u64,
-  /// Optional dequeue event callback (set via ondequeue property)
-  dequeue_callback: Option<Arc<EventListenerCallback>>,
-}
 
 /// Options for addEventListener (W3C DOM spec)
 #[napi(object)]
@@ -242,8 +196,7 @@ struct AudioDecoderInner {
 pub struct AudioDecoder {
   inner: Arc<Mutex<AudioDecoderInner>>,
   /// Separate lock for event listeners to avoid contention with decode operations
-  event_state: Arc<RwLock<EventListenerState>>,
-  dequeue_callback: Option<FunctionRef<(), UnknownReturnValue>>,
+  event_state: Arc<RwLock<CodecEventState>>,
   /// Output callback reference - stored for synchronous calls from main thread (in flush resolver)
   /// Wrapped in Rc to allow sharing with spawn_future_with_callback closure
   /// (Rc is !Send but that's OK - the callback runs on the main thread)
@@ -289,7 +242,9 @@ impl AudioDecoder {
   /// @param init - Init dictionary containing output and error callbacks
   #[napi(constructor)]
   pub fn new(
-    #[napi(ts_arg_type = "{ output: (data: AudioData) => void, error: (error: Error) => void }")]
+    #[napi(
+      ts_arg_type = "{ output: (data: AudioData) => void, error: (error: DOMException) => void }"
+    )]
     init: AudioDecoderInit,
   ) -> Result<Self> {
     let inner = AudioDecoderInner {
@@ -309,7 +264,7 @@ impl AudioDecoder {
     };
 
     let inner = Arc::new(Mutex::new(inner));
-    let event_state = Arc::new(RwLock::new(EventListenerState::default()));
+    let event_state = Arc::new(RwLock::new(CodecEventState::default()));
 
     // Create channel for worker commands
     let (sender, receiver) = channel::unbounded();
@@ -333,7 +288,6 @@ impl AudioDecoder {
     Ok(Self {
       inner,
       event_state,
-      dequeue_callback: None,
       output_callback_ref: Rc::new(init.output_ref),
       error_callback_ref: Rc::new(init.error_ref),
       command_sender: Some(Arc::new(sender)),
@@ -345,7 +299,7 @@ impl AudioDecoder {
   /// Worker loop that processes commands from the channel
   fn worker_loop(
     inner: Arc<Mutex<AudioDecoderInner>>,
-    event_state: Arc<RwLock<EventListenerState>>,
+    event_state: Arc<RwLock<CodecEventState>>,
     receiver: Receiver<DecoderCommand>,
     reset_flag: Arc<AtomicBool>,
   ) {
@@ -392,7 +346,7 @@ impl AudioDecoder {
   /// Process a decode command on the worker thread
   fn process_decode(
     inner: &Arc<Mutex<AudioDecoderInner>>,
-    event_state: &Arc<RwLock<EventListenerState>>,
+    event_state: &Arc<RwLock<CodecEventState>>,
     chunk: Arc<RwLock<Option<EncodedAudioChunkInner>>>,
     timestamp: i64,
     duration: Option<i64>,
@@ -569,7 +523,7 @@ impl AudioDecoder {
   /// Process a flush command on the worker thread
   fn process_flush(
     inner: &Arc<Mutex<AudioDecoderInner>>,
-    _event_state: &Arc<RwLock<EventListenerState>>,
+    _event_state: &Arc<RwLock<CodecEventState>>,
     reset_flag: &AtomicBool,
   ) -> Result<()> {
     let mut guard = inner
@@ -778,62 +732,12 @@ impl AudioDecoder {
     inner.state = CodecState::Closed;
   }
 
-  /// Fire dequeue event if callback is set
-  /// Also dispatches to EventTarget listeners registered via addEventListener
-  /// Uses separate RwLock to avoid blocking addEventListener during decode
-  fn fire_dequeue_event(event_state: &Arc<RwLock<EventListenerState>>) -> Result<()> {
-    // Use write lock to fire callbacks and remove once listeners atomically
-    // NonBlocking mode ensures callbacks are queued without blocking the worker thread
-    let mut state = match event_state.write() {
-      Ok(s) => s,
-      Err(_) => return Err(Error::new(Status::GenericFailure, "Lock poisoned")),
-    };
-
-    // 1. Fire ondequeue callback
-    if let Some(ref callback) = state.dequeue_callback {
-      callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
+  /// Fire dequeue event via the shared JS-side dispatcher
+  /// Dispatches one Event to ondequeue and all registered listeners
+  fn fire_dequeue_event(event_state: &Arc<RwLock<CodecEventState>>) -> Result<()> {
+    if let Ok(state) = event_state.read() {
+      state.fire();
     }
-
-    // 2. Fire EventTarget listeners
-    // For "once" listeners (Strong TSF): use call_with_return_value to drop TSF after callback
-    // For regular listeners (Weak TSF): use simple call()
-    if let Some(listeners) = state.event_listeners.get_mut("dequeue") {
-      // Partition into once and regular listeners
-      let (once_listeners, regular_listeners): (Vec<_>, Vec<_>) =
-        std::mem::take(listeners).into_iter().partition(|e| e.once);
-
-      // Fire regular listeners with simple call() (Weak TSF)
-      for entry in &regular_listeners {
-        if let EventListenerCallbackType::Weak(ref tsf) = entry.callback {
-          tsf.call((), ThreadsafeFunctionCallMode::NonBlocking);
-        }
-      }
-
-      // Fire "once" listeners with call_with_return_value (Strong TSF)
-      // Strong TSF keeps Node.js alive; dropping it in callback releases Node.js
-      for entry in once_listeners {
-        if let EventListenerCallbackType::Strong(ref tsf) = entry.callback {
-          // Clone the Arc to move into closure; original drops at loop end
-          let tsf_clone = tsf.clone();
-          tsf.call_with_return_value(
-            (),
-            ThreadsafeFunctionCallMode::NonBlocking,
-            move |_: Result<UnknownReturnValue>, _env: Env| {
-              // Drop TSF clone after callback - releases Node.js to exit
-              drop(tsf_clone);
-              Ok(())
-            },
-          );
-        }
-      }
-
-      // Put back regular listeners (once listeners are already consumed/removed)
-      *listeners = regular_listeners;
-      if listeners.is_empty() {
-        state.event_listeners.remove("dequeue");
-      }
-    }
-
     Ok(())
   }
 
@@ -868,30 +772,18 @@ impl AudioDecoder {
   pub fn set_ondequeue(
     &mut self,
     env: &Env,
-    callback: Option<FunctionRef<(), UnknownReturnValue>>,
+    this: This,
+    callback: Option<FunctionRef<Unknown<'static>, UnknownReturnValue>>,
   ) -> Result<()> {
-    // Update event_state, not inner
     let mut state = self
       .event_state
       .write()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    state.dequeue_callback = match callback {
-      Some(ref cb) => {
-        let tsf = cb
-          .borrow_back(env)?
-          .build_threadsafe_function()
-          .callee_handled::<false>()
-          .weak::<true>() // Weak to allow Node.js process to exit
-          .build_callback(|ctx| new_event(&ctx.env, "dequeue"))?;
-        Some(Arc::new(tsf))
-      }
-      None => None,
-    };
-
-    drop(state);
-    self.dequeue_callback = callback;
-
+    state.set_codec_obj(env, this.object)?;
+    if callback.is_some() {
+      state.ensure_dispatcher(env, &self.event_state)?;
+    }
+    state.set_ondequeue(callback);
     Ok(())
   }
 
@@ -900,12 +792,14 @@ impl AudioDecoder {
   pub fn get_ondequeue<'env>(
     &self,
     env: &'env Env,
-  ) -> Result<Option<Function<'env, (), UnknownReturnValue>>> {
-    if let Some(ref callback) = self.dequeue_callback {
-      let cb = callback.borrow_back(env)?;
-      Ok(Some(cb))
-    } else {
-      Ok(None)
+  ) -> Result<Option<Function<'env, Unknown<'static>, UnknownReturnValue>>> {
+    let state = self
+      .event_state
+      .read()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    match state.ondequeue() {
+      Some(callback) => Ok(Some(callback.borrow_back(env)?)),
+      None => Ok(None),
     }
   }
 
@@ -1483,71 +1377,27 @@ impl AudioDecoder {
   // ============================================================================
 
   /// Add an event listener for the specified event type
+  /// Uses separate RwLock to avoid blocking on decode operations
   #[napi(
     ts_args_type = "eventType: string, callback: (event: Event) => unknown, options?: AudioDecoderAddEventListenerOptions | undefined | null"
   )]
   pub fn add_event_listener(
     &self,
     env: Env,
+    this: This,
     event_type: String,
-    callback: FunctionRef<(), UnknownReturnValue>,
+    callback: FunctionRef<Unknown<'static>, UnknownReturnValue>,
     options: Option<AudioDecoderAddEventListenerOptions>,
   ) -> Result<()> {
-    // Use event_state instead of inner
     let mut state = self
       .event_state
       .write()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    let id = state.next_listener_id;
-    state.next_listener_id += 1;
-
+    state.set_codec_obj(&env, this.object)?;
+    state.ensure_dispatcher(&env, &self.event_state)?;
     let once = options.as_ref().and_then(|o| o.once).unwrap_or(false);
-    let func = callback.borrow_back(&env)?;
-
-    // Reference to the original JS callback for GC prevention and identity
-    // comparison in removeEventListener
-    let identity = func.create_ref()?;
-
-    // Listeners receive a real Event object whose type matches event_type
-    let event_type_for_cb = event_type.clone();
-    // Create either weak TSF (regular) or strong TSF (once) based on listener type
-    let callback_type = if once {
-      // Once listeners: use strong TSF (keeps Node.js alive until callback fires)
-      // Strong TSF holds reference to JS function directly
-      let tsf = Arc::new(
-        func
-          .build_threadsafe_function()
-          .callee_handled::<false>()
-          .weak::<false>() // Strong - keeps Node.js alive
-          .build_callback(move |ctx| new_event(&ctx.env, &event_type_for_cb))?,
-      );
-      EventListenerCallbackType::Strong(tsf)
-    } else {
-      // Regular listeners: use weak TSF (allows Node.js to exit)
-      let tsf = Arc::new(
-        func
-          .build_threadsafe_function()
-          .callee_handled::<false>()
-          .weak::<true>() // Weak - allows Node.js to exit
-          .build_callback(move |ctx| new_event(&ctx.env, &event_type_for_cb))?,
-      );
-      EventListenerCallbackType::Weak(tsf)
-    };
-
-    let entry = EventListenerEntry {
-      id,
-      callback: callback_type,
-      once,
-      identity,
-    };
-
-    state
-      .event_listeners
-      .entry(event_type)
-      .or_default()
-      .push(entry);
-    Ok(())
+    state.add_listener(&env, &event_type, callback, once)
   }
 
   /// Remove an event listener for the specified event type
@@ -1558,71 +1408,22 @@ impl AudioDecoder {
     &self,
     env: Env,
     event_type: String,
-    callback: FunctionRef<(), UnknownReturnValue>,
+    callback: FunctionRef<Unknown<'static>, UnknownReturnValue>,
     _options: Option<AudioDecoderEventListenerOptions>,
   ) -> Result<()> {
-    // Use event_state instead of inner
     let mut state = self
       .event_state
       .write()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    // DOM spec: remove the first registered listener whose callback === the
-    // one passed here
-    if let Some(listeners) = state.event_listeners.get_mut(&event_type) {
-      if let Some(pos) = listeners.iter().position(|entry| {
-        match (entry.identity.borrow_back(&env), callback.borrow_back(&env)) {
-          (Ok(registered), Ok(passed)) => env.strict_equals(registered, passed).unwrap_or(false),
-          _ => false,
-        }
-      }) {
-        listeners.remove(pos);
-      }
-      if listeners.is_empty() {
-        state.event_listeners.remove(&event_type);
-      }
-    }
+    state.remove_listener(&env, &event_type, &callback);
     Ok(())
   }
 
   /// Dispatch an event to all registered listeners
   #[napi]
-  pub fn dispatch_event(&self, event_type: String) -> Result<bool> {
-    // Use event_state instead of inner
-    let mut state = self
-      .event_state
-      .write()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    let mut ids_to_remove = Vec::new();
-
-    if let Some(listeners) = state.event_listeners.get(&event_type) {
-      for entry in listeners {
-        // Call the listener with no arguments (like dequeue callback)
-        match &entry.callback {
-          EventListenerCallbackType::Weak(tsf) => {
-            tsf.call((), ThreadsafeFunctionCallMode::Blocking);
-          }
-          EventListenerCallbackType::Strong(tsf) => {
-            tsf.call((), ThreadsafeFunctionCallMode::Blocking);
-          }
-        }
-        if entry.once {
-          ids_to_remove.push(entry.id);
-        }
-      }
-    }
-
-    // Remove "once" listeners
-    if !ids_to_remove.is_empty()
-      && let Some(listeners) = state.event_listeners.get_mut(&event_type)
-    {
-      listeners.retain(|e| !ids_to_remove.contains(&e.id));
-      if listeners.is_empty() {
-        state.event_listeners.remove(&event_type);
-      }
-    }
-
+  pub fn dispatch_event(&self, env: Env, event_type: String) -> Result<bool> {
+    crate::webcodecs::event_target::dispatch(&env, &self.event_state, &event_type);
     Ok(true) // Event was not cancelled
   }
 }

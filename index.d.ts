@@ -271,7 +271,7 @@ export declare class AudioDecoder {
    *
    * @param init - Init dictionary containing output and error callbacks
    */
-  constructor(init: { output: (data: AudioData) => void; error: (error: Error) => void })
+  constructor(init: { output: (data: AudioData) => void; error: (error: DOMException) => void })
   /** Get decoder state */
   get state(): CodecState
   /** Get number of pending decode operations (per WebCodecs spec) */
@@ -310,7 +310,10 @@ export declare class AudioDecoder {
    * returns { supported: false } for valid but unsupported configs.
    */
   static isConfigSupported(config: AudioDecoderConfig): Promise<AudioDecoderSupport>
-  /** Add an event listener for the specified event type */
+  /**
+   * Add an event listener for the specified event type
+   * Uses separate RwLock to avoid blocking on decode operations
+   */
   addEventListener(
     eventType: string,
     callback: (event: Event) => unknown,
@@ -358,7 +361,7 @@ export declare class AudioEncoder {
    */
   constructor(init: {
     output: (chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadata) => void
-    error: (error: Error) => void
+    error: (error: DOMException) => void
   })
   /** Get encoder state */
   get state(): CodecState
@@ -895,7 +898,7 @@ export declare class VideoDecoder {
    *
    * @param init - Init dictionary containing output and error callbacks
    */
-  constructor(init: { output: (frame: VideoFrame) => void; error: (error: Error) => void })
+  constructor(init: { output: (frame: VideoFrame) => void; error: (error: DOMException) => void })
   /** Get decoder state */
   get state(): CodecState
   /** Get number of pending decode operations (per WebCodecs spec) */
@@ -993,7 +996,7 @@ export declare class VideoEncoder {
    */
   constructor(init: {
     output: (chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadata) => void
-    error: (error: Error) => void
+    error: (error: DOMException) => void
   })
   /** Get encoder state */
   get state(): CodecState

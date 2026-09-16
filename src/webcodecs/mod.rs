@@ -12,6 +12,7 @@ pub mod demuxer_base;
 mod encoded_audio_chunk;
 mod encoded_video_chunk;
 pub mod error;
+pub(crate) mod event_target;
 mod flush_tracker;
 mod hardware;
 pub(crate) mod hw_fallback;
