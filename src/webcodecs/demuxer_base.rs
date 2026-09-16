@@ -760,23 +760,26 @@ fn demux_with_callbacks_inner<F: DemuxerFormat>(
     match next {
       Ok(Some(chunk)) => {
         if let Some(video_chunk) = chunk.video_chunk {
-          if let Some(callback) = video_callback {
-            block_on(callback.call_async(video_chunk)).map_err(|error| {
-              Error::new(
-                Status::GenericFailure,
-                format!("Video output callback failed: {}", error),
-              )
-            })?;
+          if let Some(callback) = video_callback
+            && let Err(error) = block_on(callback.call_async(video_chunk))
+          {
+            let message = format!("Video output callback failed: {}", error);
+            if let Some(callback) = error_callback {
+              let _ =
+                block_on(callback.call_async(Error::new(Status::GenericFailure, message.clone())));
+            }
+            return Err(Error::new(Status::GenericFailure, message));
           }
         } else if let Some(audio_chunk) = chunk.audio_chunk
           && let Some(callback) = audio_callback
+          && let Err(error) = block_on(callback.call_async(audio_chunk))
         {
-          block_on(callback.call_async(audio_chunk)).map_err(|error| {
-            Error::new(
-              Status::GenericFailure,
-              format!("Audio output callback failed: {}", error),
-            )
-          })?;
+          let message = format!("Audio output callback failed: {}", error);
+          if let Some(callback) = error_callback {
+            let _ =
+              block_on(callback.call_async(Error::new(Status::GenericFailure, message.clone())));
+          }
+          return Err(Error::new(Status::GenericFailure, message));
         }
       }
       Ok(None) => break,

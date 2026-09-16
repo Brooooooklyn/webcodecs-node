@@ -218,13 +218,8 @@ runTest('Mp4Demuxer: seek and demux', async (t) => {
 
 runTest('Mp4Demuxer: rejects overlapping callback demux sessions', async (t) => {
   let outputCount = 0
-  let resolveOutputs!: () => void
-  const outputs = new Promise<void>((resolve) => {
-    resolveOutputs = resolve
-  })
   const onOutput = () => {
     outputCount += 1
-    if (outputCount === 100) resolveOutputs()
   }
   const demuxer = new Mp4Demuxer({
     videoOutput: onOutput,
@@ -238,16 +233,20 @@ runTest('Mp4Demuxer: rejects overlapping callback demux sessions', async (t) => 
   demuxer.demux(100)
   t.throws(() => demuxer.demux(1), { message: /already in progress/ })
 
-  await outputs
-  // The callback-session reservation is released by the native worker after
-  // the final JavaScript callback has returned. Poll the observable state
-  // instead of assuming a fixed number of event-loop turns also schedules
-  // that worker (notably under emulated ARM CI).
-  const readyDeadline = Date.now() + 5_000
-  while (demuxer.state === 'demuxing' && Date.now() < readyDeadline) {
-    await new Promise<void>((resolve) => setTimeout(resolve, 10))
-  }
+  // Poll the session lifecycle instead of awaiting an exact callback count:
+  // callback delivery shares the event loop with concurrently running tests,
+  // so a fixed-count promise with no timeout turned a stalled or prematurely
+  // exited worker into a hung suite (observed on Windows CI). The start/finish
+  // split distinguishes "worker never ran" from "delivery stalled", and a
+  // short session then fails on the count instead of hanging.
+  await waitFor(
+    () => demuxer.state === 'demuxing' || outputCount > 0,
+    'callback demux session to start',
+    60_000,
+  )
+  await waitFor(() => demuxer.state !== 'demuxing', 'callback demux session to finish', 60_000)
   t.is(demuxer.state, 'ready')
+  t.is(outputCount, 100)
   await t.notThrowsAsync(() => demuxer.demuxAsync(1))
   demuxer.close()
 })
