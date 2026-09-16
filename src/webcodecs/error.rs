@@ -364,12 +364,13 @@ pub fn enforce_range_long_long(env: &Env, value: f64, field_name: &str) -> Resul
   let truncated = value.trunc();
 
   // WebIDL step 4: Check if in range of long long (i64)
-  // i64::MIN = -9223372036854775808, i64::MAX = 9223372036854775807
-  // f64 can represent these exactly as -9223372036854775808.0 and 9223372036854775807.0
+  // i64::MIN = -9223372036854775808 is exactly representable in f64, but
+  // i64::MAX = 9223372036854775807 is not — it rounds up to 2^63, so the
+  // upper bound must be exclusive to reject 2^63 itself.
   const I64_MIN_F64: f64 = i64::MIN as f64;
-  const I64_MAX_F64: f64 = i64::MAX as f64;
+  const I64_MAX_F64: f64 = i64::MAX as f64; // evaluates to 2^63
 
-  if !(I64_MIN_F64..=I64_MAX_F64).contains(&truncated) {
+  if truncated < I64_MIN_F64 || truncated >= I64_MAX_F64 {
     env.throw_type_error(
       &format!("{} is out of range for long long", field_name),
       None,
@@ -427,7 +428,10 @@ pub fn enforce_range_unsigned_long_long(env: &Env, value: f64, field_name: &str)
   let truncated = value.trunc();
 
   // WebIDL step 4: Check if in range of unsigned long long (u64)
-  if truncated < 0.0 || truncated > u64::MAX as f64 {
+  // u64::MAX is not representable in f64 — `u64::MAX as f64` rounds up to
+  // 2^64, so the upper bound must be exclusive to reject 2^64 itself.
+  // The largest representable f64 below it (2^64 - 2048) is still in range.
+  if truncated < 0.0 || truncated >= u64::MAX as f64 {
     env.throw_type_error(
       &format!("{} is out of range for unsigned long long", field_name),
       None,

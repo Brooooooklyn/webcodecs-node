@@ -81,6 +81,33 @@ test('EncodedVideoChunk: construction with negative duration throws', (t) => {
   )
 })
 
+// u64::MAX rounds up to 2^64 in f64 — the bound must reject 2**64 itself
+test('EncodedVideoChunk: construction with 2**64 duration throws', (t) => {
+  t.throws(
+    () =>
+      new EncodedVideoChunk({
+        type: 'key',
+        timestamp: 0,
+        duration: 2 ** 64,
+        data: new Uint8Array([0, 1]),
+      }),
+    { instanceOf: TypeError },
+  )
+})
+
+// i64::MAX rounds up to 2^63 in f64 — the signed bound must reject 2**63
+test('EncodedVideoChunk: construction with 2**63 timestamp throws', (t) => {
+  t.throws(
+    () =>
+      new EncodedVideoChunk({
+        type: 'key',
+        timestamp: 2 ** 63,
+        data: new Uint8Array([0, 1]),
+      }),
+    { instanceOf: TypeError },
+  )
+})
+
 test('EncodedVideoChunk: construction requires type', (t) => {
   t.throws(
     () => {
