@@ -515,6 +515,50 @@ test('VideoDecoder: configure, reset, configure does not stall', async (t) => {
   decoder.close()
 })
 
+test('VideoDecoder: reconfigure snapshots description at configure() time', async (t) => {
+  const { chunks, config } = await createEncodedChunks('avc1.42001E', 320, 240, 1)
+
+  if (chunks.length === 0 || !config.description) {
+    t.pass('No chunks or description produced')
+    return
+  }
+
+  const { init, outputs, errors } = createCollectingCodecInit<VideoFrame>()
+  const decoder = new VideoDecoder({
+    output: (frame) => {
+      init.output(frame)
+      frame.close()
+    },
+    error: init.error,
+  })
+
+  decoder.configure(config)
+  t.is(decoder.state, 'configured')
+
+  // Reconfigure queues the config for the worker via microtask; the
+  // description must be snapshotted synchronously because a caller write after
+  // configure() returns still precedes the worker's copy.
+  const src = config.description
+  const mutableDescription = new Uint8Array(
+    ArrayBuffer.isView(src)
+      ? src.buffer.slice(src.byteOffset, src.byteOffset + src.byteLength)
+      : src.slice(0),
+  )
+  decoder.configure({ ...config, description: mutableDescription })
+  mutableDescription.fill(0xff)
+
+  decoder.decode(chunks[0])
+  await decoder.flush()
+
+  t.deepEqual(
+    errors.map((e) => e.message),
+    [],
+    'no decoder errors after mutating reconfigure description',
+  )
+  t.true(outputs.length > 0, 'h264 decode produced output frames')
+  decoder.close()
+})
+
 // ============================================================================
 // New Flush After Reset in Callback Tests
 // ============================================================================
