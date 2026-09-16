@@ -1498,6 +1498,11 @@ impl AudioEncoder {
   /// Encode audio data
   #[napi]
   pub fn encode(&self, env: Env, data: &AudioData) -> Result<()> {
+    // W3C spec: throw TypeError if AudioData is closed
+    if data.closed()? {
+      return throw_type_error_unit(&env, "Cannot encode a closed AudioData");
+    }
+
     // Clone frame, resample if needed, and get timestamp on main thread
     let (frame_to_send, timestamp) = {
       let mut inner = self

@@ -407,6 +407,8 @@ export interface AudioDataInit {
   numberOfChannels: number
   /** Timestamp in microseconds */
   timestamp: number
+  /** Duration in microseconds */
+  duration?: number
   /** Audio data */
   data: BufferSource
   /** ArrayBuffers to transfer */

@@ -341,6 +341,21 @@ test('VideoFrame: with duration', (t) => {
   frame.close()
 })
 
+// WebIDL: duration is [EnforceRange] unsigned long long — negative throws TypeError
+test('VideoFrame: negative duration throws', (t) => {
+  t.throws(
+    () =>
+      new VideoFrame(new Uint8Array(32), {
+        format: 'RGBA',
+        codedWidth: 4,
+        codedHeight: 2,
+        timestamp: 0,
+        duration: -1,
+      }),
+    { instanceOf: TypeError },
+  )
+})
+
 test('VideoFrame: without duration', (t) => {
   const frame = new VideoFrame(new Uint8Array(32), {
     format: 'RGBA',

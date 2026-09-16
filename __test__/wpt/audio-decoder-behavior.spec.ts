@@ -394,6 +394,61 @@ test('AudioDecoder: decode with negative timestamp', async (t) => {
   decoder.close()
 })
 
+// WPT: "Decode a delta frame without keyframe" — first chunk must be key
+test('AudioDecoder: decode delta chunk first throws DataError', async (t) => {
+  const { chunks, config } = await createEncodedChunks('opus', 48000, 2, 1)
+
+  if (chunks.length === 0) {
+    t.pass('No chunks produced')
+    return
+  }
+
+  // Re-wrap real encoded bytes as 'delta' — type is caller-controlled
+  const data = new Uint8Array(chunks[0].byteLength)
+  chunks[0].copyTo(data)
+  const deltaChunk = new EncodedAudioChunk({ type: 'delta', timestamp: 0, data })
+
+  const decoder = new AudioDecoder({
+    output: () => {},
+    error: () => {},
+  })
+  decoder.configure(config)
+
+  try {
+    decoder.decode(deltaChunk)
+    t.fail('decode delta first should throw DataError')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'error should be DOMException instance')
+    t.is((error as DOMException).name, 'DataError', 'error name should be DataError')
+  }
+
+  decoder.close()
+})
+
+test('AudioDecoder: decode delta chunk after key is accepted', async (t) => {
+  const { chunks, config } = await createEncodedChunks('opus', 48000, 2, 1)
+
+  if (chunks.length === 0) {
+    t.pass('No chunks produced')
+    return
+  }
+
+  const data = new Uint8Array(chunks[0].byteLength)
+  chunks[0].copyTo(data)
+  const deltaChunk = new EncodedAudioChunk({ type: 'delta', timestamp: 1000, data })
+
+  const decoder = new AudioDecoder({
+    output: () => {},
+    error: () => {},
+  })
+  decoder.configure(config)
+
+  decoder.decode(chunks[0])
+  t.notThrows(() => decoder.decode(deltaChunk), 'delta after key should not throw')
+
+  decoder.close()
+})
+
 // ============================================================================
 // Empty Frame Tests
 // ============================================================================

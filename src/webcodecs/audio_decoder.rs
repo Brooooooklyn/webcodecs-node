@@ -7,7 +7,8 @@ use crate::codec::{AudioDecoderConfig as InternalAudioDecoderConfig, CodecContex
 use crate::ffi::AVCodecID;
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunkInner;
 use crate::webcodecs::error::{
-  DOMExceptionName, native_dom_exception_error, throw_invalid_state_error, throw_type_error_unit,
+  DOMExceptionName, native_dom_exception_error, throw_data_error, throw_invalid_state_error,
+  throw_type_error_unit,
 };
 use crate::webcodecs::flush_tracker::FlushTracker;
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
@@ -198,6 +199,8 @@ struct AudioDecoderInner {
   error_callback: ErrorCallback,
   /// Whether an error has occurred during decoding (for flush error propagation)
   had_error: bool,
+  /// Whether a key chunk has been decoded since the last configure (spec: [[key chunk required]])
+  keyframe_received: bool,
   /// Pending flush operations, tracked independently for overlapping calls.
   flushes: FlushTracker,
   /// Queue of decoded audio data waiting to be delivered via output callback
@@ -294,6 +297,7 @@ impl AudioDecoder {
       output_callback: init.output,
       error_callback: init.error,
       had_error: false,
+      keyframe_received: false,
       flushes: FlushTracker::default(),
       pending_data: Vec::new(),
       timestamp_queue: std::collections::VecDeque::new(),
@@ -670,6 +674,7 @@ impl AudioDecoder {
     // main-thread decode() calls after this FIFO command are already counted.
     guard.timestamp_queue.clear();
     guard.frame_count = 0;
+    guard.keyframe_received = false;
 
     // Parse codec string
     let codec = match &config.codec {
@@ -1081,6 +1086,17 @@ impl AudioDecoder {
         }
       };
 
+      // W3C spec: throw DataError if first chunk is not a keyframe
+      let is_key = chunk.is_key();
+      if !inner.keyframe_received {
+        if is_key {
+          inner.keyframe_received = true;
+        } else {
+          // Trying to decode a delta chunk before any key chunk
+          return throw_data_error(&env, "First chunk must be a keyframe");
+        }
+      }
+
       // Increment queue size (pending operation)
       inner.decode_queue_size += 1;
 
@@ -1306,6 +1322,7 @@ impl AudioDecoder {
     inner.frame_count = 0;
     inner.decode_queue_size = 0;
     inner.had_error = false;
+    inner.keyframe_received = false;
 
     // Clear flush-related state
     inner.flushes.clear();

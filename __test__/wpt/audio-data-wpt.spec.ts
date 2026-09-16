@@ -227,6 +227,40 @@ test('AudioData: negative timestamp', (t) => {
   audioData.close()
 })
 
+// WebIDL: duration is [EnforceRange] unsigned long long — negative throws TypeError
+test('AudioData: negative duration throws', (t) => {
+  t.throws(
+    () =>
+      new AudioData({
+        data: new Uint8Array(8),
+        format: 'u8',
+        sampleRate: 44100,
+        numberOfFrames: 4,
+        numberOfChannels: 2,
+        timestamp: 0,
+        duration: -1,
+      }),
+    { instanceOf: TypeError },
+  )
+})
+
+// Spec: provided duration is stored as [[duration]] rather than computed
+test('AudioData: provided duration is honored', (t) => {
+  const audioData = new AudioData({
+    data: new Uint8Array(8),
+    format: 'u8',
+    sampleRate: 44100,
+    numberOfFrames: 4,
+    numberOfChannels: 2,
+    timestamp: 0,
+    duration: 12345,
+  })
+
+  // 4 frames at 44100Hz computes to ~90µs — provided value must win
+  t.is(audioData.duration, 12345)
+  audioData.close()
+})
+
 // ============================================================================
 // Format Tests
 // ============================================================================

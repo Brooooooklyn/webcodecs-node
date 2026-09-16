@@ -8,8 +8,9 @@ use crate::ffi::{
   AVColorPrimaries, AVColorRange, AVColorSpace, AVColorTransferCharacteristic, AVPixelFormat,
 };
 use crate::webcodecs::error::{
-  enforce_range_long_long, enforce_range_long_long_optional, invalid_state_error,
-  not_supported_error, throw_invalid_state_error, throw_not_supported_error, type_error,
+  enforce_range_long_long, enforce_range_long_long_optional,
+  enforce_range_unsigned_long_long_optional, invalid_state_error, not_supported_error,
+  throw_invalid_state_error, throw_not_supported_error, type_error,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -839,7 +840,9 @@ impl FromNapiValue for VideoFrameBufferInit {
 
     // Duration is optional per WebIDL [EnforceRange] unsigned long long
     let duration_f64: Option<f64> = obj.get("duration")?;
-    let duration = enforce_range_long_long_optional(&env_wrapper, duration_f64, "duration")?;
+    let duration =
+      enforce_range_unsigned_long_long_optional(&env_wrapper, duration_f64, "duration")?
+        .map(|v| v.min(i64::MAX as u64) as i64);
     let layout: Option<Vec<PlaneLayout>> = obj.get("layout")?;
     let visible_rect: Option<DOMRectInit> = obj.get("visibleRect")?;
     let rotation: Option<f64> = obj.get("rotation")?;
@@ -959,7 +962,9 @@ impl FromNapiValue for VideoFrameConstructorInit {
     let timestamp_f64: Option<f64> = obj.get("timestamp")?;
     let timestamp = enforce_range_long_long_optional(&env_wrapper, timestamp_f64, "timestamp")?;
     let duration_f64: Option<f64> = obj.get("duration")?;
-    let duration = enforce_range_long_long_optional(&env_wrapper, duration_f64, "duration")?;
+    let duration =
+      enforce_range_unsigned_long_long_optional(&env_wrapper, duration_f64, "duration")?
+        .map(|v| v.min(i64::MAX as u64) as i64);
 
     Ok(VideoFrameConstructorInit {
       format,
