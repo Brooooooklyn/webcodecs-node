@@ -449,6 +449,70 @@ test('AudioDecoder: decode delta chunk after key is accepted', async (t) => {
   decoder.close()
 })
 
+// Spec: flush() synchronously sets [[key chunk required]] = true
+test('AudioDecoder: decode delta chunk after flush throws DataError', async (t) => {
+  const { chunks, config } = await createEncodedChunks('opus', 48000, 2, 1)
+
+  if (chunks.length === 0) {
+    t.pass('No chunks produced')
+    return
+  }
+
+  const data = new Uint8Array(chunks[0].byteLength)
+  chunks[0].copyTo(data)
+  const deltaChunk = new EncodedAudioChunk({ type: 'delta', timestamp: 1000, data })
+
+  const decoder = new AudioDecoder({
+    output: () => {},
+    error: () => {},
+  })
+  decoder.configure(config)
+  decoder.decode(chunks[0])
+  await decoder.flush()
+
+  try {
+    decoder.decode(deltaChunk)
+    t.fail('decode delta after flush should throw DataError')
+  } catch (error) {
+    t.is((error as DOMException).name, 'DataError', 'error name should be DataError')
+  }
+
+  decoder.close()
+})
+
+// Spec: configure() synchronously sets [[key chunk required]] = true
+test('AudioDecoder: decode delta chunk after reconfigure throws DataError', async (t) => {
+  const { chunks, config } = await createEncodedChunks('opus', 48000, 2, 1)
+
+  if (chunks.length === 0) {
+    t.pass('No chunks produced')
+    return
+  }
+
+  const data = new Uint8Array(chunks[0].byteLength)
+  chunks[0].copyTo(data)
+  const deltaChunk = new EncodedAudioChunk({ type: 'delta', timestamp: 1000, data })
+
+  const decoder = new AudioDecoder({
+    output: () => {},
+    error: () => {},
+  })
+  decoder.configure(config)
+  decoder.decode(chunks[0])
+
+  // Reconfigure re-arms the key-chunk requirement synchronously
+  decoder.configure(config)
+
+  try {
+    decoder.decode(deltaChunk)
+    t.fail('decode delta after reconfigure should throw DataError')
+  } catch (error) {
+    t.is((error as DOMException).name, 'DataError', 'error name should be DataError')
+  }
+
+  decoder.close()
+})
+
 // ============================================================================
 // Empty Frame Tests
 // ============================================================================

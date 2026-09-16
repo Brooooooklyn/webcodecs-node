@@ -935,6 +935,11 @@ impl AudioDecoder {
       return throw_invalid_state_error(&env, "Decoder is closed");
     }
 
+    // W3C spec: configure() sets [[key chunk required]] = true synchronously,
+    // so a delta chunk decoded right after configure() must throw DataError
+    // before the worker's reconfigure command runs.
+    inner.keyframe_received = false;
+
     // If already configured, queue reconfigure via microtask for W3C spec FIFO ordering
     // This ensures pending decode commands are processed before reconfiguration
     if inner.state == CodecState::Configured {
@@ -1175,6 +1180,10 @@ impl AudioDecoder {
           "Cannot flush an unconfigured codec",
         );
       }
+
+      // W3C spec: flush() sets [[key chunk required]] = true synchronously,
+      // so a delta chunk decoded after flush() must throw DataError.
+      inner.keyframe_received = false;
 
       inner
         .flushes

@@ -6,8 +6,7 @@
 use crate::codec::Frame;
 use crate::ffi::AVSampleFormat;
 use crate::webcodecs::error::{
-  enforce_range_long_long, enforce_range_unsigned_long_long_optional, invalid_state_error,
-  native_range_error, throw_invalid_state_error,
+  enforce_range_long_long, invalid_state_error, native_range_error, throw_invalid_state_error,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -241,8 +240,6 @@ pub struct AudioDataInit {
   pub number_of_channels: u32,
   /// Timestamp in microseconds (required)
   pub timestamp: i64,
-  /// Duration in microseconds (optional) - [EnforceRange] unsigned long long per spec
-  pub duration: Option<i64>,
   /// Raw audio sample data (required) - BufferSource per spec
   pub data: Vec<u8>,
 }
@@ -305,12 +302,6 @@ impl FromNapiValue for AudioDataInit {
       None => return Err(throw_type_error(env, "timestamp is required")),
     };
 
-    // Duration is optional per WebIDL [EnforceRange] unsigned long long
-    let duration_f64: Option<f64> = obj.get("duration")?;
-    let duration =
-      enforce_range_unsigned_long_long_optional(&env_wrapper, duration_f64, "duration")?
-        .map(|v| v.min(i64::MAX as u64) as i64);
-
     // Validate data - required field, accept BufferSource (ArrayBuffer, TypedArray, DataView)
     let data: Vec<u8> = if let Ok(Some(buffer)) = obj.get::<Buffer>("data") {
       buffer.to_vec()
@@ -354,7 +345,6 @@ impl FromNapiValue for AudioDataInit {
       number_of_frames,
       number_of_channels,
       timestamp,
-      duration,
       data,
     })
   }
@@ -380,9 +370,6 @@ struct AudioDataInner {
   frame: Arc<ParkingLotRwLock<Frame>>,
   format: AudioSampleFormat,
   timestamp_us: i64,
-  /// Duration in microseconds when provided at construction; otherwise computed
-  /// from frames and sample rate in the getter (spec: [[duration]])
-  duration_us: Option<i64>,
   closed: bool,
 }
 
@@ -482,7 +469,6 @@ impl AudioData {
       frame: frame.into_shared(),
       format: init.format,
       timestamp_us: init.timestamp,
-      duration_us: init.duration,
       closed: false,
     };
 
@@ -501,7 +487,6 @@ impl AudioData {
       frame: frame.into_shared(),
       format,
       timestamp_us,
-      duration_us: None,
       closed: false,
     };
 
@@ -633,9 +618,6 @@ impl AudioData {
 
     match &*inner {
       Some(i) => {
-        if let Some(duration) = i.duration_us {
-          return Ok(duration);
-        }
         let frame_guard = i.frame.read();
         let frames = frame_guard.nb_samples() as i64;
         let sample_rate = frame_guard.sample_rate() as i64;
@@ -926,7 +908,6 @@ impl AudioData {
         frame: cloned_frame,
         format: inner.format,
         timestamp_us: inner.timestamp_us,
-        duration_us: inner.duration_us,
         closed: false,
       }))),
       timestamp_us: self.timestamp_us,
