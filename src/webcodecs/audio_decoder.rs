@@ -7,7 +7,8 @@ use crate::codec::{AudioDecoderConfig as InternalAudioDecoderConfig, CodecContex
 use crate::ffi::AVCodecID;
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunkInner;
 use crate::webcodecs::error::{
-  DOMExceptionName, native_dom_exception_error, throw_invalid_state_error, throw_type_error_unit,
+  DOMExceptionName, native_dom_exception_error, throw_data_error, throw_invalid_state_error,
+  throw_type_error_unit,
 };
 use crate::webcodecs::flush_tracker::FlushTracker;
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
@@ -198,6 +199,8 @@ struct AudioDecoderInner {
   error_callback: ErrorCallback,
   /// Whether an error has occurred during decoding (for flush error propagation)
   had_error: bool,
+  /// Whether a key chunk has been decoded since the last configure (spec: [[key chunk required]])
+  keyframe_received: bool,
   /// Pending flush operations, tracked independently for overlapping calls.
   flushes: FlushTracker,
   /// Queue of decoded audio data waiting to be delivered via output callback
@@ -294,6 +297,7 @@ impl AudioDecoder {
       output_callback: init.output,
       error_callback: init.error,
       had_error: false,
+      keyframe_received: false,
       flushes: FlushTracker::default(),
       pending_data: Vec::new(),
       timestamp_queue: std::collections::VecDeque::new(),
@@ -668,6 +672,9 @@ impl AudioDecoder {
 
     // Clear codec-local work state. Do not reset decode_queue_size here:
     // main-thread decode() calls after this FIFO command are already counted.
+    // keyframe_received is intentionally not cleared here: configure() already
+    // resets it synchronously on the main thread, and clearing it again on the
+    // worker would clobber a key chunk accepted after configure() returned.
     guard.timestamp_queue.clear();
     guard.frame_count = 0;
 
@@ -930,6 +937,11 @@ impl AudioDecoder {
       return throw_invalid_state_error(&env, "Decoder is closed");
     }
 
+    // W3C spec: configure() sets [[key chunk required]] = true synchronously,
+    // so a delta chunk decoded right after configure() must throw DataError
+    // before the worker's reconfigure command runs.
+    inner.keyframe_received = false;
+
     // If already configured, queue reconfigure via microtask for W3C spec FIFO ordering
     // This ensures pending decode commands are processed before reconfiguration
     if inner.state == CodecState::Configured {
@@ -1081,6 +1093,17 @@ impl AudioDecoder {
         }
       };
 
+      // W3C spec: throw DataError if first chunk is not a keyframe
+      let is_key = chunk.is_key();
+      if !inner.keyframe_received {
+        if is_key {
+          inner.keyframe_received = true;
+        } else {
+          // Trying to decode a delta chunk before any key chunk
+          return throw_data_error(&env, "First chunk must be a keyframe");
+        }
+      }
+
       // Increment queue size (pending operation)
       inner.decode_queue_size += 1;
 
@@ -1159,6 +1182,10 @@ impl AudioDecoder {
           "Cannot flush an unconfigured codec",
         );
       }
+
+      // W3C spec: flush() sets [[key chunk required]] = true synchronously,
+      // so a delta chunk decoded after flush() must throw DataError.
+      inner.keyframe_received = false;
 
       inner
         .flushes
@@ -1306,6 +1333,7 @@ impl AudioDecoder {
     inner.frame_count = 0;
     inner.decode_queue_size = 0;
     inner.had_error = false;
+    inner.keyframe_received = false;
 
     // Clear flush-related state
     inner.flushes.clear();

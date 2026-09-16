@@ -5,7 +5,7 @@
 
 use crate::codec::Packet;
 use crate::ffi::{AVRational, avutil::av_rescale_q};
-use crate::webcodecs::error::{enforce_range_long_long, enforce_range_long_long_optional};
+use crate::webcodecs::error::{enforce_range_long_long, enforce_range_unsigned_long_long_optional};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::sync::{Arc, RwLock};
@@ -130,7 +130,9 @@ impl FromNapiValue for EncodedVideoChunkInit {
 
     // Duration is optional per WebIDL [EnforceRange] unsigned long long
     let duration_f64: Option<f64> = obj.get("duration")?;
-    let duration = enforce_range_long_long_optional(&env_wrapper, duration_f64, "duration")?;
+    let duration =
+      enforce_range_unsigned_long_long_optional(&env_wrapper, duration_f64, "duration")?
+        .map(|v| v.min(i64::MAX as u64) as i64);
 
     // Validate data - required field, accept BufferSource (ArrayBuffer, TypedArray, DataView)
     // Try different buffer types in order of preference

@@ -67,6 +67,47 @@ test('EncodedVideoChunk: construction with negative timestamp', (t) => {
   t.is(chunk.timestamp, -5000)
 })
 
+// WebIDL: duration is [EnforceRange] unsigned long long — negative throws TypeError
+test('EncodedVideoChunk: construction with negative duration throws', (t) => {
+  t.throws(
+    () =>
+      new EncodedVideoChunk({
+        type: 'key',
+        timestamp: 0,
+        duration: -1,
+        data: new Uint8Array([0, 1]),
+      }),
+    { instanceOf: TypeError },
+  )
+})
+
+// u64::MAX rounds up to 2^64 in f64 — the bound must reject 2**64 itself
+test('EncodedVideoChunk: construction with 2**64 duration throws', (t) => {
+  t.throws(
+    () =>
+      new EncodedVideoChunk({
+        type: 'key',
+        timestamp: 0,
+        duration: 2 ** 64,
+        data: new Uint8Array([0, 1]),
+      }),
+    { instanceOf: TypeError },
+  )
+})
+
+// i64::MAX rounds up to 2^63 in f64 — the signed bound must reject 2**63
+test('EncodedVideoChunk: construction with 2**63 timestamp throws', (t) => {
+  t.throws(
+    () =>
+      new EncodedVideoChunk({
+        type: 'key',
+        timestamp: 2 ** 63,
+        data: new Uint8Array([0, 1]),
+      }),
+    { instanceOf: TypeError },
+  )
+})
+
 test('EncodedVideoChunk: construction requires type', (t) => {
   t.throws(
     () => {
@@ -282,6 +323,20 @@ test('EncodedAudioChunk: construction with negative timestamp', (t) => {
   })
 
   t.is(chunk.timestamp, -10000)
+})
+
+// WebIDL: duration is [EnforceRange] unsigned long long — negative throws TypeError
+test('EncodedAudioChunk: construction with negative duration throws', (t) => {
+  t.throws(
+    () =>
+      new EncodedAudioChunk({
+        type: 'key',
+        timestamp: 0,
+        duration: -1,
+        data: new Uint8Array([0, 1]),
+      }),
+    { instanceOf: TypeError },
+  )
 })
 
 test('EncodedAudioChunk: construction requires type', (t) => {

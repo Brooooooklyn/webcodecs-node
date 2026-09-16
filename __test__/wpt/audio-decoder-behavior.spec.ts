@@ -394,6 +394,164 @@ test('AudioDecoder: decode with negative timestamp', async (t) => {
   decoder.close()
 })
 
+// WPT: "Decode a delta frame without keyframe" — first chunk must be key
+test('AudioDecoder: decode delta chunk first throws DataError', async (t) => {
+  const { chunks, config } = await createEncodedChunks('opus', 48000, 2, 1)
+
+  if (chunks.length === 0) {
+    t.pass('No chunks produced')
+    return
+  }
+
+  // Re-wrap real encoded bytes as 'delta' — type is caller-controlled
+  const data = new Uint8Array(chunks[0].byteLength)
+  chunks[0].copyTo(data)
+  const deltaChunk = new EncodedAudioChunk({ type: 'delta', timestamp: 0, data })
+
+  const decoder = new AudioDecoder({
+    output: () => {},
+    error: () => {},
+  })
+  decoder.configure(config)
+
+  try {
+    decoder.decode(deltaChunk)
+    t.fail('decode delta first should throw DataError')
+  } catch (error) {
+    t.true(error instanceof DOMException, 'error should be DOMException instance')
+    t.is((error as DOMException).name, 'DataError', 'error name should be DataError')
+  }
+
+  decoder.close()
+})
+
+test('AudioDecoder: decode delta chunk after key is accepted', async (t) => {
+  const { chunks, config } = await createEncodedChunks('opus', 48000, 2, 1)
+
+  if (chunks.length === 0) {
+    t.pass('No chunks produced')
+    return
+  }
+
+  const data = new Uint8Array(chunks[0].byteLength)
+  chunks[0].copyTo(data)
+  const deltaChunk = new EncodedAudioChunk({ type: 'delta', timestamp: 1000, data })
+
+  const decoder = new AudioDecoder({
+    output: () => {},
+    error: () => {},
+  })
+  decoder.configure(config)
+
+  decoder.decode(chunks[0])
+  t.notThrows(() => decoder.decode(deltaChunk), 'delta after key should not throw')
+
+  decoder.close()
+})
+
+// Spec: flush() synchronously sets [[key chunk required]] = true
+test('AudioDecoder: decode delta chunk after flush throws DataError', async (t) => {
+  const { chunks, config } = await createEncodedChunks('opus', 48000, 2, 1)
+
+  if (chunks.length === 0) {
+    t.pass('No chunks produced')
+    return
+  }
+
+  const data = new Uint8Array(chunks[0].byteLength)
+  chunks[0].copyTo(data)
+  const deltaChunk = new EncodedAudioChunk({ type: 'delta', timestamp: 1000, data })
+
+  const decoder = new AudioDecoder({
+    output: () => {},
+    error: () => {},
+  })
+  decoder.configure(config)
+  decoder.decode(chunks[0])
+  await decoder.flush()
+
+  try {
+    decoder.decode(deltaChunk)
+    t.fail('decode delta after flush should throw DataError')
+  } catch (error) {
+    t.is((error as DOMException).name, 'DataError', 'error name should be DataError')
+  }
+
+  decoder.close()
+})
+
+// Spec: configure() synchronously sets [[key chunk required]] = true
+test('AudioDecoder: decode delta chunk after reconfigure throws DataError', async (t) => {
+  const { chunks, config } = await createEncodedChunks('opus', 48000, 2, 1)
+
+  if (chunks.length === 0) {
+    t.pass('No chunks produced')
+    return
+  }
+
+  const data = new Uint8Array(chunks[0].byteLength)
+  chunks[0].copyTo(data)
+  const deltaChunk = new EncodedAudioChunk({ type: 'delta', timestamp: 1000, data })
+
+  const decoder = new AudioDecoder({
+    output: () => {},
+    error: () => {},
+  })
+  decoder.configure(config)
+  decoder.decode(chunks[0])
+
+  // Reconfigure re-arms the key-chunk requirement synchronously
+  decoder.configure(config)
+
+  try {
+    decoder.decode(deltaChunk)
+    t.fail('decode delta after reconfigure should throw DataError')
+  } catch (error) {
+    t.is((error as DOMException).name, 'DataError', 'error name should be DataError')
+  }
+
+  decoder.close()
+})
+
+// Spec: [[key chunk required]] is main-thread state — the worker's reconfigure
+// step must not clear a key chunk already accepted by decode()
+test('AudioDecoder: reconfigure does not clobber accepted key chunk', async (t) => {
+  const { chunks, config } = await createEncodedChunks('opus', 48000, 2, 1)
+
+  if (chunks.length === 0) {
+    t.pass('No chunks produced')
+    return
+  }
+
+  const data = new Uint8Array(chunks[0].byteLength)
+  chunks[0].copyTo(data)
+  const keyChunk = new EncodedAudioChunk({ type: 'key', timestamp: 0, data })
+  const deltaChunk = new EncodedAudioChunk({ type: 'delta', timestamp: 1000, data })
+
+  const { init, outputs } = createCollectingCodecInit<AudioData>()
+  const decoder = new AudioDecoder({
+    output: (d) => {
+      outputs.push(d)
+    },
+    error: init.error,
+  })
+  decoder.configure(config)
+
+  // Reconfigure re-arms the requirement, then a key chunk satisfies it
+  decoder.configure(config)
+  decoder.decode(keyChunk)
+
+  // Opus packets are self-contained: output proves the worker has processed
+  // both the queued Reconfigure and the Decode command
+  await waitFor(() => outputs.length > 0, 'output after reconfigure', 30_000)
+
+  // The key was already accepted — a later delta must not throw
+  t.notThrows(() => decoder.decode(deltaChunk), 'delta after accepted key should not throw')
+
+  outputs.forEach((d) => d.close())
+  decoder.close()
+})
+
 // ============================================================================
 // Empty Frame Tests
 // ============================================================================

@@ -146,6 +146,36 @@ test('AudioEncoder: encode with negative timestamp', async (t) => {
   t.is(outputs[0].timestamp, -10000, 'negative timestamp preserved')
 })
 
+// WPT: "Verify encoding closed AudioData throws."
+test('AudioEncoder: encoding closed data throws', (t) => {
+  const encoder = new AudioEncoder({
+    output: () => {},
+    error: () => {},
+  })
+
+  const data = new AudioData({
+    format: 'f32-planar',
+    sampleRate: 48000,
+    numberOfFrames: 960,
+    numberOfChannels: 2,
+    timestamp: 0,
+    data: new Uint8Array(960 * 2 * 4),
+  })
+  data.close()
+
+  encoder.configure({
+    codec: 'opus',
+    sampleRate: 48000,
+    numberOfChannels: 2,
+  })
+
+  t.throws(() => encoder.encode(data), { instanceOf: TypeError }, 'encoding closed data should throw')
+
+  // The encoder must survive — a synchronous TypeError is not a codec error
+  t.is(encoder.state, 'configured')
+  encoder.close()
+})
+
 // ============================================================================
 // Reset During Flush Tests
 // ============================================================================
