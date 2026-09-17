@@ -1004,3 +1004,49 @@ test('VideoEncoder: retained event falls back to native stopImmediatePropagation
   t.notThrows(() => retained!.stopImmediatePropagation())
   encoder.close()
 })
+
+test('VideoEncoder: eventPhase and composedPath reflect dispatch state', (t) => {
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: () => {},
+  })
+
+  let during: { phase: number; path: unknown[] } | null = null
+  let retained: Event | null = null
+  encoder.addEventListener('dequeue', (event: Event) => {
+    retained = event
+    during = { phase: event.eventPhase, path: event.composedPath() }
+  })
+  encoder.dispatchEvent('dequeue')
+
+  t.is(during?.phase, 2, 'eventPhase is AT_TARGET during dispatch')
+  t.deepEqual(during?.path, [encoder], 'composedPath returns [codec] during dispatch')
+  t.is(retained!.eventPhase, 0, 'eventPhase resets to NONE after dispatch')
+  t.deepEqual(retained!.composedPath(), [], 'composedPath returns [] after dispatch')
+  encoder.close()
+})
+
+test('VideoEncoder: every throwing listener exception is reported', (t) => {
+  // DOM reports each listener exception independently — not just the first.
+  const script = `
+    const { VideoEncoder } = require('./index.js');
+    const enc = new VideoEncoder({ output: () => {}, error: () => {} });
+    const reported = [];
+    process.on('uncaughtException', (e) => {
+      reported.push(e.message);
+      if (reported.length === 2) {
+        console.log('REPORTED:' + reported.sort().join(','));
+        enc.close();
+      }
+    });
+    enc.addEventListener('dequeue', () => { throw new Error('boom-1'); });
+    enc.addEventListener('dequeue', () => { throw new Error('boom-2'); });
+    enc.dispatchEvent('dequeue');
+  `
+  const output = execFileSync(process.execPath, ['-e', script], {
+    cwd: process.cwd(),
+    timeout: 15_000,
+    encoding: 'utf8',
+  })
+  t.true(output.includes('REPORTED:boom-1,boom-2'), 'each listener exception must be reported')
+})

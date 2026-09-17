@@ -410,7 +410,40 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
     }
   }
 
-  let mut thrown: Option<sys::napi_value> = None;
+  // DOM: emulate the dispatch-phase state a real EventTarget would set.
+  // eventPhase reads AT_TARGET while listeners run (reset to NONE below);
+  // composedPath returns [codec] during dispatch — the wrapper is deleted in
+  // cleanup so post-dispatch calls hit the native prototype method (which
+  // returns [] for a non-dispatching event) and the captured codec handle is
+  // never dereferenced outside this callback's handle scope.
+  if let Ok(phase_prop) = Property::new()
+    .with_utf8_name("eventPhase")
+    .and_then(|p| p.with_napi_value(env, 2u32))
+  {
+    let _ = event_obj.define_properties(&[phase_prop]);
+  }
+  if let Some(ref codec) = codec_obj {
+    let codec_raw = codec.raw() as usize;
+    if let Ok(wrapper) = env.create_function_from_closure::<(), Unknown, _>(
+      "composedPath",
+      move |ctx: FunctionCallContext| -> Result<Unknown> {
+        let mut path = ctx.env.create_array(1)?;
+        let codec =
+          unsafe { Object::from_napi_value(ctx.env.raw(), codec_raw as sys::napi_value) }?;
+        path.set_element(0, codec)?;
+        unsafe { Unknown::from_napi_value(ctx.env.raw(), path.raw()) }
+      },
+    ) && let Ok(cp_prop) = Property::new()
+      .with_utf8_name("composedPath")
+      .and_then(|p| p.with_napi_value(env, wrapper))
+    {
+      let _ = event_obj.define_properties(&[cp_prop.with_property_attributes(
+        PropertyAttributes::Writable | PropertyAttributes::Configurable,
+      )]);
+    }
+  }
+
+  let mut thrown: Vec<sys::napi_value> = Vec::new();
   for item in &snapshot {
     // DOM: skip listeners removed between snapshot and invocation
     let still_registered = {
@@ -458,15 +491,15 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
       if res.is_err() {
         // A throwing listener leaves a pending exception on the env that
         // would poison every subsequent napi call. DOM reports listener
-        // exceptions and continues dispatch, so clear it now and re-report
-        // the first one after dispatch completes.
+        // exceptions and continues dispatch, so clear it now and report each
+        // one after dispatch completes.
         let mut pending = false;
         unsafe { sys::napi_is_exception_pending(env.raw(), &mut pending) };
         if pending {
           let mut exc = ptr::null_mut();
           let status = unsafe { sys::napi_get_and_clear_last_exception(env.raw(), &mut exc) };
-          if status == sys::Status::napi_ok && thrown.is_none() {
-            thrown = Some(exc);
+          if status == sys::Status::napi_ok {
+            thrown.push(exc);
           }
         }
       }
@@ -476,7 +509,7 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
     }
   }
 
-  // DOM: currentTarget is null once dispatch completes
+  // DOM: currentTarget is null and eventPhase is NONE once dispatch completes
   if codec_obj.is_some()
     && let Ok(ct_prop) = Property::new()
       .with_utf8_name("currentTarget")
@@ -484,45 +517,57 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
   {
     let _ = event_obj.define_properties(&[ct_prop]);
   }
+  if let Ok(phase_prop) = Property::new()
+    .with_utf8_name("eventPhase")
+    .and_then(|p| p.with_napi_value(env, 0u32))
+  {
+    let _ = event_obj.define_properties(&[phase_prop]);
+  }
 
-  // Remove the stopImmediatePropagation wrapper so listeners retaining the
-  // event fall back to the prototype method — the wrapper's captured raw
-  // napi_value is only valid within this dispatcher's handle scope.
+  // Remove the dispatch-time method wrappers so listeners retaining the event
+  // fall back to the prototype methods — the wrappers' captured raw napi_values
+  // are only valid within this dispatcher's handle scope.
   let _ = event_obj.delete_named_property("stopImmediatePropagation");
+  let _ = event_obj.delete_named_property("composedPath");
 
-  // DOM: listener exceptions are reported, not propagated from dispatchEvent.
-  // Schedule a rethrow on the microtask queue so it surfaces as an uncaught
-  // error while the caller still sees a normal return.
-  if let Some(exc) = thrown {
-    let mut exc_ref = ptr::null_mut();
-    let env_raw = env.raw();
-    let reported =
-      unsafe { sys::napi_create_reference(env_raw, exc, 1, &mut exc_ref) == sys::Status::napi_ok }
-        && env
-          .create_function_from_closure::<(), (), _>("reportListenerException", move |_| {
-            unsafe {
-              let mut v = ptr::null_mut();
-              sys::napi_get_reference_value(env_raw, exc_ref, &mut v);
-              sys::napi_delete_reference(env_raw, exc_ref);
-              if !v.is_null() {
-                sys::napi_throw(env_raw, v);
-              }
+  // DOM: every listener exception is reported (not propagated from
+  // dispatchEvent). Schedule a rethrow on the microtask queue so each
+  // surfaces as an uncaught error while the caller still sees a normal return.
+  for exc in thrown {
+    report_exception(env, exc);
+  }
+}
+
+/// Report one listener exception as an uncaught error via the microtask queue.
+/// Falls back to throwing inline if scheduling fails — better than swallowing.
+fn report_exception(env: &Env, exc: sys::napi_value) {
+  let mut exc_ref = ptr::null_mut();
+  let env_raw = env.raw();
+  let reported =
+    unsafe { sys::napi_create_reference(env_raw, exc, 1, &mut exc_ref) == sys::Status::napi_ok }
+      && env
+        .create_function_from_closure::<(), (), _>("reportListenerException", move |_| {
+          unsafe {
+            let mut v = ptr::null_mut();
+            sys::napi_get_reference_value(env_raw, exc_ref, &mut v);
+            sys::napi_delete_reference(env_raw, exc_ref);
+            if !v.is_null() {
+              sys::napi_throw(env_raw, v);
             }
-            Ok(())
-          })
-          .and_then(|reporter| {
-            let global = env.get_global()?;
-            let qm =
-              global.get_named_property::<Function<Function<(), ()>, Unknown>>("queueMicrotask")?;
-            qm.call(reporter).map(|_| ())
-          })
-          .is_ok();
-    if !reported {
-      // Couldn't schedule a report — better to throw inline than swallow it.
-      unsafe { sys::napi_throw(env_raw, exc) };
-      if !exc_ref.is_null() {
-        unsafe { sys::napi_delete_reference(env_raw, exc_ref) };
-      }
+          }
+          Ok(())
+        })
+        .and_then(|reporter| {
+          let global = env.get_global()?;
+          let qm =
+            global.get_named_property::<Function<Function<(), ()>, Unknown>>("queueMicrotask")?;
+          qm.call(reporter).map(|_| ())
+        })
+        .is_ok();
+  if !reported {
+    unsafe { sys::napi_throw(env_raw, exc) };
+    if !exc_ref.is_null() {
+      unsafe { sys::napi_delete_reference(env_raw, exc_ref) };
     }
   }
 }
