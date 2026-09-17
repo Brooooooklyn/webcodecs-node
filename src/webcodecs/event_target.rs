@@ -234,6 +234,14 @@ impl CodecEventState {
     }
   }
 
+  /// Any thread: a work item completed without producing a dispatch (no
+  /// dispatcher existed, or the TSFN was already closing). Only adjusts the
+  /// counter — with no dispatcher there is no codec ref, and a closing TSFN
+  /// means the env is tearing down, so no unref is required here.
+  fn note_undelivered(&mut self) {
+    self.outstanding = self.outstanding.saturating_sub(1);
+  }
+
   /// JS thread: a queued dequeue dispatch finished delivery — its work item
   /// is no longer outstanding.
   fn note_delivery(&mut self, env: &Env) {
@@ -369,19 +377,30 @@ impl CodecEventState {
   /// the codec wrapper and worker are gone by the time it runs.
   pub fn fire(shared: &Arc<RwLock<CodecEventState>>) {
     let dispatcher = shared.read().ok().and_then(|s| s.dispatcher.clone());
-    if let Some(dispatcher) = dispatcher {
-      let ptr = Arc::into_raw(Arc::clone(shared)) as usize as u64;
-      let status = dispatcher.call(
-        FnArgs::from((CMD_DISPATCH, (ptr >> 32) as u32, ptr as u32)),
-        ThreadsafeFunctionCallMode::NonBlocking,
-      );
-      if status != Status::Ok {
-        // TSFN already closing — reclaim the leaked Arc.
-        unsafe {
-          drop(Arc::from_raw(
-            ptr as usize as *const RwLock<CodecEventState>,
-          ));
-        }
+    let Some(dispatcher) = dispatcher else {
+      // No dispatcher: the item completed without a dispatch. Drain it so a
+      // listener registered later doesn't see a stale outstanding count —
+      // with no dispatcher there is no codec ref to unpin anyway.
+      if let Ok(mut state) = shared.write() {
+        state.note_undelivered();
+      }
+      return;
+    };
+    let ptr = Arc::into_raw(Arc::clone(shared)) as usize as u64;
+    let status = dispatcher.call(
+      FnArgs::from((CMD_DISPATCH, (ptr >> 32) as u32, ptr as u32)),
+      ThreadsafeFunctionCallMode::NonBlocking,
+    );
+    if status != Status::Ok {
+      // TSFN already closing — reclaim the leaked Arc and drain the item;
+      // the env is tearing down so no unref is needed on this thread.
+      unsafe {
+        drop(Arc::from_raw(
+          ptr as usize as *const RwLock<CodecEventState>,
+        ));
+      }
+      if let Ok(mut state) = shared.write() {
+        state.note_undelivered();
       }
     }
   }
@@ -453,101 +472,136 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
     return;
   };
   let in_dispatch = Arc::new(AtomicBool::new(true));
-  // A strong ref keeps the codec alive while the event is retained (DOM keeps
-  // event.target reachable); released by a finalizer when the event is GC'd.
+  // A strong ref keeps the codec alive for as long as the event's `target`
+  // can be observed (DOM keeps event.target reachable after dispatch). The
+  // finalizer is attached to the target getter FUNCTION below, not the event:
+  // an accessor extracted via getOwnPropertyDescriptor can outlive the event,
+  // so the handle's lifetime must follow the closure that dereferences it.
   let codec_ref = codec_obj.as_ref().and_then(|codec| {
     let mut r = ptr::null_mut();
     let ok = unsafe {
       sys::napi_create_reference(env.raw(), codec.raw(), 1, &mut r) == sys::Status::napi_ok
-        && sys::napi_add_finalizer(
-          env.raw(),
-          event_obj.raw(),
-          r as *mut std::ffi::c_void,
-          Some(release_codec_ref),
-          ptr::null_mut(),
-          ptr::null_mut(),
-        ) == sys::Status::napi_ok
     };
-    if !ok && !r.is_null() {
-      unsafe { sys::napi_delete_reference(env.raw(), r) };
-      return None;
-    }
-    ok.then_some(r as usize)
+    if ok { Some(r as usize) } else { None }
   });
 
+  // The getters are real functions installed via Object.defineProperty —
+  // with_getter_closure ties the Rust closure's lifetime to the EVENT (its
+  // finalizer lives on the target object), so an accessor extracted via
+  // getOwnPropertyDescriptor would call freed memory after the event is
+  // collected. create_function_from_closure anchors the closure on the
+  // function itself, which keeps extracted accessors safe.
+  let mut target_getter: Option<sys::napi_value> = None;
   for name in ["target", "currentTarget"] {
     let flag = in_dispatch.clone();
-    let getter = move |env: Env, this: This| -> Result<Unknown<'static>> {
-      if flag.load(Ordering::SeqCst)
-        && let Some(r) = codec_ref
-        && let Ok(v) = ref_value(&env, r)
-      {
-        return Ok(as_static(v));
-      }
-      let native = forward_event_getter(&env, this.object, name).ok();
-      if let Some(v) = native
-        && !is_nullish(env.raw(), v.raw())
-      {
-        return Ok(as_static(v));
-      }
-      // Native slot empty (never natively dispatched or dispatch finished):
-      // target still resolves to the codec (event.target persists after
-      // dispatch); currentTarget correctly stays null.
-      if name == "target"
-        && let Some(r) = codec_ref
-        && let Ok(v) = ref_value(&env, r)
-      {
-        return Ok(as_static(v));
-      }
-      match native {
-        Some(v) => Ok(as_static(v)),
-        None => {
-          let raw = unsafe { Null::to_napi_value(env.raw(), Null) }?;
-          Ok(as_static(unsafe {
-            Unknown::from_napi_value(env.raw(), raw)
-          }?))
+    let Ok(getter_fn) = env.create_function_from_closure::<(), Unknown, _>(
+      name,
+      move |ctx: FunctionCallContext| -> Result<Unknown> {
+        if flag.load(Ordering::SeqCst)
+          && let Some(r) = codec_ref
+          && let Ok(v) = ref_value(ctx.env, r)
+        {
+          return Ok(as_static(v));
         }
-      }
+        let this = ctx.this::<Object>()?;
+        let native = forward_event_getter(ctx.env, this, name).ok();
+        if let Some(v) = native
+          && !is_nullish(ctx.env.raw(), v.raw())
+        {
+          return Ok(as_static(v));
+        }
+        // Native slot empty (never natively dispatched or dispatch finished):
+        // target still resolves to the codec (event.target persists after
+        // dispatch); currentTarget correctly stays null.
+        if name == "target"
+          && let Some(r) = codec_ref
+          && let Ok(v) = ref_value(ctx.env, r)
+        {
+          return Ok(as_static(v));
+        }
+        match native {
+          Some(v) => Ok(as_static(v)),
+          None => {
+            let raw = unsafe { Null::to_napi_value(ctx.env.raw(), Null) }?;
+            Ok(as_static(unsafe {
+              Unknown::from_napi_value(ctx.env.raw(), raw)
+            }?))
+          }
+        }
+      },
+    ) else {
+      continue;
     };
-    if let Ok(prop) = Property::new().with_utf8_name(name).map(|p| {
-      p.with_getter_closure(getter)
-        .with_property_attributes(PropertyAttributes::Configurable)
-    }) {
-      let _ = event_obj.define_properties(&[prop]);
+    if name == "target" {
+      target_getter = Some(getter_fn.raw());
+    }
+    let _ = define_getter(env, event_obj.raw(), name, getter_fn.raw());
+  }
+
+  // Anchor codec_ref's lifetime to the target getter — the only closure that
+  // dereferences it outside dispatch (currentTarget/eventPhase only touch it
+  // while in_dispatch, when the event is necessarily alive). If anchoring
+  // fails, drop the own props so no closure captures a dangling handle.
+  let mut ref_anchored = codec_ref.is_none();
+  if let (Some(r), Some(getter_fn)) = (codec_ref, target_getter) {
+    ref_anchored = unsafe {
+      sys::napi_add_finalizer(
+        env.raw(),
+        getter_fn,
+        r as *mut std::ffi::c_void,
+        Some(release_codec_ref),
+        ptr::null_mut(),
+        ptr::null_mut(),
+      ) == sys::Status::napi_ok
+    };
+  }
+  if !ref_anchored {
+    let _ = event_obj.delete_named_property("target");
+    let _ = event_obj.delete_named_property("currentTarget");
+    if let Some(r) = codec_ref {
+      unsafe { sys::napi_delete_reference(env.raw(), r as sys::napi_ref) };
     }
   }
 
   {
     let flag = in_dispatch.clone();
-    let phase_getter = move |env: Env, this: This| -> Result<u32> {
-      if flag.load(Ordering::SeqCst) {
-        return Ok(2); // Event.AT_TARGET
-      }
-      forward_event_getter(&env, this.object, "eventPhase")
-        .and_then(|v| unsafe { u32::from_napi_value(env.raw(), v.raw()) })
-        .or(Ok(0))
-    };
-    if let Ok(prop) = Property::new().with_utf8_name("eventPhase").map(|p| {
-      p.with_getter_closure(phase_getter)
-        .with_property_attributes(PropertyAttributes::Configurable)
-    }) {
-      let _ = event_obj.define_properties(&[prop]);
+    if let Ok(phase_fn) = env.create_function_from_closure::<(), u32, _>(
+      "eventPhase",
+      move |ctx: FunctionCallContext| -> Result<u32> {
+        if flag.load(Ordering::SeqCst) {
+          return Ok(2); // Event.AT_TARGET
+        }
+        let this = ctx.this::<Object>()?;
+        forward_event_getter(ctx.env, this, "eventPhase")
+          .and_then(|v| unsafe { u32::from_napi_value(ctx.env.raw(), v.raw()) })
+          .or(Ok(0))
+      },
+    ) {
+      let _ = define_getter(env, event_obj.raw(), "eventPhase", phase_fn.raw());
     }
   }
 
-  // DOM: honor stopImmediatePropagation. The event never passes through a
-  // real EventTarget, so shadow the method with a wrapper that only flips a
-  // flag this loop observes — deliberately NOT forwarding to the native
-  // method, which would set the event's internal stop flag and poison a later
-  // native dispatchEvent on the retained event.
+  // DOM: honor stopImmediatePropagation. During our dispatch the wrapper only
+  // flips a flag this loop observes — deliberately NOT forwarding to the
+  // native method, which would set the event's internal stop flag and poison
+  // a later native dispatchEvent. After dispatch (the wrapper may be
+  // extracted and retained), calls forward to the native method so the real
+  // stop flag is set — matching DOM for an event dispatched natively later.
   let stop_immediate = Arc::new(AtomicBool::new(false));
   {
     let flag = stop_immediate.clone();
-    if let Ok(wrapper) = env.create_function_from_closure::<(), (), _>(
+    let dispatching = in_dispatch.clone();
+    if let Ok(wrapper) = env.create_function_from_closure::<(), Unknown, _>(
       "stopImmediatePropagation",
-      move |_ctx: FunctionCallContext| -> Result<()> {
-        flag.store(true, Ordering::SeqCst);
-        Ok(())
+      move |ctx: FunctionCallContext| -> Result<Unknown> {
+        if dispatching.load(Ordering::SeqCst) {
+          flag.store(true, Ordering::SeqCst);
+          let mut raw = ptr::null_mut();
+          check_status!(unsafe { sys::napi_get_undefined(ctx.env.raw(), &mut raw) })?;
+          return unsafe { Unknown::from_napi_value(ctx.env.raw(), raw) };
+        }
+        let this = ctx.this::<Unknown>()?;
+        call_event_proto_method(ctx.env, this.raw(), "stopImmediatePropagation")
       },
     ) && let Ok(sip_prop) = Property::new()
       .with_utf8_name("stopImmediatePropagation")
@@ -573,7 +627,7 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
       move |ctx: FunctionCallContext| -> Result<Unknown> {
         if !dispatching.load(Ordering::SeqCst) {
           let this = ctx.this::<Unknown>()?;
-          return call_native_composed_path(ctx.env, this.raw());
+          return call_event_proto_method(ctx.env, this.raw(), "composedPath");
         }
         let mut path = ctx.env.create_array(1)?;
         let codec =
@@ -791,17 +845,21 @@ fn forward_event_getter<'a>(env: &'a Env, this: Object<'a>, name: &str) -> Resul
   }
 }
 
-/// Invoke the native `Event.prototype.composedPath` on `this` via raw N-API —
-/// the Event constructor is a function, so typed `get_named_property::<Object>`
-/// reads reject it. Safe at any time; fetches everything fresh in the caller's
-/// handle scope.
-fn call_native_composed_path(env: &Env, this: sys::napi_value) -> Result<Unknown<'static>> {
+/// Invoke the native `Event.prototype.<name>` method on `this` via raw
+/// N-API — the Event constructor is a function, so typed
+/// `get_named_property::<Object>` reads reject it. Safe at any time; fetches
+/// everything fresh in the caller's handle scope.
+fn call_event_proto_method(
+  env: &Env,
+  this: sys::napi_value,
+  name: &str,
+) -> Result<Unknown<'static>> {
   let env_raw = env.raw();
   unsafe {
     let global = env.get_global()?.raw();
     let event_ctor = get_named_raw(env_raw, global, "Event")?;
     let proto = get_named_raw(env_raw, event_ctor, "prototype")?;
-    let method = get_named_raw(env_raw, proto, "composedPath")?;
+    let method = get_named_raw(env_raw, proto, name)?;
     let mut out = ptr::null_mut();
     check_status!(sys::napi_call_function(
       env_raw,
@@ -812,6 +870,56 @@ fn call_native_composed_path(env: &Env, this: sys::napi_value) -> Result<Unknown
       &mut out,
     ))?;
     Ok(as_static(Unknown::from_napi_value(env_raw, out)?))
+  }
+}
+
+/// Install `getter_fn` as an own getter `name` on `obj` via
+/// `Object.defineProperty(obj, name, { get, configurable, enumerable })` —
+/// raw N-API because the Object constructor is a function value.
+fn define_getter(
+  env: &Env,
+  obj: sys::napi_value,
+  name: &str,
+  getter_fn: sys::napi_value,
+) -> Result<()> {
+  let env_raw = env.raw();
+  unsafe {
+    let global = env.get_global()?.raw();
+    let object_ctor = get_named_raw(env_raw, global, "Object")?;
+    let define_property = get_named_raw(env_raw, object_ctor, "defineProperty")?;
+    let mut desc = ptr::null_mut();
+    check_status!(sys::napi_create_object(env_raw, &mut desc))?;
+    check_status!(sys::napi_set_named_property(
+      env_raw,
+      desc,
+      c"get".as_ptr(),
+      getter_fn
+    ))?;
+    let mut t = ptr::null_mut();
+    check_status!(sys::napi_get_boolean(env_raw, true, &mut t))?;
+    check_status!(sys::napi_set_named_property(
+      env_raw,
+      desc,
+      c"configurable".as_ptr(),
+      t
+    ))?;
+    check_status!(sys::napi_set_named_property(
+      env_raw,
+      desc,
+      c"enumerable".as_ptr(),
+      t
+    ))?;
+    let name_v = env.create_string(name)?.raw();
+    let mut out = ptr::null_mut();
+    check_status!(sys::napi_call_function(
+      env_raw,
+      object_ctor,
+      define_property,
+      3,
+      [obj, name_v, desc].as_ptr(),
+      &mut out,
+    ))?;
+    Ok(())
   }
 }
 

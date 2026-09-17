@@ -1273,3 +1273,97 @@ test('VideoEncoder: once listener for a non-emitted type does not pin the proces
   })
   t.true(output.includes('REGISTERED'), 'process must exit without waiting')
 })
+
+test('VideoEncoder: extracted event accessors stay valid after event GC', (t) => {
+  // Getter/wrapper functions extracted via getOwnPropertyDescriptor can
+  // outlive the event; they must keep working (function-anchored lifetimes).
+  const script = `
+    const { VideoEncoder } = require('./index.js');
+    const enc = new VideoEncoder({ output: () => {}, error: () => {} });
+    let getT, getCT, getPh;
+    (() => {
+      enc.addEventListener('dequeue', (e) => {
+        getT = Object.getOwnPropertyDescriptor(e, 'target').get;
+        getCT = Object.getOwnPropertyDescriptor(e, 'currentTarget').get;
+        getPh = Object.getOwnPropertyDescriptor(e, 'eventPhase').get;
+      });
+      enc.dispatchEvent('dequeue');
+    })();
+    globalThis.gc();
+    setTimeout(() => {
+      globalThis.gc();
+      const fresh = new Event('x');
+      console.log('T:' + (getT.call(fresh) === enc));
+      console.log('CT:' + getCT.call(fresh));
+      console.log('PH:' + getPh.call(fresh));
+    }, 300);
+  `
+  const output = execFileSync(process.execPath, ['--expose-gc', '-e', script], {
+    cwd: process.cwd(),
+    timeout: 15_000,
+    encoding: 'utf8',
+  })
+  t.regex(output, /T:true/, 'extracted target getter must resolve the codec')
+  t.regex(output, /CT:null/, 'extracted currentTarget getter must be null')
+  t.regex(output, /PH:0/, 'extracted eventPhase getter must be NONE')
+})
+
+test('VideoEncoder: extracted stopImmediatePropagation forwards to native after dispatch', (t) => {
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: () => {},
+  })
+
+  let saved: ((this: Event) => void) | null = null
+  let retained: Event | null = null
+  encoder.addEventListener('dequeue', (event: Event) => {
+    retained = event
+    saved = event.stopImmediatePropagation as (this: Event) => void
+  })
+  encoder.dispatchEvent('dequeue')
+
+  // Calling the extracted wrapper after our dispatch must invoke the real
+  // native method — setting the event's internal stop flag so a subsequent
+  // native dispatchEvent runs no listeners.
+  saved!.call(retained!)
+  const other = new EventTarget()
+  let fired = 0
+  other.addEventListener('dequeue', () => fired++)
+  other.dispatchEvent(retained!)
+  t.is(fired, 0, 'extracted SIP must set the native stop flag')
+  encoder.close()
+})
+
+test('VideoEncoder: codec collectable after work drained without listeners', (t) => {
+  // Encode before any listener exists: fire() drains the outstanding count
+  // without a dispatcher, so a listener registered afterwards must not pin
+  // the codec forever.
+  const script = `
+    const { VideoEncoder, VideoFrame } = require('./index.js');
+    let weak;
+    let enc = new VideoEncoder({ output: () => {}, error: () => {} });
+    weak = new WeakRef(enc);
+    enc.configure({ codec: 'avc1.42001f', width: 64, height: 64, bitrate: 100000 });
+    const f = new VideoFrame(new Uint8Array(64*64*1.5), {
+      format: 'I420', codedWidth: 64, codedHeight: 64, timestamp: 0,
+    });
+    enc.encode(f, { keyFrame: true });
+    f.close();
+    setTimeout(() => {
+      enc.addEventListener('dequeue', () => {});
+      enc.close();
+      enc = null;
+      globalThis.gc();
+      setTimeout(() => {
+        globalThis.gc();
+        console.log('COLLECTED:' + (weak.deref() === undefined));
+      }, 600);
+    }, 800);
+  `
+  const output = execFileSync(process.execPath, ['--expose-gc', '-e', script], {
+    cwd: process.cwd(),
+    timeout: 15_000,
+    encoding: 'utf8',
+  })
+  t.regex(output, /COLLECTED:true/, 'codec must be collectable')
+})
