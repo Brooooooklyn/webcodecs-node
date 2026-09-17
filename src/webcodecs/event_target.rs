@@ -291,7 +291,10 @@ impl CodecEventState {
     &mut self,
     handler: Option<FunctionRef<Unknown<'static>, UnknownReturnValue>>,
   ) {
-    if handler.is_some() {
+    // Re-assigning while a handler is set replaces the callback in the same
+    // slot (DOM event-handler semantics); only a null -> non-null transition
+    // creates a new registration.
+    if handler.is_some() && self.ondequeue.is_none() {
       self.ondequeue_id = self.next_listener_id;
       self.next_listener_id += 1;
     }
@@ -499,15 +502,22 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
     }
   }
 
-  // DOM: composedPath returns [codec] during dispatch — the wrapper is
-  // deleted in cleanup so post-dispatch calls hit the native prototype method
-  // (which returns [] for a non-dispatching event) and the captured codec
-  // handle is never dereferenced outside this callback's handle scope.
+  // DOM: composedPath returns [codec] during dispatch. Outside our dispatch
+  // the captured raw codec handle may be stale (its handle scope has ended),
+  // so the wrapper forwards to the native prototype method instead — which
+  // returns [] for a non-dispatching event and the real path during a native
+  // re-dispatch. This stays safe even if the wrapper is extracted and called
+  // after the event property is deleted.
   if let Some(ref codec) = codec_obj {
     let codec_raw = codec.raw() as usize;
+    let dispatching = in_dispatch.clone();
     if let Ok(wrapper) = env.create_function_from_closure::<(), Unknown, _>(
       "composedPath",
       move |ctx: FunctionCallContext| -> Result<Unknown> {
+        if !dispatching.load(Ordering::SeqCst) {
+          let this = ctx.this::<Unknown>()?;
+          return call_native_composed_path(ctx.env, this.raw());
+        }
         let mut path = ctx.env.create_array(1)?;
         let codec =
           unsafe { Object::from_napi_value(ctx.env.raw(), codec_raw as sys::napi_value) }?;
@@ -713,6 +723,30 @@ fn forward_event_getter<'a>(env: &'a Env, this: Object<'a>, name: &str) -> Resul
       &mut out,
     ))?;
     Unknown::from_napi_value(env_raw, out)
+  }
+}
+
+/// Invoke the native `Event.prototype.composedPath` on `this` via raw N-API —
+/// the Event constructor is a function, so typed `get_named_property::<Object>`
+/// reads reject it. Safe at any time; fetches everything fresh in the caller's
+/// handle scope.
+fn call_native_composed_path(env: &Env, this: sys::napi_value) -> Result<Unknown<'static>> {
+  let env_raw = env.raw();
+  unsafe {
+    let global = env.get_global()?.raw();
+    let event_ctor = get_named_raw(env_raw, global, "Event")?;
+    let proto = get_named_raw(env_raw, event_ctor, "prototype")?;
+    let method = get_named_raw(env_raw, proto, "composedPath")?;
+    let mut out = ptr::null_mut();
+    check_status!(sys::napi_call_function(
+      env_raw,
+      this,
+      method,
+      0,
+      ptr::null(),
+      &mut out,
+    ))?;
+    Ok(as_static(Unknown::from_napi_value(env_raw, out)?))
   }
 }
 

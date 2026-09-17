@@ -1126,7 +1126,7 @@ test('VideoEncoder: ondequeue participates in registration order', (t) => {
   encoder.dispatchEvent('dequeue')
   t.deepEqual(order, ['listener', 'ondequeue'])
 
-  // Re-assigning the handler is a fresh registration — it moves to the end
+  // Handler assigned before addEventListener runs first
   order.length = 0
   const encoder2 = new VideoEncoder({ output: () => {}, error: () => {} })
   encoder2.ondequeue = () => order.push('ondequeue')
@@ -1134,8 +1134,25 @@ test('VideoEncoder: ondequeue participates in registration order', (t) => {
   encoder2.dispatchEvent('dequeue')
   t.deepEqual(order, ['ondequeue', 'listener'])
 
+  // Re-assigning while set replaces the callback in the SAME slot
+  order.length = 0
+  const encoder3 = new VideoEncoder({ output: () => {}, error: () => {} })
+  encoder3.ondequeue = () => order.push('first')
+  encoder3.addEventListener('dequeue', () => order.push('listener'))
+  encoder3.ondequeue = () => order.push('second')
+  encoder3.dispatchEvent('dequeue')
+  t.deepEqual(order, ['second', 'listener'])
+
+  // But clearing then re-setting creates a fresh registration at the end
+  order.length = 0
+  encoder3.ondequeue = null
+  encoder3.ondequeue = () => order.push('third')
+  encoder3.dispatchEvent('dequeue')
+  t.deepEqual(order, ['listener', 'third'])
+
   encoder.close()
   encoder2.close()
+  encoder3.close()
 })
 
 test('VideoEncoder: stopImmediatePropagation does not poison native re-dispatch', (t) => {
@@ -1158,6 +1175,36 @@ test('VideoEncoder: stopImmediatePropagation does not poison native re-dispatch'
   other.addEventListener('dequeue', () => fired++)
   other.dispatchEvent(retained!)
   t.is(fired, 1, 'native re-dispatch must not be stopped by our dispatch')
+  encoder.close()
+})
+
+test('VideoEncoder: extracted composedPath stays safe and forwards natively', (t) => {
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: () => {},
+  })
+
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
+  let saved: Function | null = null
+  let retained: Event | null = null
+  encoder.addEventListener('dequeue', (event: Event) => {
+    retained = event
+    saved = event.composedPath
+    t.is(event.composedPath().length, 1, 'during dispatch: [codec]')
+  })
+  encoder.dispatchEvent('dequeue')
+
+  // Extracted function called after dispatch must not touch a stale handle —
+  // forwards to the native method ([] for a non-dispatching event).
+  t.deepEqual(saved!.call(retained!), [])
+  // During a native re-dispatch the extracted wrapper reports the real path.
+  const other = new EventTarget()
+  let nativePathLen = -1
+  other.addEventListener('dequeue', (e: Event) => {
+    nativePathLen = saved!.call(e).length
+  })
+  other.dispatchEvent(retained!)
+  t.is(nativePathLen, 1, 'extracted wrapper returns native path on re-dispatch')
   encoder.close()
 })
 
