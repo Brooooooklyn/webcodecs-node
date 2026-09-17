@@ -1315,33 +1315,41 @@ test('VideoEncoder: extracted event accessors stay valid after event GC', (t) =>
 })
 
 test('VideoEncoder: codec collectable when a listener retains its event', (t) => {
-  // A listener storing its event forms codec → state → FunctionRef →
-  // listener → event → codec. The event→codec edge is a JS WeakRef (visible,
-  // non-rooting) so the cycle is collectable — an opaque napi_ref edge would
-  // pin the codec forever.
+  // A listener storing its event forms codec → state → listener → event →
+  // codec. Both edges are GC-traceable JS references (event[sym] → codec,
+  // codec[sym] → Map(id → callback)) while the native refs stay weak, so:
+  // while the event is retained the codec must stay alive (DOM target
+  // retention), and once it is dropped the whole cycle must be collectable.
   const script = `
     const { VideoEncoder } = require('./index.js');
-    let weak;
+    let weak, weakL;
     (() => {
       const enc = new VideoEncoder({ output: () => {}, error: () => {} });
+      const listener = (e) => { globalThis.saved = e; };
       weak = new WeakRef(enc);
-      enc.addEventListener('dequeue', (e) => { globalThis.saved = e; });
+      weakL = new WeakRef(listener);
+      enc.addEventListener('dequeue', listener);
       enc.dispatchEvent('dequeue');
     })();
     globalThis.gc();
     setTimeout(() => {
       globalThis.gc();
-      console.log('COLLECTED:' + (weak.deref() === undefined));
-      console.log('TARGET:' + globalThis.saved.target);
-    }, 400);
+      console.log('HELD:' + (weak.deref() !== undefined));
+      globalThis.saved = null;
+      globalThis.gc();
+      setTimeout(() => {
+        globalThis.gc();
+        console.log('COLLECTED:' + (weak.deref() === undefined && weakL.deref() === undefined));
+      }, 300);
+    }, 300);
   `
   const output = execFileSync(process.execPath, ['--expose-gc', '-e', script], {
     cwd: process.cwd(),
     timeout: 15_000,
     encoding: 'utf8',
   })
-  t.regex(output, /COLLECTED:true/, 'codec must be collectable')
-  t.regex(output, /TARGET:null/, 'dead codec derefs to null')
+  t.regex(output, /HELD:true/, 'retained event must keep the codec alive')
+  t.regex(output, /COLLECTED:true/, 'dropped event must release the cycle')
 })
 
 test('VideoEncoder: extracted stopImmediatePropagation forwards to native after dispatch', (t) => {

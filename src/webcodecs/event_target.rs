@@ -32,14 +32,16 @@ use super::error::new_event;
 const CMD_DELETE_REF: u32 = 1;
 const CMD_DISPATCH: u32 = 2;
 
-/// A registered event listener. The FunctionRef both calls the JS callback and
-/// identifies the listener for removeEventListener (strict equality).
+/// A registered event listener. `callback` is a WEAK napi_ref — the JS
+/// callback's liveness is anchored by a GC-traceable Map on the codec object
+/// (`codec[Symbol.for("webcodecs.listeners")]`), so the codec→listener edge
+/// never roots the listener and a retained-event cycle stays collectable.
 struct EventListenerEntry {
   id: u64,
   once: bool,
   /// DOM capture flag — part of listener identity for add/remove matching.
   capture: bool,
-  callback: Arc<FunctionRef<Unknown<'static>, UnknownReturnValue>>,
+  callback: usize,
 }
 
 /// Weak reference to the codec's JS object.
@@ -136,10 +138,11 @@ pub struct CodecEventState {
   /// Weak ref to the codec's JS object (`this`), captured lazily on the first
   /// event-related call so dispatched events expose it as target/currentTarget.
   codec_obj: Option<WeakCodecRef>,
-  /// The ondequeue event handler property value, plus its registration-order
+  /// The ondequeue event handler property value (weak napi_ref, same
+  /// Map-anchored liveness as ordinary listeners), plus its registration-order
   /// id — an event handler participates in listener ordering, so assigning it
   /// after addEventListener must run it after earlier registrations.
-  ondequeue: Option<Arc<FunctionRef<Unknown<'static>, UnknownReturnValue>>>,
+  ondequeue: Option<usize>,
   ondequeue_id: u64,
   /// Enqueued work items whose dequeue dispatch has not been delivered (or
   /// discarded) yet. While >0 the codec_obj ref is held strong so a queued
@@ -290,25 +293,42 @@ impl CodecEventState {
     once: bool,
     capture: bool,
   ) -> Result<()> {
-    let listeners = self.listeners.entry(event_type.to_string()).or_default();
-    for entry in listeners.iter() {
-      let same = entry.capture == capture
-        && match (entry.callback.borrow_back(env), callback.borrow_back(env)) {
-          (Ok(registered), Ok(passed)) => env.strict_equals(registered, passed).unwrap_or(false),
-          _ => false,
-        };
-      if same {
-        return Ok(());
-      }
+    let callback_raw = callback.borrow_back(env)?.raw();
+    let codec_raw = self.codec_raw(env);
+    let dup = self
+      .listeners
+      .get(event_type)
+      .map(|ls| {
+        ls.iter().any(|entry| {
+          entry.capture == capture
+            && match (
+              upgrade_ref(env, entry.callback).ok().flatten(),
+              callback.borrow_back(env).ok(),
+            ) {
+              (Some(registered), Some(passed)) => {
+                env.strict_equals(registered, passed).unwrap_or(false)
+              }
+              _ => false,
+            }
+        })
+      })
+      .unwrap_or(false);
+    if dup {
+      return Ok(());
     }
     let id = self.next_listener_id;
     self.next_listener_id += 1;
-    listeners.push(Arc::new(EventListenerEntry {
-      id,
-      once,
-      capture,
-      callback: Arc::new(callback),
-    }));
+    let refr = Self::anchor_callback(env, codec_raw, id, callback_raw)?;
+    self
+      .listeners
+      .entry(event_type.to_string())
+      .or_default()
+      .push(Arc::new(EventListenerEntry {
+        id,
+        once,
+        capture,
+        callback: refr,
+      }));
     // Only once-listeners for 'dequeue' — the codec's sole automatic event —
     // keep the process alive. A once-listener for a type the codec never
     // emits on its own would pin the process forever.
@@ -328,18 +348,25 @@ impl CodecEventState {
     callback: &FunctionRef<Unknown<'static>, UnknownReturnValue>,
     capture: bool,
   ) {
+    let codec_raw = self.codec_raw(env);
     let mut removed_once = false;
-    if let Some(listeners) = self.listeners.get_mut(event_type) {
-      if let Some(pos) = listeners.iter().position(|entry| {
+    if let Some(listeners) = self.listeners.get_mut(event_type)
+      && let Some(pos) = listeners.iter().position(|entry| {
         entry.capture == capture
-          && match (entry.callback.borrow_back(env), callback.borrow_back(env)) {
-            (Ok(registered), Ok(passed)) => env.strict_equals(registered, passed).unwrap_or(false),
+          && match (
+            upgrade_ref(env, entry.callback).ok().flatten(),
+            callback.borrow_back(env).ok(),
+          ) {
+            (Some(registered), Some(passed)) => {
+              env.strict_equals(registered, passed).unwrap_or(false)
+            }
             _ => false,
           }
-      }) {
-        removed_once = listeners[pos].once;
-        listeners.remove(pos);
-      }
+      })
+    {
+      let removed = listeners.remove(pos);
+      removed_once = removed.once;
+      release_callback(env, codec_raw, removed.id, removed.callback);
       if listeners.is_empty() {
         self.listeners.remove(event_type);
       }
@@ -354,21 +381,71 @@ impl CodecEventState {
   /// a fresh registration for ordering purposes (DOM event-handler semantics).
   pub fn set_ondequeue(
     &mut self,
+    env: &Env,
     handler: Option<FunctionRef<Unknown<'static>, UnknownReturnValue>>,
-  ) {
+  ) -> Result<()> {
+    let codec_raw = self.codec_raw(env);
     // Re-assigning while a handler is set replaces the callback in the same
     // slot (DOM event-handler semantics); only a null -> non-null transition
     // creates a new registration.
-    if handler.is_some() && self.ondequeue.is_none() {
-      self.ondequeue_id = self.next_listener_id;
-      self.next_listener_id += 1;
+    let replacing = self.ondequeue.is_some();
+    if let Some(old) = self.ondequeue.take() {
+      release_callback(env, codec_raw, self.ondequeue_id, old);
     }
-    self.ondequeue = handler.map(Arc::new);
+    if let Some(h) = handler {
+      if !replacing {
+        self.ondequeue_id = self.next_listener_id;
+        self.next_listener_id += 1;
+      }
+      self.ondequeue = Some(Self::anchor_callback(
+        env,
+        codec_raw,
+        self.ondequeue_id,
+        h.borrow_back(env)?.raw(),
+      )?);
+    }
+    Ok(())
   }
 
-  /// The current ondequeue handler, for the property getter.
-  pub fn ondequeue(&self) -> Option<&Arc<FunctionRef<Unknown<'static>, UnknownReturnValue>>> {
-    self.ondequeue.as_ref()
+  /// The current ondequeue handler's weak ref, for the property getter.
+  pub fn ondequeue(&self) -> Option<usize> {
+    self.ondequeue
+  }
+
+  /// The codec's JS object handle, when captured.
+  fn codec_raw(&self, env: &Env) -> Option<sys::napi_value> {
+    self
+      .codec_obj
+      .as_ref()
+      .and_then(|r| r.get(env))
+      .map(|o| o.raw())
+  }
+
+  /// Register `fn_raw` in the codec's listener Map under `id` and return a
+  /// weak napi_ref for invocation. If no Map edge can be installed (no codec
+  /// object captured), falls back to a strong ref so the callback stays
+  /// callable — trading collectability for correctness on that path.
+  fn anchor_callback(
+    env: &Env,
+    codec: Option<sys::napi_value>,
+    id: u64,
+    fn_raw: sys::napi_value,
+  ) -> Result<usize> {
+    let mut strong = true;
+    if let Some(codec) = codec
+      && let Ok(Some(map)) = listener_map(env, codec, true)
+    {
+      let mut idv = ptr::null_mut();
+      unsafe { sys::napi_create_double(env.raw(), id as f64, &mut idv) };
+      if map_op(env, map, "set", &[idv, fn_raw]).is_ok() {
+        strong = false;
+      }
+    }
+    let mut r = ptr::null_mut();
+    check_status!(unsafe {
+      sys::napi_create_reference(env.raw(), fn_raw, if strong { 1 } else { 0 }, &mut r)
+    })?;
+    Ok(r as usize)
   }
 
   /// Fire the dequeue event from the worker thread (async, non-blocking).
@@ -406,11 +483,56 @@ impl CodecEventState {
   }
 }
 
-/// Snapshot item: listener id plus a shared handle to the JS callback.
+impl Drop for CodecEventState {
+  /// Delete listener callback napi_ref handles. Only the JS thread may call
+  /// napi_delete_reference — a drop landing on a worker routes each handle
+  /// through the dispatcher, matching WeakCodecRef's release path.
+  fn drop(&mut self) {
+    let mut refs: Vec<usize> = self
+      .listeners
+      .values()
+      .flatten()
+      .map(|e| e.callback)
+      .collect();
+    if let Some(r) = self.ondequeue {
+      refs.push(r);
+    }
+    if refs.is_empty() {
+      return;
+    }
+    let on_js_thread = self
+      .codec_obj
+      .as_ref()
+      .map(|c| c.js_thread == std::thread::current().id())
+      .unwrap_or(false);
+    if on_js_thread {
+      let env = self.codec_obj.as_ref().unwrap().env;
+      for r in refs {
+        unsafe { sys::napi_delete_reference(env, r as sys::napi_ref) };
+      }
+    } else if let Some(ref dispatcher) = self.dispatcher {
+      for r in refs {
+        let addr = r as u64;
+        dispatcher.call(
+          FnArgs::from((
+            CMD_DELETE_REF,
+            ((addr >> 32) & 0xffff_ffff) as u32,
+            addr as u32,
+          )),
+          ThreadsafeFunctionCallMode::NonBlocking,
+        );
+      }
+    }
+    // No codec ref and no dispatcher: handles leak harmlessly — listeners can
+    // only exist after ensure_dispatcher ran, so this is an env-teardown edge.
+  }
+}
+
+/// Snapshot item: listener id plus the weak napi_ref handle to invoke.
 struct DispatchItem {
   id: u64,
   once: bool,
-  callback: Arc<FunctionRef<Unknown<'static>, UnknownReturnValue>>,
+  callback: usize,
   /// True for the ondequeue handler pseudo-entry
   is_ondequeue: bool,
 }
@@ -432,13 +554,11 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
     let mut snapshot: Vec<DispatchItem> = Vec::new();
     // The ondequeue handler only applies to "dequeue" events; it participates
     // in registration order with ordinary listeners.
-    if event_type == "dequeue"
-      && let Some(ref handler) = state.ondequeue
-    {
+    if event_type == "dequeue" && state.ondequeue.is_some() {
       snapshot.push(DispatchItem {
         id: state.ondequeue_id,
         once: false,
-        callback: handler.clone(),
+        callback: state.ondequeue.unwrap_or(0),
         is_ondequeue: true,
       });
     }
@@ -447,7 +567,7 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
         snapshot.push(DispatchItem {
           id: entry.id,
           once: entry.once,
-          callback: entry.callback.clone(),
+          callback: entry.callback,
           is_ondequeue: false,
         });
       }
@@ -472,14 +592,12 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
     return;
   };
   let in_dispatch = Arc::new(AtomicBool::new(true));
-  // The event→codec edge is a JS WeakRef under a global-registry Symbol key —
-  // visible to GC and non-rooting — so a listener retaining the event forms a
-  // pure-JS, collectable cycle (codec → state → listener → event → codec)
-  // instead of an opaque napi_ref edge that would pin the codec forever.
-  if let Some(ref codec) = codec_obj
-    && let Ok(wr) = weak_ref_new(env, codec.raw())
-  {
-    let _ = define_sym_prop(env, event_obj.raw(), TARGET_SYM_DESC, wr);
+  // The event→codec edge is a plain JS value under a global-registry Symbol
+  // key — DOM keeps event.target alive after dispatch, and a GC-traceable JS
+  // edge (unlike an opaque napi_ref) lets the whole codec/listener/event
+  // cycle be collected once unreachable.
+  if let Some(ref codec) = codec_obj {
+    let _ = define_sym_prop(env, event_obj.raw(), TARGET_SYM_DESC, codec.raw());
   }
 
   // The getters are real functions installed via Object.defineProperty —
@@ -494,15 +612,11 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
       name,
       move |ctx: FunctionCallContext| -> Result<Unknown> {
         let this = ctx.this::<Object>()?;
-        // The stored value is a WeakRef; deref() yields the codec while it
-        // lives, undefined once collected.
-        let ours = sym_prop(ctx.env, this.raw())
-          .ok()
-          .and_then(|wr| weak_ref_deref(ctx.env, wr.raw()).ok().flatten());
+        let ours = sym_prop(ctx.env, this.raw()).ok();
         if flag.load(Ordering::SeqCst) {
           return match ours {
-            Some(v) => Ok(as_static(v)),
-            None => null_unknown(ctx.env),
+            Some(v) if !is_nullish(ctx.env.raw(), v.raw()) => Ok(as_static(v)),
+            _ => null_unknown(ctx.env),
           };
         }
         let native = forward_event_getter(ctx.env, this, name).ok();
@@ -516,6 +630,7 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
         // dispatch); currentTarget correctly stays null.
         if name == "target"
           && let Some(v) = ours
+          && !is_nullish(ctx.env.raw(), v.raw())
         {
           return Ok(as_static(v));
         }
@@ -624,7 +739,7 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
       };
       if item.is_ondequeue {
         if state.ondequeue_id == item.id {
-          state.ondequeue.clone()
+          state.ondequeue
         } else {
           None
         }
@@ -634,23 +749,52 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
           .get(event_type)
           .map(|l| l.iter().any(|e| e.id == item.id))
           .unwrap_or(false);
-        if live {
-          Some(item.callback.clone())
-        } else {
-          None
-        }
+        if live { Some(item.callback) } else { None }
       }
     };
     let Some(callback) = invoke_cb else {
       continue;
     };
+    // Upgrade BEFORE the once-removal below deletes the ref handle — the
+    // upgraded local handle stays valid until this handle scope ends, while
+    // the deleted ref would be unusable.
+    let func = upgrade_ref(env, callback).ok().flatten();
+    if func.is_none() && !item.once {
+      // The weak ref was emptied — only possible if its Map anchor is gone.
+      // Drop the dead entry so it can't wedge dispatch.
+      if let Ok(mut state) = shared.write() {
+        if item.is_ondequeue {
+          if state.ondequeue == Some(callback) {
+            state.ondequeue = None;
+          }
+        } else if let Some(listeners) = state.listeners.get_mut(event_type) {
+          listeners.retain(|e| e.id != item.id);
+          if listeners.is_empty() {
+            state.listeners.remove(event_type);
+          }
+        }
+      }
+      unsafe { sys::napi_delete_reference(env.raw(), callback as sys::napi_ref) };
+      if stop_immediate.load(Ordering::SeqCst) {
+        break;
+      }
+      continue;
+    }
     // DOM spec: remove "once" listeners before invoking so a re-entrant
     // dispatchEvent inside the listener cannot observe it again.
     if item.once
       && let Ok(mut state) = shared.write()
       && let Some(listeners) = state.listeners.get_mut(event_type)
     {
-      listeners.retain(|e| e.id != item.id);
+      if let Some(pos) = listeners.iter().position(|e| e.id == item.id) {
+        let removed = listeners.remove(pos);
+        release_callback(
+          env,
+          codec_obj.as_ref().map(|o| o.raw()),
+          removed.id,
+          removed.callback,
+        );
+      }
       if listeners.is_empty() {
         state.listeners.remove(event_type);
       }
@@ -659,15 +803,28 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
         state.sync_once_ref(env);
       }
     }
-    if let Ok(func) = callback.borrow_back(env) {
-      // Relax the event's phantom lifetime to match the stored callback's
-      // args type; the event is only used within this synchronous call.
-      let arg: Unknown<'static> = unsafe { std::mem::transmute(event) };
-      let res = match &codec_obj {
-        Some(codec) => func.apply(*codec, arg).map(|_| ()),
-        None => func.call(arg).map(|_| ()),
+    if let Some(func) = func {
+      // this = the codec object (or undefined if it is gone).
+      let this_raw = match codec_obj.as_ref() {
+        Some(codec) => codec.raw(),
+        None => {
+          let mut u = ptr::null_mut();
+          unsafe { sys::napi_get_undefined(env.raw(), &mut u) };
+          u
+        }
       };
-      if res.is_err() {
+      let mut out = ptr::null_mut();
+      let status = unsafe {
+        sys::napi_call_function(
+          env.raw(),
+          this_raw,
+          func.raw(),
+          1,
+          [event_obj.raw()].as_ptr(),
+          &mut out,
+        )
+      };
+      if status != sys::Status::napi_ok {
         // A throwing listener leaves a pending exception on the env that
         // would poison every subsequent napi call. DOM reports listener
         // exceptions and continues dispatch, so clear it now and report each
@@ -781,7 +938,7 @@ fn symbol_for(env: &Env, desc: &str) -> Result<sys::napi_value> {
 }
 
 /// `this[Symbol.for(TARGET_SYM_DESC)]` — the event's dispatch target, stored
-/// as a WeakRef so the edge is visible to the garbage collector.
+/// as a plain JS value so the edge is visible to the garbage collector.
 fn sym_prop(env: &Env, this: sys::napi_value) -> Result<Unknown<'static>> {
   let env_raw = env.raw();
   let sym = symbol_for(env, TARGET_SYM_DESC)?;
@@ -790,46 +947,87 @@ fn sym_prop(env: &Env, this: sys::napi_value) -> Result<Unknown<'static>> {
   Ok(as_static(unsafe { Unknown::from_napi_value(env_raw, v)? }))
 }
 
-/// `new WeakRef(v)` via raw N-API.
-fn weak_ref_new(env: &Env, v: sys::napi_value) -> Result<sys::napi_value> {
-  let env_raw = env.raw();
-  unsafe {
-    let global = env.get_global()?.raw();
-    let ctor = get_named_raw(env_raw, global, "WeakRef")?;
-    let mut wr = ptr::null_mut();
-    check_status!(sys::napi_new_instance(
-      env_raw,
-      ctor,
-      1,
-      [v].as_ptr(),
-      &mut wr,
-    ))?;
-    Ok(wr)
-  }
-}
+/// Symbol.for() key for the codec's listener-liveness Map (id → callback).
+/// A plain JS edge makes the codec→listener relationship GC-traceable, so
+/// listener napi_refs can stay weak and a codec→state→listener→event→codec
+/// cycle remains collectable.
+const LISTENERS_SYM_DESC: &str = "webcodecs.listeners";
 
-/// `wr.deref()` — the referent while it lives, `None` once collected or when
-/// `wr` is not a WeakRef (e.g. an extracted getter called on a foreign this).
-fn weak_ref_deref(env: &Env, wr: sys::napi_value) -> Result<Option<Unknown<'static>>> {
+/// `codec[Symbol.for(desc)]` as a Map, creating and installing it when
+/// `create` is set. None when absent and not requested.
+fn listener_map(
+  env: &Env,
+  codec: sys::napi_value,
+  create: bool,
+) -> Result<Option<sys::napi_value>> {
   let env_raw = env.raw();
-  if is_nullish(env_raw, wr) {
+  let sym = symbol_for(env, LISTENERS_SYM_DESC)?;
+  let mut v = ptr::null_mut();
+  check_status!(unsafe { sys::napi_get_property(env_raw, codec, sym, &mut v) })?;
+  if !is_nullish(env_raw, v) {
+    return Ok(Some(v));
+  }
+  if !create {
     return Ok(None);
   }
   unsafe {
-    let deref = get_named_raw(env_raw, wr, "deref")?;
-    let mut v = ptr::null_mut();
-    check_status!(sys::napi_call_function(
+    let global = env.get_global()?.raw();
+    let map_ctor = get_named_raw(env_raw, global, "Map")?;
+    let mut map = ptr::null_mut();
+    check_status!(sys::napi_new_instance(
       env_raw,
-      wr,
-      deref,
+      map_ctor,
       0,
       ptr::null(),
-      &mut v,
+      &mut map,
     ))?;
-    if is_nullish(env_raw, v) {
-      return Ok(None);
-    }
-    Ok(Some(as_static(Unknown::from_napi_value(env_raw, v)?)))
+    define_sym_prop(env, codec, LISTENERS_SYM_DESC, map)?;
+    Ok(Some(map))
+  }
+}
+
+/// `map[method](...args)` via raw N-API ("set" / "delete").
+fn map_op(env: &Env, map: sys::napi_value, method: &str, args: &[sys::napi_value]) -> Result<()> {
+  let env_raw = env.raw();
+  unsafe {
+    let f = get_named_raw(env_raw, map, method)?;
+    let mut out = ptr::null_mut();
+    check_status!(sys::napi_call_function(
+      env_raw,
+      map,
+      f,
+      args.len(),
+      args.as_ptr(),
+      &mut out,
+    ))?;
+    Ok(())
+  }
+}
+
+/// Upgrade a weak napi_ref to a value; `None` if it has been emptied by GC.
+pub(crate) fn upgrade_ref(env: &Env, refr: usize) -> Result<Option<Unknown<'static>>> {
+  let mut v = ptr::null_mut();
+  check_status!(unsafe {
+    sys::napi_get_reference_value(env.raw(), refr as sys::napi_ref, &mut v)
+  })?;
+  if v.is_null() {
+    return Ok(None);
+  }
+  Ok(Some(as_static(unsafe {
+    Unknown::from_napi_value(env.raw(), v)?
+  })))
+}
+
+/// Release one registered callback: delete its napi_ref handle and drop its
+/// liveness entry from the codec's listener Map. JS thread only.
+fn release_callback(env: &Env, codec: Option<sys::napi_value>, id: u64, refr: usize) {
+  unsafe { sys::napi_delete_reference(env.raw(), refr as sys::napi_ref) };
+  if let Some(codec) = codec
+    && let Ok(Some(map)) = listener_map(env, codec, false)
+  {
+    let mut idv = ptr::null_mut();
+    unsafe { sys::napi_create_double(env.raw(), id as f64, &mut idv) };
+    let _ = map_op(env, map, "delete", &[idv]);
   }
 }
 

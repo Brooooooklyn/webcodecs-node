@@ -1179,7 +1179,7 @@ impl AudioEncoder {
     if callback.is_some() {
       state.ensure_dispatcher(env, this.object)?;
     }
-    state.set_ondequeue(callback);
+    state.set_ondequeue(env, callback)?;
     Ok(())
   }
 
@@ -1194,7 +1194,11 @@ impl AudioEncoder {
       .read()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
     match state.ondequeue() {
-      Some(callback) => Ok(Some(callback.borrow_back(env)?)),
+      Some(refr) => Ok(
+        crate::webcodecs::event_target::upgrade_ref(env, refr)?
+          .map(|v| unsafe { v.cast::<Function<'env, Unknown<'static>, UnknownReturnValue>>() })
+          .transpose()?,
+      ),
       None => Ok(None),
     }
   }
