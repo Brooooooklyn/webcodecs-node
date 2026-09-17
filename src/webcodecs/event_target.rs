@@ -490,9 +490,39 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
   // napi_value is only valid within this dispatcher's handle scope.
   let _ = event_obj.delete_named_property("stopImmediatePropagation");
 
-  // Report the first listener exception after dispatch so it surfaces as an
-  // uncaught error instead of being silently swallowed.
+  // DOM: listener exceptions are reported, not propagated from dispatchEvent.
+  // Schedule a rethrow on the microtask queue so it surfaces as an uncaught
+  // error while the caller still sees a normal return.
   if let Some(exc) = thrown {
-    unsafe { sys::napi_throw(env.raw(), exc) };
+    let mut exc_ref = ptr::null_mut();
+    let env_raw = env.raw();
+    let reported =
+      unsafe { sys::napi_create_reference(env_raw, exc, 1, &mut exc_ref) == sys::Status::napi_ok }
+        && env
+          .create_function_from_closure::<(), (), _>("reportListenerException", move |_| {
+            unsafe {
+              let mut v = ptr::null_mut();
+              sys::napi_get_reference_value(env_raw, exc_ref, &mut v);
+              sys::napi_delete_reference(env_raw, exc_ref);
+              if !v.is_null() {
+                sys::napi_throw(env_raw, v);
+              }
+            }
+            Ok(())
+          })
+          .and_then(|reporter| {
+            let global = env.get_global()?;
+            let qm =
+              global.get_named_property::<Function<Function<(), ()>, Unknown>>("queueMicrotask")?;
+            qm.call(reporter).map(|_| ())
+          })
+          .is_ok();
+    if !reported {
+      // Couldn't schedule a report — better to throw inline than swallow it.
+      unsafe { sys::napi_throw(env_raw, exc) };
+      if !exc_ref.is_null() {
+        unsafe { sys::napi_delete_reference(env_raw, exc_ref) };
+      }
+    }
   }
 }

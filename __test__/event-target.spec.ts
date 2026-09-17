@@ -908,25 +908,30 @@ test('VideoEncoder: once listener does not re-fire on re-entrant dispatch', asyn
 })
 
 test('VideoEncoder: throwing listener does not abort later listeners', (t) => {
-  const encoder = new VideoEncoder({
-    output: () => {},
-    error: () => {},
+  // DOM semantics: a throwing listener must not prevent later listeners from
+  // running, and the exception is *reported* as an uncaught error rather than
+  // propagated from dispatchEvent. Observed via a child process so the report
+  // doesn't hit ava's own uncaughtException handling.
+  const script = `
+    const { VideoEncoder } = require('./index.js');
+    const enc = new VideoEncoder({ output: () => {}, error: () => {} });
+    process.on('uncaughtException', (e) => {
+      console.log('UNCAUGHT:' + e.message);
+      enc.close();
+    });
+    const fired = [];
+    enc.addEventListener('dequeue', () => { fired.push('l1'); throw new Error('listener boom'); });
+    enc.addEventListener('dequeue', () => { fired.push('l2'); console.log('FIRED:' + fired.join(',')); });
+    console.log('RETURNED:' + enc.dispatchEvent('dequeue'));
+  `
+  const output = execFileSync(process.execPath, ['-e', script], {
+    cwd: process.cwd(),
+    timeout: 15_000,
+    encoding: 'utf8',
   })
-
-  const fired: string[] = []
-  encoder.addEventListener('dequeue', () => {
-    fired.push('l1')
-    throw new Error('listener boom')
-  })
-  encoder.addEventListener('dequeue', () => {
-    fired.push('l2')
-  })
-
-  // Synchronous dispatch: the first listener throws, but dispatch must still
-  // reach l2 and then surface the first exception to the caller.
-  t.throws(() => encoder.dispatchEvent('dequeue'), { message: 'listener boom' })
-  t.deepEqual(fired, ['l1', 'l2'], 'dispatch must continue after a listener throws')
-  encoder.close()
+  t.true(output.includes('RETURNED:true'), 'dispatchEvent must not propagate listener exceptions')
+  t.true(output.includes('FIRED:l1,l2'), 'dispatch must continue after a listener throws')
+  t.true(output.includes('UNCAUGHT:listener boom'), 'exception must be reported as uncaught')
 })
 
 test('VideoEncoder: once dequeue listener keeps the process alive until it fires', (t) => {
