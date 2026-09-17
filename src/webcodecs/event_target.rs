@@ -136,8 +136,11 @@ pub struct CodecEventState {
   /// Weak ref to the codec's JS object (`this`), captured lazily on the first
   /// event-related call so dispatched events expose it as target/currentTarget.
   codec_obj: Option<WeakCodecRef>,
-  /// The ondequeue event handler property value.
+  /// The ondequeue event handler property value, plus its registration-order
+  /// id — an event handler participates in listener ordering, so assigning it
+  /// after addEventListener must run it after earlier registrations.
   ondequeue: Option<Arc<FunctionRef<Unknown<'static>, UnknownReturnValue>>>,
+  ondequeue_id: u64,
   /// Single dispatcher invoked from the worker thread; runs the whole
   /// dispatch on the JS thread in one call.
   dispatcher: Option<Arc<DispatcherTsf>>,
@@ -241,7 +244,10 @@ impl CodecEventState {
       capture,
       callback: Arc::new(callback),
     }));
-    if once {
+    // Only once-listeners for 'dequeue' — the codec's sole automatic event —
+    // keep the process alive. A once-listener for a type the codec never
+    // emits on its own would pin the process forever.
+    if once && event_type == "dequeue" {
       self.once_pending += 1;
       self.sync_once_ref(env);
     }
@@ -273,17 +279,22 @@ impl CodecEventState {
         self.listeners.remove(event_type);
       }
     }
-    if removed_once {
+    if removed_once && event_type == "dequeue" {
       self.once_pending = self.once_pending.saturating_sub(1);
       self.sync_once_ref(env);
     }
   }
 
-  /// Replace the ondequeue event handler.
+  /// Replace the ondequeue event handler. Each non-null assignment counts as
+  /// a fresh registration for ordering purposes (DOM event-handler semantics).
   pub fn set_ondequeue(
     &mut self,
     handler: Option<FunctionRef<Unknown<'static>, UnknownReturnValue>>,
   ) {
+    if handler.is_some() {
+      self.ondequeue_id = self.next_listener_id;
+      self.next_listener_id += 1;
+    }
     self.ondequeue = handler.map(Arc::new);
   }
 
@@ -340,12 +351,13 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
       return;
     };
     let mut snapshot: Vec<DispatchItem> = Vec::new();
-    // The ondequeue handler only applies to "dequeue" events
+    // The ondequeue handler only applies to "dequeue" events; it participates
+    // in registration order with ordinary listeners.
     if event_type == "dequeue"
       && let Some(ref handler) = state.ondequeue
     {
       snapshot.push(DispatchItem {
-        id: u64::MAX,
+        id: state.ondequeue_id,
         once: false,
         callback: handler.clone(),
         is_ondequeue: true,
@@ -361,6 +373,7 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
         });
       }
     }
+    snapshot.sort_by_key(|i| i.id);
     (state.codec_obj.as_ref().and_then(|r| r.get(env)), snapshot)
   };
 
@@ -462,34 +475,18 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
     }
   }
 
-  // DOM: honor stopImmediatePropagation. The event never passes through a real
-  // EventTarget, so shadow the method with a wrapper that flips a flag this
-  // loop can observe, then forwards to the native implementation so the
-  // event's internal flag stays correct if it is re-dispatched elsewhere.
+  // DOM: honor stopImmediatePropagation. The event never passes through a
+  // real EventTarget, so shadow the method with a wrapper that only flips a
+  // flag this loop observes — deliberately NOT forwarding to the native
+  // method, which would set the event's internal stop flag and poison a later
+  // native dispatchEvent on the retained event.
   let stop_immediate = Arc::new(AtomicBool::new(false));
   {
-    // The prototype method is an intrinsic that outlives this dispatch, so the
-    // raw handle can be captured into the 'static closure safely.
-    let orig_sip = env
-      .get_global()
-      .and_then(|g| g.get_named_property::<Object>("Event"))
-      .and_then(|e| e.get_named_property::<Object>("prototype"))
-      .and_then(|p| p.get_named_property::<Unknown>("stopImmediatePropagation"))
-      .map(|f| f.raw() as usize)
-      .unwrap_or(0);
     let flag = stop_immediate.clone();
     if let Ok(wrapper) = env.create_function_from_closure::<(), (), _>(
       "stopImmediatePropagation",
-      move |ctx: FunctionCallContext| -> Result<()> {
+      move |_ctx: FunctionCallContext| -> Result<()> {
         flag.store(true, Ordering::SeqCst);
-        if orig_sip != 0
-          && let Ok(this) = ctx.this::<Unknown>()
-          && let Ok(orig) = unsafe {
-            Function::<(), Unknown>::from_napi_value(ctx.env.raw(), orig_sip as sys::napi_value)
-          }
-        {
-          let _ = orig.apply(this, ());
-        }
         Ok(())
       },
     ) && let Ok(sip_prop) = Property::new()
@@ -561,8 +558,10 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
       if listeners.is_empty() {
         state.listeners.remove(event_type);
       }
-      state.once_pending = state.once_pending.saturating_sub(1);
-      state.sync_once_ref(env);
+      if event_type == "dequeue" {
+        state.once_pending = state.once_pending.saturating_sub(1);
+        state.sync_once_ref(env);
+      }
     }
     if let Ok(func) = item.callback.borrow_back(env) {
       // Relax the event's phantom lifetime to match the stored callback's

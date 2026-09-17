@@ -1112,3 +1112,69 @@ test('VideoEncoder: retained event re-dispatched on a real EventTarget sees nati
   t.is(retained!.target, other, 'target persists as the last dispatch target')
   encoder.close()
 })
+
+test('VideoEncoder: ondequeue participates in registration order', (t) => {
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: () => {},
+  })
+
+  // Handler assigned after addEventListener must run after it
+  const order: string[] = []
+  encoder.addEventListener('dequeue', () => order.push('listener'))
+  encoder.ondequeue = () => order.push('ondequeue')
+  encoder.dispatchEvent('dequeue')
+  t.deepEqual(order, ['listener', 'ondequeue'])
+
+  // Re-assigning the handler is a fresh registration — it moves to the end
+  order.length = 0
+  const encoder2 = new VideoEncoder({ output: () => {}, error: () => {} })
+  encoder2.ondequeue = () => order.push('ondequeue')
+  encoder2.addEventListener('dequeue', () => order.push('listener'))
+  encoder2.dispatchEvent('dequeue')
+  t.deepEqual(order, ['ondequeue', 'listener'])
+
+  encoder.close()
+  encoder2.close()
+})
+
+test('VideoEncoder: stopImmediatePropagation does not poison native re-dispatch', (t) => {
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: () => {},
+  })
+
+  let retained: Event | null = null
+  encoder.addEventListener('dequeue', (event: Event) => {
+    retained = event
+    event.stopImmediatePropagation()
+  })
+  encoder.dispatchEvent('dequeue')
+
+  // The internal stop flag must not leak onto the event — a later native
+  // dispatchEvent on the retained event must run its listeners normally.
+  const other = new EventTarget()
+  let fired = 0
+  other.addEventListener('dequeue', () => fired++)
+  other.dispatchEvent(retained!)
+  t.is(fired, 1, 'native re-dispatch must not be stopped by our dispatch')
+  encoder.close()
+})
+
+test('VideoEncoder: once listener for a non-emitted type does not pin the process', (t) => {
+  // Only 'dequeue' is emitted automatically; a once-listener for another type
+  // must not keep Node alive waiting for an event that cannot arrive.
+  const script = `
+    const { VideoEncoder } = require('./index.js');
+    const enc = new VideoEncoder({ output: () => {}, error: () => {} });
+    enc.addEventListener('not-a-real-event', () => {}, { once: true });
+    console.log('REGISTERED');
+    // No other handles — process should exit promptly.
+  `
+  const output = execFileSync(process.execPath, ['-e', script], {
+    cwd: process.cwd(),
+    timeout: 10_000,
+    encoding: 'utf8',
+  })
+  t.true(output.includes('REGISTERED'), 'process must exit without waiting')
+})
