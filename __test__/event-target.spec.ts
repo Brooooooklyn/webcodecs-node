@@ -1011,16 +1011,17 @@ test('VideoEncoder: eventPhase and composedPath reflect dispatch state', (t) => 
     error: () => {},
   })
 
-  let during: { phase: number; path: unknown[] } | null = null
+  const during: { phase: number; path: unknown[] } = { phase: -1, path: [] }
   let retained: Event | null = null
   encoder.addEventListener('dequeue', (event: Event) => {
     retained = event
-    during = { phase: event.eventPhase, path: event.composedPath() }
+    during.phase = event.eventPhase
+    during.path = event.composedPath()
   })
   encoder.dispatchEvent('dequeue')
 
-  t.is(during?.phase, 2, 'eventPhase is AT_TARGET during dispatch')
-  t.deepEqual(during?.path, [encoder], 'composedPath returns [codec] during dispatch')
+  t.is(during.phase, 2, 'eventPhase is AT_TARGET during dispatch')
+  t.deepEqual(during.path, [encoder], 'composedPath returns [codec] during dispatch')
   t.is(retained!.eventPhase, 0, 'eventPhase resets to NONE after dispatch')
   t.deepEqual(retained!.composedPath(), [], 'composedPath returns [] after dispatch')
   encoder.close()
@@ -1049,4 +1050,32 @@ test('VideoEncoder: every throwing listener exception is reported', (t) => {
     encoding: 'utf8',
   })
   t.true(output.includes('REPORTED:boom-1,boom-2'), 'each listener exception must be reported')
+})
+
+test('VideoEncoder: queued dequeue event survives codec GC', (t) => {
+  // The dispatch payload carries a strong state reference, so a dequeue event
+  // queued by the worker is still delivered even if the codec wrapper is
+  // finalized before the callback runs.
+  const script = `
+    const { VideoEncoder, VideoFrame } = require('./index.js');
+    let fired = 0;
+    (() => {
+      const enc = new VideoEncoder({ output: () => {}, error: () => {} });
+      enc.addEventListener('dequeue', () => { fired++; });
+      enc.configure({ codec: 'avc1.42001f', width: 64, height: 64, bitrate: 100_000 });
+      const f = new VideoFrame(new Uint8Array(64*64*1.5), {
+        format: 'I420', codedWidth: 64, codedHeight: 64, timestamp: 0,
+      });
+      enc.encode(f, { keyFrame: true });
+      f.close();
+    })();
+    globalThis.gc();
+    setTimeout(() => console.log('FIRED:' + fired), 1500);
+  `
+  const output = execFileSync(process.execPath, ['--expose-gc', '-e', script], {
+    cwd: process.cwd(),
+    timeout: 15_000,
+    encoding: 'utf8',
+  })
+  t.regex(output, /FIRED:[1-9]/, 'queued dispatch must still fire its listeners')
 })

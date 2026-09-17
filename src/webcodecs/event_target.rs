@@ -22,12 +22,15 @@ use std::sync::{Arc, RwLock};
 
 use super::error::new_event;
 
-/// Dispatcher command, sent as two u32 args (a pointer cannot cross the JS
-/// boundary as a single number without f64 truncation). (0, 0) means dispatch
-/// a dequeue event; any other pair is the (hi, lo) halves of a raw napi_ref
-/// that must be deleted on the JS thread — off-thread drops of WeakCodecRef
-/// route their handle release through the dispatcher.
-const CMD_DISPATCH: (u32, u32) = (0, 0);
+/// Dispatcher commands, sent as three u32 args (a pointer cannot cross the JS
+/// boundary as a single number without f64 truncation).
+/// - (CMD_DISPATCH, hi, lo): dispatch a dequeue event, taking ownership of the
+///   `Arc<RwLock<CodecEventState>>` leaked at that pointer — a queued dispatch
+///   keeps the state alive until it runs.
+/// - (CMD_DELETE_REF, hi, lo): delete the raw napi_ref at that pointer —
+///   off-thread drops of WeakCodecRef route handle release through here.
+const CMD_DELETE_REF: u32 = 1;
+const CMD_DISPATCH: u32 = 2;
 
 /// A registered event listener. The FunctionRef both calls the JS callback and
 /// identifies the listener for removeEventListener (strict equality).
@@ -102,7 +105,11 @@ impl Drop for WeakCodecRef {
       // Node anyway — leaking is safe in that path.
       let addr = self.raw_ref as usize as u64;
       gc.call(
-        (((addr >> 32) & 0xffff_ffff) as u32, addr as u32),
+        FnArgs::from((
+          CMD_DELETE_REF,
+          ((addr >> 32) & 0xffff_ffff) as u32,
+          addr as u32,
+        )),
         ThreadsafeFunctionCallMode::NonBlocking,
       );
     }
@@ -112,7 +119,10 @@ impl Drop for WeakCodecRef {
   }
 }
 
-type DispatcherTsf = ThreadsafeFunction<(u32, u32), (), (u32, u32), Status, false, true>;
+// The payload must be FnArgs — a plain tuple goes through the ToNapiValue
+// blanket impl and arrives as a single Array argument, not three args.
+type DispatcherTsf =
+  ThreadsafeFunction<FnArgs<(u32, u32, u32)>, (), FnArgs<(u32, u32, u32)>, Status, false, true>;
 
 /// Per-codec event state shared between the JS thread and the worker thread.
 #[derive(Default)]
@@ -139,39 +149,35 @@ impl CodecEventState {
   /// The codec's JS object (`this`) is captured lazily here rather than in a
   /// separate step: a WeakCodecRef without a dispatcher would have no route to
   /// delete its napi_ref when the final drop lands on a worker thread.
-  pub fn ensure_dispatcher(
-    &mut self,
-    env: &Env,
-    shared: &Arc<RwLock<CodecEventState>>,
-    this: Object,
-  ) -> Result<()> {
+  pub fn ensure_dispatcher(&mut self, env: &Env, this: Object) -> Result<()> {
     if self.dispatcher.is_some() {
       return Ok(());
     }
     if self.codec_obj.is_none() {
       self.codec_obj = Some(WeakCodecRef::new(env, this)?);
     }
-    // The closure holds a Weak, not an Arc: the dispatcher TSF is stored inside
-    // this same state, so a strong capture would create a
-    // state → TSF → JS function → closure → state cycle that never drops.
-    let weak_shared = Arc::downgrade(shared);
+    // The closure captures no state: each dispatch payload carries ownership
+    // of a strong Arc<RwLock<CodecEventState>> (leaked via Arc::into_raw in
+    // fire()), so a queued dispatch keeps the state alive until it runs —
+    // without the dispatcher retaining the state permanently.
     let dispatch_fn = env.create_function_from_closure(
       "codecDispatch",
-      move |ctx: FunctionCallContext| -> Result<()> {
-        let cmd = (
-          ctx.get::<u32>(0).unwrap_or(0),
-          ctx.get::<u32>(1).unwrap_or(0),
-        );
-        if cmd == CMD_DISPATCH {
-          if let Some(shared) = weak_shared.upgrade() {
+      |ctx: FunctionCallContext| -> Result<()> {
+        let cmd = ctx.get::<u32>(0).unwrap_or(0);
+        let ptr =
+          ((ctx.get::<u32>(1).unwrap_or(0) as u64) << 32) | ctx.get::<u32>(2).unwrap_or(0) as u64;
+        match cmd {
+          CMD_DISPATCH => {
+            let shared = unsafe { Arc::from_raw(ptr as usize as *const RwLock<CodecEventState>) };
             dispatch(ctx.env, &shared, "dequeue");
           }
-        } else {
-          // Delete a napi_ref handle on the JS thread (see WeakCodecRef::drop)
-          let raw_ref = ((((cmd.0 as u64) << 32) | cmd.1 as u64) as usize) as sys::napi_ref;
-          unsafe {
-            sys::napi_delete_reference(ctx.env.raw(), raw_ref);
+          CMD_DELETE_REF => {
+            // Delete a napi_ref handle on the JS thread (see WeakCodecRef::drop)
+            unsafe {
+              sys::napi_delete_reference(ctx.env.raw(), ptr as usize as sys::napi_ref);
+            }
           }
+          _ => {}
         }
         Ok(())
       },
@@ -287,9 +293,25 @@ impl CodecEventState {
   }
 
   /// Fire the dequeue event from the worker thread (async, non-blocking).
-  pub fn fire(&self) {
-    if let Some(ref dispatcher) = self.dispatcher {
-      dispatcher.call(CMD_DISPATCH, ThreadsafeFunctionCallMode::NonBlocking);
+  /// A strong Arc is leaked into the payload and reclaimed by the JS callback,
+  /// so a queued dispatch keeps the state (and its listeners) alive even if
+  /// the codec wrapper and worker are gone by the time it runs.
+  pub fn fire(shared: &Arc<RwLock<CodecEventState>>) {
+    let dispatcher = shared.read().ok().and_then(|s| s.dispatcher.clone());
+    if let Some(dispatcher) = dispatcher {
+      let ptr = Arc::into_raw(Arc::clone(shared)) as usize as u64;
+      let status = dispatcher.call(
+        FnArgs::from((CMD_DISPATCH, (ptr >> 32) as u32, ptr as u32)),
+        ThreadsafeFunctionCallMode::NonBlocking,
+      );
+      if status != Status::Ok {
+        // TSFN already closing — reclaim the leaked Arc.
+        unsafe {
+          drop(Arc::from_raw(
+            ptr as usize as *const RwLock<CodecEventState>,
+          ));
+        }
+      }
     }
   }
 }

@@ -2304,9 +2304,7 @@ impl VideoEncoder {
   /// Fire dequeue event via the shared JS-side dispatcher
   /// Dispatches one Event to ondequeue and all registered listeners
   fn fire_dequeue_event(event_state: &Arc<RwLock<CodecEventState>>) -> Result<()> {
-    if let Ok(state) = event_state.read() {
-      state.fire();
-    }
+    CodecEventState::fire(event_state);
     Ok(())
   }
 
@@ -2601,7 +2599,7 @@ impl VideoEncoder {
       .write()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
     if callback.is_some() {
-      state.ensure_dispatcher(env, &self.event_state, this.object)?;
+      state.ensure_dispatcher(env, this.object)?;
     }
     state.set_ondequeue(callback);
     Ok(())
@@ -3601,7 +3599,7 @@ impl VideoEncoder {
       .write()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    state.ensure_dispatcher(&env, &self.event_state, this.object)?;
+    state.ensure_dispatcher(&env, this.object)?;
     let once = options.as_ref().and_then(|o| o.once).unwrap_or(false);
     let capture = options.as_ref().and_then(|o| o.capture).unwrap_or(false);
     state.add_listener(&env, &event_type, callback, once, capture)
