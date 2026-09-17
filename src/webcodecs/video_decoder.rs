@@ -990,8 +990,10 @@ impl VideoDecoder {
 
     // Clear codec-local work state. Do not reset decode_queue_size here:
     // main-thread decode() calls after this FIFO command are already counted.
+    // keyframe_received is intentionally not cleared here: configure() already
+    // resets it synchronously on the main thread, and clearing it again on the
+    // worker would clobber a key chunk accepted after configure() returned.
     guard.chunk_meta.clear();
-    guard.keyframe_received = false;
     guard.silent_decode_count = 0;
     guard.first_output_produced = false;
 
@@ -1351,6 +1353,11 @@ impl VideoDecoder {
       return throw_invalid_state_error(&env, "Decoder is closed");
     }
 
+    // W3C spec: configure() sets [[key chunk required]] = true synchronously,
+    // so a delta chunk decoded right after configure() must throw DataError
+    // before the worker's reconfigure command runs.
+    inner.keyframe_received = false;
+
     // W3C spec: If already configured, queue reconfigure via microtask
     // This ensures FIFO ordering with pending decode commands
     if inner.state == CodecState::Configured {
@@ -1670,6 +1677,10 @@ impl VideoDecoder {
           "Cannot flush an unconfigured codec",
         );
       }
+
+      // W3C spec: flush() sets [[key chunk required]] = true synchronously,
+      // so a delta chunk decoded after flush() must throw DataError.
+      inner.keyframe_received = false;
 
       inner
         .flushes
