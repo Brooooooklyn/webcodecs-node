@@ -368,27 +368,97 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
     return;
   }
 
-  // One Event per dispatch; expose the codec as target/currentTarget via own
-  // data properties (the Event prototype only defines getters, so plain
-  // assignment would fail).
+  // One Event per dispatch. The event is never dispatched through a real
+  // EventTarget, so target/currentTarget/eventPhase are exposed as own
+  // getters that report codec state while dispatching and forward to the
+  // native prototype getters otherwise — transparent if a listener retains
+  // the event and re-dispatches it through a real EventTarget.
   let Ok(event) = new_event(env, event_type) else {
     return;
   };
   let Ok(mut event_obj) = (unsafe { event.cast::<Object>() }) else {
     return;
   };
-  if let Some(ref codec) = codec_obj {
-    if let Ok(target_prop) = Property::new()
-      .with_utf8_name("target")
-      .and_then(|p| p.with_napi_value(env, codec))
-    {
-      let _ = event_obj.define_properties(&[target_prop]);
+  let in_dispatch = Arc::new(AtomicBool::new(true));
+  // A strong ref keeps the codec alive while the event is retained (DOM keeps
+  // event.target reachable); released by a finalizer when the event is GC'd.
+  let codec_ref = codec_obj.as_ref().and_then(|codec| {
+    let mut r = ptr::null_mut();
+    let ok = unsafe {
+      sys::napi_create_reference(env.raw(), codec.raw(), 1, &mut r) == sys::Status::napi_ok
+        && sys::napi_add_finalizer(
+          env.raw(),
+          event_obj.raw(),
+          r as *mut std::ffi::c_void,
+          Some(release_codec_ref),
+          ptr::null_mut(),
+          ptr::null_mut(),
+        ) == sys::Status::napi_ok
+    };
+    if !ok && !r.is_null() {
+      unsafe { sys::napi_delete_reference(env.raw(), r) };
+      return None;
     }
-    if let Ok(ct_prop) = Property::new()
-      .with_utf8_name("currentTarget")
-      .and_then(|p| p.with_napi_value(env, codec))
-    {
-      let _ = event_obj.define_properties(&[ct_prop]);
+    ok.then_some(r as usize)
+  });
+
+  for name in ["target", "currentTarget"] {
+    let flag = in_dispatch.clone();
+    let getter = move |env: Env, this: This| -> Result<Unknown<'static>> {
+      if flag.load(Ordering::SeqCst)
+        && let Some(r) = codec_ref
+        && let Ok(v) = ref_value(&env, r)
+      {
+        return Ok(as_static(v));
+      }
+      let native = forward_event_getter(&env, this.object, name).ok();
+      if let Some(v) = native
+        && !is_nullish(env.raw(), v.raw())
+      {
+        return Ok(as_static(v));
+      }
+      // Native slot empty (never natively dispatched or dispatch finished):
+      // target still resolves to the codec (event.target persists after
+      // dispatch); currentTarget correctly stays null.
+      if name == "target"
+        && let Some(r) = codec_ref
+        && let Ok(v) = ref_value(&env, r)
+      {
+        return Ok(as_static(v));
+      }
+      match native {
+        Some(v) => Ok(as_static(v)),
+        None => {
+          let raw = unsafe { Null::to_napi_value(env.raw(), Null) }?;
+          Ok(as_static(unsafe {
+            Unknown::from_napi_value(env.raw(), raw)
+          }?))
+        }
+      }
+    };
+    if let Ok(prop) = Property::new().with_utf8_name(name).map(|p| {
+      p.with_getter_closure(getter)
+        .with_property_attributes(PropertyAttributes::Configurable)
+    }) {
+      let _ = event_obj.define_properties(&[prop]);
+    }
+  }
+
+  {
+    let flag = in_dispatch.clone();
+    let phase_getter = move |env: Env, this: This| -> Result<u32> {
+      if flag.load(Ordering::SeqCst) {
+        return Ok(2); // Event.AT_TARGET
+      }
+      forward_event_getter(&env, this.object, "eventPhase")
+        .and_then(|v| unsafe { u32::from_napi_value(env.raw(), v.raw()) })
+        .or(Ok(0))
+    };
+    if let Ok(prop) = Property::new().with_utf8_name("eventPhase").map(|p| {
+      p.with_getter_closure(phase_getter)
+        .with_property_attributes(PropertyAttributes::Configurable)
+    }) {
+      let _ = event_obj.define_properties(&[prop]);
     }
   }
 
@@ -432,18 +502,10 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
     }
   }
 
-  // DOM: emulate the dispatch-phase state a real EventTarget would set.
-  // eventPhase reads AT_TARGET while listeners run (reset to NONE below);
-  // composedPath returns [codec] during dispatch — the wrapper is deleted in
-  // cleanup so post-dispatch calls hit the native prototype method (which
-  // returns [] for a non-dispatching event) and the captured codec handle is
-  // never dereferenced outside this callback's handle scope.
-  if let Ok(phase_prop) = Property::new()
-    .with_utf8_name("eventPhase")
-    .and_then(|p| p.with_napi_value(env, 2u32))
-  {
-    let _ = event_obj.define_properties(&[phase_prop]);
-  }
+  // DOM: composedPath returns [codec] during dispatch — the wrapper is
+  // deleted in cleanup so post-dispatch calls hit the native prototype method
+  // (which returns [] for a non-dispatching event) and the captured codec
+  // handle is never dereferenced outside this callback's handle scope.
   if let Some(ref codec) = codec_obj {
     let codec_raw = codec.raw() as usize;
     if let Ok(wrapper) = env.create_function_from_closure::<(), Unknown, _>(
@@ -531,20 +593,10 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
     }
   }
 
-  // DOM: currentTarget is null and eventPhase is NONE once dispatch completes
-  if codec_obj.is_some()
-    && let Ok(ct_prop) = Property::new()
-      .with_utf8_name("currentTarget")
-      .and_then(|p| p.with_napi_value(env, Null))
-  {
-    let _ = event_obj.define_properties(&[ct_prop]);
-  }
-  if let Ok(phase_prop) = Property::new()
-    .with_utf8_name("eventPhase")
-    .and_then(|p| p.with_napi_value(env, 0u32))
-  {
-    let _ = event_obj.define_properties(&[phase_prop]);
-  }
+  // Dispatch complete: the getters now forward to the native prototype
+  // getters, so currentTarget/eventPhase read null/NONE automatically while
+  // target keeps resolving to the codec.
+  in_dispatch.store(false, Ordering::SeqCst);
 
   // Remove the dispatch-time method wrappers so listeners retaining the event
   // fall back to the prototype methods — the wrappers' captured raw napi_values
@@ -592,4 +644,82 @@ fn report_exception(env: &Env, exc: sys::napi_value) {
       unsafe { sys::napi_delete_reference(env_raw, exc_ref) };
     }
   }
+}
+
+/// Relax a JS value's scope lifetime to 'static. Only used for values that are
+/// converted back to a raw napi_value within the same synchronous napi call.
+fn as_static(v: Unknown) -> Unknown<'static> {
+  unsafe { std::mem::transmute(v) }
+}
+
+/// Get a JS value through a strong napi_ref created on this env.
+fn ref_value<'a>(env: &'a Env, refr: usize) -> Result<Unknown<'a>> {
+  let mut v = ptr::null_mut();
+  check_status!(unsafe {
+    sys::napi_get_reference_value(env.raw(), refr as sys::napi_ref, &mut v)
+  })?;
+  unsafe { Unknown::from_napi_value(env.raw(), v) }
+}
+
+/// Finalizer releasing the per-event strong ref to the codec object.
+unsafe extern "C" fn release_codec_ref(
+  env: sys::napi_env,
+  finalize_data: *mut std::ffi::c_void,
+  _hint: *mut std::ffi::c_void,
+) {
+  unsafe { sys::napi_delete_reference(env, finalize_data as sys::napi_ref) };
+}
+
+fn is_nullish(env: sys::napi_env, v: sys::napi_value) -> bool {
+  let mut t = sys::ValueType::napi_undefined;
+  unsafe { sys::napi_typeof(env, v, &mut t) };
+  matches!(
+    t,
+    sys::ValueType::napi_undefined | sys::ValueType::napi_null
+  )
+}
+
+/// Invoke `Event.prototype`'s native getter for `name` on `this`. Values are
+/// fetched fresh in the caller's handle scope, so this is safe to call at any
+/// time — including from retained events long after our dispatch returned.
+fn forward_event_getter<'a>(env: &'a Env, this: Object<'a>, name: &str) -> Result<Unknown<'a>> {
+  let env_raw = env.raw();
+  unsafe {
+    let global = env.get_global()?.raw();
+    let object_ctor = get_named_raw(env_raw, global, "Object")?;
+    let gopd = get_named_raw(env_raw, object_ctor, "getOwnPropertyDescriptor")?;
+    let event_ctor = get_named_raw(env_raw, global, "Event")?;
+    let proto = get_named_raw(env_raw, event_ctor, "prototype")?;
+    let name_v = env.create_string(name)?.raw();
+    let mut desc = ptr::null_mut();
+    check_status!(sys::napi_call_function(
+      env_raw,
+      object_ctor,
+      gopd,
+      2,
+      [proto, name_v].as_ptr(),
+      &mut desc,
+    ))?;
+    if is_nullish(env_raw, desc) {
+      return Err(Error::new(Status::GenericFailure, "no such Event getter"));
+    }
+    let getter = get_named_raw(env_raw, desc, "get")?;
+    let mut out = ptr::null_mut();
+    check_status!(sys::napi_call_function(
+      env_raw,
+      this.raw(),
+      getter,
+      0,
+      ptr::null(),
+      &mut out,
+    ))?;
+    Unknown::from_napi_value(env_raw, out)
+  }
+}
+
+fn get_named_raw(env: sys::napi_env, obj: sys::napi_value, name: &str) -> Result<sys::napi_value> {
+  let cname = std::ffi::CString::new(name)?;
+  let mut v = ptr::null_mut();
+  check_status!(unsafe { sys::napi_get_named_property(env, obj, cname.as_ptr(), &mut v) })?;
+  Ok(v)
 }

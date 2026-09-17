@@ -1079,3 +1079,36 @@ test('VideoEncoder: queued dequeue event survives codec GC', (t) => {
   })
   t.regex(output, /FIRED:[1-9]/, 'queued dispatch must still fire its listeners')
 })
+
+test('VideoEncoder: retained event re-dispatched on a real EventTarget sees native state', (t) => {
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: () => {},
+  })
+
+  let retained: Event | null = null
+  encoder.addEventListener('dequeue', (event: Event) => {
+    retained = event
+  })
+  encoder.dispatchEvent('dequeue')
+  t.truthy(retained)
+  // Our dispatch state persists correctly on the event
+  t.is(retained!.target, encoder as unknown as EventTarget)
+  t.is(retained!.currentTarget, null)
+  t.is(retained!.eventPhase, 0)
+
+  // Re-dispatching through a real EventTarget must show native dispatch state
+  const other = new EventTarget()
+  const seen: { t?: unknown; ct?: unknown; ph?: number } = {}
+  other.addEventListener('dequeue', (e) => {
+    seen.t = e.target
+    seen.ct = e.currentTarget
+    seen.ph = e.eventPhase
+  })
+  other.dispatchEvent(retained!)
+  t.is(seen.t, other, 'target reflects the real dispatch target')
+  t.is(seen.ct, other, 'currentTarget reflects the real dispatch target')
+  t.is(seen.ph, 2, 'eventPhase is AT_TARGET during real dispatch')
+  t.is(retained!.target, other, 'target persists as the last dispatch target')
+  encoder.close()
+})
