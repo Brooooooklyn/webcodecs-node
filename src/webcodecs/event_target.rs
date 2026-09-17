@@ -472,18 +472,15 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
     return;
   };
   let in_dispatch = Arc::new(AtomicBool::new(true));
-  // A strong ref keeps the codec alive for as long as the event's `target`
-  // can be observed (DOM keeps event.target reachable after dispatch). The
-  // finalizer is attached to the target getter FUNCTION below, not the event:
-  // an accessor extracted via getOwnPropertyDescriptor can outlive the event,
-  // so the handle's lifetime must follow the closure that dereferences it.
-  let codec_ref = codec_obj.as_ref().and_then(|codec| {
-    let mut r = ptr::null_mut();
-    let ok = unsafe {
-      sys::napi_create_reference(env.raw(), codec.raw(), 1, &mut r) == sys::Status::napi_ok
-    };
-    if ok { Some(r as usize) } else { None }
-  });
+  // The event→codec edge is a JS WeakRef under a global-registry Symbol key —
+  // visible to GC and non-rooting — so a listener retaining the event forms a
+  // pure-JS, collectable cycle (codec → state → listener → event → codec)
+  // instead of an opaque napi_ref edge that would pin the codec forever.
+  if let Some(ref codec) = codec_obj
+    && let Ok(wr) = weak_ref_new(env, codec.raw())
+  {
+    let _ = define_sym_prop(env, event_obj.raw(), TARGET_SYM_DESC, wr);
+  }
 
   // The getters are real functions installed via Object.defineProperty —
   // with_getter_closure ties the Rust closure's lifetime to the EVENT (its
@@ -491,19 +488,23 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
   // getOwnPropertyDescriptor would call freed memory after the event is
   // collected. create_function_from_closure anchors the closure on the
   // function itself, which keeps extracted accessors safe.
-  let mut target_getter: Option<sys::napi_value> = None;
   for name in ["target", "currentTarget"] {
     let flag = in_dispatch.clone();
     let Ok(getter_fn) = env.create_function_from_closure::<(), Unknown, _>(
       name,
       move |ctx: FunctionCallContext| -> Result<Unknown> {
-        if flag.load(Ordering::SeqCst)
-          && let Some(r) = codec_ref
-          && let Ok(v) = ref_value(ctx.env, r)
-        {
-          return Ok(as_static(v));
-        }
         let this = ctx.this::<Object>()?;
+        // The stored value is a WeakRef; deref() yields the codec while it
+        // lives, undefined once collected.
+        let ours = sym_prop(ctx.env, this.raw())
+          .ok()
+          .and_then(|wr| weak_ref_deref(ctx.env, wr.raw()).ok().flatten());
+        if flag.load(Ordering::SeqCst) {
+          return match ours {
+            Some(v) => Ok(as_static(v)),
+            None => null_unknown(ctx.env),
+          };
+        }
         let native = forward_event_getter(ctx.env, this, name).ok();
         if let Some(v) = native
           && !is_nullish(ctx.env.raw(), v.raw())
@@ -514,53 +515,19 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
         // target still resolves to the codec (event.target persists after
         // dispatch); currentTarget correctly stays null.
         if name == "target"
-          && let Some(r) = codec_ref
-          && let Ok(v) = ref_value(ctx.env, r)
+          && let Some(v) = ours
         {
           return Ok(as_static(v));
         }
         match native {
           Some(v) => Ok(as_static(v)),
-          None => {
-            let raw = unsafe { Null::to_napi_value(ctx.env.raw(), Null) }?;
-            Ok(as_static(unsafe {
-              Unknown::from_napi_value(ctx.env.raw(), raw)
-            }?))
-          }
+          None => null_unknown(ctx.env),
         }
       },
     ) else {
       continue;
     };
-    if name == "target" {
-      target_getter = Some(getter_fn.raw());
-    }
     let _ = define_getter(env, event_obj.raw(), name, getter_fn.raw());
-  }
-
-  // Anchor codec_ref's lifetime to the target getter — the only closure that
-  // dereferences it outside dispatch (currentTarget/eventPhase only touch it
-  // while in_dispatch, when the event is necessarily alive). If anchoring
-  // fails, drop the own props so no closure captures a dangling handle.
-  let mut ref_anchored = codec_ref.is_none();
-  if let (Some(r), Some(getter_fn)) = (codec_ref, target_getter) {
-    ref_anchored = unsafe {
-      sys::napi_add_finalizer(
-        env.raw(),
-        getter_fn,
-        r as *mut std::ffi::c_void,
-        Some(release_codec_ref),
-        ptr::null_mut(),
-        ptr::null_mut(),
-      ) == sys::Status::napi_ok
-    };
-  }
-  if !ref_anchored {
-    let _ = event_obj.delete_named_property("target");
-    let _ = event_obj.delete_named_property("currentTarget");
-    if let Some(r) = codec_ref {
-      unsafe { sys::napi_delete_reference(env.raw(), r as sys::napi_ref) };
-    }
   }
 
   {
@@ -780,22 +747,147 @@ fn as_static(v: Unknown) -> Unknown<'static> {
   unsafe { std::mem::transmute(v) }
 }
 
-/// Get a JS value through a strong napi_ref created on this env.
-fn ref_value<'a>(env: &'a Env, refr: usize) -> Result<Unknown<'a>> {
-  let mut v = ptr::null_mut();
-  check_status!(unsafe {
-    sys::napi_get_reference_value(env.raw(), refr as sys::napi_ref, &mut v)
-  })?;
-  unsafe { Unknown::from_napi_value(env.raw(), v) }
+fn null_unknown(env: &Env) -> Result<Unknown<'static>> {
+  let raw = unsafe { Null::to_napi_value(env.raw(), Null) }?;
+  Ok(as_static(unsafe {
+    Unknown::from_napi_value(env.raw(), raw)
+  }?))
 }
 
-/// Finalizer releasing the per-event strong ref to the codec object.
-unsafe extern "C" fn release_codec_ref(
-  env: sys::napi_env,
-  finalize_data: *mut std::ffi::c_void,
-  _hint: *mut std::ffi::c_void,
-) {
-  unsafe { sys::napi_delete_reference(env, finalize_data as sys::napi_ref) };
+/// Symbol.for() key for the JS-visible event → codec edge. A global-registry
+/// symbol needs no captured handle — getters fetch it fresh per call.
+const TARGET_SYM_DESC: &str = "webcodecs.codecTarget";
+
+/// `Symbol.for(desc)` via raw N-API (Symbol is a function value, so typed
+/// property reads reject it).
+fn symbol_for(env: &Env, desc: &str) -> Result<sys::napi_value> {
+  let env_raw = env.raw();
+  unsafe {
+    let global = env.get_global()?.raw();
+    let sym_ctor = get_named_raw(env_raw, global, "Symbol")?;
+    let sym_for = get_named_raw(env_raw, sym_ctor, "for")?;
+    let key = env.create_string(desc)?.raw();
+    let mut sym = ptr::null_mut();
+    check_status!(sys::napi_call_function(
+      env_raw,
+      sym_ctor,
+      sym_for,
+      1,
+      [key].as_ptr(),
+      &mut sym,
+    ))?;
+    Ok(sym)
+  }
+}
+
+/// `this[Symbol.for(TARGET_SYM_DESC)]` — the event's dispatch target, stored
+/// as a WeakRef so the edge is visible to the garbage collector.
+fn sym_prop(env: &Env, this: sys::napi_value) -> Result<Unknown<'static>> {
+  let env_raw = env.raw();
+  let sym = symbol_for(env, TARGET_SYM_DESC)?;
+  let mut v = ptr::null_mut();
+  check_status!(unsafe { sys::napi_get_property(env_raw, this, sym, &mut v) })?;
+  Ok(as_static(unsafe { Unknown::from_napi_value(env_raw, v)? }))
+}
+
+/// `new WeakRef(v)` via raw N-API.
+fn weak_ref_new(env: &Env, v: sys::napi_value) -> Result<sys::napi_value> {
+  let env_raw = env.raw();
+  unsafe {
+    let global = env.get_global()?.raw();
+    let ctor = get_named_raw(env_raw, global, "WeakRef")?;
+    let mut wr = ptr::null_mut();
+    check_status!(sys::napi_new_instance(
+      env_raw,
+      ctor,
+      1,
+      [v].as_ptr(),
+      &mut wr,
+    ))?;
+    Ok(wr)
+  }
+}
+
+/// `wr.deref()` — the referent while it lives, `None` once collected or when
+/// `wr` is not a WeakRef (e.g. an extracted getter called on a foreign this).
+fn weak_ref_deref(env: &Env, wr: sys::napi_value) -> Result<Option<Unknown<'static>>> {
+  let env_raw = env.raw();
+  if is_nullish(env_raw, wr) {
+    return Ok(None);
+  }
+  unsafe {
+    let deref = get_named_raw(env_raw, wr, "deref")?;
+    let mut v = ptr::null_mut();
+    check_status!(sys::napi_call_function(
+      env_raw,
+      wr,
+      deref,
+      0,
+      ptr::null(),
+      &mut v,
+    ))?;
+    if is_nullish(env_raw, v) {
+      return Ok(None);
+    }
+    Ok(Some(as_static(Unknown::from_napi_value(env_raw, v)?)))
+  }
+}
+
+/// Install `value` as a non-enumerable own data prop keyed by
+/// `Symbol.for(desc)` on `obj`, via `Object.defineProperty`.
+fn define_sym_prop(
+  env: &Env,
+  obj: sys::napi_value,
+  desc: &str,
+  value: sys::napi_value,
+) -> Result<()> {
+  let env_raw = env.raw();
+  unsafe {
+    let global = env.get_global()?.raw();
+    let object_ctor = get_named_raw(env_raw, global, "Object")?;
+    let define_property = get_named_raw(env_raw, object_ctor, "defineProperty")?;
+    let sym = symbol_for(env, desc)?;
+    let mut d = ptr::null_mut();
+    check_status!(sys::napi_create_object(env_raw, &mut d))?;
+    check_status!(sys::napi_set_named_property(
+      env_raw,
+      d,
+      c"value".as_ptr(),
+      value
+    ))?;
+    let mut t = ptr::null_mut();
+    let mut f = ptr::null_mut();
+    check_status!(sys::napi_get_boolean(env_raw, true, &mut t))?;
+    check_status!(sys::napi_get_boolean(env_raw, false, &mut f))?;
+    check_status!(sys::napi_set_named_property(
+      env_raw,
+      d,
+      c"writable".as_ptr(),
+      t
+    ))?;
+    check_status!(sys::napi_set_named_property(
+      env_raw,
+      d,
+      c"configurable".as_ptr(),
+      t
+    ))?;
+    check_status!(sys::napi_set_named_property(
+      env_raw,
+      d,
+      c"enumerable".as_ptr(),
+      f
+    ))?;
+    let mut out = ptr::null_mut();
+    check_status!(sys::napi_call_function(
+      env_raw,
+      object_ctor,
+      define_property,
+      3,
+      [obj, sym, d].as_ptr(),
+      &mut out,
+    ))?;
+    Ok(())
+  }
 }
 
 fn is_nullish(env: sys::napi_env, v: sys::napi_value) -> bool {

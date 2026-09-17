@@ -1280,20 +1280,25 @@ test('VideoEncoder: extracted event accessors stay valid after event GC', (t) =>
   const script = `
     const { VideoEncoder } = require('./index.js');
     const enc = new VideoEncoder({ output: () => {}, error: () => {} });
-    let getT, getCT, getPh;
+    let getT, getCT, getPh, ev;
     (() => {
       enc.addEventListener('dequeue', (e) => {
+        ev = e;
         getT = Object.getOwnPropertyDescriptor(e, 'target').get;
         getCT = Object.getOwnPropertyDescriptor(e, 'currentTarget').get;
         getPh = Object.getOwnPropertyDescriptor(e, 'eventPhase').get;
       });
       enc.dispatchEvent('dequeue');
+      console.log('HELD:' + (getT.call(ev) === enc));
+      ev = null;
     })();
     globalThis.gc();
     setTimeout(() => {
       globalThis.gc();
+      // Getters are this-sensitive like DOM: on a foreign receiver they
+      // report null — and must not crash after the original event is gone.
       const fresh = new Event('x');
-      console.log('T:' + (getT.call(fresh) === enc));
+      console.log('T:' + getT.call(fresh));
       console.log('CT:' + getCT.call(fresh));
       console.log('PH:' + getPh.call(fresh));
     }, 300);
@@ -1303,9 +1308,40 @@ test('VideoEncoder: extracted event accessors stay valid after event GC', (t) =>
     timeout: 15_000,
     encoding: 'utf8',
   })
-  t.regex(output, /T:true/, 'extracted target getter must resolve the codec')
+  t.regex(output, /HELD:true/, 'getter resolves codec on the original event')
+  t.regex(output, /T:null/, 'foreign receiver must not leak the codec')
   t.regex(output, /CT:null/, 'extracted currentTarget getter must be null')
   t.regex(output, /PH:0/, 'extracted eventPhase getter must be NONE')
+})
+
+test('VideoEncoder: codec collectable when a listener retains its event', (t) => {
+  // A listener storing its event forms codec → state → FunctionRef →
+  // listener → event → codec. The event→codec edge is a JS WeakRef (visible,
+  // non-rooting) so the cycle is collectable — an opaque napi_ref edge would
+  // pin the codec forever.
+  const script = `
+    const { VideoEncoder } = require('./index.js');
+    let weak;
+    (() => {
+      const enc = new VideoEncoder({ output: () => {}, error: () => {} });
+      weak = new WeakRef(enc);
+      enc.addEventListener('dequeue', (e) => { globalThis.saved = e; });
+      enc.dispatchEvent('dequeue');
+    })();
+    globalThis.gc();
+    setTimeout(() => {
+      globalThis.gc();
+      console.log('COLLECTED:' + (weak.deref() === undefined));
+      console.log('TARGET:' + globalThis.saved.target);
+    }, 400);
+  `
+  const output = execFileSync(process.execPath, ['--expose-gc', '-e', script], {
+    cwd: process.cwd(),
+    timeout: 15_000,
+    encoding: 'utf8',
+  })
+  t.regex(output, /COLLECTED:true/, 'codec must be collectable')
+  t.regex(output, /TARGET:null/, 'dead codec derefs to null')
 })
 
 test('VideoEncoder: extracted stopImmediatePropagation forwards to native after dispatch', (t) => {
