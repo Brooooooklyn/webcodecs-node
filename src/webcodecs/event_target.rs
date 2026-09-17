@@ -485,6 +485,11 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
     let _ = event_obj.define_properties(&[ct_prop]);
   }
 
+  // Remove the stopImmediatePropagation wrapper so listeners retaining the
+  // event fall back to the prototype method — the wrapper's captured raw
+  // napi_value is only valid within this dispatcher's handle scope.
+  let _ = event_obj.delete_named_property("stopImmediatePropagation");
+
   // Report the first listener exception after dispatch so it surfaces as an
   // uncaught error instead of being silently swallowed.
   if let Some(exc) = thrown {

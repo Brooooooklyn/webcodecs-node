@@ -980,3 +980,22 @@ test('VideoEncoder: stopImmediatePropagation stops remaining listeners', (t) => 
   t.deepEqual(fired, ['l1'], 'each new event starts un-stopped')
   encoder.close()
 })
+
+test('VideoEncoder: retained event falls back to native stopImmediatePropagation', (t) => {
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: () => {},
+  })
+
+  let retained: Event | null = null
+  encoder.addEventListener('dequeue', (event: Event) => {
+    retained = event
+  })
+  encoder.dispatchEvent('dequeue')
+
+  t.truthy(retained)
+  // After dispatch returns, the own-property wrapper is removed — calling it
+  // must reach the native prototype method without crashing or dangling.
+  t.notThrows(() => retained!.stopImmediatePropagation())
+  encoder.close()
+})
