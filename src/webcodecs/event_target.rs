@@ -20,11 +20,20 @@ use std::sync::{Arc, RwLock};
 
 use super::error::new_event;
 
+/// Dispatcher command, sent as two u32 args (a pointer cannot cross the JS
+/// boundary as a single number without f64 truncation). (0, 0) means dispatch
+/// a dequeue event; any other pair is the (hi, lo) halves of a raw napi_ref
+/// that must be deleted on the JS thread — off-thread drops of WeakCodecRef
+/// route their handle release through the dispatcher.
+const CMD_DISPATCH: (u32, u32) = (0, 0);
+
 /// A registered event listener. The FunctionRef both calls the JS callback and
 /// identifies the listener for removeEventListener (strict equality).
 struct EventListenerEntry {
   id: u64,
   once: bool,
+  /// DOM capture flag — part of listener identity for add/remove matching.
+  capture: bool,
   callback: Arc<FunctionRef<Unknown<'static>, UnknownReturnValue>>,
 }
 
@@ -34,17 +43,20 @@ struct EventListenerEntry {
 /// → napi_ref → codec object) and pin the codec against GC forever, so this
 /// uses a zero-refcount (weak) reference: once the codec is collected,
 /// `get()` returns None and dispatches degrade to a null target.
-///
-/// The raw napi_ref handle itself is intentionally never deleted: deleting a
-/// reference must run on the owning JS thread, while this state can be dropped
-/// by the worker thread holding the last Arc. The leaked handle is a small GC
-/// slot only — it does not keep the JS object alive.
 struct WeakCodecRef {
   raw_ref: sys::napi_ref,
+  env: sys::napi_env,
+  /// Thread this ref was created on (the JS thread). Used to decide whether
+  /// drop can delete the ref directly.
+  js_thread: std::thread::ThreadId,
+  /// Dispatcher TSF used to release this ref on the JS thread when the final
+  /// drop lands on a worker thread. Optional because the dispatcher is created
+  /// lazily after the ref itself.
+  gc: Option<Arc<DispatcherTsf>>,
 }
 
-// The napi_ref is only ever dereferenced on the JS thread (inside `dispatch`),
-// so sharing the handle across threads is sound.
+// The napi_ref is only ever dereferenced or deleted on the JS thread, so
+// sharing the handle across threads is sound.
 unsafe impl Send for WeakCodecRef {}
 unsafe impl Sync for WeakCodecRef {}
 
@@ -52,7 +64,12 @@ impl WeakCodecRef {
   fn new(env: &Env, obj: Object) -> Result<Self> {
     let mut raw_ref = ptr::null_mut();
     check_status!(unsafe { sys::napi_create_reference(env.raw(), obj.raw(), 0, &mut raw_ref) })?;
-    Ok(Self { raw_ref })
+    Ok(Self {
+      raw_ref,
+      env: env.raw(),
+      js_thread: std::thread::current().id(),
+      gc: None,
+    })
   }
 
   /// Get the codec object on the JS thread; None once the codec is GC'd.
@@ -66,7 +83,34 @@ impl WeakCodecRef {
   }
 }
 
-type DispatcherTsf = ThreadsafeFunction<(), (), (), Status, false, true>;
+impl Drop for WeakCodecRef {
+  fn drop(&mut self) {
+    if self.raw_ref.is_null() {
+      return;
+    }
+    if std::thread::current().id() == self.js_thread {
+      // Dropped on the JS thread: delete the ref directly.
+      unsafe {
+        sys::napi_delete_reference(self.env, self.raw_ref);
+      }
+    } else if let Some(gc) = self.gc.take() {
+      // Dropped on a worker thread: napi_delete_reference must run on the
+      // owning JS thread, so route the handle through the dispatcher. If the
+      // TSFN is already closing (env teardown), the handle is reclaimed by
+      // Node anyway — leaking is safe in that path.
+      let addr = self.raw_ref as usize;
+      gc.call(
+        (((addr >> 32) & 0xffff_ffff) as u32, addr as u32),
+        ThreadsafeFunctionCallMode::NonBlocking,
+      );
+    }
+    // No dispatcher available on a worker-thread drop: the codec was dropped
+    // without ever registering a listener — the raw handle slot leaks, but it
+    // does not keep the JS object alive.
+  }
+}
+
+type DispatcherTsf = ThreadsafeFunction<(u32, u32), (), (u32, u32), Status, false, true>;
 
 /// Per-codec event state shared between the JS thread and the worker thread.
 #[derive(Default)]
@@ -101,11 +145,28 @@ impl CodecEventState {
     if self.dispatcher.is_some() {
       return Ok(());
     }
-    let shared = shared.clone();
+    // The closure holds a Weak, not an Arc: the dispatcher TSF is stored inside
+    // this same state, so a strong capture would create a
+    // state → TSF → JS function → closure → state cycle that never drops.
+    let weak_shared = Arc::downgrade(shared);
     let dispatch_fn = env.create_function_from_closure(
       "codecDispatch",
       move |ctx: FunctionCallContext| -> Result<()> {
-        dispatch(ctx.env, &shared, "dequeue");
+        let cmd = (
+          ctx.get::<u32>(0).unwrap_or(0),
+          ctx.get::<u32>(1).unwrap_or(0),
+        );
+        if cmd == CMD_DISPATCH {
+          if let Some(shared) = weak_shared.upgrade() {
+            dispatch(ctx.env, &shared, "dequeue");
+          }
+        } else {
+          // Delete a napi_ref handle on the JS thread (see WeakCodecRef::drop)
+          let raw_ref = (((cmd.0 as usize) << 32) | cmd.1 as usize) as sys::napi_ref;
+          unsafe {
+            sys::napi_delete_reference(ctx.env.raw(), raw_ref);
+          }
+        }
         Ok(())
       },
     )?;
@@ -114,26 +175,34 @@ impl CodecEventState {
       .callee_handled::<false>()
       .weak::<true>()
       .build()?;
-    self.dispatcher = Some(Arc::new(tsf));
+    let dispatcher = Arc::new(tsf);
+    // Let the codec-obj ref route its deletion through this dispatcher when it
+    // drops on a worker thread.
+    if let Some(ref mut codec) = self.codec_obj {
+      codec.gc = Some(dispatcher.clone());
+    }
+    self.dispatcher = Some(dispatcher);
     Ok(())
   }
 
   /// Register an event listener (DOM addEventListener).
-  /// Re-registering the identical callback for the same type is a no-op per
-  /// DOM spec.
+  /// Re-registering the identical callback with the same capture flag for the
+  /// same type is a no-op per DOM spec.
   pub fn add_listener(
     &mut self,
     env: &Env,
     event_type: &str,
     callback: FunctionRef<Unknown<'static>, UnknownReturnValue>,
     once: bool,
+    capture: bool,
   ) -> Result<()> {
     let listeners = self.listeners.entry(event_type.to_string()).or_default();
     for entry in listeners.iter() {
-      let same = match (entry.callback.borrow_back(env), callback.borrow_back(env)) {
-        (Ok(registered), Ok(passed)) => env.strict_equals(registered, passed).unwrap_or(false),
-        _ => false,
-      };
+      let same = entry.capture == capture
+        && match (entry.callback.borrow_back(env), callback.borrow_back(env)) {
+          (Ok(registered), Ok(passed)) => env.strict_equals(registered, passed).unwrap_or(false),
+          _ => false,
+        };
       if same {
         return Ok(());
       }
@@ -143,25 +212,28 @@ impl CodecEventState {
     listeners.push(Arc::new(EventListenerEntry {
       id,
       once,
+      capture,
       callback: Arc::new(callback),
     }));
     Ok(())
   }
 
   /// Remove the first registered listener whose callback strict-equals the
-  /// one passed (DOM removeEventListener).
+  /// one passed with a matching capture flag (DOM removeEventListener).
   pub fn remove_listener(
     &mut self,
     env: &Env,
     event_type: &str,
     callback: &FunctionRef<Unknown<'static>, UnknownReturnValue>,
+    capture: bool,
   ) {
     if let Some(listeners) = self.listeners.get_mut(event_type) {
       if let Some(pos) = listeners.iter().position(|entry| {
-        match (entry.callback.borrow_back(env), callback.borrow_back(env)) {
-          (Ok(registered), Ok(passed)) => env.strict_equals(registered, passed).unwrap_or(false),
-          _ => false,
-        }
+        entry.capture == capture
+          && match (entry.callback.borrow_back(env), callback.borrow_back(env)) {
+            (Ok(registered), Ok(passed)) => env.strict_equals(registered, passed).unwrap_or(false),
+            _ => false,
+          }
       }) {
         listeners.remove(pos);
       }
@@ -187,7 +259,7 @@ impl CodecEventState {
   /// Fire the dequeue event from the worker thread (async, non-blocking).
   pub fn fire(&self) {
     if let Some(ref dispatcher) = self.dispatcher {
-      dispatcher.call((), ThreadsafeFunctionCallMode::NonBlocking);
+      dispatcher.call(CMD_DISPATCH, ThreadsafeFunctionCallMode::NonBlocking);
     }
   }
 }
@@ -208,7 +280,8 @@ struct DispatchItem {
 /// identity; `target`/`currentTarget` are set to the codec object and `this`
 /// inside each listener is the codec (DOM dispatch semantics). Listeners
 /// added during dispatch do not run in this dispatch; listeners removed
-/// before their turn are skipped; `once` listeners are removed after firing.
+/// before their turn are skipped; `once` listeners are removed before
+/// invocation so a re-entrant dispatchEvent cannot observe them again.
 pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &str) {
   let (codec_obj, snapshot) = {
     let Ok(state) = shared.read() else {
@@ -267,7 +340,6 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
     }
   }
 
-  let mut once_ids = Vec::new();
   for item in &snapshot {
     // DOM: skip listeners removed between snapshot and invocation
     let still_registered = {
@@ -291,6 +363,17 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
     if !still_registered {
       continue;
     }
+    // DOM spec: remove "once" listeners before invoking so a re-entrant
+    // dispatchEvent inside the listener cannot observe it again.
+    if item.once
+      && let Ok(mut state) = shared.write()
+      && let Some(listeners) = state.listeners.get_mut(event_type)
+    {
+      listeners.retain(|e| e.id != item.id);
+      if listeners.is_empty() {
+        state.listeners.remove(event_type);
+      }
+    }
     if let Ok(func) = item.callback.borrow_back(env) {
       // Relax the event's phantom lifetime to match the stored callback's
       // args type; the event is only used within this synchronous call.
@@ -299,9 +382,6 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
         Some(codec) => func.apply(*codec, arg).map(|_| ()),
         None => func.call(arg).map(|_| ()),
       };
-    }
-    if item.once {
-      once_ids.push(item.id);
     }
   }
 
@@ -312,16 +392,5 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
       .and_then(|p| p.with_napi_value(env, Null))
   {
     let _ = event_obj.define_properties(&[ct_prop]);
-  }
-
-  // Remove once listeners that fired
-  if !once_ids.is_empty()
-    && let Ok(mut state) = shared.write()
-    && let Some(listeners) = state.listeners.get_mut(event_type)
-  {
-    listeners.retain(|e| !once_ids.contains(&e.id));
-    if listeners.is_empty() {
-      state.listeners.remove(event_type);
-    }
   }
 }

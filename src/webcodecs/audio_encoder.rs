@@ -1936,7 +1936,8 @@ impl AudioEncoder {
     state.set_codec_obj(&env, this.object)?;
     state.ensure_dispatcher(&env, &self.event_state)?;
     let once = options.as_ref().and_then(|o| o.once).unwrap_or(false);
-    state.add_listener(&env, &event_type, callback, once)
+    let capture = options.as_ref().and_then(|o| o.capture).unwrap_or(false);
+    state.add_listener(&env, &event_type, callback, once, capture)
   }
 
   /// Remove an event listener for the specified event type
@@ -1948,14 +1949,15 @@ impl AudioEncoder {
     env: Env,
     event_type: String,
     callback: FunctionRef<Unknown<'static>, UnknownReturnValue>,
-    _options: Option<AudioEncoderEventListenerOptions>,
+    options: Option<AudioEncoderEventListenerOptions>,
   ) -> Result<()> {
     let mut state = self
       .event_state
       .write()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    state.remove_listener(&env, &event_type, &callback);
+    let capture = options.as_ref().and_then(|o| o.capture).unwrap_or(false);
+    state.remove_listener(&env, &event_type, &callback, capture);
     Ok(())
   }
 

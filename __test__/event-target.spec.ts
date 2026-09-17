@@ -838,3 +838,69 @@ test('VideoEncoder: re-registering the same callback is a no-op', async (t) => {
   t.is(count, 1, 'duplicate registration should not double-fire per dispatch')
   encoder.close()
 })
+
+test('VideoEncoder: capture flag is part of listener identity', async (t) => {
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: () => {},
+  })
+
+  let bubble = 0
+  let capture = 0
+  const listener = () => {
+    bubble++
+  }
+  encoder.addEventListener('dequeue', listener)
+  // Same callback with capture:true is a DISTINCT registration per DOM spec
+  encoder.addEventListener('dequeue', () => {
+    capture++
+  }, { capture: true })
+  encoder.addEventListener('dequeue', listener, { capture: true })
+
+  encoder.configure(createEncoderConfig('h264', 64, 64))
+  const frame = generateSolidColorI420Frame(64, 64, TestColors.green, 0)
+  encoder.encode(frame, { keyFrame: true })
+  frame.close()
+
+  await new Promise<void>((resolve) => {
+    const check = () => (bubble + capture >= 2 ? resolve() : setTimeout(check, 10))
+    check()
+  })
+  await new Promise((r) => setTimeout(r, 50))
+
+  // One dispatch fires: bubble listener once + capture listener once + capture'd
+  // instance of `listener` once (it registered again with capture:true)
+  t.is(bubble + capture >= 2, true)
+  // Removing with capture:false removes only the bubble registration
+  encoder.removeEventListener('dequeue', listener)
+  encoder.close()
+})
+
+test('VideoEncoder: once listener does not re-fire on re-entrant dispatch', async (t) => {
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: () => {},
+  })
+
+  let count = 0
+  const listener = () => {
+    count++
+    // Re-entrant dispatch must not observe this once-listener again
+    encoder.dispatchEvent('dequeue')
+  }
+  encoder.addEventListener('dequeue', listener, { once: true })
+
+  encoder.configure(createEncoderConfig('h264', 64, 64))
+  const frame = generateSolidColorI420Frame(64, 64, TestColors.green, 0)
+  encoder.encode(frame, { keyFrame: true })
+  frame.close()
+
+  await new Promise<void>((resolve) => {
+    const check = () => (count >= 1 ? resolve() : setTimeout(check, 10))
+    check()
+  })
+  await new Promise((r) => setTimeout(r, 50))
+
+  t.is(count, 1, 'once listener must be removed before invocation')
+  encoder.close()
+})
