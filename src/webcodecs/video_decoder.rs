@@ -1278,9 +1278,8 @@ impl VideoDecoder {
       .event_state
       .write()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-    state.set_codec_obj(env, this.object)?;
     if callback.is_some() {
-      state.ensure_dispatcher(env, &self.event_state)?;
+      state.ensure_dispatcher(env, &self.event_state, this.object)?;
     }
     state.set_ondequeue(callback);
     Ok(())
@@ -2022,8 +2021,7 @@ impl VideoDecoder {
       .write()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    state.set_codec_obj(&env, this.object)?;
-    state.ensure_dispatcher(&env, &self.event_state)?;
+    state.ensure_dispatcher(&env, &self.event_state, this.object)?;
     let once = options.as_ref().and_then(|o| o.once).unwrap_or(false);
     let capture = options.as_ref().and_then(|o| o.capture).unwrap_or(false);
     state.add_listener(&env, &event_type, callback, once, capture)

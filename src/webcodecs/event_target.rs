@@ -8,6 +8,7 @@
 //! object, matching DOM EventTarget semantics.
 
 use napi::Env;
+use napi::PropertyAttributes;
 use napi::bindgen_prelude::*;
 use napi::check_status;
 use napi::sys;
@@ -16,6 +17,7 @@ use napi::threadsafe_function::{
 };
 use std::collections::HashMap;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use super::error::new_event;
@@ -132,22 +134,22 @@ pub struct CodecEventState {
 }
 
 impl CodecEventState {
-  /// Capture the codec's JS object on first use (JS thread only).
-  pub fn set_codec_obj(&mut self, env: &Env, this: Object) -> Result<()> {
-    if self.codec_obj.is_none() {
-      self.codec_obj = Some(WeakCodecRef::new(env, this)?);
-    }
-    Ok(())
-  }
-
   /// Ensure the worker→JS dispatcher exists (JS thread only).
+  ///
+  /// The codec's JS object (`this`) is captured lazily here rather than in a
+  /// separate step: a WeakCodecRef without a dispatcher would have no route to
+  /// delete its napi_ref when the final drop lands on a worker thread.
   pub fn ensure_dispatcher(
     &mut self,
     env: &Env,
     shared: &Arc<RwLock<CodecEventState>>,
+    this: Object,
   ) -> Result<()> {
     if self.dispatcher.is_some() {
       return Ok(());
+    }
+    if self.codec_obj.is_none() {
+      self.codec_obj = Some(WeakCodecRef::new(env, this)?);
     }
     // The closure holds a Weak, not an Arc: the dispatcher TSF is stored inside
     // this same state, so a strong capture would create a
@@ -368,6 +370,46 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
     }
   }
 
+  // DOM: honor stopImmediatePropagation. The event never passes through a real
+  // EventTarget, so shadow the method with a wrapper that flips a flag this
+  // loop can observe, then forwards to the native implementation so the
+  // event's internal flag stays correct if it is re-dispatched elsewhere.
+  let stop_immediate = Arc::new(AtomicBool::new(false));
+  {
+    // The prototype method is an intrinsic that outlives this dispatch, so the
+    // raw handle can be captured into the 'static closure safely.
+    let orig_sip = env
+      .get_global()
+      .and_then(|g| g.get_named_property::<Object>("Event"))
+      .and_then(|e| e.get_named_property::<Object>("prototype"))
+      .and_then(|p| p.get_named_property::<Unknown>("stopImmediatePropagation"))
+      .map(|f| f.raw() as usize)
+      .unwrap_or(0);
+    let flag = stop_immediate.clone();
+    if let Ok(wrapper) = env.create_function_from_closure::<(), (), _>(
+      "stopImmediatePropagation",
+      move |ctx: FunctionCallContext| -> Result<()> {
+        flag.store(true, Ordering::SeqCst);
+        if orig_sip != 0
+          && let Ok(this) = ctx.this::<Unknown>()
+          && let Ok(orig) = unsafe {
+            Function::<(), Unknown>::from_napi_value(ctx.env.raw(), orig_sip as sys::napi_value)
+          }
+        {
+          let _ = orig.apply(this, ());
+        }
+        Ok(())
+      },
+    ) && let Ok(sip_prop) = Property::new()
+      .with_utf8_name("stopImmediatePropagation")
+      .and_then(|p| p.with_napi_value(env, wrapper))
+    {
+      let _ = event_obj.define_properties(&[sip_prop.with_property_attributes(
+        PropertyAttributes::Writable | PropertyAttributes::Configurable,
+      )]);
+    }
+  }
+
   let mut thrown: Option<sys::napi_value> = None;
   for item in &snapshot {
     // DOM: skip listeners removed between snapshot and invocation
@@ -428,6 +470,9 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
           }
         }
       }
+    }
+    if stop_immediate.load(Ordering::SeqCst) {
+      break;
     }
   }
 

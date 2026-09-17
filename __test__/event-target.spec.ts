@@ -955,3 +955,28 @@ test('VideoEncoder: once dequeue listener keeps the process alive until it fires
   })
   t.true(output.includes('DEQUEUE_FIRED'), 'once listener must fire before process exit')
 })
+
+test('VideoEncoder: stopImmediatePropagation stops remaining listeners', (t) => {
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: () => {},
+  })
+
+  const fired: string[] = []
+  encoder.addEventListener('dequeue', (event: Event) => {
+    fired.push('l1')
+    event.stopImmediatePropagation()
+  })
+  encoder.addEventListener('dequeue', () => {
+    fired.push('l2')
+  })
+
+  encoder.dispatchEvent('dequeue')
+  t.deepEqual(fired, ['l1'], 'l2 must not run after stopImmediatePropagation')
+
+  // A fresh dispatch must still reach both listeners — the flag is per-event
+  fired.length = 0
+  encoder.dispatchEvent('dequeue')
+  t.deepEqual(fired, ['l1'], 'each new event starts un-stopped')
+  encoder.close()
+})
