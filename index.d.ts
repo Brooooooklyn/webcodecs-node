@@ -271,7 +271,7 @@ export declare class AudioDecoder {
    *
    * @param init - Init dictionary containing output and error callbacks
    */
-  constructor(init: { output: (data: AudioData) => void; error: (error: Error) => void })
+  constructor(init: { output: (data: AudioData) => void; error: (error: DOMException) => void })
   /** Get decoder state */
   get state(): CodecState
   /** Get number of pending decode operations (per WebCodecs spec) */
@@ -282,9 +282,9 @@ export declare class AudioDecoder {
    * The dequeue event fires when decodeQueueSize decreases,
    * allowing backpressure management.
    */
-  set ondequeue(callback: (() => unknown) | undefined | null)
+  set ondequeue(callback: ((event: Event) => unknown) | undefined | null)
   /** Get the dequeue event handler (per WebCodecs spec) */
-  get ondequeue(): (() => unknown) | null
+  get ondequeue(): ((event: Event) => unknown) | null
   /** Configure the decoder */
   configure(config: AudioDecoderConfig): void
   /** Decode an encoded audio chunk */
@@ -310,16 +310,19 @@ export declare class AudioDecoder {
    * returns { supported: false } for valid but unsupported configs.
    */
   static isConfigSupported(config: AudioDecoderConfig): Promise<AudioDecoderSupport>
-  /** Add an event listener for the specified event type */
+  /**
+   * Add an event listener for the specified event type
+   * Uses separate RwLock to avoid blocking on decode operations
+   */
   addEventListener(
     eventType: string,
-    callback: () => unknown,
+    callback: (event: Event) => unknown,
     options?: AudioDecoderAddEventListenerOptions | undefined | null,
   ): void
   /** Remove an event listener for the specified event type */
   removeEventListener(
     eventType: string,
-    callback: () => unknown,
+    callback: (event: Event) => unknown,
     options?: AudioDecoderEventListenerOptions | undefined | null,
   ): void
   /** Dispatch an event to all registered listeners */
@@ -358,7 +361,7 @@ export declare class AudioEncoder {
    */
   constructor(init: {
     output: (chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadata) => void
-    error: (error: Error) => void
+    error: (error: DOMException) => void
   })
   /** Get encoder state */
   get state(): CodecState
@@ -370,9 +373,9 @@ export declare class AudioEncoder {
    * The dequeue event fires when encodeQueueSize decreases,
    * allowing backpressure management.
    */
-  set ondequeue(callback: (() => unknown) | undefined | null)
+  set ondequeue(callback: ((event: Event) => unknown) | undefined | null)
   /** Get the dequeue event handler (per WebCodecs spec) */
-  get ondequeue(): (() => unknown) | null
+  get ondequeue(): ((event: Event) => unknown) | null
   /** Configure the encoder */
   configure(config: AudioEncoderConfig): void
   /** Encode audio data */
@@ -404,13 +407,13 @@ export declare class AudioEncoder {
    */
   addEventListener(
     eventType: string,
-    callback: () => unknown,
+    callback: (event: Event) => unknown,
     options?: AudioEncoderAddEventListenerOptions | undefined | null,
   ): void
   /** Remove an event listener for the specified event type */
   removeEventListener(
     eventType: string,
-    callback: () => unknown,
+    callback: (event: Event) => unknown,
     options?: AudioEncoderEventListenerOptions | undefined | null,
   ): void
   /** Dispatch an event to all registered listeners */
@@ -895,7 +898,7 @@ export declare class VideoDecoder {
    *
    * @param init - Init dictionary containing output and error callbacks
    */
-  constructor(init: { output: (frame: VideoFrame) => void; error: (error: Error) => void })
+  constructor(init: { output: (frame: VideoFrame) => void; error: (error: DOMException) => void })
   /** Get decoder state */
   get state(): CodecState
   /** Get number of pending decode operations (per WebCodecs spec) */
@@ -906,9 +909,9 @@ export declare class VideoDecoder {
    * The dequeue event fires when decodeQueueSize decreases,
    * allowing backpressure management.
    */
-  set ondequeue(callback: (() => unknown) | undefined | null)
+  set ondequeue(callback: ((event: Event) => unknown) | undefined | null)
   /** Get the dequeue event handler (per WebCodecs spec) */
-  get ondequeue(): (() => unknown) | null
+  get ondequeue(): ((event: Event) => unknown) | null
   /**
    * Configure the decoder
    *
@@ -947,13 +950,13 @@ export declare class VideoDecoder {
    */
   addEventListener(
     eventType: string,
-    callback: () => unknown,
+    callback: (event: Event) => unknown,
     options?: VideoDecoderAddEventListenerOptions | undefined | null,
   ): void
   /** Remove an event listener for the specified event type */
   removeEventListener(
     eventType: string,
-    callback: () => unknown,
+    callback: (event: Event) => unknown,
     options?: VideoDecoderEventListenerOptions | undefined | null,
   ): void
   /** Dispatch an event to all registered listeners */
@@ -993,7 +996,7 @@ export declare class VideoEncoder {
    */
   constructor(init: {
     output: (chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadata) => void
-    error: (error: Error) => void
+    error: (error: DOMException) => void
   })
   /** Get encoder state */
   get state(): CodecState
@@ -1005,9 +1008,9 @@ export declare class VideoEncoder {
    * The dequeue event fires when encodeQueueSize decreases,
    * allowing backpressure management.
    */
-  set ondequeue(callback: (() => unknown) | undefined | null)
+  set ondequeue(callback: ((event: Event) => unknown) | undefined | null)
   /** Get the dequeue event handler (per WebCodecs spec) */
-  get ondequeue(): (() => unknown) | null
+  get ondequeue(): ((event: Event) => unknown) | null
   /** Configure the encoder */
   configure(config: VideoEncoderConfig): void
   /** Encode a frame */
@@ -1031,13 +1034,13 @@ export declare class VideoEncoder {
    */
   addEventListener(
     eventType: string,
-    callback: () => unknown,
+    callback: (event: Event) => unknown,
     options?: AddEventListenerOptions | undefined | null,
   ): void
   /** Remove an event listener for the specified event type */
   removeEventListener(
     eventType: string,
-    callback: () => unknown,
+    callback: (event: Event) => unknown,
     options?: EventListenerOptions | undefined | null,
   ): void
   /** Dispatch an event to all registered listeners */

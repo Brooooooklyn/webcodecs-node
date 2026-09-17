@@ -128,7 +128,7 @@ test('AudioDecoder: configure() with FLAC codec requires description', async (t)
   // Should trigger error callback and close decoder (no description provided)
   t.is(decoder.state, 'closed')
   t.is(errors.length, 1)
-  t.true(errors[0].message.includes('NotSupportedError'))
+  t.is((errors[0] as unknown as DOMException).name, 'NotSupportedError')
 })
 
 test('AudioDecoder: configure() with mono audio', (t) => {

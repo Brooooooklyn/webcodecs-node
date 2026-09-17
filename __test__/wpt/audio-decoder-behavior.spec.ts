@@ -597,8 +597,8 @@ test('AudioDecoder: decode empty chunk triggers error', async (t) => {
   }
 
   const error = await gotError
-  t.true(error instanceof Error)
-  // Error callbacks receive standard Error with DOMException name in message
+  // Error callbacks receive a real DOMException (WebCodecsErrorCallback)
+  t.true(error instanceof DOMException)
   t.true(isErrorOfType(error, 'EncodingError'), 'error should be EncodingError')
   t.is(decoder.state, 'closed', 'decoder closed after error')
 })

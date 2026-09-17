@@ -196,7 +196,7 @@ for (const entry of validButUnsupportedConfigs) {
 
     t.true(isErrorCallbackCalled, 'error callback should be called')
     t.truthy(errorReceived, 'error should be received')
-    t.true(errorReceived!.message.includes('NotSupportedError'), 'error should be NotSupportedError')
+    t.is((errorReceived as unknown as DOMException).name, 'NotSupportedError', 'error should be NotSupportedError')
     t.is(encoder.state, 'closed', 'encoder should be closed after error')
   })
 }

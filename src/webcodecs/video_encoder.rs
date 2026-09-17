@@ -14,8 +14,10 @@ use crate::ffi::{
 use crate::webcodecs::codec_pressure;
 use crate::webcodecs::error::DOMExceptionName;
 use crate::webcodecs::error::{
-  native_dom_exception_error, throw_data_error, throw_invalid_state_error, throw_type_error_unit,
+  error_as_dom_exception, native_dom_exception_error, throw_data_error, throw_invalid_state_error,
+  throw_type_error_unit,
 };
+use crate::webcodecs::event_target::CodecEventState;
 use crate::webcodecs::flush_tracker::FlushTracker;
 use crate::webcodecs::hw_fallback::{
   is_hw_encoding_disabled, record_hw_encoding_failure, record_hw_encoding_success,
@@ -35,7 +37,7 @@ use napi::threadsafe_function::{
 };
 use napi_derive::napi;
 use parking_lot::RwLock as ParkingLotRwLock;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -173,9 +175,11 @@ type OutputCallback = ThreadsafeFunction<
 >;
 
 /// Type alias for error callback (takes Error object)
-/// Using CalleeHandled: false because WebCodecs error callback receives Error directly,
-/// not error-first (err, result) style
-type ErrorCallback = ThreadsafeFunction<Error, UnknownReturnValue, Error, Status, false, true>;
+/// Using CalleeHandled: false because WebCodecs error callback receives the
+/// error directly, not error-first (err, result) style. The Error payload is
+/// converted to a native DOMException in the JS-side callback.
+type ErrorCallback =
+  ThreadsafeFunction<Error, UnknownReturnValue, Unknown<'static>, Status, false, true>;
 
 // Note: For ondequeue, we use FunctionRef instead of ThreadsafeFunction
 // to support both getter and setter per WebCodecs spec
@@ -290,12 +294,14 @@ impl FromNapiValue for VideoEncoderInit {
     // Create FunctionRef to prevent GC from collecting the error callback
     let error_ref = error_func.create_ref()?;
 
-    // Create ThreadsafeFunction for async calls from worker thread
+    // Create ThreadsafeFunction for async calls from worker thread.
+    // The JS-side callback converts the Error payload into a native
+    // DOMException (WebCodecsErrorCallback receives DOMException per spec).
     let error: ErrorCallback = error_func
       .build_threadsafe_function()
       .callee_handled::<false>()
       .weak::<true>()
-      .build()?;
+      .build_callback(|ctx| error_as_dom_exception(&ctx.env, ctx.value))?;
 
     Ok(VideoEncoderInit {
       output,
@@ -312,49 +318,6 @@ impl FromNapiValue for VideoEncoderInit {
 /// For HEVC with B-pyramid (has_b_frames=2), we need at least 4 frames.
 /// Using 5 to be safe across different encoders and configurations.
 const SILENT_FAILURE_THRESHOLD: u32 = 5;
-
-/// Type alias for weak event listener callback (allows Node.js process to exit)
-type WeakEventListenerCallback =
-  ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, true>;
-
-/// Type alias for strong event listener callback (keeps Node.js alive until called)
-type StrongEventListenerCallback =
-  ThreadsafeFunction<(), UnknownReturnValue, (), Status, false, false>;
-
-/// Backwards compatibility alias for dequeue callback
-type EventListenerCallback = WeakEventListenerCallback;
-
-/// Enum to hold either weak or strong TSF for event listeners
-enum EventListenerCallbackType {
-  /// Weak TSF for regular listeners (doesn't prevent Node.js exit)
-  Weak(Arc<WeakEventListenerCallback>),
-  /// Strong TSF for once listeners (keeps Node.js alive until callback fires)
-  /// Wrapped in Arc to allow cloning for the callback closure
-  Strong(Arc<StrongEventListenerCallback>),
-}
-
-/// Entry for tracking event listeners
-/// Stores either weak TSF (for regular) or strong TSF (for once) listeners
-struct EventListenerEntry {
-  id: u64,
-  callback: EventListenerCallbackType,
-  once: bool,
-  /// Only needed for Weak variant - Strong TSF keeps the function alive automatically
-  _prevent_gc: Option<FunctionRef<(), UnknownReturnValue>>,
-}
-
-/// State for EventTarget interface, separate from main encoder state
-/// to avoid lock contention during encoding operations.
-/// Uses RwLock so addEventListener doesn't block on encode operations.
-#[derive(Default)]
-struct EventListenerState {
-  /// Event listeners registry (event type -> list of listeners)
-  event_listeners: HashMap<String, Vec<EventListenerEntry>>,
-  /// Counter for generating unique listener IDs
-  next_listener_id: u64,
-  /// Optional dequeue event callback (set via ondequeue property)
-  dequeue_callback: Option<Arc<EventListenerCallback>>,
-}
 
 /// Options for addEventListener (W3C DOM spec)
 #[napi(object)]
@@ -566,8 +529,7 @@ pub struct VideoEncoder {
   inner: Arc<Mutex<VideoEncoderInner>>,
   /// Separate lock for EventTarget state to avoid lock contention with encode operations.
   /// This allows addEventListener to complete immediately even when worker holds inner lock.
-  event_state: Arc<RwLock<EventListenerState>>,
-  dequeue_callback: Option<FunctionRef<(), UnknownReturnValue>>,
+  event_state: Arc<RwLock<CodecEventState>>,
   /// Output callback reference - stored for synchronous calls from main thread (in flush resolver)
   /// Wrapped in Rc to allow sharing with spawn_future_with_callback closure
   /// (Rc is !Send but that's OK - the callback runs on the main thread)
@@ -613,7 +575,7 @@ impl VideoEncoder {
   #[napi(constructor)]
   pub fn new(
     #[napi(
-      ts_arg_type = "{ output: (chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadata) => void, error: (error: Error) => void }"
+      ts_arg_type = "{ output: (chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadata) => void, error: (error: DOMException) => void }"
     )]
     init: VideoEncoderInit,
   ) -> Result<Self> {
@@ -664,7 +626,7 @@ impl VideoEncoder {
     let inner = Arc::new(Mutex::new(inner));
 
     // Create separate lock for event listener state (avoids contention with encode operations)
-    let event_state = Arc::new(RwLock::new(EventListenerState::default()));
+    let event_state = Arc::new(RwLock::new(CodecEventState::default()));
 
     // Create channel for worker commands
     let (sender, receiver) = channel::unbounded();
@@ -688,7 +650,6 @@ impl VideoEncoder {
     Ok(Self {
       inner,
       event_state,
-      dequeue_callback: None,
       output_callback_ref: Rc::new(init.output_ref),
       error_callback_ref: Rc::new(init.error_ref),
       command_sender: Some(Arc::new(sender)),
@@ -700,7 +661,7 @@ impl VideoEncoder {
   /// Worker loop that processes commands from the channel
   fn worker_loop(
     inner: Arc<Mutex<VideoEncoderInner>>,
-    event_state: Arc<RwLock<EventListenerState>>,
+    event_state: Arc<RwLock<CodecEventState>>,
     receiver: Receiver<EncoderCommand>,
     reset_flag: Arc<AtomicBool>,
   ) {
@@ -736,7 +697,7 @@ impl VideoEncoder {
   /// Process an encode command on the worker thread
   fn process_encode(
     inner: &Arc<Mutex<VideoEncoderInner>>,
-    event_state: &Arc<RwLock<EventListenerState>>,
+    event_state: &Arc<RwLock<CodecEventState>>,
     request: VideoEncodeRequest,
     reset_flag: &AtomicBool,
   ) {
@@ -1578,7 +1539,7 @@ impl VideoEncoder {
   /// Process a flush command on the worker thread
   fn process_flush(
     inner: &Arc<Mutex<VideoEncoderInner>>,
-    _event_state: &Arc<RwLock<EventListenerState>>,
+    _event_state: &Arc<RwLock<CodecEventState>>,
     reset_flag: &AtomicBool,
   ) -> Result<()> {
     let mut guard = inner
@@ -2340,61 +2301,10 @@ impl VideoEncoder {
     inner.state = CodecState::Closed;
   }
 
-  /// Fire dequeue event - uses separate RwLock to avoid blocking addEventListener
-  /// Also dispatches to EventTarget listeners registered via addEventListener
-  fn fire_dequeue_event(event_state: &Arc<RwLock<EventListenerState>>) -> Result<()> {
-    // Use write lock to fire callbacks and remove once listeners atomically
-    // NonBlocking mode ensures callbacks are queued without blocking the worker thread
-    let mut state = match event_state.write() {
-      Ok(s) => s,
-      Err(_) => return Err(Error::new(Status::GenericFailure, "Lock poisoned")),
-    };
-
-    // 1. Fire ondequeue callback
-    if let Some(ref callback) = state.dequeue_callback {
-      callback.call((), ThreadsafeFunctionCallMode::NonBlocking);
-    }
-
-    // 2. Fire EventTarget listeners
-    // For "once" listeners (Strong TSF): use call_with_return_value to drop TSF after callback
-    // For regular listeners (Weak TSF): use simple call()
-    if let Some(listeners) = state.event_listeners.get_mut("dequeue") {
-      // Partition into once and regular listeners
-      let (once_listeners, regular_listeners): (Vec<_>, Vec<_>) =
-        std::mem::take(listeners).into_iter().partition(|e| e.once);
-
-      // Fire regular listeners with simple call() (Weak TSF)
-      for entry in &regular_listeners {
-        if let EventListenerCallbackType::Weak(ref tsf) = entry.callback {
-          tsf.call((), ThreadsafeFunctionCallMode::NonBlocking);
-        }
-      }
-
-      // Fire "once" listeners with call_with_return_value (Strong TSF)
-      // Strong TSF keeps Node.js alive; dropping it in callback releases Node.js
-      for entry in once_listeners {
-        if let EventListenerCallbackType::Strong(ref tsf) = entry.callback {
-          // Clone the Arc to move into closure; original drops at loop end
-          let tsf_clone = tsf.clone();
-          tsf.call_with_return_value(
-            (),
-            ThreadsafeFunctionCallMode::NonBlocking,
-            move |_: Result<UnknownReturnValue>, _env: Env| {
-              // Drop TSF clone after callback - releases Node.js to exit
-              drop(tsf_clone);
-              Ok(())
-            },
-          );
-        }
-      }
-
-      // Put back regular listeners (once listeners are already consumed/removed)
-      *listeners = regular_listeners;
-      if listeners.is_empty() {
-        state.event_listeners.remove("dequeue");
-      }
-    }
-
+  /// Fire dequeue event via the shared JS-side dispatcher
+  /// Dispatches one Event to ondequeue and all registered listeners
+  fn fire_dequeue_event(event_state: &Arc<RwLock<CodecEventState>>) -> Result<()> {
+    CodecEventState::fire(event_state);
     Ok(())
   }
 
@@ -2674,46 +2584,44 @@ impl VideoEncoder {
   ///
   /// The dequeue event fires when encodeQueueSize decreases,
   /// allowing backpressure management.
-  #[napi(setter)]
+  #[napi(
+    setter,
+    ts_args_type = "callback: ((event: Event) => unknown) | undefined | null"
+  )]
   pub fn set_ondequeue(
-    &mut self,
+    &self,
     env: &Env,
-    callback: Option<FunctionRef<(), UnknownReturnValue>>,
+    this: This,
+    callback: Option<FunctionRef<Unknown<'static>, UnknownReturnValue>>,
   ) -> Result<()> {
-    // Update event_state with ThreadsafeFunction for worker thread
     let mut state = self
       .event_state
       .write()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-    state.dequeue_callback = match callback {
-      Some(ref cb) => Some(Arc::new(
-        cb.borrow_back(env)?
-          .build_threadsafe_function()
-          .callee_handled::<false>()
-          .weak::<true>() // Weak to allow Node.js process to exit
-          .build()?,
-      )),
-      None => None,
-    };
-    drop(state); // Release lock before storing FunctionRef
-
-    // Store FunctionRef for getter (main thread only)
-    self.dequeue_callback = callback;
-
+    if callback.is_some() {
+      state.ensure_dispatcher(env, this.object)?;
+    }
+    state.set_ondequeue(env, callback)?;
     Ok(())
   }
 
   /// Get the dequeue event handler (per WebCodecs spec)
-  #[napi(getter)]
+  #[napi(getter, ts_return_type = "((event: Event) => unknown) | null")]
   pub fn get_ondequeue<'env>(
     &self,
     env: &'env Env,
-  ) -> Result<Option<Function<'env, (), UnknownReturnValue>>> {
-    if let Some(ref callback) = self.dequeue_callback {
-      let cb = callback.borrow_back(env)?;
-      Ok(Some(cb))
-    } else {
-      Ok(None)
+  ) -> Result<Option<Function<'env, Unknown<'static>, UnknownReturnValue>>> {
+    let state = self
+      .event_state
+      .read()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    match state.ondequeue() {
+      Some(refr) => Ok(
+        crate::webcodecs::event_target::upgrade_ref(env, refr)?
+          .map(|v| unsafe { v.cast::<Function<'env, Unknown<'static>, UnknownReturnValue>>() })
+          .transpose()?,
+      ),
+      None => Ok(None),
     }
   }
 
@@ -3183,7 +3091,13 @@ impl VideoEncoder {
     inner.state = CodecState::Configured;
     inner.extradata_sent = false;
     inner.frame_count = 0;
+    let cleared_queue = inner.encode_queue_size as usize;
     inner.encode_queue_size = 0;
+    if cleared_queue > 0
+      && let Ok(mut es) = self.event_state.write()
+    {
+      es.note_queue_cleared(&env, cleared_queue);
+    }
 
     // Hardware acceleration tracking
     inner.is_hardware = is_hardware;
@@ -3341,6 +3255,9 @@ impl VideoEncoder {
 
       // Increment queue size (pending operation)
       inner.encode_queue_size += 1;
+      if let Ok(mut es) = self.event_state.write() {
+        es.note_enqueue(&env);
+      }
 
       (frame_arc, timestamp, duration, rotation, flip, color_space)
     };
@@ -3566,7 +3483,13 @@ impl VideoEncoder {
     inner.state = CodecState::Unconfigured;
     inner.frame_count = 0;
     inner.extradata_sent = false;
+    let cleared_queue = inner.encode_queue_size as usize;
     inner.encode_queue_size = 0;
+    if cleared_queue > 0
+      && let Ok(mut es) = self.event_state.write()
+    {
+      es.note_queue_cleared(&env, cleared_queue);
+    }
     inner.had_error = false;
 
     // Release the hardware encoder slot if we acquired one
@@ -3668,7 +3591,13 @@ impl VideoEncoder {
     inner.input_color_space = None;
     inner.session_orientation = None;
     inner.state = CodecState::Closed;
+    let cleared_queue = inner.encode_queue_size as usize;
     inner.encode_queue_size = 0;
+    if cleared_queue > 0
+      && let Ok(mut es) = self.event_state.write()
+    {
+      es.note_queue_cleared(&env, cleared_queue);
+    }
 
     Ok(())
   }
@@ -3679,12 +3608,15 @@ impl VideoEncoder {
 
   /// Add an event listener for the specified event type
   /// Uses separate RwLock to avoid blocking on encode operations
-  #[napi]
+  #[napi(
+    ts_args_type = "eventType: string, callback: (event: Event) => unknown, options?: AddEventListenerOptions | undefined | null"
+  )]
   pub fn add_event_listener(
     &self,
     env: Env,
+    this: This,
     event_type: String,
-    callback: FunctionRef<(), UnknownReturnValue>,
+    callback: FunctionRef<Unknown<'static>, UnknownReturnValue>,
     options: Option<AddEventListenerOptions>,
   ) -> Result<()> {
     let mut state = self
@@ -3692,113 +3624,37 @@ impl VideoEncoder {
       .write()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    let id = state.next_listener_id;
-    state.next_listener_id += 1;
-
+    state.ensure_dispatcher(&env, this.object)?;
     let once = options.as_ref().and_then(|o| o.once).unwrap_or(false);
-    let func = callback.borrow_back(&env)?;
-
-    // Create either weak TSF (regular) or strong TSF (once) based on listener type
-    let (callback_type, prevent_gc) = if once {
-      // Once listeners: use strong TSF (keeps Node.js alive until callback fires)
-      // No need for _prevent_gc since strong TSF keeps function alive
-      let tsf = Arc::new(
-        func
-          .build_threadsafe_function()
-          .callee_handled::<false>()
-          .weak::<false>() // Strong - keeps Node.js alive
-          .build()?,
-      );
-      (EventListenerCallbackType::Strong(tsf), None)
-    } else {
-      // Regular listeners: use weak TSF with _prevent_gc
-      let prevent_gc = func.create_ref()?;
-      let tsf = Arc::new(
-        func
-          .build_threadsafe_function()
-          .callee_handled::<false>()
-          .weak::<true>() // Weak - allows Node.js to exit
-          .build()?,
-      );
-      (EventListenerCallbackType::Weak(tsf), Some(prevent_gc))
-    };
-
-    let entry = EventListenerEntry {
-      id,
-      callback: callback_type,
-      once,
-      _prevent_gc: prevent_gc,
-    };
-
-    state
-      .event_listeners
-      .entry(event_type)
-      .or_default()
-      .push(entry);
-    Ok(())
+    let capture = options.as_ref().and_then(|o| o.capture).unwrap_or(false);
+    state.add_listener(&env, &event_type, callback, once, capture)
   }
 
   /// Remove an event listener for the specified event type
-  #[napi]
+  #[napi(
+    ts_args_type = "eventType: string, callback: (event: Event) => unknown, options?: EventListenerOptions | undefined | null"
+  )]
   pub fn remove_event_listener(
     &self,
+    env: Env,
     event_type: String,
-    _callback: FunctionRef<(), UnknownReturnValue>,
-    _options: Option<EventListenerOptions>,
+    callback: FunctionRef<Unknown<'static>, UnknownReturnValue>,
+    options: Option<EventListenerOptions>,
   ) -> Result<()> {
     let mut state = self
       .event_state
       .write()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    // Note: We can't compare function references directly, so we remove the last added listener
-    // for simplicity. A more complete implementation would need to track callback identity.
-    if let Some(listeners) = state.event_listeners.get_mut(&event_type) {
-      listeners.pop();
-      if listeners.is_empty() {
-        state.event_listeners.remove(&event_type);
-      }
-    }
+    let capture = options.as_ref().and_then(|o| o.capture).unwrap_or(false);
+    state.remove_listener(&env, &event_type, &callback, capture);
     Ok(())
   }
 
   /// Dispatch an event to all registered listeners
   #[napi]
-  pub fn dispatch_event(&self, event_type: String) -> Result<bool> {
-    let mut state = self
-      .event_state
-      .write()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    let mut ids_to_remove = Vec::new();
-
-    if let Some(listeners) = state.event_listeners.get(&event_type) {
-      for entry in listeners {
-        // Call the listener with no arguments (like dequeue callback)
-        match &entry.callback {
-          EventListenerCallbackType::Weak(tsf) => {
-            tsf.call((), ThreadsafeFunctionCallMode::NonBlocking);
-          }
-          EventListenerCallbackType::Strong(tsf) => {
-            tsf.call((), ThreadsafeFunctionCallMode::NonBlocking);
-          }
-        }
-        if entry.once {
-          ids_to_remove.push(entry.id);
-        }
-      }
-    }
-
-    // Remove "once" listeners
-    if !ids_to_remove.is_empty()
-      && let Some(listeners) = state.event_listeners.get_mut(&event_type)
-    {
-      listeners.retain(|e| !ids_to_remove.contains(&e.id));
-      if listeners.is_empty() {
-        state.event_listeners.remove(&event_type);
-      }
-    }
-
+  pub fn dispatch_event(&self, env: Env, event_type: String) -> Result<bool> {
+    crate::webcodecs::event_target::dispatch(&env, &self.event_state, &event_type);
     Ok(true) // Event was not cancelled
   }
 
