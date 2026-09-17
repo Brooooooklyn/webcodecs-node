@@ -98,7 +98,7 @@ impl Drop for WeakCodecRef {
       // owning JS thread, so route the handle through the dispatcher. If the
       // TSFN is already closing (env teardown), the handle is reclaimed by
       // Node anyway — leaking is safe in that path.
-      let addr = self.raw_ref as usize;
+      let addr = self.raw_ref as usize as u64;
       gc.call(
         (((addr >> 32) & 0xffff_ffff) as u32, addr as u32),
         ThreadsafeFunctionCallMode::NonBlocking,
@@ -166,7 +166,7 @@ impl CodecEventState {
           }
         } else {
           // Delete a napi_ref handle on the JS thread (see WeakCodecRef::drop)
-          let raw_ref = (((cmd.0 as usize) << 32) | cmd.1 as usize) as sys::napi_ref;
+          let raw_ref = ((((cmd.0 as u64) << 32) | cmd.1 as u64) as usize) as sys::napi_ref;
           unsafe {
             sys::napi_delete_reference(ctx.env.raw(), raw_ref);
           }
