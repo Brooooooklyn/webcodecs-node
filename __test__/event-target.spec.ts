@@ -6,6 +6,8 @@
  * requires EventTarget interface on all codecs.
  */
 
+import { execFileSync } from 'node:child_process'
+
 import test from 'ava'
 
 import {
@@ -903,4 +905,53 @@ test('VideoEncoder: once listener does not re-fire on re-entrant dispatch', asyn
 
   t.is(count, 1, 'once listener must be removed before invocation')
   encoder.close()
+})
+
+test('VideoEncoder: throwing listener does not abort later listeners', (t) => {
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: () => {},
+  })
+
+  const fired: string[] = []
+  encoder.addEventListener('dequeue', () => {
+    fired.push('l1')
+    throw new Error('listener boom')
+  })
+  encoder.addEventListener('dequeue', () => {
+    fired.push('l2')
+  })
+
+  // Synchronous dispatch: the first listener throws, but dispatch must still
+  // reach l2 and then surface the first exception to the caller.
+  t.throws(() => encoder.dispatchEvent('dequeue'), { message: 'listener boom' })
+  t.deepEqual(fired, ['l1', 'l2'], 'dispatch must continue after a listener throws')
+  encoder.close()
+})
+
+test('VideoEncoder: once dequeue listener keeps the process alive until it fires', (t) => {
+  // A once listener must prevent Node from exiting before the dequeue fires —
+  // the dispatcher TSFN is ref'd while once listeners are pending.
+  const script = `
+    const { VideoEncoder, VideoFrame } = require('./index.js');
+    const enc = new VideoEncoder({ output: () => {}, error: () => {} });
+    enc.addEventListener('dequeue', () => {
+      console.log('DEQUEUE_FIRED');
+      enc.close();
+    }, { once: true });
+    enc.configure({ codec: 'avc1.42001f', width: 64, height: 64, bitrate: 100_000 });
+    const f = new VideoFrame(new Uint8Array(64*64*1.5), {
+      format: 'I420', codedWidth: 64, codedHeight: 64, timestamp: 0,
+    });
+    enc.encode(f, { keyFrame: true });
+    f.close();
+    // No other handles — process would exit immediately if the dispatcher
+    // were not ref'd while the once listener is pending.
+  `
+  const output = execFileSync(process.execPath, ['-e', script], {
+    cwd: process.cwd(),
+    timeout: 15_000,
+    encoding: 'utf8',
+  })
+  t.true(output.includes('DEQUEUE_FIRED'), 'once listener must fire before process exit')
 })

@@ -117,6 +117,10 @@ type DispatcherTsf = ThreadsafeFunction<(u32, u32), (), (u32, u32), Status, fals
 pub struct CodecEventState {
   listeners: HashMap<String, Vec<Arc<EventListenerEntry>>>,
   next_listener_id: u64,
+  /// Registered once-listeners not yet fired. While >0 the dispatcher TSFN is
+  /// ref'd (strong) so Node cannot exit before they run — matching the
+  /// historical strong-TSF semantics for once listeners.
+  once_pending: usize,
   /// Weak ref to the codec's JS object (`this`), captured lazily on the first
   /// event-related call so dispatched events expose it as target/currentTarget.
   codec_obj: Option<WeakCodecRef>,
@@ -185,6 +189,20 @@ impl CodecEventState {
     Ok(())
   }
 
+  /// Toggle the dispatcher TSFN's ref on 0↔1 transitions of once_pending.
+  /// JS thread only.
+  fn sync_once_ref(&mut self, env: &Env) {
+    if let Some(ref dispatcher) = self.dispatcher {
+      unsafe {
+        if self.once_pending > 0 {
+          sys::napi_ref_threadsafe_function(env.raw(), dispatcher.handle.get_raw());
+        } else {
+          sys::napi_unref_threadsafe_function(env.raw(), dispatcher.handle.get_raw());
+        }
+      }
+    }
+  }
+
   /// Register an event listener (DOM addEventListener).
   /// Re-registering the identical callback with the same capture flag for the
   /// same type is a no-op per DOM spec.
@@ -215,6 +233,10 @@ impl CodecEventState {
       capture,
       callback: Arc::new(callback),
     }));
+    if once {
+      self.once_pending += 1;
+      self.sync_once_ref(env);
+    }
     Ok(())
   }
 
@@ -227,6 +249,7 @@ impl CodecEventState {
     callback: &FunctionRef<Unknown<'static>, UnknownReturnValue>,
     capture: bool,
   ) {
+    let mut removed_once = false;
     if let Some(listeners) = self.listeners.get_mut(event_type) {
       if let Some(pos) = listeners.iter().position(|entry| {
         entry.capture == capture
@@ -235,11 +258,16 @@ impl CodecEventState {
             _ => false,
           }
       }) {
+        removed_once = listeners[pos].once;
         listeners.remove(pos);
       }
       if listeners.is_empty() {
         self.listeners.remove(event_type);
       }
+    }
+    if removed_once {
+      self.once_pending = self.once_pending.saturating_sub(1);
+      self.sync_once_ref(env);
     }
   }
 
@@ -340,6 +368,7 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
     }
   }
 
+  let mut thrown: Option<sys::napi_value> = None;
   for item in &snapshot {
     // DOM: skip listeners removed between snapshot and invocation
     let still_registered = {
@@ -373,15 +402,32 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
       if listeners.is_empty() {
         state.listeners.remove(event_type);
       }
+      state.once_pending = state.once_pending.saturating_sub(1);
+      state.sync_once_ref(env);
     }
     if let Ok(func) = item.callback.borrow_back(env) {
       // Relax the event's phantom lifetime to match the stored callback's
       // args type; the event is only used within this synchronous call.
       let arg: Unknown<'static> = unsafe { std::mem::transmute(event) };
-      let _ = match &codec_obj {
+      let res = match &codec_obj {
         Some(codec) => func.apply(*codec, arg).map(|_| ()),
         None => func.call(arg).map(|_| ()),
       };
+      if res.is_err() {
+        // A throwing listener leaves a pending exception on the env that
+        // would poison every subsequent napi call. DOM reports listener
+        // exceptions and continues dispatch, so clear it now and re-report
+        // the first one after dispatch completes.
+        let mut pending = false;
+        unsafe { sys::napi_is_exception_pending(env.raw(), &mut pending) };
+        if pending {
+          let mut exc = ptr::null_mut();
+          let status = unsafe { sys::napi_get_and_clear_last_exception(env.raw(), &mut exc) };
+          if status == sys::Status::napi_ok && thrown.is_none() {
+            thrown = Some(exc);
+          }
+        }
+      }
     }
   }
 
@@ -392,5 +438,11 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
       .and_then(|p| p.with_napi_value(env, Null))
   {
     let _ = event_obj.define_properties(&[ct_prop]);
+  }
+
+  // Report the first listener exception after dispatch so it surfaces as an
+  // uncaught error instead of being silently swallowed.
+  if let Some(exc) = thrown {
+    unsafe { sys::napi_throw(env.raw(), exc) };
   }
 }
