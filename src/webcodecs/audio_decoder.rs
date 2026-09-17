@@ -768,7 +768,7 @@ impl AudioDecoder {
     ts_args_type = "callback: ((event: Event) => unknown) | undefined | null"
   )]
   pub fn set_ondequeue(
-    &mut self,
+    &self,
     env: &Env,
     this: This,
     callback: Option<FunctionRef<Unknown<'static>, UnknownReturnValue>>,
@@ -935,7 +935,13 @@ impl AudioDecoder {
     inner.codec_string = codec;
     inner.state = CodecState::Configured;
     inner.frame_count = 0;
+    let cleared_queue = inner.decode_queue_size as usize;
     inner.decode_queue_size = 0;
+    if cleared_queue > 0
+      && let Ok(mut es) = self.event_state.write()
+    {
+      es.note_queue_cleared(&env, cleared_queue);
+    }
     inner.timestamp_queue.clear();
 
     // Create new channel and worker for decode operations
@@ -1005,6 +1011,9 @@ impl AudioDecoder {
 
       // Increment queue size (pending operation)
       inner.decode_queue_size += 1;
+      if let Ok(mut es) = self.event_state.write() {
+        es.note_enqueue(&env);
+      }
 
       (Arc::clone(&chunk.inner), timestamp, duration)
     };
@@ -1230,7 +1239,13 @@ impl AudioDecoder {
     inner.codec_string.clear();
     inner.state = CodecState::Unconfigured;
     inner.frame_count = 0;
+    let cleared_queue = inner.decode_queue_size as usize;
     inner.decode_queue_size = 0;
+    if cleared_queue > 0
+      && let Ok(mut es) = self.event_state.write()
+    {
+      es.note_queue_cleared(&env, cleared_queue);
+    }
     inner.had_error = false;
     inner.keyframe_received = false;
 
@@ -1308,7 +1323,13 @@ impl AudioDecoder {
     inner.config = None;
     inner.codec_string.clear();
     inner.state = CodecState::Closed;
+    let cleared_queue = inner.decode_queue_size as usize;
     inner.decode_queue_size = 0;
+    if cleared_queue > 0
+      && let Ok(mut es) = self.event_state.write()
+    {
+      es.note_queue_cleared(&env, cleared_queue);
+    }
 
     Ok(())
   }

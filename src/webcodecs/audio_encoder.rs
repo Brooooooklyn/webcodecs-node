@@ -1167,7 +1167,7 @@ impl AudioEncoder {
     ts_args_type = "callback: ((event: Event) => unknown) | undefined | null"
   )]
   pub fn set_ondequeue(
-    &mut self,
+    &self,
     env: &Env,
     this: This,
     callback: Option<FunctionRef<Unknown<'static>, UnknownReturnValue>>,
@@ -1354,7 +1354,13 @@ impl AudioEncoder {
     inner.extradata_sent = false;
     inner.frame_count = 0;
     inner.resampler = None;
+    let cleared_queue = inner.encode_queue_size as usize;
     inner.encode_queue_size = 0;
+    if cleared_queue > 0
+      && let Ok(mut es) = self.event_state.write()
+    {
+      es.note_queue_cleared(&env, cleared_queue);
+    }
 
     // Check if AAC ADTS format is requested
     let is_aac = codec.to_lowercase().starts_with("mp4a.40") || codec.to_lowercase() == "aac";
@@ -1544,6 +1550,9 @@ impl AudioEncoder {
 
       // Increment queue size (pending operation)
       inner.encode_queue_size += 1;
+      if let Ok(mut es) = self.event_state.write() {
+        es.note_enqueue(&env);
+      }
 
       (frame_to_send, timestamp)
     };
@@ -1765,7 +1774,13 @@ impl AudioEncoder {
     inner.frame_count = 0;
     inner.extradata_sent = false;
     inner.cached_flac_decoder_config = None;
+    let cleared_queue = inner.encode_queue_size as usize;
     inner.encode_queue_size = 0;
+    if cleared_queue > 0
+      && let Ok(mut es) = self.event_state.write()
+    {
+      es.note_queue_cleared(&env, cleared_queue);
+    }
     inner.timestamp_queue.clear();
     inner.base_timestamp = None;
     // Clear flush-related state
@@ -1835,7 +1850,13 @@ impl AudioEncoder {
     inner.config = None;
     inner.active_config = None;
     inner.state = CodecState::Closed;
+    let cleared_queue = inner.encode_queue_size as usize;
     inner.encode_queue_size = 0;
+    if cleared_queue > 0
+      && let Ok(mut es) = self.event_state.write()
+    {
+      es.note_queue_cleared(&env, cleared_queue);
+    }
 
     Ok(())
   }

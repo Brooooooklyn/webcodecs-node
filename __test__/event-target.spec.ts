@@ -1058,10 +1058,17 @@ test('VideoEncoder: queued dequeue event survives codec GC', (t) => {
   // finalized before the callback runs.
   const script = `
     const { VideoEncoder, VideoFrame } = require('./index.js');
-    let fired = 0;
+    let fired = 0, targetOk = false, thisOk = false;
     (() => {
       const enc = new VideoEncoder({ output: () => {}, error: () => {} });
-      enc.addEventListener('dequeue', () => { fired++; });
+      // Marker on the codec so the listener can verify target identity
+      // WITHOUT capturing enc in its closure (which would pin it anyway).
+      enc.marker = 42;
+      enc.addEventListener('dequeue', function (e) {
+        fired++;
+        targetOk = e.target != null && e.target.marker === 42;
+        thisOk = this === e.target;
+      });
       enc.configure({ codec: 'avc1.42001f', width: 64, height: 64, bitrate: 100_000 });
       const f = new VideoFrame(new Uint8Array(64*64*1.5), {
         format: 'I420', codedWidth: 64, codedHeight: 64, timestamp: 0,
@@ -1070,7 +1077,10 @@ test('VideoEncoder: queued dequeue event survives codec GC', (t) => {
       f.close();
     })();
     globalThis.gc();
-    setTimeout(() => console.log('FIRED:' + fired), 1500);
+    setTimeout(() => {
+      globalThis.gc();
+      console.log('FIRED:' + fired + ' TARGET:' + targetOk + ' THIS:' + thisOk);
+    }, 1500);
   `
   const output = execFileSync(process.execPath, ['--expose-gc', '-e', script], {
     cwd: process.cwd(),
@@ -1078,6 +1088,12 @@ test('VideoEncoder: queued dequeue event survives codec GC', (t) => {
     encoding: 'utf8',
   })
   t.regex(output, /FIRED:[1-9]/, 'queued dispatch must still fire its listeners')
+  t.regex(
+    output,
+    /TARGET:true/,
+    'queued dispatch must retain the codec object as event.target'
+  )
+  t.regex(output, /THIS:true/, 'listener this must be the codec')
 })
 
 test('VideoEncoder: retained event re-dispatched on a real EventTarget sees native state', (t) => {
@@ -1153,6 +1169,38 @@ test('VideoEncoder: ondequeue participates in registration order', (t) => {
   encoder.close()
   encoder2.close()
   encoder3.close()
+})
+
+test('VideoEncoder: ondequeue replaced mid-dispatch runs the replacement', (t) => {
+  const encoder = new VideoEncoder({
+    output: () => {},
+    error: () => {},
+  })
+
+  // Listener registered first, ondequeue second — so ondequeue's slot runs
+  // after the listener, which replaces the handler before its turn.
+  const order: string[] = []
+  encoder.addEventListener('dequeue', () => {
+    order.push('listener')
+    encoder.ondequeue = () => order.push('second')
+  })
+  encoder.ondequeue = () => order.push('first')
+  encoder.dispatchEvent('dequeue')
+  t.deepEqual(order, ['listener', 'second'])
+
+  // Clearing it mid-dispatch removes the slot: no ondequeue call at all.
+  order.length = 0
+  const encoder2 = new VideoEncoder({ output: () => {}, error: () => {} })
+  encoder2.addEventListener('dequeue', () => {
+    order.push('listener')
+    encoder2.ondequeue = null
+  })
+  encoder2.ondequeue = () => order.push('cleared')
+  encoder2.dispatchEvent('dequeue')
+  t.deepEqual(order, ['listener'])
+
+  encoder.close()
+  encoder2.close()
 })
 
 test('VideoEncoder: stopImmediatePropagation does not poison native re-dispatch', (t) => {

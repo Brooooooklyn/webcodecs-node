@@ -1267,7 +1267,7 @@ impl VideoDecoder {
     ts_args_type = "callback: ((event: Event) => unknown) | undefined | null"
   )]
   pub fn set_ondequeue(
-    &mut self,
+    &self,
     env: &Env,
     this: This,
     callback: Option<FunctionRef<Unknown<'static>, UnknownReturnValue>>,
@@ -1536,7 +1536,13 @@ impl VideoDecoder {
     inner.codec_string = codec;
     inner.state = CodecState::Configured;
     inner.frame_count = 0;
+    let cleared_queue = inner.decode_queue_size as usize;
     inner.decode_queue_size = 0;
+    if cleared_queue > 0
+      && let Ok(mut es) = self.event_state.write()
+    {
+      es.note_queue_cleared(&env, cleared_queue);
+    }
     inner.keyframe_received = false;
 
     // Store hardware acceleration tracking state
@@ -1605,6 +1611,9 @@ impl VideoDecoder {
       }
 
       inner.decode_queue_size += 1;
+      if let Ok(mut es) = self.event_state.write() {
+        es.note_enqueue(&env);
+      }
     }
 
     // Send decode command to worker thread via microtask for W3C spec FIFO ordering
@@ -1822,7 +1831,13 @@ impl VideoDecoder {
     inner.codec_string.clear();
     inner.state = CodecState::Unconfigured;
     inner.frame_count = 0;
+    let cleared_queue = inner.decode_queue_size as usize;
     inner.decode_queue_size = 0;
+    if cleared_queue > 0
+      && let Ok(mut es) = self.event_state.write()
+    {
+      es.note_queue_cleared(&env, cleared_queue);
+    }
     inner.keyframe_received = false;
     inner.had_error = false;
 
@@ -1908,7 +1923,13 @@ impl VideoDecoder {
     inner.config = None;
     inner.codec_string.clear();
     inner.state = CodecState::Closed;
+    let cleared_queue = inner.decode_queue_size as usize;
     inner.decode_queue_size = 0;
+    if cleared_queue > 0
+      && let Ok(mut es) = self.event_state.write()
+    {
+      es.note_queue_cleared(&env, cleared_queue);
+    }
 
     // Reset hardware tracking state
     inner.is_hardware = false;

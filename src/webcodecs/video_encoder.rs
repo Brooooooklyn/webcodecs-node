@@ -2589,7 +2589,7 @@ impl VideoEncoder {
     ts_args_type = "callback: ((event: Event) => unknown) | undefined | null"
   )]
   pub fn set_ondequeue(
-    &mut self,
+    &self,
     env: &Env,
     this: This,
     callback: Option<FunctionRef<Unknown<'static>, UnknownReturnValue>>,
@@ -3087,7 +3087,13 @@ impl VideoEncoder {
     inner.state = CodecState::Configured;
     inner.extradata_sent = false;
     inner.frame_count = 0;
+    let cleared_queue = inner.encode_queue_size as usize;
     inner.encode_queue_size = 0;
+    if cleared_queue > 0
+      && let Ok(mut es) = self.event_state.write()
+    {
+      es.note_queue_cleared(&env, cleared_queue);
+    }
 
     // Hardware acceleration tracking
     inner.is_hardware = is_hardware;
@@ -3245,6 +3251,9 @@ impl VideoEncoder {
 
       // Increment queue size (pending operation)
       inner.encode_queue_size += 1;
+      if let Ok(mut es) = self.event_state.write() {
+        es.note_enqueue(&env);
+      }
 
       (frame_arc, timestamp, duration, rotation, flip, color_space)
     };
@@ -3470,7 +3479,13 @@ impl VideoEncoder {
     inner.state = CodecState::Unconfigured;
     inner.frame_count = 0;
     inner.extradata_sent = false;
+    let cleared_queue = inner.encode_queue_size as usize;
     inner.encode_queue_size = 0;
+    if cleared_queue > 0
+      && let Ok(mut es) = self.event_state.write()
+    {
+      es.note_queue_cleared(&env, cleared_queue);
+    }
     inner.had_error = false;
 
     // Release the hardware encoder slot if we acquired one
@@ -3572,7 +3587,13 @@ impl VideoEncoder {
     inner.input_color_space = None;
     inner.session_orientation = None;
     inner.state = CodecState::Closed;
+    let cleared_queue = inner.encode_queue_size as usize;
     inner.encode_queue_size = 0;
+    if cleared_queue > 0
+      && let Ok(mut es) = self.event_state.write()
+    {
+      es.note_queue_cleared(&env, cleared_queue);
+    }
 
     Ok(())
   }

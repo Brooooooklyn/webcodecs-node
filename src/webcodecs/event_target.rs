@@ -141,6 +141,12 @@ pub struct CodecEventState {
   /// after addEventListener must run it after earlier registrations.
   ondequeue: Option<Arc<FunctionRef<Unknown<'static>, UnknownReturnValue>>>,
   ondequeue_id: u64,
+  /// Enqueued work items whose dequeue dispatch has not been delivered (or
+  /// discarded) yet. While >0 the codec_obj ref is held strong so a queued
+  /// dispatch always finds a live event target — the codec cannot be GC'd
+  /// between the worker's fire() and delivery on the JS thread. Returns to
+  /// weak when the count drains to zero.
+  outstanding: usize,
   /// Single dispatcher invoked from the worker thread; runs the whole
   /// dispatch on the JS thread in one call.
   dispatcher: Option<Arc<DispatcherTsf>>,
@@ -158,6 +164,11 @@ impl CodecEventState {
     }
     if self.codec_obj.is_none() {
       self.codec_obj = Some(WeakCodecRef::new(env, this)?);
+      // A listener registered while work is already in flight must find the
+      // codec pinned, matching what note_enqueue does for later enqueues.
+      if self.outstanding > 0 {
+        self.set_codec_strong(env, true);
+      }
     }
     // The closure captures no state: each dispatch payload carries ownership
     // of a strong Arc<RwLock<CodecEventState>> (leaked via Arc::into_raw in
@@ -173,6 +184,9 @@ impl CodecEventState {
           CMD_DISPATCH => {
             let shared = unsafe { Arc::from_raw(ptr as usize as *const RwLock<CodecEventState>) };
             dispatch(ctx.env, &shared, "dequeue");
+            if let Ok(mut state) = shared.write() {
+              state.note_delivery(ctx.env);
+            }
           }
           CMD_DELETE_REF => {
             // Delete a napi_ref handle on the JS thread (see WeakCodecRef::drop)
@@ -198,6 +212,49 @@ impl CodecEventState {
     }
     self.dispatcher = Some(dispatcher);
     Ok(())
+  }
+
+  /// JS thread: a work item was enqueued, so a dequeue dispatch will follow.
+  /// Retains the codec object strongly until that dispatch is delivered so
+  /// listeners observe a live target/currentTarget/this.
+  pub fn note_enqueue(&mut self, env: &Env) {
+    if self.outstanding == 0 {
+      self.set_codec_strong(env, true);
+    }
+    self.outstanding += 1;
+  }
+
+  /// JS thread: queued work was discarded without dequeue dispatches
+  /// (reset/close/reconfigure). `cleared` is the number of dropped items;
+  /// items already fired but undelivered stay outstanding until delivered.
+  pub fn note_queue_cleared(&mut self, env: &Env, cleared: usize) {
+    self.outstanding = self.outstanding.saturating_sub(cleared);
+    if self.outstanding == 0 {
+      self.set_codec_strong(env, false);
+    }
+  }
+
+  /// JS thread: a queued dequeue dispatch finished delivery — its work item
+  /// is no longer outstanding.
+  fn note_delivery(&mut self, env: &Env) {
+    self.outstanding = self.outstanding.saturating_sub(1);
+    if self.outstanding == 0 {
+      self.set_codec_strong(env, false);
+    }
+  }
+
+  /// Bump/lower the codec_obj ref between strong and weak. JS thread only.
+  fn set_codec_strong(&mut self, env: &Env, strong: bool) {
+    if let Some(ref codec) = self.codec_obj {
+      let mut count = 0u32;
+      unsafe {
+        if strong {
+          sys::napi_reference_ref(env.raw(), codec.raw_ref, &mut count);
+        } else {
+          sys::napi_reference_unref(env.raw(), codec.raw_ref, &mut count);
+        }
+      }
+    }
   }
 
   /// Toggle the dispatcher TSFN's ref on 0↔1 transitions of once_pending.
@@ -536,28 +593,36 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
 
   let mut thrown: Vec<sys::napi_value> = Vec::new();
   for item in &snapshot {
-    // DOM: skip listeners removed between snapshot and invocation
-    let still_registered = {
+    // DOM: skip listeners removed between snapshot and invocation. For the
+    // ondequeue slot, match by registration id and resolve the CURRENT
+    // handler — an earlier listener may have replaced the callback in-place
+    // (which keeps the slot), and the replacement must run.
+    let invoke_cb = {
       let Ok(state) = shared.read() else {
         break;
       };
       if item.is_ondequeue {
-        state
-          .ondequeue
-          .as_ref()
-          .map(|h| Arc::ptr_eq(h, &item.callback))
-          .unwrap_or(false)
+        if state.ondequeue_id == item.id {
+          state.ondequeue.clone()
+        } else {
+          None
+        }
       } else {
-        state
+        let live = state
           .listeners
           .get(event_type)
           .map(|l| l.iter().any(|e| e.id == item.id))
-          .unwrap_or(false)
+          .unwrap_or(false);
+        if live {
+          Some(item.callback.clone())
+        } else {
+          None
+        }
       }
     };
-    if !still_registered {
+    let Some(callback) = invoke_cb else {
       continue;
-    }
+    };
     // DOM spec: remove "once" listeners before invoking so a re-entrant
     // dispatchEvent inside the listener cannot observe it again.
     if item.once
@@ -573,7 +638,7 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
         state.sync_once_ref(env);
       }
     }
-    if let Ok(func) = item.callback.borrow_back(env) {
+    if let Ok(func) = callback.borrow_back(env) {
       // Relax the event's phantom lifetime to match the stored callback's
       // args type; the event is only used within this synchronous call.
       let arg: Unknown<'static> = unsafe { std::mem::transmute(event) };
