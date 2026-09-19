@@ -77,7 +77,7 @@
     "emnapi": "^2.0.0-alpha.5",
     "husky": "^9.1.7",
     "lint-staged": "^17.5.1",
-    "mediabunny": "1.56.2",
+    "mediabunny": "1.58.1",
     "npm-run-all2": "^9.0.3",
     "oxfmt": "^0.68.0",
     "oxlint": "^1.83.0",
@@ -112,7 +112,7 @@
       "armv7-unknown-linux-gnueabihf"
     ]
   },
-  "packageManager": "pnpm@12.4.1",
+  "packageManager": "pnpm@12.4.2",
   "ava": {
     "environmentVariables": {
       "TS_NODE_PROJECT": "./tsconfig.json"
