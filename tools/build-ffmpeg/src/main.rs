@@ -1,6 +1,6 @@
 //! FFmpeg build script for CI environments
 //!
-//! Builds FFmpeg 9.0 and all codec dependencies from source for Linux/FreeBSD targets.
+//! Builds FFmpeg 9.0.2 and all codec dependencies from source for Linux/FreeBSD targets.
 //! Usage: cargo run --release --bin build-ffmpeg -- [OPTIONS]
 
 use std::env;
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 // Version constants
-const DEFAULT_FFMPEG_VERSION: &str = "n9.0";
+const DEFAULT_FFMPEG_VERSION: &str = "n9.0.2";
 const X264_REPO: &str = "https://code.videolan.org/videolan/x264.git";
 const X265_REPO: &str = "https://bitbucket.org/multicoreware/x265_git.git";
 const X265_BRANCH: &str = "Release_4.1";
@@ -2523,7 +2523,7 @@ USAGE:
     build-ffmpeg [OPTIONS]
 
 OPTIONS:
-    --ffmpeg-version <TAG>    FFmpeg git tag [default: n9.0]
+    --ffmpeg-version <TAG>    FFmpeg git tag [default: n9.0.2]
     -o, --output <DIR>        Output installation directory [default: ./ffmpeg-build]
     -t, --target <TARGET>     Cross-compilation target [default: host]
     -s, --source-dir <DIR>    Directory for source code [default: ./ffmpeg-src]
@@ -2742,7 +2742,7 @@ mod tests {
   #[test]
   fn defaults_to_latest_stable_ffmpeg() {
     let context = parse_args_from(args(&["build-ffmpeg"])).unwrap();
-    assert_eq!(context.ffmpeg_version, "n9.0");
+    assert_eq!(context.ffmpeg_version, "n9.0.2");
   }
 
   #[test]
