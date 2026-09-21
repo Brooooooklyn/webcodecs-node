@@ -1,6 +1,6 @@
 {
   "name": "@napi-rs/webcodecs",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "WebCodecs API implementation for Node.js using FFmpeg",
   "keywords": [
     "N-API",
@@ -85,8 +85,8 @@
     "prettier": "^3.9.6",
     "tinybench": "^6.2.0",
     "typescript": "^7.0.2",
-    "webcodecs-polyfill": "^1.0.1",
-    "vite-plugin-mkcert": "^2.1.0"
+    "vite-plugin-mkcert": "^2.1.0",
+    "webcodecs-polyfill": "^1.0.1"
   },
   "peerDependencies": {
     "@napi-rs/canvas": ">=0.1.0"
