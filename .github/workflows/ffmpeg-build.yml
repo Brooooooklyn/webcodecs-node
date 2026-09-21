@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       ffmpeg_version:
-        description: 'FFmpeg version tag (e.g., n9.0)'
+        description: 'FFmpeg version tag (e.g., n9.0.2)'
         required: true
-        default: 'n9.0'
+        default: 'n9.0.2'
 
 env:
-  FFMPEG_VERSION: ${{ github.event.inputs.ffmpeg_version || 'n9.0' }}
+  FFMPEG_VERSION: ${{ github.event.inputs.ffmpeg_version || 'n9.0.2' }}
 
 jobs:
   # Build for x86_64 and aarch64 targets using zig
