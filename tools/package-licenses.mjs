@@ -19,6 +19,7 @@ const root = process.cwd()
 const readJson = async (path) => JSON.parse(await readFile(path, 'utf8'))
 const pkg = await readJson(join(root, 'package.json'))
 const license = 'SEE LICENSE IN LICENSES.md'
+const compareNames = (left, right) => left.localeCompare(right)
 const documents = ['LICENSE', 'LICENSES.md', 'THIRD_PARTY_NOTICES.md', 'SOURCE_DISTRIBUTION.md']
 const noticeManifest = await readJson(join(root, 'licenses/manifest.json'))
 const noticePaths = noticeManifest.files.map(({ file }) => {
@@ -28,8 +29,12 @@ const noticePaths = noticeManifest.files.map(({ file }) => {
 const requiredFiles = [...documents, 'licenses/manifest.json', ...noticePaths]
 assert.equal(new Set(noticePaths).size, noticePaths.length, 'Duplicate notice in manifest')
 assert.equal(pkg.license, license, 'Root package license must refer to LICENSES.md')
-const expectedNoticeNames = ['manifest.json', ...noticeManifest.files.map(({ file }) => file)].sort()
-assert.deepEqual((await readdir(join(root, 'licenses'))).sort(), expectedNoticeNames, 'Unlisted reference notice')
+const expectedNoticeNames = ['manifest.json', ...noticeManifest.files.map(({ file }) => file)].sort(compareNames)
+assert.deepEqual(
+  (await readdir(join(root, 'licenses'))).sort(compareNames),
+  expectedNoticeNames,
+  'Unlisted reference notice',
+)
 for (const notice of noticeManifest.files) {
   const data = await readFile(join(root, 'licenses', notice.file))
   assert.equal(createHash('sha256').update(data).digest('hex'), notice.sha256, `Notice digest mismatch: ${notice.file}`)
@@ -41,7 +46,11 @@ assert.equal(new Set(suffixes).size, suffixes.length, 'Duplicate native target')
 // whichever directories happen to exist.
 const entries = await readdir(join(root, 'npm'), { withFileTypes: true })
 const actualSuffixes = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name)
-assert.deepEqual(actualSuffixes.sort(), [...suffixes].sort(), 'Run napi create-npm-dirs for the configured targets')
+assert.deepEqual(
+  actualSuffixes.sort(compareNames),
+  [...suffixes].sort(compareNames),
+  'Run napi create-npm-dirs for the configured targets',
+)
 
 const marker = '\n## Licenses and source\n'
 const readmeNotice = `${marker}\nThis native addon statically links GPL-enabled FFmpeg and codec libraries.\nSee [LICENSES.md](LICENSES.md), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md),\nand [SOURCE_DISTRIBUTION.md](SOURCE_DISTRIBUTION.md) for licensing terms and\noutstanding source-distribution work. The original project's MIT license\ndoes not by itself cover this combined binary.\n`
@@ -67,7 +76,7 @@ for (const suffix of suffixes) {
   } else {
     assert.equal(native.license, license, `Wrong license field: ${native.name}`)
     assert.deepEqual(
-      (await readdir(join(dir, 'licenses'))).sort(),
+      (await readdir(join(dir, 'licenses'))).sort(compareNames),
       expectedNoticeNames,
       `Stale notice files: ${native.name}`,
     )
