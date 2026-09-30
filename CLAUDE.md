@@ -4,7 +4,7 @@
 
 WebCodecs API implementation for Node.js using FFmpeg, built with napi-rs (Rust → Node.js native addon). Provides W3C WebCodecs spec-compliant video/audio encoding/decoding with FFmpeg as the backend.
 
-**Package:** `@napi-rs/webcodecs` | **Version:** `0.0.0` | **License:** MIT
+**Package:** `@napi-rs/webcodecs` | **Version:** `0.0.0` | **Original source license:** MIT; native distribution: see `LICENSES.md`
 
 ## Project Status
 
