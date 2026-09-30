@@ -465,6 +465,10 @@ jobs:
         run: pnpm napi create-npm-dirs
       - name: Move artifacts
         run: pnpm artifacts
+      - name: Prepare license notices for every npm package
+        run: pnpm licenses:prepare
+      - name: Check packed license files
+        run: pnpm licenses:check
       - name: List packages
         run: ls -R ./npm
         shell: bash

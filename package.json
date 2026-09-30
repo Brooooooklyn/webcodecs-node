@@ -18,7 +18,7 @@
     "type": "github",
     "url": "https://github.com/sponsors/Brooooooklyn"
   },
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSES.md",
   "main": "index.js",
   "exports": {
     ".": {
@@ -38,7 +38,12 @@
     "index.js",
     "polyfill.d.ts",
     "polyfill.js",
-    "standard.d.ts"
+    "standard.d.ts",
+    "LICENSE",
+    "LICENSES.md",
+    "THIRD_PARTY_NOTICES.md",
+    "SOURCE_DISTRIBUTION.md",
+    "licenses/"
   ],
   "scripts": {
     "artifacts": "napi artifacts",
@@ -49,12 +54,14 @@
     "format:oxfmt": "oxfmt",
     "format:rs": "cargo fmt",
     "lint": "oxlint --type-aware",
-    "prepublishOnly": "napi prepublish -t npm",
+    "prepublishOnly": "node tools/package-licenses.mjs && node tools/package-licenses.mjs --check && napi prepublish -t npm",
     "test": "ava",
     "demo": "cd example && vite",
     "typecheck": "tsc -b tsconfig.json && tsc --ignoreConfig ./index.d.ts",
     "preversion": "oxnode ./build.ts --platform && git add .",
-    "version": "napi version"
+    "version": "napi version",
+    "licenses:prepare": "node tools/package-licenses.mjs",
+    "licenses:check": "node tools/package-licenses.mjs --check"
   },
   "lint-staged": {
     "*.@(js|ts|tsx)": [

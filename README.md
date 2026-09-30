@@ -722,4 +722,11 @@ cargo clippy
 
 ## License
 
-MIT
+The original project source is [MIT licensed](LICENSE). The prebuilt native
+addons statically link GPL-enabled FFmpeg, x264, x265, and other libraries;
+their distribution is subject to additional terms, including GPLv3.
+
+Read [LICENSES.md](LICENSES.md), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md),
+and the outstanding [Corresponding Source work](SOURCE_DISTRIBUTION.md) before
+redistributing the prebuilt packages. The MIT source license alone does not
+cover the bundled native binaries.
