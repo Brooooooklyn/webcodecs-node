@@ -18,6 +18,9 @@ supportedArchitectures:
   cpu:
     - current
     - x64
+  libc:
+    - glibc
+    - musl
 minimumReleaseAgeExclude:
   - '@emnapi/*'
   - '@napi-rs/*'
