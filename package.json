@@ -119,7 +119,7 @@
       "armv7-unknown-linux-gnueabihf"
     ]
   },
-  "packageManager": "pnpm@12.10.1",
+  "packageManager": "pnpm@12.11.2",
   "ava": {
     "environmentVariables": {
       "TS_NODE_PROJECT": "./tsconfig.json"
