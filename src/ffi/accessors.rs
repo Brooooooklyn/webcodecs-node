@@ -9,6 +9,7 @@ use super::types::*;
 use std::os::raw::{c_int, c_uint};
 
 unsafe extern "C" {
+  pub fn ffframe_convert_rgb_color(src: *const AVFrame, dst: *mut AVFrame) -> c_int;
   // ========================================================================
   // AVCodecContext Setters
   // ========================================================================

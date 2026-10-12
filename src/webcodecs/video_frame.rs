@@ -986,10 +986,22 @@ impl FromNapiValue for VideoFrameConstructorInit {
   }
 }
 
-/// Options for copyTo operation
+/// predefined RGB target color spaces.
+#[napi(string_enum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredefinedColorSpace {
+  #[napi(value = "srgb")]
+  Srgb,
+  #[napi(value = "display-p3")]
+  DisplayP3,
+}
+
+/// options for copyTo operation.
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct VideoFrameCopyToOptions {
+  /// target RGB color space.
+  pub color_space: Option<PredefinedColorSpace>,
   /// Target pixel format (for format conversion)
   pub format: Option<VideoPixelFormat>,
   /// Region to copy (not yet implemented)
@@ -2404,8 +2416,83 @@ impl VideoFrame {
       // Allocate buffer for cropped data
       let mut temp_buffer = vec![0u8; buffer_size];
 
-      // Perform format conversion and copy, or copy directly
-      if needs_conversion {
+      // color metadata belongs to the VideoFrame, not necessarily its AVFrame.
+      let target_color = options.as_ref().and_then(|o| {
+        o.format
+          .filter(|f| {
+            matches!(
+              f,
+              VideoPixelFormat::RGBA
+                | VideoPixelFormat::BGRA
+                | VideoPixelFormat::RGBX
+                | VideoPixelFormat::BGRX
+            )
+          })
+          .map(|_| o.color_space.unwrap_or(PredefinedColorSpace::Srgb))
+      });
+      if let Some(target) = target_color {
+        let mut source = frame_guard
+          .shallow_clone()
+          .map_err(|e| not_supported_error(&e.to_string()))?;
+        let color = &inner.color_space;
+        source.set_color_primaries(match color.primaries {
+          Some(VideoColorPrimaries::Bt709) => AVColorPrimaries::Bt709,
+          Some(VideoColorPrimaries::Bt470bg) => AVColorPrimaries::Bt470bg,
+          Some(VideoColorPrimaries::Smpte170m) => AVColorPrimaries::Smpte170m,
+          Some(VideoColorPrimaries::Bt2020) => AVColorPrimaries::Bt2020,
+          Some(VideoColorPrimaries::Smpte432) => AVColorPrimaries::Smpte432,
+          None => source.color_primaries(),
+        });
+        source.set_color_trc(match color.transfer {
+          Some(VideoTransferCharacteristics::Bt709) => AVColorTransferCharacteristic::Bt709,
+          Some(VideoTransferCharacteristics::Smpte170m) => AVColorTransferCharacteristic::Smpte170m,
+          Some(VideoTransferCharacteristics::Iec6196621 | VideoTransferCharacteristics::Srgb) => {
+            AVColorTransferCharacteristic::Iec61966_2_1
+          }
+          Some(VideoTransferCharacteristics::Linear) => AVColorTransferCharacteristic::Linear,
+          Some(VideoTransferCharacteristics::Pq) => AVColorTransferCharacteristic::Smpte2084,
+          Some(VideoTransferCharacteristics::Hlg) => AVColorTransferCharacteristic::AribStdB67,
+          None => source.color_trc(),
+        });
+        source.set_colorspace(match color.matrix {
+          Some(VideoMatrixCoefficients::Rgb) => AVColorSpace::Rgb,
+          Some(VideoMatrixCoefficients::Bt709) => AVColorSpace::Bt709,
+          Some(VideoMatrixCoefficients::Bt470bg) => AVColorSpace::Bt470bg,
+          Some(VideoMatrixCoefficients::Smpte170m) => AVColorSpace::Smpte170m,
+          Some(VideoMatrixCoefficients::Bt2020Ncl) => AVColorSpace::Bt2020Ncl,
+          None => source.colorspace(),
+        });
+        source.set_color_range(match color.full_range {
+          Some(true) => AVColorRange::Jpeg,
+          Some(false) => AVColorRange::Mpeg,
+          None => source.color_range(),
+        });
+        let mut converted = Frame::new_video(
+          frame_guard.width(),
+          frame_guard.height(),
+          format.to_av_format(),
+        )
+        .map_err(|e| not_supported_error(&e.to_string()))?;
+        converted.set_color_primaries(match target {
+          PredefinedColorSpace::Srgb => AVColorPrimaries::Bt709,
+          PredefinedColorSpace::DisplayP3 => AVColorPrimaries::Smpte432,
+        });
+        converted.set_color_trc(AVColorTransferCharacteristic::Iec61966_2_1);
+        converted.set_colorspace(AVColorSpace::Rgb);
+        converted.set_color_range(AVColorRange::Jpeg);
+        Scaler::convert_color(&source, &mut converted)
+          .map_err(|e| not_supported_error(&e.to_string()))?;
+        Self::copy_cropped_data(
+          &converted,
+          format,
+          rect_x,
+          rect_y,
+          rect_width,
+          rect_height,
+          &mut temp_buffer,
+          layout_for_thread.as_deref(),
+        )?;
+      } else if needs_conversion {
         let src_av_format = original_format.to_av_format();
         let dst_av_format = format.to_av_format();
 

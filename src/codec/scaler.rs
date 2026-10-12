@@ -51,6 +51,14 @@ pub struct Scaler {
 }
 
 impl Scaler {
+  /// convert packed RGB pixels using explicit color metadata.
+  pub fn convert_color(src: &Frame, dst: &mut Frame) -> CodecResult<()> {
+    let result =
+      unsafe { crate::ffi::accessors::ffframe_convert_rgb_color(src.as_ptr(), dst.as_mut_ptr()) };
+    crate::ffi::check_error(result)?;
+    Ok(())
+  }
+
   /// Create a new scaler for the given conversion
   pub fn new(
     src_width: u32,
