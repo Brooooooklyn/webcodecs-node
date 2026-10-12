@@ -6,7 +6,7 @@
 
 import test from 'ava'
 
-import { VideoFrame } from '../index.js'
+import { VideoFrame, DOMRectReadOnly } from '../index.js'
 import {
   generateSolidColorI420Frame,
   generateSolidColorRGBAFrame,
@@ -332,4 +332,14 @@ test('VideoFrame: gradient pattern creates varied data', async (t) => {
   t.true(uniqueValues.size > 100, 'Gradient should have varied Y values')
 
   frame.close()
+})
+
+test('DOMRectReadOnly: JSON carries normalized edges and preserves nonfinite geometry', (t) => {
+  const rect = new DOMRectReadOnly(1, 2, -3, -4)
+  t.deepEqual(rect.toJSON(), { x: 1, y: 2, width: -3, height: -4, top: -2, right: 1, bottom: 2, left: -2 })
+  t.deepEqual([rect.top, rect.right, rect.bottom, rect.left], [-2, 1, 2, -2])
+  const nan = new DOMRectReadOnly(1, 2, NaN, NaN)
+  t.deepEqual([nan.top, nan.right, nan.bottom, nan.left], [NaN, NaN, NaN, NaN])
+  const infinite = new DOMRectReadOnly(Infinity, Infinity, -Infinity, -Infinity)
+  t.deepEqual([infinite.top, infinite.right, infinite.bottom, infinite.left], [NaN, NaN, NaN, NaN])
 })

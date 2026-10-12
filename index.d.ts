@@ -440,16 +440,16 @@ export declare class DOMRectReadOnly {
   get width(): number
   /** Height */
   get height(): number
-  /** Top edge (same as y) */
+  /** top edge */
   get top(): number
-  /** Right edge (x + width) */
+  /** right edge */
   get right(): number
-  /** Bottom edge (y + height) */
+  /** bottom edge */
   get bottom(): number
-  /** Left edge (same as x) */
+  /** left edge */
   get left(): number
   /** Convert to JSON (W3C spec uses toJSON) */
-  toJSON(): DOMRectInit
+  toJSON(): DomRectJson
 }
 
 /**
@@ -1421,6 +1421,17 @@ export interface DOMRectInit {
   y?: number
   width?: number
   height?: number
+}
+
+export interface DomRectJson {
+  x: number
+  y: number
+  width: number
+  height: number
+  top: number
+  right: number
+  bottom: number
+  left: number
 }
 
 /** Output callback metadata for audio */

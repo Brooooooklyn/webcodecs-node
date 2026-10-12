@@ -555,3 +555,53 @@ test('Roundtrip: rotation preserved through encode/decode cycle', async (t) => {
 
   decodedFrames.forEach((f) => f.close())
 })
+
+for (const rotation of [0, 90, 180, 270]) {
+  for (const flip of [false, true]) {
+    test(`VideoFrame: natural display size survives ${rotation}/${flip} clone and crop`, (t) => {
+      const init = {
+        format: 'RGBA',
+        codedWidth: 2,
+        codedHeight: 4,
+        timestamp: 1,
+        displayWidth: 6,
+        displayHeight: 8,
+        rotation,
+        flip,
+      } satisfies VideoFrameBufferInitWithOrientation
+      const source = new VideoFrame(new Uint8Array(32), init)
+      const clone = source.clone()
+      source.close()
+      const combinedRotation = (rotation + (flip ? 270 : 90)) % 360
+      const rotated = new VideoFrame(clone, { rotation: 90 })
+      const crop = new VideoFrame(clone, { visibleRect: { x: 0, y: 0, width: 1, height: 2 } })
+      const override = new VideoFrame(clone, { displayWidth: 10, displayHeight: 12 })
+      try {
+        const dimensions = (width: number, height: number, angle: number) =>
+          angle === 90 || angle === 270 ? [height, width] : [width, height]
+        t.deepEqual([clone.displayWidth, clone.displayHeight], dimensions(6, 8, rotation))
+        t.deepEqual([rotated.displayWidth, rotated.displayHeight], dimensions(6, 8, combinedRotation))
+        t.deepEqual([crop.displayWidth, crop.displayHeight], dimensions(3, 4, rotation))
+        t.deepEqual([override.displayWidth, override.displayHeight], dimensions(10, 12, rotation))
+        t.is(rotated.rotation, combinedRotation)
+        t.is(rotated.flip, flip)
+        t.deepEqual(crop.visibleRect?.toJSON(), {
+          x: 0,
+          y: 0,
+          width: 1,
+          height: 2,
+          top: 0,
+          right: 1,
+          bottom: 2,
+          left: 0,
+        })
+        t.deepEqual([source.displayWidth, source.displayHeight], [0, 0])
+      } finally {
+        clone.close()
+        rotated.close()
+        crop.close()
+        override.close()
+      }
+    })
+  }
+}

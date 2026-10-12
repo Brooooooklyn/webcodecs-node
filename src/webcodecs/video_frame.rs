@@ -661,6 +661,28 @@ pub struct DOMRectReadOnly {
   height: f64,
 }
 
+// preserve nan rather than f64::min/max choosing the finite operand.
+fn rect_edges(origin: f64, extent: f64) -> (f64, f64) {
+  let end = origin + extent;
+  if origin.is_nan() || end.is_nan() {
+    (f64::NAN, f64::NAN)
+  } else {
+    (origin.min(end), origin.max(end))
+  }
+}
+
+#[napi(object)]
+pub struct DOMRectJSON {
+  pub x: f64,
+  pub y: f64,
+  pub width: f64,
+  pub height: f64,
+  pub top: f64,
+  pub right: f64,
+  pub bottom: f64,
+  pub left: f64,
+}
+
 #[napi]
 impl DOMRectReadOnly {
   /// Create a new DOMRectReadOnly
@@ -698,38 +720,42 @@ impl DOMRectReadOnly {
     self.height
   }
 
-  /// Top edge (same as y)
+  /// top edge
   #[napi(getter)]
   pub fn top(&self) -> f64 {
-    self.y
+    rect_edges(self.y, self.height).0
   }
 
-  /// Right edge (x + width)
+  /// right edge
   #[napi(getter)]
   pub fn right(&self) -> f64 {
-    self.x + self.width
+    rect_edges(self.x, self.width).1
   }
 
-  /// Bottom edge (y + height)
+  /// bottom edge
   #[napi(getter)]
   pub fn bottom(&self) -> f64 {
-    self.y + self.height
+    rect_edges(self.y, self.height).1
   }
 
-  /// Left edge (same as x)
+  /// left edge
   #[napi(getter)]
   pub fn left(&self) -> f64 {
-    self.x
+    rect_edges(self.x, self.width).0
   }
 
   /// Convert to JSON (W3C spec uses toJSON)
   #[napi(js_name = "toJSON")]
-  pub fn to_json(&self) -> DOMRectInit {
-    DOMRectInit {
-      x: Some(self.x),
-      y: Some(self.y),
-      width: Some(self.width),
-      height: Some(self.height),
+  pub fn to_json(&self) -> DOMRectJSON {
+    DOMRectJSON {
+      x: self.x,
+      y: self.y,
+      width: self.width,
+      height: self.height,
+      top: self.top(),
+      right: self.right(),
+      bottom: self.bottom(),
+      left: self.left(),
     }
   }
 }
@@ -1041,7 +1067,7 @@ struct VideoFrameInner {
   visible_top: u32,
   visible_width: u32,
   visible_height: u32,
-  /// Display dimensions (may differ from visible rect if explicitly set)
+  /// unrotated natural dimensions; public getters apply rotation
   display_width: u32,
   display_height: u32,
   /// Rotation in degrees clockwise (0, 90, 180, 270)
@@ -1406,21 +1432,9 @@ impl VideoFrame {
       format,
     )?;
 
-    // Display dimensions default to visible dimensions, swapped if rotation is 90/270
-    let display_width = init.display_width.unwrap_or({
-      if rotation == 90.0 || rotation == 270.0 {
-        visible_height
-      } else {
-        visible_width
-      }
-    });
-    let display_height = init.display_height.unwrap_or({
-      if rotation == 90.0 || rotation == 270.0 {
-        visible_width
-      } else {
-        visible_height
-      }
-    });
+    // retain natural dimensions; rotation applies only when exposing display dimensions.
+    let display_width = init.display_width.unwrap_or(visible_width);
+    let display_height = init.display_height.unwrap_or(visible_height);
 
     // Color space: use provided value, or default to sRGB for RGB formats
     let color_space = if init.color_space.is_some() {
@@ -1832,12 +1846,8 @@ impl VideoFrame {
     let original_format =
       VideoPixelFormat::from_av_format(frame.format()).unwrap_or(VideoPixelFormat::I420);
 
-    // Display dimensions may be swapped based on rotation
-    let (display_width, display_height) = if parsed_rotation == 90.0 || parsed_rotation == 270.0 {
-      (height, width)
-    } else {
-      (width, height)
-    };
+    let display_width = width;
+    let display_height = height;
 
     // Use provided colorSpace from decoder config, or extract from FFmpeg frame
     // If colorSpace is empty (all None), extract from FFmpeg to get embedded bitstream values
@@ -2012,7 +2022,11 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) => Ok(inner.display_width),
+      Some(inner) => Ok(if inner.rotation == 90.0 || inner.rotation == 270.0 {
+        inner.display_height
+      } else {
+        inner.display_width
+      }),
       _ => Ok(0),
     }
   }
@@ -2026,7 +2040,11 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) => Ok(inner.display_height),
+      Some(inner) => Ok(if inner.rotation == 90.0 || inner.rotation == 270.0 {
+        inner.display_width
+      } else {
+        inner.display_height
+      }),
       _ => Ok(0),
     }
   }
