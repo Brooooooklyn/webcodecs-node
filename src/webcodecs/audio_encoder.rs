@@ -207,6 +207,9 @@ struct AudioEncoderInner {
   /// Queue of input timestamps for correlation with output packets
   /// (needed because FFmpeg may buffer frames internally)
   timestamp_queue: std::collections::VecDeque<i64>,
+  /// End time of the last output, used for packets drained at flush after
+  /// encoder delay has used up the queued input timestamps.
+  last_output_end: Option<i64>,
   /// Base timestamp from the first input AudioData (for timestamp calculation)
   base_timestamp: Option<i64>,
   /// W3C spec: Flag to suppress output delivery after reset()
@@ -297,6 +300,16 @@ impl Drop for AudioEncoder {
   }
 }
 
+impl AudioEncoderInner {
+  fn next_output_timestamp(&mut self, duration_us: Option<i64>) -> Option<i64> {
+    let timestamp = self.timestamp_queue.pop_front().or(self.last_output_end);
+    if let Some(timestamp) = timestamp {
+      self.last_output_end = Some(timestamp + duration_us.unwrap_or(0));
+    }
+    timestamp
+  }
+}
+
 #[napi]
 impl AudioEncoder {
   /// Create a new AudioEncoder with init dictionary (per WebCodecs spec)
@@ -324,6 +337,7 @@ impl AudioEncoder {
       error_callback: init.error,
       flushes: FlushTracker::default(),
       timestamp_queue: std::collections::VecDeque::new(),
+      last_output_end: None,
       base_timestamp: None,
       output_suppressed: false,
       pending_chunks: Vec::new(),
@@ -622,7 +636,7 @@ impl AudioEncoder {
         None
       };
       for packet in packets {
-        let output_timestamp = guard.timestamp_queue.pop_front();
+        let output_timestamp = guard.next_output_timestamp(Some(duration_us));
         let chunk = EncodedAudioChunk::from_packet_with_adts(
           packet,
           Some(duration_us),
@@ -826,7 +840,7 @@ impl AudioEncoder {
           None
         };
         for packet in packets {
-          let output_timestamp = guard.timestamp_queue.pop_front();
+          let output_timestamp = guard.next_output_timestamp(Some(duration_us));
           let chunk = EncodedAudioChunk::from_packet_with_adts(
             packet,
             Some(duration_us),
@@ -903,9 +917,16 @@ impl AudioEncoder {
         None
       };
       for packet in packets {
-        let output_timestamp = guard.timestamp_queue.pop_front();
-        let chunk =
-          EncodedAudioChunk::from_packet_with_adts(packet, None, output_timestamp, adts_params);
+        // Packet durations are in the encoder time base of 1/sample_rate
+        let duration_us =
+          (packet.duration() > 0).then(|| packet.duration() * 1_000_000 / sample_rate);
+        let output_timestamp = guard.next_output_timestamp(duration_us);
+        let chunk = EncodedAudioChunk::from_packet_with_adts(
+          packet,
+          duration_us,
+          output_timestamp,
+          adts_params,
+        );
         // Create decoderConfig: FLAC on every chunk, others only on first chunk
         let decoder_config = if is_flac {
           // FLAC: Always include decoderConfig with fresh extradata
@@ -991,6 +1012,7 @@ impl AudioEncoder {
     // Clear codec-local work state. Do not reset encode_queue_size here:
     // main-thread encode() calls after this FIFO command are already counted.
     guard.timestamp_queue.clear();
+    guard.last_output_end = None;
     guard.frame_count = 0;
     guard.extradata_sent = false;
     guard.base_timestamp = None;
@@ -1786,6 +1808,7 @@ impl AudioEncoder {
       es.note_queue_cleared(&env, cleared_queue);
     }
     inner.timestamp_queue.clear();
+    inner.last_output_end = None;
     inner.base_timestamp = None;
     // Clear flush-related state
     inner.flushes.clear();
