@@ -1219,7 +1219,9 @@ int ffframe_convert_rgb_color(const AVFrame *src, AVFrame *dst) {
           ? dst->color_trc : src->color_trc;
       rgb->colorspace = AVCOL_SPC_RGB;
       rgb->color_range = AVCOL_RANGE_JPEG;
-      int ret = sws_scale_frame(scaler, rgb, src);
+      int ret = av_opt_set_int(scaler, "sws_flags",
+          SWS_BILINEAR | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT, 0);
+      if (ret >= 0) ret = sws_scale_frame(scaler, rgb, src);
       if (ret >= 0) ret = ffframe_convert_rgb_color(rgb, dst);
       av_frame_free(&rgb);
       sws_freeContext(scaler);

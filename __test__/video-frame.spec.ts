@@ -401,3 +401,37 @@ test('VideoFrame: explicit RGB copies preserve browser alpha and gamut conversio
     }
   }
 })
+
+test('VideoFrame: legacy SDR transfers use the browser RGB compatibility space', async (t) => {
+  for (const transfer of ['bt709', 'smpte170m'] satisfies ('bt709' | 'smpte170m')[]) {
+    for (const primaries of ['bt709', 'smpte432'] satisfies ('bt709' | 'smpte432')[]) {
+      for (const format of ['RGBA', 'BGRA'] satisfies ('RGBA' | 'BGRA')[]) {
+        const input = format === 'RGBA' ? [32, 128, 223, 255] : [223, 128, 32, 255]
+        const frame = new VideoFrame(Uint8Array.from(input), {
+          format,
+          codedWidth: 1,
+          codedHeight: 1,
+          timestamp: 0,
+          colorSpace: { primaries, transfer, matrix: 'rgb', fullRange: true },
+        })
+        try {
+          for (const colorSpace of ['srgb', 'display-p3'] satisfies ('srgb' | 'display-p3')[]) {
+            const output = new Uint8Array(4)
+            await frame.copyTo(output, { format: 'RGBA', colorSpace })
+            const expected =
+              primaries === 'bt709'
+                ? colorSpace === 'srgb'
+                  ? [32, 128, 223, 255]
+                  : [63, 126, 216, 255]
+                : colorSpace === 'srgb'
+                  ? [0, 130, 230, 255]
+                  : [32, 128, 223, 255]
+            t.deepEqual(Array.from(output), expected)
+          }
+        } finally {
+          frame.close()
+        }
+      }
+    }
+  }
+})

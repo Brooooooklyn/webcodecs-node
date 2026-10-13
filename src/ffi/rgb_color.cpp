@@ -32,10 +32,6 @@ static bool rgb_profile(AVColorPrimaries primaries,
     case AVCOL_TRC_IEC61966_2_1:
       curve = *skcms_sRGB_TransferFunction();
       break;
-    case AVCOL_TRC_BT709:
-    case AVCOL_TRC_SMPTE170M:
-      curve = {1.0f/.45f, 1.0f/1.099f, .099f/1.099f, 1.0f/4.5f, .081f, 0, 0};
-      break;
     case AVCOL_TRC_LINEAR:
       curve = {1, 1, 0, 1, 0, 0, 0};
       break;
@@ -47,14 +43,26 @@ static bool rgb_profile(AVColorPrimaries primaries,
 }
 
 extern "C" int ffframe_transform_rgb_color(const AVFrame* src, AVFrame* dst) {
+  // chromium's CompatRGBColorSpace maps legacy sdr encodings to srgb.
+  const auto compatible_primaries = [](AVColorPrimaries value) {
+    return value == AVCOL_PRI_SMPTE170M ? AVCOL_PRI_BT709 : value;
+  };
+  const auto compatible_transfer = [](AVColorTransferCharacteristic value) {
+    return value == AVCOL_TRC_BT709 || value == AVCOL_TRC_SMPTE170M
+        ? AVCOL_TRC_IEC61966_2_1 : value;
+  };
+  const auto source_primaries = compatible_primaries(src->color_primaries);
+  const auto target_primaries = compatible_primaries(dst->color_primaries);
+  const auto source_transfer = compatible_transfer(src->color_trc);
+  const auto target_transfer = compatible_transfer(dst->color_trc);
   skcms_ICCProfile source, target;
-  if (!rgb_profile(src->color_primaries, src->color_trc, &source) ||
-      !rgb_profile(dst->color_primaries, dst->color_trc, &target))
+  if (!rgb_profile(source_primaries, source_transfer, &source) ||
+      !rgb_profile(target_primaries, target_transfer, &target))
     return AVERROR(ENOSYS);
   // skcms recognizes identity by profile address and still unpremultiplies.
   // avoid a lossy transfer-function round trip for the same color space.
   const auto* output_profile =
-      src->color_primaries == dst->color_primaries && src->color_trc == dst->color_trc
+      source_primaries == target_primaries && source_transfer == target_transfer
       ? &source : &target;
   const auto input_format = src->format == AV_PIX_FMT_RGBA
       ? skcms_PixelFormat_RGBA_8888 : skcms_PixelFormat_BGRA_8888;
