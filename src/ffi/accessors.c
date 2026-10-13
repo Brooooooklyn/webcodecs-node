@@ -1190,97 +1190,375 @@ int ff_codec_get_hw_pix_fmt(const AVCodec* codec, int device_type) {
     return AV_PIX_FMT_NONE;
 }
 
-// packed RGB color conversion uses the already bundled Little CMS library.
-#include <lcms2.h>
+/* ============================================================================
+ * VideoFrame.copyTo to RGBA/BGRA with a target colour space (Chrome's model).
+ * Integer libyuv front end, then 256-entry decode LUT -> 3x3 -> exact
+ * sRGB encode. Only the copy rect is touched; output goes straight to the caller.
+ * ============================================================================ */
+#include <math.h>
+#include <stdint.h>
+#include <string.h>
 #include <libavutil/csp.h>
 #include <libavutil/error.h>
+#include <libavutil/mem.h>
+#include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 
-static cmsHPROFILE ff_rgb_profile(enum AVColorPrimaries primaries,
-                                 enum AVColorTransferCharacteristic transfer) {
-  const AVColorPrimariesDesc *desc = av_csp_primaries_desc_from_id(primaries);
-  if (!desc) return NULL;
-  cmsToneCurve *curve = NULL;
-  if (transfer == AVCOL_TRC_IEC61966_2_1) {
-    const double params[] = {2.4, 1.0/1.055, 0.055/1.055, 1.0/12.92, 0.04045, 0, 0};
-    curve = cmsBuildParametricToneCurve(NULL, 4, params);
-  } else if (transfer == AVCOL_TRC_BT709 || transfer == AVCOL_TRC_SMPTE170M) {
-    const double params[] = {1.0/0.45, 1.0/1.099, 0.099/1.099, 1.0/4.5, 0.081, 0, 0};
-    curve = cmsBuildParametricToneCurve(NULL, 4, params);
-  } else if (transfer == AVCOL_TRC_LINEAR) {
-    curve = cmsBuildGamma(NULL, 1.0);
-  }
-  if (!curve) return NULL;
-  cmsCIExyY white = {av_q2d(desc->wp.x), av_q2d(desc->wp.y), 1.0};
-  cmsCIExyYTRIPLE rgb = {
-    {av_q2d(desc->prim.r.x), av_q2d(desc->prim.r.y), 1.0},
-    {av_q2d(desc->prim.g.x), av_q2d(desc->prim.g.y), 1.0},
-    {av_q2d(desc->prim.b.x), av_q2d(desc->prim.b.y), 1.0},
-  };
-  cmsToneCurve *curves[] = {curve, curve, curve};
-  cmsHPROFILE profile = cmsCreateRGBProfile(&white, &rgb, curves);
-  cmsFreeToneCurve(curve);
-  return profile;
+enum { RC_CURVE_SRGB, RC_CURVE_LINEAR, RC_CURVE_G22, RC_CURVE_G28 };
+enum { RC_IDENTITY, RC_LUT8, RC_MATRIX };
+
+typedef struct RcState {
+  int cls;
+  float dec[256];   // 8-bit code -> linear
+  float m[9];       // src -> target
+  float thr[256];   // encode: code k+1 starts at linear thr[k]
+  struct { float t; int32_t k; } enc[4097]; // bucket [i/4096, (i+1)/4096): code k, k+1 from t on
+  uint8_t lut8[256];
+} RcState;
+
+// libyuv YuvConstants (row_common.cc, LIBYUV_UNLIMITED_* off): YG, YB, UB, UG, VG, VR
+static const int32_t kRcYuv[6][6] = {
+  {18997, -1160, 128, 25, 52, 102}, // I601
+  {16320, 32, 113, 22, 46, 90},     // JPEG
+  {18997, -1160, 128, 14, 34, 115}, // H709
+  {16320, 32, 119, 12, 30, 101},    // F709
+  {19003, -1160, 128, 12, 42, 107}, // 2020
+  {16320, 32, 120, 11, 37, 94},     // V2020
+};
+
+static double rc_srgb_dec(double v) {
+  return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4);
 }
 
-int ffframe_convert_rgb_color(const AVFrame *src, AVFrame *dst) {
-  cmsUInt32Number src_type, dst_type;
-  switch (src->format) {
-    case AV_PIX_FMT_RGBA: src_type = TYPE_RGBA_8; break;
-    case AV_PIX_FMT_BGRA: src_type = TYPE_BGRA_8; break;
-    default: {
-      // convert YUV encoding to full range RGB without changing its gamut.
-      AVFrame *rgb = av_frame_alloc();
-      struct SwsContext *scaler = sws_alloc_context();
-      if (!rgb || !scaler) {
-        av_frame_free(&rgb);
-        sws_freeContext(scaler);
-        return AVERROR(ENOMEM);
-      }
-      rgb->width = src->width;
-      rgb->height = src->height;
-      rgb->format = AV_PIX_FMT_RGBA;
-      // let swscale infer unspecified source metadata against the target.
-      rgb->color_primaries = src->color_primaries == AVCOL_PRI_UNSPECIFIED
-          ? dst->color_primaries : src->color_primaries;
-      rgb->color_trc = src->color_trc == AVCOL_TRC_UNSPECIFIED
-          ? dst->color_trc : src->color_trc;
-      rgb->colorspace = AVCOL_SPC_RGB;
-      rgb->color_range = AVCOL_RANGE_JPEG;
-      int ret = sws_scale_frame(scaler, rgb, src);
-      if (ret >= 0) ret = ffframe_convert_rgb_color(rgb, dst);
-      av_frame_free(&rgb);
-      sws_freeContext(scaler);
-      return ret;
+static double rc_curve_dec(int curve, double v) {
+  switch (curve) {
+  case RC_CURVE_LINEAR: return v;
+  case RC_CURVE_G22: return pow(v, 2.2);
+  case RC_CURVE_G28: return pow(v, 2.8);
+  default: return rc_srgb_dec(v);
+  }
+}
+
+// RGB -> XYZ for D65 primaries; returns 0 when the primaries are unknown or not D65.
+static int rc_npm(enum AVColorPrimaries p, double o[9]) {
+  const AVColorPrimariesDesc *d = av_csp_primaries_desc_from_id(p);
+  if (!d || av_cmp_q(d->wp.x, av_make_q(3127, 10000)) || av_cmp_q(d->wp.y, av_make_q(3290, 10000)))
+    return 0;
+  const AVCIExy *c[3] = {&d->prim.r, &d->prim.g, &d->prim.b};
+  double P[9], inv[9], W[3] = {0.3127 / 0.3290, 1.0, (1 - 0.3127 - 0.3290) / 0.3290};
+  for (int i = 0; i < 3; i++) {
+    double x = av_q2d(c[i]->x), y = av_q2d(c[i]->y);
+    P[i] = x / y; P[3 + i] = 1.0; P[6 + i] = (1 - x - y) / y;
+  }
+  double det = P[0] * (P[4] * P[8] - P[5] * P[7]) - P[1] * (P[3] * P[8] - P[5] * P[6]) +
+               P[2] * (P[3] * P[7] - P[4] * P[6]);
+  inv[0] = (P[4] * P[8] - P[5] * P[7]) / det; inv[1] = (P[2] * P[7] - P[1] * P[8]) / det;
+  inv[2] = (P[1] * P[5] - P[2] * P[4]) / det; inv[3] = (P[5] * P[6] - P[3] * P[8]) / det;
+  inv[4] = (P[0] * P[8] - P[2] * P[6]) / det; inv[5] = (P[2] * P[3] - P[0] * P[5]) / det;
+  inv[6] = (P[3] * P[7] - P[4] * P[6]) / det; inv[7] = (P[1] * P[6] - P[0] * P[7]) / det;
+  inv[8] = (P[0] * P[4] - P[1] * P[3]) / det;
+  for (int i = 0; i < 3; i++) {
+    double s = inv[i * 3] * W[0] + inv[i * 3 + 1] * W[1] + inv[i * 3 + 2] * W[2];
+    for (int r = 0; r < 3; r++) o[r * 3 + i] = P[r * 3 + i] * s;
+  }
+  return 1;
+}
+
+static void rc_inv3(const double a[9], double o[9]) {
+  double det = a[0] * (a[4] * a[8] - a[5] * a[7]) - a[1] * (a[3] * a[8] - a[5] * a[6]) +
+               a[2] * (a[3] * a[7] - a[4] * a[6]);
+  o[0] = (a[4] * a[8] - a[5] * a[7]) / det; o[1] = (a[2] * a[7] - a[1] * a[8]) / det;
+  o[2] = (a[1] * a[5] - a[2] * a[4]) / det; o[3] = (a[5] * a[6] - a[3] * a[8]) / det;
+  o[4] = (a[0] * a[8] - a[2] * a[6]) / det; o[5] = (a[2] * a[3] - a[0] * a[5]) / det;
+  o[6] = (a[3] * a[7] - a[4] * a[6]) / det; o[7] = (a[1] * a[6] - a[0] * a[7]) / det;
+  o[8] = (a[0] * a[4] - a[1] * a[3]) / det;
+}
+
+// out = inv(npm(dst)) * npm(src), as float
+static void rc_gamut(enum AVColorPrimaries src, enum AVColorPrimaries dst, float out[9]) {
+  double s[9], d[9], di[9];
+  rc_npm(src, s);
+  rc_npm(dst, d);
+  rc_inv3(d, di);
+  for (int r = 0; r < 3; r++)
+    for (int c = 0; c < 3; c++)
+      out[r * 3 + c] = (float)(di[r * 3] * s[c] + di[r * 3 + 1] * s[3 + c] + di[r * 3 + 2] * s[6 + c]);
+}
+
+// round(sRGB_encode(l) * 255), exact: a bucket is narrower than any code, so it holds at most
+// one code boundary.
+static inline uint8_t rc_enc(const RcState *t, float l) {
+  l = l > 0.0f ? (l < 1.0f ? l : 1.0f) : 0.0f; // also maps NaN to 0
+  int i = (int)(l * 4096.0f);
+  return (uint8_t)(t->enc[i].k + (l >= t->enc[i].t));
+}
+
+// SPEC.md §2: tags -> class. Returns the YUV table index for YUV sources.
+static int rc_setup(RcState *t, int pri, int trc, int mat, int range, int target_p3) {
+  int missing = pri == AVCOL_PRI_RESERVED0 || pri == AVCOL_PRI_UNSPECIFIED ||
+                pri == AVCOL_PRI_RESERVED || trc == AVCOL_TRC_RESERVED0 ||
+                trc == AVCOL_TRC_UNSPECIFIED || trc == AVCOL_TRC_RESERVED ||
+                mat == AVCOL_SPC_UNSPECIFIED || mat == AVCOL_SPC_RESERVED ||
+                range == AVCOL_RANGE_UNSPECIFIED;
+  int curve = RC_CURVE_SRGB;
+  switch (trc) {
+  case AVCOL_TRC_LINEAR: curve = RC_CURVE_LINEAR; break;
+  case AVCOL_TRC_GAMMA22: curve = RC_CURVE_G22; break;
+  case AVCOL_TRC_GAMMA28: curve = RC_CURVE_G28; break;
+  case AVCOL_TRC_BT709: case AVCOL_TRC_SMPTE170M: case AVCOL_TRC_SMPTE240M:
+  case AVCOL_TRC_IEC61966_2_1: case AVCOL_TRC_BT2020_10: case AVCOL_TRC_BT2020_12: break;
+  default: missing = 1; // pq/hlg (no tone map yet), log, bt1361, smpte428, ...: drawn as sRGB
+  }
+  enum AVColorPrimaries gamut = (enum AVColorPrimaries)pri, dst = target_p3 ? AVCOL_PRI_SMPTE432 : AVCOL_PRI_BT709;
+  double tmp[9];
+  if (gamut == AVCOL_PRI_SMPTE170M || gamut == AVCOL_PRI_SMPTE240M) gamut = AVCOL_PRI_BT709;
+  if (missing || !rc_npm(gamut, tmp)) { curve = RC_CURVE_SRGB; gamut = AVCOL_PRI_BT709; }
+
+  int full = range == AVCOL_RANGE_JPEG, yuv = 0;
+  if (mat == AVCOL_SPC_BT709) yuv = full ? 3 : 2;
+  else if (mat == AVCOL_SPC_BT470BG || mat == AVCOL_SPC_SMPTE170M) yuv = full ? 1 : 0;
+  else if (mat == AVCOL_SPC_BT2020_NCL) yuv = full ? 5 : 4;
+
+  if (curve == RC_CURVE_SRGB && gamut == dst) { t->cls = RC_IDENTITY; return yuv; }
+  for (int i = 0; i < 256; i++) t->dec[i] = (float)rc_curve_dec(curve, i / 255.0);
+  for (int k = 0; k < 255; k++) t->thr[k] = (float)rc_srgb_dec((k + 0.5) / 255.0);
+  t->thr[255] = 2.0f;
+  for (int i = 0, k = 0; i <= 4096; i++) {
+    while (k < 255 && t->thr[k] <= (float)i / 4096.0f) k++;
+    t->enc[i].k = k;
+    t->enc[i].t = t->thr[k];
+  }
+  if (gamut == dst) {
+    t->cls = RC_LUT8;
+    for (int i = 0; i < 256; i++) t->lut8[i] = rc_enc(t, t->dec[i]);
+  } else {
+    t->cls = RC_MATRIX;
+    rc_gamut(gamut, dst, t->m);
+  }
+  return yuv;
+}
+
+// Colour stage, in place on n pixels of 8-bit R'G'B'A (ri/bi = byte index of R and B).
+// Coefficients are copied to locals: stores through uint8_t * may alias *t.
+static av_always_inline void rc_color_row(const RcState *t, uint8_t *p, int n, int ri, int bi) {
+  const float *dec = t->dec;
+  const float a0 = t->m[0], a1 = t->m[1], a2 = t->m[2], a3 = t->m[3], a4 = t->m[4],
+              a5 = t->m[5], a6 = t->m[6], a7 = t->m[7], a8 = t->m[8];
+  if (t->cls == RC_LUT8) {
+    const uint8_t *lut = t->lut8;
+    for (int i = 0; i < n; i++, p += 4) {
+      uint8_t r = lut[p[0]], g = lut[p[1]], b = lut[p[2]];
+      p[0] = r; p[1] = g; p[2] = b;
+    }
+  } else { // RC_MATRIX
+    for (int i = 0; i < n; i++, p += 4) {
+      float r = dec[p[ri]], g = dec[p[1]], b = dec[p[bi]];
+      uint8_t R = rc_enc(t, a0 * r + a1 * g + a2 * b);
+      uint8_t G = rc_enc(t, a3 * r + a4 * g + a5 * b);
+      uint8_t B = rc_enc(t, a6 * r + a7 * g + a8 * b);
+      p[ri] = R; p[1] = G; p[bi] = B;
     }
   }
-  switch (dst->format) {
-    case AV_PIX_FMT_RGBA: dst_type = TYPE_RGBA_8; break;
-    case AV_PIX_FMT_BGRA: dst_type = TYPE_BGRA_8; break;
-    default: return AVERROR(ENOSYS);
+}
+
+static inline int32_t rc_clamp6(int32_t z) {
+  z = z < 0 ? 0 : z >> 6;
+  return z > 255 ? 255 : z;
+}
+
+#define RC_CHUNK 256
+// Stage 1 for a chunk: 16-bit expanded luma + 8-bit chroma/alpha, nearest chroma (libyuv
+// YuvPixel / YuvPixel10_16 input stage). Stage 2: libyuv integer matrix, unit stride.
+static av_always_inline void rc_yuv_stage(const uint8_t *ys, const uint8_t *us, const uint8_t *vs,
+                                          const uint8_t *as, int n, int xo, int hs, int cstep,
+                                          int depth, int shift, uint16_t *y16, uint8_t *u8,
+                                          uint8_t *v8, uint8_t *a8) {
+  uint8_t cu[RC_CHUNK + 1], cv[RC_CHUNK + 1];
+  int nc = ((n - 1 + xo) >> hs) + 1;
+  if (depth == 8) {
+    for (int i = 0; i < n; i++) y16[i] = (uint16_t)(ys[i] * 0x0101);
+    for (int j = 0; j < nc; j++) { cu[j] = us[j * cstep]; cv[j] = vs[j * cstep]; }
+    if (as) memcpy(a8, as, (size_t)n);
+  } else {
+    const uint16_t *y2 = (const uint16_t *)ys, *u2 = (const uint16_t *)us, *v2 = (const uint16_t *)vs;
+    for (int i = 0; i < n; i++) {
+      uint32_t v = (uint32_t)(y2[i] >> shift);
+      y16[i] = (uint16_t)((v << (16 - depth)) | (v >> (2 * depth - 16)));
+    }
+    for (int j = 0; j < nc; j++) {
+      int u = (u2[j * cstep] >> shift) >> (depth - 8), v = (v2[j * cstep] >> shift) >> (depth - 8);
+      cu[j] = (uint8_t)(u > 255 ? 255 : u); cv[j] = (uint8_t)(v > 255 ? 255 : v);
+    }
+    if (as)
+      for (int i = 0; i < n; i++) a8[i] = (uint8_t)((((const uint16_t *)as)[i] >> shift) >> (depth - 8));
   }
-  if (src->colorspace != AVCOL_SPC_RGB || src->color_range != AVCOL_RANGE_JPEG)
-    return AVERROR(ENOSYS);
-  // a same-format identity copy must preserve every byte exactly.
-  if (src->format == dst->format &&
-      src->color_primaries == dst->color_primaries &&
-      src->color_trc == dst->color_trc)
-    return av_frame_copy(dst, src);
-  cmsHPROFILE input = ff_rgb_profile(src->color_primaries, src->color_trc);
-  cmsHPROFILE output = ff_rgb_profile(dst->color_primaries, dst->color_trc);
-  if (!input || !output) {
-    if (input) cmsCloseProfile(input);
-    if (output) cmsCloseProfile(output);
-    return AVERROR(ENOSYS);
+  if (hs == 0) {
+    memcpy(u8, cu, (size_t)n); memcpy(v8, cv, (size_t)n);
+  } else if (hs == 1) { // 2:1 nearest chroma as a pair loop so it vectorises
+    int pairs = (n - xo) >> 1, j;
+    if (xo) { u8[0] = cu[0]; v8[0] = cv[0]; }
+    for (j = 0; j < pairs; j++) {
+      u8[xo + 2 * j] = u8[xo + 2 * j + 1] = cu[xo + j];
+      v8[xo + 2 * j] = v8[xo + 2 * j + 1] = cv[xo + j];
+    }
+    if (xo + 2 * pairs < n) { u8[n - 1] = cu[xo + j]; v8[n - 1] = cv[xo + j]; }
+  } else {
+    for (int i = 0; i < n; i++) { u8[i] = cu[(i + xo) >> hs]; v8[i] = cv[(i + xo) >> hs]; }
   }
-  cmsHTRANSFORM transform = cmsCreateTransform(input, src_type, output, dst_type,
-      INTENT_RELATIVE_COLORIMETRIC, cmsFLAGS_COPY_ALPHA | cmsFLAGS_NOOPTIMIZE);
-  cmsCloseProfile(input);
-  cmsCloseProfile(output);
-  if (!transform) return AVERROR(ENOMEM);
-  for (int y = 0; y < src->height; ++y)
-    cmsDoTransform(transform, src->data[0] + y * src->linesize[0],
-                   dst->data[0] + y * dst->linesize[0], src->width);
-  cmsDeleteTransform(transform);
+}
+
+static av_always_inline void rc_yuv_matrix(const uint16_t *y16, const uint8_t *u8, const uint8_t *v8,
+                                           const uint8_t *a8, uint8_t *o, int n, const int32_t *k,
+                                           int ri, int bi) {
+  const uint32_t yg = (uint32_t)k[0];
+  const int32_t yb = k[1], ub = k[2], ug = k[3], vg = k[4], vr = k[5];
+  const int32_t rb = vr * 128 - yb, gb = ug * 128 + vg * 128 + yb, bb = ub * 128 - yb;
+  for (int i = 0; i < n; i++) {
+    int32_t y1 = (int32_t)((y16[i] * yg) >> 16), u = u8[i], v = v8[i];
+    o[4 * i + ri] = (uint8_t)rc_clamp6(y1 + v * vr - rb);
+    o[4 * i + 1] = (uint8_t)rc_clamp6(y1 + gb - (u * ug + v * vg));
+    o[4 * i + bi] = (uint8_t)rc_clamp6(y1 + u * ub - bb);
+    o[4 * i + 3] = a8[i];
+  }
+}
+
+static av_always_inline void rc_yuv_row(const uint8_t *ys, const uint8_t *us, const uint8_t *vs,
+                                        const uint8_t *as, uint8_t *o, int n, int xo, int hs,
+                                        int cstep, int depth, int shift, const int32_t *k, int ri,
+                                        int bi) {
+  uint16_t y16[RC_CHUNK];
+  uint8_t u8[RC_CHUNK], v8[RC_CHUNK], a8[RC_CHUNK];
+  int bps = depth > 8 ? 2 : 1;
+  if (!as) memset(a8, 255, sizeof(a8));
+  for (int i = 0; i < n; i += RC_CHUNK) { // chunks start at even pixels, so chroma stays aligned
+    int m = n - i < RC_CHUNK ? n - i : RC_CHUNK, c = ((i + xo) >> hs) * cstep * bps;
+    rc_yuv_stage(ys + i * bps, us + c, vs + c, as ? as + i * bps : NULL, m, xo, hs, cstep, depth,
+                 shift, y16, u8, v8, a8);
+    rc_yuv_matrix(y16, u8, v8, a8, o + 4 * i, m, k, ri, bi);
+  }
+}
+
+static av_always_inline void rc_rgb_row(const uint8_t *s, uint8_t *o, int n,
+                                        int step, int sr, int sg, int sb, int sa, int ri, int bi) {
+  for (int i = 0; i < n; i++, s += step, o += 4) {
+    o[ri] = s[sr]; o[1] = s[sg]; o[bi] = s[sb]; o[3] = sa >= 0 ? s[sa] : 255;
+  }
+}
+
+// Front end for one row: source -> 8-bit R'G'B'A in destination byte order.
+static av_always_inline int rc_front_row(const AVFrame *f, const AVPixFmtDescriptor *d, int x, int y, int n,
+                        const int32_t *k, uint8_t *o, int ri, int bi) {
+  if (d->flags & AV_PIX_FMT_FLAG_RGB) {
+    const uint8_t *s = f->data[0] + (ptrdiff_t)y * f->linesize[0];
+    int step = d->comp[0].step, sa = d->nb_components == 4 ? d->comp[3].offset : -1;
+    int sr = d->comp[0].offset, sg = d->comp[1].offset, sb = d->comp[2].offset;
+    s += (ptrdiff_t)x * step;
+    if (step == 4 && sa >= 0 && sr == ri && sb == bi && sg == 1 && sa == 3)
+      memcpy(o, s, (size_t)n * 4);
+    else if (step == 4 && sr == 2 && sg == 1 && sb == 0 && sa == 3 && ri == 0)
+      rc_rgb_row(s, o, n, 4, 2, 1, 0, 3, 0, 2); // BGRA -> RGBA
+    else if (step == 4 && sr == 0 && sg == 1 && sb == 2 && sa == 3 && ri == 2)
+      rc_rgb_row(s, o, n, 4, 0, 1, 2, 3, 2, 0); // RGBA -> BGRA
+    else
+      rc_rgb_row(s, o, n, step, sr, sg, sb, sa, ri, bi);
+    return 0;
+  }
+  int hs = d->log2_chroma_w, vs = d->log2_chroma_h, depth = d->comp[0].depth;
+  int cstep = d->comp[1].step / (depth > 8 ? 2 : 1), cy = y >> vs, cx = x >> hs;
+  const uint8_t *p[4];
+  for (int c = 0; c < 4 && c < d->nb_components; c++) {
+    int py = c == 1 || c == 2 ? cy : y, px = c == 1 || c == 2 ? cx * d->comp[c].step : x * d->comp[c].step;
+    p[c] = f->data[d->comp[c].plane] + (ptrdiff_t)py * f->linesize[d->comp[c].plane] + px + d->comp[c].offset;
+  }
+  const uint8_t *a = d->nb_components == 4 ? p[3] : NULL;
+  int xo = x & ((1 << hs) - 1), sh = d->comp[0].shift;
+  if (depth == 8 && hs == 1 && cstep == 1) rc_yuv_row(p[0], p[1], p[2], a, o, n, xo, 1, 1, 8, 0, k, ri, bi);
+  else if (depth == 8 && hs == 1 && cstep == 2) rc_yuv_row(p[0], p[1], p[2], a, o, n, xo, 1, 2, 8, 0, k, ri, bi);
+  else if (depth == 8) rc_yuv_row(p[0], p[1], p[2], a, o, n, xo, hs, cstep, 8, 0, k, ri, bi);
+  else if (depth == 10 && hs == 1 && cstep == 1) rc_yuv_row(p[0], p[1], p[2], a, o, n, xo, 1, 1, 10, 0, k, ri, bi);
+  else rc_yuv_row(p[0], p[1], p[2], a, o, n, xo, hs, cstep, depth, sh, k, ri, bi);
   return 0;
+}
+
+// ri/bi are literals at both call sites so every row loop is specialised per byte order.
+static av_always_inline void rc_rows(const RcState *t, const AVFrame *f, const AVPixFmtDescriptor *d,
+                                     int x, int y, int w, int h, const int32_t *k, uint8_t *dst,
+                                     ptrdiff_t dst_stride, int ri, int bi) {
+  for (int r = 0; r < h; r++) {
+    uint8_t *o = dst + (ptrdiff_t)r * dst_stride;
+    rc_front_row(f, d, x, y + r, w, k, o, ri, bi);
+    if (t->cls != RC_IDENTITY) rc_color_row(t, o, w, ri, bi);
+  }
+}
+
+// Planar/semi-planar YUV (8..16 bit LE, 1-byte or 2-byte samples) or packed 8-bit RGB.
+static int rc_direct(const AVPixFmtDescriptor *d) {
+  if (d->flags & (AV_PIX_FMT_FLAG_BE | AV_PIX_FMT_FLAG_PAL | AV_PIX_FMT_FLAG_HWACCEL |
+                  AV_PIX_FMT_FLAG_BITSTREAM | AV_PIX_FMT_FLAG_FLOAT | AV_PIX_FMT_FLAG_BAYER))
+    return 0;
+  if (d->flags & AV_PIX_FMT_FLAG_RGB)
+    return !(d->flags & AV_PIX_FMT_FLAG_PLANAR) && d->comp[0].depth == 8 && d->nb_components >= 3 &&
+           d->comp[0].plane == 0 && (d->comp[0].step == 3 || d->comp[0].step == 4);
+  if (d->nb_components < 3 || d->comp[0].plane != 0 || d->comp[1].plane == 0) return 0;
+  return d->comp[0].depth == 8 ? d->comp[0].step == 1 : d->comp[0].step == 2;
+}
+
+int ffframe_copy_rect_to_rgb(const AVFrame *src, int x, int y, int w, int h, int pri, int trc,
+                             int mat, int range, int target_p3, int dst_bgr, uint8_t *dst,
+                             ptrdiff_t dst_stride) {
+  if (!src || !dst || x < 0 || y < 0 || w <= 0 || h <= 0 || x > src->width - w ||
+      y > src->height - h || dst_stride < (ptrdiff_t)w * 4)
+    return AVERROR(EINVAL);
+  if (pri < 0) pri = src->color_primaries;
+  if (trc < 0) trc = src->color_trc;
+  if (mat < 0) mat = src->colorspace;
+  if (range < 0) range = src->color_range;
+  const AVPixFmtDescriptor *d = av_pix_fmt_desc_get((enum AVPixelFormat)src->format);
+  if (!d) return AVERROR(EINVAL);
+  int direct = rc_direct(d);
+  // GPU frames and formats swscale cannot read are not supported (checked before any allocation).
+  if (!direct && ((d->flags & AV_PIX_FMT_FLAG_HWACCEL) ||
+                  !sws_isSupportedInput((enum AVPixelFormat)src->format)))
+    return AVERROR(ENOSYS);
+  if (range == AVCOL_RANGE_UNSPECIFIED && (src->format == AV_PIX_FMT_YUVJ420P ||
+      src->format == AV_PIX_FMT_YUVJ422P || src->format == AV_PIX_FMT_YUVJ444P))
+    range = AVCOL_RANGE_JPEG;
+  RcState *t = av_malloc(sizeof(*t)); // ~37 KB: kept off the (blocking pool) thread stack
+  if (!t) return AVERROR(ENOMEM);
+  int ret = 0;
+  int yuv = rc_setup(t, pri, trc, mat, range, target_p3);
+  const AVFrame *f = src;
+  AVFrame *tmp = NULL;
+  if (!direct) { // rare formats (pal8, gray, rgb48, ...): whole frame to RGBA with swscale
+    struct SwsContext *s = sws_getContext(src->width, src->height, (enum AVPixelFormat)src->format,
+                                          src->width, src->height, AV_PIX_FMT_RGBA, SWS_POINT,
+                                          NULL, NULL, NULL);
+    tmp = av_frame_alloc();
+    ret = !s || !tmp ? AVERROR(ENOMEM) : 0;
+    if (!ret) {
+      int cs = mat == AVCOL_SPC_BT709 ? SWS_CS_ITU709
+             : mat == AVCOL_SPC_BT2020_NCL ? SWS_CS_BT2020
+             : SWS_CS_DEFAULT;
+      sws_setColorspaceDetails(s, sws_getCoefficients(cs), range == AVCOL_RANGE_JPEG,
+                               sws_getCoefficients(SWS_CS_DEFAULT), 1, 0, 1 << 16, 1 << 16);
+      tmp->format = AV_PIX_FMT_RGBA;
+      tmp->width = src->width;
+      tmp->height = src->height;
+      ret = av_frame_get_buffer(tmp, 0);
+    }
+    if (!ret)
+      ret = sws_scale(s, (const uint8_t *const *)src->data, src->linesize, 0, src->height,
+                      tmp->data, tmp->linesize);
+    sws_freeContext(s);
+    if (ret < 0) goto end;
+    ret = 0;
+    f = tmp;
+    d = av_pix_fmt_desc_get(AV_PIX_FMT_RGBA);
+  }
+  if (!dst_bgr) rc_rows(t, f, d, x, y, w, h, kRcYuv[yuv], dst, dst_stride, 0, 2);
+  else rc_rows(t, f, d, x, y, w, h, kRcYuv[yuv], dst, dst_stride, 2, 0);
+end:
+  av_frame_free(&tmp);
+  av_free(t);
+  return ret;
 }

@@ -51,10 +51,45 @@ pub struct Scaler {
 }
 
 impl Scaler {
-  /// convert packed RGB pixels using explicit color metadata.
-  pub fn convert_color(src: &Frame, dst: &mut Frame) -> CodecResult<()> {
-    let result =
-      unsafe { crate::ffi::accessors::ffframe_convert_rgb_color(src.as_ptr(), dst.as_mut_ptr()) };
+  /// Convert the rect (x, y, w, h) of `src` to 8-bit RGBA or BGRA rows `stride` bytes apart
+  /// in `dst`, using AVCOL_* `tags` [primaries, trc, matrix, range] (-1 = the frame's own).
+  #[allow(clippy::too_many_arguments)]
+  pub fn copy_rect_to_rgb(
+    src: &Frame,
+    rect: (u32, u32, u32, u32),
+    tags: [i32; 4],
+    target_p3: bool,
+    bgr: bool,
+    dst: &mut [u8],
+    stride: usize,
+  ) -> CodecResult<()> {
+    let (x, y, w, h) = rect;
+    let end = (h as usize)
+      .checked_sub(1)
+      .and_then(|rows| rows.checked_mul(stride))
+      .and_then(|v| v.checked_add(w as usize * 4));
+    if end.is_none_or(|end| end > dst.len()) || stride > isize::MAX as usize {
+      return Err(CodecError::InvalidConfig(
+        "copy rect does not fit the destination".into(),
+      ));
+    }
+    let result = unsafe {
+      crate::ffi::accessors::ffframe_copy_rect_to_rgb(
+        src.as_ptr(),
+        x as i32,
+        y as i32,
+        w as i32,
+        h as i32,
+        tags[0],
+        tags[1],
+        tags[2],
+        tags[3],
+        target_p3 as i32,
+        bgr as i32,
+        dst.as_mut_ptr(),
+        stride as isize,
+      )
+    };
     crate::ffi::check_error(result)?;
     Ok(())
   }
