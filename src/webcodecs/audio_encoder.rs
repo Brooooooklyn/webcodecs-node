@@ -14,6 +14,7 @@ use crate::webcodecs::error::{
 };
 use crate::webcodecs::event_target::CodecEventState;
 use crate::webcodecs::flush_tracker::FlushTracker;
+use crate::webcodecs::output_delivery::OutputDelivery;
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
 use crate::webcodecs::{
   AacBitstreamFormat, AudioData, AudioEncoderConfig, AudioEncoderSupport, EncodedAudioChunk,
@@ -210,6 +211,8 @@ struct AudioEncoderInner {
   /// End time of the last output, used for packets drained at flush after
   /// encoder delay has used up the queued input timestamps.
   last_output_end: Option<i64>,
+  /// Outputs sent through the threadsafe output callback, awaited by flush().
+  output_delivery: Arc<OutputDelivery>,
   /// Base timestamp from the first input AudioData (for timestamp calculation)
   base_timestamp: Option<i64>,
   /// W3C spec: Flag to suppress output delivery after reset()
@@ -338,6 +341,7 @@ impl AudioEncoder {
       flushes: FlushTracker::default(),
       timestamp_queue: std::collections::VecDeque::new(),
       last_output_end: None,
+      output_delivery: Arc::new(OutputDelivery::default()),
       base_timestamp: None,
       output_suppressed: false,
       pending_chunks: Vec::new(),
@@ -702,9 +706,11 @@ impl AudioEncoder {
         if guard.flushes.should_buffer_outputs() {
           guard.pending_chunks.push((chunk, metadata));
         } else {
-          guard.output_callback.call(
+          let on_delivered = guard.output_delivery.track();
+          guard.output_callback.call_with_return_value(
             (chunk, metadata).into(),
             ThreadsafeFunctionCallMode::NonBlocking,
+            on_delivered,
           );
         }
       }
@@ -1687,14 +1693,23 @@ impl AudioEncoder {
     // Clone references for the callback closure
     let inner_clone = self.inner.clone();
     let output_callback_ref = self.output_callback_ref.clone();
+    let output_delivery = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?
+      .output_delivery
+      .clone();
+    let wait_abort_flag = flush_abort_flag.clone();
 
     env.spawn_future_with_callback(
       async move {
         // Wait for worker response in a blocking thread
         let result = spawn_blocking(move || {
-          response_receiver
+          let result = response_receiver
             .recv()
-            .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?
+            .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?;
+          output_delivery.wait_until_delivered(&wait_abort_flag);
+          result
         })
         .await
         .map_err(|join_error| {

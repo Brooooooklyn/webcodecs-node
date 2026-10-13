@@ -22,6 +22,7 @@ mod mkv_muxer;
 mod mp4_demuxer;
 mod mp4_muxer;
 pub mod muxer_base;
+mod output_delivery;
 mod promise_reject;
 mod video_decoder;
 mod video_encoder;

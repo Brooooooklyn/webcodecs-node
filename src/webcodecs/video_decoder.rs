@@ -12,6 +12,7 @@ use crate::webcodecs::error::{
 };
 use crate::webcodecs::event_target::CodecEventState;
 use crate::webcodecs::flush_tracker::FlushTracker;
+use crate::webcodecs::output_delivery::OutputDelivery;
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
 use crate::webcodecs::video_frame::VideoColorSpaceInit;
 use crate::webcodecs::{
@@ -207,6 +208,8 @@ struct VideoDecoderInner {
   had_error: bool,
   /// Pending flush operations, tracked independently for overlapping calls.
   flushes: FlushTracker,
+  /// Outputs sent through the threadsafe output callback, awaited by flush().
+  output_delivery: Arc<OutputDelivery>,
   /// Next chunk sequence number for opaque identity tagging (1-based)
   next_chunk_seq: u64,
   /// Sequence number -> (timestamp, duration) for chunks in flight
@@ -342,6 +345,7 @@ impl VideoDecoder {
       keyframe_received: false,
       had_error: false,
       flushes: FlushTracker::default(),
+      output_delivery: Arc::new(OutputDelivery::default()),
       next_chunk_seq: 1,
       chunk_meta: ChunkMetaMap::new(),
       pending_frames: Vec::new(),
@@ -700,9 +704,12 @@ impl VideoDecoder {
       if guard.flushes.should_buffer_outputs() {
         guard.pending_frames.push(video_frame);
       } else {
-        guard
-          .output_callback
-          .call(video_frame, ThreadsafeFunctionCallMode::NonBlocking);
+        let on_delivered = guard.output_delivery.track();
+        guard.output_callback.call_with_return_value(
+          video_frame,
+          ThreadsafeFunctionCallMode::NonBlocking,
+          on_delivered,
+        );
       }
     }
   }
@@ -856,9 +863,12 @@ impl VideoDecoder {
         if guard.flushes.should_buffer_outputs() {
           guard.pending_frames.push(video_frame);
         } else {
-          guard
-            .output_callback
-            .call(video_frame, ThreadsafeFunctionCallMode::NonBlocking);
+          let on_delivered = guard.output_delivery.track();
+          guard.output_callback.call_with_return_value(
+            video_frame,
+            ThreadsafeFunctionCallMode::NonBlocking,
+            on_delivered,
+          );
         }
       }
     }
@@ -1727,14 +1737,23 @@ impl VideoDecoder {
     // Clone references for the callback closure
     let inner_clone = self.inner.clone();
     let output_callback_ref = self.output_callback_ref.clone();
+    let output_delivery = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?
+      .output_delivery
+      .clone();
+    let wait_abort_flag = flush_abort_flag.clone();
 
     env.spawn_future_with_callback(
       async move {
         // Wait for worker response in a blocking thread
         let result = spawn_blocking(move || {
-          response_receiver
+          let result = response_receiver
             .recv()
-            .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?
+            .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?;
+          output_delivery.wait_until_delivered(&wait_abort_flag);
+          result
         })
         .await
         .map_err(|join_error| {
