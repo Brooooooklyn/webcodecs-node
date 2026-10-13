@@ -1192,7 +1192,7 @@ int ff_codec_get_hw_pix_fmt(const AVCodec* codec, int device_type) {
 
 /* ============================================================================
  * VideoFrame.copyTo to RGBA/BGRA with a target colour space (Chrome's model).
- * Integer libyuv front end, then 256-entry decode LUT -> 3x3 -> exact
+ * Integer libyuv front end, then 256-entry decode LUT -> 3x3 (-> tone map) -> exact
  * sRGB encode. Only the copy rect is touched; output goes straight to the caller.
  * ============================================================================ */
 #include <math.h>
@@ -1204,13 +1204,16 @@ int ff_codec_get_hw_pix_fmt(const AVCodec* codec, int device_type) {
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 
-enum { RC_CURVE_SRGB, RC_CURVE_LINEAR, RC_CURVE_G22, RC_CURVE_G28 };
-enum { RC_IDENTITY, RC_LUT8, RC_MATRIX };
+enum { RC_CURVE_SRGB, RC_CURVE_LINEAR, RC_CURVE_G22, RC_CURVE_G28, RC_CURVE_PQ, RC_CURVE_HLG };
+enum { RC_IDENTITY, RC_LUT8, RC_MATRIX, RC_PQ, RC_HLG };
 
 typedef struct RcState {
   int cls;
-  float dec[256];   // 8-bit code -> linear
-  float m[9];       // src -> target
+  float dec[256];   // 8-bit code -> linear (SDR) / 203-nit relative (PQ) / scene light (HLG)
+  float m[9];       // SDR: src -> target. HDR: src -> bt2020
+  float m2[9];      // HDR: bt2020 -> target
+  float ky[3];      // HLG: luminance row of the source primaries
+  float tm_k;       // HDR: x7 * 2^y7
   float thr[256];   // encode: code k+1 starts at linear thr[k]
   struct { float t; int32_t k; } enc[4097]; // bucket [i/4096, (i+1)/4096): code k, k+1 from t on
   uint8_t lut8[256];
@@ -1226,6 +1229,18 @@ static const int32_t kRcYuv[6][6] = {
   {16320, 32, 120, 11, 37, 94},     // V2020
 };
 
+// AGTM RWTMO control points for frames without HDR metadata (x, log2 gain, slope), SPEC.md §5
+static const double kRcTm[8][3] = {
+  {1.0, -1.0, 0.0},
+  {1.2392578125, -1.0712890625, -0.439697265625},
+  {1.5859375, -1.2353515625, -0.47802734375},
+  {2.0390625, -1.44140625, -0.42529296875},
+  {2.599609375, -1.6611328125, -0.359619140625},
+  {3.267578125, -1.8798828125, -0.30126953125},
+  {4.04296875, -2.09375, -0.253662109375},
+  {4.92578125, -2.30078125, -0.2158203125},
+};
+
 static double rc_srgb_dec(double v) {
   return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4);
 }
@@ -1235,6 +1250,14 @@ static double rc_curve_dec(int curve, double v) {
   case RC_CURVE_LINEAR: return v;
   case RC_CURVE_G22: return pow(v, 2.2);
   case RC_CURVE_G28: return pow(v, 2.8);
+  case RC_CURVE_PQ: {
+    const double m1 = 2610.0 / 16384, m2 = 2523.0 / 4096 * 128;
+    const double c1 = 3424.0 / 4096, c2 = 2413.0 / 4096 * 32, c3 = 2392.0 / 4096 * 32;
+    double p = pow(v, 1.0 / m2), n = p - c1;
+    return pow((n > 0 ? n : 0) / (c2 - c3 * p), 1.0 / m1) * 10000.0 / 203.0;
+  }
+  case RC_CURVE_HLG:
+    return v <= 0.5 ? v * v / 3 : (exp((v - 0.55991073) / 0.17883277) + 0.28466892) / 12;
   default: return rc_srgb_dec(v);
   }
 }
@@ -1275,7 +1298,8 @@ static void rc_inv3(const double a[9], double o[9]) {
 }
 
 // out = inv(npm(dst)) * npm(src), as float
-static void rc_gamut(enum AVColorPrimaries src, enum AVColorPrimaries dst, float out[9]) {
+static void rc_gamut(enum AVColorPrimaries src, enum AVColorPrimaries dst, float out[9],
+                     double ky[3]) {
   double s[9], d[9], di[9];
   rc_npm(src, s);
   rc_npm(dst, d);
@@ -1283,6 +1307,7 @@ static void rc_gamut(enum AVColorPrimaries src, enum AVColorPrimaries dst, float
   for (int r = 0; r < 3; r++)
     for (int c = 0; c < 3; c++)
       out[r * 3 + c] = (float)(di[r * 3] * s[c] + di[r * 3 + 1] * s[3 + c] + di[r * 3 + 2] * s[6 + c]);
+  if (ky) for (int c = 0; c < 3; c++) ky[c] = s[3 + c];
 }
 
 // round(sRGB_encode(l) * 255), exact: a bucket is narrower than any code, so it holds at most
@@ -1305,9 +1330,11 @@ static int rc_setup(RcState *t, int pri, int trc, int mat, int range, int target
   case AVCOL_TRC_LINEAR: curve = RC_CURVE_LINEAR; break;
   case AVCOL_TRC_GAMMA22: curve = RC_CURVE_G22; break;
   case AVCOL_TRC_GAMMA28: curve = RC_CURVE_G28; break;
+  case AVCOL_TRC_SMPTE2084: curve = RC_CURVE_PQ; break;
+  case AVCOL_TRC_ARIB_STD_B67: curve = RC_CURVE_HLG; break;
   case AVCOL_TRC_BT709: case AVCOL_TRC_SMPTE170M: case AVCOL_TRC_SMPTE240M:
   case AVCOL_TRC_IEC61966_2_1: case AVCOL_TRC_BT2020_10: case AVCOL_TRC_BT2020_12: break;
-  default: missing = 1; // pq/hlg (no tone map yet), log, bt1361, smpte428, ...: drawn as sRGB
+  default: missing = 1; // log, log-sqrt, iec61966-2-4, bt1361, smpte428: drawn as sRGB
   }
   enum AVColorPrimaries gamut = (enum AVColorPrimaries)pri, dst = target_p3 ? AVCOL_PRI_SMPTE432 : AVCOL_PRI_BT709;
   double tmp[9];
@@ -1328,14 +1355,33 @@ static int rc_setup(RcState *t, int pri, int trc, int mat, int range, int target
     t->enc[i].k = k;
     t->enc[i].t = t->thr[k];
   }
-  if (gamut == dst) {
+  if (curve == RC_CURVE_PQ || curve == RC_CURVE_HLG) {
+    double ky[3];
+    t->cls = curve == RC_CURVE_PQ ? RC_PQ : RC_HLG;
+    rc_gamut(gamut, AVCOL_PRI_BT2020, t->m, ky);
+    rc_gamut(AVCOL_PRI_BT2020, dst, t->m2, NULL);
+    for (int c = 0; c < 3; c++) t->ky[c] = (float)ky[c];
+    t->tm_k = (float)(kRcTm[7][0] * exp2(kRcTm[7][1]));
+  } else if (gamut == dst) {
     t->cls = RC_LUT8;
     for (int i = 0; i < 256; i++) t->lut8[i] = rc_enc(t, t->dec[i]);
   } else {
     t->cls = RC_MATRIX;
-    rc_gamut(gamut, dst, t->m);
+    rc_gamut(gamut, dst, t->m, NULL);
   }
   return yuv;
+}
+
+static inline float rc_tm_gain(const RcState *t, float x) {
+  if (x <= 1.0f) return 0.5f;
+  if (x >= (float)kRcTm[7][0]) return t->tm_k / x;
+  int i = 0;
+  while (x > (float)kRcTm[i + 1][0]) i++;
+  float xa = (float)kRcTm[i][0], ya = (float)kRcTm[i][1], ma = (float)kRcTm[i][2];
+  float xb = (float)kRcTm[i + 1][0], yb = (float)kRcTm[i + 1][1], mb = (float)kRcTm[i + 1][2];
+  float h = xb - xa, s = (x - xa) / h;
+  float c3 = 2 * ya + ma * h - 2 * yb + mb * h, c2 = -3 * ya + 3 * yb - 2 * ma * h - mb * h;
+  return exp2f(((c3 * s + c2) * s + ma * h) * s + ya);
 }
 
 // Colour stage, in place on n pixels of 8-bit R'G'B'A (ri/bi = byte index of R and B).
@@ -1344,19 +1390,39 @@ static av_always_inline void rc_color_row(const RcState *t, uint8_t *p, int n, i
   const float *dec = t->dec;
   const float a0 = t->m[0], a1 = t->m[1], a2 = t->m[2], a3 = t->m[3], a4 = t->m[4],
               a5 = t->m[5], a6 = t->m[6], a7 = t->m[7], a8 = t->m[8];
+  const float b0 = t->m2[0], b1 = t->m2[1], b2 = t->m2[2], b3 = t->m2[3], b4 = t->m2[4],
+              b5 = t->m2[5], b6 = t->m2[6], b7 = t->m2[7], b8 = t->m2[8];
+  const float k0 = t->ky[0], k1 = t->ky[1], k2 = t->ky[2];
+  const int hlg = t->cls == RC_HLG;
   if (t->cls == RC_LUT8) {
     const uint8_t *lut = t->lut8;
     for (int i = 0; i < n; i++, p += 4) {
       uint8_t r = lut[p[0]], g = lut[p[1]], b = lut[p[2]];
       p[0] = r; p[1] = g; p[2] = b;
     }
-  } else { // RC_MATRIX
+  } else if (t->cls == RC_MATRIX) {
     for (int i = 0; i < n; i++, p += 4) {
       float r = dec[p[ri]], g = dec[p[1]], b = dec[p[bi]];
       uint8_t R = rc_enc(t, a0 * r + a1 * g + a2 * b);
       uint8_t G = rc_enc(t, a3 * r + a4 * g + a5 * b);
       uint8_t B = rc_enc(t, a6 * r + a7 * g + a8 * b);
       p[ri] = R; p[1] = G; p[bi] = B;
+    }
+  } else { // PQ / HLG: SPEC.md §5
+    for (int i = 0; i < n; i++, p += 4) {
+      float r = dec[p[ri]], g = dec[p[1]], b = dec[p[bi]];
+      if (hlg) { // OOTF, gamma 1.2, Lw 1000, 1.0 = 203 nits
+        float ys = k0 * r + k1 * g + k2 * b;
+        float k = ys > 0.0f ? powf(ys, 0.2f) * (1000.0f / 203.0f) : 0.0f;
+        r *= k; g *= k; b *= k;
+      }
+      float R = a0 * r + a1 * g + a2 * b, G = a3 * r + a4 * g + a5 * b, B = a6 * r + a7 * g + a8 * b;
+      float x = R > G ? R : G, s = rc_tm_gain(t, x > B ? x : B);
+      R *= s; G *= s; B *= s;
+      uint8_t oR = rc_enc(t, b0 * R + b1 * G + b2 * B);
+      uint8_t oG = rc_enc(t, b3 * R + b4 * G + b5 * B);
+      uint8_t oB = rc_enc(t, b6 * R + b7 * G + b8 * B);
+      p[ri] = oR; p[1] = oG; p[bi] = oB;
     }
   }
 }
