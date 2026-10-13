@@ -187,7 +187,7 @@ type ErrorCallback =
 /// Per-frame data sent to the worker as one FIFO command payload.
 struct VideoEncodeRequest {
   /// Shared reference to the frame data (via Arc for Rust-level sharing)
-  frame: Arc<ParkingLotRwLock<Frame>>,
+  frame: Result<Arc<ParkingLotRwLock<Frame>>>,
   timestamp: i64,
   /// Duration in microseconds from the input VideoFrame
   duration: Option<i64>,
@@ -349,9 +349,8 @@ struct VideoEncoderInner {
   output_callback: OutputCallback,
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
-  /// Whether the encoder entered the closed state because encoding failed.
-  /// Used to distinguish EncodingError from an explicit close in flush().
-  had_error: bool,
+  /// retains the native failure category for pending and later flush rejections.
+  failure_name: Option<DOMExceptionName>,
   /// Pending flush operations, tracked independently for overlapping calls.
   flushes: FlushTracker,
   /// Maps frame PTS (encoder time_base units) to input timestamps (µs) and
@@ -589,7 +588,7 @@ impl VideoEncoder {
       encode_queue_size: 0,
       output_callback: init.output,
       error_callback: init.error,
-      had_error: false,
+      failure_name: None,
       flushes: FlushTracker::default(),
       timestamp_map: BTreeMap::new(),
       // Hardware acceleration tracking
@@ -732,6 +731,24 @@ impl VideoEncoder {
       // Don't call report_error() - that would set state to Closed and invoke error callback
       return;
     }
+
+    let frame_arc = match frame_arc {
+      Ok(frame) => frame,
+      Err(error) => {
+        let old_size = guard.encode_queue_size;
+        guard.encode_queue_size = 0;
+        if old_size > 0 {
+          let _ = Self::fire_dequeue_event(event_state);
+        }
+        let message = if error.reason.starts_with("NotSupportedError:") {
+          "OperationError: encoder cannot read the opaque float image".to_owned()
+        } else {
+          format!("Failed to access frame: {}", error)
+        };
+        Self::report_error(&mut guard, &message);
+        return;
+      }
+    };
 
     if guard.input_color_space.is_none() {
       guard.input_color_space = color_space;
@@ -1553,11 +1570,13 @@ impl VideoEncoder {
       ));
     }
 
-    if guard.state == CodecState::Closed && guard.had_error {
-      return Err(Error::new(
-        Status::GenericFailure,
-        "EncodingError: Encode error occurred",
-      ));
+    if guard.state == CodecState::Closed {
+      if let Some(name) = guard.failure_name {
+        return Err(Error::new(
+          Status::GenericFailure,
+          format!("{}: Encode error occurred", name.as_str()),
+        ));
+      }
     }
 
     // Per W3C spec: state check happens on main thread (in flush() method).
@@ -2297,7 +2316,11 @@ impl VideoEncoder {
     inner
       .error_callback
       .call(error, ThreadsafeFunctionCallMode::NonBlocking);
-    inner.had_error = true;
+    inner.failure_name = Some(if error_msg.starts_with("OperationError:") {
+      DOMExceptionName::OperationError
+    } else {
+      DOMExceptionName::EncodingError
+    });
     inner.state = CodecState::Closed;
   }
 
@@ -3210,13 +3233,8 @@ impl VideoEncoder {
       }
 
       // Get Arc reference to frame data (shares via Rust Arc, no pixel copy)
-      let frame_arc = match frame.frame_arc() {
-        Ok(arc) => arc,
-        Err(e) => {
-          Self::report_error(&mut inner, &format!("Failed to access frame: {}", e));
-          return Ok(());
-        }
-      };
+      // resource consumption belongs to the FIFO worker, including unsupported images.
+      let frame_arc = frame.frame_arc();
 
       // Get timestamp
       let timestamp = match frame.timestamp() {
@@ -3317,8 +3335,8 @@ impl VideoEncoder {
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
       if inner.state == CodecState::Closed {
-        let (error_name, error_msg) = if inner.had_error {
-          (DOMExceptionName::EncodingError, "Encode error occurred")
+        let (error_name, error_msg) = if let Some(name) = inner.failure_name {
+          (name, "Encode error occurred")
         } else {
           (
             DOMExceptionName::InvalidStateError,
@@ -3435,8 +3453,10 @@ impl VideoEncoder {
           )?);
         }
 
-        // Return worker result (errors keep DOMException-style message for now)
-        result
+        match result {
+          Ok(()) => Ok(()),
+          Err(error) => Err(Error::from(error_as_dom_exception(env, error)?)),
+        }
       },
     )
   }
@@ -3490,7 +3510,7 @@ impl VideoEncoder {
     {
       es.note_queue_cleared(&env, cleared_queue);
     }
-    inner.had_error = false;
+    inner.failure_name = None;
 
     // Release the hardware encoder slot if we acquired one
     if inner.acquired_hw_slot {

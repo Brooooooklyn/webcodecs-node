@@ -8,7 +8,13 @@
 
 import test from 'ava'
 
-import { VideoFrame, VideoEncoder, EncodedVideoChunk } from '../index.js'
+import {
+  VideoFrame,
+  VideoEncoder,
+  EncodedVideoChunk,
+  createVideoFrameFromRGBA16Float,
+  copyVideoFrameRGBA16Float,
+} from '../index.js'
 
 // Skip all canvas tests on aarch64-windows (no @napi-rs/canvas support)
 const isAarch64Windows = process.platform === 'win32' && process.arch === 'arm64'
@@ -321,4 +327,155 @@ runTest('VideoFrame: Canvas can be encoded (smoke test)', async (t) => {
 
   t.true(chunks.length > 0, 'Should have encoded at least one chunk')
   t.is(chunks[0]!.type, 'key', 'First chunk should be keyframe')
+})
+
+test('VideoFrame: native float resource owns half bits across clone and close', (t) => {
+  const expected = new Uint16Array([0x3000, 0x3802, 0x3b00, 0x3800, 0x3d00, 0x3400, 0xb000, 0x3800])
+  const backing = new Uint16Array(expected.length + 4)
+  backing.set(expected, 2)
+  const frame = createVideoFrameFromRGBA16Float(backing.subarray(2, 10), {
+    codedWidth: 2,
+    codedHeight: 1,
+    timestamp: 123,
+    duration: 45,
+    colorSpace: { primaries: 'smpte432', transfer: 'iec61966-2-1', matrix: 'rgb', fullRange: true },
+  })
+  const clone = frame.clone()
+  try {
+    backing.fill(0)
+    t.is(frame.format, null)
+    t.deepEqual(copyVideoFrameRGBA16Float(frame), expected)
+    copyVideoFrameRGBA16Float(frame).fill(0)
+    frame.close()
+    t.deepEqual(copyVideoFrameRGBA16Float(clone), expected)
+    t.is(clone.timestamp, 123)
+    t.is(clone.duration, 45)
+    t.is(clone.colorSpace.primaries, 'smpte432')
+    t.throws(() => frame.clone(), { instanceOf: DOMException, name: 'InvalidStateError' })
+    t.throws(() => copyVideoFrameRGBA16Float(frame), { instanceOf: DOMException, name: 'InvalidStateError' })
+  } finally {
+    clone.close()
+    frame.close()
+  }
+})
+
+test('VideoFrame: opaque float resource rejects public copy formats without losing metadata', async (t) => {
+  const frame = createVideoFrameFromRGBA16Float(new Uint16Array([0x3000, 0x3802, 0x3b00, 0x3800]), {
+    codedWidth: 1,
+    codedHeight: 1,
+    timestamp: 123,
+    duration: 45,
+  })
+  try {
+    t.throws(() => frame.allocationSize(), { instanceOf: DOMException, name: 'NotSupportedError' })
+    t.throws(() => frame.allocationSize({ format: 'RGBA' }), { instanceOf: DOMException, name: 'NotSupportedError' })
+    await t.throwsAsync(frame.copyTo(new Uint8Array(8)), { instanceOf: DOMException, name: 'NotSupportedError' })
+    await t.throwsAsync(frame.copyTo(new Uint8Array(8), { format: 'RGBA' }), {
+      instanceOf: DOMException,
+      name: 'NotSupportedError',
+    })
+    frame.close()
+    t.is(frame.timestamp, 123)
+    t.is(frame.duration, 45)
+    t.deepEqual(frame.colorSpace.toJSON(), { primaries: null, transfer: null, matrix: null, fullRange: null })
+    t.is(frame.codedWidth, 0)
+    t.is(frame.format, null)
+  } finally {
+    frame.close()
+  }
+})
+
+test('VideoFrame: float image alpha discard and geometry preserve the source resource', (t) => {
+  const source = createVideoFrameFromRGBA16Float(new Uint16Array(2 * 2 * 4).fill(0x3800), {
+    codedWidth: 2,
+    codedHeight: 2,
+    timestamp: 1,
+  })
+  const clone = new VideoFrame(source, {
+    timestamp: 2,
+    alpha: 'discard',
+    rotation: 90,
+    displayWidth: 4,
+    displayHeight: 6,
+    visibleRect: { x: 1, y: 0, width: 1, height: 2 },
+  })
+  try {
+    t.is(clone.format, null)
+    t.is(clone.displayWidth, 6)
+    t.is(clone.displayHeight, 4)
+    t.is(clone.visibleRect.x, 1)
+    t.is(clone.visibleRect.width, 1)
+    t.is(copyVideoFrameRGBA16Float(clone)[3], 0x3c00)
+    t.is(copyVideoFrameRGBA16Float(source)[3], 0x3800)
+    clone.close()
+    t.is(copyVideoFrameRGBA16Float(source)[3], 0x3800)
+  } finally {
+    clone.close()
+    source.close()
+  }
+})
+
+test('VideoFrame: float image rejects inconsistent dimensions and keeps standard buffer formats', (t) => {
+  t.throws(() => createVideoFrameFromRGBA16Float(new Uint16Array(3), { codedWidth: 1, codedHeight: 1, timestamp: 0 }))
+  t.throws(() => createVideoFrameFromRGBA16Float(new Uint16Array(4), { codedWidth: 0, codedHeight: 1, timestamp: 0 }))
+  t.throws(() =>
+    createVideoFrameFromRGBA16Float(new Uint16Array(4), {
+      codedWidth: 1,
+      codedHeight: 1,
+      timestamp: 0,
+      displayWidth: 0,
+    }),
+  )
+  const frame = new VideoFrame(new Uint8Array([11, 22, 33, 44]), {
+    format: 'RGBA',
+    codedWidth: 1,
+    codedHeight: 1,
+    timestamp: 0,
+  })
+  try {
+    t.is(frame.format, 'RGBA')
+    t.is(frame.allocationSize(), 4)
+    t.throws(() => copyVideoFrameRGBA16Float(frame), { instanceOf: DOMException, name: 'NotSupportedError' })
+  } finally {
+    frame.close()
+  }
+})
+
+test('VideoFrame: opaque float encode rejects asynchronously and closes without output', async (t) => {
+  const frame = createVideoFrameFromRGBA16Float(new Uint16Array(2 * 2 * 4).fill(0x3800), {
+    codedWidth: 2,
+    codedHeight: 2,
+    timestamp: 123,
+  })
+  const chunks: EncodedVideoChunk[] = []
+  let reportError: (error: Error) => void = () => {
+    throw new Error('error promise was not initialized')
+  }
+  const errorResult = new Promise<Error>((resolve) => {
+    reportError = resolve
+  })
+  const encoder = new VideoEncoder({
+    output: (chunk) => {
+      chunks.push(chunk)
+    },
+    error: (error) => {
+      reportError(error)
+    },
+  })
+  try {
+    encoder.configure({ codec: 'vp8', width: 2, height: 2, bitrate: 1_000_000 })
+    encoder.encode(frame)
+    t.is(encoder.encodeQueueSize, 1)
+    frame.close()
+    await t.throwsAsync(encoder.flush(), { instanceOf: DOMException, name: 'OperationError' })
+    const error = await errorResult
+    t.true(error instanceof DOMException)
+    t.is(error.name, 'OperationError')
+    t.is(encoder.state, 'closed')
+    t.is(encoder.encodeQueueSize, 0)
+    t.deepEqual(chunks, [])
+  } finally {
+    frame.close()
+    if (encoder.state !== 'closed') encoder.close()
+  }
 })

@@ -1137,7 +1137,7 @@ export declare class VideoFrame {
    * Returns a Promise that resolves with an array of PlaneLayout objects.
    * Options can specify target format and rect for cropped copy.
    */
-  copyTo(destination: Uint8Array, options?: VideoFrameCopyToOptions | undefined | null): Promise<Array<PlaneLayout>>
+  copyTo(destination: Uint8Array, options?: VideoFrameCopyToOptions | undefined | null): Promise<PlaneLayout[]>
   /**
    * Clone this VideoFrame
    *
@@ -1370,6 +1370,15 @@ export type CodecState = 'unconfigured' | 'configured' | 'closed'
 
 /** ColorSpaceConversion for ImageDecoder (W3C WebCodecs spec) */
 export type ColorSpaceConversion = 'default' | 'none'
+
+/** native image-consumer interop with a real class borrow and independent half-pixel storage. */
+export declare function copyVideoFrameRGBA16Float(frame: VideoFrame): Uint16Array
+
+/** native canvas-provider interop, separate from the browser VideoFrame interface. */
+export declare function createVideoFrameFromRGBA16Float(
+  data: Uint16Array,
+  init: Omit<VideoFrameBufferInit, 'format' | 'layout' | 'transfer'> & { alpha?: 'keep' | 'discard' },
+): VideoFrame
 
 /** Audio decoder configuration exposed to JavaScript */
 export interface DemuxerAudioDecoderConfig {
