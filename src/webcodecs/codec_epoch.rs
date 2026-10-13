@@ -34,6 +34,7 @@ use napi::{check_status, sys};
 
 use super::error::{DOMExceptionName, error_as_dom_exception};
 use super::event_target::{CodecEventState, ErrorDelivery, report_exception};
+use super::output_delivery::OutputDelivery;
 
 /// Worker → JS: one output or error waits in the epoch's queue. The payload
 /// carries the generation it was queued under.
@@ -188,13 +189,24 @@ impl CodecEpoch {
     }
   }
 
-  fn send_item(&self, callback: &GatedOutput, generation: u32, item: EpochItem) {
+  fn send_item(
+    &self,
+    callback: &GatedOutput,
+    generation: u32,
+    item: EpochItem,
+    output_delivery: &Arc<OutputDelivery>,
+  ) {
     let Ok(mut outputs) = self.0.outputs.lock() else {
       return;
     };
     outputs.push_back((generation, item));
     drop(outputs);
-    callback.call(generation, ThreadsafeFunctionCallMode::NonBlocking);
+    let on_delivered = output_delivery.track();
+    callback.call_with_return_value(
+      generation,
+      ThreadsafeFunctionCallMode::NonBlocking,
+      on_delivered,
+    );
   }
 
   /// Worker: queue an output and wake the shared callback for it.
@@ -203,8 +215,14 @@ impl CodecEpoch {
     callback: &GatedOutput,
     generation: u32,
     output: BufferedOutput,
+    output_delivery: &Arc<OutputDelivery>,
   ) {
-    self.send_item(callback, generation, EpochItem::Output(output));
+    self.send_item(
+      callback,
+      generation,
+      EpochItem::Output(output),
+      output_delivery,
+    );
   }
 
   /// Move an output buffered for a pending flush into the same ordered queue
@@ -214,8 +232,14 @@ impl CodecEpoch {
     callback: &GatedOutput,
     generation: u32,
     output: BufferedOutput,
+    output_delivery: &Arc<OutputDelivery>,
   ) {
-    self.send_item(callback, generation, EpochItem::FlushOutput(output));
+    self.send_item(
+      callback,
+      generation,
+      EpochItem::FlushOutput(output),
+      output_delivery,
+    );
   }
 
   /// Queue an error behind every output already produced. Its dequeue guard

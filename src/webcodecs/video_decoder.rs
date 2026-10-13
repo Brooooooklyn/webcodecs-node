@@ -16,6 +16,7 @@ use crate::webcodecs::error::{
 };
 use crate::webcodecs::event_target::CodecEventState;
 use crate::webcodecs::flush_tracker::{FlushAbort, FlushTracker};
+use crate::webcodecs::output_delivery::OutputDelivery;
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
 use crate::webcodecs::video_frame::VideoColorSpaceInit;
 use crate::webcodecs::{
@@ -200,6 +201,8 @@ struct VideoDecoderInner {
   failure_name: Option<DOMExceptionName>,
   /// Pending flush operations, tracked independently for overlapping calls.
   flushes: FlushTracker,
+  /// Outputs sent through the threadsafe output callback, awaited by flush().
+  output_delivery: Arc<OutputDelivery>,
   /// Next chunk sequence number for opaque identity tagging (1-based)
   next_chunk_seq: u64,
   /// Sequence number -> (timestamp, duration) for chunks in flight
@@ -315,6 +318,7 @@ impl VideoDecoderInner {
       &self.output_callback,
       self.generation,
       buffered_output(frame),
+      &self.output_delivery,
     );
   }
 }
@@ -442,6 +446,7 @@ impl VideoDecoder {
       keyframe_received: false,
       failure_name: None,
       flushes: FlushTracker::default(),
+      output_delivery: Arc::new(OutputDelivery::default()),
       next_chunk_seq: 1,
       chunk_meta: ChunkMetaMap::new(),
       pending_frames: Vec::new(),
@@ -1389,6 +1394,7 @@ impl VideoDecoder {
         &inner.output_callback,
         inner.generation,
         buffered_output(frame),
+        &inner.output_delivery,
       );
     }
     inner.epoch.send_error(
@@ -1919,14 +1925,23 @@ impl VideoDecoder {
     // Clone references for the callback closure
     let inner_clone = self.inner.clone();
     let output_callback_ref = self.output_callback_ref.clone();
+    let output_delivery = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?
+      .output_delivery
+      .clone();
+    let wait_abort_flag = flush_abort.clone();
 
     env.spawn_future_with_callback(
       async move {
         // Wait for worker response in a blocking thread
         let result = spawn_blocking(move || {
-          response_receiver
+          let result = response_receiver
             .recv()
-            .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?
+            .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?;
+          output_delivery.wait_until_delivered(&wait_abort_flag);
+          result
         })
         .await
         .map_err(|join_error| {
