@@ -61,6 +61,13 @@ impl Scaler {
     dst_format: AVPixelFormat,
     algorithm: ScaleAlgorithm,
   ) -> CodecResult<Self> {
+    let conversion_flags = if src_format != dst_format
+      && matches!(dst_format, AVPixelFormat::Rgba | AVPixelFormat::Bgra)
+    {
+      crate::ffi::swscale::SWS_ACCURATE_RND | crate::ffi::swscale::SWS_FULL_CHR_H_INT
+    } else {
+      0
+    };
     let ptr = unsafe {
       sws_getContext(
         src_width as i32,
@@ -69,7 +76,7 @@ impl Scaler {
         dst_width as i32,
         dst_height as i32,
         dst_format.as_raw(),
-        algorithm.to_sws_flags(),
+        algorithm.to_sws_flags() | conversion_flags,
         std::ptr::null_mut(),
         std::ptr::null_mut(),
         std::ptr::null(),

@@ -2394,15 +2394,14 @@ impl VideoFrame {
           inner.visible_width as f64,
           inner.visible_height as f64,
         );
-        // Validate rect against SOURCE format (original_format), not target format.
-        // Rect alignment must match the source frame's subsampling requirements.
+        // conversion precedes cropping, so offsets follow the output format.
         let frame_guard = frame.read();
         let (_, _, w, h) = parse_visible_rect(
           default_rect,
           Some(rect),
           frame_guard.width(),
           frame_guard.height(),
-          original_format,
+          format,
         )?;
         (w, h)
       } else {
@@ -2522,8 +2521,7 @@ impl VideoFrame {
       }
 
       // Parse rect (default to visible rect)
-      // Validate rect against SOURCE format (original_format), not target format.
-      // Rect alignment must match the source frame's subsampling requirements.
+      // conversion precedes cropping, so offsets follow the output format.
       let default_rect = (
         inner.visible_left as f64,
         inner.visible_top as f64,
@@ -2537,9 +2535,13 @@ impl VideoFrame {
         rect,
         frame_guard.width(),
         frame_guard.height(),
-        original_format,
+        format,
       )?;
       drop(frame_guard);
+      // chromium's yuv view starts at the common chroma-aligned origin.
+      let (h_factor, v_factor) = get_subsampling_factors(original_format);
+      let rect_x = rect_x / h_factor * h_factor;
+      let rect_y = rect_y / v_factor * v_factor;
 
       // Get and validate custom layout if provided
       let custom_layout = options.as_ref().and_then(|o| o.layout.clone());
