@@ -11,14 +11,18 @@ import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 
 import {
+  ImageDecoder,
+  Mp4Demuxer,
+  VideoDecoder,
   VideoFrame,
   resetHardwareFallbackState,
+  type EncodedVideoChunk,
   type PredefinedColorSpace,
   type VideoColorSpaceInit,
   type VideoFrameCopyToOptions,
   type VideoPixelFormat,
 } from '../index.js'
-import { libyuvTableFor, yuvToRgba, type Rect } from './helpers/libyuv.js'
+import { i420ToRgba, LIBYUV, libyuvTableFor, yuvToRgba, type Rect } from './helpers/libyuv.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -254,4 +258,185 @@ test('copyTo RGBA writes rows at the layout offset and stride', async (t) => {
     const start = layout[0].offset + r * layout[0].stride
     t.is(firstMismatch(out.subarray(start, start + row), want.subarray(r * row, (r + 1) * row)), -1, `row ${r}`)
   }
+})
+
+// ============================================================================
+// Regressions: frames the first version of the colorSpace path rejected or got wrong
+// ============================================================================
+
+const RGB_TAGS: Record<string, VideoColorSpaceInit> = {
+  empty: {},
+  partial: { primaries: 'bt709' },
+  // WPT's RGBX frames: matrix and range are ignored for RGB sources
+  wptBt709Limited: { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false },
+}
+
+test('copyTo between RGB formats is an exact copy or swizzle for sRGB-like tags', async (t) => {
+  const source = Uint8Array.from({ length: 4 * 4 * 4 }, (_, i) => (i * 37 + 11) & 255)
+  // the same pixels with R and B swapped
+  const swizzled = source.map((v, i) => (i % 4 === 0 ? source[i + 2] : i % 4 === 2 ? source[i - 2] : v))
+  for (const [name, colorSpace] of Object.entries(RGB_TAGS)) {
+    for (const format of RGB_FORMATS) {
+      const frame = new VideoFrame(source, { format, codedWidth: 4, codedHeight: 4, timestamp: 0, colorSpace })
+      for (const dst of RGB_FORMATS) {
+        const sameOrder = dst.startsWith('BGR') === format.startsWith('BGR')
+        const want = sameOrder ? source : swizzled
+        t.is(firstMismatch(await copy(frame, { format: dst }), want), -1, `${name}: ${format} -> ${dst}`)
+      }
+      frame.close()
+    }
+  }
+})
+
+test('copyTo of a GIF frame to its own format equals the plain copy', async (t) => {
+  const decoder = new ImageDecoder({ data: readFileSync(join(__dirname, 'fixtures/animated.gif')), type: 'image/gif' })
+  const { image } = await decoder.decode()
+  try {
+    const plain = await copy(image, {})
+    t.is(firstMismatch(await copy(image, { format: image.format! }), plain), -1, `format ${image.format}`)
+  } finally {
+    image.close()
+    decoder.close()
+  }
+})
+
+test('copyTo RGBA of a grayscale PNG keeps the gray level', async (t) => {
+  const decoder = new ImageDecoder({ data: readFileSync(join(__dirname, 'fixtures/gray.png')), type: 'image/png' })
+  const { image } = await decoder.decode()
+  try {
+    const out = await copy(image, { format: 'RGBA' })
+    t.deepEqual(Array.from(out), Array.from({ length: 16 }, () => [64, 64, 64, 255]).flat())
+  } finally {
+    image.close()
+    decoder.close()
+  }
+})
+
+test('copyTo RGBA of a PQ frame is tone mapped instead of rejected', async (t) => {
+  const frame = new VideoFrame(new Uint8Array(24).fill(128), {
+    format: 'I420',
+    codedWidth: 4,
+    codedHeight: 4,
+    timestamp: 0,
+    colorSpace: { primaries: 'bt2020', transfer: 'pq', matrix: 'bt2020-ncl', fullRange: false },
+  })
+  const out = await copy(frame, { format: 'RGBA' })
+  frame.close()
+  t.deepEqual(Array.from(out), Array.from({ length: 16 }, () => [137, 137, 137, 255]).flat())
+})
+
+/** First frame of an MP4 fixture, decoded in software. */
+async function decodeFirstFrame(file: string): Promise<VideoFrame> {
+  const errors: Error[] = []
+  const chunks: EncodedVideoChunk[] = []
+  const demuxer = new Mp4Demuxer({ videoOutput: (chunk) => chunks.push(chunk), error: (e) => errors.push(e) })
+  await demuxer.load(join(__dirname, 'fixtures', file))
+  const config = demuxer.videoDecoderConfig!
+  await demuxer.demuxAsync()
+  demuxer.close()
+  const frames: VideoFrame[] = []
+  const decoder = new VideoDecoder({ output: (f) => frames.push(f), error: (e) => errors.push(e) })
+  decoder.configure({ ...config, hardwareAcceleration: 'prefer-software' })
+  for (const chunk of chunks) decoder.decode(chunk)
+  await decoder.flush()
+  decoder.close()
+  for (const f of frames.slice(1)) f.close()
+  if (errors.length > 0 || frames.length === 0) {
+    frames[0]?.close()
+    throw errors[0] ?? new Error(`no frame decoded from ${file}`)
+  }
+  return frames[0]
+}
+
+test('copyTo RGBA of an interlaced H.264 frame matches libyuv I601', async (t) => {
+  const frame = await decodeFirstFrame('wpt/h264_interlaced.mp4')
+  try {
+    const { codedWidth: width, codedHeight: height } = frame
+    const full = { x: 0, y: 0, width, height }
+    t.is(libyuvTableFor(frame.colorSpace), LIBYUV.I601)
+    const planes = await copy(frame, { rect: full })
+    for (const rect of [full, { x: 4, y: 2, width: 13, height: 7 }]) {
+      const got = await copy(frame, { format: 'RGBA', rect })
+      t.is(firstMismatch(got, i420ToRgba(planes, width, height, LIBYUV.I601, rect)), -1, JSON.stringify(rect))
+    }
+  } finally {
+    frame.close()
+  }
+})
+
+test('copyTo honors the Display P3 tag of decoded video', async (t) => {
+  const frame = await decodeFirstFrame('h264_p3.mp4')
+  try {
+    const p3 = await copy(frame, { format: 'RGBA', colorSpace: 'display-p3' })
+    const srgb = await copy(frame, { format: 'RGBA' })
+    // the P3 copy is the YUV stage only; converting it to sRGB must give the sRGB copy exactly
+    const p3Frame = new VideoFrame(p3, {
+      format: 'RGBA',
+      codedWidth: frame.visibleRect.width,
+      codedHeight: frame.visibleRect.height,
+      timestamp: 0,
+      colorSpace: { primaries: 'smpte432', transfer: 'iec61966-2-1', matrix: 'rgb', fullRange: true },
+    })
+    const converted = await copy(p3Frame, { format: 'RGBA' })
+    p3Frame.close()
+    t.is(firstMismatch(converted, srgb), -1)
+    t.not(firstMismatch(p3, srgb), -1, 'display-p3 and srgb copies should differ')
+  } finally {
+    frame.close()
+  }
+})
+
+test('concurrent copyTo calls give the same bytes as sequential ones', async (t) => {
+  const w = 320
+  const h = 180
+  const i420 = (colorSpace: VideoColorSpaceInit) =>
+    new VideoFrame(
+      Uint8Array.from({ length: (w * h * 3) / 2 }, (_, i) => 16 + ((i * 7) % 220)),
+      { format: 'I420', codedWidth: w, codedHeight: h, timestamp: 0, colorSpace },
+    )
+  const p10 = (colorSpace: VideoColorSpaceInit) =>
+    new VideoFrame(le16(Array.from({ length: (w * h * 3) / 2 }, (_, i) => 64 + ((i * 13) % 876))), {
+      format: 'I420P10',
+      codedWidth: w,
+      codedHeight: h,
+      timestamp: 0,
+      colorSpace,
+    })
+  const rgba = (colorSpace?: VideoColorSpaceInit) =>
+    new VideoFrame(
+      Uint8Array.from({ length: w * h * 4 }, (_, i) => (i * 31) & 255),
+      {
+        format: 'RGBA',
+        codedWidth: w,
+        codedHeight: h,
+        timestamp: 0,
+        ...(colorSpace ? { colorSpace } : {}),
+      },
+    )
+  const frames = [
+    i420({ primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false }),
+    i420({ primaries: 'bt2020', transfer: 'bt709', matrix: 'bt2020-ncl', fullRange: false }),
+    p10({ primaries: 'bt2020', transfer: 'pq', matrix: 'bt2020-ncl', fullRange: false }),
+    p10({ primaries: 'bt2020', transfer: 'hlg', matrix: 'bt2020-ncl', fullRange: false }),
+    rgba({ primaries: 'smpte432', transfer: 'iec61966-2-1', matrix: 'rgb', fullRange: true }),
+    rgba(),
+  ]
+  const targets = ['srgb', 'display-p3', undefined] as const
+  const calls = Array.from({ length: 96 }, (_, k) => {
+    const x = (k * 34) % 160
+    const y = (k * 18) % 90
+    const colorSpace = targets[k % 3]
+    const options: VideoFrameCopyToOptions = {
+      format: RGB_FORMATS[k % 4],
+      ...(colorSpace ? { colorSpace } : {}),
+      rect: { x, y, width: 1 + ((k * 23) % 159), height: 1 + ((k * 13) % 89) },
+    }
+    return [frames[k % frames.length], options] as const
+  })
+  const sequential: Uint8Array[] = []
+  for (const [frame, options] of calls) sequential.push(await copy(frame, options))
+  const concurrent = await Promise.all(calls.map(([frame, options]) => copy(frame, options)))
+  for (const frame of frames) frame.close()
+  const mismatched = calls.flatMap((_, i) => (firstMismatch(concurrent[i], sequential[i]) === -1 ? [] : [i]))
+  t.deepEqual(mismatched, [])
 })
