@@ -13,9 +13,24 @@ use crate::webcodecs::error::{
   not_supported_error, throw_invalid_state_error, throw_not_supported_error, type_error,
 };
 use napi::bindgen_prelude::*;
+use napi::threadsafe_function::UnknownReturnValue;
 use napi_derive::napi;
 use parking_lot::RwLock;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+static NEXT_FRAME_ID: AtomicU64 = AtomicU64::new(1);
+// callbacks are weak native references anchored by the frame's traceable listener map.
+// this keeps a callback that captures its frame collectible with that frame.
+struct FrameCloseObservers {
+  env: napi::sys::napi_env,
+  callbacks: Vec<usize>,
+}
+thread_local! {
+  static CLOSE_OBSERVERS: RefCell<HashMap<u64, FrameCloseObservers>> = RefCell::new(HashMap::new());
+}
 
 /// Video pixel format (WebCodecs spec)
 #[napi(string_enum)]
@@ -1302,6 +1317,7 @@ fn parse_visible_rect(
 /// This is a WebCodecs-compliant VideoFrame implementation backed by FFmpeg.
 #[napi]
 pub struct VideoFrame {
+  observer_id: u64,
   inner: Arc<Mutex<Option<VideoFrameInner>>>,
   /// Frame metadata lives outside the detachable resource per WebCodecs.
   timestamp_us: i64,
@@ -1324,6 +1340,7 @@ fn parse_rotation(rotation: f64) -> f64 {
 impl VideoFrame {
   fn from_inner(inner: VideoFrameInner) -> Self {
     Self {
+      observer_id: NEXT_FRAME_ID.fetch_add(1, Ordering::Relaxed),
       timestamp_us: inner.timestamp_us,
       duration_us: inner.duration_us,
       rotation: inner.rotation,
@@ -2202,9 +2219,9 @@ impl VideoFrame {
 
   /// Get the coded rect (the region containing valid pixel data)
   /// Returns DOMRectReadOnly per W3C WebCodecs spec
-  /// Throws InvalidStateError if the VideoFrame is closed
+  /// returns null after the resource is closed.
   #[napi(getter)]
-  pub fn coded_rect(&self, env: Env) -> Result<DOMRectReadOnly> {
+  pub fn coded_rect(&self) -> Result<Option<DOMRectReadOnly>> {
     let guard = self
       .inner
       .lock()
@@ -2213,35 +2230,35 @@ impl VideoFrame {
     match guard.as_ref() {
       Some(inner) => {
         let (width, height) = inner.resource.dimensions();
-        Ok(DOMRectReadOnly {
+        Ok(Some(DOMRectReadOnly {
           x: 0.0,
           y: 0.0,
           width: width as f64,
           height: height as f64,
-        })
+        }))
       }
-      _ => throw_invalid_state_error(&env, "VideoFrame is closed"),
+      _ => Ok(None),
     }
   }
 
   /// Get the visible rect (the region of coded data that should be displayed)
   /// Returns DOMRectReadOnly per W3C WebCodecs spec
-  /// Throws InvalidStateError if the VideoFrame is closed
+  /// returns null after the resource is closed.
   #[napi(getter)]
-  pub fn visible_rect(&self, env: Env) -> Result<DOMRectReadOnly> {
+  pub fn visible_rect(&self) -> Result<Option<DOMRectReadOnly>> {
     let guard = self
       .inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) => Ok(DOMRectReadOnly {
+      Some(inner) => Ok(Some(DOMRectReadOnly {
         x: inner.visible_left as f64,
         y: inner.visible_top as f64,
         width: inner.visible_width as f64,
         height: inner.visible_height as f64,
-      }),
-      _ => throw_invalid_state_error(&env, "VideoFrame is closed"),
+      })),
+      _ => Ok(None),
     }
   }
 
@@ -2345,7 +2362,7 @@ impl VideoFrame {
     if inner.resource.format().is_none() {
       return throw_not_supported_error(
         &env,
-        "opaque float image cannot be copied to a WebCodecs pixel format",
+        "Failed to execute 'allocationSize' on 'VideoFrame': Operation is not supported when format is null.",
       );
     }
 
@@ -2483,6 +2500,11 @@ impl VideoFrame {
         _ => return Err(invalid_state_error("VideoFrame is closed")),
       };
 
+      if inner.resource.format().is_none() {
+        return Err(not_supported_error(
+          "Failed to execute 'copyTo' on 'VideoFrame': Operation is not supported when format is null.",
+        ));
+      }
       let (frame, original_format) = inner.resource.software()?;
       let format = options
         .as_ref()
@@ -3097,7 +3119,7 @@ impl VideoFrame {
   /// 2. Assign true to frame's [[Detached]]
   /// Note: Metadata (timestamp, duration, etc.) remains accessible after close
   #[napi]
-  pub fn close(&self) -> Result<()> {
+  pub fn close(&self, env: Env, this: This) -> Result<()> {
     let mut guard = self
       .inner
       .lock()
@@ -3106,7 +3128,46 @@ impl VideoFrame {
     // Detach and drop the resource immediately. Timestamp and duration are stored
     // separately so their getters remain available after detachment.
     *guard = None;
-
+    drop(guard);
+    // expire consumers synchronously on explicit close. garbage collection
+    // releases observer references without expiring independently owned images.
+    let observers =
+      CLOSE_OBSERVERS.with(|registry| registry.borrow_mut().remove(&self.observer_id));
+    let mut thrown = Vec::new();
+    for (id, reference) in observers
+      .into_iter()
+      .flat_map(|entry| entry.callbacks)
+      .enumerate()
+    {
+      let callback = super::event_target::upgrade_ref(&env, reference)?;
+      super::event_target::release_callback(&env, Some(this.raw()), id as u64, reference);
+      let Some(callback) = callback else { continue };
+      let mut result = std::ptr::null_mut();
+      let mut receiver = std::ptr::null_mut();
+      unsafe { napi::sys::napi_get_undefined(env.raw(), &mut receiver) };
+      let status = unsafe {
+        napi::sys::napi_call_function(
+          env.raw(),
+          receiver,
+          callback.raw(),
+          0,
+          std::ptr::null(),
+          &mut result,
+        )
+      };
+      if status != napi::sys::Status::napi_ok {
+        let mut exception = std::ptr::null_mut();
+        if unsafe { napi::sys::napi_get_and_clear_last_exception(env.raw(), &mut exception) }
+          == napi::sys::Status::napi_ok
+          && !exception.is_null()
+        {
+          thrown.push(exception);
+        }
+      }
+    }
+    for exception in thrown {
+      super::event_target::report_exception(&env, exception);
+    }
     Ok(())
   }
 
@@ -3740,4 +3801,55 @@ pub fn create_video_frame_from_rgba16_float(
 #[napi(js_name = "copyVideoFrameRGBA16Float")]
 pub fn copy_video_frame_rgba16_float(env: Env, frame: &VideoFrame) -> Result<Uint16Array> {
   frame.copy_rgba16_float(env)
+}
+
+impl Drop for VideoFrame {
+  fn drop(&mut self) {
+    // a frame wrapper can be collected while its external texture still owns
+    // an image. removing its callbacks must not perform an explicit close.
+    let _ = CLOSE_OBSERVERS.try_with(|registry| {
+      let observers = registry.borrow_mut().remove(&self.observer_id);
+      if let Some(observers) = observers {
+        for reference in observers.callbacks {
+          unsafe {
+            napi::sys::napi_delete_reference(observers.env, reference as napi::sys::napi_ref)
+          };
+        }
+      }
+    });
+  }
+}
+
+/// native image consumers subscribe to explicit close without changing the browser interface.
+#[napi(
+  js_name = "registerVideoFrameCloseObserver",
+  ts_args_type = "frame: VideoFrame, callback: () => void"
+)]
+pub fn register_video_frame_close_observer(
+  env: Env,
+  frame: ClassInstance<VideoFrame>,
+  callback: FunctionRef<(), UnknownReturnValue>,
+) -> Result<()> {
+  if frame.closed()? {
+    return throw_invalid_state_error(&env, "VideoFrame is closed");
+  }
+  let callback = callback.borrow_back(&env)?;
+  CLOSE_OBSERVERS.with(|registry| {
+    let mut registry = registry.borrow_mut();
+    let observers = registry
+      .entry(frame.observer_id)
+      .or_insert_with(|| FrameCloseObservers {
+        env: env.raw(),
+        callbacks: Vec::new(),
+      });
+    let id = observers.callbacks.len() as u64;
+    let reference = super::event_target::CodecEventState::anchor_callback(
+      &env,
+      Some(frame.value),
+      id,
+      callback.raw(),
+    )?;
+    observers.callbacks.push(reference);
+    Ok(())
+  })
 }

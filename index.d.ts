@@ -1086,15 +1086,15 @@ export declare class VideoFrame {
   /**
    * Get the coded rect (the region containing valid pixel data)
    * Returns DOMRectReadOnly per W3C WebCodecs spec
-   * Throws InvalidStateError if the VideoFrame is closed
+   * returns null after the resource is closed.
    */
-  get codedRect(): DOMRectReadOnly
+  get codedRect(): DOMRectReadOnly | null
   /**
    * Get the visible rect (the region of coded data that should be displayed)
    * Returns DOMRectReadOnly per W3C WebCodecs spec
-   * Throws InvalidStateError if the VideoFrame is closed
+   * returns null after the resource is closed.
    */
-  get visibleRect(): DOMRectReadOnly
+  get visibleRect(): DOMRectReadOnly | null
   /**
    * Get the presentation timestamp in microseconds
    * Per W3C spec: "The timestamp getter steps are to return [[timestamp]]"
@@ -1152,7 +1152,7 @@ export declare class VideoFrame {
    * 2. Assign true to frame's [[Detached]]
    * Note: Metadata (timestamp, duration, etc.) remains accessible after close
    */
-  close(): void
+  close(this: this): void
 }
 
 /**
@@ -1668,6 +1668,9 @@ export interface PlaneLayout {
   /** Number of bytes per row (stride) */
   stride: number
 }
+
+/** native image consumers subscribe to explicit close without changing the browser interface. */
+export declare function registerVideoFrameCloseObserver(frame: VideoFrame, callback: () => void): void
 
 /**
  * Reset all hardware fallback state.

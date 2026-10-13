@@ -351,8 +351,8 @@ frame.close()
 ### Native float canvas interop
 
 Native canvas providers can retain RGBA16Float images with
-`createVideoFrameFromRGBA16Float(data, init)`. `data` contains tightly packed,
-unpremultiplied RGBA half-float bit patterns in a `Uint16Array`, with four
+`createVideoFrameFromRGBA16Float(data, init)`. `data` contains tightly packed
+RGBA half-float bit patterns in a `Uint16Array`, with four
 components per coded pixel. The native frame copies the input once; clones share
 immutable storage, and closing one frame leaves its clones usable. Supply the
 image color space in `init.colorSpace`; the default is full-range sRGB.
@@ -361,7 +361,11 @@ These frames have `format === null`. Public `allocationSize()` and `copyTo()`
 reject with `NotSupportedError`, including requests for an explicit eight-bit
 format. `copyVideoFrameRGBA16Float(frame)` gives native image consumers an
 independent copy of the half-float bits without changing that public contract.
-Both functions are module exports rather than additions to `VideoFrame.prototype`.
+These functions are module exports rather than additions to `VideoFrame.prototype`.
+Native GPU consumers can use `registerVideoFrameCloseObserver(frame, callback)`
+to expire their retained textures synchronously when that frame is explicitly
+closed. Clones have independent observers. Collecting a frame wrapper releases
+its observers while independently retained GPU images remain usable.
 
 The FFmpeg encoder cannot consume this opaque image resource. `encode()` queues
 the input normally, then reports a native `OperationError`, rejects pending

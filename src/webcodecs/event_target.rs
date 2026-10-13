@@ -425,7 +425,7 @@ impl CodecEventState {
   /// weak napi_ref for invocation. If no Map edge can be installed (no codec
   /// object captured), falls back to a strong ref so the callback stays
   /// callable — trading collectability for correctness on that path.
-  fn anchor_callback(
+  pub(crate) fn anchor_callback(
     env: &Env,
     codec: Option<sys::napi_value>,
     id: u64,
@@ -866,7 +866,7 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
 
 /// Report one listener exception as an uncaught error via the microtask queue.
 /// Falls back to throwing inline if scheduling fails — better than swallowing.
-fn report_exception(env: &Env, exc: sys::napi_value) {
+pub(crate) fn report_exception(env: &Env, exc: sys::napi_value) {
   let mut exc_ref = ptr::null_mut();
   let env_raw = env.raw();
   let reported =
@@ -1020,7 +1020,7 @@ pub(crate) fn upgrade_ref(env: &Env, refr: usize) -> Result<Option<Unknown<'stat
 
 /// Release one registered callback: delete its napi_ref handle and drop its
 /// liveness entry from the codec's listener Map. JS thread only.
-fn release_callback(env: &Env, codec: Option<sys::napi_value>, id: u64, refr: usize) {
+pub(crate) fn release_callback(env: &Env, codec: Option<sys::napi_value>, id: u64, refr: usize) {
   unsafe { sys::napi_delete_reference(env.raw(), refr as sys::napi_ref) };
   if let Some(codec) = codec
     && let Ok(Some(map)) = listener_map(env, codec, false)

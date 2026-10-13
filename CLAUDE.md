@@ -744,8 +744,8 @@ These are fundamental limitations that cannot be resolved without upstream NAPI-
 | Enum casing                  | lowercase               | ✅ "key", "unconfigured"      |
 | VideoColorSpace.toJSON()     | toJSON() method         | ✅ Correct capitalization     |
 | DOMRectReadOnly.toJSON()     | toJSON() method         | ✅ Correct capitalization     |
-| VideoFrame.codedRect         | throws on closed        | ✅ InvalidStateError          |
-| VideoFrame.visibleRect       | throws on closed        | ✅ InvalidStateError          |
+| VideoFrame.codedRect         | null on closed          | ✅ Detached metadata          |
+| VideoFrame.visibleRect       | null on closed          | ✅ Detached metadata          |
 | VideoFrame visibleRect param | cropping support        | ✅ Full W3C compliance        |
 | VideoFrame.copyTo rect       | subregion copy          | ✅ Full W3C compliance        |
 | VideoFrame.copyTo format     | format conversion       | ✅ YUV→RGB, RGB→RGB supported |

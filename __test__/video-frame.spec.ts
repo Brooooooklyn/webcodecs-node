@@ -272,6 +272,8 @@ test('VideoFrame: close() releases resources', (t) => {
   // Metadata remains observable after the native pixel storage is detached.
   t.is(frame.timestamp, 12_345)
   t.is(frame.duration, 33_333)
+  t.is(frame.codedRect, null)
+  t.is(frame.visibleRect, null)
   t.throws(() => frame.allocationSize())
 
   // Idempotent - calling close again should not throw

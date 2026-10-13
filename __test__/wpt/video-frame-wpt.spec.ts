@@ -710,6 +710,7 @@ test('VideoFrame: codedRect', (t) => {
   })
 
   const rect = frame.codedRect
+  if (!rect) throw new Error('live frame has no coded rectangle')
   t.truthy(rect)
   t.true(rect instanceof DOMRectReadOnly)
   t.is(rect.x, 0)

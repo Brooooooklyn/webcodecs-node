@@ -14,6 +14,7 @@ import {
   EncodedVideoChunk,
   createVideoFrameFromRGBA16Float,
   copyVideoFrameRGBA16Float,
+  registerVideoFrameCloseObserver,
 } from '../index.js'
 
 // Skip all canvas tests on aarch64-windows (no @napi-rs/canvas support)
@@ -166,6 +167,7 @@ runTest('VideoFrame: Canvas with visibleRect', (t) => {
   t.is(frame.codedHeight, 240)
 
   const visibleRect = frame.visibleRect
+  if (!visibleRect) throw new Error('live canvas frame has no visible rectangle')
   t.is(visibleRect.x, 10)
   t.is(visibleRect.y, 10)
   t.is(visibleRect.width, 300)
@@ -341,12 +343,21 @@ test('VideoFrame: native float resource owns half bits across clone and close', 
     colorSpace: { primaries: 'smpte432', transfer: 'iec61966-2-1', matrix: 'rgb', fullRange: true },
   })
   const clone = frame.clone()
+  const closed: string[] = []
+  registerVideoFrameCloseObserver(frame, () => {
+    closed.push('source')
+  })
+  registerVideoFrameCloseObserver(clone, () => {
+    closed.push('clone')
+  })
   try {
     backing.fill(0)
     t.is(frame.format, null)
     t.deepEqual(copyVideoFrameRGBA16Float(frame), expected)
     copyVideoFrameRGBA16Float(frame).fill(0)
     frame.close()
+    frame.close()
+    t.deepEqual(closed, ['source'])
     t.deepEqual(copyVideoFrameRGBA16Float(clone), expected)
     t.is(clone.timestamp, 123)
     t.is(clone.duration, 45)
@@ -357,6 +368,7 @@ test('VideoFrame: native float resource owns half bits across clone and close', 
     clone.close()
     frame.close()
   }
+  t.deepEqual(closed, ['source', 'clone'])
 })
 
 test('VideoFrame: opaque float resource rejects public copy formats without losing metadata', async (t) => {
@@ -379,6 +391,8 @@ test('VideoFrame: opaque float resource rejects public copy formats without losi
     t.is(frame.duration, 45)
     t.deepEqual(frame.colorSpace.toJSON(), { primaries: null, transfer: null, matrix: null, fullRange: null })
     t.is(frame.codedWidth, 0)
+    t.is(frame.codedRect, null)
+    t.is(frame.visibleRect, null)
     t.is(frame.format, null)
   } finally {
     frame.close()
@@ -403,8 +417,10 @@ test('VideoFrame: float image alpha discard and geometry preserve the source res
     t.is(clone.format, null)
     t.is(clone.displayWidth, 6)
     t.is(clone.displayHeight, 4)
-    t.is(clone.visibleRect.x, 1)
-    t.is(clone.visibleRect.width, 1)
+    const rect = clone.visibleRect
+    if (!rect) throw new Error('live float frame has no visible rectangle')
+    t.is(rect.x, 1)
+    t.is(rect.width, 1)
     t.is(copyVideoFrameRGBA16Float(clone)[3], 0x3c00)
     t.is(copyVideoFrameRGBA16Float(source)[3], 0x3800)
     clone.close()
