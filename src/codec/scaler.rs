@@ -322,4 +322,63 @@ mod tests {
     assert!(converter.is_ok());
     assert!(converter.unwrap().is_converter_only());
   }
+
+  /// BT.709 limited-range tags [primaries, trc, matrix, range].
+  const BT709_LIMITED: [i32; 4] = [
+    crate::ffi::AVColorPrimaries::Bt709 as i32,
+    crate::ffi::AVColorTransferCharacteristic::Bt709 as i32,
+    crate::ffi::AVColorSpace::Bt709 as i32,
+    crate::ffi::AVColorRange::Mpeg as i32,
+  ];
+
+  /// 4x2 I420 frame: row 0 is Y=235 (white), row 1 is Y=16 (black), U=V=128.
+  fn white_black_i420() -> Frame {
+    let mut frame = Frame::new_video(4, 2, AVPixelFormat::Yuv420p).unwrap();
+    let y_stride = frame.linesize(0) as usize;
+    let y = frame.plane_data_mut(0).unwrap();
+    y[..4].fill(235);
+    y[y_stride..y_stride + 4].fill(16);
+    for plane in 1..3 {
+      frame.plane_data_mut(plane).unwrap().fill(128);
+    }
+    frame
+  }
+
+  #[test]
+  fn copy_rect_to_rgb_limited_white_black() {
+    let frame = white_black_i420();
+    for bgr in [false, true] {
+      let mut dst = [0u8; 4 * 4 * 2];
+      Scaler::copy_rect_to_rgb(
+        &frame,
+        (0, 0, 4, 2),
+        BT709_LIMITED,
+        false,
+        bgr,
+        &mut dst,
+        16,
+      )
+      .unwrap();
+      for px in dst[..16].chunks(4) {
+        assert_eq!(px, [255, 255, 255, 255]);
+      }
+      for px in dst[16..].chunks(4) {
+        assert_eq!(px, [0, 0, 0, 255]);
+      }
+    }
+  }
+
+  #[test]
+  fn copy_rect_to_rgb_rejects_out_of_bounds() {
+    let frame = white_black_i420();
+    let copy = |rect, dst: &mut [u8]| {
+      Scaler::copy_rect_to_rgb(&frame, rect, BT709_LIMITED, false, false, dst, 8)
+    };
+    let mut dst = [0u8; 2 * 4 * 2];
+    // x + width runs past the 4-pixel-wide frame
+    assert!(copy((3, 0, 2, 2), &mut dst).is_err());
+    // the last row needs 8 bytes at offset 8, so 15 bytes is one too few
+    assert!(copy((0, 0, 2, 2), &mut dst[..15]).is_err());
+    assert!(copy((0, 0, 2, 2), &mut dst).is_ok());
+  }
 }
