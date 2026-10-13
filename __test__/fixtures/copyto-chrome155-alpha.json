@@ -1,0 +1,36 @@
+{
+  "chrome": "155.0.8059.40",
+  "colors": [
+    [255, 0, 0],
+    [200, 100, 50],
+    [37, 180, 250],
+    [128, 128, 128],
+    [255, 255, 255],
+    [1, 2, 3]
+  ],
+  "alphas": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 16, 20, 24, 32, 40, 48, 63, 64, 96, 100, 127, 128, 129, 150, 160, 192, 200, 224, 250, 253, 254],
+  "rgb": {
+    "A p>s": "AAAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAAAAAA/wAA/3YAt09Synwv214f5kkSwmkAzlk21Gwn214fzWUO214f31cb214f2Vcl1mEa1F8h2V0a1V4c1lwi1l4g1lwh2F0f1lwf1l4e2F0d1l0e2Fwg11wf110f110f1lwg110fAAAAAP//AIL/AK3/AML/AND/AK3/ALn/AMP/AK3/ALb/AK3/AL7/ALP/ALb/ALj/ALv9ALb/ALj/ALX/ALf/ALj/ALj/ALj/ALf/ALf/ALf/ALf/ALj/ALf/ALf/ALf/ALj/ALf/AAAA////f3+Aqqqqf3+AmZmZf3+AkpKSf3+Ajo6Of3+Af3+AiIiIf3+Af3+Af3+Af3+Af3+Af3+AgYKCf3+Af3+Af3+AgIGBf3+AgICAf3+Af3+Af3+Af3+Af3+Af3+AgICAf3+AAAAA////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGAAAEAAQEAAMDAAMDAAICAgIEAgIEAgIEAgIDAQMDAQMDAQIEAQIDAQIDAQID",
+    "A s>p": "AAAA6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMj6jMjAAAA6jMj74Yzn1pXtoJLv2s/xV04rHE1s2VHu3VEv2s/tG45v2s/wWY8v2s/vGZAu209uWs/vWo9umo9umk/u2o+umk/vGo+umk+u2o+vGo+umo+vGk+u2k+u2o+u2k+u2k+u2o+AAAAdfv9N373TKf4Z735Z8n6Vaj4WLT5W7z5UKj4VLD5Vaj4Wrj5VK34V7D5VrL5WrXxV7DzWLL0VrD1V7H1WLL0WLL0V7L1V7HzWLHzWLL0V7H0WLL0V7H0WLH0V7H0WLL0V7H0AAAA////gH9/qqqqgH9/mZmZgH9/kpKSgH9/jo6OgH9/gH9/iIiIgH9/gH9/gH9/gH9/gH9/gH9/goKCgH9/gH9/gH9/gYCAgH9/gICAgH9/gH9/gH9/gH9/gH9/gH9/gICAgH9/AAAA////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFAAAEAQQEAAMDAAIDAAICAgIEAgIEAgIDAgIDAgMDAgMDAQIDAQIDAQIDAQID",
+    "A same": "AAAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAAAAAA/wAA/4AAqlVVv4BAzGYz1FUqtm0kv2BAxnE5zGYzv2oqzGYzz2AwzGYzymA1x2gwxmYzymUwxmUxx2Q0x2Uyx2MzyWQyx2QyyGUxyWQxx2QxyWQyyGMyyGQyyGQyyGQyyGQyAAAAAP//AID/AKr/QL//M8z/Kqr/JLb/IL//HKr/GrP/Kqr/Irv/IK//JrP/ILX/KLf3JrP5JbX6JLL7JLP7JbX6JrX6JLX7JrP5JrT5JbT6JbT6JbX6JbT6JrT6JbT6JbT6JbT6AAAA////gICAqqqqgICAmZmZgICAkpKSgICAjo6OgICAgICAiIiIgICAgICAgICAgICAgICAgICAgoKCgICAgICAgICAgYGBgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAAAAA////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFAAAEAAQEAAMDAAMDAAICAgIEAgIEAgIDAgIDAQMDAQMDAQIDAQIDAQIDAQID",
+    "X p>s": "AAAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAAAAAA///////////////////////////////////////////////////////////////3///F//+l//99//97//ZS/+xP/7o+/7k+/7c9/501/5Qx/3sp/3Yn9Wkj214g2V0f2F0fAAAAAP//AP//AP//AP//AP//AP//AP//AP//AP//AP//AP//AP//AP//AP//AP//AP//AP//AP//AP//AP//AP//AP//AP//AP//AP//AP//AP//APP/AOr/ANH/ALv/ALn/ALj/AAAA/////////////////////////////////////////////////////////////////////////////////////////////////f392trazMzMqqqqo6OjkpKSg4ODgYGBgIGBAAAA////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////AAAAxv//Y///Qq7/MYLHKGifIVeFHEpyGUFjFjpYFDRQECtCDSM1DCEyChooCBYhBhAZBQ0UBAsRAwgNAwgMAgUIAgUIAgQGAgQGAgQGAQMFAQMFAQMEAQMEAQIEAQIDAQIDAQID",
+    "X s>p": "AAAA///////////////////////////////////////////////////////////////////h//+8/8+P/8uN/4he/4Ja/2dH/2ZG/2VG/1c8/1E4/0Qv/0Et/zoo7zQk7DMk6zMjAAAA///////////////////////////////////////////////////////////////////////////7///3//+l//+e/9R8/9J7/9B6/7Np/6hj+YxS74ZP1XhHv2s/vWo+vGo+AAAA////////////////////////////////////////////////////////////////////////////////6P//3///sP//rv//rf//lf//i///dOz/b+L/ZMr/WbX5WLP2WLL1AAAA/////////////////////////////////////////////////////////////////////////////////////////////////f392trazMzMqqqqo6OjkpKSg4ODgYGBgYCAAAAA////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////AAAA////lvv/ZKf2S324PGSUMlR7K0hpJj9cIThSHjJKGSo9FCExEx8uDxklDRUfCRAXCA0SBgoPBQgMBQgMAwUIAwUHAgQGAgQGAgQGAgMFAgMFAgMEAgMEAQIDAQIDAQIDAQID",
+    "X same": "AAAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAAAAAA///////////////////////////////////////////////////////////////////////////K///H//+F//+A/8lk/8dk/8Zj/6pV/59Q/4VC/4BA5HI5zGYzymUyyWQyAAAA////////////////////////////////////////////////////////////////7P//xf//lv//k///Yv//Xv//Sv//Sv//Sf//P///O///Me//L+X/Ks3/Jrj/JbX8JbX7AAAA/////////////////////////////////////////////////////////////////////////////////////////////////f392trazMzMqqqqo6OjkpKSg4ODgYGBgYGBAAAA////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////AAAA////gP//Var/QIC/M2aZKlWAJEltIEBgHDlVGjNNFSpAESIzECAwDRomCxUgCBAYBg0TBQsQBAgMBAgMAwUIAwUIAgQGAgQGAgQGAgMFAgMFAQMEAQMEAQIDAQIDAQIDAQID"
+  },
+  "i420a": [
+    {
+      "yuv": [126, 128, 128],
+      "rgb": {
+        "srgb": "AAAA////gICAqqqqgICAmZmZgICAkpKSgICAjo6OgICAgICAiIiIgICAgICAgICAgICAgICAgICAgoKCgICAgICAgICAgYGBgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA",
+        "display-p3": "AAAA////gH9/qqqqgH9/mZmZgH9/kpKSgH9/jo6OgH9/gH9/iIiIgH9/gH9/gH9/gH9/gH9/gH9/goKCgH9/gH9/gH9/gYCAgH9/gICAgH9/gH9/gH9/gH9/gH9/gH9/gICAgH9/"
+      }
+    },
+    {
+      "yuv": [63, 102, 240],
+      "rgb": {
+        "srgb": "AAAA/////4CA/1VV/0BA/zMz/yoq/yQk/yAg/xwc/xoa/xUV/xER/xAQ/w0N/wsL/wgI/wYG/wUF/wQE/wQE/wMF/wMF/wIE/wIE/wIE/wID/wID/wEE/wEE/wED/wED/wED/wED",
+        "display-p3": "AAAA////74aD7GJc61FJ60g/60M56kA06j0x6jwv6jou6jkr6jcp6jcp6jYo6jYn6jUm6jUm6jQl6jQl6jQl6jQl6jQl6jQl6jQl6jQl6jMk6jMk6jMl6jMl6jMk6jMk6jMk6jMk"
+      }
+    }
+  ]
+}

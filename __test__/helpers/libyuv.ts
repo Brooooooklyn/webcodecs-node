@@ -78,6 +78,26 @@ export function yuvToRgba(src: YuvPlanes, t: LibyuvTable, rect: Rect): Uint8Arra
   return out
 }
 
+const f32 = Math.fround
+const INV255 = f32(1 / 255)
+
+/** Round half to even, like Skia's float to int store. */
+const rint = (v: number) => {
+  const r = Math.round(v)
+  return r - v === 0.5 && r % 2 !== 0 ? r - 1 : r
+}
+
+/**
+ * Chrome's alpha handling when a copy changes the format but not the colour: an 8-bit premultiply
+ * ('rgb': SkSwizzler (c * a + 127) / 255, 'yuv': libyuv ARGBAttenuate (c * a + 255) >> 8, 'none' for
+ * RGBX/BGRX sources), then Skia's float32 unpremultiply. Alpha 0 gives 0.
+ */
+export function chromeAlphaRoundTrip(c: number, a: number, premultiply: 'rgb' | 'yuv' | 'none'): number {
+  const p = premultiply === 'rgb' ? Math.floor((c * a + 127) / 255) : premultiply === 'yuv' ? (c * a + 255) >> 8 : c
+  const scale = a === 0 ? 0 : f32(1 / f32(a * INV255))
+  return rint(f32(Math.min(f32(f32(p * INV255) * scale), 1) * 255))
+}
+
 /** Tightly packed 8-bit I420 (as copyTo() writes it) -> RGBA for `rect`. */
 export function i420ToRgba(planes: Uint8Array, width: number, height: number, t: LibyuvTable, rect: Rect) {
   const ySize = width * height

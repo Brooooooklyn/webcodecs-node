@@ -53,6 +53,8 @@ pub struct Scaler {
 impl Scaler {
   /// Convert the rect (x, y, w, h) of `src` to 8-bit RGBA or BGRA rows `stride` bytes apart
   /// in `dst`, using AVCOL_* `tags` [primaries, trc, matrix, range] (-1 = the frame's own).
+  /// `same_format`: the target is the VideoFrame's own format. `src_x`: the VideoFrame is
+  /// RGBX/BGRX. Together they pick Chrome's alpha handling.
   #[allow(clippy::too_many_arguments)]
   pub fn copy_rect_to_rgb(
     src: &Frame,
@@ -60,6 +62,8 @@ impl Scaler {
     tags: [i32; 4],
     target_p3: bool,
     bgr: bool,
+    same_format: bool,
+    src_x: bool,
     dst: &mut [u8],
     stride: usize,
   ) -> CodecResult<()> {
@@ -86,6 +90,8 @@ impl Scaler {
         tags[3],
         target_p3 as i32,
         bgr as i32,
+        same_format as i32,
+        src_x as i32,
         dst.as_mut_ptr(),
         stride as isize,
       )
@@ -355,6 +361,8 @@ mod tests {
         BT709_LIMITED,
         false,
         bgr,
+        false,
+        false,
         &mut dst,
         16,
       )
@@ -372,7 +380,17 @@ mod tests {
   fn copy_rect_to_rgb_rejects_out_of_bounds() {
     let frame = white_black_i420();
     let copy = |rect, dst: &mut [u8]| {
-      Scaler::copy_rect_to_rgb(&frame, rect, BT709_LIMITED, false, false, dst, 8)
+      Scaler::copy_rect_to_rgb(
+        &frame,
+        rect,
+        BT709_LIMITED,
+        false,
+        false,
+        false,
+        false,
+        dst,
+        8,
+      )
     };
     let mut dst = [0u8; 2 * 4 * 2];
     // x + width runs past the 4-pixel-wide frame

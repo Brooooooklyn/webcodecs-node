@@ -22,7 +22,7 @@ import {
   type VideoFrameCopyToOptions,
   type VideoPixelFormat,
 } from '../index.js'
-import { i420ToRgba, LIBYUV, libyuvTableFor, yuvToRgba, type Rect } from './helpers/libyuv.js'
+import { chromeAlphaRoundTrip, i420ToRgba, LIBYUV, libyuvTableFor, yuvToRgba, type Rect } from './helpers/libyuv.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -42,6 +42,33 @@ interface ChromeFixture {
 }
 
 const fixture: ChromeFixture = JSON.parse(readFileSync(join(__dirname, 'fixtures/copyto-chrome155.json'), 'utf8'))
+
+/** Chrome 155 output for alpha 0..254, made by the oracle runs named in the commit that added it. */
+interface AlphaFixture {
+  chrome: string
+  colors: number[][]
+  alphas: number[]
+  /** Base64 R, G, B per (colour, alpha), colour-major, for each kind of copy */
+  rgb: Record<string, string>
+  /** solid Y, U, V with BT.709 limited tags; R, G, B per alpha */
+  i420a: Array<{ yuv: number[]; rgb: Record<'srgb' | 'display-p3', string> }>
+}
+
+/** Chrome 155 output of 16x16 frames with non-solid chroma (BT.709 limited tags, sRGB). */
+interface ChromaFixture {
+  chrome: string
+  width: number
+  height: number
+  cases: Array<{ format: VideoPixelFormat; pattern: string; data: string; rgb: string }>
+}
+
+const alphaFixture: AlphaFixture = JSON.parse(
+  readFileSync(join(__dirname, 'fixtures/copyto-chrome155-alpha.json'), 'utf8'),
+)
+const chromaFixture: ChromaFixture = JSON.parse(
+  readFileSync(join(__dirname, 'fixtures/copyto-chrome155-chroma.json'), 'utf8'),
+)
+const fromBase64 = (s: string) => new Uint8Array(Buffer.from(s, 'base64'))
 
 const RGB_FORMATS = ['RGBA', 'BGRA', 'RGBX', 'BGRX'] as const
 
@@ -181,6 +208,141 @@ test(`copyTo matches Chrome ${fixture.chrome} on random HDR pixels`, async (t) =
 })
 
 // ============================================================================
+// Alpha: every copy except an identity copy takes Chrome's 8-bit premultiplied round trip
+// ============================================================================
+
+const ALPHA_TAGS: Record<string, VideoColorSpaceInit | undefined> = {
+  omitted: undefined,
+  srgb: { primaries: 'bt709', transfer: 'iec61966-2-1', matrix: 'rgb', fullRange: true },
+  p3: { primaries: 'smpte432', transfer: 'iec61966-2-1', matrix: 'rgb', fullRange: true },
+}
+
+/** Logical [R, G, B, A] of pixel p of a packed RGB buffer. */
+const rgbaAt = (data: Uint8Array, p: number, format: string) =>
+  format.startsWith('BGR')
+    ? [data[4 * p + 2], data[4 * p + 1], data[4 * p], data[4 * p + 3]]
+    : Array.from(data.subarray(4 * p, 4 * p + 4))
+
+test(`copyTo alpha of RGB frames matches Chrome ${alphaFixture.chrome}`, async (t) => {
+  const { colors, alphas } = alphaFixture
+  const width = alphas.length
+  const height = colors.length
+  const failures: string[] = []
+  for (const format of RGB_FORMATS) {
+    const x = format.endsWith('X')
+    // pixel (column, row) = (alpha or X byte alphas[column], colour colors[row])
+    const source = Uint8Array.from(
+      colors.flatMap(([r, g, b]) => alphas.flatMap((a) => (format.startsWith('BGR') ? [b, g, r, a] : [r, g, b, a]))),
+    )
+    for (const [tag, colorSpace] of Object.entries(ALPHA_TAGS)) {
+      const frame = new VideoFrame(source, {
+        format,
+        codedWidth: width,
+        codedHeight: height,
+        timestamp: 0,
+        ...(colorSpace ? { colorSpace } : {}),
+      })
+      for (const dst of RGB_FORMATS) {
+        for (const target of [undefined, 'srgb', 'display-p3'] as const) {
+          const srcP3 = tag === 'p3'
+          const dstP3 = target === 'display-p3'
+          const change = srcP3 === dstP3 ? 'same' : srcP3 ? 'p>s' : 's>p'
+          // Chrome keeps the bytes for an identity copy, and for an RGBX/BGRX frame drawn to
+          // BGRA/BGRX without a colour change; every other copy comes from the fixture.
+          const keep = (format === dst && srcP3 === dstP3) || (x && change === 'same' && dst.startsWith('BGR'))
+          const rgb = keep ? undefined : fromBase64(alphaFixture.rgb[`${x ? 'X' : 'A'} ${change}`])
+          const out = await copy(frame, { format: dst, ...(target ? { colorSpace: target } : {}) })
+          let worst = 0
+          for (let p = 0; p < width * height; p++) {
+            const src = rgbaAt(source, p, format)
+            const want = rgb ? [rgb[3 * p], rgb[3 * p + 1], rgb[3 * p + 2], src[3]] : src
+            const got = rgbaAt(out, p, dst)
+            worst = Math.max(
+              worst,
+              got[3] === want[3] ? 0 : Infinity,
+              ...[0, 1, 2].map((c) => Math.abs(got[c] - want[c])),
+            )
+          }
+          // a colour change goes through float maths Chrome approximates: within 1
+          if (worst > (change === 'same' ? 0 : 1))
+            failures.push(`${format} ${tag} -> ${dst} ${target ?? '(colorSpace omitted)'}: off by ${worst}`)
+        }
+      }
+      frame.close()
+    }
+  }
+  t.deepEqual(failures, [])
+})
+
+test(`copyTo alpha of I420A frames matches Chrome ${alphaFixture.chrome}`, async (t) => {
+  const { alphas } = alphaFixture
+  const width = alphas.length
+  const failures: string[] = []
+  for (const { yuv, rgb } of alphaFixture.i420a) {
+    const [y, u, v] = yuv
+    const fill = (value: number, n: number) => Array.from({ length: n }, () => value)
+    const data = Uint8Array.from([
+      ...fill(y, 2 * width),
+      ...fill(u, width / 2),
+      ...fill(v, width / 2),
+      ...alphas,
+      ...alphas,
+    ])
+    const frame = new VideoFrame(data, {
+      format: 'I420A',
+      codedWidth: width,
+      codedHeight: 2,
+      timestamp: 0,
+      colorSpace: { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false },
+    })
+    for (const dst of RGB_FORMATS) {
+      for (const target of [undefined, 'srgb', 'display-p3'] as const) {
+        const want = fromBase64(rgb[target ?? 'srgb'])
+        const out = await copy(frame, { format: dst, ...(target ? { colorSpace: target } : {}) })
+        let worst = 0
+        for (let p = 0; p < 2 * width; p++) {
+          const got = rgbaAt(out, p, dst)
+          const i = p % width
+          worst = Math.max(
+            worst,
+            got[3] === alphas[i] ? 0 : Infinity,
+            ...[0, 1, 2].map((c) => Math.abs(got[c] - want[3 * i + c])),
+          )
+        }
+        if (worst > (target === 'display-p3' ? 1 : 0))
+          failures.push(`I420A ${yuv.join()} -> ${dst} ${target ?? '(colorSpace omitted)'}: off by ${worst}`)
+      }
+    }
+    frame.close()
+  }
+  t.deepEqual(failures, [])
+})
+
+test(`copyTo RGBA of non-solid chroma matches Chrome ${chromaFixture.chrome} (nearest chroma)`, async (t) => {
+  const { width, height } = chromaFixture
+  const failures: string[] = []
+  for (const c of chromaFixture.cases) {
+    const frame = new VideoFrame(fromBase64(c.data), {
+      format: c.format,
+      codedWidth: width,
+      codedHeight: height,
+      timestamp: 0,
+      colorSpace: { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false },
+    })
+    const out = await copy(frame, { format: 'RGBA' })
+    frame.close()
+    const want = fromBase64(c.rgb)
+    const at = firstMismatch(
+      out.filter((_, i) => i % 4 !== 3),
+      want,
+    )
+    if (at >= 0 || out.some((v, i) => i % 4 === 3 && v !== 255))
+      failures.push(`${c.format} ${c.pattern}: first difference at RGB byte ${at}`)
+  }
+  t.deepEqual(failures, [])
+})
+
+// ============================================================================
 // YUV -> R'G'B' stage on non-solid frames (libyuv integer math, nearest chroma)
 // ============================================================================
 
@@ -235,7 +397,13 @@ for (const format of Object.keys(STAGE1_FORMATS) as Array<keyof typeof STAGE1_FO
       const frame = new VideoFrame(data, { format, codedWidth: W, codedHeight: H, timestamp: 0, colorSpace })
       for (const rect of [{ x: 0, y: 0, width: W, height: H }, ODD_RECT]) {
         const got = await copy(frame, { format: 'RGBA', rect })
-        const at = firstMismatch(got, yuvToRgba(planes, libyuvTableFor(colorSpace), rect))
+        const want = yuvToRgba(planes, libyuvTableFor(colorSpace), rect)
+        // I420A: the format changes, so Chrome premultiplies to 8 bits and unpremultiplies
+        if (planes.a)
+          want.forEach((c, i) => {
+            if (i % 4 !== 3) want[i] = chromeAlphaRoundTrip(c, want[i - (i % 4) + 3], 'yuv')
+          })
+        const at = firstMismatch(got, want)
         if (at >= 0) failures.push(`${name} ${JSON.stringify(rect)}: first difference at byte ${at}`)
       }
       frame.close()
@@ -272,7 +440,8 @@ const RGB_TAGS: Record<string, VideoColorSpaceInit> = {
 }
 
 test('copyTo between RGB formats is an exact copy or swizzle for sRGB-like tags', async (t) => {
-  const source = Uint8Array.from({ length: 4 * 4 * 4 }, (_, i) => (i * 37 + 11) & 255)
+  // opaque: below 255 a format change also takes Chrome's alpha round trip (tested above)
+  const source = Uint8Array.from({ length: 4 * 4 * 4 }, (_, i) => (i % 4 === 3 ? 255 : (i * 37 + 11) & 255))
   // the same pixels with R and B swapped
   const swizzled = source.map((v, i) => (i % 4 === 0 ? source[i + 2] : i % 4 === 2 ? source[i - 2] : v))
   for (const [name, colorSpace] of Object.entries(RGB_TAGS)) {

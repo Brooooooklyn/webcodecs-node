@@ -2499,6 +2499,11 @@ impl VideoFrame {
           rgb_copy_tags(&inner.color_space),
           target == PredefinedColorSpace::DisplayP3,
           matches!(format, VideoPixelFormat::BGRA | VideoPixelFormat::BGRX),
+          format == original_format,
+          matches!(
+            original_format,
+            VideoPixelFormat::RGBX | VideoPixelFormat::BGRX
+          ),
           temp_buffer.get_mut(offset..).unwrap_or_default(),
           stride,
         )

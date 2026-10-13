@@ -1194,6 +1194,7 @@ int ff_codec_get_hw_pix_fmt(const AVCodec* codec, int device_type) {
  * VideoFrame.copyTo to RGBA/BGRA with a target colour space (Chrome's model).
  * Integer libyuv front end, then 256-entry decode LUT -> 3x3 (-> tone map) -> exact
  * sRGB encode. Only the copy rect is touched; output goes straight to the caller.
+ * Pixels with alpha below 255 follow Chrome's premultiplied round trip (rc_alpha_run).
  * ============================================================================ */
 #include <math.h>
 #include <stdint.h>
@@ -1209,6 +1210,7 @@ enum { RC_IDENTITY, RC_LUT8, RC_MATRIX, RC_PQ, RC_HLG };
 
 typedef struct RcState {
   int cls;
+  int curve;        // RC_CURVE_* of the source, for the alpha path's computed decode
   float dec[256];   // 8-bit code -> linear (SDR) / 203-nit relative (PQ) / scene light (HLG)
   float m[9];       // SDR: src -> target. HDR: src -> bt2020
   float m2[9];      // HDR: bt2020 -> target
@@ -1340,6 +1342,7 @@ static int rc_setup(RcState *t, int pri, int trc, int mat, int range, int target
   double tmp[9];
   if (gamut == AVCOL_PRI_SMPTE170M || gamut == AVCOL_PRI_SMPTE240M) gamut = AVCOL_PRI_BT709;
   if (missing || !rc_npm(gamut, tmp)) { curve = RC_CURVE_SRGB; gamut = AVCOL_PRI_BT709; }
+  t->curve = curve;
 
   int full = range == AVCOL_RANGE_JPEG, yuv = 0;
   if (mat == AVCOL_SPC_BT709) yuv = full ? 3 : 2;
@@ -1425,6 +1428,124 @@ static av_always_inline void rc_color_row(const RcState *t, uint8_t *p, int n, i
       p[ri] = oR; p[1] = oG; p[bi] = oB;
     }
   }
+}
+
+/* Alpha path for copies that are not an identity copy (chrome_model.py chrome_pixel). Chrome
+ * draws the frame as a premultiplied 8-bit image, then Skia's float32 raster pipeline writes
+ * the unpremultiplied copy:
+ *   RC_PM_RGB  RGBA/BGRA source  c' = (c * a + 127) / 255   (SkSwizzler premultiply)
+ *   RC_PM_YUV  YUV with alpha    c' = (c * a + 255) >> 8    (libyuv ARGBAttenuate)
+ *   RC_PM_X    RGBX/BGRX source  c' = c, with the X byte as alpha (an opaque image)
+ * v = c' / 255. Premultiplied sources divide v by A = a / 255 before the colour stage and
+ * multiply by A after it. Then clamp to [0, 1], divide by A (A == 0 gives 0), x255, round
+ * half to even. Only pixels with alpha (or X) below 255 come here. */
+enum { RC_PM_NONE, RC_PM_RGB, RC_PM_YUV, RC_PM_X };
+
+// Per-call alpha path tables, one row per alpha value, filled on first use.
+typedef struct RcAlpha {
+  int pm;
+  uint8_t ready[256];
+  uint8_t *out; // no colour change: out[a * 256 + c] is the output byte for R, G and B
+  float *lin;   // colour change, premultiplied source: lin[a * 256 + c'] = decode(v / A)
+} RcAlpha;
+
+static inline int rc_premul(int pm, int c, int a) {
+  return pm == RC_PM_RGB ? (c * a + 127) / 255 : pm == RC_PM_YUV ? (c * a + 255) >> 8 : c;
+}
+
+// Skia: v * (1 / A) (0 when A == 0), clamp to [0, 1], x255, round half to even.
+static inline uint8_t rc_unpremul(float v, int a) {
+  v *= a ? 1.0f / ((float)a * (1.0f / 255.0f)) : 0.0f;
+  return (uint8_t)lrintf((v < 1.0f ? v : 1.0f) * 255.0f);
+}
+
+static void rc_alpha_fill(const RcState *t, RcAlpha *al, int a) {
+  if (al->out) {
+    for (int c = 0; c < 256; c++)
+      al->out[a * 256 + c] = rc_unpremul((float)rc_premul(al->pm, c, a) * (1.0f / 255.0f), a);
+  } else if (al->lin) { // c' <= a
+    const float s = a ? 1.0f / ((float)a * (1.0f / 255.0f)) : 0.0f;
+    for (int c = 0; c <= a; c++)
+      al->lin[a * 256 + c] = (float)rc_curve_dec(t->curve, (float)c * (1.0f / 255.0f) * s);
+  }
+  al->ready[a] = 1;
+}
+
+// The colour stage of rc_color_row on linear values (class LUT8 has none).
+static av_always_inline void rc_color_lin(const RcState *t, float l[3]) {
+  const float *m = t->m, *n = t->m2;
+  if (t->cls == RC_LUT8) return;
+  if (t->cls == RC_HLG) {
+    float ys = t->ky[0] * l[0] + t->ky[1] * l[1] + t->ky[2] * l[2];
+    float k = ys > 0.0f ? powf(ys, 0.2f) * (1000.0f / 203.0f) : 0.0f;
+    for (int i = 0; i < 3; i++) l[i] *= k;
+  }
+  float R = m[0] * l[0] + m[1] * l[1] + m[2] * l[2];
+  float G = m[3] * l[0] + m[4] * l[1] + m[5] * l[2];
+  float B = m[6] * l[0] + m[7] * l[1] + m[8] * l[2];
+  if (t->cls != RC_MATRIX) { // PQ / HLG: tone map, then BT.2020 -> target
+    float x = R > G ? R : G, s = rc_tm_gain(t, x > B ? x : B);
+    R *= s; G *= s; B *= s;
+    l[0] = n[0] * R + n[1] * G + n[2] * B;
+    l[1] = n[3] * R + n[4] * G + n[5] * B;
+    l[2] = n[6] * R + n[7] * G + n[8] * B;
+  } else {
+    l[0] = R; l[1] = G; l[2] = B;
+  }
+}
+
+// RGBX/BGRX source with a colour change: colour stage on c / 255, then the encoded value is
+// divided by A.
+static void rc_alpha_x(const RcState *t, uint8_t *p, int ri, int bi) {
+  const int at[3] = {ri, 1, bi};
+  float l[3] = {t->dec[p[ri]], t->dec[p[1]], t->dec[p[bi]]};
+  rc_color_lin(t, l);
+  for (int i = 0; i < 3; i++) {
+    float e = l[i] > 0.0f ? (l[i] < 1.0f ? l[i] : 1.0f) : 0.0f;
+    e = e <= 0.0031308f ? 12.92f * e : 1.055f * powf(e, 1.0f / 2.4f) - 0.055f;
+    p[at[i]] = rc_unpremul(e, p[3]);
+  }
+}
+
+// Pixels from i up to the next alpha 255 (or n) take the alpha path; returns where it stopped.
+static av_always_inline int rc_alpha_run(const RcState *t, RcAlpha *al, uint8_t *o, int i, int n,
+                                         int ri, int bi) {
+  for (; i < n && o[4 * i + 3] != 255; i++) {
+    uint8_t *p = o + 4 * i;
+    const int a = p[3], pm = al->pm;
+    if (!al->ready[a]) rc_alpha_fill(t, al, a);
+    if (al->out) {
+      const uint8_t *row = al->out + a * 256;
+      p[0] = row[p[0]]; p[1] = row[p[1]]; p[2] = row[p[2]];
+    } else if (al->lin) {
+      // v / A, colour stage, x A. The x A, clamp and / A that follow move the value by about
+      // 1e-7, so it is encoded directly (within 1 of Chrome, like the opaque path).
+      const float *row = al->lin + a * 256;
+      float l[3] = {row[rc_premul(pm, p[ri], a)], row[rc_premul(pm, p[1], a)],
+                    row[rc_premul(pm, p[bi], a)]};
+      rc_color_lin(t, l);
+      p[ri] = rc_enc(t, l[0]); p[1] = rc_enc(t, l[1]); p[bi] = rc_enc(t, l[2]);
+    } else {
+      rc_alpha_x(t, p, ri, bi);
+    }
+  }
+  return i;
+}
+
+// Length of the leading run of pixels whose alpha (or X) byte is 255 (16 at a time first).
+static av_always_inline int rc_opaque_run(const uint8_t *p, int n) {
+  static const uint8_t ab[8] = {0, 0, 0, 255, 0, 0, 0, 255};
+  uint64_t m, w[8];
+  int i = 0;
+  memcpy(&m, ab, 8);
+  for (; i + 16 <= n; i += 16) {
+    uint64_t v = m;
+    memcpy(w, p + 4 * i, 64);
+    for (int k = 0; k < 8; k++) v &= w[k];
+    if (v != m) break;
+  }
+  while (i < n && p[4 * i + 3] == 255) i++;
+  return i;
 }
 
 static inline int32_t rc_clamp6(int32_t z) {
@@ -1553,12 +1674,21 @@ static av_always_inline int rc_front_row(const AVFrame *f, const AVPixFmtDescrip
 
 // ri/bi are literals at both call sites so every row loop is specialised per byte order.
 static av_always_inline void rc_rows(const RcState *t, const AVFrame *f, const AVPixFmtDescriptor *d,
-                                     int x, int y, int w, int h, const int32_t *k, uint8_t *dst,
-                                     ptrdiff_t dst_stride, int ri, int bi) {
+                                     int x, int y, int w, int h, const int32_t *k, RcAlpha *al,
+                                     uint8_t *dst, ptrdiff_t dst_stride, int ri, int bi) {
   for (int r = 0; r < h; r++) {
     uint8_t *o = dst + (ptrdiff_t)r * dst_stride;
     rc_front_row(f, d, x, y + r, w, k, o, ri, bi);
-    if (t->cls != RC_IDENTITY) rc_color_row(t, o, w, ri, bi);
+    if (!al->pm) {
+      if (t->cls != RC_IDENTITY) rc_color_row(t, o, w, ri, bi);
+      continue;
+    }
+    // runs with alpha 255 take the colour stage as is; other pixels take the alpha path
+    for (int i = 0; i < w;) {
+      int j = i + rc_opaque_run(o + 4 * i, w - i);
+      if (j > i && t->cls != RC_IDENTITY) rc_color_row(t, o + 4 * i, j - i, ri, bi);
+      i = rc_alpha_run(t, al, o, j, w, ri, bi);
+    }
   }
 }
 
@@ -1575,8 +1705,8 @@ static int rc_direct(const AVPixFmtDescriptor *d) {
 }
 
 int ffframe_copy_rect_to_rgb(const AVFrame *src, int x, int y, int w, int h, int pri, int trc,
-                             int mat, int range, int target_p3, int dst_bgr, uint8_t *dst,
-                             ptrdiff_t dst_stride) {
+                             int mat, int range, int target_p3, int dst_bgr, int same_format,
+                             int src_x, uint8_t *dst, ptrdiff_t dst_stride) {
   if (!src || !dst || x < 0 || y < 0 || w <= 0 || h <= 0 || x > src->width - w ||
       y > src->height - h || dst_stride < (ptrdiff_t)w * 4)
     return AVERROR(EINVAL);
@@ -1600,6 +1730,7 @@ int ffframe_copy_rect_to_rgb(const AVFrame *src, int x, int y, int w, int h, int
   int yuv = rc_setup(t, pri, trc, mat, range, target_p3);
   const AVFrame *f = src;
   AVFrame *tmp = NULL;
+  RcAlpha al = {0};
   if (!direct) { // rare formats (pal8, gray, rgb48, ...): whole frame to RGBA with swscale
     struct SwsContext *s = sws_getContext(src->width, src->height, (enum AVPixelFormat)src->format,
                                           src->width, src->height, AV_PIX_FMT_RGBA, SWS_POINT,
@@ -1626,10 +1757,25 @@ int ffframe_copy_rect_to_rgb(const AVFrame *src, int x, int y, int w, int h, int
     f = tmp;
     d = av_pix_fmt_desc_get(AV_PIX_FMT_RGBA);
   }
-  if (!dst_bgr) rc_rows(t, f, d, x, y, w, h, kRcYuv[yuv], dst, dst_stride, 0, 2);
-  else rc_rows(t, f, d, x, y, w, h, kRcYuv[yuv], dst, dst_stride, 2, 0);
+  // Chrome copies the bytes as they are only when the format and the colour space are both
+  // unchanged. Other copies take its alpha path, except an RGBX/BGRX frame drawn to BGRA/BGRX
+  // without a colour change (Skia's memcpy blit of an opaque N32 image).
+  if (!same_format || t->cls != RC_IDENTITY) {
+    if (src_x) al.pm = t->cls != RC_IDENTITY || !dst_bgr ? RC_PM_X : RC_PM_NONE;
+    else if (d->nb_components == 4) al.pm = d->flags & AV_PIX_FMT_FLAG_RGB ? RC_PM_RGB : RC_PM_YUV;
+  }
+  if (al.pm && t->cls == RC_IDENTITY) {
+    if (!(al.out = av_malloc(256 * 256))) ret = AVERROR(ENOMEM);
+  } else if (al.pm && al.pm != RC_PM_X) {
+    if (!(al.lin = av_malloc(256 * 256 * sizeof(float)))) ret = AVERROR(ENOMEM);
+  }
+  if (ret < 0) goto end;
+  if (!dst_bgr) rc_rows(t, f, d, x, y, w, h, kRcYuv[yuv], &al, dst, dst_stride, 0, 2);
+  else rc_rows(t, f, d, x, y, w, h, kRcYuv[yuv], &al, dst, dst_stride, 2, 0);
 end:
   av_frame_free(&tmp);
+  av_free(al.out);
+  av_free(al.lin);
   av_free(t);
   return ret;
 }
