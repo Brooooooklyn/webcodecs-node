@@ -1190,16 +1190,44 @@ int ff_codec_get_hw_pix_fmt(const AVCodec* codec, int device_type) {
     return AV_PIX_FMT_NONE;
 }
 
-// encoded rgb conversion shares chromium's native color management arithmetic.
+// packed RGB color conversion uses the already bundled Little CMS library.
+#include <lcms2.h>
+#include <libavutil/csp.h>
 #include <libavutil/error.h>
 #include <libswscale/swscale.h>
 
-int ffframe_transform_rgb_color(const AVFrame *src, AVFrame *dst);
+static cmsHPROFILE ff_rgb_profile(enum AVColorPrimaries primaries,
+                                 enum AVColorTransferCharacteristic transfer) {
+  const AVColorPrimariesDesc *desc = av_csp_primaries_desc_from_id(primaries);
+  if (!desc) return NULL;
+  cmsToneCurve *curve = NULL;
+  if (transfer == AVCOL_TRC_IEC61966_2_1) {
+    const double params[] = {2.4, 1.0/1.055, 0.055/1.055, 1.0/12.92, 0.04045, 0, 0};
+    curve = cmsBuildParametricToneCurve(NULL, 4, params);
+  } else if (transfer == AVCOL_TRC_BT709 || transfer == AVCOL_TRC_SMPTE170M) {
+    const double params[] = {1.0/0.45, 1.0/1.099, 0.099/1.099, 1.0/4.5, 0.081, 0, 0};
+    curve = cmsBuildParametricToneCurve(NULL, 4, params);
+  } else if (transfer == AVCOL_TRC_LINEAR) {
+    curve = cmsBuildGamma(NULL, 1.0);
+  }
+  if (!curve) return NULL;
+  cmsCIExyY white = {av_q2d(desc->wp.x), av_q2d(desc->wp.y), 1.0};
+  cmsCIExyYTRIPLE rgb = {
+    {av_q2d(desc->prim.r.x), av_q2d(desc->prim.r.y), 1.0},
+    {av_q2d(desc->prim.g.x), av_q2d(desc->prim.g.y), 1.0},
+    {av_q2d(desc->prim.b.x), av_q2d(desc->prim.b.y), 1.0},
+  };
+  cmsToneCurve *curves[] = {curve, curve, curve};
+  cmsHPROFILE profile = cmsCreateRGBProfile(&white, &rgb, curves);
+  cmsFreeToneCurve(curve);
+  return profile;
+}
 
 int ffframe_convert_rgb_color(const AVFrame *src, AVFrame *dst) {
+  cmsUInt32Number src_type, dst_type;
   switch (src->format) {
-    case AV_PIX_FMT_RGBA: break;
-    case AV_PIX_FMT_BGRA: break;
+    case AV_PIX_FMT_RGBA: src_type = TYPE_RGBA_8; break;
+    case AV_PIX_FMT_BGRA: src_type = TYPE_BGRA_8; break;
     default: {
       // convert YUV encoding to full range RGB without changing its gamut.
       AVFrame *rgb = av_frame_alloc();
@@ -1219,9 +1247,7 @@ int ffframe_convert_rgb_color(const AVFrame *src, AVFrame *dst) {
           ? dst->color_trc : src->color_trc;
       rgb->colorspace = AVCOL_SPC_RGB;
       rgb->color_range = AVCOL_RANGE_JPEG;
-      int ret = av_opt_set_int(scaler, "sws_flags",
-          SWS_BILINEAR | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT, 0);
-      if (ret >= 0) ret = sws_scale_frame(scaler, rgb, src);
+      int ret = sws_scale_frame(scaler, rgb, src);
       if (ret >= 0) ret = ffframe_convert_rgb_color(rgb, dst);
       av_frame_free(&rgb);
       sws_freeContext(scaler);
@@ -1229,11 +1255,32 @@ int ffframe_convert_rgb_color(const AVFrame *src, AVFrame *dst) {
     }
   }
   switch (dst->format) {
-    case AV_PIX_FMT_RGBA: break;
-    case AV_PIX_FMT_BGRA: break;
+    case AV_PIX_FMT_RGBA: dst_type = TYPE_RGBA_8; break;
+    case AV_PIX_FMT_BGRA: dst_type = TYPE_BGRA_8; break;
     default: return AVERROR(ENOSYS);
   }
   if (src->colorspace != AVCOL_SPC_RGB || src->color_range != AVCOL_RANGE_JPEG)
     return AVERROR(ENOSYS);
-  return ffframe_transform_rgb_color(src, dst);
+  // a same-format identity copy must preserve every byte exactly.
+  if (src->format == dst->format &&
+      src->color_primaries == dst->color_primaries &&
+      src->color_trc == dst->color_trc)
+    return av_frame_copy(dst, src);
+  cmsHPROFILE input = ff_rgb_profile(src->color_primaries, src->color_trc);
+  cmsHPROFILE output = ff_rgb_profile(dst->color_primaries, dst->color_trc);
+  if (!input || !output) {
+    if (input) cmsCloseProfile(input);
+    if (output) cmsCloseProfile(output);
+    return AVERROR(ENOSYS);
+  }
+  cmsHTRANSFORM transform = cmsCreateTransform(input, src_type, output, dst_type,
+      INTENT_RELATIVE_COLORIMETRIC, cmsFLAGS_COPY_ALPHA | cmsFLAGS_NOOPTIMIZE);
+  cmsCloseProfile(input);
+  cmsCloseProfile(output);
+  if (!transform) return AVERROR(ENOMEM);
+  for (int y = 0; y < src->height; ++y)
+    cmsDoTransform(transform, src->data[0] + y * src->linesize[0],
+                   dst->data[0] + y * dst->linesize[0], src->width);
+  cmsDeleteTransform(transform);
+  return 0;
 }

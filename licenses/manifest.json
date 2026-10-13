@@ -299,16 +299,6 @@
       "upstream": "https://raw.githubusercontent.com/FFmpeg/nv-codec-headers/n13.0.19.0/include/ffnvcodec/nvEncodeAPI.h",
       "excerpt": true,
       "sha256": "72b60be67644d841bfd54a042875b5846294d357040dd7ac8e38bde20d9e8f97"
-    },
-    {
-      "file": "skcms-LICENSE.txt",
-      "sha256": "e59bb5c5c6ba426a9ac4ba9fe667ad14c5166b12aa25be8af1d122b14fbe2e36",
-      "project": "skcms",
-      "upstream": "https://skia.googlesource.com/skcms",
-      "revision": "7e572ada698a60ff50bd9038fd6e01e44f40868a",
-      "ref": "7e572ada698a60ff50bd9038fd6e01e44f40868a",
-      "upstreamPath": "LICENSE",
-      "excerpt": false
     }
   ]
 }
