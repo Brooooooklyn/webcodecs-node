@@ -440,3 +440,49 @@ test('concurrent copyTo calls give the same bytes as sequential ones', async (t)
   const mismatched = calls.flatMap((_, i) => (firstMismatch(concurrent[i], sequential[i]) === -1 ? [] : [i]))
   t.deepEqual(mismatched, [])
 })
+
+// ============================================================================
+// Cost guard: only the copy rect is converted
+// ============================================================================
+
+// QEMU-emulated armv7 timings are not meaningful (same skip as demuxer.spec.ts)
+const isLinuxArmv7 = process.platform === 'linux' && process.arch === 'arm'
+const testTiming = isLinuxArmv7 ? test.skip : test.serial
+
+testTiming('copyTo RGBA of a 2x2 rect costs far less than the full 4K frame', async (t) => {
+  const w = 3840
+  const h = 2160
+  const data = new Uint8Array((w * h * 3) / 2)
+  for (let i = 0; i < data.length; i++) data[i] = 16 + ((i * 7) % 220)
+  const frame = new VideoFrame(data, {
+    format: 'I420',
+    codedWidth: w,
+    codedHeight: h,
+    timestamp: 0,
+    colorSpace: { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false },
+  })
+  const full: VideoFrameCopyToOptions = { format: 'RGBA' }
+  const rect: VideoFrameCopyToOptions = { format: 'RGBA', rect: { x: 0, y: 0, width: 2, height: 2 } }
+  const fullOut = new Uint8Array(frame.allocationSize(full))
+  const rectOut = new Uint8Array(frame.allocationSize(rect))
+  const time = async (options: VideoFrameCopyToOptions, out: Uint8Array) => {
+    const start = process.hrtime.bigint()
+    await frame.copyTo(out, options)
+    return Number(process.hrtime.bigint() - start) / 1e6
+  }
+  await time(full, fullOut)
+  await time(rect, rectOut)
+  // Interleaved samples, so both see the same machine load. Load (other test files, Rosetta for
+  // the x64 macOS job) only adds time, mostly to the tiny rect copy, so compare the fastest runs.
+  const fullMs: number[] = []
+  const rectMs: number[] = []
+  for (let i = 0; i < 9; i++) {
+    fullMs.push(await time(full, fullOut))
+    rectMs.push(await time(rect, rectOut))
+  }
+  frame.close()
+  const fullBest = Math.min(...fullMs)
+  const rectBest = Math.min(...rectMs)
+  t.log(`best of 9: full 4K ${fullBest.toFixed(2)} ms, 2x2 rect ${rectBest.toFixed(3)} ms`)
+  t.true(rectBest < fullBest / 20, 'a 2x2 rect copy must not convert the whole frame')
+})
