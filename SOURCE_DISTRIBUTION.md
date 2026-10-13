@@ -105,3 +105,13 @@ approach before publishing:
 
 This patch makes neither choice and removes no codecs. It provides an
 engineering inventory of the evidence and gaps, not a legal determination.
+
+## pinned color transform source
+
+The addon build fetches SkCMS Git commit
+`7e572ada698a60ff50bd9038fd6e01e44f40868a` from
+`https://skia.googlesource.com/skcms` and verifies the checkout revision and
+tracked contents before compilation. Retain that source with the build inputs
+for binary distribution. The native bridge and its build configuration are
+`src/ffi/rgb_color.cpp` and `build.rs`; its original license is included as
+`licenses/skcms-LICENSE.txt`.

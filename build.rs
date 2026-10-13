@@ -84,6 +84,7 @@ fn main() {
 
   // Compile C accessor library
   compile_accessors(&ffmpeg_dir, &target_os, &target_arch, &target_env);
+  compile_rgb_color(&ffmpeg_dir);
 
   // Link FFmpeg libraries
   link_ffmpeg(&ffmpeg_dir, &target_os, None);
@@ -475,6 +476,73 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
     write!(hex, "{byte:02x}").expect("writing to a String never fails");
   }
   Ok(hex)
+}
+
+// use the same native transform as chromium, with pinned source inputs.
+fn compile_rgb_color(ffmpeg_dir: &Path) {
+  const REVISION: &str = "7e572ada698a60ff50bd9038fd6e01e44f40868a";
+  let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+  let source = out.join(format!("skcms-{REVISION}"));
+  if !source.exists() {
+    let partial = out.join("skcms-source-partial");
+    if partial.exists() {
+      fs::remove_dir_all(&partial).expect("clear interrupted skcms checkout");
+    }
+    fs::create_dir_all(&partial).expect("create skcms source directory");
+    let git = |args: &[&str]| {
+      let status = Command::new("git")
+        .arg("-C")
+        .arg(&partial)
+        .args(args)
+        .status()
+        .expect("run git for skcms source");
+      assert!(status.success(), "skcms source checkout failed: {args:?}");
+    };
+    git(&["init", "--quiet"]);
+    git(&[
+      "remote",
+      "add",
+      "origin",
+      "https://skia.googlesource.com/skcms",
+    ]);
+    git(&["fetch", "--depth=1", "origin", REVISION]);
+    git(&["checkout", "--detach", "FETCH_HEAD"]);
+    fs::rename(partial, &source).expect("retain verified skcms checkout");
+  }
+  let revision = Command::new("git")
+    .arg("-C")
+    .arg(&source)
+    .args(["rev-parse", "HEAD"])
+    .output()
+    .expect("read skcms revision");
+  assert!(revision.status.success(), "skcms revision unavailable");
+  assert_eq!(
+    String::from_utf8_lossy(&revision.stdout).trim(),
+    REVISION,
+    "skcms source revision mismatch"
+  );
+  let clean = Command::new("git")
+    .arg("-C")
+    .arg(&source)
+    .args(["diff", "--quiet", "HEAD", "--"])
+    .status()
+    .expect("verify skcms source");
+  assert!(
+    clean.success(),
+    "skcms source differs from its pinned commit"
+  );
+  cc::Build::new()
+    .cpp(true)
+    .std("c++17")
+    .define("SKCMS_DISABLE_HSW", None)
+    .define("SKCMS_DISABLE_SKX", None)
+    .include(ffmpeg_dir.join("include"))
+    .include(&source)
+    .file("src/ffi/rgb_color.cpp")
+    .file(source.join("skcms.cc"))
+    .file(source.join("src/skcms_TransformBaseline.cc"))
+    .compile("webcodecs_rgb_color");
+  println!("cargo:rerun-if-changed=src/ffi/rgb_color.cpp");
 }
 
 /// Compile the C accessor library

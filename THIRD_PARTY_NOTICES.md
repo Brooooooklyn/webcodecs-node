@@ -12,6 +12,11 @@ marked there. Those digests identify notice files, not source archives or
 binaries. Original project source remains under [MIT](LICENSE); see
 [LICENSES.md](LICENSES.md) for the combined binary distribution.
 
+SkCMS is compiled directly by `build.rs` from source commit
+`7e572ada698a60ff50bd9038fd6e01e44f40868a`. The build fetches that Git commit
+and verifies the source checkout before compilation. Its BSD-3-Clause notice
+is `licenses/skcms-LICENSE.txt`.
+
 ## Configured dependencies
 
 The Unix versions come from `tools/build-ffmpeg/src/main.rs`. Windows uses

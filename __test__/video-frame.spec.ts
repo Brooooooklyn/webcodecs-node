@@ -333,3 +333,71 @@ test('VideoFrame: gradient pattern creates varied data', async (t) => {
 
   frame.close()
 })
+
+test('VideoFrame: explicit RGB copies preserve browser alpha and gamut conversion', async (t) => {
+  const samples = [
+    {
+      primaries: 'bt709',
+      rgba: [32, 128, 223, 128],
+      srgb: [32, 128, 223, 128],
+      p3: [63, 126, 216, 128],
+    },
+    {
+      primaries: 'smpte432',
+      rgba: [32, 128, 223, 128],
+      srgb: [0, 130, 230, 128],
+      p3: [32, 128, 223, 128],
+    },
+    {
+      primaries: 'bt709',
+      rgba: [128, 128, 128, 128],
+      srgb: [128, 128, 128, 128],
+      p3: [128, 127, 127, 128],
+    },
+    {
+      primaries: 'smpte432',
+      rgba: [128, 128, 128, 128],
+      srgb: [127, 127, 128, 128],
+      p3: [128, 128, 128, 128],
+    },
+  ] satisfies {
+    primaries: 'bt709' | 'smpte432'
+    rgba: number[]
+    srgb: number[]
+    p3: number[]
+  }[]
+  for (const sample of samples) {
+    for (const format of ['RGBA', 'BGRA'] satisfies ('RGBA' | 'BGRA')[]) {
+      const pack = (rgba: number[]) => (format === 'RGBA' ? rgba : [rgba[2], rgba[1], rgba[0], rgba[3]])
+      const input = new Uint8Array(pack(sample.rgba))
+      const frame = new VideoFrame(input, {
+        format,
+        codedWidth: 1,
+        codedHeight: 1,
+        timestamp: 0,
+        colorSpace: {
+          primaries: sample.primaries,
+          transfer: 'iec61966-2-1',
+          matrix: 'rgb',
+          fullRange: true,
+        },
+      })
+      try {
+        const raw = new Uint8Array(4)
+        await frame.copyTo(raw)
+        t.deepEqual(raw, input)
+        for (const colorSpace of ['srgb', 'display-p3'] satisfies ('srgb' | 'display-p3')[]) {
+          const output = new Uint8Array(4)
+          await frame.copyTo(output, { format, colorSpace })
+          t.deepEqual(
+            Array.from(output),
+            pack(colorSpace === 'srgb' ? sample.srgb : sample.p3),
+            `${sample.primaries}/${format}/${colorSpace}`,
+          )
+        }
+      } finally {
+        frame.close()
+      }
+    }
+  }
+})
