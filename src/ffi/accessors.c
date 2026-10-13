@@ -1447,8 +1447,10 @@ static av_always_inline void rc_yuv_stage(const uint8_t *ys, const uint8_t *us, 
     if (as) memcpy(a8, as, (size_t)n);
   } else {
     const uint16_t *y2 = (const uint16_t *)ys, *u2 = (const uint16_t *)us, *v2 = (const uint16_t *)vs;
+    const uint32_t mx = (1u << depth) - 1; // out-of-range samples saturate, like chroma below
     for (int i = 0; i < n; i++) {
       uint32_t v = (uint32_t)(y2[i] >> shift);
+      v = v > mx ? mx : v;
       y16[i] = (uint16_t)((v << (16 - depth)) | (v >> (2 * depth - 16)));
     }
     for (int j = 0; j < nc; j++) {
@@ -1456,7 +1458,10 @@ static av_always_inline void rc_yuv_stage(const uint8_t *ys, const uint8_t *us, 
       cu[j] = (uint8_t)(u > 255 ? 255 : u); cv[j] = (uint8_t)(v > 255 ? 255 : v);
     }
     if (as)
-      for (int i = 0; i < n; i++) a8[i] = (uint8_t)((((const uint16_t *)as)[i] >> shift) >> (depth - 8));
+      for (int i = 0; i < n; i++) {
+        uint32_t a = (uint32_t)(((const uint16_t *)as)[i] >> shift);
+        a8[i] = (uint8_t)((a > mx ? mx : a) >> (depth - 8));
+      }
   }
   if (hs == 0) {
     memcpy(u8, cu, (size_t)n); memcpy(v8, cv, (size_t)n);
@@ -1589,7 +1594,7 @@ int ffframe_copy_rect_to_rgb(const AVFrame *src, int x, int y, int w, int h, int
   if (range == AVCOL_RANGE_UNSPECIFIED && (src->format == AV_PIX_FMT_YUVJ420P ||
       src->format == AV_PIX_FMT_YUVJ422P || src->format == AV_PIX_FMT_YUVJ444P))
     range = AVCOL_RANGE_JPEG;
-  RcState *t = av_malloc(sizeof(*t)); // ~37 KB: kept off the (blocking pool) thread stack
+  RcState *t = av_mallocz(sizeof(*t)); // ~37 KB: kept off the (blocking pool) thread stack
   if (!t) return AVERROR(ENOMEM);
   int ret = 0;
   int yuv = rc_setup(t, pri, trc, mat, range, target_p3);

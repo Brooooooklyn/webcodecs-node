@@ -325,6 +325,25 @@ test('copyTo RGBA of a PQ frame is tone mapped instead of rejected', async (t) =
   t.deepEqual(Array.from(out), Array.from({ length: 16 }, () => [137, 137, 137, 255]).flat())
 })
 
+test('copyTo RGBA saturates 10-bit luma and alpha samples above 1023', async (t) => {
+  // a JS buffer can hold any 16-bit sample; out-of-range values must clamp, not wrap
+  for (const format of ['I420P10', 'I420AP10'] as const) {
+    for (const value of [1024, 65535]) {
+      const y = [value, value, value, value]
+      const frame = new VideoFrame(le16([...y, 512, 512, ...(format === 'I420AP10' ? y : [])]), {
+        format,
+        codedWidth: 2,
+        codedHeight: 2,
+        timestamp: 0,
+        colorSpace: LIBYUV_TAGS.H709,
+      })
+      const out = await copy(frame, { format: 'RGBA' })
+      frame.close()
+      t.deepEqual(Array.from(out), Array.from({ length: 4 }, () => [255, 255, 255, 255]).flat(), `${format} ${value}`)
+    }
+  }
+})
+
 /** First frame of an MP4 fixture, decoded in software. */
 async function decodeFirstFrame(file: string): Promise<VideoFrame> {
   const errors: Error[] = []
