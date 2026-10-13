@@ -401,6 +401,34 @@ test('AudioEncoder: flush() returns a Promise', async (t) => {
   encoder.close()
 })
 
+test('AudioEncoder: AAC chunks flushed at the end keep distinct timestamps and microsecond durations', async (t) => {
+  const { encoder, chunks } = createTestEncoder()
+
+  encoder.configure({
+    codec: 'mp4a.40.2',
+    sampleRate: 48000,
+    numberOfChannels: 2,
+    bitrate: 128000,
+  })
+
+  for (let i = 0; i < 20; i++) {
+    const audio = generateSineTone(440, 1024, 2, 48000, 'f32', Math.round((i * 1024 * 1_000_000) / 48000))
+    encoder.encode(audio)
+    audio.close()
+  }
+  await encoder.flush()
+
+  // 20 input frames plus one packet of encoder delay
+  t.is(chunks.length, 21)
+  const frameDuration = Math.floor((1024 * 1_000_000) / 48000)
+  chunks.forEach((chunk, i) => {
+    t.is(chunk.timestamp, Math.floor((i * 1024 * 1_000_000) / 48000), `timestamp of chunk ${i}`)
+    t.is(chunk.duration, frameDuration, `duration of chunk ${i}`)
+  })
+
+  encoder.close()
+})
+
 // ============================================================================
 // isConfigSupported Tests
 // ============================================================================
