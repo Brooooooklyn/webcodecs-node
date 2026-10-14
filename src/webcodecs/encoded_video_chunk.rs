@@ -5,7 +5,10 @@
 
 use crate::codec::Packet;
 use crate::ffi::{AVRational, avutil::av_rescale_q};
-use crate::webcodecs::error::{enforce_range_long_long, enforce_range_unsigned_long_long_optional};
+use crate::webcodecs::error::{
+  enforce_range_long_long, enforce_range_unsigned_long_long_optional,
+  enforce_range_unsigned_long_value,
+};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::sync::{Arc, RwLock};
@@ -1820,10 +1823,13 @@ pub struct VideoDecoderConfig {
   pub coded_width: Option<u32>,
   /// Coded height in pixels (optional for some codecs)
   pub coded_height: Option<u32>,
-  /// Display aspect width
+  /// Display aspect width ([EnforceRange] unsigned long)
   pub display_aspect_width: Option<u32>,
-  /// Display aspect height
+  /// Display aspect height ([EnforceRange] unsigned long)
   pub display_aspect_height: Option<u32>,
+  /// TypeError message from converting a member, e.g. a displayAspectWidth out of range.
+  /// configure() throws it and isConfigSupported() rejects with it, like Chrome.
+  pub conversion_error: Option<String>,
   /// Color space parameters (uses init object for compatibility)
   pub color_space: Option<crate::webcodecs::video_frame::VideoColorSpaceInit>,
   /// Hardware acceleration preference (W3C spec enum)
@@ -1850,8 +1856,25 @@ impl FromNapiValue for VideoDecoderConfig {
     let codec: Option<String> = obj.get("codec")?;
     let coded_width: Option<u32> = obj.get("codedWidth")?;
     let coded_height: Option<u32> = obj.get("codedHeight")?;
-    let display_aspect_width: Option<u32> = obj.get("displayAspectWidth")?;
-    let display_aspect_height: Option<u32> = obj.get("displayAspectHeight")?;
+    // [EnforceRange] unsigned long, like Chrome. A plain u32 read would wrap -1 to 2^32 - 1.
+    // The TypeError is kept for configure()/isConfigSupported(): the latter must reject, not
+    // throw. Chrome reads members in IDL (name) order, so height is checked first.
+    let mut conversion_error = None;
+    let mut enforce_range = |name: &str| -> Result<Option<u32>> {
+      let value: Option<f64> = obj.get(name)?;
+      let Some(value) = value else {
+        return Ok(None);
+      };
+      match enforce_range_unsigned_long_value(value, name) {
+        Ok(value) => Ok(Some(value)),
+        Err(message) => {
+          conversion_error.get_or_insert(message);
+          Ok(None)
+        }
+      }
+    };
+    let display_aspect_height = enforce_range("displayAspectHeight")?;
+    let display_aspect_width = enforce_range("displayAspectWidth")?;
     let color_space: Option<crate::webcodecs::video_frame::VideoColorSpaceInit> =
       obj.get("colorSpace")?;
     let hardware_acceleration: Option<HardwareAcceleration> = obj.get("hardwareAcceleration")?;
@@ -1881,6 +1904,7 @@ impl FromNapiValue for VideoDecoderConfig {
       coded_height,
       display_aspect_width,
       display_aspect_height,
+      conversion_error,
       color_space,
       hardware_acceleration,
       optimize_for_latency,
