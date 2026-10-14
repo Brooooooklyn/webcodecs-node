@@ -422,6 +422,22 @@ test('copyTo: a large RGB conversion matches the same frame copied in small stri
       strips.set(part, y * width * 4)
     }
     t.true(Buffer.from(whole).equals(Buffer.from(strips)), `${format} ${JSON.stringify(options)}`)
+
+    // The same rect into a padded layout: the bands split the destination by its stride, and the
+    // padding keeps its bytes.
+    const row = width * 4
+    const layout = [{ offset: 32, stride: row + 64 }]
+    const padded = new Uint8Array(layout[0].offset + layout[0].stride * height).fill(SENTINEL)
+    t.deepEqual(await frame.copyTo(padded, { ...options, layout }), layout)
+    let wrongRows = 0
+    for (let y = 0; y < height; y++) {
+      const start = layout[0].offset + y * layout[0].stride
+      const got = Buffer.from(padded.subarray(start, start + row))
+      if (!got.equals(Buffer.from(whole.subarray(y * row, (y + 1) * row)))) wrongRows++
+      if (!padded.subarray(start + row, start + layout[0].stride).every((b) => b === SENTINEL)) wrongRows++
+    }
+    t.true(padded.subarray(0, layout[0].offset).every((b) => b === SENTINEL))
+    t.is(wrongRows, 0, `${format} ${JSON.stringify(options)} with a padded layout`)
     frame.close()
   }
 })
