@@ -10,7 +10,7 @@ import test from 'ava'
 
 import { DOMRectReadOnly, VideoDecoder, VideoEncoder, VideoFrame, EncodedVideoChunk } from '../index.js'
 import type { VideoDecoderConfigOutput } from '../index.js'
-import type { VideoDecoderConfig, VideoEncoderConfig } from '../standard.js'
+import type { VideoDecoderConfig, VideoEncoderConfig, VideoFrameBufferInit } from '../standard.js'
 
 type FrameInit = {
   visibleRect?: { x: number; y: number; width: number; height: number }
@@ -112,6 +112,39 @@ for (const [kind, make] of constructors) {
     })
   })
 }
+
+test('VideoFrame: displayHeight converts before displayWidth like Chrome', (t) => {
+  // WebIDL converts dictionary members in lexicographic order and stops at the first failure.
+  // Chrome 155 reads displayHeight first in both constructors: an invalid displayHeight throws
+  // before the displayWidth getter runs, and a throwing displayHeight getter wins over an invalid
+  // displayWidth.
+  // [invalid member, member whose getter throws, expected error, getter calls]
+  const cases: Array<[FrameInit, string, { instanceOf: typeof Error; message?: string }, number]> = [
+    [{ displayHeight: -1 }, 'displayWidth', { instanceOf: TypeError }, 0],
+    [{ displayWidth: -1 }, 'displayHeight', { instanceOf: Error, message: 'displayHeight getter' }, 1],
+  ]
+  for (const kind of ['buffer', 'wrap']) {
+    for (const [invalid, getter, expected, expectedCalls] of cases) {
+      const label = `${kind}: ${JSON.stringify(invalid)}, ${getter} getter throws`
+      let calls = 0
+      const base = kind === 'buffer' ? { format: 'RGBX', codedWidth: 4, codedHeight: 2, timestamp: 0 } : {}
+      const init = Object.defineProperty({ ...base, ...invalid }, getter, {
+        enumerable: true,
+        get() {
+          calls++
+          throw new Error(`${getter} getter`)
+        },
+      }) as VideoFrameBufferInit
+      const source = kind === 'buffer' ? new Uint8Array(4 * 2 * 4) : rgbx(4, 2)
+      try {
+        t.throws(() => new VideoFrame(source, init).close(), expected, label)
+      } finally {
+        if (source instanceof VideoFrame) source.close()
+      }
+      t.is(calls, expectedCalls, `${label}: getter calls`)
+    }
+  }
+})
 
 // ============================================================================
 // Computed display size of a cropped wrap (spec step 8.5)

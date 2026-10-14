@@ -1194,16 +1194,18 @@ impl FromNapiValue for VideoFrameConstructorInit {
         .map(|v| v.min(i64::MAX as u64) as i64);
 
     // displayWidth/displayHeight are WebIDL [EnforceRange] unsigned long: a plain u32
-    // conversion would wrap -1 or 2^32 + 1 into range instead of throwing.
-    let display_width = super::error::enforce_range_unsigned_long_optional(
-      &env_wrapper,
-      obj.get("displayWidth")?,
-      "displayWidth",
-    )?;
+    // conversion would wrap -1 or 2^32 + 1 into range instead of throwing. WebIDL converts
+    // dictionary members in lexicographic order and stops at the first failure, so
+    // displayHeight is read and checked before the displayWidth getter runs.
     let display_height = super::error::enforce_range_unsigned_long_optional(
       &env_wrapper,
       obj.get("displayHeight")?,
       "displayHeight",
+    )?;
+    let display_width = super::error::enforce_range_unsigned_long_optional(
+      &env_wrapper,
+      obj.get("displayWidth")?,
+      "displayWidth",
     )?;
     // rotation is a WebIDL (restricted) double.
     let rotation: Option<f64> = obj.get("rotation")?;
