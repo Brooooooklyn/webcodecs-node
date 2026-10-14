@@ -242,6 +242,8 @@ struct VideoDecoderInner {
   // ========================================================================
   /// Color space from decoder config - applied to decoded frames
   config_color_space: Option<VideoColorSpaceInit>,
+  /// displayAspectWidth/displayAspectHeight from decoder config - applied to decoded frames
+  config_display_aspect: Option<(u32, u32)>,
 }
 
 /// Get the preferred hardware device type for the current platform
@@ -356,6 +358,7 @@ impl VideoDecoder {
       config_flip: false,
       // Color space from config (None = extract from FFmpeg frame)
       config_color_space: None,
+      config_display_aspect: None,
     };
 
     let inner = Arc::new(Mutex::new(inner));
@@ -695,6 +698,11 @@ impl VideoDecoder {
         guard.config_color_space.as_ref(),
       );
 
+      if let Err(e) = Self::apply_display_aspect(&guard, &video_frame) {
+        Self::report_error(&mut guard, &format!("EncodingError: {}", e));
+        return;
+      }
+
       // During flush, queue frames for synchronous delivery in resolver
       // Otherwise, use NonBlocking callback for immediate delivery
       if guard.flushes.should_buffer_outputs() {
@@ -704,6 +712,14 @@ impl VideoDecoder {
           .output_callback
           .call(video_frame, ThreadsafeFunctionCallMode::NonBlocking);
       }
+    }
+  }
+
+  /// Applies the config's displayAspectWidth:displayAspectHeight to a decoded frame.
+  fn apply_display_aspect(inner: &VideoDecoderInner, frame: &VideoFrame) -> Result<()> {
+    match inner.config_display_aspect {
+      Some((width, height)) => frame.apply_display_aspect(width, height),
+      None => Ok(()),
     }
   }
 
@@ -853,6 +869,11 @@ impl VideoDecoder {
           guard.config_flip,
           guard.config_color_space.as_ref(),
         );
+
+        if let Err(e) = Self::apply_display_aspect(&guard, &video_frame) {
+          Self::report_error(&mut guard, &format!("EncodingError: {}", e));
+          return;
+        }
         if guard.flushes.should_buffer_outputs() {
           guard.pending_frames.push(video_frame);
         } else {
@@ -951,6 +972,15 @@ impl VideoDecoder {
         guard.config_flip,
         guard.config_color_space.as_ref(),
       );
+
+      if let Err(e) = Self::apply_display_aspect(&guard, &video_frame) {
+        let msg = e.reason.clone();
+        Self::report_error(&mut guard, &format!("EncodingError: {}", msg));
+        return Err(Error::new(
+          Status::GenericFailure,
+          format!("EncodingError: {}", msg),
+        ));
+      }
       // Always queue during flush for synchronous delivery in resolver
       guard.pending_frames.push(video_frame);
     }
@@ -1141,6 +1171,9 @@ impl VideoDecoder {
 
     // Store colorSpace from config
     guard.config_color_space = config.color_space;
+    guard.config_display_aspect = config
+      .display_aspect_width
+      .zip(config.display_aspect_height);
   }
 
   /// Resolve the (timestamp, duration) pair belonging to a decoded frame.
@@ -1563,6 +1596,9 @@ impl VideoDecoder {
     // Store colorSpace from config (W3C WebCodecs spec)
     // If provided, this colorSpace will be applied to all decoded frames
     inner.config_color_space = config.color_space;
+    inner.config_display_aspect = config
+      .display_aspect_width
+      .zip(config.display_aspect_height);
 
     // Create new channel and worker if needed (after reconfiguration)
     if self.command_sender.is_none() {

@@ -2161,6 +2161,38 @@ fn parse_display_size(
   Ok(Some((width, height)))
 }
 
+/// Natural size for a decoder's displayAspectWidth:displayAspectHeight, like Chromium's
+/// VideoAspectRatio::DAR(width, height).GetNaturalSize(visible_rect): grow one side of the
+/// visible size until it matches the ratio. None keeps the visible size (Chromium casts the
+/// members to int, so a value above i32::MAX makes the ratio invalid).
+fn natural_size_for_display_aspect(
+  visible_width: u32,
+  visible_height: u32,
+  aspect_width: u32,
+  aspect_height: u32,
+) -> Option<(f64, f64)> {
+  let (aspect_width, aspect_height) = (aspect_width as i32, aspect_height as i32);
+  if aspect_height == 0 || visible_width == 0 || visible_height == 0 {
+    return None;
+  }
+  let aspect = f64::from(aspect_width) / f64::from(aspect_height);
+  if !aspect.is_finite() || aspect <= 0.0 {
+    return None;
+  }
+  let (mut width, mut height) = (f64::from(visible_width), f64::from(visible_height));
+  if aspect >= width / height {
+    width = height * aspect;
+  } else {
+    height = width / aspect;
+  }
+  let (width, height) = (width.round(), height.round());
+  let int_max = f64::from(i32::MAX);
+  if width < 1.0 || width > int_max || height < 1.0 || height > int_max {
+    return None;
+  }
+  Some((width, height))
+}
+
 #[napi]
 impl VideoFrame {
   fn from_inner(inner: VideoFrameInner) -> Self {
@@ -4127,6 +4159,44 @@ impl VideoFrame {
   /// that need to share the frame without deep copying.
   pub(crate) fn frame_arc(&self) -> Result<Arc<RwLock<Frame>>> {
     self.with_inner(|inner| Ok(inner.resource.software()?.0.clone()))
+  }
+
+  /// Applies a VideoDecoderConfig displayAspectWidth:displayAspectHeight to a decoded frame
+  /// (spec "Create a VideoFrame" step 8): grows the display width or height to the ratio.
+  ///
+  /// Fails when the grown size exceeds the media limits; Chromium's decoder reports an
+  /// EncodingError then.
+  pub(crate) fn apply_display_aspect(&self, aspect_width: u32, aspect_height: u32) -> Result<()> {
+    let mut guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    let Some(inner) = guard.as_mut() else {
+      return Ok(());
+    };
+    let Some((width, height)) = natural_size_for_display_aspect(
+      inner.visible_width,
+      inner.visible_height,
+      aspect_width,
+      aspect_height,
+    ) else {
+      return Ok(());
+    };
+    if width > f64::from(MAX_DIMENSION)
+      || height > f64::from(MAX_DIMENSION)
+      || width * height > MAX_CANVAS as f64
+    {
+      return Err(Error::new(
+        Status::GenericFailure,
+        format!(
+          "Display size {}x{} for display aspect {}:{} exceeds implementation limit",
+          width, height, aspect_width, aspect_height
+        ),
+      ));
+    }
+    inner.display_width = width as u32;
+    inner.display_height = height as u32;
+    Ok(())
   }
 
   /// Borrow internal frame for read access (crate internal use)
