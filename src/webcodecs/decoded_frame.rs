@@ -14,7 +14,7 @@
 //! how to expose them is a separate product decision. `copyTo()` refuses to read
 //! them as I420 because their memory does not match.
 
-use crate::codec::{CodecError, Frame};
+use crate::codec::{CodecError, Frame, ScaleAlgorithm, Scaler};
 use crate::ffi::accessors::{
   ffframe_convert_decoded, ffframe_palette_has_alpha, ffpixfmt_describe,
 };
@@ -37,10 +37,13 @@ pub(crate) enum DecodedSource {
   ///   Chrome labels the image BGRA or BGRX by it.
   /// - `yuv`: whether Chrome decodes the image to YUV planes (JPEG: the sampling
   ///   factors; AVIF: one still image without alpha).
+  /// - `size`: desiredWidth/desiredHeight. A converted frame is resized in the same
+  ///   swscale pass; a kept frame is resized in its own format.
   Image {
     codec: AVCodecID,
     alpha: Option<bool>,
     yuv: Option<bool>,
+    size: Option<(u32, u32)>,
   },
   /// VideoDecoder, software decoder
   Video,
@@ -68,12 +71,45 @@ fn describe(raw: i32) -> Result<PixDesc, CodecError> {
   })
 }
 
+/// What to do with a decoded frame.
+enum Choice {
+  /// Its memory already is this format.
+  Keep(VideoPixelFormat),
+  /// Convert it to this format (`image`: an image, see `ffframe_convert_decoded`).
+  Convert {
+    format: VideoPixelFormat,
+    desc: PixDesc,
+    image: bool,
+  },
+}
+
 /// Give a decoded frame the WebCodecs format that describes its bytes, converting
 /// it when FFmpeg's format has no WebCodecs equivalent.
 pub(crate) fn decoded_frame_format(
   mut frame: Frame,
   source: DecodedSource,
 ) -> Result<(Frame, VideoPixelFormat), CodecError> {
+  let size = match source {
+    DecodedSource::Image { size, .. } => size,
+    _ => None,
+  };
+  match choose(&mut frame, source)? {
+    Choice::Keep(format) => match size {
+      Some((width, height)) => Ok((resize(&frame, width, height)?, format)),
+      None => Ok((frame, format)),
+    },
+    // One swscale pass to the final size: a full-size converted copy of a large
+    // image is never made.
+    Choice::Convert {
+      format,
+      desc,
+      image,
+    } => Ok((convert(&frame, format, &desc, image, size)?, format)),
+  }
+}
+
+/// Pick the frame's format. A yuvj* frame is relabelled yuv* here.
+fn choose(frame: &mut Frame, source: DecodedSource) -> Result<Choice, CodecError> {
   let av = frame.format();
   // Chrome decodes a JPEG to BGRX unless its sampling factors are ones it reads as YUV,
   // even when FFmpeg's planes have a WebCodecs layout (FFmpeg reads 2x2/1x2/1x2 as yuvj422p).
@@ -87,7 +123,7 @@ pub(crate) fn decoded_frame_format(
   );
   if !rgb_only {
     if let Some(format) = VideoPixelFormat::from_av_format(av) {
-      return Ok((frame, format));
+      return Ok(Choice::Keep(format));
     }
 
     // yuvj* is yuv* with full range: same planes, so only the format field changes.
@@ -101,38 +137,47 @@ pub(crate) fn decoded_frame_format(
       frame.set_format(yuv);
       frame.set_color_range(AVColorRange::Jpeg);
       let format = VideoPixelFormat::from_av_format(yuv).unwrap_or(VideoPixelFormat::I420);
-      return Ok((frame, format));
+      return Ok(Choice::Keep(format));
     }
   }
 
   match source {
     // Unchanged from before this mapping existed (see the module comment).
-    DecodedSource::HardwareVideo => Ok((frame, VideoPixelFormat::I420)),
+    DecodedSource::HardwareVideo => Ok(Choice::Keep(VideoPixelFormat::I420)),
     DecodedSource::Video => {
       // Chrome reports RGB video as I444 with the G, B, R planes.
       if let Some(format) = planar_rgb_format(av) {
-        return Ok((frame, format));
+        return Ok(Choice::Keep(format));
       }
       let desc = describe(frame.format_raw())?;
-      let format = video_target(&desc);
-      Ok((convert(&frame, format, &desc, false)?, format))
+      Ok(Choice::Convert {
+        format: video_target(&desc),
+        desc,
+        image: false,
+      })
     }
-    DecodedSource::Image { codec, alpha, yuv } => {
+    DecodedSource::Image {
+      codec, alpha, yuv, ..
+    } => {
       // Chrome reports a still AVIF with the identity matrix as I444 with the G, B, R
       // planes (an animated one, or one with alpha, as BGRX/BGRA).
       if codec == AVCodecID::Av1
         && yuv == Some(true)
         && let Some(format) = planar_rgb_format(av)
       {
-        return Ok((frame, format));
+        return Ok(Choice::Keep(format));
       }
       let desc = describe(frame.format_raw())?;
-      let format = if image_has_alpha(&frame, &desc, codec, alpha) {
+      let format = if image_has_alpha(frame, &desc, codec, alpha) {
         VideoPixelFormat::BGRA
       } else {
         VideoPixelFormat::BGRX
       };
-      Ok((convert(&frame, format, &desc, true)?, format))
+      Ok(Choice::Convert {
+        format,
+        desc,
+        image: true,
+      })
     }
   }
 }
@@ -213,23 +258,41 @@ fn video_target(desc: &PixDesc) -> VideoPixelFormat {
   }
 }
 
+/// Convert `src` to `format`, at `size` when given.
 fn convert(
   src: &Frame,
   format: VideoPixelFormat,
   desc: &PixDesc,
   image: bool,
+  size: Option<(u32, u32)>,
 ) -> Result<Frame, CodecError> {
   if desc.flags & FLAG_HWACCEL != 0 {
     return Err(CodecError::InvalidState(
       "hardware frame was not downloaded".into(),
     ));
   }
-  let mut dst = Frame::new_video(src.width(), src.height(), format.to_av_format())?;
+  let (width, height) = size.unwrap_or((src.width(), src.height()));
+  let mut dst = Frame::new_video(width, height, format.to_av_format())?;
   // Images without a range tag are full range; video without one is limited range.
   check_error(unsafe {
     ffframe_convert_decoded(src.as_ptr(), dst.as_mut_ptr(), image as std::os::raw::c_int)
   })?;
   Ok(dst)
+}
+
+/// Resize a kept frame in its own format (ImageDecoder desiredWidth/desiredHeight).
+fn resize(src: &Frame, width: u32, height: u32) -> Result<Frame, CodecError> {
+  let format = src.format();
+  Scaler::new(
+    src.width(),
+    src.height(),
+    format,
+    width,
+    height,
+    format,
+    ScaleAlgorithm::Lanczos, // High quality for images
+  )?
+  .scale_alloc(src)
 }
 
 #[cfg(test)]
