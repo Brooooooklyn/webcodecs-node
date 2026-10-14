@@ -763,17 +763,138 @@ pub struct DOMRectJSON {
   pub left: f64,
 }
 
+/// WebIDL `unrestricted double` conversion (ToNumber) of an optional member that defaults to 0.
+/// Errors thrown by `valueOf`, a Symbol or a BigInt stay pending and propagate.
+fn to_unrestricted_double(value: Option<Unknown>) -> Result<f64> {
+  match value {
+    Some(value) if value.get_type()? != ValueType::Undefined => {
+      value.coerce_to_number()?.get_double()
+    }
+    _ => Ok(0.0),
+  }
+}
+
+/// IDL order of the DOMRectReadOnly prototype members (napi-derive defines them alphabetically).
+const DOM_RECT_READ_ONLY_MEMBERS: [&str; 10] = [
+  "x",
+  "y",
+  "width",
+  "height",
+  "top",
+  "right",
+  "bottom",
+  "left",
+  "toJSON",
+  "constructor",
+];
+
+/// Gives the exported DOMRectReadOnly class the shape Chrome's has: prototype members in IDL
+/// order (what `for...in` and `Object.getOwnPropertyNames` list) and a `Symbol.toStringTag`
+/// of "DOMRectReadOnly".
+fn install_dom_rect_read_only_shape(env: &Env, exports: &Object) -> Result<()> {
+  // The class is a function, which `get_named_property::<Object>` rejects.
+  let class = exports
+    .get_named_property::<Unknown>("DOMRectReadOnly")?
+    .coerce_to_object()?;
+  let prototype: Object = class.get_named_property("prototype")?;
+  let global = env.get_global()?;
+  let reflect: Object = global.get_named_property("Reflect")?;
+  let get_descriptor: Function<FnArgs<(Object, &str)>, Unknown> =
+    reflect.get_named_property("getOwnPropertyDescriptor")?;
+  let delete_property: Function<FnArgs<(Object, &str)>, bool> =
+    reflect.get_named_property("deleteProperty")?;
+  let define_property: Function<FnArgs<(Object, Unknown, Unknown)>, bool> =
+    reflect.get_named_property("defineProperty")?;
+  // Delete and redefine each member in IDL order, so every member moves to the end in turn.
+  for name in DOM_RECT_READ_ONLY_MEMBERS {
+    let descriptor = get_descriptor.call((prototype, name).into())?;
+    if descriptor.get_type()? == ValueType::Undefined {
+      return Err(Error::new(
+        Status::GenericFailure,
+        format!("DOMRectReadOnly.prototype.{} is missing", name),
+      ));
+    }
+    delete_property.call((prototype, name).into())?;
+    let key = env.create_string(name)?.to_unknown();
+    define_property.call((prototype, key, descriptor).into())?;
+  }
+  let to_string_tag: Unknown = global
+    .get_named_property::<Unknown>("Symbol")?
+    .coerce_to_object()?
+    .get_named_property("toStringTag")?;
+  let mut tag = Object::new(env)?;
+  tag.set_named_property("value", "DOMRectReadOnly")?;
+  tag.set_named_property("configurable", true)?;
+  define_property.call((prototype, to_string_tag, tag.to_unknown()).into())?;
+  Ok(())
+}
+
+/// [`install_dom_rect_read_only_shape`] for the load hook: a failure is logged and cleared, so
+/// it does not make the module fail to load.
+fn try_install_dom_rect_read_only_shape(env: &Env, exports: &Object) {
+  if let Err(error) = install_dom_rect_read_only_shape(env, exports) {
+    tracing::warn!(target: "webcodecs", error = %error, "DOMRectReadOnly shape not installed");
+    let mut exception = std::ptr::null_mut();
+    unsafe { napi::sys::napi_get_and_clear_last_exception(env.raw(), &mut exception) };
+  }
+}
+
 #[napi]
 impl DOMRectReadOnly {
   /// Create a new DOMRectReadOnly
-  #[napi(constructor)]
-  pub fn new(x: Option<f64>, y: Option<f64>, width: Option<f64>, height: Option<f64>) -> Self {
-    DOMRectReadOnly {
-      x: x.unwrap_or(0.0),
-      y: y.unwrap_or(0.0),
-      width: width.unwrap_or(0.0),
-      height: height.unwrap_or(0.0),
+  ///
+  /// Arguments convert like WebIDL `unrestricted double` (ToNumber), as in browsers.
+  #[napi(
+    constructor,
+    ts_args_type = "x?: number | undefined | null, y?: number | undefined | null, width?: number | undefined | null, height?: number | undefined | null"
+  )]
+  pub fn new(
+    x: Option<Unknown>,
+    y: Option<Unknown>,
+    width: Option<Unknown>,
+    height: Option<Unknown>,
+  ) -> Result<Self> {
+    Ok(DOMRectReadOnly {
+      x: to_unrestricted_double(x)?,
+      y: to_unrestricted_double(y)?,
+      width: to_unrestricted_double(width)?,
+      height: to_unrestricted_double(height)?,
+    })
+  }
+
+  /// Create a DOMRectReadOnly from a DOMRectInit dictionary (Geometry Interfaces `fromRect`)
+  #[napi(js_name = "fromRect", ts_args_type = "other?: DOMRectInit")]
+  pub fn from_rect(env: Env, other: Option<Unknown>) -> Result<DOMRectReadOnly> {
+    // undefined and null convert to an empty dictionary.
+    let Some(other) = other else {
+      return Ok(DOMRectReadOnly {
+        x: 0.0,
+        y: 0.0,
+        width: 0.0,
+        height: 0.0,
+      });
+    };
+    if !matches!(other.get_type()?, ValueType::Object | ValueType::Function) {
+      return Err(throw_type_error(
+        env.raw(),
+        "The provided value is not of type 'DOMRectInit'.",
+      ));
     }
+    let other = other.coerce_to_object()?;
+    let member = |name: &str| -> Result<f64> {
+      to_unrestricted_double(Some(other.get_named_property::<Unknown>(name)?))
+    };
+    // WebIDL reads dictionary members in lexicographic order.
+    let height = member("height")?;
+    let width = member("width")?;
+    let x = member("x")?;
+    let y = member("y")?;
+    Ok(DOMRectReadOnly {
+      x,
+      y,
+      width,
+      height,
+    })
   }
 
   /// X coordinate
@@ -1742,15 +1863,18 @@ thread_local! {
     const { std::cell::Cell::new(None) };
 }
 
-/// Runs each time the module loads into an env (the main thread or a worker), before page code
-/// can use the module. napi-rs keeps one `module_exports` hook per crate: add new load-time work
-/// here.
+/// Runs each time the module loads into an env (the main thread or a worker), after napi-rs has
+/// defined the exported classes and before page code can use the module. napi-rs keeps one
+/// `module_exports` hook per crate, and a second one silently replaces this one: add new
+/// load-time work here.
 #[napi(module_exports)]
 // Only napi's load-time registration calls this, and `cargo test` builds leave it out.
 #[cfg_attr(test, allow(dead_code))]
-pub fn on_module_load(_exports: Object, env: Env) -> Result<()> {
+pub fn on_module_load(exports: Object, env: Env) -> Result<()> {
   capture_buffer_flag_getters(&env)?;
-  capture_iterator_symbol(&env)
+  capture_iterator_symbol(&env)?;
+  try_install_dom_rect_read_only_shape(&env, &exports);
+  Ok(())
 }
 
 /// Captures the buffer flag getters of `env`, once per env.

@@ -425,13 +425,19 @@ export declare class AudioEncoder {
  * Used for codedRect and visibleRect properties
  */
 export declare class DOMRectReadOnly {
-  /** Create a new DOMRectReadOnly */
+  /**
+   * Create a new DOMRectReadOnly
+   *
+   * Arguments convert like WebIDL `unrestricted double` (ToNumber), as in browsers.
+   */
   constructor(
     x?: number | undefined | null,
     y?: number | undefined | null,
     width?: number | undefined | null,
     height?: number | undefined | null,
   )
+  /** Create a DOMRectReadOnly from a DOMRectInit dictionary (Geometry Interfaces `fromRect`) */
+  static fromRect(other?: DOMRectInit): DOMRectReadOnly
   /** X coordinate */
   get x(): number
   /** Y coordinate */

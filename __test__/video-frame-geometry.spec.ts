@@ -1,14 +1,14 @@
 /**
  * VideoFrame geometry parity with Chrome
  *
- * Display size validation, rotation rounding, orientation after close, and decoder
- * displayAspectWidth/displayAspectHeight.
+ * Display size validation, rotation rounding, orientation after close, decoder
+ * displayAspectWidth/displayAspectHeight, and the DOMRectReadOnly interface.
  * Expected values were recorded in Chrome 155.
  */
 
 import test from 'ava'
 
-import { VideoDecoder, VideoEncoder, VideoFrame, EncodedVideoChunk } from '../index.js'
+import { DOMRectReadOnly, VideoDecoder, VideoEncoder, VideoFrame, EncodedVideoChunk } from '../index.js'
 import type { VideoDecoderConfig } from '../standard.js'
 
 type FrameInit = {
@@ -393,4 +393,106 @@ test('VideoDecoder: reconfigure applies the new display aspect', async (t) => {
   }
   decoder.close()
   t.deepEqual(sizes, ['427x240', '320x240', '320x640'])
+})
+
+// ============================================================================
+// DOMRectReadOnly interface shape
+// ============================================================================
+
+test('DOMRectReadOnly: Object.prototype.toString reports DOMRectReadOnly', (t) => {
+  t.is(Object.prototype.toString.call(new DOMRectReadOnly(1, 2, 3, 4)), '[object DOMRectReadOnly]')
+  t.is(Object.prototype.toString.call(DOMRectReadOnly.prototype), '[object DOMRectReadOnly]')
+  const descriptor = Object.getOwnPropertyDescriptor(DOMRectReadOnly.prototype, Symbol.toStringTag)
+  t.deepEqual(descriptor, { value: 'DOMRectReadOnly', writable: false, enumerable: false, configurable: true })
+  const frame = rgbx(4, 2)
+  t.is(Object.prototype.toString.call(frame.visibleRect), '[object DOMRectReadOnly]')
+  frame.close()
+})
+
+test('DOMRectReadOnly: members enumerate in IDL order', (t) => {
+  const keys: string[] = []
+  for (const key in new DOMRectReadOnly(1, 2, 3, 4)) keys.push(key)
+  t.deepEqual(keys, ['x', 'y', 'width', 'height', 'top', 'right', 'bottom', 'left', 'toJSON'])
+  t.deepEqual(Object.getOwnPropertyNames(DOMRectReadOnly.prototype), [
+    'x',
+    'y',
+    'width',
+    'height',
+    'top',
+    'right',
+    'bottom',
+    'left',
+    'toJSON',
+    'constructor',
+  ])
+  // Moving the members keeps them working
+  const rect = new DOMRectReadOnly(1, 2, -3, 4)
+  t.deepEqual(rect.toJSON(), { x: 1, y: 2, width: -3, height: 4, top: 2, right: 1, bottom: 6, left: -2 })
+  t.is(DOMRectReadOnly.prototype.constructor, DOMRectReadOnly)
+})
+
+const edges = (rect: DOMRectReadOnly) => [rect.x, rect.y, rect.width, rect.height]
+
+test('DOMRectReadOnly: constructor converts arguments with ToNumber', (t) => {
+  const args = (...values: unknown[]) => values as [number, number, number, number]
+  t.deepEqual(edges(new DOMRectReadOnly(...args('1', '2', '-3', ' 4 '))), [1, 2, -3, 4])
+  t.deepEqual(edges(new DOMRectReadOnly(...args(true, false, '', '0x10'))), [1, 0, 0, 16])
+  t.deepEqual(edges(new DOMRectReadOnly(...args(null, undefined, [5], { valueOf: () => 7 }))), [0, 0, 5, 7])
+  t.deepEqual(edges(new DOMRectReadOnly(...args('abc', {}))), [NaN, NaN, 0, 0])
+  t.deepEqual(edges(new DOMRectReadOnly(NaN, Infinity, -0, -Infinity)), [NaN, Infinity, -0, -Infinity])
+
+  // Arguments convert in order; an exception stops the conversion
+  const log: string[] = []
+  const tracked = (name: string, value: number) => ({
+    valueOf() {
+      log.push(name)
+      if (name === 'y') throw new RangeError('boom')
+      return value
+    },
+  })
+  t.throws(() => new DOMRectReadOnly(...args(tracked('x', 1), tracked('y', 2), tracked('width', 3))), {
+    instanceOf: RangeError,
+    message: 'boom',
+  })
+  t.deepEqual(log, ['x', 'y'])
+  t.throws(() => new DOMRectReadOnly(...args(Symbol('x'))), { instanceOf: TypeError })
+  t.throws(() => new DOMRectReadOnly(...args(1n)), { instanceOf: TypeError })
+})
+
+test('DOMRectReadOnly.fromRect converts a DOMRectInit like Chrome', (t) => {
+  t.is(typeof DOMRectReadOnly.fromRect, 'function')
+  t.is(DOMRectReadOnly.fromRect.length, 0)
+  for (const empty of [undefined, null, {}, { top: 9, left: 9 }]) {
+    const rect = DOMRectReadOnly.fromRect(empty as never)
+    t.true(rect instanceof DOMRectReadOnly)
+    t.deepEqual(edges(rect), [0, 0, 0, 0])
+  }
+  t.deepEqual(edges(DOMRectReadOnly.fromRect()), [0, 0, 0, 0])
+  const rect = DOMRectReadOnly.fromRect({ x: 1, y: 2, width: 3, height: 4 })
+  t.is(JSON.stringify(rect), '{"x":1,"y":2,"width":3,"height":4,"top":2,"right":4,"bottom":6,"left":1}')
+  t.deepEqual(edges(DOMRectReadOnly.fromRect({ x: '1', width: '-3', y: null } as never)), [1, 0, -3, 0])
+  t.deepEqual(edges(DOMRectReadOnly.fromRect({ x: 'abc', y: { valueOf: () => 42 } } as never)), [NaN, 42, 0, 0])
+  // Another rect reads through its prototype getters
+  t.deepEqual(edges(DOMRectReadOnly.fromRect(new DOMRectReadOnly(5, 6, 7, 8))), [5, 6, 7, 8])
+
+  // Members are read in lexicographic order
+  const log: string[] = []
+  const init = {}
+  for (const key of ['y', 'x', 'width', 'height']) {
+    Object.defineProperty(init, key, {
+      get() {
+        log.push(key)
+        return 1
+      },
+      enumerable: true,
+    })
+  }
+  DOMRectReadOnly.fromRect(init)
+  t.deepEqual(log, ['height', 'width', 'x', 'y'])
+
+  for (const value of [5, 'x', true]) {
+    t.throws(() => DOMRectReadOnly.fromRect(value as never), { instanceOf: TypeError })
+  }
+  t.throws(() => DOMRectReadOnly.fromRect({ x: Symbol('x') } as never), { instanceOf: TypeError })
+  t.throws(() => DOMRectReadOnly.fromRect({ x: 1n } as never), { instanceOf: TypeError })
 })
