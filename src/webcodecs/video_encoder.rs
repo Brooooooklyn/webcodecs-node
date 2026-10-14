@@ -743,6 +743,8 @@ impl VideoEncoder {
         guard.scaler = None;
         guard.hw_frame_ctx = None;
         guard.hw_device_ctx = None;
+        // Frames kept for a software fallback that can no longer happen.
+        guard.pending_frames.clear();
         if guard.acquired_hw_slot {
           codec_pressure::gauge().release_hw_encoder();
           guard.acquired_hw_slot = false;
