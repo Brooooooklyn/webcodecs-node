@@ -273,7 +273,8 @@ test('ImageDecoder decodes JPEG XL image data', async (t) => {
 
   t.is(result.image.codedWidth, 32)
   t.is(result.image.codedHeight, 32)
-  t.is(result.image.format, 'RGBX')
+  // libjxl decodes this sample to rgb24; Chrome 155 reports it as BGRX
+  t.is(result.image.format, 'BGRX')
   t.is(result.image.timestamp, 0)
   t.true(result.complete)
 

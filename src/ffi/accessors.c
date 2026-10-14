@@ -1779,3 +1779,76 @@ end:
   av_free(t);
   return ret;
 }
+
+/* ============================================================================
+ * Decoded frames whose AVPixelFormat has no WebCodecs equivalent
+ * (src/webcodecs/decoded_frame.rs picks the target format)
+ * ============================================================================ */
+
+// Descriptor facts: out = {flags, nb_components, log2_chroma_w, log2_chroma_h, depth of comp 0}.
+int ffpixfmt_describe(int fmt, int *out) {
+  const AVPixFmtDescriptor *d = av_pix_fmt_desc_get((enum AVPixelFormat)fmt);
+  if (!d || !out) return AVERROR(EINVAL);
+  out[0] = (int)d->flags;
+  out[1] = d->nb_components;
+  out[2] = d->log2_chroma_w;
+  out[3] = d->log2_chroma_h;
+  out[4] = d->comp[0].depth;
+  return 0;
+}
+
+// 1 when a palette frame has an entry that is not fully opaque.
+int ffframe_palette_has_alpha(const AVFrame *f) {
+  const AVPixFmtDescriptor *d = f ? av_pix_fmt_desc_get((enum AVPixelFormat)f->format) : NULL;
+  if (!d || !(d->flags & AV_PIX_FMT_FLAG_PAL) || !f->data[1]) return 0;
+  const uint32_t *pal = (const uint32_t *)f->data[1];
+  for (int i = 0; i < AVPALETTE_COUNT; i++)
+    if ((pal[i] >> 24) != 0xFF) return 1;
+  return 0;
+}
+
+// Convert all of src into dst, which has its own format and buffers at the same size. Gray and
+// YUV samples keep their range (unspecified_full picks it when src has no range tag); YUV <-> RGB
+// uses src's matrix. dst gets src's props; an RGB dst is tagged RGB matrix, full range, and a
+// YUV dst made from a full-range source is tagged full range.
+int ffframe_convert_decoded(const AVFrame *src, AVFrame *dst, int unspecified_full) {
+  if (!src || !dst || src->width != dst->width || src->height != dst->height || src->width <= 0 ||
+      src->height <= 0)
+    return AVERROR(EINVAL);
+  const AVPixFmtDescriptor *dd = av_pix_fmt_desc_get((enum AVPixelFormat)dst->format);
+  if (!dd || !sws_isSupportedInput((enum AVPixelFormat)src->format) ||
+      !sws_isSupportedOutput((enum AVPixelFormat)dst->format))
+    return AVERROR(ENOSYS);
+  int f = src->format;
+  int full = src->color_range == AVCOL_RANGE_JPEG ||
+             (src->color_range != AVCOL_RANGE_MPEG && unspecified_full) ||
+             f == AV_PIX_FMT_YUVJ420P || f == AV_PIX_FMT_YUVJ422P || f == AV_PIX_FMT_YUVJ444P ||
+             f == AV_PIX_FMT_YUVJ440P || f == AV_PIX_FMT_YUVJ411P;
+  int mat = src->colorspace;
+  int cs = mat == AVCOL_SPC_BT709 ? SWS_CS_ITU709
+         : mat == AVCOL_SPC_BT2020_NCL || mat == AVCOL_SPC_BT2020_CL ? SWS_CS_BT2020
+         : mat == AVCOL_SPC_SMPTE240M ? SWS_CS_SMPTE240M
+         : mat == AVCOL_SPC_FCC ? SWS_CS_FCC
+         : SWS_CS_DEFAULT;
+  struct SwsContext *s = sws_getContext(src->width, src->height, (enum AVPixelFormat)f, dst->width,
+                                        dst->height, (enum AVPixelFormat)dst->format,
+                                        SWS_BILINEAR | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT,
+                                        NULL, NULL, NULL);
+  if (!s) return AVERROR(ENOMEM);
+  sws_setColorspaceDetails(s, sws_getCoefficients(cs), full, sws_getCoefficients(cs), full, 0,
+                           1 << 16, 1 << 16);
+  int ret = sws_scale(s, (const uint8_t *const *)src->data, src->linesize, 0, src->height,
+                      dst->data, dst->linesize);
+  sws_freeContext(s);
+  if (ret < 0) return ret;
+  if (ret != dst->height) return AVERROR_EXTERNAL;
+  ret = av_frame_copy_props(dst, src);
+  if (ret < 0) return ret;
+  if (dd->flags & AV_PIX_FMT_FLAG_RGB) {
+    dst->colorspace = AVCOL_SPC_RGB;
+    dst->color_range = AVCOL_RANGE_JPEG;
+  } else if (full) {
+    dst->color_range = AVCOL_RANGE_JPEG; // yuvj formats carry full range in the format itself
+  }
+  return 0;
+}
