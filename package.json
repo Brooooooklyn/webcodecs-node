@@ -54,7 +54,7 @@
     "format:oxfmt": "oxfmt",
     "format:rs": "cargo fmt",
     "lint": "oxlint --type-aware",
-    "prepublishOnly": "node tools/package-licenses.mjs && node tools/package-licenses.mjs --check && napi prepublish -t npm",
+    "prepublishOnly": "node tools/check-loader-version.mjs && node tools/package-licenses.mjs && node tools/package-licenses.mjs --check && napi prepublish -t npm",
     "test": "ava",
     "demo": "cd example && vite",
     "typecheck": "tsc -b tsconfig.json && tsc --ignoreConfig ./index.d.ts",
