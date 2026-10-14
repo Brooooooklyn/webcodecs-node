@@ -514,6 +514,45 @@ test('VideoDecoder: an invalid display aspect stops the config read like Chrome'
   }
 })
 
+test('VideoDecoder: colorSpace is read before the display aspect like Chrome', async (t) => {
+  // Chrome 155 reads colorSpace before displayAspectHeight/displayAspectWidth (WebIDL name order),
+  // so a colorSpace error comes first, not the display aspect TypeError.
+  const icsError = async (config: VideoDecoderConfig) => {
+    try {
+      await VideoDecoder.isConfigSupported(config)
+    } catch (error) {
+      return error as Error
+    }
+    return undefined
+  }
+  const aspects: Array<[string, Partial<VideoDecoderConfig>]> = [
+    ['H -1', { displayAspectWidth: 16, displayAspectHeight: -1 }],
+    ['W NaN', { displayAspectWidth: NaN, displayAspectHeight: 9 }],
+    ['lone H -1', { displayAspectHeight: -1 }],
+  ]
+  for (const [name, aspect] of aspects) {
+    let calls = 0
+    const withGetter = () =>
+      Object.defineProperty({ codec: 'vp8', ...aspect }, 'colorSpace', {
+        enumerable: true,
+        get() {
+          calls++
+          throw new Error('colorSpace getter')
+        },
+      }) as VideoDecoderConfig
+    const badColorSpace = { codec: 'vp8', ...aspect, colorSpace: { primaries: 'bogus' } } as unknown as VideoDecoderConfig
+    const decoder = new VideoDecoder({ output: (frame) => frame.close(), error: (error) => t.fail(error.message) })
+    t.throws(() => decoder.configure(withGetter()), { message: 'colorSpace getter' }, `configure ${name}, getter`)
+    t.throws(() => decoder.configure(badColorSpace), { message: /primaries/i }, `configure ${name}, bad primaries`)
+    decoder.close()
+    // isConfigSupported() reports the same error. It throws it instead of rejecting with it: that
+    // is a separate difference from Chrome for every throwing getter.
+    t.is((await icsError(withGetter()))?.message, 'colorSpace getter', `isConfigSupported ${name}, getter`)
+    t.regex(String((await icsError(badColorSpace))?.message), /primaries/i, `isConfigSupported ${name}, bad primaries`)
+    t.is(calls, 2, `${name}: the colorSpace getter runs once per call`)
+  }
+})
+
 test('VideoDecoder: fractional displayAspectWidth/displayAspectHeight truncate like Chrome', async (t) => {
   const chunks = await encodeVp8(320, 240)
   // [width, height, Chrome 155 support.config members, output display size]
