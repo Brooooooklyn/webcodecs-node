@@ -734,7 +734,8 @@ fn rect_edges(origin: f64, extent: f64) -> (f64, f64) {
   (min, max)
 }
 
-#[napi(object)]
+/// Result of DOMRectReadOnly.toJSON()
+#[napi(object, js_name = "DOMRectJSON")]
 pub struct DOMRectJSON {
   pub x: f64,
   pub y: f64,
@@ -783,25 +784,25 @@ impl DOMRectReadOnly {
     self.height
   }
 
-  /// top edge
+  /// Top edge: min(y, y + height), NaN if either is NaN
   #[napi(getter)]
   pub fn top(&self) -> f64 {
     rect_edges(self.y, self.height).0
   }
 
-  /// right edge
+  /// Right edge: max(x, x + width), NaN if either is NaN
   #[napi(getter)]
   pub fn right(&self) -> f64 {
     rect_edges(self.x, self.width).1
   }
 
-  /// bottom edge
+  /// Bottom edge: max(y, y + height), NaN if either is NaN
   #[napi(getter)]
   pub fn bottom(&self) -> f64 {
     rect_edges(self.y, self.height).1
   }
 
-  /// left edge
+  /// Left edge: min(x, x + width), NaN if either is NaN
   #[napi(getter)]
   pub fn left(&self) -> f64 {
     rect_edges(self.x, self.width).0
@@ -1142,7 +1143,9 @@ struct VideoFrameInner {
   visible_top: u32,
   visible_width: u32,
   visible_height: u32,
-  /// unrotated natural dimensions; public getters apply rotation
+  /// Natural (unrotated) display size, like Chromium's natural_size().
+  /// The displayWidth/displayHeight getters swap it for rotation 90/270.
+  /// The spec text stores the display size already rotated instead.
   display_width: u32,
   display_height: u32,
   /// Rotation in degrees clockwise (0, 90, 180, 270)
@@ -1507,7 +1510,9 @@ impl VideoFrame {
       format,
     )?;
 
-    // retain natural dimensions; rotation applies only when exposing display dimensions.
+    // Store the natural (unrotated) size. Explicit displayWidth/displayHeight are
+    // taken as the natural size too, like Chromium (the spec text stores them as
+    // already rotated). The displayWidth/displayHeight getters apply rotation.
     let display_width = init.display_width.unwrap_or(visible_width);
     let display_height = init.display_height.unwrap_or(visible_height);
 

@@ -440,16 +440,16 @@ export declare class DOMRectReadOnly {
   get width(): number
   /** Height */
   get height(): number
-  /** top edge */
+  /** Top edge: min(y, y + height), NaN if either is NaN */
   get top(): number
-  /** right edge */
+  /** Right edge: max(x, x + width), NaN if either is NaN */
   get right(): number
-  /** bottom edge */
+  /** Bottom edge: max(y, y + height), NaN if either is NaN */
   get bottom(): number
-  /** left edge */
+  /** Left edge: min(x, x + width), NaN if either is NaN */
   get left(): number
   /** Convert to JSON (W3C spec uses toJSON) */
-  toJSON(): DomRectJson
+  toJSON(): DOMRectJSON
 }
 
 /**
@@ -1423,7 +1423,8 @@ export interface DOMRectInit {
   height?: number
 }
 
-export interface DomRectJson {
+/** Result of DOMRectReadOnly.toJSON() */
+export interface DOMRectJSON {
   x: number
   y: number
   width: number
