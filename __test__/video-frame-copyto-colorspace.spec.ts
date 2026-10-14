@@ -558,10 +558,12 @@ test('copyTo honors the Display P3 tag of decoded video', async (t) => {
     const p3 = await copy(frame, { format: 'RGBA', colorSpace: 'display-p3' })
     const srgb = await copy(frame, { format: 'RGBA' })
     // the P3 copy is the YUV stage only; converting it to sRGB must give the sRGB copy exactly
+    const visible = frame.visibleRect
+    if (!visible) throw new Error('live frame has no visible rectangle')
     const p3Frame = new VideoFrame(p3, {
       format: 'RGBA',
-      codedWidth: frame.visibleRect.width,
-      codedHeight: frame.visibleRect.height,
+      codedWidth: visible.width,
+      codedHeight: visible.height,
       timestamp: 0,
       colorSpace: { primaries: 'smpte432', transfer: 'iec61966-2-1', matrix: 'rgb', fullRange: true },
     })

@@ -9,13 +9,30 @@ use crate::ffi::{
 };
 use crate::webcodecs::error::{
   enforce_range_long_long, enforce_range_long_long_optional,
-  enforce_range_unsigned_long_long_optional, invalid_state_error, not_supported_error,
-  throw_invalid_state_error, throw_not_supported_error, type_error,
+  enforce_range_unsigned_long_long_optional, error_as_dom_exception, invalid_state_error,
+  not_supported_error, throw_invalid_state_error, throw_not_supported_error, type_error,
 };
 use napi::bindgen_prelude::*;
+use napi::threadsafe_function::UnknownReturnValue;
 use napi_derive::napi;
 use parking_lot::RwLock;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+static NEXT_FRAME_ID: AtomicU64 = AtomicU64::new(1);
+// Callbacks are weak native references anchored by the frame's traceable listener map.
+// This keeps a callback that captures its frame collectible with that frame.
+struct FrameCloseObservers {
+  env: napi::sys::napi_env,
+  next_id: u64,
+  // (listener map key, napi_ref) pairs
+  callbacks: Vec<(u64, usize)>,
+}
+thread_local! {
+  static CLOSE_OBSERVERS: RefCell<HashMap<u64, FrameCloseObservers>> = RefCell::new(HashMap::new());
+}
 
 /// Video pixel format (WebCodecs spec)
 #[napi(string_enum)]
@@ -1130,12 +1147,98 @@ pub struct VideoFrameRect {
   pub height: u32,
 }
 
+/// Owned native image data with no eight-bit staging or public pixel-format alias.
+#[derive(Clone)]
+enum VideoFrameResource {
+  Software {
+    frame: Arc<RwLock<Frame>>,
+    format: VideoPixelFormat,
+  },
+  Rgba16Float {
+    width: u32,
+    height: u32,
+    pixels: Arc<[u16]>,
+  },
+}
+
+impl VideoFrameResource {
+  fn dimensions(&self) -> (u32, u32) {
+    match self {
+      Self::Software { frame, .. } => {
+        let frame = frame.read();
+        (frame.width(), frame.height())
+      }
+      Self::Rgba16Float { width, height, .. } => (*width, *height),
+    }
+  }
+
+  fn format(&self) -> Option<VideoPixelFormat> {
+    match self {
+      Self::Software { format, .. } => Some(*format),
+      Self::Rgba16Float { .. } => None,
+    }
+  }
+
+  fn software(&self) -> Result<(&Arc<RwLock<Frame>>, VideoPixelFormat)> {
+    match self {
+      Self::Software { frame, format } => Ok((frame, *format)),
+      Self::Rgba16Float { .. } => Err(not_supported_error(
+        "opaque float image cannot be copied to a WebCodecs pixel format",
+      )),
+    }
+  }
+
+  fn discard_alpha(&self) -> Result<Self> {
+    match self {
+      Self::Software { frame, format } if format.has_alpha() => {
+        let source = frame.read();
+        let target_format = format.without_alpha();
+        let scaler = Scaler::new_converter(
+          source.width(),
+          source.height(),
+          format.to_av_format(),
+          target_format.to_av_format(),
+        )
+        .map_err(|e| {
+          Error::new(
+            Status::GenericFailure,
+            format!("Failed to create converter for alpha discard: {}", e),
+          )
+        })?;
+        let converted = scaler.scale_alloc(&source).map_err(|e| {
+          Error::new(
+            Status::GenericFailure,
+            format!("Failed to convert frame for alpha discard: {}", e),
+          )
+        })?;
+        Ok(Self::Software {
+          frame: converted.into_shared(),
+          format: target_format,
+        })
+      }
+      Self::Rgba16Float {
+        width,
+        height,
+        pixels,
+      } => {
+        let mut pixels = pixels.to_vec();
+        for alpha in pixels.iter_mut().skip(3).step_by(4) {
+          *alpha = 0x3c00;
+        }
+        Ok(Self::Rgba16Float {
+          width: *width,
+          height: *height,
+          pixels: pixels.into(),
+        })
+      }
+      _ => Ok(self.clone()),
+    }
+  }
+}
+
 /// Internal state for VideoFrame
 struct VideoFrameInner {
-  /// The underlying FFmpeg frame, wrapped in Arc<RwLock> for shared access
-  frame: Arc<RwLock<Frame>>,
-  /// Original pixel format (preserved since FFmpeg may convert RGBX→RGBA, etc.)
-  original_format: VideoPixelFormat,
+  resource: VideoFrameResource,
   timestamp_us: i64,
   duration_us: Option<i64>,
   /// Visible rectangle internal slots per W3C spec
@@ -1294,13 +1397,13 @@ fn parse_visible_rect(
 /// This is a WebCodecs-compliant VideoFrame implementation backed by FFmpeg.
 #[napi]
 pub struct VideoFrame {
+  observer_id: u64,
   inner: Arc<Mutex<Option<VideoFrameInner>>>,
   /// Frame metadata lives outside the detachable resource per WebCodecs.
   timestamp_us: i64,
   duration_us: Option<i64>,
   rotation: f64,
   flip: bool,
-  color_space: VideoColorSpace,
 }
 
 /// Parse rotation value per W3C spec algorithm
@@ -1317,12 +1420,104 @@ fn parse_rotation(rotation: f64) -> f64 {
 impl VideoFrame {
   fn from_inner(inner: VideoFrameInner) -> Self {
     Self {
+      observer_id: NEXT_FRAME_ID.fetch_add(1, Ordering::Relaxed),
       timestamp_us: inner.timestamp_us,
       duration_us: inner.duration_us,
       rotation: inner.rotation,
       flip: inner.flip,
-      color_space: inner.color_space.clone(),
       inner: Arc::new(Mutex::new(Some(inner))),
+    }
+  }
+
+  /// Native host interop for a retained rgba16float canvas image.
+  /// Public WebCodecs pixel formats intentionally have no alias for this resource.
+  fn from_rgba16_float(data: Uint16Array, init: VideoFrameConstructorInit) -> Result<Self> {
+    let width = init
+      .coded_width
+      .ok_or_else(|| type_error("codedWidth is required"))?;
+    let height = init
+      .coded_height
+      .ok_or_else(|| type_error("codedHeight is required"))?;
+    let timestamp = init
+      .timestamp
+      .ok_or_else(|| type_error("timestamp is required"))?;
+    let expected = (width as usize)
+      .checked_mul(height as usize)
+      .and_then(|n| n.checked_mul(4))
+      .filter(|_| width > 0 && height > 0)
+      .ok_or_else(|| type_error("invalid rgba16float image dimensions"))?;
+    if data.len() != expected {
+      return Err(type_error(
+        "rgba16float image size does not match its dimensions",
+      ));
+    }
+    if init.format.is_some() || init.layout.is_some() || init.transfer.is_some() {
+      return Err(type_error(
+        "rgba16float images do not use a public buffer format, layout or transfer list",
+      ));
+    }
+    let (visible_left, visible_top, visible_width, visible_height) = parse_visible_rect(
+      (0., 0., width as f64, height as f64),
+      init.visible_rect.as_ref(),
+      width,
+      height,
+      VideoPixelFormat::RGBA,
+    )?;
+    if init.display_width == Some(0) || init.display_height == Some(0) {
+      return Err(type_error("display dimensions must be positive"));
+    }
+    if !matches!(init.alpha.as_deref(), None | Some("keep") | Some("discard")) {
+      return Err(type_error("invalid alpha handling"));
+    }
+    let mut pixels = data.to_vec();
+    if init.alpha.as_deref() == Some("discard") {
+      for alpha in pixels.iter_mut().skip(3).step_by(4) {
+        *alpha = 0x3c00;
+      }
+    }
+    let resource = VideoFrameResource::Rgba16Float {
+      width,
+      height,
+      pixels: pixels.into(),
+    };
+    let color_space = match init.color_space {
+      Some(color) => VideoColorSpace::new(Some(color)),
+      None => VideoColorSpace::from_components(
+        Some(VideoColorPrimaries::Bt709),
+        Some(VideoTransferCharacteristics::Iec6196621),
+        Some(VideoMatrixCoefficients::Rgb),
+        Some(true),
+      ),
+    };
+    Ok(Self::from_inner(VideoFrameInner {
+      resource,
+      timestamp_us: timestamp,
+      duration_us: init.duration,
+      visible_left,
+      visible_top,
+      visible_width,
+      visible_height,
+      display_width: init.display_width.unwrap_or(visible_width),
+      display_height: init.display_height.unwrap_or(visible_height),
+      rotation: parse_rotation(init.rotation.unwrap_or(0.)),
+      flip: init.flip.unwrap_or(false),
+      color_space,
+    }))
+  }
+
+  /// Native consumer interop; returns an independent copy without changing public copyTo.
+  fn copy_rgba16_float(&self, env: Env) -> Result<Uint16Array> {
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    let inner = match guard.as_ref() {
+      Some(inner) => inner,
+      None => return throw_invalid_state_error(&env, "VideoFrame is closed"),
+    };
+    match &inner.resource {
+      VideoFrameResource::Rgba16Float { pixels, .. } => Ok(Uint16Array::new(pixels.to_vec())),
+      _ => throw_not_supported_error(&env, "VideoFrame does not contain an rgba16float image"),
     }
   }
 
@@ -1538,8 +1733,10 @@ impl VideoFrame {
     };
 
     let inner = VideoFrameInner {
-      frame: frame.into_shared(),
-      original_format: format,
+      resource: VideoFrameResource::Software {
+        frame: frame.into_shared(),
+        format,
+      },
       timestamp_us: timestamp,
       duration_us: init.duration,
       visible_left,
@@ -1719,47 +1916,14 @@ impl VideoFrame {
         .map(|a| a == "discard")
         .unwrap_or(false);
 
-      // Handle alpha discard: convert to non-alpha format if needed
-      // Otherwise, share the Arc (no pixel data copy)
-      let (final_frame, final_format) =
-        if should_discard_alpha && source_inner.original_format.has_alpha() {
-          let target_format = source_inner.original_format.without_alpha();
-          let src_av_format = source_inner.original_format.to_av_format();
-          let dst_av_format = target_format.to_av_format();
-
-          // Need to read from source frame for conversion
-          let source_frame_guard = source_inner.frame.read();
-
-          // Use Scaler to convert format (drops alpha channel)
-          let scaler = Scaler::new_converter(
-            source_frame_guard.width(),
-            source_frame_guard.height(),
-            src_av_format,
-            dst_av_format,
-          )
-          .map_err(|e| {
-            Error::new(
-              Status::GenericFailure,
-              format!("Failed to create converter for alpha discard: {}", e),
-            )
-          })?;
-
-          let converted = scaler.scale_alloc(&source_frame_guard).map_err(|e| {
-            Error::new(
-              Status::GenericFailure,
-              format!("Failed to convert frame for alpha discard: {}", e),
-            )
-          })?;
-
-          // Conversion creates a new frame, wrap it in Arc
-          (converted.into_shared(), target_format)
-        } else {
-          // No conversion needed - share the same underlying frame data via Arc clone
-          (source_inner.frame.clone(), source_inner.original_format)
-        };
-
-      // Get frame dimensions from the Arc (need read lock for converted, already have it for shared)
-      let frame_guard = final_frame.read();
+      let resource = if should_discard_alpha {
+        source_inner.resource.discard_alpha()?
+      } else {
+        source_inner.resource.clone()
+      };
+      let (coded_width, coded_height) = resource.dimensions();
+      // Opaque RGBA has one-pixel alignment even though it has no public format.
+      let alignment_format = resource.format().unwrap_or(VideoPixelFormat::RGBA);
 
       // Apply overrides from init (all fields optional for frame clone)
       let timestamp_us = init
@@ -1781,13 +1945,10 @@ impl VideoFrame {
       let (visible_left, visible_top, visible_width, visible_height) = parse_visible_rect(
         default_rect,
         init.as_ref().and_then(|i| i.visible_rect.as_ref()),
-        frame_guard.width(),
-        frame_guard.height(),
-        final_format,
+        coded_width,
+        coded_height,
+        alignment_format,
       )?;
-
-      // Drop the read guard before we move final_frame into the new struct
-      drop(frame_guard);
 
       // Handle rotation per W3C spec "Add Rotations" algorithm
       let init_rotation = parse_rotation(init.as_ref().and_then(|i| i.rotation).unwrap_or(0.0));
@@ -1830,8 +1991,7 @@ impl VideoFrame {
         });
 
       let new_inner = VideoFrameInner {
-        frame: final_frame,
-        original_format: final_format,
+        resource,
         timestamp_us,
         duration_us,
         visible_left,
@@ -1857,8 +2017,10 @@ impl VideoFrame {
       VideoPixelFormat::from_av_format(frame.format()).unwrap_or(VideoPixelFormat::I420);
 
     let inner = VideoFrameInner {
-      frame: frame.into_shared(),
-      original_format,
+      resource: VideoFrameResource::Software {
+        frame: frame.into_shared(),
+        format: original_format,
+      },
       timestamp_us,
       duration_us,
       visible_left: 0,
@@ -1891,8 +2053,10 @@ impl VideoFrame {
     };
 
     let inner = VideoFrameInner {
-      frame,
-      original_format,
+      resource: VideoFrameResource::Software {
+        frame,
+        format: original_format,
+      },
       timestamp_us,
       duration_us,
       visible_left: 0,
@@ -1950,8 +2114,10 @@ impl VideoFrame {
     };
 
     let inner = VideoFrameInner {
-      frame: frame.into_shared(),
-      original_format,
+      resource: VideoFrameResource::Software {
+        frame: frame.into_shared(),
+        format: original_format,
+      },
       timestamp_us,
       duration_us,
       visible_left: 0,
@@ -1991,8 +2157,10 @@ impl VideoFrame {
     };
 
     let inner = VideoFrameInner {
-      frame: frame.into_shared(),
-      original_format,
+      resource: VideoFrameResource::Software {
+        frame: frame.into_shared(),
+        format: original_format,
+      },
       timestamp_us,
       duration_us,
       visible_left: 0,
@@ -2033,8 +2201,10 @@ impl VideoFrame {
     drop(frame_guard);
 
     let inner = VideoFrameInner {
-      frame: frame_arc,
-      original_format,
+      resource: VideoFrameResource::Software {
+        frame: frame_arc,
+        format: original_format,
+      },
       timestamp_us,
       duration_us,
       visible_left: 0,
@@ -2060,7 +2230,7 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) => Ok(Some(inner.original_format)),
+      Some(inner) => Ok(inner.resource.format()),
       _ => Ok(None),
     }
   }
@@ -2074,7 +2244,7 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) => Ok(inner.frame.read().width()),
+      Some(inner) => Ok(inner.resource.dimensions().0),
       _ => Ok(0),
     }
   }
@@ -2088,7 +2258,7 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) => Ok(inner.frame.read().height()),
+      Some(inner) => Ok(inner.resource.dimensions().1),
       _ => Ok(0),
     }
   }
@@ -2131,9 +2301,9 @@ impl VideoFrame {
 
   /// Get the coded rect (the region containing valid pixel data)
   /// Returns DOMRectReadOnly per W3C WebCodecs spec
-  /// Throws InvalidStateError if the VideoFrame is closed
+  /// Returns null after the resource is closed.
   #[napi(getter)]
-  pub fn coded_rect(&self, env: Env) -> Result<DOMRectReadOnly> {
+  pub fn coded_rect(&self) -> Result<Option<DOMRectReadOnly>> {
     let guard = self
       .inner
       .lock()
@@ -2141,36 +2311,36 @@ impl VideoFrame {
 
     match guard.as_ref() {
       Some(inner) => {
-        let frame_guard = inner.frame.read();
-        Ok(DOMRectReadOnly {
+        let (width, height) = inner.resource.dimensions();
+        Ok(Some(DOMRectReadOnly {
           x: 0.0,
           y: 0.0,
-          width: frame_guard.width() as f64,
-          height: frame_guard.height() as f64,
-        })
+          width: width as f64,
+          height: height as f64,
+        }))
       }
-      _ => throw_invalid_state_error(&env, "VideoFrame is closed"),
+      _ => Ok(None),
     }
   }
 
   /// Get the visible rect (the region of coded data that should be displayed)
   /// Returns DOMRectReadOnly per W3C WebCodecs spec
-  /// Throws InvalidStateError if the VideoFrame is closed
+  /// Returns null after the resource is closed.
   #[napi(getter)]
-  pub fn visible_rect(&self, env: Env) -> Result<DOMRectReadOnly> {
+  pub fn visible_rect(&self) -> Result<Option<DOMRectReadOnly>> {
     let guard = self
       .inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) => Ok(DOMRectReadOnly {
+      Some(inner) => Ok(Some(DOMRectReadOnly {
         x: inner.visible_left as f64,
         y: inner.visible_top as f64,
         width: inner.visible_width as f64,
         height: inner.visible_height as f64,
-      }),
-      _ => throw_invalid_state_error(&env, "VideoFrame is closed"),
+      })),
+      _ => Ok(None),
     }
   }
 
@@ -2193,7 +2363,14 @@ impl VideoFrame {
   /// Get the color space parameters
   #[napi(getter)]
   pub fn color_space(&self) -> Result<VideoColorSpace> {
-    Ok(self.color_space.clone())
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    Ok(match guard.as_ref() {
+      Some(inner) => inner.color_space.clone(),
+      None => VideoColorSpace::new(None),
+    })
   }
 
   /// Get whether this VideoFrame has been closed (W3C WebCodecs spec)
@@ -2221,7 +2398,13 @@ impl VideoFrame {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
     match guard.as_ref() {
-      Some(inner) => Ok(Self::get_number_of_planes(inner.original_format)),
+      Some(inner) => Ok(
+        inner
+          .resource
+          .format()
+          .map(Self::get_number_of_planes)
+          .unwrap_or(1),
+      ),
       _ => throw_invalid_state_error(&env, "VideoFrame is closed"),
     }
   }
@@ -2258,19 +2441,27 @@ impl VideoFrame {
       _ => return throw_invalid_state_error(&env, "VideoFrame is closed"),
     };
 
+    if inner.resource.format().is_none() {
+      return throw_not_supported_error(
+        &env,
+        "Failed to execute 'allocationSize' on 'VideoFrame': Operation is not supported when format is null.",
+      );
+    }
+
+    let (frame, original_format) = inner.resource.software()?;
     let format = options
       .as_ref()
       .and_then(|o| o.format)
-      .unwrap_or(inner.original_format);
+      .unwrap_or(original_format);
 
     // Check if format conversion is supported
     // Per WPT: YUV→RGB and RGB→RGB work; RGB→YUV throws NotSupportedError
-    if format != inner.original_format && !inner.original_format.can_convert_to(format) {
+    if format != original_format && !original_format.can_convert_to(format) {
       return throw_not_supported_error(
         &env,
         &format!(
           "Format conversion from {:?} to {:?} is not supported",
-          inner.original_format, format
+          original_format, format
         ),
       );
     }
@@ -2285,15 +2476,14 @@ impl VideoFrame {
           inner.visible_width as f64,
           inner.visible_height as f64,
         );
-        // Validate rect against SOURCE format (original_format), not target format.
-        // Rect alignment must match the source frame's subsampling requirements.
-        let frame_guard = inner.frame.read();
+        // Conversion precedes cropping, so offsets follow the output format.
+        let frame_guard = frame.read();
         let (_, _, w, h) = parse_visible_rect(
           default_rect,
           Some(rect),
           frame_guard.width(),
           frame_guard.height(),
-          inner.original_format,
+          format,
         )?;
         (w, h)
       } else {
@@ -2340,9 +2530,33 @@ impl VideoFrame {
   ///
   /// Returns a Promise that resolves with an array of PlaneLayout objects.
   /// Options can specify target format and rect for cropped copy.
-  #[napi]
-  pub async fn copy_to(
+  #[napi(ts_return_type = "Promise<PlaneLayout[]>")]
+  pub fn copy_to<'env>(
     &self,
+    env: &'env Env,
+    destination: Uint8Array,
+    options: Option<VideoFrameCopyToOptions>,
+  ) -> Result<PromiseRaw<'env, Vec<PlaneLayout>>> {
+    let inner = self.inner.clone();
+    env.spawn_future_with_callback(
+      async move { Ok(Self::copy_pixels(inner, destination, options).await) },
+      |env, result| match result {
+        Ok(layout) => Ok(layout),
+        Err(error) => {
+          if let Some(message) = error.reason.strip_prefix("TypeError:") {
+            return Err(Error::from(
+              napi::JsTypeError::from(Error::new(Status::InvalidArg, message.trim_start()))
+                .into_unknown(*env),
+            ));
+          }
+          Err(Error::from(error_as_dom_exception(env, error)?))
+        }
+      },
+    )
+  }
+
+  async fn copy_pixels(
+    inner_state: Arc<Mutex<Option<VideoFrameInner>>>,
     mut destination: Uint8Array,
     options: Option<VideoFrameCopyToOptions>,
   ) -> Result<Vec<PlaneLayout>> {
@@ -2358,8 +2572,7 @@ impl VideoFrame {
       original_format,
       needs_conversion,
     ) = {
-      let guard = self
-        .inner
+      let guard = inner_state
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
@@ -2368,26 +2581,29 @@ impl VideoFrame {
         _ => return Err(invalid_state_error("VideoFrame is closed")),
       };
 
+      if inner.resource.format().is_none() {
+        return Err(not_supported_error(
+          "Failed to execute 'copyTo' on 'VideoFrame': Operation is not supported when format is null.",
+        ));
+      }
+      let (frame, original_format) = inner.resource.software()?;
       let format = options
         .as_ref()
         .and_then(|o| o.format)
-        .unwrap_or(inner.original_format);
+        .unwrap_or(original_format);
 
       // Check if format conversion is supported
       // Per WPT: YUV→RGB and RGB→RGB work; RGB→YUV throws NotSupportedError
-      let needs_conversion = format != inner.original_format;
-      if needs_conversion && !inner.original_format.can_convert_to(format) {
+      let needs_conversion = format != original_format;
+      if needs_conversion && !original_format.can_convert_to(format) {
         return Err(not_supported_error(&format!(
           "Format conversion from {:?} to {:?} is not supported",
-          inner.original_format, format
+          original_format, format
         )));
       }
 
-      let original_format = inner.original_format;
-
       // Parse rect (default to visible rect)
-      // Validate rect against SOURCE format (original_format), not target format.
-      // Rect alignment must match the source frame's subsampling requirements.
+      // Conversion precedes cropping, so offsets follow the output format.
       let default_rect = (
         inner.visible_left as f64,
         inner.visible_top as f64,
@@ -2395,15 +2611,19 @@ impl VideoFrame {
         inner.visible_height as f64,
       );
       let rect = options.as_ref().and_then(|o| o.rect.as_ref());
-      let frame_guard = inner.frame.read();
+      let frame_guard = frame.read();
       let (rect_x, rect_y, rect_width, rect_height) = parse_visible_rect(
         default_rect,
         rect,
         frame_guard.width(),
         frame_guard.height(),
-        original_format,
+        format,
       )?;
       drop(frame_guard);
+      // Chromium's YUV view starts at the common chroma-aligned origin.
+      let (h_factor, v_factor) = get_subsampling_factors(original_format);
+      let rect_x = rect_x / h_factor * h_factor;
+      let rect_y = rect_y / v_factor * v_factor;
 
       // Get and validate custom layout if provided
       let custom_layout = options.as_ref().and_then(|o| o.layout.clone());
@@ -2460,7 +2680,7 @@ impl VideoFrame {
     }
 
     // Clone inner Arc for the blocking thread
-    let inner_clone = self.inner.clone();
+    let inner_clone = inner_state.clone();
     let layout_for_thread = custom_layout.clone();
 
     // Perform the copy in a blocking thread to not block the event loop
@@ -2497,7 +2717,7 @@ impl VideoFrame {
       };
 
       // Acquire read lock on the frame for the duration of the copy operation
-      let frame_guard = inner.frame.read();
+      let frame_guard = inner.resource.software()?.0.read();
 
       // Allocate buffer for cropped data
       let mut temp_buffer = vec![0u8; buffer_size];
@@ -2994,8 +3214,7 @@ impl VideoFrame {
 
     // Clone the Arc - shares the same underlying Frame (no pixel data copy)
     let new_inner = VideoFrameInner {
-      frame: inner.frame.clone(),
-      original_format: inner.original_format,
+      resource: inner.resource.clone(),
       timestamp_us: inner.timestamp_us,
       duration_us: inner.duration_us,
       visible_left: inner.visible_left,
@@ -3016,9 +3235,11 @@ impl VideoFrame {
   /// Per W3C spec "Close VideoFrame" algorithm:
   /// 1. Assign null to frame's [[resource reference]]
   /// 2. Assign true to frame's [[Detached]]
-  /// Note: Metadata (timestamp, duration, etc.) remains accessible after close
-  #[napi]
-  pub fn close(&self) -> Result<()> {
+  /// Note: Metadata (timestamp, duration, etc.) remains accessible after close.
+  /// codedRect and visibleRect become null, every colorSpace field becomes null,
+  /// and callbacks registered with registerVideoFrameCloseObserver run synchronously.
+  #[napi(ts_args_type = "")]
+  pub fn close(&self, env: Env, this: This) -> Result<()> {
     let mut guard = self
       .inner
       .lock()
@@ -3027,7 +3248,42 @@ impl VideoFrame {
     // Detach and drop the resource immediately. Timestamp and duration are stored
     // separately so their getters remain available after detachment.
     *guard = None;
-
+    drop(guard);
+    // Expire consumers synchronously on explicit close. Garbage collection
+    // releases observer references without expiring independently owned images.
+    let observers =
+      CLOSE_OBSERVERS.with(|registry| registry.borrow_mut().remove(&self.observer_id));
+    let mut thrown = Vec::new();
+    for (id, reference) in observers.into_iter().flat_map(|entry| entry.callbacks) {
+      let callback = super::event_target::upgrade_ref(&env, reference)?;
+      super::event_target::release_callback(&env, Some(this.raw()), id, reference);
+      let Some(callback) = callback else { continue };
+      let mut result = std::ptr::null_mut();
+      let mut receiver = std::ptr::null_mut();
+      unsafe { napi::sys::napi_get_undefined(env.raw(), &mut receiver) };
+      let status = unsafe {
+        napi::sys::napi_call_function(
+          env.raw(),
+          receiver,
+          callback.raw(),
+          0,
+          std::ptr::null(),
+          &mut result,
+        )
+      };
+      if status != napi::sys::Status::napi_ok {
+        let mut exception = std::ptr::null_mut();
+        if unsafe { napi::sys::napi_get_and_clear_last_exception(env.raw(), &mut exception) }
+          == napi::sys::Status::napi_ok
+          && !exception.is_null()
+        {
+          thrown.push(exception);
+        }
+      }
+    }
+    for exception in thrown {
+      super::event_target::report_exception(&env, exception);
+    }
     Ok(())
   }
 
@@ -3040,7 +3296,7 @@ impl VideoFrame {
   /// This is the preferred way to pass frame data to encoders/other consumers
   /// that need to share the frame without deep copying.
   pub(crate) fn frame_arc(&self) -> Result<Arc<RwLock<Frame>>> {
-    self.with_inner(|inner| Ok(inner.frame.clone()))
+    self.with_inner(|inner| Ok(inner.resource.software()?.0.clone()))
   }
 
   /// Borrow internal frame for read access (crate internal use)
@@ -3052,7 +3308,7 @@ impl VideoFrame {
     F: FnOnce(&Frame) -> R,
   {
     self.with_inner(|inner| {
-      let frame_guard = inner.frame.read();
+      let frame_guard = inner.resource.software()?.0.read();
       Ok(f(&frame_guard))
     })
   }
@@ -3643,4 +3899,128 @@ impl VideoFrame {
 
     Ok(())
   }
+}
+
+/// Native canvas-provider interop, separate from the browser VideoFrame interface.
+#[napi(
+  js_name = "createVideoFrameFromRGBA16Float",
+  ts_args_type = "data: Uint16Array, init: Omit<VideoFrameBufferInit, 'format' | 'layout' | 'transfer'> & {rotation?: number; flip?: boolean; alpha?: 'keep' | 'discard'}"
+)]
+pub fn create_video_frame_from_rgba16_float(
+  env: Env,
+  data: Unknown,
+  init: VideoFrameConstructorInit,
+) -> Result<VideoFrame> {
+  // Read the typed array only after `init` is converted: its getters may detach the buffer.
+  let data = unsafe { Uint16Array::from_napi_value(env.raw(), data.raw())? };
+  VideoFrame::from_rgba16_float(data, init).map_err(|error| {
+    match error.reason.strip_prefix("TypeError:") {
+      Some(message) => throw_type_error(env.raw(), message.trim_start()),
+      None => error,
+    }
+  })
+}
+
+/// Unwraps a VideoFrame argument after a real `instanceof` check, like the constructor does.
+fn video_frame_argument<'env>(
+  env: &Env,
+  value: Unknown<'env>,
+) -> Result<ClassInstance<'env, VideoFrame>> {
+  if !VideoFrame::instance_of(env, &value).unwrap_or(false) {
+    return Err(throw_type_error(env.raw(), "frame must be a VideoFrame"));
+  }
+  unsafe { ClassInstance::<VideoFrame>::from_napi_value(env.raw(), value.raw()) }
+}
+
+/// Native image-consumer interop: copies the half-float bits of an RGBA16Float frame into a new
+/// `Uint16Array`. Returns the whole coded image; `visibleRect` is ignored. Throws a TypeError if
+/// `frame` is not a VideoFrame, InvalidStateError if it is closed, and NotSupportedError if it does
+/// not hold an RGBA16Float image.
+#[napi(
+  js_name = "copyVideoFrameRGBA16Float",
+  ts_args_type = "frame: VideoFrame"
+)]
+pub fn copy_video_frame_rgba16_float(env: Env, frame: Unknown) -> Result<Uint16Array> {
+  video_frame_argument(&env, frame)?.copy_rgba16_float(env)
+}
+
+impl Drop for VideoFrame {
+  fn drop(&mut self) {
+    // A frame wrapper can be collected while its external texture still owns
+    // an image. Removing its callbacks must not perform an explicit close.
+    let _ = CLOSE_OBSERVERS.try_with(|registry| {
+      let observers = registry.borrow_mut().remove(&self.observer_id);
+      if let Some(observers) = observers {
+        for (_, reference) in observers.callbacks {
+          unsafe {
+            napi::sys::napi_delete_reference(observers.env, reference as napi::sys::napi_ref)
+          };
+        }
+      }
+    });
+  }
+}
+
+/// Native image consumers subscribe to explicit close without changing the browser interface.
+#[napi(
+  js_name = "registerVideoFrameCloseObserver",
+  ts_args_type = "frame: VideoFrame, callback: () => void"
+)]
+pub fn register_video_frame_close_observer(
+  env: Env,
+  frame: Unknown,
+  callback: FunctionRef<(), UnknownReturnValue>,
+) -> Result<()> {
+  let frame = video_frame_argument(&env, frame)?;
+  if frame.closed()? {
+    return throw_invalid_state_error(&env, "VideoFrame is closed");
+  }
+  let callback = callback.borrow_back(&env)?;
+  // Reserve the id under a short borrow. Anchoring runs JS, which may close or
+  // register on frames, so no borrow is held across it.
+  let id = CLOSE_OBSERVERS.with(|registry| {
+    let mut registry = registry.borrow_mut();
+    let observers = registry
+      .entry(frame.observer_id)
+      .or_insert_with(|| FrameCloseObservers {
+        env: env.raw(),
+        next_id: 0,
+        callbacks: Vec::new(),
+      });
+    let id = observers.next_id;
+    observers.next_id += 1;
+    id
+  });
+  let reference = super::event_target::CodecEventState::anchor_callback(
+    &env,
+    Some(frame.value),
+    id,
+    callback.raw(),
+  )?;
+  // A frozen frame cannot hold the listener map: anchoring leaves a TypeError
+  // pending and a strong reference. Drop the reference so nothing is registered.
+  let mut pending = false;
+  unsafe { napi::sys::napi_is_exception_pending(env.raw(), &mut pending) };
+  if pending {
+    unsafe { napi::sys::napi_delete_reference(env.raw(), reference as napi::sys::napi_ref) };
+    return Ok(());
+  }
+  // JS that ran while anchoring may have closed the frame.
+  if frame.closed()? {
+    super::event_target::release_callback(&env, Some(frame.value), id, reference);
+    return throw_invalid_state_error(&env, "VideoFrame is closed");
+  }
+  CLOSE_OBSERVERS.with(|registry| {
+    let mut registry = registry.borrow_mut();
+    registry
+      .entry(frame.observer_id)
+      .or_insert_with(|| FrameCloseObservers {
+        env: env.raw(),
+        next_id: id + 1,
+        callbacks: Vec::new(),
+      })
+      .callbacks
+      .push((id, reference));
+  });
+  Ok(())
 }

@@ -29,6 +29,8 @@ use napi::bindgen_prelude::*;
 pub enum DOMExceptionName {
   /// Encoding or decoding operation failed
   EncodingError,
+  /// The input resource cannot be consumed by the encoder.
+  OperationError,
   /// Unsupported codec or configuration
   NotSupportedError,
   /// Wrong state (e.g., operating on closed object)
@@ -47,6 +49,7 @@ impl DOMExceptionName {
   pub fn as_str(&self) -> &'static str {
     match self {
       DOMExceptionName::EncodingError => "EncodingError",
+      DOMExceptionName::OperationError => "OperationError",
       DOMExceptionName::NotSupportedError => "NotSupportedError",
       DOMExceptionName::InvalidStateError => "InvalidStateError",
       DOMExceptionName::DataError => "DataError",

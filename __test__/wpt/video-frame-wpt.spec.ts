@@ -464,10 +464,10 @@ test('VideoFrame: properties after close', (t) => {
   t.is(frame.rotation, 90)
   t.true(frame.flip)
   t.deepEqual(frame.colorSpace.toJSON(), {
-    primaries: 'bt709',
-    transfer: 'bt709',
-    matrix: 'bt709',
-    fullRange: false,
+    primaries: null,
+    transfer: null,
+    matrix: null,
+    fullRange: null,
   })
 })
 
@@ -582,9 +582,9 @@ test('VideoFrame: copyTo closed throws', async (t) => {
 
   frame.close()
 
-  // Async rejections use standard Error with DOMException name in message
   const error = await t.throwsAsync(frame.copyTo(new Uint8Array(32)))
-  t.true(error?.message.includes('InvalidStateError'), 'copyTo on closed frame should include InvalidStateError')
+  t.is(error?.name, 'InvalidStateError')
+  t.true(error instanceof DOMException)
 })
 
 test('VideoFrame: copyTo destination too small throws', async (t) => {
@@ -595,7 +595,7 @@ test('VideoFrame: copyTo destination too small throws', async (t) => {
     timestamp: 0,
   })
 
-  await t.throwsAsync(frame.copyTo(new Uint8Array(16)), { message: /TypeError/ })
+  await t.throwsAsync(frame.copyTo(new Uint8Array(16)), { instanceOf: TypeError })
 
   frame.close()
 })
@@ -710,6 +710,7 @@ test('VideoFrame: codedRect', (t) => {
   })
 
   const rect = frame.codedRect
+  if (!rect) throw new Error('live frame has no coded rectangle')
   t.truthy(rect)
   t.true(rect instanceof DOMRectReadOnly)
   t.is(rect.x, 0)
@@ -720,7 +721,7 @@ test('VideoFrame: codedRect', (t) => {
   frame.close()
 })
 
-test('VideoFrame: codedRect closed throws', (t) => {
+test('VideoFrame: codedRect is null after close', (t) => {
   const frame = new VideoFrame(new Uint8Array(32), {
     format: 'RGBA',
     codedWidth: 4,
@@ -730,14 +731,7 @@ test('VideoFrame: codedRect closed throws', (t) => {
 
   frame.close()
 
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-unused-expressions
-    frame.codedRect
-    t.fail('codedRect should throw InvalidStateError')
-  } catch (error) {
-    t.true(error instanceof DOMException, 'codedRect error should be DOMException')
-    t.is((error as DOMException).name, 'InvalidStateError')
-  }
+  t.is(frame.codedRect, null)
 })
 
 // ============================================================================
@@ -759,7 +753,7 @@ test('VideoFrame: visibleRect', (t) => {
   frame.close()
 })
 
-test('VideoFrame: visibleRect closed throws', (t) => {
+test('VideoFrame: visibleRect is null after close', (t) => {
   const frame = new VideoFrame(new Uint8Array(32), {
     format: 'RGBA',
     codedWidth: 4,
@@ -769,14 +763,7 @@ test('VideoFrame: visibleRect closed throws', (t) => {
 
   frame.close()
 
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-unused-expressions
-    frame.visibleRect
-    t.fail('visibleRect should throw InvalidStateError')
-  } catch (error) {
-    t.true(error instanceof DOMException, 'visibleRect error should be DOMException')
-    t.is((error as DOMException).name, 'InvalidStateError')
-  }
+  t.is(frame.visibleRect, null)
 })
 
 test('VideoFrame: construction with visibleRect crops correctly', (t) => {
@@ -1697,7 +1684,8 @@ test('VideoFrame: copyTo throws NotSupportedError on format mismatch', async (t)
 
   // Trying to copy to a different format should throw NotSupportedError
   const error = await t.throwsAsync(frame.copyTo(new Uint8Array(12), { format: 'I420' } as any))
-  t.true(error?.message.includes('NotSupportedError'), 'should throw NotSupportedError')
+  t.is(error?.name, 'NotSupportedError')
+  t.true(error instanceof DOMException)
   t.true(error?.message.includes('not supported'), 'should mention format conversion not supported')
 
   frame.close()
@@ -2471,7 +2459,8 @@ test('VideoFrame: copyTo throws NotSupportedError for RGBA to I420', async (t) =
   })
 
   const error = await t.throwsAsync(frame.copyTo(new Uint8Array(24), { format: 'I420' }))
-  t.true(error?.message.includes('NotSupportedError'))
+  t.is(error?.name, 'NotSupportedError')
+  t.true(error instanceof DOMException)
 
   frame.close()
 })
@@ -2566,7 +2555,8 @@ test('VideoFrame: copyTo throws TypeError on layout offset overflow', async (t) 
       layout: [{ offset: 4294967294, stride: 16 }],
     }),
   )
-  t.true(error?.message.includes('TypeError'), 'should throw TypeError on overflow')
+  t.is(error?.name, 'TypeError')
+  t.true(error instanceof TypeError)
 
   frame.close()
 })
@@ -2590,46 +2580,30 @@ test('VideoFrame: allocationSize throws TypeError on stride * height overflow', 
   frame.close()
 })
 
-test('VideoFrame: copyTo with format conversion validates rect against source format', async (t) => {
-  // I420 requires 2x2 alignment for rect offsets
-  const frame = new VideoFrame(new Uint8Array(24), {
+test('VideoFrame: RGB copies use a chroma-aligned YUV crop origin', async (t) => {
+  const source = new Uint8Array(24).fill(128)
+  source.fill(16, 0, 16)
+  for (const index of [5, 6, 9]) source[index] = 235
+  const frame = new VideoFrame(source, {
     format: 'I420',
     codedWidth: 4,
     codedHeight: 4,
     timestamp: 0,
+    colorSpace: { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false },
   })
-
-  // Odd rect offset (x=1) should throw even when converting to RGBA
-  // because the SOURCE format (I420) requires alignment
-  const error = await t.throwsAsync(
-    frame.copyTo(new Uint8Array(16), {
-      format: 'RGBA',
-      rect: { x: 1, y: 0, width: 2, height: 2 }, // x=1 not aligned for I420
-    }),
-  )
-  t.true(error?.message.includes('TypeError'), 'should throw TypeError for unaligned rect')
-
-  frame.close()
-})
-
-test('VideoFrame: allocationSize with format conversion validates rect against source format', (t) => {
-  const frame = new VideoFrame(new Uint8Array(24), {
-    format: 'I420',
-    codedWidth: 4,
-    codedHeight: 4,
-    timestamp: 0,
-  })
-
-  // Odd rect should throw even when asking for RGBA output
-  const error = t.throws(() => {
-    frame.allocationSize({
-      format: 'RGBA',
-      rect: { x: 1, y: 1, width: 2, height: 2 },
-    })
-  })
-  t.true(error?.message.includes('TypeError'), 'should throw TypeError for unaligned rect')
-
-  frame.close()
+  try {
+    const rect = { x: 1, y: 1, width: 2, height: 2 }
+    for (const format of ['RGBA', 'BGRA'] satisfies ('RGBA' | 'BGRA')[]) {
+      const options = { format, rect }
+      t.is(frame.allocationSize(options), 16)
+      const output = new Uint8Array(16)
+      t.deepEqual(await frame.copyTo(output, options), [{ offset: 0, stride: 8 }])
+      t.deepEqual(Array.from(output), [0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255])
+    }
+    await t.throwsAsync(frame.copyTo(new Uint8Array(6), { rect }), { instanceOf: TypeError })
+  } finally {
+    frame.close()
+  }
 })
 
 test('VideoFrame: format conversion with valid aligned rect succeeds', async (t) => {

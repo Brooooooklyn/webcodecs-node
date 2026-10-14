@@ -1086,15 +1086,15 @@ export declare class VideoFrame {
   /**
    * Get the coded rect (the region containing valid pixel data)
    * Returns DOMRectReadOnly per W3C WebCodecs spec
-   * Throws InvalidStateError if the VideoFrame is closed
+   * Returns null after the resource is closed.
    */
-  get codedRect(): DOMRectReadOnly
+  get codedRect(): DOMRectReadOnly | null
   /**
    * Get the visible rect (the region of coded data that should be displayed)
    * Returns DOMRectReadOnly per W3C WebCodecs spec
-   * Throws InvalidStateError if the VideoFrame is closed
+   * Returns null after the resource is closed.
    */
-  get visibleRect(): DOMRectReadOnly
+  get visibleRect(): DOMRectReadOnly | null
   /**
    * Get the presentation timestamp in microseconds
    * Per W3C spec: "The timestamp getter steps are to return [[timestamp]]"
@@ -1137,7 +1137,7 @@ export declare class VideoFrame {
    * Returns a Promise that resolves with an array of PlaneLayout objects.
    * Options can specify target format and rect for cropped copy.
    */
-  copyTo(destination: Uint8Array, options?: VideoFrameCopyToOptions | undefined | null): Promise<Array<PlaneLayout>>
+  copyTo(destination: Uint8Array, options?: VideoFrameCopyToOptions | undefined | null): Promise<PlaneLayout[]>
   /**
    * Clone this VideoFrame
    *
@@ -1150,7 +1150,9 @@ export declare class VideoFrame {
    * Per W3C spec "Close VideoFrame" algorithm:
    * 1. Assign null to frame's [[resource reference]]
    * 2. Assign true to frame's [[Detached]]
-   * Note: Metadata (timestamp, duration, etc.) remains accessible after close
+   * Note: Metadata (timestamp, duration, etc.) remains accessible after close.
+   * codedRect and visibleRect become null, every colorSpace field becomes null,
+   * and callbacks registered with registerVideoFrameCloseObserver run synchronously.
    */
   close(): void
 }
@@ -1370,6 +1372,24 @@ export type CodecState = 'unconfigured' | 'configured' | 'closed'
 
 /** ColorSpaceConversion for ImageDecoder (W3C WebCodecs spec) */
 export type ColorSpaceConversion = 'default' | 'none'
+
+/**
+ * Native image-consumer interop: copies the half-float bits of an RGBA16Float frame into a new
+ * `Uint16Array`. Returns the whole coded image; `visibleRect` is ignored. Throws a TypeError if
+ * `frame` is not a VideoFrame, InvalidStateError if it is closed, and NotSupportedError if it does
+ * not hold an RGBA16Float image.
+ */
+export declare function copyVideoFrameRGBA16Float(frame: VideoFrame): Uint16Array
+
+/** Native canvas-provider interop, separate from the browser VideoFrame interface. */
+export declare function createVideoFrameFromRGBA16Float(
+  data: Uint16Array,
+  init: Omit<VideoFrameBufferInit, 'format' | 'layout' | 'transfer'> & {
+    rotation?: number
+    flip?: boolean
+    alpha?: 'keep' | 'discard'
+  },
+): VideoFrame
 
 /** Audio decoder configuration exposed to JavaScript */
 export interface DemuxerAudioDecoderConfig {
@@ -1663,6 +1683,9 @@ export interface PlaneLayout {
 
 /** predefined RGB target color spaces. */
 export type PredefinedColorSpace = 'srgb' | 'display-p3'
+
+/** Native image consumers subscribe to explicit close without changing the browser interface. */
+export declare function registerVideoFrameCloseObserver(frame: VideoFrame, callback: () => void): void
 
 /**
  * Reset all hardware fallback state.
