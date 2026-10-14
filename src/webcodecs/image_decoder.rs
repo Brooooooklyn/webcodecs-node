@@ -8,6 +8,7 @@ use crate::codec::{CodecContext, DecoderConfig, Frame, Packet, ScaleAlgorithm, S
 use crate::ffi::avutil::av_rescale_q;
 use crate::ffi::{AV_NOPTS_VALUE, AVCodecID, AVRational};
 use crate::webcodecs::VideoFrame;
+use crate::webcodecs::buffer_source::{self, Uint8ArrayCopy};
 use crate::webcodecs::error::{
   DOMExceptionName, invalid_state_error, native_dom_exception_error, native_range_error,
   throw_invalid_state_error,
@@ -40,9 +41,8 @@ pub enum ColorSpaceConversion {
 
 /// Data source for ImageDecoder - stores the encoded image data
 pub enum ImageDecoderData {
-  /// Buffered data (Uint8Array from constructor)
-  Buffer(Uint8Array),
-  /// Collected stream data (Vec<u8> after stream is fully read)
+  /// Encoded bytes owned by the decoder: a copy of the BufferSource passed to
+  /// the constructor, or the stream chunks collected so far.
   Vec(Vec<u8>),
   /// Empty (data has been consumed or not yet available)
   Empty,
@@ -51,7 +51,9 @@ pub enum ImageDecoderData {
 /// ImageDecoder init options
 /// Per W3C spec, `data` can be either a BufferSource or a ReadableStream
 pub struct ImageDecoderInit<'env> {
-  /// The image data (encoded bytes or stream) - BufferSource | ReadableStream per spec
+  /// The image data (encoded bytes or stream) - BufferSource | ReadableStream per spec.
+  /// Only a handle: a BufferSource is copied by the constructor, after every
+  /// init getter has run.
   pub data: Unknown<'env>,
   /// MIME type of the image (e.g., "image/png", "image/jpeg")
   pub mime_type: String,
@@ -124,7 +126,7 @@ impl<'env> FromNapiValue for ImageDecoderInit<'env> {
       ));
     }
 
-    // Get data - try Uint8Array first, then ReadableStream
+    // Get data - a BufferSource or a ReadableStream
     let data_napi_value: napi::sys::napi_value = {
       let mut result = std::ptr::null_mut();
       napi::check_status!(
@@ -452,7 +454,7 @@ pub struct ImageDecoder {
 #[napi]
 impl ImageDecoder {
   /// Create a new ImageDecoder
-  /// Supports both Uint8Array and ReadableStream as data source per W3C spec.
+  /// Supports a BufferSource (copied here) or a ReadableStream as data source per W3C spec.
   /// ReadableStream input is buffered without a fixed size limit.
   #[napi(constructor)]
   pub fn new<'env>(env: &'env Env, mut this: This, init: ImageDecoderInit<'env>) -> Result<Self> {
@@ -509,13 +511,22 @@ impl ImageDecoder {
       prefer_animation: init.prefer_animation,
     }));
 
-    if let Ok(buf) = unsafe { init.data.cast::<Uint8Array>() } {
-      // Buffer data: store immediately and mark complete
+    if let Some(raw) = unsafe { buffer_source::inspect(env.raw(), init.data.raw())? } {
+      // BufferSource: copy the bytes now. Every init getter has already run;
+      // keeping a pointer into the caller's buffer would let JS detach, shrink
+      // or rewrite it while decode work reads it on another thread.
+      let bytes = raw.to_vec();
+      // Like Chrome, empty (or detached) data is a TypeError, except for an
+      // unsupported type: decode() rejects with NotSupportedError instead.
+      if codec_id.is_some() && bytes.is_empty() {
+        env.throw_type_error("No image data provided", None)?;
+        return Err(Error::new(Status::InvalidArg, "No image data provided"));
+      }
       {
         let mut inner_guard = inner
           .lock()
           .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-        inner_guard.data = ImageDecoderData::Buffer(buf);
+        inner_guard.data = ImageDecoderData::Vec(bytes);
       }
       complete.store(true, Ordering::Release);
 
@@ -547,7 +558,10 @@ impl ImageDecoder {
           .with_value(&ready_promise)
           .with_property_attributes(PropertyAttributes::default()),
       ])?;
-    } else if let Ok(stream) = unsafe { init.data.cast::<ReadableStream<Uint8Array>>() } {
+    } else if let Ok(stream) = unsafe { init.data.cast::<ReadableStream<Uint8ArrayCopy>>() } {
+      // Each chunk is copied on the JS thread when its read() settles, before
+      // the bytes cross to the decode task: the producer may detach or reuse
+      // a chunk's buffer right after enqueueing it.
       // Stream data: append chunks incrementally and probe at geometrically
       // increasing byte thresholds. This avoids O(n^2) reparsing while letting
       // `tracks.ready` and decode() resolve before a delayed stream close.
@@ -580,7 +594,7 @@ impl ImageDecoder {
               .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
             match &mut inner_guard.data {
               ImageDecoderData::Vec(data) => data.extend_from_slice(&chunk),
-              _ => inner_guard.data = ImageDecoderData::Vec(chunk.to_vec()),
+              _ => inner_guard.data = ImageDecoderData::Vec(chunk.into_vec()),
             }
             match &inner_guard.data {
               ImageDecoderData::Vec(data) => data.len(),
@@ -974,7 +988,6 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
     }
 
     let data_bytes = match &guard.data {
-      ImageDecoderData::Buffer(buf) => buf.as_ref().to_vec(),
       ImageDecoderData::Vec(vec) => vec.clone(),
       ImageDecoderData::Empty => {
         return Err(Error::new(Status::GenericFailure, "No data available"));

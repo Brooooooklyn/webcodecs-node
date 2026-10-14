@@ -5,6 +5,7 @@
 
 use crate::codec::muxer::{ContainerFormat, MuxerOptions};
 use crate::ffi::AVCodecID;
+use crate::webcodecs::buffer_source::Uint8ArrayCopy;
 use crate::webcodecs::codec_string::parse_codec_string;
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunk;
 use crate::webcodecs::encoded_video_chunk::EncodedVideoChunk;
@@ -112,7 +113,8 @@ pub struct WebMVideoTrackConfig {
   /// Frame rate (frames per second)
   pub framerate: Option<f64>,
   /// Codec-specific description data
-  pub description: Option<Uint8Array>,
+  #[napi(ts_type = "Uint8Array")]
+  pub description: Option<Uint8ArrayCopy>,
   /// Whether the video has alpha channel (VP9 alpha support)
   pub alpha: Option<bool>,
 }
@@ -127,7 +129,8 @@ pub struct WebMAudioTrackConfig {
   /// Number of audio channels
   pub number_of_channels: u32,
   /// Codec-specific description data
-  pub description: Option<Uint8Array>,
+  #[napi(ts_type = "Uint8Array")]
+  pub description: Option<Uint8ArrayCopy>,
 }
 
 // ============================================================================

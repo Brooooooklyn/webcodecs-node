@@ -4,6 +4,7 @@
 //! WebM typically contains VP8, VP9, or AV1 video with Opus or Vorbis audio.
 
 use crate::ffi::AVCodecID;
+use crate::webcodecs::buffer_source::Uint8ArrayCopy;
 use crate::webcodecs::demuxer_base::{
   AudioOutputCallback, DemuxerAudioDecoderConfig, DemuxerChunk, DemuxerFormat, DemuxerInner,
   DemuxerTrackInfo, DemuxerVideoDecoderConfig, ErrorCallback, VideoOutputCallback,
@@ -182,12 +183,12 @@ impl WebMDemuxer {
 
   /// Load a WebM from a buffer
   ///
-  /// This method uses zero-copy buffer loading - the Uint8Array data is passed
-  /// directly to the demuxer without an intermediate copy.
-  #[napi]
-  pub async fn load_buffer(&self, data: Uint8Array) -> Result<()> {
+  /// The bytes are copied when this is called, so the caller may reuse,
+  /// detach or resize the buffer afterwards.
+  #[napi(ts_args_type = "data: Uint8Array")]
+  pub async fn load_buffer(&self, data: Uint8ArrayCopy) -> Result<()> {
     let inner = self.inner.clone();
-    // Zero-copy: pass Uint8Array directly (it implements BufferSource)
+    let data = data.into_vec();
 
     tokio::task::spawn_blocking(move || {
       let mut guard = inner

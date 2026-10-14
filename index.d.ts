@@ -523,7 +523,7 @@ export declare class EncodedVideoChunk {
 export declare class ImageDecoder {
   /**
    * Create a new ImageDecoder
-   * Supports both Uint8Array and ReadableStream as data source per W3C spec.
+   * Supports a BufferSource (copied here) or a ReadableStream as data source per W3C spec.
    * ReadableStream input is buffered without a fixed size limit.
    */
   constructor(init: ImageDecoderInit)
@@ -612,8 +612,8 @@ export declare class MkvDemuxer {
   /**
    * Load an MKV from a buffer
    *
-   * This method uses zero-copy buffer loading - the Uint8Array data is passed
-   * directly to the demuxer without an intermediate copy.
+   * The bytes are copied when this is called, so the caller may reuse,
+   * detach or resize the buffer afterwards.
    */
   loadBuffer(data: Uint8Array): Promise<void>
   get tracks(): Array<DemuxerTrackInfo>
@@ -733,8 +733,8 @@ export declare class Mp4Demuxer {
   /**
    * Load an MP4 from a buffer
    *
-   * This method uses zero-copy buffer loading - the Uint8Array data is passed
-   * directly to the demuxer without an intermediate copy.
+   * The bytes are copied when this is called, so the caller may reuse,
+   * detach or resize the buffer afterwards.
    */
   loadBuffer(data: Uint8Array): Promise<void>
   /** Get all tracks */
@@ -1186,8 +1186,8 @@ export declare class WebMDemuxer {
   /**
    * Load a WebM from a buffer
    *
-   * This method uses zero-copy buffer loading - the Uint8Array data is passed
-   * directly to the demuxer without an intermediate copy.
+   * The bytes are copied when this is called, so the caller may reuse,
+   * detach or resize the buffer afterwards.
    */
   loadBuffer(data: Uint8Array): Promise<void>
   get tracks(): Array<DemuxerTrackInfo>

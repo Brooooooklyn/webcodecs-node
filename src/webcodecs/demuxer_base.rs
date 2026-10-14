@@ -22,21 +22,6 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
 // ============================================================================
-// BufferSource implementation for Uint8Array (zero-copy support)
-// ============================================================================
-
-/// Implement BufferSource for Uint8Array to enable zero-copy buffer loading.
-///
-/// This allows passing Uint8Array directly from JavaScript to the demuxer
-/// without an intermediate copy to Vec<u8>.
-impl BufferSource for Uint8Array {
-  fn buffer_data(&self) -> (*const u8, usize) {
-    let slice: &[u8] = self.as_ref();
-    (slice.as_ptr(), slice.len())
-  }
-}
-
-// ============================================================================
 // Lock Helper Macros
 // ============================================================================
 
@@ -355,8 +340,9 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
 
   /// Load from a buffer
   ///
-  /// This method accepts any type implementing `BufferSource`, enabling
-  /// zero-copy buffer loading from `Uint8Array` without intermediate copies.
+  /// The source must own its bytes (for example a `Vec<u8>`): the demuxer
+  /// reads them on worker threads for as long as it is open, so it must never
+  /// point into a JS buffer that JS can detach or resize.
   pub fn load_buffer(&mut self, source: impl BufferSource + 'static) -> Result<()> {
     if self.state != DemuxerState::Unloaded {
       return Err(Error::new(
