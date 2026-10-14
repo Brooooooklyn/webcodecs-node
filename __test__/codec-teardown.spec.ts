@@ -378,6 +378,141 @@ for (const [name, make, expected] of workerErrorCases) {
   })
 }
 
+// Work that succeeds, then work that fails, then flush(). The flush buffers the
+// outputs of the first work; they must reach JS before the error callback, never
+// after the error closed the codec. Chrome: outputs, error, flush rejection.
+interface FailAfterOutputCase {
+  name: string
+  // Configures the codec, queues `good` successful work items and one failing
+  // item, and returns the codec. Synchronous, so a flush() right after it is
+  // pending before the worker starts.
+  run(record: Record, good: number): TeardownCodec
+  error: string
+}
+
+async function failAfterOutputCases(): Promise<FailAfterOutputCase[]> {
+  const video = await encodeVp8Chunks(3)
+  const audio = await encodeOpusChunks(3)
+  return [
+    {
+      name: 'VideoEncoder: opaque frame',
+      error: 'OperationError',
+      run: (record, good) => {
+        const encoder = new VideoEncoder({ output: () => record('output'), error: (e) => record('error:' + e.name) })
+        encoder.configure({ codec: 'vp8', width: 16, height: 16, hardwareAcceleration: 'prefer-software' })
+        for (let i = 0; i < good; i++) {
+          const frame = i420Frame(16, 16, i)
+          encoder.encode(frame, { keyFrame: true })
+          frame.close()
+        }
+        const opaque = createVideoFrameFromRGBA16Float(new Uint16Array(16 * 16 * 4), {
+          codedWidth: 16,
+          codedHeight: 16,
+          timestamp: good * 33_333,
+        })
+        encoder.encode(opaque)
+        opaque.close()
+        return encoder
+      },
+    },
+    {
+      name: 'VideoDecoder: corrupt chunk',
+      error: 'EncodingError',
+      run: (record, good) => {
+        const decoder = new VideoDecoder({
+          output: (frame) => {
+            record('output')
+            frame.close()
+          },
+          error: (e) => record('error:' + e.name),
+        })
+        // Low latency: each chunk decodes on its own, so the corrupt one fails in decode()
+        decoder.configure({ ...video.config, optimizeForLatency: true, hardwareAcceleration: 'prefer-software' })
+        for (let i = 0; i < good; i++) decoder.decode(video.chunks[i])
+        decoder.decode(new EncodedVideoChunk({ type: 'key', timestamp: good * 33_333, data: new Uint8Array([0]) }))
+        return decoder
+      },
+    },
+    {
+      // Chrome resamples Opus input to 48 kHz; this encoder (libopus) cannot open at
+      // 44.1 kHz, so the queued reconfigure fails on the worker.
+      name: 'AudioEncoder: reconfigure the encoder cannot open',
+      error: 'EncodingError',
+      run: (record, good) => {
+        const encoder = new AudioEncoder({ output: () => record('output'), error: (e) => record('error:' + e.name) })
+        encoder.configure({ codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 })
+        for (let i = 0; i < good; i++) {
+          const data = audioData(i)
+          encoder.encode(data)
+          data.close()
+        }
+        encoder.configure({ codec: 'opus', sampleRate: 44_100, numberOfChannels: 2 })
+        return encoder
+      },
+    },
+    {
+      name: 'AudioDecoder: corrupt chunk',
+      error: 'EncodingError',
+      run: (record, good) => {
+        const decoder = new AudioDecoder({
+          output: (data) => {
+            record('output')
+            data.close()
+          },
+          error: (e) => record('error:' + e.name),
+        })
+        decoder.configure(audio.config)
+        for (let i = 0; i < good; i++) decoder.decode(audio.chunks[i])
+        // An Opus code 3 packet that declares zero frames
+        decoder.decode(
+          new EncodedAudioChunk({ type: 'key', timestamp: good * 20_000, data: new Uint8Array([0x03, 0x00]) }),
+        )
+        return decoder
+      },
+    },
+  ]
+}
+
+test('outputs of work before a failure reach JS before the error callback, and the pending flush rejects after it', async (t) => {
+  for (const failCase of await failAfterOutputCases()) {
+    const log: string[] = []
+    const codec = failCase.run((entry) => log.push(entry), 2)
+    await codec.flush().catch((error: unknown) => log.push(`flush:${(error as DOMException).name}`))
+    await delay(100)
+    t.deepEqual(
+      log,
+      ['output', 'output', `error:${failCase.error}`, `flush:${failCase.error}`],
+      failCase.name,
+    )
+    t.is(codec.state, 'closed', failCase.name)
+  }
+})
+
+test('close() in an output callback that runs before the error callback drops the error', async (t) => {
+  for (const failCase of await failAfterOutputCases()) {
+    const log: string[] = []
+    let codec: TeardownCodec | undefined
+    let closed = false
+    codec = failCase.run((entry) => {
+      log.push(entry)
+      if (entry === 'output' && !closed) {
+        closed = true
+        codec!.close()
+      }
+    }, 2)
+    // The first output callback closes the codec: the second output and the
+    // error are dropped, and the flush is aborted.
+    const flush = await codec.flush().then(
+      () => 'ok',
+      (error: unknown) => (error as DOMException).name,
+    )
+    await delay(100)
+    t.deepEqual(log, ['output'], failCase.name)
+    t.is(flush, 'AbortError', failCase.name)
+    t.is(codec.state, 'closed', failCase.name)
+  }
+})
+
 // ============================================================================
 // flush() after the error callback ran: InvalidStateError
 // ============================================================================
