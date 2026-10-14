@@ -18,7 +18,7 @@ const DEFAULT_BUFFER_SIZE: usize = 32 * 1024;
 pub enum IoMode {
   /// Buffer-based output (muxer writes to memory buffer)
   BufferWrite(Box<MemoryBuffer>),
-  /// Buffer-based input (demuxer reads from read-only buffer) - supports zero-copy
+  /// Buffer-based input (demuxer reads from an owned read-only buffer)
   BufferRead(Box<ReadOnlyBuffer>),
   /// Streaming output (muxer writes to streaming buffer)
   StreamingWrite(Box<StreamingBuffer>),
@@ -51,8 +51,7 @@ impl CustomIOContext {
 
   /// Create a new custom I/O context for reading from a memory buffer
   ///
-  /// This method accepts any type implementing `BufferSource`, enabling
-  /// zero-copy buffer loading from `Uint8Array` without intermediate copies.
+  /// The source must own its bytes (see `BufferSource`).
   pub fn new_buffer_read(source: impl BufferSource + 'static) -> Result<Self, String> {
     let buffer = ReadOnlyBuffer::new(source);
     Self::create_read_context(IoMode::BufferRead(Box::new(buffer)))

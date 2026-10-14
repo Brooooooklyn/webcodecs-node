@@ -15,7 +15,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-napi = { version = "3", features = ["async", "napi5", "web_stream"] }
+napi = { version = "3", features = ["async", "napi7", "web_stream"] }
 napi-derive = { version = "3" }
 
 futures = "0.3"

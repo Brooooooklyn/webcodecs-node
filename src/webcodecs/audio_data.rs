@@ -5,6 +5,7 @@
 
 use crate::codec::Frame;
 use crate::ffi::AVSampleFormat;
+use crate::webcodecs::buffer_source;
 use crate::webcodecs::error::{
   enforce_range_long_long, invalid_state_error, native_range_error, throw_invalid_state_error,
 };
@@ -302,42 +303,10 @@ impl FromNapiValue for AudioDataInit {
       None => return Err(throw_type_error(env, "timestamp is required")),
     };
 
-    // Validate data - required field, accept BufferSource (ArrayBuffer, TypedArray, DataView)
-    let data: Vec<u8> = if let Ok(Some(buffer)) = obj.get::<Buffer>("data") {
-      buffer.to_vec()
-    } else if let Ok(Some(array)) = obj.get::<Uint8Array>("data") {
-      array.to_vec()
-    } else if let Ok(Some(array_buffer)) = obj.get::<ArrayBuffer>("data") {
-      array_buffer.to_vec()
-    } else {
-      // Check if data property exists but is undefined/null
-      let has_data = obj.has_named_property("data")?;
-      if !has_data {
-        return Err(throw_type_error(env, "data is required"));
-      }
-
-      // Try getting as object and check for buffer/byteLength properties (DataView, other TypedArrays)
-      if let Ok(Some(data_obj)) = obj.get::<Object>("data") {
-        let byte_length: Option<u32> = data_obj.get("byteLength").ok().flatten();
-        let byte_offset: u32 = data_obj.get("byteOffset").ok().flatten().unwrap_or(0);
-
-        if let (Some(len), Ok(Some(buffer))) = (byte_length, data_obj.get::<ArrayBuffer>("buffer"))
-        {
-          let full_data = buffer.to_vec();
-          let offset = byte_offset as usize;
-          let length = len as usize;
-          if offset + length <= full_data.len() {
-            full_data[offset..offset + length].to_vec()
-          } else {
-            return Err(throw_type_error(env, "data must be a valid BufferSource"));
-          }
-        } else {
-          return Err(throw_type_error(env, "data must be a BufferSource"));
-        }
-      } else {
-        return Err(throw_type_error(env, "data is required"));
-      }
-    };
+    // Validate data - required field, any BufferSource. The view is located
+    // with engine calls, not its (overridable) buffer/byteOffset/byteLength
+    // properties, and its bytes are copied before any other JS runs.
+    let data = buffer_source::copy_required_data(env, &obj)?;
 
     Ok(AudioDataInit {
       format,
@@ -741,38 +710,12 @@ impl AudioData {
     let num_frames = plan.copy_frames;
     let channels = frame_guard.channels() as usize;
 
-    // Extract the underlying buffer from AllowSharedBufferSource (TypedArray, DataView, or ArrayBuffer)
-    let typed_array = destination
-      .coerce_to_object()
-      .map_err(|_| Error::new(Status::InvalidArg, "Invalid AllowSharedBufferSource"))?;
-
-    // Get buffer info - handle both TypedArray/DataView and direct ArrayBuffer
-    let (mut buffer, byte_offset, byte_length): (ArrayBuffer, usize, usize) =
-      if let Ok(true) = typed_array.has_named_property("buffer") {
-        // It's a TypedArray or DataView - get its underlying buffer info
-        let byte_length: u32 = typed_array.get("byteLength").ok().flatten().unwrap_or(0);
-        let byte_offset: u32 = typed_array.get("byteOffset").ok().flatten().unwrap_or(0);
-        let buffer: ArrayBuffer = typed_array
-          .get("buffer")?
-          .ok_or_else(|| Error::new(Status::InvalidArg, "Invalid AllowSharedBufferSource"))?;
-        (buffer, byte_offset as usize, byte_length as usize)
-      } else {
-        // It's likely an ArrayBuffer directly
-        let byte_length: Option<u32> = typed_array.get("byteLength").ok().flatten();
-        if let Some(len) = byte_length {
-          let buffer = ArrayBuffer::from_unknown(destination)?;
-          (buffer, 0, len as usize)
-        } else {
-          return Err(Error::new(
-            Status::InvalidArg,
-            "Invalid AllowSharedBufferSource",
-          ));
-        }
-      };
-
-    // Get mutable access to the destination buffer at the correct offset
-    let full_buffer = unsafe { buffer.as_mut() };
-    let dest_slice = &mut full_buffer[byte_offset..byte_offset + byte_length];
+    // Locate the destination with engine calls: its own buffer/byteOffset/
+    // byteLength properties may lie, and reading them would run JS while the
+    // locks above are held.
+    let destination = buffer_source::copy_to_destination(env.raw(), &destination)?;
+    // SAFETY: no JS runs between locating the destination and the writes below.
+    let dest_slice = unsafe { destination.as_mut_slice() };
 
     // The destination must hold element_count samples in the destination
     // format — not the source format's byte size (RangeError per W3C spec)
