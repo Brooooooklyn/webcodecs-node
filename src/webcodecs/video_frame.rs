@@ -31,6 +31,27 @@ struct FrameCloseObservers {
   next_id: u64,
   // (listener map key, napi_ref) pairs
   callbacks: Vec<(u64, usize)>,
+  // The frame's anchor holder.
+  holder: super::event_target::HolderRef,
+}
+
+impl FrameCloseObservers {
+  fn new(env: napi::sys::napi_env, next_id: u64) -> Self {
+    Self {
+      env,
+      next_id,
+      callbacks: Vec::new(),
+      holder: Default::default(),
+    }
+  }
+
+  /// Delete every napi_ref this entry owns (JS thread).
+  fn delete_refs(mut self) {
+    for (_, reference) in self.callbacks.drain(..) {
+      unsafe { napi::sys::napi_delete_reference(self.env, reference as napi::sys::napi_ref) };
+    }
+    self.holder.clear(self.env);
+  }
 }
 thread_local! {
   static CLOSE_OBSERVERS: RefCell<HashMap<u64, FrameCloseObservers>> = RefCell::new(HashMap::new());
@@ -4238,7 +4259,7 @@ impl VideoFrame {
   /// flip false, codedRect and visibleRect null, every colorSpace field becomes null,
   /// and callbacks registered with registerVideoFrameCloseObserver run synchronously.
   #[napi(ts_args_type = "")]
-  pub fn close(&self, env: Env, this: This) -> Result<()> {
+  pub fn close(&self, env: Env) -> Result<()> {
     let mut guard = self
       .inner
       .lock()
@@ -4252,10 +4273,18 @@ impl VideoFrame {
     // releases observer references without expiring independently owned images.
     let observers =
       CLOSE_OBSERVERS.with(|registry| registry.borrow_mut().remove(&self.observer_id));
+    let (holder, callbacks) = match observers {
+      Some(mut entry) => {
+        let holder = entry.holder.get(&env);
+        entry.holder.clear(env.raw());
+        (holder, std::mem::take(&mut entry.callbacks))
+      }
+      None => (None, Vec::new()),
+    };
     let mut thrown = Vec::new();
-    for (id, reference) in observers.into_iter().flat_map(|entry| entry.callbacks) {
+    for (id, reference) in callbacks {
       let callback = super::event_target::upgrade_ref(&env, reference)?;
-      super::event_target::release_callback(&env, Some(this.raw()), id, reference);
+      super::event_target::release_callback(&env, holder, id, reference);
       let Some(callback) = callback else { continue };
       let mut result = std::ptr::null_mut();
       let mut receiver = std::ptr::null_mut();
@@ -4988,11 +5017,7 @@ impl Drop for VideoFrame {
     let _ = CLOSE_OBSERVERS.try_with(|registry| {
       let observers = registry.borrow_mut().remove(&self.observer_id);
       if let Some(observers) = observers {
-        for (_, reference) in observers.callbacks {
-          unsafe {
-            napi::sys::napi_delete_reference(observers.env, reference as napi::sys::napi_ref)
-          };
-        }
+        observers.delete_refs();
       }
     });
   }
@@ -5013,42 +5038,44 @@ pub fn register_video_frame_close_observer(
     return throw_invalid_state_error(&env, "VideoFrame is closed");
   }
   let callback = callback.borrow_back(&env)?;
-  // Reserve the id under a short borrow. Anchoring can run JS when code that ran
-  // before this module loaded replaced WeakMap methods, and that JS may close or
-  // register on frames, so no borrow is held across it.
-  let id = CLOSE_OBSERVERS.with(|registry| {
+  // Reserve the id and find or make the frame's holder under a short borrow.
+  // Linking a new holder can run JS when code that ran before this module
+  // loaded replaced WeakMap methods, and that JS may close or register on
+  // frames, so no borrow is held across it.
+  let (id, anchor) = CLOSE_OBSERVERS.with(|registry| {
     let mut registry = registry.borrow_mut();
     let observers = registry
       .entry(frame.observer_id)
-      .or_insert_with(|| FrameCloseObservers {
-        env: env.raw(),
-        next_id: 0,
-        callbacks: Vec::new(),
-      });
+      .or_insert_with(|| FrameCloseObservers::new(env.raw(), 0));
     let id = observers.next_id;
     observers.next_id += 1;
-    id
+    (id, observers.holder.prepare(&env))
   });
-  let reference = super::event_target::CodecEventState::anchor_callback(
-    &env,
-    Some(frame.value),
-    id,
-    callback.raw(),
-  )?;
-  // JS that ran while anchoring may have closed the frame.
+  let anchor = anchor?;
+  if let Some(ref anchor) = anchor
+    && let Err(error) = super::event_target::link_holder(&env, frame.value, anchor)
+  {
+    // An unlinked holder keeps nothing alive: forget it so the next
+    // registration makes a new one.
+    CLOSE_OBSERVERS.with(|registry| {
+      if let Some(observers) = registry.borrow_mut().get_mut(&frame.observer_id) {
+        observers.holder.clear(env.raw());
+      }
+    });
+    return Err(error);
+  }
+  let holder = anchor.map(|anchor| anchor.holder);
+  let reference = super::event_target::anchor_callback(&env, holder, id, callback.raw())?;
+  // JS that ran while linking may have closed the frame.
   if frame.closed()? {
-    super::event_target::release_callback(&env, Some(frame.value), id, reference);
+    super::event_target::release_callback(&env, holder, id, reference);
     return throw_invalid_state_error(&env, "VideoFrame is closed");
   }
   CLOSE_OBSERVERS.with(|registry| {
-    let mut registry = registry.borrow_mut();
     registry
+      .borrow_mut()
       .entry(frame.observer_id)
-      .or_insert_with(|| FrameCloseObservers {
-        env: env.raw(),
-        next_id: id + 1,
-        callbacks: Vec::new(),
-      })
+      .or_insert_with(|| FrameCloseObservers::new(env.raw(), id + 1))
       .callbacks
       .push((id, reference));
   });
