@@ -8,7 +8,7 @@
 import test from 'ava'
 
 import { AudioEncoder } from '../index.js'
-import { generateSineTone, generateSilence, type EncodedAudioChunk } from './helpers/index.js'
+import { generateSineTone, generateSilence, waitFor, type EncodedAudioChunk } from './helpers/index.js'
 
 // Helper to create encoder with callbacks that collect output
 function createTestEncoder() {
@@ -125,8 +125,8 @@ test('AudioEncoder: configure() with mono audio', (t) => {
   encoder.close()
 })
 
-test('AudioEncoder: configure() with invalid codec triggers error callback', (t) => {
-  const { encoder } = createTestEncoder()
+test('AudioEncoder: configure() with invalid codec triggers error callback', async (t) => {
+  const { encoder, errors } = createTestEncoder()
 
   encoder.configure({
     codec: 'invalid-codec',
@@ -136,6 +136,8 @@ test('AudioEncoder: configure() with invalid codec triggers error callback', (t)
 
   // Error callback transitions to closed
   t.is(encoder.state, 'closed')
+  await waitFor(() => errors.length > 0, 'error callback')
+  t.is(errors[0].name, 'NotSupportedError')
 
   // Already closed by error callback, so close() throws InvalidStateError
   try {
