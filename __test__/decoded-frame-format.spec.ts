@@ -11,6 +11,10 @@
  */
 
 import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { deflateSync } from 'node:zlib'
 
 import test from 'ava'
@@ -514,6 +518,100 @@ for (const [name, jpeg, chrome] of FFMPEG_JPEG_CASES) {
     image.close()
   })
 }
+
+// ============================================================================
+// ImageDecoder: AVIF with the identity matrix (gbrp)
+// ============================================================================
+
+const wptFixture = (name: string) =>
+  new Uint8Array(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/wpt', name)))
+const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex')
+
+test('ImageDecoder: a still AVIF with the identity matrix (gbrp) decodes to I444 with the G, B, R planes, like Chrome', async (t) => {
+  const image = await decodeImage(wptFixture('four-colors.avif'), 'image/avif')
+  t.is(image.format, 'I444')
+  t.is(image.allocationSize(), 320 * 240 * 3)
+  const { bytes, layout } = await rawCopy(image)
+  t.deepEqual(layout, [
+    [0, 320],
+    [76800, 320],
+    [153600, 320],
+  ])
+  // Chrome 155's bytes, and its G, B, R samples in the four quadrants
+  t.is(sha256(bytes), 'd2d1b9fbfa388b547bd24d674e26667e2ce0c45a5353e2cf590a95e8d144fcaf')
+  const gbr = (x: number, y: number) => [0, 1, 2].map((p) => bytes[p * 76800 + y * 320 + x])
+  t.deepEqual(
+    [gbr(80, 60), gbr(240, 60), gbr(80, 180), gbr(240, 180)],
+    [
+      [255, 0, 255],
+      [0, 0, 255],
+      [0, 255, 0],
+      [255, 0, 0],
+    ],
+  )
+  // copyTo RGBA reads the planes as RGB: yellow, red, blue, green
+  const rgba = new Uint8Array(image.allocationSize({ format: 'RGBA' }))
+  await image.copyTo(rgba, { format: 'RGBA' })
+  const px = (x: number, y: number) => Array.from(rgba.subarray((y * 320 + x) * 4, (y * 320 + x) * 4 + 4))
+  t.deepEqual(
+    [px(80, 60), px(240, 60), px(80, 180), px(240, 180)],
+    [
+      [255, 255, 0, 255],
+      [255, 0, 0, 255],
+      [0, 0, 255, 255],
+      [0, 255, 0, 255],
+    ],
+  )
+  t.true(image.colorSpace.fullRange)
+  image.close()
+})
+
+test('ImageDecoder: a 10-bit still AVIF with the identity matrix (gbrp10le) decodes to I444P10, like Chrome', async (t) => {
+  // avifenc -d 10 -y 444 --cicp 1/13/0 -r full, 17x5
+  const image = await decodeImage(
+    b64(
+      'AAAAIGZ0eXBhdmlmAAAAAGF2aWZtaWYxbWlhZk1BMUEAAADrbWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAcGljdAAAAAAAAAAAAAAAAAAAAAAOcGl0bQAAAAAAAQAAAB5pbG9jAAAAAEQAAAEAAQAAAAEAAAETAAABFQAAAChpaW5mAAAAAAABAAAAGmluZmUCAAAAAAEAAGF2MDFDb2xvcgAAAABqaXBycAAAAEtpcGNvAAAAFGlzcGUAAAAAAAAAEQAAAAUAAAAQcGl4aQAAAAADCgoKAAAADGF2MUOBIEAAAAAAE2NvbHJuY2x4AAEADQAAgAAAABdpcG1hAAAAAAAAAAEAAQQBAoMEAAABHW1kYXQSAAoIOBChGMBDQAgyhgIRgAIIIIQA/7OADBdAzEPUfUID6UhLJmq+heFQMBP0ZA9HieUgsVfkYrARkrPP///0+sHOlNaDBnL1SQCGjpZg7NsI7K2dpPFglqm2Yn//64ZKdKkTxDDqmezHo7wdooBeI3zbX8PiLa/7Ab85qKfeC1h3LWiXFzJEBA8PCt1gkW+wHJ/+LFAK3+jPRR5I/bHBoh9+t1O1kLGZ7YlRDVQY4bv0uysEPy/vuPHsl70t5K/WPYa/0KD/alWyhqBxwFI+20QZ+M4ajEHnvsgvzk1/Ixn/Tnj9UCsSjyUHToW7FC1lvjSJ7VS4CAWhVqDc7hbf/84dHUElbJX+/HhzQwMDJ0QTDT/3',
+    ),
+    'image/avif',
+  )
+  t.is(image.format, 'I444P10')
+  const { bytes, layout } = await rawCopy(image)
+  t.deepEqual(layout, [
+    [0, 34],
+    [170, 34],
+    [340, 34],
+  ])
+  t.deepEqual(
+    Array.from(bytes),
+    Array.from(
+      b64(
+        'kAGhAbgByQHgAfEBBwIbAjICQwJZAm0CgwKTAqgCvALSAq8CwALXAugC/wIQAyYDOgNRA2IDeAOMA6IDsgPHA9sD8QPKA98D8wMAABcAKAA+AFIAaQB6AJAApAC6AMoA3wDzAAkB5wD3AA8BIAE3AUgBXgFyAYkBmgGwAcQB2gHqAf8BEwIpAgMCFAIsAj0CUgJoAngCjgKiArcCyALeAvICBwMYAy4DQQMEADIAbACdANAABgE6AW8BoAHaAQYCPgJ1AqUC2wISA0EDeAA+ABwA5gCbAHMBTQEWAdgBmgF7Ak4CAgLQArECfwM2A+oA2gCCAHUAOADrAdIBhwFJAT8B4gLZApkCRwI1AukDqgNeAWoBNAHBAY8BWgBgACwA/ACKAFMDYgMxA/4DiQNVAh4C0AHnAbgBSwEAAdMA6QC8AHAAAgDbA/EDpAN2AwoD3AKTAh0AsABGAdgBbQIAA5UDKQC7AE8B4gF5AgwDpQM6ANEAXQFIANsAcQEDApoCMAPBA1sA6gB9AQ4CpAI4A80DYQD3AIgBdwAJAZ8BMgLGAlkD9QOAABMBqAE8AtMCaQP8A48AHwG2AaIANAHKAV0C8wKIAxwAsgBCAdUBaAL+ApcDIwC6AEwB4QHNAGAB9gGIAh4DtANFANsAbwEBApcCKgO+A1IA5AB4AQ8C',
+      ),
+    ),
+  )
+  image.close()
+})
+
+test('ImageDecoder: an animated AVIF with the identity matrix decodes to BGRX, like Chrome', async (t) => {
+  const image = await decodeImage(wptFixture('four-colors-flip.avif'), 'image/avif')
+  t.is(image.format, 'BGRX')
+  t.is(sha256((await rawCopy(image)).bytes), 'da76d824e943b611eba6c53b51254d65789dc0e2d5722ea3f10469666fce7d8a')
+  image.close()
+})
+
+test('ImageDecoder: an AVIF with the identity matrix and an alpha plane is not I444', async (t) => {
+  // avifenc -l, 17x5 with alpha. Chrome 155 decodes it to BGRA; the alpha plane is a
+  // separate stream that is not decoded here, so the colour planes alone become BGRX.
+  const image = await decodeImage(
+    b64(
+      'AAAAIGZ0eXBhdmlmAAAAAGF2aWZtaWYxbWlhZk1BMUEAAAGGbWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAcGljdAAAAAAAAAAAAAAAAAAAAAAOcGl0bQAAAAAAAQAAACxpbG9jAAAAAEQAAAIAAQAAAAEAAAHmAAABQwACAAAAAQAAAa4AAAA4AAAAQmlpbmYAAAAAAAIAAAAaaW5mZQIAAAAAAQAAYXYwMUNvbG9yAAAAABppbmZlAgAAAAACAABhdjAxQWxwaGEAAAAAGmlyZWYAAAAAAAAADmF1eGwAAgABAAEAAADDaXBycAAAAJ1pcGNvAAAAFGlzcGUAAAAAAAAAEQAAAAUAAAAQcGl4aQAAAAADCAgIAAAADGF2MUOBIAAAAAAAE2NvbHJuY2x4AAEADQAAgAAAAA5waXhpAAAAAAEIAAAADGF2MUOBABwAAAAAOGF1eEMAAAAAdXJuOm1wZWc6bXBlZ0I6Y2ljcDpzeXN0ZW1zOmF1eGlsaWFyeTphbHBoYQAAAAAeaXBtYQAAAAAAAAACAAEEAQKDBAACBAEFhgcAAAGDbWRhdBIACgUYEKEYVDItEACjWjEPaehqtCmzusF203x/ZVTsmKwyCl3sqTyCraasU5t45zx4fWNQIuVEEgAKCDgQoRhAQ0AIMrQCEAAAqjGf///9oHeMXcgzYCXuxYyyXuu8we3yYCYCXu3hq7M1ENxFlTlT9Tno6w77Idc60OUxsOfV8akRy73d+C4NN9oWgUH1IDH89vF57WB70P8o5weAWa7/5lYtNpm+Wiz////hWb8QGdYER1k822tL27l5XLE8HEiH/D4NKZGxg4nVqzlb9xBqcdEn6E5l4y672f+y29iCJYvT8f33BtxbFRF3x98NLd/00yvxlzCbI+gDD2x6EXUKGB1perOpMl44YbLBZZcZIztB80ogITg0GUnIp1n//zdjwkCKr3/AAIf//4fObSXMtt1t1dTCd5LIRgRttoRgRtt1toRo4eqoPOx/mibc7fw1fJOYZDmfsGIiEiPyUDERCRCRGDERGDIDEy/Ez4aMdaDU+QkvrMHLnyA=',
+    ),
+    'image/avif',
+  )
+  t.not(image.format, 'I444')
+  t.is(image.allocationSize(), 17 * 5 * 4)
+  image.close()
+})
 
 // ============================================================================
 // VideoDecoder: one lossless 16x16 keyframe each, so the decoded samples are known
