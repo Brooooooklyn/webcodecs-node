@@ -626,6 +626,47 @@ test('ImageDecoder: an animated AVIF with the identity matrix decodes to BGRX, l
   image.close()
 })
 
+test('ImageDecoder: a streamed animated AVIF with the identity matrix is BGRX from its first frame, like Chrome', async (t) => {
+  // avifenc -l --fps 1, two 8x4 frames (R = 32x, G = 64y, B = 200, then R = 200, G = 32x,
+  // B = 64y), with the 'moov' box moved after 'mdat' and the iloc and stco offsets moved
+  // with it. Bytes 0..429 (ftyp, meta, mdat) hold every frame but not the track, so a
+  // probe there finds one stream with one frame. The 'avis' brand says it is animated.
+  const data = b64(
+    'AAAALGZ0eXBhdmlzAAAAAGF2aWZhdmlzbXNmMWlzbzhtaWYxbWlhZk1BMUEAAADrbWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAcGljdAAAAAAAAAAAAAAAAAAAAAAOcGl0bQAAAAAAAQAAAB5pbG9jAAAAAEQAAAEAAQAAAAEAAAEfAAAASwAAAChpaW5mAAAAAAABAAAAGmluZmUCAAAAAAEAAGF2MDFDb2xvcgAAAABqaXBycAAAAEtpcGNvAAAAFGlzcGUAAAAAAAAACAAAAAQAAAAQcGl4aQAAAAADCAgIAAAADGF2MUOBIAAAAAAAE2NvbHJuY2x4AAEADQAAgAAAABdpcG1hAAAAAAAAAAEAAQQBAoMEAAAAlm1kYXQSAAoMIAAAAQ/Nr5ICGgBAMjkQAIAAhsGyOHh+ofhKRcGopR8MBJib3oMJ/fEcKQB5nPtRbwL1Pk8Q6rWvgLj/w2uZPl//QEo2JyASADI/MAOAgP34egAEAAACrct9MQt6HZPdOYifvHj/XwybUkEN39rTRHllNN7RPTSXGiHKk9yXR6d3MDftgBedoycgAAACxm1vb3YAAAB4bXZoZAEAAAAAAAAA5vVOggAAAADm9U6CAAAAAf//////////AAEAAAEAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAJGdHJhawAAAGh0a2hkAQAAAQAAAADm9U6CAAAAAOb1ToIAAAABAAAAAP//////////AAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAQAAAAAAIAAAABAAAAAAALGVkdHMAAAAkZWxzdAEAAAEAAAABAAAAAAAAAAIAAAAAAAAAAAABAAAAAAGqbWRpYQAAACxtZGhkAQAAAAAAAADm9U6CAAAAAOb1ToIAAAABAAAAAAAAAAJVxAAAAAAAIWhkbHIAAAAAAAAAAHBpY3QAAAAAAAAAAAAAAAAAAAABVW1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAARVzdGJsAAAAlXN0c2QAAAAAAAAAAQAAAIVhdjAxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAgABABIAAAASAAAAAAAAAABCkFPTSBDb2RpbmcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGP//AAAADGF2MUOBIAAAAAAAE2NvbHJuY2x4AAEADQAAgAAAABBjY3N0AAAAAHwAAAAAAAAYc3R0cwAAAAAAAAABAAAAAgAAAAEAAAAcc3RzYwAAAAAAAAABAAAAAQAAAAIAAAABAAAAHHN0c3oAAAAAAAAAAAAAAAIAAABLAAAAQwAAABRzdGNvAAAAAAAAAAEAAAEfAAAAFHN0c3MAAAAAAAAAAQAAAAE=',
+  )
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => (release = resolve))
+  const chunks = [data.slice(0, 429), data.slice(429)]
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      // Hold the 'moov' box until the first frame has been checked.
+      if (chunks.length === 1) await gate
+      const chunk = chunks.shift()
+      if (chunk) controller.enqueue(chunk)
+      else controller.close()
+    },
+  })
+  const decoder = new ImageDecoder({ data: stream, type: 'image/avif' })
+  // tracks.ready resolves once the first 429 bytes have been decoded
+  await decoder.tracks.ready
+  const early = (await decoder.decode({ frameIndex: 0 })).image
+  t.false(decoder.complete)
+  release()
+  await decoder.completed
+  const late = (await decoder.decode({ frameIndex: 0 })).image
+  t.is(decoder.tracks.selectedTrack?.frameCount, 2)
+  decoder.close()
+  const whole = await decodeImage(data, 'image/avif')
+
+  // Chrome 155 waits for the track and returns these BGRX bytes, streamed or not
+  const chrome = Array.from({ length: 32 }, (_, i) => [200, 64 * Math.floor(i / 8), 32 * (i % 8), 255]).flat()
+  for (const image of [early, late, whole]) {
+    t.is(image.format, 'BGRX')
+    t.deepEqual(Array.from((await rawCopy(image)).bytes), chrome)
+    image.close()
+  }
+})
+
 test('ImageDecoder: an AVIF with the identity matrix and an alpha plane is not I444', async (t) => {
   // avifenc -l, 17x5 with alpha. Chrome 155 decodes it to BGRA; the alpha plane is a
   // separate stream that is not decoded here, so the colour planes alone become BGRX.
