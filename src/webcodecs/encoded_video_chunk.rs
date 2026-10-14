@@ -1860,10 +1860,13 @@ impl FromNapiValue for VideoDecoderConfig {
     let codec: Option<String> = obj.get("codec")?;
     let coded_width: Option<u32> = obj.get("codedWidth")?;
     let coded_height: Option<u32> = obj.get("codedHeight")?;
+    let color_space: Option<crate::webcodecs::video_frame::VideoColorSpaceInit> =
+      obj.get("colorSpace")?;
     // [EnforceRange] unsigned long, like Chrome. A plain u32 read would wrap -1 to 2^32 - 1.
-    // Chrome reads members in IDL (name) order, so height is checked first. Like WebIDL, the
-    // read stops at the first failure: no later member is read, so no later getter can replace
-    // the TypeError. configure() throws it and isConfigSupported() rejects with it.
+    // Chrome reads members in IDL (name) order: colorSpace before the aspect (description too,
+    // but this reader reads it later), and height before width. Like WebIDL, the read stops at
+    // the first failure: no later member is read, so no later getter can replace the TypeError.
+    // configure() throws it and isConfigSupported() rejects with it.
     let enforce_range = |name: &str| -> Result<std::result::Result<Option<u32>, String>> {
       let value: Option<f64> = obj.get(name)?;
       Ok(
@@ -1885,8 +1888,6 @@ impl FromNapiValue for VideoDecoderConfig {
         });
       }
     };
-    let color_space: Option<crate::webcodecs::video_frame::VideoColorSpaceInit> =
-      obj.get("colorSpace")?;
     let hardware_acceleration: Option<HardwareAcceleration> = obj.get("hardwareAcceleration")?;
     let optimize_for_latency: Option<bool> = obj.get("optimizeForLatency")?;
 
