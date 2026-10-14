@@ -4,12 +4,11 @@
 //! MKV is a flexible container that supports almost any video and audio codec.
 
 use crate::ffi::AVCodecID;
-use crate::webcodecs::buffer_source::Uint8ArrayCopy;
 use crate::webcodecs::demuxer_base::{
   AudioOutputCallback, DemuxerAudioDecoderConfig, DemuxerChunk, DemuxerFormat, DemuxerInner,
   DemuxerTrackInfo, DemuxerVideoDecoderConfig, ErrorCallback, VideoOutputCallback,
-  demux_with_callbacks, parse_aac_codec_string, parse_h264_codec_string, parse_hevc_codec_string,
-  parse_vp9_codec_string, with_demuxer_inner, with_demuxer_inner_mut,
+  demux_with_callbacks, load_buffer_from_js, parse_aac_codec_string, parse_h264_codec_string,
+  parse_hevc_codec_string, parse_vp9_codec_string, with_demuxer_inner, with_demuxer_inner_mut,
 };
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunk;
 use crate::webcodecs::encoded_video_chunk::EncodedVideoChunk;
@@ -191,19 +190,9 @@ impl MkvDemuxer {
   ///
   /// The bytes are copied when this is called, so the caller may reuse,
   /// detach or resize the buffer afterwards.
-  #[napi(ts_args_type = "data: Uint8Array")]
-  pub async fn load_buffer(&self, data: Uint8ArrayCopy) -> Result<()> {
-    let inner = self.inner.clone();
-    let data = data.into_vec();
-
-    tokio::task::spawn_blocking(move || {
-      let mut guard = inner
-        .lock()
-        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-      guard.load_buffer(data)
-    })
-    .await
-    .map_err(|e| Error::new(Status::GenericFailure, format!("Task error: {}", e)))?
+  #[napi(ts_args_type = "data: Uint8Array", ts_return_type = "Promise<void>")]
+  pub fn load_buffer<'env>(&self, env: &'env Env, data: Unknown) -> Result<PromiseRaw<'env, ()>> {
+    load_buffer_from_js(env, &self.inner, data)
   }
 
   #[napi(getter)]
