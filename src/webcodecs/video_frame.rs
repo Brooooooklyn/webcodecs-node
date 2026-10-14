@@ -1138,12 +1138,13 @@ pub struct PlaneLayout {
 
 /// PredefinedColorSpace values that Chrome knows but cannot copy to: NotSupportedError, not
 /// TypeError.
-const UNSUPPORTED_COPY_COLOR_SPACES: [&str; 5] = [
+const UNSUPPORTED_COPY_COLOR_SPACES: [&str; 6] = [
   "rec2020",
   "srgb-linear",
   "display-p3-linear",
   "rec2100-hlg",
   "rec2100-pq",
+  "rec2100-linear",
 ];
 const UNSUPPORTED_COLOR_SPACE_MESSAGE: &str =
   "This pixel conversion to this color space is not supported.";

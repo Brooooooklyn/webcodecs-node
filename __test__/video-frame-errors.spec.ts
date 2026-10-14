@@ -432,7 +432,14 @@ test('rect members default to 0 in copyTo, not to the visible rect', async (t) =
 
 test("colorSpace values Chrome's enum has but copyTo cannot target are NotSupportedError", async (t) => {
   const frame = makeI420_4x2()
-  for (const colorSpace of ['rec2020', 'srgb-linear', 'display-p3-linear', 'rec2100-hlg', 'rec2100-pq']) {
+  for (const colorSpace of [
+    'rec2020',
+    'srgb-linear',
+    'display-p3-linear',
+    'rec2100-hlg',
+    'rec2100-pq',
+    'rec2100-linear',
+  ]) {
     for (const options of [{ format: 'RGBA', colorSpace }, { colorSpace }]) {
       const label = JSON.stringify(options)
       await rejectsDOMException(t, 'NotSupportedError', `copyTo ${label}`, frame, new Uint8Array(64), options)
