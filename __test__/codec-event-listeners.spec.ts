@@ -393,6 +393,66 @@ test('module load: the listener store and the copyTo buffer checks are both set 
   })
 })
 
+test('module load: loading the module again leaves callbacks removable and collectable', (t) => {
+  // process.dlopen with a fresh module object runs the module's load hook again in
+  // the same Node environment. (Node gives that load its own napi_env, so it gets
+  // its own store.) Callbacks registered before and after the second load must
+  // still be released by removal while their owners stay alive.
+  const result = runChild<{ loadedAgain: boolean; collected: Record<string, boolean>; owners: number }>(`
+    ${PRELUDE}
+    const first = require('./index.js');
+    const file = Object.keys(require.cache).find((name) => name.endsWith('.node'));
+    const collected = {};
+    const registry = new FinalizationRegistry((key) => { collected[key] = true; });
+    const owners = [];
+    let removers = [];
+    const register = (m, kind, key) => {
+      collected[key] = false;
+      const owner = kind === 'VideoFrame'
+        ? new m.VideoFrame(new Uint8Array(64), { format: 'RGBA', codedWidth: 4, codedHeight: 4, timestamp: 0 })
+        : new m[kind]({ output: () => {}, error: () => {} });
+      owners.push(owner);
+      (() => {
+        const callback = () => key;
+        registry.register(callback, key);
+        if (kind === 'VideoFrame') {
+          m.registerVideoFrameCloseObserver(owner, callback);
+          // close() releases the observers; the frame object stays alive.
+          removers.push(() => owner.close());
+        } else {
+          owner.addEventListener('dequeue', callback);
+          owner.ondequeue = callback;
+          removers.push(() => { owner.removeEventListener('dequeue', callback); owner.ondequeue = null; });
+        }
+      })();
+    };
+    register(first, 'AudioDecoder', 'first load, before:AudioDecoder');
+    register(first, 'VideoFrame', 'first load, before:VideoFrame');
+    const second = { exports: {} };
+    process.dlopen(second, file);
+    register(first, 'VideoEncoder', 'first load, after:VideoEncoder');
+    register(second.exports, 'AudioDecoder', 'second load:AudioDecoder');
+    register(second.exports, 'VideoFrame', 'second load:VideoFrame');
+    for (const remove of removers) remove();
+    removers = [];
+    (async () => {
+      for (let i = 0; i < 20 && Object.values(collected).includes(false); i++) await fullGc();
+      done({ loadedAgain: first.AudioDecoder !== second.exports.AudioDecoder, collected, owners: owners.length });
+    })().catch(fail);
+  `)
+  t.deepEqual(result, {
+    loadedAgain: true,
+    collected: {
+      'first load, before:AudioDecoder': true,
+      'first load, before:VideoFrame': true,
+      'first load, after:VideoEncoder': true,
+      'second load:AudioDecoder': true,
+      'second load:VideoFrame': true,
+    },
+    owners: 5,
+  })
+})
+
 // ============================================================================
 // Dequeue event coalescing
 // ============================================================================
