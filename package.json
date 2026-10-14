@@ -58,8 +58,7 @@
     "test": "ava",
     "demo": "cd example && vite",
     "typecheck": "tsc -b tsconfig.json && tsc --ignoreConfig ./index.d.ts",
-    "preversion": "oxnode ./build.ts --platform && git add .",
-    "version": "napi version",
+    "version": "napi version && oxnode ./build.ts --platform && git add .",
     "licenses:prepare": "node tools/package-licenses.mjs",
     "licenses:check": "node tools/package-licenses.mjs --check"
   },
