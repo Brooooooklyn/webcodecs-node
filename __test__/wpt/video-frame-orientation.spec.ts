@@ -153,11 +153,9 @@ test('VideoFrame: orientation of wrapped frame', (t) => {
   t.is(frame.rotation, 90, 'rotation')
   t.is(frame.flip, true, 'flip')
 
-  // Note: WPT expects displayWidth=2, displayHeight=4 (swapped due to 90° rotation).
-  // Current implementation preserves source frame's display dimensions when wrapping.
-  // Validate actual current behavior: displayWidth=4, displayHeight=2 (unchanged from source)
-  t.is(frame.displayWidth, 4, 'displayWidth (not swapped in current implementation)')
-  t.is(frame.displayHeight, 2, 'displayHeight (not swapped in current implementation)')
+  // With 90 degree rotation, display dimensions swap (WPT expects 2x4)
+  t.is(frame.displayWidth, 2, 'displayWidth')
+  t.is(frame.displayHeight, 4, 'displayHeight')
 
   frame.close()
 })
