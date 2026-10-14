@@ -357,10 +357,12 @@ components per coded pixel. The native frame copies the input once; clones share
 immutable storage, and closing one frame leaves its clones usable. Supply the
 image color space in `init.colorSpace`; the default is full-range sRGB.
 
-These frames have `format === null`. Public `allocationSize()` and `copyTo()`
-reject with `NotSupportedError`, including requests for an explicit eight-bit
-format. `copyVideoFrameRGBA16Float(frame)` gives native image consumers an
-independent copy of the half-float bits without changing that public contract.
+These frames have `format === null`. Public `allocationSize()` throws and
+`copyTo()` rejects with `NotSupportedError`, including requests for an explicit
+eight-bit format. `copyVideoFrameRGBA16Float(frame)` gives native image consumers
+an independent copy of the half-float bits without changing that public contract.
+It returns the whole coded image (`codedWidth * codedHeight * 4` values) and
+ignores `visibleRect`.
 These functions are module exports rather than additions to `VideoFrame.prototype`.
 Native GPU consumers can use `registerVideoFrameCloseObserver(frame, callback)`
 to expire their retained textures synchronously when that frame is explicitly
@@ -614,7 +616,7 @@ frame.close()
 
 Per WPT `videoFrame-copyTo-rgb.any.js`, RGB-to-YUV conversion throws `NotSupportedError`.
 
-Custom layouts with overflow-inducing values (e.g., `offset: 2³²-2`) throw `TypeError` via checked arithmetic. Rect alignment is validated against the source format during conversion.
+Custom layouts with overflow-inducing values (e.g., `offset: 2³²-2`) throw `TypeError` via checked arithmetic. The copy `rect` is validated against the output format. For YUV-to-RGB conversion, the read origin is then aligned down to the source chroma grid, as Chrome does.
 
 ### ImageDecoder Options
 

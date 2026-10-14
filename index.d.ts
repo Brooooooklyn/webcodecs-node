@@ -1086,13 +1086,13 @@ export declare class VideoFrame {
   /**
    * Get the coded rect (the region containing valid pixel data)
    * Returns DOMRectReadOnly per W3C WebCodecs spec
-   * returns null after the resource is closed.
+   * Returns null after the resource is closed.
    */
   get codedRect(): DOMRectReadOnly | null
   /**
    * Get the visible rect (the region of coded data that should be displayed)
    * Returns DOMRectReadOnly per W3C WebCodecs spec
-   * returns null after the resource is closed.
+   * Returns null after the resource is closed.
    */
   get visibleRect(): DOMRectReadOnly | null
   /**
@@ -1150,7 +1150,9 @@ export declare class VideoFrame {
    * Per W3C spec "Close VideoFrame" algorithm:
    * 1. Assign null to frame's [[resource reference]]
    * 2. Assign true to frame's [[Detached]]
-   * Note: Metadata (timestamp, duration, etc.) remains accessible after close
+   * Note: Metadata (timestamp, duration, etc.) remains accessible after close.
+   * codedRect and visibleRect become null, every colorSpace field becomes null,
+   * and callbacks registered with registerVideoFrameCloseObserver run synchronously.
    */
   close(): void
 }
@@ -1371,10 +1373,13 @@ export type CodecState = 'unconfigured' | 'configured' | 'closed'
 /** ColorSpaceConversion for ImageDecoder (W3C WebCodecs spec) */
 export type ColorSpaceConversion = 'default' | 'none'
 
-/** native image-consumer interop with a real class borrow and independent half-pixel storage. */
+/**
+ * Native image-consumer interop with a real class borrow and independent half-float storage.
+ * Returns the whole coded image; `visibleRect` is ignored.
+ */
 export declare function copyVideoFrameRGBA16Float(frame: VideoFrame): Uint16Array
 
-/** native canvas-provider interop, separate from the browser VideoFrame interface. */
+/** Native canvas-provider interop, separate from the browser VideoFrame interface. */
 export declare function createVideoFrameFromRGBA16Float(
   data: Uint16Array,
   init: Omit<VideoFrameBufferInit, 'format' | 'layout' | 'transfer'> & {
@@ -1677,7 +1682,7 @@ export interface PlaneLayout {
 /** predefined RGB target color spaces. */
 export type PredefinedColorSpace = 'srgb' | 'display-p3'
 
-/** native image consumers subscribe to explicit close without changing the browser interface. */
+/** Native image consumers subscribe to explicit close without changing the browser interface. */
 export declare function registerVideoFrameCloseObserver(frame: VideoFrame, callback: () => void): void
 
 /**

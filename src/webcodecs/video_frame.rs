@@ -22,8 +22,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 static NEXT_FRAME_ID: AtomicU64 = AtomicU64::new(1);
-// callbacks are weak native references anchored by the frame's traceable listener map.
-// this keeps a callback that captures its frame collectible with that frame.
+// Callbacks are weak native references anchored by the frame's traceable listener map.
+// This keeps a callback that captures its frame collectible with that frame.
 struct FrameCloseObservers {
   env: napi::sys::napi_env,
   next_id: u64,
@@ -1147,7 +1147,7 @@ pub struct VideoFrameRect {
   pub height: u32,
 }
 
-/// owned native image data with no eight-bit staging or public pixel-format alias.
+/// Owned native image data with no eight-bit staging or public pixel-format alias.
 #[derive(Clone)]
 enum VideoFrameResource {
   Software {
@@ -1429,8 +1429,8 @@ impl VideoFrame {
     }
   }
 
-  /// native host interop for a retained rgba16float canvas image.
-  /// public WebCodecs pixel formats intentionally have no alias for this resource.
+  /// Native host interop for a retained rgba16float canvas image.
+  /// Public WebCodecs pixel formats intentionally have no alias for this resource.
   fn from_rgba16_float(data: Uint16Array, init: VideoFrameConstructorInit) -> Result<Self> {
     let width = init
       .coded_width
@@ -1505,7 +1505,7 @@ impl VideoFrame {
     }))
   }
 
-  /// native consumer interop; returns an independent copy without changing public copyTo.
+  /// Native consumer interop; returns an independent copy without changing public copyTo.
   fn copy_rgba16_float(&self, env: Env) -> Result<Uint16Array> {
     let guard = self
       .inner
@@ -1922,7 +1922,7 @@ impl VideoFrame {
         source_inner.resource.clone()
       };
       let (coded_width, coded_height) = resource.dimensions();
-      // opaque rgba has one-pixel alignment even though it has no public format.
+      // Opaque RGBA has one-pixel alignment even though it has no public format.
       let alignment_format = resource.format().unwrap_or(VideoPixelFormat::RGBA);
 
       // Apply overrides from init (all fields optional for frame clone)
@@ -2301,7 +2301,7 @@ impl VideoFrame {
 
   /// Get the coded rect (the region containing valid pixel data)
   /// Returns DOMRectReadOnly per W3C WebCodecs spec
-  /// returns null after the resource is closed.
+  /// Returns null after the resource is closed.
   #[napi(getter)]
   pub fn coded_rect(&self) -> Result<Option<DOMRectReadOnly>> {
     let guard = self
@@ -2325,7 +2325,7 @@ impl VideoFrame {
 
   /// Get the visible rect (the region of coded data that should be displayed)
   /// Returns DOMRectReadOnly per W3C WebCodecs spec
-  /// returns null after the resource is closed.
+  /// Returns null after the resource is closed.
   #[napi(getter)]
   pub fn visible_rect(&self) -> Result<Option<DOMRectReadOnly>> {
     let guard = self
@@ -2476,7 +2476,7 @@ impl VideoFrame {
           inner.visible_width as f64,
           inner.visible_height as f64,
         );
-        // conversion precedes cropping, so offsets follow the output format.
+        // Conversion precedes cropping, so offsets follow the output format.
         let frame_guard = frame.read();
         let (_, _, w, h) = parse_visible_rect(
           default_rect,
@@ -2603,7 +2603,7 @@ impl VideoFrame {
       }
 
       // Parse rect (default to visible rect)
-      // conversion precedes cropping, so offsets follow the output format.
+      // Conversion precedes cropping, so offsets follow the output format.
       let default_rect = (
         inner.visible_left as f64,
         inner.visible_top as f64,
@@ -2620,7 +2620,7 @@ impl VideoFrame {
         format,
       )?;
       drop(frame_guard);
-      // chromium's yuv view starts at the common chroma-aligned origin.
+      // Chromium's YUV view starts at the common chroma-aligned origin.
       let (h_factor, v_factor) = get_subsampling_factors(original_format);
       let rect_x = rect_x / h_factor * h_factor;
       let rect_y = rect_y / v_factor * v_factor;
@@ -3235,7 +3235,9 @@ impl VideoFrame {
   /// Per W3C spec "Close VideoFrame" algorithm:
   /// 1. Assign null to frame's [[resource reference]]
   /// 2. Assign true to frame's [[Detached]]
-  /// Note: Metadata (timestamp, duration, etc.) remains accessible after close
+  /// Note: Metadata (timestamp, duration, etc.) remains accessible after close.
+  /// codedRect and visibleRect become null, every colorSpace field becomes null,
+  /// and callbacks registered with registerVideoFrameCloseObserver run synchronously.
   #[napi(ts_args_type = "")]
   pub fn close(&self, env: Env, this: This) -> Result<()> {
     let mut guard = self
@@ -3247,7 +3249,7 @@ impl VideoFrame {
     // separately so their getters remain available after detachment.
     *guard = None;
     drop(guard);
-    // expire consumers synchronously on explicit close. garbage collection
+    // Expire consumers synchronously on explicit close. Garbage collection
     // releases observer references without expiring independently owned images.
     let observers =
       CLOSE_OBSERVERS.with(|registry| registry.borrow_mut().remove(&self.observer_id));
@@ -3899,7 +3901,7 @@ impl VideoFrame {
   }
 }
 
-/// native canvas-provider interop, separate from the browser VideoFrame interface.
+/// Native canvas-provider interop, separate from the browser VideoFrame interface.
 #[napi(
   js_name = "createVideoFrameFromRGBA16Float",
   ts_args_type = "data: Uint16Array, init: Omit<VideoFrameBufferInit, 'format' | 'layout' | 'transfer'> & {rotation?: number; flip?: boolean; alpha?: 'keep' | 'discard'}"
@@ -3930,7 +3932,8 @@ fn video_frame_argument<'env>(
   unsafe { ClassInstance::<VideoFrame>::from_napi_value(env.raw(), value.raw()) }
 }
 
-/// native image-consumer interop with a real class borrow and independent half-pixel storage.
+/// Native image-consumer interop with a real class borrow and independent half-float storage.
+/// Returns the whole coded image; `visibleRect` is ignored.
 #[napi(
   js_name = "copyVideoFrameRGBA16Float",
   ts_args_type = "frame: VideoFrame"
@@ -3941,8 +3944,8 @@ pub fn copy_video_frame_rgba16_float(env: Env, frame: Unknown) -> Result<Uint16A
 
 impl Drop for VideoFrame {
   fn drop(&mut self) {
-    // a frame wrapper can be collected while its external texture still owns
-    // an image. removing its callbacks must not perform an explicit close.
+    // A frame wrapper can be collected while its external texture still owns
+    // an image. Removing its callbacks must not perform an explicit close.
     let _ = CLOSE_OBSERVERS.try_with(|registry| {
       let observers = registry.borrow_mut().remove(&self.observer_id);
       if let Some(observers) = observers {
@@ -3956,7 +3959,7 @@ impl Drop for VideoFrame {
   }
 }
 
-/// native image consumers subscribe to explicit close without changing the browser interface.
+/// Native image consumers subscribe to explicit close without changing the browser interface.
 #[napi(
   js_name = "registerVideoFrameCloseObserver",
   ts_args_type = "frame: VideoFrame, callback: () => void"

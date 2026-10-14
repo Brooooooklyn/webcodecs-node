@@ -349,7 +349,7 @@ struct VideoEncoderInner {
   output_callback: OutputCallback,
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
-  /// retains the native failure category for pending and later flush rejections.
+  /// Retains the native failure category for pending and later flush rejections.
   failure_name: Option<DOMExceptionName>,
   /// Pending flush operations, tracked independently for overlapping calls.
   flushes: FlushTracker,
@@ -3248,7 +3248,7 @@ impl VideoEncoder {
       }
 
       // Get Arc reference to frame data (shares via Rust Arc, no pixel copy)
-      // resource consumption belongs to the FIFO worker, including unsupported images.
+      // Resource consumption belongs to the FIFO worker, including unsupported images.
       let frame_arc = frame.frame_arc();
 
       // Get timestamp

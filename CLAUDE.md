@@ -199,6 +199,11 @@ The build system uses explicit full paths to static libraries to avoid dynamic l
 
 - **VideoFrame**: All pixel formats (I420, I420A, I422, I444, NV12, NV21, RGBA, RGBX, BGRA, BGRX)
   - RGBA/RGBX/BGRA/BGRX formats default to sRGB colorSpace (BT.709 primaries, IEC 61966-2-1 transfer)
+  - Opaque RGBA16Float frames (`format === null`) via the module exports `createVideoFrameFromRGBA16Float`,
+    `copyVideoFrameRGBA16Float` (whole coded image, ignores visibleRect) and `registerVideoFrameCloseObserver`;
+    `allocationSize()` throws and `copyTo()` rejects with NotSupportedError, `encode()` fails with OperationError
+  - copyTo `rect` is validated against the output format; for YUV→RGB the read origin is aligned down to the
+    source chroma grid, as Chrome does
 - **EncodedVideoChunk**: Key/Delta types with copyTo()
 - **VideoEncoder**: Callback-based API, bitrateMode, latencyMode, scalabilityMode, keyFrame forcing, EventTarget
 - **VideoDecoder**: Full implementation with callback API, EventTarget interface
@@ -750,7 +755,7 @@ These are fundamental limitations that cannot be resolved without upstream NAPI-
 | VideoFrame.copyTo rect       | subregion copy          | ✅ Full W3C compliance        |
 | VideoFrame.copyTo format     | format conversion       | ✅ YUV→RGB, RGB→RGB supported |
 | VideoFrame layout overflow   | TypeError on overflow   | ✅ Checked arithmetic (u64)   |
-| VideoFrame rect validation   | source format alignment | ✅ Validates against source   |
+| VideoFrame rect validation   | source format alignment | ✅ Output format (Chrome)     |
 | ImageDecoder.closed          | readonly boolean        | ✅ Implemented                |
 | ImageTrackList.ready         | Promise                 | ✅ Implemented                |
 | ImageTrackList.item()        | indexed access          | ✅ Implemented                |
@@ -759,6 +764,8 @@ These are fundamental limitations that cannot be resolved without upstream NAPI-
 | SvcOutputMetadata            | temporalLayerId only    | ✅ All multi-temporal modes   |
 | DOMException errors          | instanceof DOMException | ✅ Native DOMException        |
 | VideoEncoder.encode options  | keyFrame forcing        | ✅ Forces I-frame             |
+| Opaque frame copyTo()        | NotSupportedError       | ✅ Also with explicit format  |
+| Opaque frame encode()        | EncodingError           | ✅ OperationError (Chrome)    |
 | EventTarget interface        | addEventListener, etc   | ✅ All codecs                 |
 | RGBA colorSpace default      | sRGB for RGB formats    | ✅ BT.709/sRGB                |
 | VP9 short form codec         | "vp9" accepted          | ✅ For compatibility          |

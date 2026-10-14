@@ -29,7 +29,7 @@ use napi::bindgen_prelude::*;
 pub enum DOMExceptionName {
   /// Encoding or decoding operation failed
   EncodingError,
-  /// the input resource cannot be consumed by the encoder.
+  /// The input resource cannot be consumed by the encoder.
   OperationError,
   /// Unsupported codec or configuration
   NotSupportedError,
