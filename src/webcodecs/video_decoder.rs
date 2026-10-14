@@ -6,7 +6,8 @@
 use crate::codec::{CodecContext, DecoderConfig, Frame, Packet, download_hw_frame};
 use crate::ffi::{AV_NOPTS_VALUE, AVCodecID, AVHWDeviceType, accessors::ffctx_set_hw_get_format};
 use crate::webcodecs::codec_epoch::{
-  CancelToken, CodecEpoch, ErrorOrigin, GatedError, GatedOutput, gated_error, gated_output,
+  CancelToken, CodecEpoch, ErrorOrigin, GatedError, GatedOutput, buffered_output, gated_error,
+  gated_output,
 };
 use crate::webcodecs::decoded_frame::{DecodedSource, decoded_frame_format};
 use crate::webcodecs::encoded_video_chunk::InternalSlice;
@@ -136,7 +137,8 @@ impl FromNapiValue for VideoDecoderInit {
     // Create ThreadsafeFunction for async calls from worker thread.
     // The JS-side callback converts the Error payload into a native
     // DOMException (WebCodecsErrorCallback receives DOMException per spec).
-    let error: ErrorCallback = gated_error(&env_wrapper, error_func.raw(), &epoch)?;
+    let error: ErrorCallback =
+      gated_error(&env_wrapper, error_func.raw(), output_func.raw(), &epoch)?;
 
     Ok(VideoDecoderInit {
       output,
@@ -487,6 +489,15 @@ impl VideoDecoder {
       .set_close_on_error(&inner, &event_state, |inner, env, events, name| {
         inner.close_codec(env, events, Some(name));
       });
+
+    // Outputs a pending flush buffered reach JS before an error callback, as in
+    // Chrome, instead of after the error closed the decoder.
+    init.epoch.set_take_buffered(&inner, |inner| {
+      std::mem::take(&mut inner.pending_frames)
+        .into_iter()
+        .map(buffered_output)
+        .collect()
+    });
 
     // Create channel for worker commands
     let (sender, receiver) = channel::unbounded();

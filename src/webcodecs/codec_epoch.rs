@@ -13,6 +13,9 @@
 //! queues that error as a task, which reset() does not cancel. Such an error
 //! still reaches JS after reset() and closes the codec then; only close()
 //! drops it.
+//!
+//! Outputs produced before an error reach JS before the error callback, and
+//! none reaches JS after it, as in Chrome.
 
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -23,7 +26,7 @@ use napi::threadsafe_function::{ThreadsafeCallContext, ThreadsafeFunction, Unkno
 use napi::{check_status, sys};
 
 use super::error::{DOMExceptionName, error_as_dom_exception};
-use super::event_target::CodecEventState;
+use super::event_target::{CodecEventState, report_exception};
 
 /// Worker → JS output callback. The first argument is the codec generation.
 pub(crate) type GatedOutput<Args> =
@@ -68,6 +71,21 @@ impl ErrorOrigin {
 /// reset(). Gets the error's name.
 type CloseOnError = Box<dyn Fn(&Env, DOMExceptionName) + Send + Sync>;
 
+/// An output a codec buffered for a pending flush. Turned into the output
+/// callback's arguments on the JS thread.
+pub(crate) type BufferedOutput =
+  Box<dyn FnOnce(sys::napi_env) -> Result<Vec<sys::napi_value>> + Send>;
+
+/// Buffer `args` for the output callback.
+pub(crate) fn buffered_output<Args: JsValuesTupleIntoVec + Send + 'static>(
+  args: Args,
+) -> BufferedOutput {
+  Box::new(move |env| args.into_vec(env))
+}
+
+/// JS thread: takes the outputs the codec buffered for a pending flush.
+type TakeBuffered = Box<dyn Fn() -> Vec<BufferedOutput> + Send + Sync>;
+
 #[derive(Default)]
 struct EpochState {
   generation: AtomicU32,
@@ -77,6 +95,8 @@ struct EpochState {
   closed: AtomicBool,
   /// Set once by the codec's constructor.
   close_on_error: OnceLock<CloseOnError>,
+  /// Set once by the codec's constructor.
+  take_buffered: OnceLock<TakeBuffered>,
 }
 
 /// Generation counter shared by one codec, its workers and its callbacks.
@@ -143,6 +163,79 @@ impl CodecEpoch {
     let _ = self.0.close_on_error.set(close);
   }
 
+  /// Install how the error callback takes the outputs the codec buffered for
+  /// a pending flush, so they reach JS before the error. The codec's
+  /// constructor calls this once. The codec state is held weakly.
+  pub(crate) fn set_take_buffered<T: Send + 'static>(
+    &self,
+    inner: &Arc<Mutex<T>>,
+    take: fn(&mut T) -> Vec<BufferedOutput>,
+  ) {
+    let inner = Arc::downgrade(inner);
+    let take: TakeBuffered = Box::new(move || {
+      let Some(inner) = inner.upgrade() else {
+        return Vec::new();
+      };
+      let Ok(mut guard) = inner.lock() else {
+        return Vec::new();
+      };
+      take(&mut guard)
+    });
+    let _ = self.0.take_buffered.set(take);
+  }
+
+  /// JS thread: an error queued under `generation` is about to reach JS.
+  /// Outputs a pending flush buffered were produced before the error; that
+  /// flush would deliver them after the error closed the codec. Hand them to
+  /// `output` now, so they arrive before the error callback as in Chrome.
+  /// Stops when an output callback calls close() or reset().
+  fn deliver_buffered(&self, env: &Env, generation: u32, output: &OutputRef) -> Result<()> {
+    if !self.is_current(generation) || self.error_delivered() {
+      return Ok(());
+    }
+    let Some(take) = self.0.take_buffered.get() else {
+      return Ok(());
+    };
+    let outputs = take();
+    if outputs.is_empty() {
+      return Ok(());
+    }
+    let function = output.borrow_back(env)?;
+    let mut this = ptr::null_mut();
+    check_status!(unsafe { sys::napi_get_undefined(env.raw(), &mut this) })?;
+    for buffered in outputs {
+      if !self.is_current(generation) {
+        break;
+      }
+      // A throwing output callback must not keep the error from JS: report
+      // the exception and go on.
+      if let Ok(args) = buffered(env.raw()) {
+        let mut result = ptr::null_mut();
+        unsafe {
+          sys::napi_call_function(
+            env.raw(),
+            this,
+            function.raw(),
+            args.len(),
+            args.as_ptr(),
+            &mut result,
+          )
+        };
+      }
+      let mut pending = false;
+      unsafe { sys::napi_is_exception_pending(env.raw(), &mut pending) };
+      if pending {
+        let mut exception = ptr::null_mut();
+        if unsafe { sys::napi_get_and_clear_last_exception(env.raw(), &mut exception) }
+          == sys::Status::napi_ok
+        {
+          report_exception(env, exception);
+        }
+      }
+    }
+    Ok(())
+  }
+
   /// JS thread: whether an error queued under `generation` reaches the error
   /// callback. `configure_error` is the error's name when configure() found
   /// it (ErrorOrigin::Configure). Marks the error delivered when it does.
@@ -195,18 +288,24 @@ enum CallbackKind {
   Error,
 }
 
+/// The user's output callback, as the error gate calls it.
+type OutputRef = FunctionRef<Unknown<'static>, UnknownReturnValue>;
+
 /// Wrap a user callback in a native function whose first argument is the
 /// generation the call was queued under. Calls from an older generation are
 /// dropped; the others call `callback` with the remaining arguments and an
 /// undefined `this`. For the error callback, the second argument is the
 /// error's name when configure() found it, or null (see `admit_error`). A
-/// worker ThreadsafeFunction targets the returned function.
+/// worker ThreadsafeFunction targets the returned function. Before the error
+/// callback runs, the outputs a pending flush buffered go to `output` (see
+/// `deliver_buffered`).
 ///
 /// An exception thrown by the callback stays pending, so it surfaces exactly
 /// as it did when the ThreadsafeFunction called the callback directly.
 fn gated_callback<'env, Args: JsValuesTupleIntoVec>(
   env: &'env Env,
   callback: sys::napi_value,
+  output: Option<sys::napi_value>,
   epoch: CodecEpoch,
   kind: CallbackKind,
 ) -> Result<Function<'env, Args, UnknownReturnValue>> {
@@ -214,17 +313,31 @@ fn gated_callback<'env, Args: JsValuesTupleIntoVec>(
     Function::<Unknown<'static>, UnknownReturnValue>::from_napi_value(env.raw(), callback)?
   }
   .create_ref()?;
+  let output = match output {
+    Some(output) => Some(
+      unsafe {
+        Function::<Unknown<'static>, UnknownReturnValue>::from_napi_value(env.raw(), output)?
+      }
+      .create_ref()?,
+    ),
+    None => None,
+  };
   let gated = env.create_function_from_closure::<Args, (), _>("codecCallback", move |ctx| {
     let generation = ctx.get::<u32>(0)?;
     let first_arg = match kind {
       CallbackKind::Output => {
-        if !epoch.is_current(generation) {
+        // Once the error callback ran, the codec is closed: Chrome drops the
+        // outputs still on their way.
+        if !epoch.is_current(generation) || epoch.error_delivered() {
           return Ok(());
         }
         1
       }
       CallbackKind::Error => {
         let configure_error = ctx.get::<Option<String>>(1)?;
+        if let Some(output) = output.as_ref() {
+          epoch.deliver_buffered(ctx.env, generation, output)?;
+        }
         if !epoch.admit_error(ctx.env, generation, configure_error.as_deref()) {
           return Ok(());
         }
@@ -264,7 +377,7 @@ pub(crate) fn gated_output<Args: 'static + JsValuesTupleIntoVec>(
   callback: sys::napi_value,
   epoch: &CodecEpoch,
 ) -> Result<GatedOutput<Args>> {
-  gated_callback::<Args>(env, callback, epoch.clone(), CallbackKind::Output)?
+  gated_callback::<Args>(env, callback, None, epoch.clone(), CallbackKind::Output)?
     .build_threadsafe_function()
     .callee_handled::<false>()
     .weak::<true>()
@@ -273,15 +386,18 @@ pub(crate) fn gated_output<Args: 'static + JsValuesTupleIntoVec>(
 
 /// Weak ThreadsafeFunction that hands the error callback `callback` a native
 /// DOMException (WebCodecsErrorCallback receives DOMException per spec),
-/// unless close() or reset() dropped the error.
+/// unless close() or reset() dropped the error. Outputs a pending flush
+/// buffered go to the output callback `output` first.
 pub(crate) fn gated_error(
   env: &Env,
   callback: sys::napi_value,
+  output: sys::napi_value,
   epoch: &CodecEpoch,
 ) -> Result<GatedError> {
   gated_callback::<FnArgs<(u32, Option<String>, Unknown<'static>)>>(
     env,
     callback,
+    Some(output),
     epoch.clone(),
     CallbackKind::Error,
   )?
