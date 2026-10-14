@@ -51,6 +51,55 @@ pub struct Scaler {
 }
 
 impl Scaler {
+  /// Convert the rect (x, y, w, h) of `src` to 8-bit RGBA or BGRA rows `stride` bytes apart
+  /// in `dst`, using AVCOL_* `tags` [primaries, trc, matrix, range] (-1 = the frame's own).
+  /// `same_format`: the target is the VideoFrame's own format. `src_x`: the VideoFrame is
+  /// RGBX/BGRX. Together they pick Chrome's alpha handling.
+  #[allow(clippy::too_many_arguments)]
+  pub fn copy_rect_to_rgb(
+    src: &Frame,
+    rect: (u32, u32, u32, u32),
+    tags: [i32; 4],
+    target_p3: bool,
+    bgr: bool,
+    same_format: bool,
+    src_x: bool,
+    dst: &mut [u8],
+    stride: usize,
+  ) -> CodecResult<()> {
+    let (x, y, w, h) = rect;
+    let end = (h as usize)
+      .checked_sub(1)
+      .and_then(|rows| rows.checked_mul(stride))
+      .and_then(|v| v.checked_add(w as usize * 4));
+    if end.is_none_or(|end| end > dst.len()) || stride > isize::MAX as usize {
+      return Err(CodecError::InvalidConfig(
+        "copy rect does not fit the destination".into(),
+      ));
+    }
+    let result = unsafe {
+      crate::ffi::accessors::ffframe_copy_rect_to_rgb(
+        src.as_ptr(),
+        x as i32,
+        y as i32,
+        w as i32,
+        h as i32,
+        tags[0],
+        tags[1],
+        tags[2],
+        tags[3],
+        target_p3 as i32,
+        bgr as i32,
+        same_format as i32,
+        src_x as i32,
+        dst.as_mut_ptr(),
+        stride as isize,
+      )
+    };
+    crate::ffi::check_error(result)?;
+    Ok(())
+  }
+
   /// Create a new scaler for the given conversion
   pub fn new(
     src_width: u32,
@@ -61,13 +110,6 @@ impl Scaler {
     dst_format: AVPixelFormat,
     algorithm: ScaleAlgorithm,
   ) -> CodecResult<Self> {
-    let conversion_flags = if src_format != dst_format
-      && matches!(dst_format, AVPixelFormat::Rgba | AVPixelFormat::Bgra)
-    {
-      crate::ffi::swscale::SWS_ACCURATE_RND | crate::ffi::swscale::SWS_FULL_CHR_H_INT
-    } else {
-      0
-    };
     let ptr = unsafe {
       sws_getContext(
         src_width as i32,
@@ -76,7 +118,7 @@ impl Scaler {
         dst_width as i32,
         dst_height as i32,
         dst_format.as_raw(),
-        algorithm.to_sws_flags() | conversion_flags,
+        algorithm.to_sws_flags(),
         std::ptr::null_mut(),
         std::ptr::null_mut(),
         std::ptr::null(),
@@ -285,5 +327,76 @@ mod tests {
     let converter = Scaler::new_converter(1920, 1080, AVPixelFormat::Rgba, AVPixelFormat::Yuv420p);
     assert!(converter.is_ok());
     assert!(converter.unwrap().is_converter_only());
+  }
+
+  /// BT.709 limited-range tags [primaries, trc, matrix, range].
+  const BT709_LIMITED: [i32; 4] = [
+    crate::ffi::AVColorPrimaries::Bt709 as i32,
+    crate::ffi::AVColorTransferCharacteristic::Bt709 as i32,
+    crate::ffi::AVColorSpace::Bt709 as i32,
+    crate::ffi::AVColorRange::Mpeg as i32,
+  ];
+
+  /// 4x2 I420 frame: row 0 is Y=235 (white), row 1 is Y=16 (black), U=V=128.
+  fn white_black_i420() -> Frame {
+    let mut frame = Frame::new_video(4, 2, AVPixelFormat::Yuv420p).unwrap();
+    let y_stride = frame.linesize(0) as usize;
+    let y = frame.plane_data_mut(0).unwrap();
+    y[..4].fill(235);
+    y[y_stride..y_stride + 4].fill(16);
+    for plane in 1..3 {
+      frame.plane_data_mut(plane).unwrap().fill(128);
+    }
+    frame
+  }
+
+  #[test]
+  fn copy_rect_to_rgb_limited_white_black() {
+    let frame = white_black_i420();
+    for bgr in [false, true] {
+      let mut dst = [0u8; 4 * 4 * 2];
+      Scaler::copy_rect_to_rgb(
+        &frame,
+        (0, 0, 4, 2),
+        BT709_LIMITED,
+        false,
+        bgr,
+        false,
+        false,
+        &mut dst,
+        16,
+      )
+      .unwrap();
+      for px in dst[..16].chunks(4) {
+        assert_eq!(px, [255, 255, 255, 255]);
+      }
+      for px in dst[16..].chunks(4) {
+        assert_eq!(px, [0, 0, 0, 255]);
+      }
+    }
+  }
+
+  #[test]
+  fn copy_rect_to_rgb_rejects_out_of_bounds() {
+    let frame = white_black_i420();
+    let copy = |rect, dst: &mut [u8]| {
+      Scaler::copy_rect_to_rgb(
+        &frame,
+        rect,
+        BT709_LIMITED,
+        false,
+        false,
+        false,
+        false,
+        dst,
+        8,
+      )
+    };
+    let mut dst = [0u8; 2 * 4 * 2];
+    // x + width runs past the 4-pixel-wide frame
+    assert!(copy((3, 0, 2, 2), &mut dst).is_err());
+    // the last row needs 8 bytes at offset 8, so 15 bytes is one too few
+    assert!(copy((0, 0, 2, 2), &mut dst[..15]).is_err());
+    assert!(copy((0, 0, 2, 2), &mut dst).is_ok());
   }
 }

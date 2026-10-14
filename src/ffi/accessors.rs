@@ -9,6 +9,25 @@ use super::types::*;
 use std::os::raw::{c_int, c_uint};
 
 unsafe extern "C" {
+  /// Convert a rect of `src` to RGBA (dst_bgr = 0) or BGRA. Tags are AVCOL_* values; -1 = use src's.
+  /// same_format: the target format is the VideoFrame's own; src_x: the VideoFrame is RGBX/BGRX.
+  pub fn ffframe_copy_rect_to_rgb(
+    src: *const AVFrame,
+    x: c_int,
+    y: c_int,
+    w: c_int,
+    h: c_int,
+    primaries: c_int,
+    trc: c_int,
+    matrix: c_int,
+    range: c_int,
+    target_p3: c_int,
+    dst_bgr: c_int,
+    same_format: c_int,
+    src_x: c_int,
+    dst: *mut u8,
+    dst_stride: isize,
+  ) -> c_int;
   // ========================================================================
   // AVCodecContext Setters
   // ========================================================================

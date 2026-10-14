@@ -440,16 +440,16 @@ export declare class DOMRectReadOnly {
   get width(): number
   /** Height */
   get height(): number
-  /** top edge */
+  /** Top edge: min(y, y + height), NaN if either is NaN */
   get top(): number
-  /** right edge */
+  /** Right edge: max(x, x + width), NaN if either is NaN */
   get right(): number
-  /** bottom edge */
+  /** Bottom edge: max(y, y + height), NaN if either is NaN */
   get bottom(): number
-  /** left edge */
+  /** Left edge: min(x, x + width), NaN if either is NaN */
   get left(): number
   /** Convert to JSON (W3C spec uses toJSON) */
-  toJSON(): DomRectJson
+  toJSON(): DOMRectJSON
 }
 
 /**
@@ -1432,7 +1432,8 @@ export interface DOMRectInit {
   height?: number
 }
 
-export interface DomRectJson {
+/** Result of DOMRectReadOnly.toJSON() */
+export interface DOMRectJSON {
   x: number
   y: number
   width: number
@@ -1669,6 +1670,9 @@ export interface PlaneLayout {
   stride: number
 }
 
+/** predefined RGB target color spaces. */
+export type PredefinedColorSpace = 'srgb' | 'display-p3'
+
 /** native image consumers subscribe to explicit close without changing the browser interface. */
 export declare function registerVideoFrameCloseObserver(frame: VideoFrame, callback: () => void): void
 
@@ -1810,8 +1814,10 @@ export interface VideoEncoderSupport {
   config: VideoEncoderConfig
 }
 
-/** Options for copyTo operation */
+/** options for copyTo operation. */
 export interface VideoFrameCopyToOptions {
+  /** target RGB color space. */
+  colorSpace?: PredefinedColorSpace
   /** Target pixel format (for format conversion) */
   format?: VideoPixelFormat
   /** Region to copy (not yet implemented) */

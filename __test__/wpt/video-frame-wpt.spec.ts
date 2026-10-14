@@ -2631,3 +2631,66 @@ test('VideoFrame: format conversion with valid aligned rect succeeds', async (t)
 
   frame.close()
 })
+
+// regression: explicit RGB output must convert the frame's source gamut.
+for (const inputFormat of ['RGBA', 'BGRA'] as const) {
+  for (const outputFormat of ['RGBA', 'BGRA'] as const) {
+    for (const [primaries, target, rgb] of [
+      ['smpte432', 'srgb', [0, 130, 230]],
+      ['bt709', 'display-p3', [63, 126, 216]],
+    ] as const) {
+      test(`VideoFrame: copyTo ${inputFormat} ${primaries} to ${outputFormat} ${target}`, async (t) => {
+        const pixel = inputFormat === 'RGBA' ? [32, 128, 223, 255] : [223, 128, 32, 255]
+        const bytes = Uint8Array.from([...pixel, ...pixel, ...pixel, ...pixel])
+        const frame = new VideoFrame(bytes, {
+          format: inputFormat,
+          codedWidth: 2,
+          codedHeight: 2,
+          timestamp: 0,
+          colorSpace: { primaries, transfer: 'iec61966-2-1', matrix: 'rgb', fullRange: true },
+        })
+        const clone = frame.clone()
+        frame.close()
+        try {
+          const options = {
+            format: outputFormat,
+            colorSpace: target,
+            rect: { x: 1, y: 0, width: 1, height: 2 },
+            layout: [{ offset: 4, stride: 8 }],
+          }
+          const output = new Uint8Array(clone.allocationSize(options))
+          const layout = await clone.copyTo(output, options)
+          const channels = outputFormat === 'RGBA' ? [...rgb] : [...rgb].reverse()
+          t.deepEqual(layout, options.layout)
+          t.deepEqual(Array.from(output.slice(4, 8)), [...channels, 255])
+          t.deepEqual(Array.from(output.slice(12, 16)), [...channels, 255])
+          const original = new Uint8Array(bytes.length)
+          await clone.copyTo(original)
+          t.deepEqual(original, bytes)
+          t.is(clone.colorSpace.primaries, primaries)
+        } finally {
+          clone.close()
+        }
+      })
+    }
+  }
+}
+
+test('VideoFrame: explicit RGB copy defaults to sRGB', async (t) => {
+  const frame = new VideoFrame(Uint8Array.of(32, 128, 223, 255), {
+    format: 'RGBA',
+    codedWidth: 1,
+    codedHeight: 1,
+    timestamp: 0,
+    colorSpace: { primaries: 'smpte432', transfer: 'iec61966-2-1', matrix: 'rgb', fullRange: true },
+  })
+  try {
+    const output = new Uint8Array(4)
+    await frame.copyTo(output, { format: 'RGBA' })
+    t.deepEqual([...output], [0, 130, 230, 255])
+    await frame.copyTo(output, { colorSpace: 'srgb' })
+    t.deepEqual([...output], [32, 128, 223, 255])
+  } finally {
+    frame.close()
+  }
+})
