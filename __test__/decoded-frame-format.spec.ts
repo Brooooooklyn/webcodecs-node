@@ -485,6 +485,36 @@ for (const [name, jpeg, format, layout, chrome] of JPEG_CASES) {
   })
 }
 
+// FFmpeg writes 4:2:2 JPEGs with 2x2/1x2/1x2 sampling factors and 4:4:4 with 1x2/1x2/1x2
+// (16x8, `ffmpeg -pix_fmt yuvj422p|yuvj444p`). FFmpeg reads them back as yuvj422p/yuvj444p,
+// but Chrome decodes a JPEG to YUV only for 1x1 chroma with 1x1, 2x1 or 2x2 luma: these are BGRX.
+// [name, JPEG, Chrome copyTo() bytes]
+const FFMPEG_JPEG_CASES: [string, string, string][] = [
+  [
+    '4:2:2 (2x2/1x2/1x2)',
+    '/9j//gAPTGF2YzYzLjEuMTAyAP/bAEMACAQEBAQEBQUFBQUFBgYGBgYGBgYGBgYGBgcHBwgICAcHBwYGBwcICAgICQkJCAgICAkJCgoKDAwLCw4ODhERFP/EAFkAAQAAAAAAAAAAAAAAAAAAAAUBAQEBAAAAAAAAAAAAAAAAAAYCBBAAAgMBAQAAAAAAAAAAAAAAAAQHI6ExQREAAgIDAQAAAAAAAAAAAAAABgAzI0GBUUP/wAARCAAIABADASIAAhIAAxIA/9oADAMBAAIRAxEAPwA5OP8AlWCqcf8AKsHE/BVPwk3M5bO5TBv6bcwEWxWcynQPy0//2Q==',
+    'wSkY/74qHv+2Kiv/rio3/6UrQ/+cKk//lypb/44pZ/+GKnP/fil+/3Ypi/9uKZj/ZSqk/1wpr/9VKrv/USvB/7xAF/+5QR3/sUEq/6pBNv+fQkH/mEJO/5BCWv+HQWb/gEJy/3dBff9xQIr/akCX/19Aof9YQa7/UEG6/01CwP+2Wxj/s1we/6tcKf+jXDb/mVxC/5FcT/+MXFv/g1tm/3tbc/9zW33/a1uK/2Nbl/9ZW6H/UVyu/0pcu/9GXcH/sXMZ/610H/+mdSv/nnU3/5R1Qv+MdU//hnVb/310Z/92dHP/bXN+/2Z0i/9edJj/VXOi/05zr/9Gc7z/Q3TC/6mNF/+mjh7/no4q/5eON/+OjkL/ho5P/3+OW/92jWf/b45z/2aNfv9gjIv/WIyY/06Nov9Gja//P427/zuOwf+mpRn/oqYf/5umLP+Tpjn/iaZD/4GmUP95pl3/caZn/2mmdP9gpn7/W6WL/1OlmP9IpaT/QaWx/zmmvP82p8L/n78a/5zAIP+UwSv/jcE4/4LBQ/97wU//dcFc/2zAaP9lwHT/XMB//1TAjP9NwJn/QsCj/zvAsP8zwL3/MMHD/5vXGf+X1x//kNgq/4fXNv9+2EL/dtlO/27ZW/9m2Gf/Xthz/1XXfv9Q14v/R9aX/z7Xov8216//Lti8/yvYwv8=',
+  ],
+  [
+    '4:4:4 (1x2/1x2/1x2)',
+    '/9j//gAPTGF2YzYzLjEuMTAyAP/bAEMACAQEBAQEBQUFBQUFBgYGBgYGBgYGBgYGBgcHBwgICAcHBwYGBwcICAgICQkJCAgICAkJCgoKDAwLCw4ODhERFP/EAFoAAQEAAAAAAAAAAAAAAAAAAAUGAQEBAQEAAAAAAAAAAAAAAAAGBQQHEAACAwEBAAAAAAAAAAAAAAAABAcjoTFBEQACAwEBAAAAAAAAAAAAAAAABQYjoTJC/8AAEQgACAAQAwESAAISAAMSAP/aAAwDAQACEQMRAD8AOTj/AJVhYp+FZ3M+rNDDv0HEMt5s0OIfIGnH/KsLFPwzO5n1ZoYd+jrCGW82aHEPk//Z',
+    'xSoV/74qHv+2KSz/rik5/6cqRP+eKVD/lSld/5ApZv+EKXT/fil9/3Ypi/9uKZj/Zyqk/14pr/9VKbz/UCnF/75BFP+5QR3/sEEr/6hBOP+hQEL/mEFP/5BBXP+JQWX/fkFz/3lBfP9vQYr/aEGX/2FAof9YQa7/UEG7/0lBxP+6WxX/s1we/6tcK/+jXDf/m1tD/5NcT/+KW13/hVtm/3lbdP9zW33/a1uK/2Nbl/9bWqL/U1uu/0pbvP9FW8X/tHQW/610H/+mdCz/nnQ5/5V0Q/+OdFD/hHRd/390Zv90c3X/bXN+/2Z0i/9edJj/VXOi/05zr/9EdLz/P3TF/62NFv+ojR//no0s/5eNOf+OjUP/ho1Q/3+NXf94jWb/bY11/2iMfv9ejYv/V42Y/06Nov9Gja//P428/ziNxf+nphb/oqYf/5mlLf+Rpjn/iaVF/4GlUf95pV7/cqVn/2eldf9ipX7/WaWN/1GmmP9IpaT/QaWx/zmlvf8ypcb/o8AX/5zAIP+UwC3/i8A6/4TARP98wFH/c8Bf/26/aP9jv3b/XMB//1TAjP9LwJn/RL+j/zzAsP8zv77/Lr/H/5zYFv+X1x//jtgs/4XXOP9+2EP/dthQ/27XXv9n12f/XNd1/1fXfv9O2Iv/RdeX/z7Xov8216//Lte9/yfXxv8=',
+  ],
+]
+
+for (const [name, jpeg, chrome] of FFMPEG_JPEG_CASES) {
+  test(`ImageDecoder: ${name} JPEG written by FFmpeg decodes to BGRX like Chrome`, async (t) => {
+    const image = await decodeImage(b64(jpeg), 'image/jpeg')
+    t.is(image.format, 'BGRX')
+    t.is(image.allocationSize(), 16 * 8 * 4)
+    const copy = await rawCopy(image)
+    t.deepEqual(copy.layout, [[0, 64]])
+    // FFmpeg and libjpeg-turbo (IDCT, YCbCr -> RGB) differ by up to 2 on these samples
+    t.true(maxDiff(copy.bytes, b64(chrome)) <= 2)
+    image.close()
+  })
+}
+
 // ============================================================================
 // VideoDecoder: one lossless 16x16 keyframe each, so the decoded samples are known
 // ============================================================================

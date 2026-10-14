@@ -1038,6 +1038,10 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
       AVCodecID::Png => png_alpha_hint(&data_bytes),
       _ => None,
     },
+    yuv: match codec_id {
+      AVCodecID::Mjpeg => jpeg_yuv_hint(&data_bytes),
+      _ => None,
+    },
   };
   let frames = frames
     .into_iter()
@@ -1165,6 +1169,50 @@ fn png_alpha_hint(data: &[u8]) -> Option<bool> {
     pos = pos.checked_add(12)?.checked_add(length)?;
   }
   None
+}
+
+/// Whether Chrome decodes a JPEG to YUV planes, from its SOF sampling factors: three
+/// components, both chroma components 1x1 and luma 1x1, 2x1 or 2x2 (4:4:4, 4:2:2,
+/// 4:2:0). Other factors decode to BGRX, also ones FFmpeg reads as the same chroma
+/// layout (FFmpeg writes 4:2:2 as 2x2/1x2/1x2 and 4:4:4 as 1x2/1x2/1x2).
+fn jpeg_yuv_hint(data: &[u8]) -> Option<bool> {
+  if data.get(..2)? != [0xFF, 0xD8] {
+    return None;
+  }
+  let mut pos = 2usize;
+  loop {
+    if *data.get(pos)? != 0xFF {
+      return None;
+    }
+    let marker = *data.get(pos + 1)?;
+    match marker {
+      // fill byte before a marker
+      0xFF => pos += 1,
+      // markers without a length: TEM, RSTn, SOI
+      0x01 | 0xD0..=0xD8 => pos += 2,
+      // scan data or end of image before any frame header
+      0xD9 | 0xDA => return None,
+      _ => {
+        let length = u16::from_be_bytes([*data.get(pos + 2)?, *data.get(pos + 3)?]) as usize;
+        // SOFn (C4 DHT, C8 JPG and CC DAC are not frame headers): precision, height,
+        // width, component count, then (id, HxV, table) for each component
+        if matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+          let header = data.get(pos + 4..pos + 2 + length)?;
+          let count = *header.get(5)? as usize;
+          let factors = (0..count)
+            .map(|i| header.get(7 + 3 * i).copied())
+            .collect::<Option<Vec<u8>>>()?;
+          return Some(
+            count == 3
+              && matches!(factors[0], 0x11 | 0x21 | 0x22)
+              && factors[1] == 0x11
+              && factors[2] == 0x11,
+          );
+        }
+        pos += 2 + length;
+      }
+    }
+  }
 }
 
 /// Parse the GIF application extension used for animation loop control.
@@ -1382,7 +1430,9 @@ fn normalize_frame_timing(frames: &mut [Frame], time_base: (i32, i32)) {
 
 #[cfg(test)]
 mod tests {
-  use super::{gif_repetition_count, normalize_frame_timing, png_alpha_hint, webp_alpha_hint};
+  use super::{
+    gif_repetition_count, jpeg_yuv_hint, normalize_frame_timing, png_alpha_hint, webp_alpha_hint,
+  };
   use crate::codec::Frame;
   use crate::ffi::types::AV_NOPTS_VALUE;
 
@@ -1458,6 +1508,50 @@ mod tests {
     // no IDAT yet (truncated) or not a PNG
     assert_eq!(png_alpha_hint(&png(3, &[])[..33]), None);
     assert_eq!(png_alpha_hint(b"GIF89a"), None);
+  }
+
+  #[test]
+  fn reads_jpeg_yuv_hints() {
+    // SOI, APP0 (skipped), SOF with the given (HxV) factors per component, SOS
+    let jpeg = |sof: u8, factors: &[u8]| {
+      let mut b = vec![
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00, 0xFF, 0xFF, sof,
+      ];
+      b.extend_from_slice(&((8 + 3 * factors.len()) as u16).to_be_bytes());
+      b.extend_from_slice(&[8, 0, 16, 0, 16, factors.len() as u8]);
+      for (i, f) in factors.iter().enumerate() {
+        b.extend_from_slice(&[i as u8 + 1, *f, 0]);
+      }
+      b.extend_from_slice(&[0xFF, 0xDA]);
+      b
+    };
+    for (factors, yuv) in [
+      (&[0x22, 0x11, 0x11][..], true),
+      (&[0x21, 0x11, 0x11], true),
+      (&[0x11, 0x11, 0x11], true),
+      (&[0x12, 0x11, 0x11], false), // 4:4:0
+      (&[0x41, 0x11, 0x11], false), // 4:1:1
+      (&[0x22, 0x12, 0x12], false), // FFmpeg's 4:2:2
+      (&[0x12, 0x12, 0x12], false), // FFmpeg's 4:4:4
+      (&[0x21, 0x21, 0x21], false),
+      (&[0x11], false),                   // grayscale
+      (&[0x11, 0x11, 0x11, 0x11], false), // CMYK
+    ] {
+      assert_eq!(
+        jpeg_yuv_hint(&jpeg(0xC0, factors)),
+        Some(yuv),
+        "{factors:02x?}"
+      );
+    }
+    assert_eq!(jpeg_yuv_hint(&jpeg(0xC2, &[0x22, 0x11, 0x11])), Some(true)); // progressive
+    // a DHT segment is not a frame header
+    let mut dht_first = jpeg(0xC0, &[0x22, 0x12, 0x12]);
+    dht_first.splice(2..2, [0xFF, 0xC4, 0x00, 0x02]);
+    assert_eq!(jpeg_yuv_hint(&dht_first), Some(false));
+    // truncated, no frame header, not a JPEG
+    assert_eq!(jpeg_yuv_hint(&jpeg(0xC0, &[0x22, 0x11, 0x11])[..15]), None);
+    assert_eq!(jpeg_yuv_hint(&[0xFF, 0xD8, 0xFF, 0xDA]), None);
+    assert_eq!(jpeg_yuv_hint(b"GIF89a"), None);
   }
 
   #[test]
