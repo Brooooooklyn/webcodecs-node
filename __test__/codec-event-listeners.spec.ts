@@ -232,6 +232,121 @@ test('listener storage: WeakMap replaced before the module loads can drop callba
   t.deepEqual(result, { handedStore: true, fired: 0, afterward: 4 })
 })
 
+test('listener storage: WeakMap methods replaced before the module loads can call back into the same codec or frame', (t) => {
+  // The store calls them while it links a new holder, the first time a callback is
+  // registered on an object. No lock may be held then: the codec's lock is not
+  // reentrant, so a call back into the same codec would wait forever.
+  const result = runChild<Record<string, string>>(`
+    ${PRELUDE}
+    const get = WeakMap.prototype.get;
+    const set = WeakMap.prototype.set;
+    let target = null;
+    let hook = null;
+    const runHook = (key) => {
+      if (hook && key === target) { const run = hook; hook = null; run(); }
+    };
+    WeakMap.prototype.get = function (key) { runHook(key); return get.call(this, key); };
+    WeakMap.prototype.set = function (key, value) { runHook(key); return set.call(this, key, value); };
+    const m = require('./index.js');
+    const out = {};
+    for (const kind of CODECS) {
+      for (const outer of ['addEventListener', 'ondequeue']) {
+        for (const inner of ['addEventListener', 'removeEventListener', 'ondequeue', 'dispatchEvent']) {
+          const codec = new m[kind]({ output: () => {}, error: () => {} });
+          const log = [];
+          target = codec;
+          hook = () => {
+            log.push('hook');
+            const listener = () => log.push('inner');
+            if (inner === 'addEventListener') codec.addEventListener('dequeue', listener);
+            if (inner === 'removeEventListener') {
+              codec.addEventListener('dequeue', listener);
+              codec.removeEventListener('dequeue', listener);
+            }
+            if (inner === 'ondequeue') codec.ondequeue = listener;
+            if (inner === 'dispatchEvent') {
+              codec.addEventListener('dequeue', listener);
+              codec.dispatchEvent('dequeue');
+            }
+          };
+          const listener = () => log.push('outer');
+          if (outer === 'addEventListener') codec.addEventListener('dequeue', listener);
+          else codec.ondequeue = listener;
+          hook = null;
+          codec.dispatchEvent('dequeue');
+          out[kind + ':' + outer + '>' + inner] = log.join(',');
+          codec.close();
+        }
+      }
+    }
+    const frame = new m.VideoFrame(new Uint8Array(64), { format: 'RGBA', codedWidth: 4, codedHeight: 4, timestamp: 0 });
+    const log = [];
+    target = frame;
+    hook = () => {
+      log.push('hook');
+      m.registerVideoFrameCloseObserver(frame, () => log.push('inner'));
+    };
+    m.registerVideoFrameCloseObserver(frame, () => log.push('outer'));
+    hook = null;
+    frame.close();
+    out['VideoFrame:register>register'] = log.join(',');
+    done(out);
+  `)
+  const expected: Record<string, string> = {}
+  for (const kind of ['VideoEncoder', 'VideoDecoder', 'AudioEncoder', 'AudioDecoder']) {
+    for (const outer of ['addEventListener', 'ondequeue']) {
+      // The holder is linked before the outer callback is registered, so callbacks
+      // registered from the hook come first.
+      expected[`${kind}:${outer}>addEventListener`] = 'hook,inner,outer'
+      expected[`${kind}:${outer}>removeEventListener`] = 'hook,outer'
+      expected[`${kind}:${outer}>dispatchEvent`] = 'hook,inner,inner,outer'
+    }
+    expected[`${kind}:addEventListener>ondequeue`] = 'hook,inner,outer'
+    // Assigning ondequeue again replaces the handler set from the hook.
+    expected[`${kind}:ondequeue>ondequeue`] = 'hook,outer'
+  }
+  expected['VideoFrame:register>register'] = 'hook,inner,outer'
+  t.deepEqual(result, expected)
+})
+
+test('listener storage: an async_hooks init hook can call back into the codec while its first listener is added', (t) => {
+  // Adding the first listener creates the codec's thread-safe function, which runs
+  // async_hooks init hooks. That must also happen with no lock held.
+  const result = runChild<Record<string, string>>(`
+    ${PRELUDE}
+    const asyncHooks = require('node:async_hooks');
+    const m = require('./index.js');
+    let hook = null;
+    asyncHooks.createHook({
+      init() { if (hook) { const run = hook; hook = null; run(); } },
+    }).enable();
+    const out = {};
+    for (const kind of CODECS) {
+      for (const outer of ['addEventListener', 'ondequeue']) {
+        const codec = new m[kind]({ output: () => {}, error: () => {} });
+        const log = [];
+        hook = () => {
+          log.push('hook');
+          codec.addEventListener('dequeue', () => log.push('inner'));
+        };
+        const listener = () => log.push('outer');
+        if (outer === 'addEventListener') codec.addEventListener('dequeue', listener);
+        else codec.ondequeue = listener;
+        hook = null;
+        codec.dispatchEvent('dequeue');
+        out[kind + ':' + outer] = log.join(',');
+        codec.close();
+      }
+    }
+    done(out);
+  `)
+  const expected: Record<string, string> = {}
+  for (const kind of ['VideoEncoder', 'VideoDecoder', 'AudioEncoder', 'AudioDecoder']) {
+    for (const outer of ['addEventListener', 'ondequeue']) expected[`${kind}:${outer}`] = 'hook,inner,outer'
+  }
+  t.deepEqual(result, expected)
+})
+
 test('module load: the listener store and the copyTo buffer checks are both set up when the module loads', (t) => {
   // napi-rs keeps one load hook per crate, so all load-time work must run from it.
   // Builtins replaced after the load must reach neither.

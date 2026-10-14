@@ -2615,15 +2615,7 @@ impl VideoEncoder {
     this: This,
     callback: Option<FunctionRef<Unknown<'static>, UnknownReturnValue>>,
   ) -> Result<()> {
-    let mut state = self
-      .event_state
-      .write()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-    if callback.is_some() {
-      state.ensure_dispatcher(env, this.object)?;
-    }
-    state.set_ondequeue(env, callback)?;
-    Ok(())
+    CodecEventState::set_ondequeue_handler(&self.event_state, env, this.object, callback)
   }
 
   /// Get the dequeue event handler (per WebCodecs spec)
@@ -3641,15 +3633,17 @@ impl VideoEncoder {
     callback: FunctionRef<Unknown<'static>, UnknownReturnValue>,
     options: Option<AddEventListenerOptions>,
   ) -> Result<()> {
-    let mut state = self
-      .event_state
-      .write()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    state.ensure_dispatcher(&env, this.object)?;
     let once = options.as_ref().and_then(|o| o.once).unwrap_or(false);
     let capture = options.as_ref().and_then(|o| o.capture).unwrap_or(false);
-    state.add_listener(&env, &event_type, callback, once, capture)
+    CodecEventState::add_event_listener(
+      &self.event_state,
+      &env,
+      this.object,
+      &event_type,
+      callback,
+      once,
+      capture,
+    )
   }
 
   /// Remove an event listener for the specified event type
@@ -3663,14 +3657,8 @@ impl VideoEncoder {
     callback: FunctionRef<Unknown<'static>, UnknownReturnValue>,
     options: Option<EventListenerOptions>,
   ) -> Result<()> {
-    let mut state = self
-      .event_state
-      .write()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
     let capture = options.as_ref().and_then(|o| o.capture).unwrap_or(false);
-    state.remove_listener(&env, &event_type, &callback, capture);
-    Ok(())
+    CodecEventState::remove_event_listener(&self.event_state, &env, &event_type, &callback, capture)
   }
 
   /// Dispatch an event to all registered listeners
