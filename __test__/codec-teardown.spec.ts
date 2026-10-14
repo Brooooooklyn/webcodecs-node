@@ -128,6 +128,8 @@ interface CodecCase {
   make(record: Record): TeardownCodec
   // Queues work synchronously.
   queue(codec: TeardownCodec): void
+  // Queues one work item synchronously.
+  queueOne(codec: TeardownCodec): void
 }
 
 async function codecCases(): Promise<CodecCase[]> {
@@ -148,6 +150,11 @@ async function codecCases(): Promise<CodecCase[]> {
           frame.close()
         }
       },
+      queueOne: (codec) => {
+        const frame = i420Frame(640, 480, 0)
+        ;(codec as VideoEncoder).encode(frame, { keyFrame: true })
+        frame.close()
+      },
     },
     {
       name: 'VideoDecoder',
@@ -165,6 +172,7 @@ async function codecCases(): Promise<CodecCase[]> {
       queue: (codec) => {
         for (const chunk of video.chunks) (codec as VideoDecoder).decode(chunk)
       },
+      queueOne: (codec) => (codec as VideoDecoder).decode(video.chunks[0]),
     },
     {
       name: 'AudioEncoder',
@@ -179,6 +187,11 @@ async function codecCases(): Promise<CodecCase[]> {
           ;(codec as AudioEncoder).encode(data)
           data.close()
         }
+      },
+      queueOne: (codec) => {
+        const data = audioData(0)
+        ;(codec as AudioEncoder).encode(data)
+        data.close()
       },
     },
     {
@@ -197,6 +210,7 @@ async function codecCases(): Promise<CodecCase[]> {
       queue: (codec) => {
         for (const chunk of audio.chunks) (codec as AudioDecoder).decode(chunk)
       },
+      queueOne: (codec) => (codec as AudioDecoder).decode(audio.chunks[0]),
     },
   ]
 }
@@ -286,6 +300,34 @@ for (const teardown of ['close', 'reset'] as const) {
       await delay(100)
 
       t.deepEqual(log.after(), ['dequeue@after'], codecCase.name)
+      if (teardown === 'reset') codec.close()
+    }
+  })
+
+  // The event being dispatched is already visible, so tearing down from its
+  // handler must not replace it. The queue is empty by then, so no event follows.
+  // Chrome's encoders match; its decoders fire one more dequeue event on every
+  // close() and reset() from the configured state, even an idle one, which the
+  // spec only asks for when decodeQueueSize > 0.
+  test(`${teardown}() from the ondequeue handler fires no second event`, async (t) => {
+    for (const codecCase of await codecCases()) {
+      const events: string[] = []
+      const errors: string[] = []
+      const codec = codecCase.make((entry) => {
+        if (entry !== 'output') errors.push(entry)
+      })
+      codec.ondequeue = () => {
+        events.push(`dequeue:${codec.state}`)
+        if (events.length === 1) codec[teardown]()
+      }
+      codecCase.queueOne(codec)
+      await waitFor(() => events.length > 0, `${codecCase.name}: dequeue event`)
+      // A second event would be queued by the teardown; give it time to arrive.
+      await delay(100)
+
+      t.deepEqual(events, ['dequeue:configured'], codecCase.name)
+      t.deepEqual(errors, [], codecCase.name)
+      t.is(codec.state, teardown === 'close' ? 'closed' : 'unconfigured', codecCase.name)
       if (teardown === 'reset') codec.close()
     }
   })
