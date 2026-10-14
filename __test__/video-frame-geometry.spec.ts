@@ -445,6 +445,42 @@ test('VideoDecoder: invalid displayAspectWidth/displayAspectHeight are a TypeErr
   }
 })
 
+test('VideoDecoder: an invalid display aspect stops the config read like Chrome', async (t) => {
+  // WebIDL stops a dictionary conversion at the first failure. Chrome 155 reads displayAspectHeight
+  // before displayAspectWidth and runs no later getter, so a later exception cannot replace the
+  // TypeError, and isConfigSupported() still rejects instead of throwing.
+  // [name, invalid aspect members, member read later whose getter throws]
+  const cases: Array<[string, Partial<VideoDecoderConfig>, string]> = [
+    ['H -1', { displayAspectHeight: -1 }, 'displayAspectWidth'],
+    ['W -1', { displayAspectWidth: -1 }, 'flip'],
+    ['W -1', { displayAspectWidth: -1 }, 'hardwareAcceleration'],
+    ['W -1', { displayAspectWidth: -1 }, 'optimizeForLatency'],
+    ['W -1', { displayAspectWidth: -1 }, 'rotation'],
+    ['-1:-1', { displayAspectWidth: -1, displayAspectHeight: -1 }, 'rotation'],
+  ]
+  for (const [name, aspect, later] of cases) {
+    const label = `${name}, ${later} getter throws`
+    let calls = 0
+    const config = () =>
+      Object.defineProperty({ codec: 'vp8', ...aspect }, later, {
+        enumerable: true,
+        get() {
+          calls++
+          throw new Error(`${later} getter`)
+        },
+      }) as VideoDecoderConfig
+    const decoder = new VideoDecoder({ output: (frame) => frame.close(), error: (error) => t.fail(error.message) })
+    t.throws(() => decoder.configure(config()), { instanceOf: TypeError }, `configure ${label}`)
+    decoder.close()
+    let support: Promise<unknown> | undefined
+    t.notThrows(() => {
+      support = VideoDecoder.isConfigSupported(config())
+    }, `isConfigSupported ${label} rejects instead of throwing`)
+    await t.throwsAsync(support!, { instanceOf: TypeError }, `isConfigSupported ${label}`)
+    t.is(calls, 0, `${label}: the getter does not run`)
+  }
+})
+
 test('VideoDecoder: fractional displayAspectWidth/displayAspectHeight truncate like Chrome', async (t) => {
   const chunks = await encodeVp8(320, 240)
   // [width, height, Chrome 155 support.config members, output display size]
