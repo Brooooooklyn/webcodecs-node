@@ -6,6 +6,8 @@
  * Skipped on aarch64-windows where @napi-rs/canvas is not available.
  */
 
+import { execFileSync } from 'node:child_process'
+
 import test from 'ava'
 
 import {
@@ -432,15 +434,21 @@ test('VideoFrame: float image alpha discard and geometry preserve the source res
 })
 
 test('VideoFrame: float image rejects inconsistent dimensions and keeps standard buffer formats', (t) => {
-  t.throws(() => createVideoFrameFromRGBA16Float(new Uint16Array(3), { codedWidth: 1, codedHeight: 1, timestamp: 0 }))
-  t.throws(() => createVideoFrameFromRGBA16Float(new Uint16Array(4), { codedWidth: 0, codedHeight: 1, timestamp: 0 }))
-  t.throws(() =>
-    createVideoFrameFromRGBA16Float(new Uint16Array(4), {
-      codedWidth: 1,
-      codedHeight: 1,
-      timestamp: 0,
-      displayWidth: 0,
-    }),
+  t.throws(() => createVideoFrameFromRGBA16Float(new Uint16Array(3), { codedWidth: 1, codedHeight: 1, timestamp: 0 }), {
+    instanceOf: TypeError,
+  })
+  t.throws(() => createVideoFrameFromRGBA16Float(new Uint16Array(4), { codedWidth: 0, codedHeight: 1, timestamp: 0 }), {
+    instanceOf: TypeError,
+  })
+  t.throws(
+    () =>
+      createVideoFrameFromRGBA16Float(new Uint16Array(4), {
+        codedWidth: 1,
+        codedHeight: 1,
+        timestamp: 0,
+        displayWidth: 0,
+      }),
+    { instanceOf: TypeError },
   )
   const frame = new VideoFrame(new Uint8Array([11, 22, 33, 44]), {
     format: 'RGBA',
@@ -493,5 +501,245 @@ test('VideoFrame: opaque float encode rejects asynchronously and closes without 
   } finally {
     frame.close()
     if (encoder.state !== 'closed') encoder.close()
+  }
+})
+
+// ============================================================================
+// RGBA16Float module exports: native lifetimes and argument checks
+// ============================================================================
+
+// Runs `script` in a child Node process, so a native crash or abort fails the
+// test instead of killing the ava worker. The script loads ./index.js itself
+// and writes its result with fs.writeSync before exiting.
+function runChild(script: string, env: NodeJS.ProcessEnv = process.env): string {
+  return execFileSync(process.execPath, ['--expose-gc', '-e', script], {
+    cwd: process.cwd(),
+    env,
+    timeout: 30_000,
+    encoding: 'utf8',
+  })
+}
+
+test('VideoEncoder: opaque float error comes first, then one dequeue per queued encode, and the encoder is collected', (t) => {
+  const script = `
+    const fs = require('node:fs');
+    const { VideoEncoder, createVideoFrameFromRGBA16Float } = require('./index.js');
+    const tick = () => new Promise((resolve) => setImmediate(resolve));
+    const log = [];
+    let weak;
+    let settle;
+    const settled = new Promise((resolve) => { settle = resolve; });
+    const record = (entry) => { log.push(entry); if (log.length === 4) settle(); };
+    // Only reports a failure: a correct run settles as soon as the four callbacks ran.
+    const guard = setTimeout(settle, 10000);
+    (() => {
+      const encoder = new VideoEncoder({
+        output: () => record('output'),
+        // Reads the encoder through the WeakRef so the callback does not keep it alive.
+        error: (error) => record('error:' + error.name + ':' + weak.deref().encodeQueueSize),
+      });
+      weak = new WeakRef(encoder);
+      encoder.ondequeue = () => record('dequeue');
+      encoder.configure({ codec: 'vp8', width: 16, height: 16, bitrate: 100000 });
+      const frames = [0, 1, 2].map((timestamp) =>
+        createVideoFrameFromRGBA16Float(new Uint16Array(16 * 16 * 4).fill(0x3c00), {
+          codedWidth: 16, codedHeight: 16, timestamp,
+        }),
+      );
+      // encode() hands work to the worker from a microtask, so all three are queued first.
+      for (const frame of frames) { encoder.encode(frame); frame.close(); }
+    })();
+    settled.then(async () => {
+      clearTimeout(guard);
+      let collected = false;
+      for (let i = 0; i < 100 && !collected; i++) {
+        await tick();
+        globalThis.gc();
+        await tick();
+        collected = weak.deref() === undefined;
+      }
+      fs.writeSync(1, JSON.stringify({ log, collected }) + '\\n');
+      process.exit(0);
+    });
+  `
+  const result = JSON.parse(runChild(script))
+  t.deepEqual(result.log, ['error:OperationError:0', 'dequeue', 'dequeue', 'dequeue'])
+  t.true(result.collected, 'the closed encoder must be collectable')
+})
+
+test('VideoEncoder: opaque float error releases the hardware encoder slot while the encoder is alive', (t) => {
+  // The slot counter is only visible in the debug log. The marker is written to
+  // the same fd as the native log lines, so lines before it were logged before
+  // the error callback ran, while the script still references the encoder.
+  const script = `
+    const fs = require('node:fs');
+    const { VideoEncoder, createVideoFrameFromRGBA16Float } = require('./index.js');
+    // Keeps the process alive until the error callback runs; only fires on failure.
+    setTimeout(() => process.exit(0), 10000);
+    const encoder = new VideoEncoder({
+      output: () => {},
+      error: (error) => {
+        fs.writeSync(1, 'MARKER:' + error.name + '\\n');
+        process.exit(0);
+      },
+    });
+    const frame = createVideoFrameFromRGBA16Float(new Uint16Array(640 * 480 * 4), {
+      codedWidth: 640, codedHeight: 480, timestamp: 0,
+    });
+    try {
+      encoder.configure({ codec: 'avc1.42001f', width: 640, height: 480, hardwareAcceleration: 'prefer-hardware' });
+      encoder.encode(frame);
+    } catch (error) {
+      fs.writeSync(1, 'THREW:' + error.name + '\\n');
+      process.exit(0);
+    }
+    frame.close();
+  `
+  const output = runChild(script, { ...process.env, WEBCODECS_LOG: 'webcodecs=debug' })
+  const [beforeError, marker = ''] = output.split('MARKER:')
+  const slots = [...beforeError.matchAll(/hardware encoder slot \((\d+)\/\d+\)/g)].map((match) => Number(match[1]))
+  if (!marker.startsWith('OperationError') || !beforeError.includes('Acquired hardware encoder slot')) {
+    t.log('No hardware encoder slot was taken on this machine; nothing to check')
+    t.pass()
+    return
+  }
+  t.is(slots.at(-1), 0, 'the slot must be released before the error callback runs')
+})
+
+test('createVideoFrameFromRGBA16Float: data detached by an init getter throws TypeError', (t) => {
+  const data = new Uint16Array(4 * 4 * 4).fill(0x3c00)
+  const init = {
+    codedWidth: 4,
+    codedHeight: 4,
+    get timestamp() {
+      structuredClone(data.buffer, { transfer: [data.buffer] })
+      return 0
+    },
+  }
+  t.throws(() => createVideoFrameFromRGBA16Float(data, init), { instanceOf: TypeError })
+  t.is(data.length, 0)
+})
+
+test('createVideoFrameFromRGBA16Float: validation errors are TypeErrors and rotation/flip are accepted', (t) => {
+  type Init = Parameters<typeof createVideoFrameFromRGBA16Float>[1]
+  const data = () => new Uint16Array(2 * 2 * 4)
+  const invalid: Array<Record<string, unknown>> = [
+    { codedWidth: 2, codedHeight: 2 },
+    { codedHeight: 2, timestamp: 0 },
+    { codedWidth: 2, codedHeight: 2, timestamp: 0, format: 'RGBA' },
+    { codedWidth: 2, codedHeight: 2, timestamp: 0, alpha: 'bogus' },
+    { codedWidth: 2, codedHeight: 2, timestamp: 0, visibleRect: { x: 1, y: 0, width: 2, height: 1 } },
+  ]
+  for (const init of invalid) {
+    t.throws(() => createVideoFrameFromRGBA16Float(data(), init as unknown as Init), { instanceOf: TypeError })
+  }
+  const frame = createVideoFrameFromRGBA16Float(data(), {
+    codedWidth: 2,
+    codedHeight: 2,
+    timestamp: 0,
+    rotation: 90,
+    flip: true,
+  })
+  try {
+    t.is(frame.rotation, 90)
+    t.true(frame.flip)
+  } finally {
+    frame.close()
+  }
+})
+
+test('RGBA16Float exports: another class instance throws TypeError instead of crashing', (t) => {
+  const script = `
+    const fs = require('node:fs');
+    const m = require('./index.js');
+    const others = {
+      colorSpace: () => new m.VideoColorSpace({ primaries: 'bt709' }),
+      rect: () => new m.DOMRectReadOnly(1, 2, 3, 4),
+      chunk: () => new m.EncodedVideoChunk({ type: 'key', timestamp: 0, data: new Uint8Array(16) }),
+    };
+    const calls = {
+      copy: (value) => m.copyVideoFrameRGBA16Float(value),
+      observe: (value) => m.registerVideoFrameCloseObserver(value, () => {}),
+    };
+    const results = [];
+    for (const [call, run] of Object.entries(calls)) {
+      for (const [kind, make] of Object.entries(others)) {
+        try { run(make()); results.push(call + ':' + kind + ':returned'); }
+        catch (error) { results.push(call + ':' + kind + ':' + (error instanceof TypeError ? 'TypeError' : error.name)); }
+      }
+    }
+    fs.writeSync(1, JSON.stringify(results) + '\\n');
+  `
+  t.deepEqual(JSON.parse(runChild(script)), [
+    'copy:colorSpace:TypeError',
+    'copy:rect:TypeError',
+    'copy:chunk:TypeError',
+    'observe:colorSpace:TypeError',
+    'observe:rect:TypeError',
+    'observe:chunk:TypeError',
+  ])
+})
+
+test('registerVideoFrameCloseObserver: JS that closes or registers frames during registration completes', (t) => {
+  // Registration stores the callback in a Map on the frame. Patching
+  // Map.prototype.set runs JS in the middle of that step.
+  const script = `
+    const fs = require('node:fs');
+    const m = require('./index.js');
+    const make = () => m.createVideoFrameFromRGBA16Float(new Uint16Array(4), { codedWidth: 1, codedHeight: 1, timestamp: 0 });
+    const set = Map.prototype.set;
+    const results = [];
+    for (const mode of ['close-other', 'register-other', 'close-self']) {
+      const other = make();
+      const target = make();
+      let otherFired = 0;
+      let targetFired = 0;
+      let reentered = false;
+      let outcome = 'returned';
+      Map.prototype.set = function (key, value) {
+        if (!reentered && typeof value === 'function') {
+          reentered = true;
+          if (mode === 'close-other') other.close();
+          if (mode === 'register-other') m.registerVideoFrameCloseObserver(other, () => { otherFired++; });
+          if (mode === 'close-self') target.close();
+        }
+        return set.call(this, key, value);
+      };
+      try {
+        m.registerVideoFrameCloseObserver(target, () => { targetFired++; });
+      } catch (error) {
+        outcome = error.name;
+      } finally {
+        Map.prototype.set = set;
+      }
+      target.close();
+      other.close();
+      results.push([mode, outcome, targetFired, otherFired].join(':'));
+    }
+    fs.writeSync(1, JSON.stringify(results) + '\\n');
+  `
+  t.deepEqual(JSON.parse(runChild(script)), [
+    'close-other:returned:1:0',
+    'register-other:returned:1:1',
+    'close-self:InvalidStateError:0:0',
+  ])
+})
+
+test('registerVideoFrameCloseObserver: a frozen frame throws TypeError and registers nothing', (t) => {
+  const frame = createVideoFrameFromRGBA16Float(new Uint16Array(4), { codedWidth: 1, codedHeight: 1, timestamp: 0 })
+  let fired = 0
+  try {
+    Object.freeze(frame)
+    t.throws(
+      () =>
+        registerVideoFrameCloseObserver(frame, () => {
+          fired++
+        }),
+      { instanceOf: TypeError },
+    )
+    frame.close()
+    t.is(fired, 0)
+  } finally {
+    frame.close()
   }
 })
