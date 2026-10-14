@@ -417,6 +417,427 @@ test('options are read once each, in lexicographic order', async (t) => {
   frame.close()
 })
 
+// ============================================================================
+// layout: sequence<PlaneLayout> (results from Chrome 155)
+// ============================================================================
+
+const L = (offset: number, stride: number) => ({ offset, stride })
+const I420_LAYOUT = () => [L(0, 4), L(8, 2), L(10, 2)]
+// A valid I420 4x2 layout in another order; it needs 36 bytes.
+const I420_LAYOUT_SHUFFLED = () => [L(16, 8), L(4, 2), L(32, 4)]
+const I420_SHUFFLED_BYTES = [
+  0, 0, 0, 0, 9, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 0, 0, 0, 0, 5, 6, 7, 8, 0, 0, 0, 0, 11, 12, 0, 0, 0, 0,
+  0, 0,
+]
+function* yieldShuffled() {
+  yield* I420_LAYOUT_SHUFFLED()
+}
+
+test('layout takes any iterable, not only an Array', async (t) => {
+  const frame = makeI420_4x2()
+  const cases: [string, () => unknown][] = [
+    ['Set', () => new Set(I420_LAYOUT())],
+    [
+      'generator',
+      () =>
+        (function* () {
+          yield* I420_LAYOUT()
+        })(),
+    ],
+    [
+      'arguments',
+      () =>
+        Reflect.apply(
+          function () {
+            return arguments
+          },
+          undefined,
+          I420_LAYOUT(),
+        ),
+    ],
+    [
+      'function with @@iterator',
+      () =>
+        Object.assign(() => {}, {
+          *[Symbol.iterator]() {
+            yield* I420_LAYOUT()
+          },
+        }),
+    ],
+    ['Proxy of an Array', () => new Proxy(I420_LAYOUT(), {})],
+  ]
+  for (const [label, layout] of cases) {
+    t.is(allocationSize(frame, { layout: layout() }), 12, label)
+    const data = new Uint8Array(12)
+    const settled = await settleCopyTo(frame, data, { layout: layout() })
+    t.deepEqual(settled.value, I420_LAYOUT(), label)
+    t.deepEqual(Array.from(data), Array.from(I420_DATA), label)
+  }
+  // The iteration order is the plane order.
+  t.is(allocationSize(frame, { layout: new Set(I420_LAYOUT_SHUFFLED()) }), 36)
+  const data = new Uint8Array(40)
+  const settled = await settleCopyTo(frame, data, { layout: new Set(I420_LAYOUT_SHUFFLED()) })
+  t.deepEqual(settled.value, I420_LAYOUT_SHUFFLED())
+  t.deepEqual(Array.from(data), I420_SHUFFLED_BYTES)
+  // An iterator that yields 4 entries, or none, gives the wrong plane count.
+  for (const [label, layout] of [
+    ['4 entries', () => new Set([...I420_LAYOUT(), L(20, 2)])],
+    ['empty Set', () => new Set()],
+  ] as const) {
+    throwsTypeError(t, `allocationSize ${label}`, () => allocationSize(frame, { layout: layout() }))
+    await rejectsTypeError(t, `copyTo ${label}`, frame, new Uint8Array(64), { layout: layout() })
+  }
+  frame.close()
+})
+
+test('an Array layout is read by index, without its @@iterator, like Chrome', async (t) => {
+  const frame = makeI420_4x2()
+  const check = async (label: string, layout: () => unknown) => {
+    t.is(allocationSize(frame, { layout: layout() }), 12, label)
+    t.deepEqual((await settleCopyTo(frame, new Uint8Array(64), { layout: layout() })).value, I420_LAYOUT(), label)
+  }
+  // Chrome 155 does not use an Array's own @@iterator, whatever it is.
+  for (const [label, iterator] of [
+    ['a generator', yieldShuffled],
+    ['undefined', undefined],
+    ['5', 5],
+  ] as const) {
+    await check(`own @@iterator ${label}`, () =>
+      Object.defineProperty(I420_LAYOUT(), Symbol.iterator, { value: iterator }),
+    )
+  }
+  const invalidItems = () => Object.defineProperty([5, 5, 5], Symbol.iterator, { value: yieldShuffled })
+  throwsTypeError(t, 'allocationSize: the items are read, not the iterator', () =>
+    allocationSize(frame, { layout: invalidItems() }),
+  )
+  await rejectsTypeError(t, 'copyTo: the items are read, not the iterator', frame, new Uint8Array(64), {
+    layout: invalidItems(),
+  })
+
+  // Nor a patched Array.prototype[@@iterator] or array iterator next(). Patched only while the
+  // calls run synchronously.
+  const iteratorDescriptor = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator)!
+  const arrayIteratorPrototype = Object.getPrototypeOf([][Symbol.iterator]()) as { next: () => unknown }
+  const nextDescriptor = Object.getOwnPropertyDescriptor(arrayIteratorPrototype, 'next')!
+  let nextCalls = 0
+  let size = 0
+  let pending!: Promise<Settled>
+  const layout = [L(0, 4), L(8, 2), L(10, 2)]
+  Object.defineProperty(Array.prototype, Symbol.iterator, { value: yieldShuffled, configurable: true, writable: true })
+  Object.defineProperty(arrayIteratorPrototype, 'next', {
+    value(this: unknown) {
+      nextCalls++
+      return (nextDescriptor.value as () => unknown).call(this)
+    },
+    configurable: true,
+    writable: true,
+  })
+  try {
+    size = frame.allocationSize({ layout })
+    pending = settleCopyTo(frame, new Uint8Array(64), { layout })
+  } finally {
+    Object.defineProperty(Array.prototype, Symbol.iterator, iteratorDescriptor)
+    Object.defineProperty(arrayIteratorPrototype, 'next', nextDescriptor)
+  }
+  t.is(size, 12)
+  t.deepEqual((await pending).value, I420_LAYOUT())
+  t.is(nextCalls, 0)
+
+  // `length` is read again before each entry: growing or shrinking the array while an entry
+  // converts changes the plane count.
+  for (const [label, change] of [
+    ['grown', (array: unknown[]) => array.push(L(20, 2))],
+    ['shrunk', (array: unknown[]) => (array.length = 1)],
+  ] as const) {
+    const layout = () => {
+      const array: unknown[] = I420_LAYOUT()
+      array[0] = {
+        offset: 0,
+        get stride() {
+          change(array)
+          return 4
+        },
+      }
+      return array
+    }
+    throwsTypeError(t, `allocationSize ${label}`, () => allocationSize(frame, { layout: layout() }))
+    await rejectsTypeError(t, `copyTo ${label}`, frame, new Uint8Array(64), { layout: layout() })
+  }
+  frame.close()
+})
+
+test('layout iterator errors: a thrown value passes through, a broken protocol is a TypeError', async (t) => {
+  const boom = new Error('boom')
+  const iterable = (next: () => unknown) => ({ [Symbol.iterator]: () => ({ next }) })
+  const throwing: [string, () => unknown][] = [
+    [
+      '@@iterator getter',
+      () => ({
+        get [Symbol.iterator]() {
+          throw boom
+        },
+      }),
+    ],
+    [
+      '@@iterator()',
+      () => ({
+        [Symbol.iterator]() {
+          throw boom
+        },
+      }),
+    ],
+    [
+      'next getter',
+      () => ({
+        [Symbol.iterator]: () => ({
+          get next() {
+            throw boom
+          },
+        }),
+      }),
+    ],
+    [
+      'next()',
+      () =>
+        iterable(() => {
+          throw boom
+        }),
+    ],
+    [
+      'done getter',
+      () =>
+        iterable(() => ({
+          value: L(0, 4),
+          get done() {
+            throw boom
+          },
+        })),
+    ],
+    [
+      'value getter',
+      () =>
+        iterable(() => ({
+          done: false,
+          get value() {
+            throw boom
+          },
+        })),
+    ],
+  ]
+  const open = makeI420_4x2()
+  const closed = makeI420_4x2()
+  closed.close()
+  for (const frame of [open, closed]) {
+    const which = frame === open ? 'open' : 'closed'
+    for (const [label, layout] of throwing) {
+      const settled = await settleCopyTo(frame, new Uint8Array(64), { layout: layout() })
+      t.false(settled.sync, `${which} ${label}: copyTo must not throw`)
+      t.is(settled.error, boom, `${which} ${label}: copyTo rejects with the thrown value`)
+      t.is(
+        t.throws(() => allocationSize(frame, { layout: layout() })),
+        boom,
+        `${which} ${label}: allocationSize throws it`,
+      )
+    }
+  }
+
+  const typeErrors: [string, () => unknown][] = [
+    ['{length: 3} without @@iterator', () => ({ length: 3, 0: L(0, 4), 1: L(8, 2), 2: L(10, 2) })],
+    ["'abc'", () => 'abc'],
+    ["new String('abc')", () => new String('abc')],
+    ['Uint32Array', () => new Uint32Array([0, 4])],
+    ['Map', () => new Map([[1, 2]])],
+    ['@@iterator null', () => ({ [Symbol.iterator]: null })],
+    ['@@iterator 5', () => ({ [Symbol.iterator]: 5 })],
+    ['@@iterator() returns 5', () => ({ [Symbol.iterator]: () => 5 })],
+    ['next 5', () => ({ [Symbol.iterator]: () => ({ next: 5 }) })],
+    ['next() returns 5', () => iterable(() => 5)],
+    ['done: 1 ends the sequence at once', () => iterable(() => ({ done: 1, value: L(0, 4) }))],
+    [
+      'an undefined entry',
+      () =>
+        (function* () {
+          yield L(0, 4)
+          yield undefined
+          yield L(10, 2)
+        })(),
+    ],
+  ]
+  for (const [label, layout] of typeErrors) {
+    await rejectsTypeError(t, `copyTo ${label}`, open, new Uint8Array(64), { layout: layout() })
+    throwsTypeError(t, `allocationSize ${label}`, () => allocationSize(open, { layout: layout() }))
+  }
+  // A valid iterable still converts before the closed check.
+  await rejectsDOMException(t, 'InvalidStateError', 'closed Set', closed, new Uint8Array(64), {
+    layout: new Set(I420_LAYOUT()),
+  })
+  open.close()
+})
+
+test('layout iteration order matches Chrome', async (t) => {
+  const log: string[] = []
+  const logged = <T extends object>(prefix: string, target: T) =>
+    new Proxy(target, {
+      get(object, key, receiver) {
+        log.push(prefix + String(key))
+        return Reflect.get(object, key, receiver)
+      },
+    })
+  // An iterable that logs each protocol step.
+  const loggingIterable = (items: unknown[]) => ({
+    [Symbol.iterator]() {
+      log.push('@@iterator()')
+      let index = 0
+      return {
+        next(...args: unknown[]) {
+          log.push(`next(${args.length})`)
+          const done = index >= items.length
+          const value = done ? undefined : items[index++]
+          return {
+            get done() {
+              log.push('done')
+              return done
+            },
+            get value() {
+              log.push('value')
+              return value
+            },
+          }
+        },
+        return() {
+          log.push('return()')
+          return {}
+        },
+      }
+    },
+  })
+  const loggedLayout = () => [logged('[0].', L(0, 4)), logged('[1].', L(8, 2)), logged('[2].', L(10, 2))]
+  const frame = makeI420_4x2()
+  const expectLog = async (
+    label: string,
+    layout: () => unknown,
+    expected: string[],
+    outcome: 'resolve' | 'TypeError' | 'boom',
+  ) => {
+    for (const method of ['allocationSize', 'copyTo'] as const) {
+      log.length = 0
+      if (method === 'allocationSize') {
+        if (outcome === 'resolve') t.is(allocationSize(frame, { layout: layout() }), 12, `${label} ${method}`)
+        else t.throws(() => allocationSize(frame, { layout: layout() }), undefined, `${label} ${method}`)
+      } else {
+        const settled = await settleCopyTo(frame, new Uint8Array(64), { layout: layout() })
+        if (outcome === 'resolve') t.true(settled.resolved, `${label} ${method}`)
+        else if (outcome === 'TypeError') isTypeError(t, settled.error, `${label} ${method}`)
+        else t.is((settled.error as Error)?.message, 'boom', `${label} ${method}`)
+      }
+      t.deepEqual(log, expected, `${label} ${method}`)
+    }
+  }
+  // Each step reads `value` before `done`, and the entry converts before the next step.
+  await expectLog(
+    'iterable',
+    () => loggingIterable(loggedLayout()),
+    [
+      '@@iterator()',
+      'next(0)',
+      'value',
+      'done',
+      '[0].offset',
+      '[0].stride',
+      'next(0)',
+      'value',
+      'done',
+      '[1].offset',
+      '[1].stride',
+      'next(0)',
+      'value',
+      'done',
+      '[2].offset',
+      '[2].stride',
+      'next(0)',
+      'value',
+      'done',
+    ],
+    'resolve',
+  )
+  // A failed entry stops the iteration without calling return().
+  await expectLog(
+    'invalid entry',
+    () => loggingIterable([5, ...loggedLayout().slice(1)]),
+    ['@@iterator()', 'next(0)', 'value', 'done'],
+    'TypeError',
+  )
+  await expectLog(
+    'throwing entry',
+    () =>
+      loggingIterable([
+        logged('[0].', L(0, 4)),
+        {
+          offset: 8,
+          get stride() {
+            log.push('[1].stride')
+            throw new Error('boom')
+          },
+        },
+        L(10, 2),
+      ]),
+    ['@@iterator()', 'next(0)', 'value', 'done', '[0].offset', '[0].stride', 'next(0)', 'value', 'done', '[1].stride'],
+    'boom',
+  )
+  // A Proxy is not an Array: it goes through @@iterator.
+  await expectLog(
+    'Proxy of an Array',
+    () => logged('', I420_LAYOUT()),
+    ['Symbol(Symbol.iterator)', 'length', '0', 'length', '1', 'length', '2', 'length'],
+    'resolve',
+  )
+  // An Array reads each index right before converting that entry.
+  await expectLog(
+    'Array with index getters',
+    () => {
+      const items = loggedLayout()
+      const array: unknown[] = []
+      items.forEach((item, index) =>
+        Object.defineProperty(array, index, {
+          get() {
+            log.push(`get ${index}`)
+            return item
+          },
+          enumerable: true,
+        }),
+      )
+      return array
+    },
+    ['get 0', '[0].offset', '[0].stride', 'get 1', '[1].offset', '[1].stride', 'get 2', '[2].offset', '[2].stride'],
+    'resolve',
+  )
+  // layout converts between format and rect.
+  const options = () => ({
+    get format() {
+      log.push('format')
+      return undefined
+    },
+    get layout() {
+      log.push('layout')
+      return loggingIterable(I420_LAYOUT())
+    },
+    get rect() {
+      log.push('rect')
+      return undefined
+    },
+  })
+  const expected = ['format', 'layout', '@@iterator()']
+  for (let step = 0; step < 4; step++) expected.push('next(0)', 'value', 'done')
+  expected.push('rect')
+  log.length = 0
+  t.is(allocationSize(frame, options()), 12)
+  t.deepEqual(log, expected, 'allocationSize member order')
+  log.length = 0
+  t.true((await settleCopyTo(frame, new Uint8Array(64), options())).resolved)
+  t.deepEqual(log, expected, 'copyTo member order')
+  frame.close()
+})
+
 test('rect members default to 0 in copyTo, not to the visible rect', async (t) => {
   const source = new VideoFrame(
     new Uint8Array(64).map((_, i) => i),

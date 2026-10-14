@@ -1160,8 +1160,8 @@ struct CopyToOptions {
 impl CopyToOptions {
   /// Convert a VideoFrameCopyToOptions dictionary the way Chrome's bindings do. Members are read
   /// once each, in lexicographic order (colorSpace, format, layout, rect), and an undefined member
-  /// is absent. Bad values give a "TypeError: ..." error. An exception from a getter, `toString` or
-  /// `valueOf` stays pending.
+  /// is absent. Bad values give a "TypeError: ..." error. An exception from a getter, `toString`,
+  /// `valueOf` or the `layout` iterator stays pending.
   fn from_js(value: Unknown) -> Result<Self> {
     let mut options = VideoFrameCopyToOptions {
       color_space: None,
@@ -1240,51 +1240,124 @@ fn webidl_member<'env>(dict: &Object<'env>, name: &str) -> Result<Option<Unknown
   Ok((value.get_type()? != ValueType::Undefined).then_some(value))
 }
 
-/// `sequence<PlaneLayout>`. Only arrays are taken; Chrome also takes other iterables.
+/// `sequence<PlaneLayout>`, converted the way Chrome 155 does it:
+/// - A JS Array (not a Proxy) is read by index, and its `length` is read again before each entry.
+///   Like Chrome's fast path (WebIDL itself would iterate), its `@@iterator` and the array
+///   iterator's `next` are not used, even when page code replaced them.
+/// - Any other object goes through its `@@iterator`. Chrome reads each step's `value` before its
+///   `done`, converts the entry before the next step, and does not call `return()` when an entry
+///   fails.
+///
+/// A non-object, or an object without a callable `@@iterator`, is a TypeError. An exception from
+/// the iterator or from an entry stays pending.
 fn plane_layouts_from_js(value: Unknown) -> Result<Vec<PlaneLayout>> {
-  if value.get_type()? != ValueType::Object || !value.is_array()? {
+  if !is_js_object(&value)? {
     return Err(type_error(
-      "layout: the provided value cannot be converted to a sequence.",
+      "layout: The provided value cannot be converted to a sequence.",
     ));
   }
-  let array = Object::from_raw(value.value().env, value.raw());
-  let length = array.get_array_length_unchecked()?;
-  let mut layouts = Vec::with_capacity(length.min(4) as usize);
-  for index in 0..length {
-    let plane = webidl_dictionary(array.get_element::<Unknown>(index)?, "PlaneLayout")?;
-    // Required `[EnforceRange] unsigned long` members, read in lexicographic order.
-    let member = |name: &str| -> Result<u32> {
-      let value = match &plane {
-        Some(plane) => webidl_member(plane, name)?,
-        None => None,
-      };
-      let Some(value) = value else {
-        return Err(type_error(&format!(
-          "PlaneLayout.{}: required member is undefined.",
-          name
-        )));
-      };
-      let number = value.coerce_to_number()?.get_double()?;
-      if !number.is_finite() {
-        return Err(type_error(&format!(
-          "PlaneLayout.{} is not of type 'unsigned long'.",
-          name
-        )));
-      }
-      let number = number.trunc();
-      if !(0.0..=f64::from(u32::MAX)).contains(&number) {
-        return Err(type_error(&format!(
-          "PlaneLayout.{} is outside the 'unsigned long' value range.",
-          name
-        )));
-      }
-      Ok(number as u32)
-    };
-    let offset = member("offset")?;
-    let stride = member("stride")?;
-    layouts.push(PlaneLayout { offset, stride });
+  let env = value.value().env;
+  let object = Object::from_raw(env, value.raw());
+  let mut layouts = Vec::new();
+  if value.is_array()? {
+    let mut index = 0;
+    while index < object.get_array_length_unchecked()? {
+      layouts.push(plane_layout_from_js(object.get_element::<Unknown>(index)?)?);
+      index += 1;
+    }
+    return Ok(layouts);
   }
-  Ok(layouts)
+
+  let method: Unknown = object.get_property(iterator_symbol(env)?)?;
+  match method.get_type()? {
+    ValueType::Function => {}
+    ValueType::Undefined | ValueType::Null => {
+      return Err(type_error(
+        "layout: The object must have a callable @@iterator property.",
+      ));
+    }
+    _ => return Err(type_error("layout: @@iterator must be a callable.")),
+  }
+  let iterator = call_with_no_arguments(env, value.raw(), method.raw())?;
+  if !is_js_object(&iterator)? {
+    return Err(type_error("layout: Iterator object must be an object."));
+  }
+  let next: Unknown = Object::from_raw(env, iterator.raw()).get_named_property("next")?;
+  if next.get_type()? != ValueType::Function {
+    return Err(type_error("layout: Expected next() function on iterator."));
+  }
+  loop {
+    let result = call_with_no_arguments(env, iterator.raw(), next.raw())?;
+    if !is_js_object(&result)? {
+      return Err(type_error(
+        "layout: Expected iterator.next() to return an Object.",
+      ));
+    }
+    let result = Object::from_raw(env, result.raw());
+    let entry: Unknown = result.get_named_property("value")?;
+    let done: Unknown = result.get_named_property("done")?;
+    if done.coerce_to_bool()? {
+      return Ok(layouts);
+    }
+    layouts.push(plane_layout_from_js(entry)?);
+  }
+}
+
+/// One `PlaneLayout` dictionary: required `[EnforceRange] unsigned long` members, read in
+/// lexicographic order.
+fn plane_layout_from_js(value: Unknown) -> Result<PlaneLayout> {
+  let plane = webidl_dictionary(value, "PlaneLayout")?;
+  let member = |name: &str| -> Result<u32> {
+    let value = match &plane {
+      Some(plane) => webidl_member(plane, name)?,
+      None => None,
+    };
+    let Some(value) = value else {
+      return Err(type_error(&format!(
+        "PlaneLayout.{}: required member is undefined.",
+        name
+      )));
+    };
+    let number = value.coerce_to_number()?.get_double()?;
+    if !number.is_finite() {
+      return Err(type_error(&format!(
+        "PlaneLayout.{} is not of type 'unsigned long'.",
+        name
+      )));
+    }
+    let number = number.trunc();
+    if !(0.0..=f64::from(u32::MAX)).contains(&number) {
+      return Err(type_error(&format!(
+        "PlaneLayout.{} is outside the 'unsigned long' value range.",
+        name
+      )));
+    }
+    Ok(number as u32)
+  };
+  let offset = member("offset")?;
+  let stride = member("stride")?;
+  Ok(PlaneLayout { offset, stride })
+}
+
+/// Whether `value` is an ECMAScript Object (a function is one).
+fn is_js_object(value: &Unknown) -> Result<bool> {
+  Ok(matches!(
+    value.get_type()?,
+    ValueType::Object | ValueType::Function
+  ))
+}
+
+/// `function.call(this)`. A JS exception stays pending.
+fn call_with_no_arguments<'env>(
+  env: napi::sys::napi_env,
+  this: napi::sys::napi_value,
+  function: napi::sys::napi_value,
+) -> Result<Unknown<'env>> {
+  let mut result = std::ptr::null_mut();
+  napi::check_status!(unsafe {
+    napi::sys::napi_call_function(env, this, function, 0, std::ptr::null(), &mut result)
+  })?;
+  Ok(unsafe { Unknown::from_raw_unchecked(env, result) })
 }
 
 /// `DOMRectInit`: `unrestricted double` members that default to 0, read in lexicographic order.
@@ -1658,7 +1731,8 @@ thread_local! {
 // Only napi's load-time registration calls this, and `cargo test` builds leave it out.
 #[cfg_attr(test, allow(dead_code))]
 pub fn on_module_load(_exports: Object, env: Env) -> Result<()> {
-  capture_buffer_flag_getters(&env)
+  capture_buffer_flag_getters(&env)?;
+  capture_iterator_symbol(&env)
 }
 
 /// Captures the buffer flag getters of `env`, once per env.
@@ -1688,6 +1762,79 @@ fn capture_buffer_flag_getters(env: &Env) -> Result<()> {
   })?;
   BUFFER_FLAG_GETTERS.set(Some(getters));
   Ok(())
+}
+
+thread_local! {
+  // The env's `Symbol.iterator` (null if it was not a symbol), read when the module loads, like
+  // `BUFFER_FLAG_GETTERS` and with the same limit. Its cleanup hook empties the slot.
+  static ITERATOR_SYMBOL: std::cell::Cell<Option<(napi::sys::napi_env, napi::sys::napi_ref)>> =
+    const { std::cell::Cell::new(None) };
+}
+
+/// Captures `Symbol.iterator` of `env`, once per env.
+fn capture_iterator_symbol(env: &Env) -> Result<()> {
+  use napi::sys;
+  if ITERATOR_SYMBOL
+    .get()
+    .is_some_and(|(owner, _)| owner == env.raw())
+  {
+    return Ok(());
+  }
+  let env = env.raw();
+  let mut global = std::ptr::null_mut();
+  napi::check_status!(unsafe { sys::napi_get_global(env, &mut global) })?;
+  let mut symbol = std::ptr::null_mut();
+  napi::check_status!(unsafe {
+    sys::napi_get_named_property(env, global, c"Symbol".as_ptr(), &mut symbol)
+  })?;
+  let mut kind = 0;
+  napi::check_status!(unsafe { sys::napi_typeof(env, symbol, &mut kind) })?;
+  let mut reference = std::ptr::null_mut();
+  if kind == sys::ValueType::napi_function {
+    let mut iterator = std::ptr::null_mut();
+    napi::check_status!(unsafe {
+      sys::napi_get_named_property(env, symbol, c"iterator".as_ptr(), &mut iterator)
+    })?;
+    napi::check_status!(unsafe { sys::napi_typeof(env, iterator, &mut kind) })?;
+    if kind == sys::ValueType::napi_symbol {
+      napi::check_status!(unsafe { sys::napi_create_reference(env, iterator, 1, &mut reference) })?;
+    }
+  }
+  unsafe extern "C" fn forget(env: *mut std::ffi::c_void) {
+    let _ = ITERATOR_SYMBOL.try_with(|slot| {
+      if slot.get().is_some_and(|(owner, _)| owner.cast() == env) {
+        slot.set(None);
+      }
+    });
+  }
+  // Node deletes the references of an env when it tears the env down.
+  napi::check_status!(unsafe { sys::napi_add_env_cleanup_hook(env, Some(forget), env.cast()) })?;
+  ITERATOR_SYMBOL.set(Some((env, reference)));
+  Ok(())
+}
+
+/// The `Symbol.iterator` captured for `env`.
+fn iterator_symbol<'env>(env: napi::sys::napi_env) -> Result<Unknown<'env>> {
+  let reference = match ITERATOR_SYMBOL.get() {
+    Some((owner, reference)) if owner == env => reference,
+    // The load hook runs for every env, so this is only a fallback.
+    _ => {
+      capture_iterator_symbol(&Env::from_raw(env))?;
+      ITERATOR_SYMBOL
+        .get()
+        .map(|(_, reference)| reference)
+        .ok_or_else(|| Error::new(Status::GenericFailure, "Symbol.iterator missing"))?
+    }
+  };
+  if reference.is_null() {
+    return Err(Error::new(
+      Status::GenericFailure,
+      "Symbol.iterator was not a symbol when the module loaded",
+    ));
+  }
+  let mut symbol = std::ptr::null_mut();
+  napi::check_status!(unsafe { napi::sys::napi_get_reference_value(env, reference, &mut symbol) })?;
+  Ok(unsafe { Unknown::from_raw_unchecked(env, symbol) })
 }
 
 /// A reference to `Object.getOwnPropertyDescriptor(globalThis[class].prototype, key).get`, or null
