@@ -153,7 +153,7 @@ pub fn throw_as_native_error(env: &Env, error: Error) -> Error {
   };
   let (name, message) = (name.trim(), message.trim_start());
   let thrown = if name == "TypeError" {
-    env.throw_type_error(message, None)
+    throw_type_error_with_length(env, message)
   } else if DOM_EXCEPTION_NAMES.contains(&name) {
     env
       .get_global()
@@ -169,6 +169,26 @@ pub fn throw_as_native_error(env: &Env, error: Error) -> Error {
     Ok(()) => Error::new(Status::PendingException, error.reason),
     Err(_) => error,
   }
+}
+
+/// Throw a native JS TypeError. Unlike `Env::throw_type_error`, which passes the message as a C
+/// string and fails on a NUL character, this passes it with its length, so a message that quotes
+/// a user string with a NUL (an invalid enum value) still becomes a TypeError.
+fn throw_type_error_with_length(env: &Env, message: &str) -> Result<()> {
+  let mut js_message = std::ptr::null_mut();
+  napi::check_status!(unsafe {
+    napi::sys::napi_create_string_utf8(
+      env.raw(),
+      message.as_ptr().cast(),
+      message.len() as isize,
+      &mut js_message,
+    )
+  })?;
+  let mut type_error = std::ptr::null_mut();
+  napi::check_status!(unsafe {
+    napi::sys::napi_create_type_error(env.raw(), std::ptr::null_mut(), js_message, &mut type_error)
+  })?;
+  napi::check_status!(unsafe { napi::sys::napi_throw(env.raw(), type_error) })
 }
 
 /// Standard DOMException names that may prefix codec error messages.
