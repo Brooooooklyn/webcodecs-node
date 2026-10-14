@@ -1072,6 +1072,24 @@ impl FromNapiValue for VideoFrameConstructorInit {
       enforce_range_unsigned_long_long_optional(&env_wrapper, duration_f64, "duration")?
         .map(|v| v.min(i64::MAX as u64) as i64);
 
+    // displayWidth/displayHeight are WebIDL [EnforceRange] unsigned long: a plain u32
+    // conversion would wrap -1 or 2^32 + 1 into range instead of throwing.
+    let display_width = super::error::enforce_range_unsigned_long_optional(
+      &env_wrapper,
+      obj.get("displayWidth")?,
+      "displayWidth",
+    )?;
+    let display_height = super::error::enforce_range_unsigned_long_optional(
+      &env_wrapper,
+      obj.get("displayHeight")?,
+      "displayHeight",
+    )?;
+    // rotation is a WebIDL (restricted) double.
+    let rotation: Option<f64> = obj.get("rotation")?;
+    if rotation.is_some_and(|rotation| !rotation.is_finite()) {
+      return Err(throw_type_error(env, "rotation must be a finite number"));
+    }
+
     Ok(VideoFrameConstructorInit {
       format,
       coded_width: obj.get("codedWidth")?,
@@ -1080,10 +1098,10 @@ impl FromNapiValue for VideoFrameConstructorInit {
       duration,
       layout: obj.get("layout")?,
       visible_rect: obj.get("visibleRect")?,
-      rotation: obj.get("rotation")?,
+      rotation,
       flip: obj.get("flip")?,
-      display_width: obj.get("displayWidth")?,
-      display_height: obj.get("displayHeight")?,
+      display_width,
+      display_height,
       color_space: obj.get("colorSpace")?,
       metadata: obj.get("metadata")?,
       transfer: obj.get("transfer")?,
@@ -2091,18 +2109,59 @@ pub struct VideoFrame {
   /// Frame metadata lives outside the detachable resource per WebCodecs.
   timestamp_us: i64,
   duration_us: Option<i64>,
-  rotation: f64,
-  flip: bool,
 }
 
 /// Parse rotation value per W3C spec algorithm
-/// Rounds to nearest 90 degrees, normalizes to 0-359 range
+/// Rounds to the nearest multiple of 90 (ties towards positive infinity), normalized to 0-270.
+///
+/// Same steps as Chromium's media::VideoTransformation(double, bool): flooring first keeps every
+/// step exact, so huge values and negative ties (-315 -> 90) round like the spec says.
 fn parse_rotation(rotation: f64) -> f64 {
-  // Round to nearest multiple of 90, ties towards positive infinity
-  let aligned = (rotation / 90.0).round() * 90.0;
-  // Normalize to 0-359 range
-  let full_turns = (aligned / 360.0).floor() * 360.0;
-  aligned - full_turns
+  // An integer in (-360, 360); `%` on f64 is C fmod. Non-finite input (the VideoFrame
+  // constructors reject it) gives NaN, which the cast turns into 0, so rotation 0.
+  let bounded = rotation.floor() % 360.0;
+  // Add 360 to make it non-negative and 45 to round ties up: quarter turns in [0, 8].
+  let quarter_turns = (bounded as i32 + 360 + 45) / 90;
+  f64::from((quarter_turns % 4) * 90)
+}
+
+/// Chromium media::limits::kMaxDimension and kMaxCanvas (media/base/limits.h)
+const MAX_DIMENSION: u32 = (1 << 15) - 1;
+const MAX_CANVAS: u64 = (1 << 29) - 1;
+
+/// Whether a display size fits Chromium's media::VideoFrame size limits.
+fn display_size_within_limits(width: u32, height: u32) -> bool {
+  width <= MAX_DIMENSION
+    && height <= MAX_DIMENSION
+    && u64::from(width) * u64::from(height) <= MAX_CANVAS
+}
+
+/// Validates an explicit displayWidth/displayHeight pair like Chromium's
+/// ParseAndValidateDisplaySize: both or neither, nonzero, within media limits.
+/// Returns the TypeError message on failure.
+fn parse_display_size(
+  width: Option<u32>,
+  height: Option<u32>,
+) -> std::result::Result<Option<(u32, u32)>, String> {
+  let (width, height) = match (width, height) {
+    (None, None) => return Ok(None),
+    (None, Some(_)) => return Err("displayHeight specified without displayWidth.".into()),
+    (Some(_), None) => return Err("displayWidth specified without displayHeight.".into()),
+    (Some(width), Some(height)) => (width, height),
+  };
+  if width == 0 {
+    return Err("displayWidth must be nonzero.".into());
+  }
+  if height == 0 {
+    return Err("displayHeight must be nonzero.".into());
+  }
+  if !display_size_within_limits(width, height) {
+    return Err(format!(
+      "Invalid display size ({}, {}); exceeds implementation limit.",
+      width, height
+    ));
+  }
+  Ok(Some((width, height)))
 }
 
 #[napi]
@@ -2112,8 +2171,6 @@ impl VideoFrame {
       observer_id: NEXT_FRAME_ID.fetch_add(1, Ordering::Relaxed),
       timestamp_us: inner.timestamp_us,
       duration_us: inner.duration_us,
-      rotation: inner.rotation,
-      flip: inner.flip,
       inner: Arc::new(Mutex::new(Some(inner))),
     }
   }
@@ -2152,9 +2209,10 @@ impl VideoFrame {
       height,
       VideoPixelFormat::RGBA,
     )?;
-    if init.display_width == Some(0) || init.display_height == Some(0) {
-      return Err(type_error("display dimensions must be positive"));
-    }
+    let (display_width, display_height) =
+      parse_display_size(init.display_width, init.display_height)
+        .map_err(|message| type_error(&message))?
+        .unwrap_or((visible_width, visible_height));
     if !matches!(init.alpha.as_deref(), None | Some("keep") | Some("discard")) {
       return Err(type_error("invalid alpha handling"));
     }
@@ -2186,8 +2244,8 @@ impl VideoFrame {
       visible_top,
       visible_width,
       visible_height,
-      display_width: init.display_width.unwrap_or(visible_width),
-      display_height: init.display_height.unwrap_or(visible_height),
+      display_width,
+      display_height,
       rotation: parse_rotation(init.rotation.unwrap_or(0.)),
       flip: init.flip.unwrap_or(false),
       color_space,
@@ -2244,7 +2302,7 @@ impl VideoFrame {
         }
       }
 
-      return Self::new_from_video_frame(video_frame, init)
+      return Self::new_from_video_frame(&env, video_frame, init)
         .map_err(|error| throw_as_native_error(&env, error));
     }
 
@@ -2399,8 +2457,10 @@ impl VideoFrame {
     // Store the natural (unrotated) size. Explicit displayWidth/displayHeight are
     // taken as the natural size too, like Chromium (the spec text stores them as
     // already rotated). The displayWidth/displayHeight getters apply rotation.
-    let display_width = init.display_width.unwrap_or(visible_width);
-    let display_height = init.display_height.unwrap_or(visible_height);
+    let (display_width, display_height) =
+      parse_display_size(init.display_width, init.display_height)
+        .map_err(|message| throw_type_error(env.raw(), &message))?
+        .unwrap_or((visible_width, visible_height));
 
     // Color space: use provided value, or default to sRGB for RGB formats
     let color_space = if init.color_space.is_some() {
@@ -2596,10 +2656,13 @@ impl VideoFrame {
 
   /// Internal: Create VideoFrame from another VideoFrame (image source constructor form)
   fn new_from_video_frame(
+    env: &Env,
     source: &VideoFrame,
     init: Option<VideoFrameConstructorInit>,
   ) -> Result<Self> {
-    source.with_inner(|source_inner| {
+    // The closure returns Err(message) for an OperationError, thrown once the source lock is
+    // released: constructing a DOMException runs JS.
+    let new_inner = source.with_inner(|source_inner| {
       // Check if alpha should be discarded per W3C spec
       let should_discard_alpha = init
         .as_ref()
@@ -2658,28 +2721,62 @@ impl VideoFrame {
 
       // Per spec: display dimensions scale proportionally with visible rect changes
       // If not explicitly provided, scale based on ratio of new visible rect to old
-      let display_width = init
-        .as_ref()
-        .and_then(|i| i.display_width)
-        .unwrap_or_else(|| {
-          if source_inner.visible_width > 0 {
-            let scale = visible_width as f64 / source_inner.visible_width as f64;
-            ((source_inner.display_width as f64) * scale).round() as u32
-          } else {
-            visible_width
+      let explicit_display = parse_display_size(
+        init.as_ref().and_then(|i| i.display_width),
+        init.as_ref().and_then(|i| i.display_height),
+      )
+      .map_err(|message| throw_type_error(env.raw(), &message))?;
+      let has_visible_rect = init.as_ref().is_some_and(|i| i.visible_rect.is_some());
+      let (display_width, display_height) = match explicit_display {
+        Some(size) => size,
+        // Without a new visibleRect the source display size is kept as is
+        None if !has_visible_rect => (source_inner.display_width, source_inner.display_height),
+        None => {
+          let scaled = |display: u32, visible: u32, source_visible: u32| {
+            if source_visible > 0 {
+              let scale = f64::from(visible) / f64::from(source_visible);
+              (f64::from(display) * scale).round()
+            } else {
+              f64::from(visible)
+            }
+          };
+          let width = scaled(
+            source_inner.display_width,
+            visible_width,
+            source_inner.visible_width,
+          );
+          let height = scaled(
+            source_inner.display_height,
+            visible_height,
+            source_inner.visible_height,
+          );
+          // Like Chromium's ParsedVideoFrameInit (spec step 8.5)
+          if width == 0.0 {
+            return Err(throw_type_error(
+              env.raw(),
+              "computed displayWidth must be nonzero",
+            ));
           }
-        });
-      let display_height = init
-        .as_ref()
-        .and_then(|i| i.display_height)
-        .unwrap_or_else(|| {
-          if source_inner.visible_height > 0 {
-            let scale = visible_height as f64 / source_inner.visible_height as f64;
-            ((source_inner.display_height as f64) * scale).round() as u32
-          } else {
-            visible_height
+          if height == 0.0 {
+            return Err(throw_type_error(
+              env.raw(),
+              "computed displayHeight must be nonzero",
+            ));
           }
-        });
+          // Chromium cannot wrap a frame whose natural size exceeds the media limits and
+          // throws OperationError. Checking here also keeps the u32 casts below exact.
+          if width > f64::from(MAX_DIMENSION)
+            || height > f64::from(MAX_DIMENSION)
+            || width * height > MAX_CANVAS as f64
+          {
+            return Ok(Err(format!(
+              "Failed to create a VideoFrame: computed display size {}x{} exceeds implementation limit.",
+              width, height
+            )));
+          }
+          (width as u32, height as u32)
+        }
+      };
 
       let new_inner = VideoFrameInner {
         resource,
@@ -2696,8 +2793,16 @@ impl VideoFrame {
         color_space: source_inner.color_space.clone(),
       };
 
-      Ok(VideoFrame::from_inner(new_inner))
-    })
+      Ok(Ok(new_inner))
+    })?;
+    match new_inner {
+      Ok(new_inner) => Ok(VideoFrame::from_inner(new_inner)),
+      Err(message) => super::error::throw_dom_exception(
+        env,
+        super::error::DOMExceptionName::OperationError,
+        &message,
+      ),
+    }
   }
 
   /// Create a VideoFrame from an internal Frame (for decoder output)
@@ -3101,15 +3206,25 @@ impl VideoFrame {
   }
 
   /// Get the rotation in degrees clockwise (0, 90, 180, 270) - W3C WebCodecs spec
+  /// Returns 0 after close (Close VideoFrame resets [[rotation]]).
   #[napi(getter)]
   pub fn rotation(&self) -> Result<f64> {
-    Ok(self.rotation)
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    Ok(guard.as_ref().map_or(0.0, |inner| inner.rotation))
   }
 
   /// Get whether horizontal flip is applied - W3C WebCodecs spec
+  /// Returns false after close (Close VideoFrame resets [[flip]]).
   #[napi(getter)]
   pub fn flip(&self) -> Result<bool> {
-    Ok(self.flip)
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    Ok(guard.as_ref().is_some_and(|inner| inner.flip))
   }
 
   /// Get the metadata associated with this VideoFrame - W3C WebCodecs spec
@@ -3953,8 +4068,8 @@ impl VideoFrame {
   /// Per W3C spec "Close VideoFrame" algorithm:
   /// 1. Assign null to frame's [[resource reference]]
   /// 2. Assign true to frame's [[Detached]]
-  /// Note: Metadata (timestamp, duration, etc.) remains accessible after close.
-  /// codedRect and visibleRect become null, every colorSpace field becomes null,
+  /// Note: timestamp and duration remain accessible after close; rotation becomes 0,
+  /// flip false, codedRect and visibleRect null, every colorSpace field becomes null,
   /// and callbacks registered with registerVideoFrameCloseObserver run synchronously.
   #[napi(ts_args_type = "")]
   pub fn close(&self, env: Env, this: This) -> Result<()> {

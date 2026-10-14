@@ -1120,9 +1120,15 @@ export declare class VideoFrame {
    * - I420A, I422A, I444A: 4 planes
    */
   get numberOfPlanes(): number
-  /** Get the rotation in degrees clockwise (0, 90, 180, 270) - W3C WebCodecs spec */
+  /**
+   * Get the rotation in degrees clockwise (0, 90, 180, 270) - W3C WebCodecs spec
+   * Returns 0 after close (Close VideoFrame resets [[rotation]]).
+   */
   get rotation(): number
-  /** Get whether horizontal flip is applied - W3C WebCodecs spec */
+  /**
+   * Get whether horizontal flip is applied - W3C WebCodecs spec
+   * Returns false after close (Close VideoFrame resets [[flip]]).
+   */
   get flip(): boolean
   /**
    * Get the metadata associated with this VideoFrame - W3C WebCodecs spec
@@ -1151,8 +1157,8 @@ export declare class VideoFrame {
    * Per W3C spec "Close VideoFrame" algorithm:
    * 1. Assign null to frame's [[resource reference]]
    * 2. Assign true to frame's [[Detached]]
-   * Note: Metadata (timestamp, duration, etc.) remains accessible after close.
-   * codedRect and visibleRect become null, every colorSpace field becomes null,
+   * Note: timestamp and duration remain accessible after close; rotation becomes 0,
+   * flip false, codedRect and visibleRect null, every colorSpace field becomes null,
    * and callbacks registered with registerVideoFrameCloseObserver run synchronously.
    */
   close(): void

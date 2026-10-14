@@ -657,6 +657,33 @@ pub fn enforce_range_unsigned_long_long(env: &Env, value: f64, field_name: &str)
   Ok(truncated as u64)
 }
 
+/// Convert optional f64 to u32 per WebIDL `[EnforceRange] unsigned long` algorithm
+///
+/// NaN, ±Infinity, and values outside [0, 2^32 - 1] after truncation throw TypeError.
+/// A plain `u32` napi conversion would apply ToUint32 instead and wrap them.
+pub fn enforce_range_unsigned_long_optional(
+  env: &Env,
+  value: Option<f64>,
+  field_name: &str,
+) -> Result<Option<u32>> {
+  let Some(value) = value else {
+    return Ok(None);
+  };
+  let message = if value.is_nan() {
+    format!("{} cannot be NaN", field_name)
+  } else if value.is_infinite() {
+    format!("{} cannot be Infinity", field_name)
+  } else {
+    let truncated = value.trunc();
+    if (0.0..=f64::from(u32::MAX)).contains(&truncated) {
+      return Ok(Some(truncated as u32));
+    }
+    format!("{} is out of range for unsigned long", field_name)
+  };
+  env.throw_type_error(&message, None)?;
+  Err(Error::new(Status::InvalidArg, message))
+}
+
 /// Convert optional f64 to u64 per WebIDL `[EnforceRange] unsigned long long` algorithm
 pub fn enforce_range_unsigned_long_long_optional(
   env: &Env,

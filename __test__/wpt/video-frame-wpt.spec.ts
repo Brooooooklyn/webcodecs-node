@@ -461,8 +461,9 @@ test('VideoFrame: properties after close', (t) => {
   t.is(frame.displayHeight, 0)
   t.is(frame.timestamp, 0)
   t.is(frame.duration, 1000)
-  t.is(frame.rotation, 90)
-  t.true(frame.flip)
+  // Close VideoFrame resets [[rotation]] and [[flip]] (Chrome too)
+  t.is(frame.rotation, 0)
+  t.false(frame.flip)
   t.deepEqual(frame.colorSpace.toJSON(), {
     primaries: null,
     transfer: null,
