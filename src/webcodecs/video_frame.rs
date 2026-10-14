@@ -3932,8 +3932,10 @@ fn video_frame_argument<'env>(
   unsafe { ClassInstance::<VideoFrame>::from_napi_value(env.raw(), value.raw()) }
 }
 
-/// Native image-consumer interop with a real class borrow and independent half-float storage.
-/// Returns the whole coded image; `visibleRect` is ignored.
+/// Native image-consumer interop: copies the half-float bits of an RGBA16Float frame into a new
+/// `Uint16Array`. Returns the whole coded image; `visibleRect` is ignored. Throws a TypeError if
+/// `frame` is not a VideoFrame, InvalidStateError if it is closed, and NotSupportedError if it does
+/// not hold an RGBA16Float image.
 #[napi(
   js_name = "copyVideoFrameRGBA16Float",
   ts_args_type = "frame: VideoFrame"

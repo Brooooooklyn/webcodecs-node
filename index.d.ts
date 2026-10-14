@@ -1374,8 +1374,10 @@ export type CodecState = 'unconfigured' | 'configured' | 'closed'
 export type ColorSpaceConversion = 'default' | 'none'
 
 /**
- * Native image-consumer interop with a real class borrow and independent half-float storage.
- * Returns the whole coded image; `visibleRect` is ignored.
+ * Native image-consumer interop: copies the half-float bits of an RGBA16Float frame into a new
+ * `Uint16Array`. Returns the whole coded image; `visibleRect` is ignored. Throws a TypeError if
+ * `frame` is not a VideoFrame, InvalidStateError if it is closed, and NotSupportedError if it does
+ * not hold an RGBA16Float image.
  */
 export declare function copyVideoFrameRGBA16Float(frame: VideoFrame): Uint16Array
 
