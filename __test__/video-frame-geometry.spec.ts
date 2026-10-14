@@ -9,7 +9,8 @@
 import test from 'ava'
 
 import { DOMRectReadOnly, VideoDecoder, VideoEncoder, VideoFrame, EncodedVideoChunk } from '../index.js'
-import type { VideoDecoderConfig } from '../standard.js'
+import type { VideoDecoderConfigOutput } from '../index.js'
+import type { VideoDecoderConfig, VideoEncoderConfig } from '../standard.js'
 
 type FrameInit = {
   visibleRect?: { x: number; y: number; width: number; height: number }
@@ -264,16 +265,24 @@ test('VideoFrame: close resets rotation and flip but keeps them on a clone', (t)
 // VideoDecoder displayAspectWidth/displayAspectHeight
 // ============================================================================
 
-async function encodeVp8(width: number, height: number): Promise<EncodedVideoChunk[]> {
+type Encoded = { chunks: EncodedVideoChunk[]; decoderConfig: VideoDecoderConfigOutput | undefined }
+
+/** Encode one key frame of `config.width` x `config.height` */
+async function encodeKeyFrame(config: VideoEncoderConfig): Promise<Encoded> {
   const chunks: EncodedVideoChunk[] = []
+  let decoderConfig: VideoDecoderConfigOutput | undefined
   let failure: Error | null = null
   const encoder = new VideoEncoder({
-    output: (chunk) => chunks.push(chunk),
+    output: (chunk, metadata) => {
+      chunks.push(chunk)
+      decoderConfig ??= metadata?.decoderConfig
+    },
     error: (error) => {
       failure = error
     },
   })
-  encoder.configure({ codec: 'vp8', width, height, bitrate: 500_000 })
+  encoder.configure(config)
+  const { width, height } = config
   const frame = new VideoFrame(new Uint8Array(width * height * 4).fill(96), {
     format: 'RGBA',
     codedWidth: width,
@@ -285,7 +294,11 @@ async function encodeVp8(width: number, height: number): Promise<EncodedVideoChu
   await encoder.flush()
   encoder.close()
   if (failure) throw failure
-  return chunks
+  return { chunks, decoderConfig }
+}
+
+async function encodeVp8(width: number, height: number): Promise<EncodedVideoChunk[]> {
+  return (await encodeKeyFrame({ codec: 'vp8', width, height, bitrate: 500_000 })).chunks
 }
 
 type Decoded = { sizes: string[]; errors: string[]; state: string }
@@ -585,6 +598,84 @@ test('VideoDecoder.isConfigSupported returns the rotation converted like Chrome 
   t.is(rotations.length, cases.length * 2)
   for (let i = 0; i < rotations.length; i += 2) {
     t.deepEqual(rotations[i + 1], rotations[i], `rotation ${rotations[i][0]}`)
+  }
+})
+
+// ============================================================================
+// VideoEncoder displayWidth/displayHeight
+// ============================================================================
+
+test('VideoEncoder: a lone displayWidth or displayHeight is a TypeError like Chrome', async (t) => {
+  const message = 'Invalid display size; both height and width must be set together.'
+  // Chrome 155 checks the pair after codec, size and bitrate, and before a display size of 0,
+  // the framerate and codec support
+  const cases: Array<[string, Partial<VideoEncoderConfig>]> = [
+    ['lone width', { displayWidth: 640 }],
+    ['lone height', { displayHeight: 360 }],
+    ['width, undefined height', { displayWidth: 640, displayHeight: undefined }],
+    ['lone width 0', { displayWidth: 0 }],
+    ['lone height 0', { displayHeight: 0 }],
+    ['lone width, framerate 0', { displayWidth: 640, framerate: 0 }],
+    ['lone width, unknown codec', { displayWidth: 640, codec: 'bogus' }],
+    ['lone width, unknown scalabilityMode', { displayWidth: 640, scalabilityMode: 'L9T9' }],
+  ]
+  for (const [name, display] of cases) {
+    const config: VideoEncoderConfig = { codec: 'vp8', width: 320, height: 240, ...display }
+    const encoder = new VideoEncoder({ output: () => {}, error: (error) => t.fail(error.message) })
+    t.throws(() => encoder.configure(config), { instanceOf: TypeError, message }, `configure ${name}`)
+    t.is(encoder.state, 'unconfigured', `configure ${name}`)
+    encoder.close()
+    let support: Promise<unknown> | undefined
+    t.notThrows(() => {
+      support = VideoEncoder.isConfigSupported(config)
+    }, `isConfigSupported ${name} rejects instead of throwing`)
+    await t.throwsAsync(support!, { instanceOf: TypeError, message }, `isConfigSupported ${name}`)
+  }
+
+  // A bitrate of 0 is reported before the lone display size, as in Chrome
+  const config: VideoEncoderConfig = { codec: 'vp8', width: 320, height: 240, displayWidth: 640, bitrate: 0 }
+  const encoder = new VideoEncoder({ output: () => {}, error: (error) => t.fail(error.message) })
+  t.throws(() => encoder.configure(config), { instanceOf: TypeError, message: /bitrate/ })
+  encoder.close()
+  await t.throwsAsync(VideoEncoder.isConfigSupported(config), { instanceOf: TypeError, message: /bitrate/ })
+})
+
+test('VideoEncoder: displayWidth/displayHeight reach the decoded frame through decoderConfig like Chrome', async (t) => {
+  // [display size, Chrome 155 decoderConfig displayAspectWidth/displayAspectHeight, decoded display size]
+  const cases: Array<[[number, number] | null, [number, number] | null, string]> = [
+    [null, null, '320x240'],
+    [[640, 360], [640, 360], '427x240'],
+    [[320, 240], [320, 240], '320x240'],
+    [[100, 500], [100, 500], '320x1600'],
+    [[640.7, 360.2], [640, 360], '427x240'],
+  ]
+  for (const [display, aspect, size] of cases) {
+    const name = display?.join('x') ?? 'none'
+    const config: VideoEncoderConfig = { codec: 'vp8', width: 320, height: 240, bitrate: 500_000 }
+    if (display) {
+      config.displayWidth = display[0]
+      config.displayHeight = display[1]
+    }
+    const { chunks, decoderConfig } = await encodeKeyFrame(config)
+    if (!decoderConfig) {
+      t.fail(`no decoderConfig for ${name}`)
+      continue
+    }
+    t.deepEqual(
+      ['displayAspectWidth', 'displayAspectHeight'].filter((key) => key in decoderConfig),
+      aspect ? ['displayAspectWidth', 'displayAspectHeight'] : [],
+      `decoderConfig members ${name}`,
+    )
+    t.deepEqual(
+      [decoderConfig.displayAspectWidth, decoderConfig.displayAspectHeight],
+      aspect ?? [undefined, undefined],
+      `decoderConfig ${name}`,
+    )
+    t.deepEqual(
+      await decodeWith(chunks, decoderConfig),
+      { sizes: [size], errors: [], state: 'configured' },
+      `decode ${name}`,
+    )
   }
 })
 
