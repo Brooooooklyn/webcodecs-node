@@ -15,7 +15,6 @@ use napi::sys;
 use napi::threadsafe_function::{
   ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
 };
-use napi_derive::napi;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ptr;
@@ -1026,12 +1025,13 @@ pub(crate) fn release_callback(env: &Env, owner: Option<sys::napi_value>, id: u6
 /// with it, and the native side only keeps weak refs to the callbacks.
 ///
 /// The WeakMap and the intrinsic `WeakMap.prototype.get`/`set` are captured
-/// when the module loads in each env (main thread or worker_thread) and kept
-/// by native refs, so user code cannot reach the store afterwards: patching
-/// the `WeakMap` global or its prototype later changes nothing. Holders are
-/// only touched with define/delete own-property operations on an ordinary
-/// object, which run no user code. Frozen, sealed and non-extensible owners
-/// work, since nothing is added to the owner itself.
+/// when the module loads in each env (main thread or worker_thread; each load
+/// of the module gets its own env) and kept by native refs, so user code
+/// cannot reach the store afterwards: patching the `WeakMap` global or its
+/// prototype later changes nothing. Holders are only touched with
+/// define/delete own-property operations on an ordinary object, which run no
+/// user code. Frozen, sealed and non-extensible owners work, since nothing is
+/// added to the owner itself.
 ///
 /// Limit: code that replaces `WeakMap` or its prototype methods before this
 /// module loads is handed the store. It can drop entries, which loses events
@@ -1056,33 +1056,37 @@ thread_local! {
   static ANCHOR_STORES: RefCell<HashMap<usize, AnchorStore>> = RefCell::new(HashMap::new());
 }
 
-/// Create this env's anchor store when the module loads, before any user
-/// code can call into it. (Unit-test builds do not register module hooks.)
+/// Create this env's anchor store. Called from the module load hook
+/// (`video_frame::on_module_load`; napi-rs keeps one such hook per crate),
+/// before any user code can call into the module.
+///
+/// Never fails, so it cannot stop the other load-time work: without a store,
+/// callbacks fall back to strong refs. (Unit-test builds do not run the hook.)
 #[cfg_attr(test, allow(dead_code))]
-#[napi(module_exports)]
-pub fn install_callback_anchor_store(_exports: Object, env: Env) -> Result<()> {
+pub(crate) fn install_callback_anchor_store(env: &Env) {
   let key = env.raw() as usize;
-  match create_anchor_store(&env) {
-    Ok(store) => {
-      ANCHOR_STORES.with(|stores| stores.borrow_mut().insert(key, store));
-      // The env frees its own refs on teardown; only forget the handles.
-      env.add_env_cleanup_hook(key, |key| {
-        let _ = ANCHOR_STORES.try_with(|stores| stores.borrow_mut().remove(&key));
-      })?;
-      Ok(())
+  let Ok(store) = create_anchor_store(env) else {
+    // No usable WeakMap. Clear whatever the attempt threw.
+    let mut pending = false;
+    unsafe { sys::napi_is_exception_pending(env.raw(), &mut pending) };
+    if pending {
+      let mut exc = ptr::null_mut();
+      unsafe { sys::napi_get_and_clear_last_exception(env.raw(), &mut exc) };
     }
-    Err(_) => {
-      // No usable WeakMap: run without a store (strong-ref fallback) instead
-      // of failing the module load. Clear whatever the attempt threw.
-      let mut pending = false;
-      unsafe { sys::napi_is_exception_pending(env.raw(), &mut pending) };
-      if pending {
-        let mut exc = ptr::null_mut();
-        unsafe { sys::napi_get_and_clear_last_exception(env.raw(), &mut exc) };
-      }
-      Ok(())
+    return;
+  };
+  // The env frees its own refs on teardown; the hook only forgets the
+  // handles, so a later env at the same address never finds them.
+  let forget = env.add_env_cleanup_hook(key, |key| {
+    let _ = ANCHOR_STORES.try_with(|stores| stores.borrow_mut().remove(&key));
+  });
+  if forget.is_err() {
+    for r in [store.map, store.get, store.set] {
+      unsafe { sys::napi_delete_reference(env.raw(), r) };
     }
+    return;
   }
+  ANCHOR_STORES.with(|stores| stores.borrow_mut().insert(key, store));
 }
 
 #[cfg_attr(test, allow(dead_code))]
