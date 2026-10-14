@@ -76,8 +76,8 @@ function make4x2VideoFrame(rotation: number, flip: boolean): VideoFrame {
 // ============================================================================
 
 test('VideoFrame: oriented frame from ArrayBuffer', (t) => {
-  // Create an oriented VideoFrame with rotation=90 and flip=true
-  const frame = make4x2VideoFrame(90, true)
+  // Create an oriented VideoFrame with rotation=-315 (rounds to 90) and flip=true
+  const frame = make4x2VideoFrame(-315, true)
 
   // Verify orientation properties
   t.is(frame.visibleRect?.width, 4, 'visibleRect.width')
@@ -144,8 +144,8 @@ test('VideoFrame: combinations of rotation and flip', (t) => {
 test('VideoFrame: orientation of wrapped frame', (t) => {
   const origFrame = make4x2VideoFrame(0, false)
 
-  // Wrap with 90 rotation and flip
-  const frame = new VideoFrame(origFrame, { rotation: 90, flip: true })
+  // Wrap with -315 rotation (rounds to 90) and flip
+  const frame = new VideoFrame(origFrame, { rotation: -315, flip: true })
   origFrame.close()
 
   t.is(frame.visibleRect?.width, 4, 'visibleRect.width')
