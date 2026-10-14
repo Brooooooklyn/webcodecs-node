@@ -1660,6 +1660,9 @@ export interface PlaneLayout {
   stride: number
 }
 
+/** predefined RGB target color spaces. */
+export type PredefinedColorSpace = 'srgb' | 'display-p3'
+
 /**
  * Reset all hardware fallback state.
  *
@@ -1798,8 +1801,10 @@ export interface VideoEncoderSupport {
   config: VideoEncoderConfig
 }
 
-/** Options for copyTo operation */
+/** options for copyTo operation. */
 export interface VideoFrameCopyToOptions {
+  /** target RGB color space. */
+  colorSpace?: PredefinedColorSpace
   /** Target pixel format (for format conversion) */
   format?: VideoPixelFormat
   /** Region to copy (not yet implemented) */

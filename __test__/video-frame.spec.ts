@@ -343,3 +343,116 @@ test('DOMRectReadOnly: JSON carries normalized edges and preserves nonfinite geo
   const infinite = new DOMRectReadOnly(Infinity, Infinity, -Infinity, -Infinity)
   t.deepEqual([infinite.top, infinite.right, infinite.bottom, infinite.left], [NaN, NaN, NaN, NaN])
 })
+
+test('VideoFrame: explicit RGB copies preserve browser alpha and gamut conversion', async (t) => {
+  const samples = [
+    {
+      primaries: 'bt709',
+      rgba: [32, 128, 223, 128],
+      srgb: [32, 128, 223, 128],
+      p3: [63, 126, 216, 128],
+    },
+    {
+      primaries: 'smpte432',
+      rgba: [32, 128, 223, 128],
+      srgb: [0, 130, 230, 128],
+      p3: [32, 128, 223, 128],
+    },
+    {
+      primaries: 'bt709',
+      rgba: [128, 128, 128, 128],
+      srgb: [128, 128, 128, 128],
+      p3: [128, 127, 127, 128],
+    },
+    {
+      primaries: 'smpte432',
+      rgba: [128, 128, 128, 128],
+      srgb: [127, 127, 128, 128],
+      p3: [128, 128, 128, 128],
+    },
+  ] satisfies {
+    primaries: 'bt709' | 'smpte432'
+    rgba: number[]
+    srgb: number[]
+    p3: number[]
+  }[]
+  for (const sample of samples) {
+    for (const format of ['RGBA', 'BGRA'] satisfies ('RGBA' | 'BGRA')[]) {
+      const pack = (rgba: number[]) => (format === 'RGBA' ? rgba : [rgba[2], rgba[1], rgba[0], rgba[3]])
+      const input = new Uint8Array(pack(sample.rgba))
+      const frame = new VideoFrame(input, {
+        format,
+        codedWidth: 1,
+        codedHeight: 1,
+        timestamp: 0,
+        colorSpace: {
+          primaries: sample.primaries,
+          transfer: 'iec61966-2-1',
+          matrix: 'rgb',
+          fullRange: true,
+        },
+      })
+      try {
+        const raw = new Uint8Array(4)
+        await frame.copyTo(raw)
+        t.deepEqual(raw, input)
+        for (const colorSpace of ['srgb', 'display-p3'] satisfies ('srgb' | 'display-p3')[]) {
+          const output = new Uint8Array(4)
+          await frame.copyTo(output, { format, colorSpace })
+          const expected = pack(colorSpace === 'srgb' ? sample.srgb : sample.p3)
+          const label = `${sample.primaries}/${format}/${colorSpace}`
+          const gamutChange = (sample.primaries === 'bt709') !== (colorSpace === 'srgb')
+          const grayTie = sample.rgba.slice(0, 3).every((c) => c === 128)
+          if (!(gamutChange && grayTie)) {
+            t.deepEqual(Array.from(output), expected, label)
+          } else {
+            // A gamut change runs float maths that Chrome approximates (Skia's approximate pow).
+            // Gray 128 at alpha 128 lands exactly on 127.5 in exact maths, so Chrome's rounding of
+            // that tie is matched within 1, as everywhere else in the colour pipeline.
+            t.is(output[3], expected[3], label)
+            t.true(
+              [0, 1, 2].every((i) => Math.abs(output[i] - expected[i]) <= 1),
+              `${label}: ${Array.from(output).join()} vs ${expected.join()}`,
+            )
+          }
+        }
+      } finally {
+        frame.close()
+      }
+    }
+  }
+})
+
+test('VideoFrame: legacy SDR transfers use the browser RGB compatibility space', async (t) => {
+  for (const transfer of ['bt709', 'smpte170m'] satisfies ('bt709' | 'smpte170m')[]) {
+    for (const primaries of ['bt709', 'smpte432'] satisfies ('bt709' | 'smpte432')[]) {
+      for (const format of ['RGBA', 'BGRA'] satisfies ('RGBA' | 'BGRA')[]) {
+        const input = format === 'RGBA' ? [32, 128, 223, 255] : [223, 128, 32, 255]
+        const frame = new VideoFrame(Uint8Array.from(input), {
+          format,
+          codedWidth: 1,
+          codedHeight: 1,
+          timestamp: 0,
+          colorSpace: { primaries, transfer, matrix: 'rgb', fullRange: true },
+        })
+        try {
+          for (const colorSpace of ['srgb', 'display-p3'] satisfies ('srgb' | 'display-p3')[]) {
+            const output = new Uint8Array(4)
+            await frame.copyTo(output, { format: 'RGBA', colorSpace })
+            const expected =
+              primaries === 'bt709'
+                ? colorSpace === 'srgb'
+                  ? [32, 128, 223, 255]
+                  : [63, 126, 216, 255]
+                : colorSpace === 'srgb'
+                  ? [0, 130, 230, 255]
+                  : [32, 128, 223, 255]
+            t.deepEqual(Array.from(output), expected)
+          }
+        } finally {
+          frame.close()
+        }
+      }
+    }
+  }
+})
