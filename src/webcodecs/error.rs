@@ -684,6 +684,18 @@ pub fn enforce_range_unsigned_long_optional(
   Err(Error::new(Status::InvalidArg, message))
 }
 
+/// Convert f64 to u32 per WebIDL `unsigned long` (ECMAScript ToUint32)
+///
+/// NaN and ±Infinity give 0. Other values truncate and wrap modulo 2^32, so -90 gives
+/// 4294967206 and 2^32 + 90 gives 90.
+pub fn to_unsigned_long(value: f64) -> u32 {
+  if !value.is_finite() {
+    return 0;
+  }
+  // Exact: `%` on f64 is exact, and the result is an integer in [0, 2^32).
+  value.trunc().rem_euclid(4_294_967_296.0) as u32
+}
+
 /// Convert optional f64 to u64 per WebIDL `[EnforceRange] unsigned long long` algorithm
 pub fn enforce_range_unsigned_long_long_optional(
   env: &Env,
@@ -693,5 +705,36 @@ pub fn enforce_range_unsigned_long_long_optional(
   match value {
     Some(v) => Ok(Some(enforce_range_unsigned_long_long(env, v, field_name)?)),
     None => Ok(None),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::to_unsigned_long;
+
+  #[test]
+  fn to_unsigned_long_matches_to_uint32() {
+    // [input, ToUint32(input)]; the large values are what Chrome 155 echoes for
+    // VideoDecoderConfig.rotation.
+    let cases: [(f64, u32); 15] = [
+      (0.0, 0),
+      (-0.0, 0),
+      (90.0, 90),
+      (44.9, 44),
+      (-0.5, 0),
+      (-90.0, 4_294_967_206),
+      (-315.0, 4_294_966_981),
+      (4_294_967_295.0, 4_294_967_295),
+      (4_294_967_296.0 + 90.0, 90),
+      (-4_294_967_296.0, 0),
+      (1e20, 1_661_992_960),
+      (-1e20, 2_632_974_336),
+      (f64::NAN, 0),
+      (f64::INFINITY, 0),
+      (f64::NEG_INFINITY, 0),
+    ];
+    for (input, expected) in cases {
+      assert_eq!(to_unsigned_long(input), expected, "ToUint32({input})");
+    }
   }
 }
