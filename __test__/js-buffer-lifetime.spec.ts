@@ -178,7 +178,7 @@ test('ImageDecoder copies BufferSource data and ReadableStream chunks before JS 
   t.deepEqual(result, { buffered: [320, 240], streamed: [320, 240] })
 })
 
-test('description bytes are copied before later config getters run', (t) => {
+test('a description shrunk by a later config getter is never read from freed pages', (t) => {
   const result = runChild(`${CHILD_PRELUDE}
     const { Mp4Demuxer, VideoDecoder, Mp4Muxer, WebMMuxer, EncodedVideoChunk } = lib;
     (async () => {
@@ -189,6 +189,8 @@ test('description bytes are copied before later config getters run', (t) => {
       const out = {};
 
       // Each getter below runs after the description was read and shrinks it.
+      // The decoder copies the description after its getters ran (like
+      // Chrome), the muxers when they read it: neither reads the freed pages.
       let desc = resizable(description);
       const decoder = new VideoDecoder({ output: (frame) => frame.close(), error: () => {} });
       decoder.configure({ codec, description: desc, get rotation() { desc.buffer.resize(0); return 0; } });
@@ -513,6 +515,25 @@ test('AudioDecoder rejects description: null with a TypeError, like Chrome', asy
   decoder.close()
   // Chrome rejects; the async wrapper also accepts a synchronous throw.
   await t.throwsAsync(async () => AudioDecoder.isConfigSupported(nullDescription), { instanceOf: TypeError })
+})
+
+test('VideoDecoder copies the description after the other config getters ran, like Chrome', async (t) => {
+  const { codec, description } = await avcConfig()
+  // Chrome 155 reads every member first and copies the bytes when it uses the
+  // config, so a getter that runs after description was read changes them.
+  for (const getter of ['codedWidth', 'optimizeForLatency', 'rotation', 'flip']) {
+    const changed = own(description)
+    const config = { codec, description: changed }
+    Object.defineProperty(config, getter, {
+      enumerable: true,
+      get() {
+        changed[0] = 0x77
+        return undefined
+      },
+    })
+    const support = await VideoDecoder.isConfigSupported(config)
+    t.is(new Uint8Array(support.config.description as ArrayBuffer)[0], 0x77, getter)
+  }
 })
 
 test('isConfigSupported returns a copy of the description, as an ArrayBuffer', async (t) => {

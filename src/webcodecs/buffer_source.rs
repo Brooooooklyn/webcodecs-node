@@ -213,7 +213,7 @@ pub(crate) unsafe fn inspect(
 
 /// Whether `value` is a detached ArrayBuffer. False for anything else,
 /// including a SharedArrayBuffer (which cannot be detached).
-pub(crate) fn is_detached_array_buffer(env: sys::napi_env, value: sys::napi_value) -> Result<bool> {
+fn is_detached_array_buffer(env: sys::napi_env, value: sys::napi_value) -> Result<bool> {
   let mut detached = false;
   check_status!(unsafe { sys::napi_is_detached_arraybuffer(env, value, &mut detached) })?;
   Ok(detached)
@@ -244,41 +244,38 @@ pub(crate) fn copy_required_data(env: sys::napi_env, obj: &Object) -> Result<Vec
 }
 
 /// An optional BufferSource dictionary member, such as a decoder config's
-/// `description`.
+/// `description`, after [`copy_member`].
 pub(crate) enum BufferSourceMember {
   /// `undefined`.
   Absent,
   /// A value that is not a BufferSource. This includes `null`: the member is
   /// not nullable, so Chrome throws a TypeError for it.
   NotBufferSource,
-  /// A BufferSource. Its bytes were copied when the member was read.
-  Copied {
-    bytes: Vec<u8>,
-    /// The underlying ArrayBuffer, to check later whether a getter that ran
-    /// after this member was read detached it. Valid for the current native
-    /// call only.
-    buffer: sys::napi_value,
-  },
+  /// A BufferSource whose ArrayBuffer is detached (W3C: the config is not
+  /// valid).
+  Detached,
+  /// A copy of the BufferSource's bytes.
+  Copied(Vec<u8>),
 }
 
-/// Reads an optional BufferSource member (one property read, so a getter runs
-/// once) and copies its bytes into native memory right away.
-pub(crate) fn read_buffer_source_member(
-  env: sys::napi_env,
-  obj: &Object,
-  name: &str,
-) -> Result<BufferSourceMember> {
-  let value: Unknown = obj.get_named_property(name)?;
+/// Copies an optional BufferSource member, read earlier with a single
+/// property read so that a getter runs once.
+///
+/// Call it once every other member of the dictionary was read. Chrome reads
+/// all members first and copies the bytes when it uses the config, so a later
+/// getter that rewrites, resizes or detaches the buffer changes what it gets.
+/// Never runs JS, so no pointer into the buffer outlives this call.
+pub(crate) fn copy_member(env: sys::napi_env, value: &Unknown) -> Result<BufferSourceMember> {
   if value.get_type()? == ValueType::Undefined {
     return Ok(BufferSourceMember::Absent);
   }
-  Ok(match unsafe { inspect(env, value.raw())? } {
-    Some(raw) => BufferSourceMember::Copied {
-      bytes: raw.to_vec(),
-      buffer: raw.buffer,
-    },
-    None => BufferSourceMember::NotBufferSource,
-  })
+  let Some(raw) = (unsafe { inspect(env, value.raw())? }) else {
+    return Ok(BufferSourceMember::NotBufferSource);
+  };
+  if is_detached_array_buffer(env, raw.buffer)? {
+    return Ok(BufferSourceMember::Detached);
+  }
+  Ok(BufferSourceMember::Copied(raw.to_vec()))
 }
 
 /// Locates the destination of a `copyTo()` call with engine calls.
