@@ -1,14 +1,39 @@
 use crossbeam::channel::Sender;
 use napi::bindgen_prelude::{Error, Result, Status};
 use std::sync::{
-  Arc,
+  Arc, OnceLock,
   atomic::{AtomicBool, Ordering},
 };
+
+use super::error::DOMExceptionName;
+
+/// Set when a pending flush is cancelled, with the error it rejects with.
+#[derive(Default)]
+pub(crate) struct FlushAbort {
+  aborted: AtomicBool,
+  /// The error that closed the codec. Unset when close() or reset() aborted
+  /// the flush.
+  failure: OnceLock<DOMExceptionName>,
+}
+
+impl FlushAbort {
+  pub(crate) fn is_aborted(&self) -> bool {
+    self.aborted.load(Ordering::SeqCst)
+  }
+
+  /// The DOMException name and message an aborted flush rejects with.
+  pub(crate) fn rejection(&self) -> (DOMExceptionName, &'static str) {
+    match self.failure.get() {
+      Some(name) => (*name, "The codec was closed by an error"),
+      None => (DOMExceptionName::AbortError, "The operation was aborted"),
+    }
+  }
+}
 
 struct PendingFlush {
   id: u64,
   response_sender: Sender<Result<()>>,
-  abort_flag: Arc<AtomicBool>,
+  abort: Arc<FlushAbort>,
   buffering_outputs: bool,
 }
 
@@ -25,14 +50,14 @@ impl FlushTracker {
   pub(crate) fn register(
     &mut self,
     response_sender: Sender<Result<()>>,
-    abort_flag: Arc<AtomicBool>,
+    abort: Arc<FlushAbort>,
   ) -> u64 {
     let id = self.next_id;
     self.next_id = self.next_id.wrapping_add(1);
     self.pending.push(PendingFlush {
       id,
       response_sender,
-      abort_flag,
+      abort,
       buffering_outputs: true,
     });
     self.buffering_count += 1;
@@ -67,16 +92,30 @@ impl FlushTracker {
     self.buffering_count != 0
   }
 
+  /// close() or reset(): every pending flush rejects with AbortError.
   pub(crate) fn abort_all(&mut self) {
+    self.cancel_all(None);
+  }
+
+  /// An error closed the codec: every pending flush rejects with `name`.
+  pub(crate) fn fail_all(&mut self, name: DOMExceptionName) {
+    self.cancel_all(Some(name));
+  }
+
+  fn cancel_all(&mut self, failure: Option<DOMExceptionName>) {
     self.buffering_count = 0;
     for flush in self.pending.drain(..) {
-      flush.abort_flag.store(true, Ordering::SeqCst);
+      if let Some(name) = failure {
+        let _ = flush.abort.failure.set(name);
+      }
+      flush.abort.aborted.store(true, Ordering::SeqCst);
+      let (name, message) = flush.abort.rejection();
       // The worker may already have filled this bounded channel. Never block
-      // reset() on the main thread; the abort flag still makes the resolver
-      // reject if the success response won the race.
+      // the main thread; the abort flag still makes the resolver reject if
+      // the success response won the race.
       let _ = flush.response_sender.try_send(Err(Error::new(
         Status::GenericFailure,
-        "AbortError: The operation was aborted",
+        format!("{}: {}", name.as_str(), message),
       )));
     }
   }
@@ -97,8 +136,8 @@ mod tests {
     let mut tracker = FlushTracker::default();
     let (sender_a, _receiver_a) = channel::bounded(1);
     let (sender_b, _receiver_b) = channel::bounded(1);
-    let id_a = tracker.register(sender_a, Arc::new(AtomicBool::new(false)));
-    let _id_b = tracker.register(sender_b, Arc::new(AtomicBool::new(false)));
+    let id_a = tracker.register(sender_a, Arc::new(FlushAbort::default()));
+    let _id_b = tracker.register(sender_b, Arc::new(FlushAbort::default()));
     assert!(!tracker.pending.is_empty());
     tracker.finish(id_a);
     assert_eq!(tracker.pending.len(), 1);
@@ -109,17 +148,34 @@ mod tests {
     let mut tracker = FlushTracker::default();
     let (sender_a, receiver_a) = channel::bounded(1);
     let (sender_b, receiver_b) = channel::bounded(1);
-    let flag_a = Arc::new(AtomicBool::new(false));
-    let flag_b = Arc::new(AtomicBool::new(false));
+    let flag_a = Arc::new(FlushAbort::default());
+    let flag_b = Arc::new(FlushAbort::default());
     tracker.register(sender_a, flag_a.clone());
     tracker.register(sender_b, flag_b.clone());
 
     tracker.abort_all();
 
-    assert!(flag_a.load(Ordering::SeqCst));
-    assert!(flag_b.load(Ordering::SeqCst));
+    assert!(flag_a.is_aborted());
+    assert!(flag_b.is_aborted());
+    assert_eq!(flag_a.rejection().0.as_str(), "AbortError");
     assert!(receiver_a.recv().unwrap().is_err());
     assert!(receiver_b.recv().unwrap().is_err());
+    assert!(tracker.pending.is_empty());
+  }
+
+  #[test]
+  fn fails_every_pending_flush_with_the_codec_error() {
+    let mut tracker = FlushTracker::default();
+    let (sender, receiver) = channel::bounded(1);
+    let abort = Arc::new(FlushAbort::default());
+    tracker.register(sender, abort.clone());
+
+    tracker.fail_all(DOMExceptionName::NotSupportedError);
+
+    assert!(abort.is_aborted());
+    assert_eq!(abort.rejection().0.as_str(), "NotSupportedError");
+    let error = receiver.recv().unwrap().unwrap_err();
+    assert!(error.reason.starts_with("NotSupportedError:"));
     assert!(tracker.pending.is_empty());
   }
 
@@ -127,7 +183,7 @@ mod tests {
   fn stops_buffering_before_delivery_without_finishing_flush() {
     let mut tracker = FlushTracker::default();
     let (sender, _receiver) = channel::bounded(1);
-    let id = tracker.register(sender, Arc::new(AtomicBool::new(false)));
+    let id = tracker.register(sender, Arc::new(FlushAbort::default()));
 
     assert!(tracker.should_buffer_outputs());
     tracker.begin_output_delivery(id);
@@ -143,8 +199,8 @@ mod tests {
     let mut tracker = FlushTracker::default();
     let (sender_a, _receiver_a) = channel::bounded(1);
     let (sender_b, _receiver_b) = channel::bounded(1);
-    let id_a = tracker.register(sender_a, Arc::new(AtomicBool::new(false)));
-    let id_b = tracker.register(sender_b, Arc::new(AtomicBool::new(false)));
+    let id_a = tracker.register(sender_a, Arc::new(FlushAbort::default()));
+    let id_b = tracker.register(sender_b, Arc::new(FlushAbort::default()));
 
     tracker.begin_output_delivery(id_a);
     assert!(tracker.should_buffer_outputs());

@@ -5,10 +5,12 @@
  * Expected behavior is what Chrome 155 does:
  * - close()/reset() return without waiting for queued work. No output or error
  *   callback for earlier work runs afterwards; one dequeue event follows when
- *   work was still queued.
+ *   work was still queued or a dequeue event was still on its way.
  * - A codec only counts as closed by an error once its error callback ran.
  *   Before that, close()/reset() succeed and drop the error, and a flush fails
  *   with that error. After it, flush() fails with InvalidStateError.
+ * - Except: reset() keeps the NotSupportedError configure() reports for an
+ *   unsupported config. It still arrives and closes the codec; close() drops it.
  */
 
 import { execFileSync } from 'node:child_process'
@@ -438,6 +440,144 @@ test('decoders reject a flush issued before the error callback with that error',
     const codec = make((entry) => log.push(entry))
     await codec.flush().catch((error: unknown) => log.push(`flush:${(error as DOMException).name}`))
     t.deepEqual(log, ['error:NotSupportedError', 'flush:NotSupportedError'], name)
+  }
+})
+
+// ============================================================================
+// An unsupported config: reset() keeps the error, close() drops it
+// ============================================================================
+
+interface UnsupportedConfigCase {
+  name: string
+  // Creates an unconfigured codec. The error callback records the codec state it sees.
+  make(record: Record): TeardownCodec
+  configureBogus(codec: TeardownCodec): void
+  configureGood(codec: TeardownCodec): void
+  // Queues work after configureGood().
+  queue(codec: TeardownCodec): void
+}
+
+const unsupportedConfigCases: UnsupportedConfigCase[] = [
+  {
+    name: 'VideoEncoder',
+    make: (record) => {
+      const codec: VideoEncoder = new VideoEncoder({
+        output: () => record('output'),
+        error: (e) => record(`error:${e.name}:${codec.state}`),
+      })
+      return codec
+    },
+    configureBogus: (codec) => (codec as VideoEncoder).configure({ codec: 'bogus', width: 64, height: 48 }),
+    configureGood: (codec) =>
+      (codec as VideoEncoder).configure({
+        codec: 'vp8',
+        width: 64,
+        height: 48,
+        hardwareAcceleration: 'prefer-software',
+      }),
+    queue: (codec) => {
+      for (let i = 0; i < 3; i++) {
+        const frame = i420Frame(64, 48, i)
+        ;(codec as VideoEncoder).encode(frame, { keyFrame: true })
+        frame.close()
+      }
+    },
+  },
+  {
+    name: 'VideoDecoder',
+    make: (record) => {
+      const codec: VideoDecoder = new VideoDecoder({
+        output: (frame) => {
+          record('output')
+          frame.close()
+        },
+        error: (e) => record(`error:${e.name}:${codec.state}`),
+      })
+      return codec
+    },
+    configureBogus: (codec) => (codec as VideoDecoder).configure({ codec: 'bogus' }),
+    configureGood: (codec) => (codec as VideoDecoder).configure({ codec: 'vp8' }),
+    queue: () => {},
+  },
+  {
+    name: 'AudioEncoder',
+    make: (record) => {
+      const codec: AudioEncoder = new AudioEncoder({
+        output: () => record('output'),
+        error: (e) => record(`error:${e.name}:${codec.state}`),
+      })
+      return codec
+    },
+    configureBogus: (codec) =>
+      (codec as AudioEncoder).configure({ codec: 'bogus', sampleRate: 48_000, numberOfChannels: 2 }),
+    configureGood: (codec) =>
+      (codec as AudioEncoder).configure({ codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 }),
+    queue: (codec) => {
+      for (let i = 0; i < 3; i++) {
+        const data = audioData(i)
+        ;(codec as AudioEncoder).encode(data)
+        data.close()
+      }
+    },
+  },
+  {
+    name: 'AudioDecoder',
+    make: (record) => {
+      const codec: AudioDecoder = new AudioDecoder({
+        output: (data) => {
+          record('output')
+          data.close()
+        },
+        error: (e) => record(`error:${e.name}:${codec.state}`),
+      })
+      return codec
+    },
+    configureBogus: (codec) =>
+      (codec as AudioDecoder).configure({ codec: 'bogus', sampleRate: 48_000, numberOfChannels: 2 }),
+    configureGood: (codec) =>
+      (codec as AudioDecoder).configure({ codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 }),
+    queue: () => {},
+  },
+]
+
+// Chrome queues the NotSupportedError configure() finds as a task that closes the
+// codec when it runs. reset() does not cancel that task; close() makes it a no-op.
+test('reset() keeps the NotSupportedError from configure(), which closes the codec when it arrives', async (t) => {
+  for (const config of unsupportedConfigCases) {
+    const log: string[] = []
+    const codec = config.make((entry) => log.push(entry))
+    config.configureBogus(codec)
+    codec.reset()
+    t.is(codec.state, 'unconfigured', `${config.name}: state after reset()`)
+
+    // The codec works again until the error arrives, then the error closes it and
+    // drops this work.
+    config.configureGood(codec)
+    config.queue(codec)
+    const flush = await codec.flush().then(
+      () => 'ok',
+      (error: unknown) => (error as DOMException).name,
+    )
+
+    t.is(flush, 'NotSupportedError', `${config.name}: flush`)
+    t.deepEqual(log, ['error:NotSupportedError:closed'], config.name)
+    t.is(codec.state, 'closed', config.name)
+    t.throws(() => codec.reset(), { name: 'InvalidStateError' }, `${config.name}: reset() after the error`)
+  }
+})
+
+test('close() drops the NotSupportedError from configure(), also after reset()', async (t) => {
+  for (const config of unsupportedConfigCases) {
+    for (const resetFirst of [false, true]) {
+      const log: string[] = []
+      const codec = config.make((entry) => log.push(entry))
+      config.configureBogus(codec)
+      if (resetFirst) codec.reset()
+      codec.close()
+      await delay(200)
+      t.deepEqual(log, [], `${config.name}${resetFirst ? ' after reset()' : ''}`)
+      t.is(codec.state, 'closed', config.name)
+    }
   }
 })
 
