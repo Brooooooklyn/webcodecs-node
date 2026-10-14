@@ -1023,8 +1023,9 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
 
   // Demux and decode all frames.
   let (context, mut frames, video_streams) = decode_image_data(codec_id, &data_bytes)?;
-  // One video stream with one frame: no animation, alpha or other auxiliary image
-  let still = video_streams == 1 && frames.len() == 1;
+  // One video stream with one frame: no animation, alpha or other auxiliary image. An
+  // 'avis' AVIF is an animation even when only its first frame has arrived.
+  let still = video_streams == 1 && frames.len() == 1 && !avif_is_sequence(&data_bytes);
 
   // Apply preferAnimation: if false and format supports animation, only keep first frame
   if prefer_animation == Some(false) && !frames.is_empty() {
@@ -1102,6 +1103,15 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
   guard.cached_data_len = data_bytes.len();
 
   Ok(())
+}
+
+/// Whether an AVIF's major brand is 'avis', an image sequence. Chrome then decodes its
+/// track, not the still image, and resolves no frame before the track header ('moov').
+/// The ftyp box comes first, so this is known before any frame. The frame count is
+/// not: a stream can stop after the first frame, or before a 'moov' that follows the
+/// image data, where FFmpeg sees one stream with one frame.
+fn avif_is_sequence(data: &[u8]) -> bool {
+  data.get(4..12) == Some(&b"ftypavis"[..])
 }
 
 /// The alpha hint in a WebP header: the VP8X alpha flag, or the alpha_is_used bit of
@@ -1410,7 +1420,8 @@ fn normalize_frame_timing(frames: &mut [Frame], time_base: (i32, i32)) {
 #[cfg(test)]
 mod tests {
   use super::{
-    gif_repetition_count, jpeg_yuv_hint, normalize_frame_timing, png_alpha_hint, webp_alpha_hint,
+    avif_is_sequence, gif_repetition_count, jpeg_yuv_hint, normalize_frame_timing, png_alpha_hint,
+    webp_alpha_hint,
   };
   use crate::codec::Frame;
   use crate::ffi::types::AV_NOPTS_VALUE;
@@ -1531,6 +1542,15 @@ mod tests {
     assert_eq!(jpeg_yuv_hint(&jpeg(0xC0, &[0x22, 0x11, 0x11])[..15]), None);
     assert_eq!(jpeg_yuv_hint(&[0xFF, 0xD8, 0xFF, 0xDA]), None);
     assert_eq!(jpeg_yuv_hint(b"GIF89a"), None);
+  }
+
+  #[test]
+  fn reads_the_avif_sequence_brand() {
+    // only the major brand counts: Chrome decodes the still image of an 'avif' file
+    // that also lists 'avis'
+    assert!(avif_is_sequence(b"\0\0\0\x1cftypavis\0\0\0\0avifavis"));
+    assert!(!avif_is_sequence(b"\0\0\0\x1cftypavif\0\0\0\0avifavis"));
+    assert!(!avif_is_sequence(b"\0\0\0\x1cftypav"));
   }
 
   #[test]
