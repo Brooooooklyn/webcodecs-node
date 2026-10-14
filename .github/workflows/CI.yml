@@ -199,9 +199,10 @@ jobs:
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
+      # Fork pull requests get no id-token: write, so attestation cannot run there.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4
-        if: matrix.settings.target != 'wasm32-wasip1-threads'
+        if: matrix.settings.target != 'wasm32-wasip1-threads' && github.event.pull_request.head.repo.fork != true
         with:
           subject-path: '*.node'
       - name: Upload artifact
@@ -287,8 +288,10 @@ jobs:
           export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
           pnpm build --target armv7-unknown-linux-gnueabihf
 
+      # Fork pull requests get no id-token: write, so attestation cannot run there.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4
+        if: github.event.pull_request.head.repo.fork != true
         with:
           subject-path: '*.node'
 
