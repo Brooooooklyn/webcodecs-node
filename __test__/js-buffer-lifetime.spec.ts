@@ -380,6 +380,45 @@ test('chunk and AudioData constructors copy the real view bytes', (t) => {
   )
 })
 
+// Node.js before 24.13 (and Node.js 22 with --js-float16array) has Float16Array
+// but does not report its type to native code, so its byte length is unknown
+// there: such a view must be rejected, never read at a guessed length.
+test('a Float16Array is read at its full byte length, or rejected where Node-API cannot size it', (t) => {
+  const Float16 = (
+    globalThis as { Float16Array?: new (buffer: ArrayBuffer, byteOffset: number, length: number) => ArrayBufferView }
+  ).Float16Array
+  if (!Float16) {
+    t.pass('this runtime has no Float16Array')
+    return
+  }
+  const backing = new Uint8Array(64).map((_, i) => i)
+  const sized = (fn: () => number) => {
+    try {
+      return fn()
+    } catch (e) {
+      t.true(e instanceof TypeError, String(e))
+      return 'TypeError'
+    }
+  }
+  const read = [
+    sized(
+      () => new EncodedVideoChunk({ type: 'key', timestamp: 0, data: new Float16(backing.buffer, 0, 8) }).byteLength,
+    ),
+    sized(
+      () => new EncodedAudioChunk({ type: 'key', timestamp: 0, data: new Float16(backing.buffer, 0, 8) }).byteLength,
+    ),
+  ]
+  const chunk = new EncodedVideoChunk({ type: 'key', timestamp: 0, data: backing.subarray(0, 16) })
+  const destination = new Uint8Array(32)
+  const written = sized(() => {
+    chunk.copyTo(new Float16(destination.buffer, 0, 8))
+    return destination.findLastIndex((b) => b !== 0) + 1
+  })
+  const reported = typeof read[0] === 'number'
+  t.deepEqual(read, reported ? [16, 16] : ['TypeError', 'TypeError'])
+  t.is(written, reported ? 16 : 'TypeError')
+})
+
 // ============================================================================
 // ImageDecoder: copy at construction, like Chrome
 // ============================================================================
