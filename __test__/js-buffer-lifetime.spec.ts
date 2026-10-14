@@ -146,26 +146,46 @@ test('Mp4Demuxer, MkvDemuxer and WebMDemuxer.loadBuffer copy the bytes', (t) => 
   }
 })
 
-test('loadBuffer rejects a loaded or closed demuxer without copying the input first', (t) => {
-  // Peak RSS shows whether the rejected call copied the 256 MiB input: the
-  // copy would raise it by 256 MiB, nothing else in the child comes close.
+test('loadBuffer rejects without copying the input first: loading, loaded, demuxing or closed', (t) => {
+  // Peak RSS shows whether a rejected call copied the 256 MiB input: one copy
+  // would raise it by 256 MiB, nothing else in the child comes close. Each
+  // call below happens while the demuxer is in that state, so the result does
+  // not depend on timing.
   const result = runChild(`${CHILD_PRELUDE}
     const { Mp4Demuxer } = lib;
+    const settle = (p) => p.then(() => 'resolved', (e) => e.message);
     (async () => {
-      const demuxer = new Mp4Demuxer({ videoOutput: () => {}, error: () => {} });
-      await demuxer.loadBuffer(new Uint8Array(fs.readFileSync('__test__/fixtures/wpt/h264.mp4')));
+      const path = '__test__/fixtures/wpt/h264.mp4';
+      const mp4 = new Uint8Array(fs.readFileSync(path));
       const big = new Uint8Array(256 * 1024 * 1024).fill(1);
       const peakBefore = process.resourceUsage().maxRSS;
-      const loaded = await demuxer.loadBuffer(big).then(() => 'resolved', (e) => e.message);
+      let demuxing;
+      const demuxer = new Mp4Demuxer({
+        // Demuxing: asked from the first output callback of demuxAsync().
+        videoOutput: () => { demuxing ??= settle(demuxer.loadBuffer(big)); },
+        error: () => {},
+      });
+      const other = new Mp4Demuxer({ error: () => {} });
+      // Loading: asked before a loadBuffer() and a load() have finished.
+      const loads = [settle(demuxer.loadBuffer(mp4)), settle(other.load(path))];
+      const loading = [settle(demuxer.loadBuffer(big)), settle(other.loadBuffer(big))];
+      const loaded = await Promise.all(loads);
+      other.close();
+      const whileLoaded = await settle(demuxer.loadBuffer(big));
+      await demuxer.demuxAsync();
       demuxer.close();
-      const closed = await demuxer.loadBuffer(big).then(() => 'resolved', (e) => e.message);
+      const closed = await settle(demuxer.loadBuffer(big));
       const peakGrowthMiB = Math.round((process.resourceUsage().maxRSS - peakBefore) / 1024);
-      print({ loaded, closed, copied: peakGrowthMiB >= 128 });
+      print({ loaded, loading: await Promise.all(loading), whileLoaded, demuxing: await demuxing, closed, copied: peakGrowthMiB >= 128 });
     })();
   `)
+  const rejected = 'Demuxer already loaded. Call close() first.'
   t.deepEqual(result, {
-    loaded: 'Demuxer already loaded. Call close() first.',
-    closed: 'Demuxer already loaded. Call close() first.',
+    loaded: ['resolved', 'resolved'],
+    loading: [rejected, rejected],
+    whileLoaded: rejected,
+    demuxing: rejected,
+    closed: rejected,
     copied: false,
   })
 })
@@ -687,5 +707,28 @@ test('loadBuffer keeps its argument check and its rejection for every demuxer', 
     await t.throwsAsync(demuxer.loadBuffer(bytes), { message: 'Demuxer already loaded. Call close() first.' })
     demuxer.close()
     await t.throwsAsync(demuxer.loadBuffer(bytes), { message: 'Demuxer already loaded. Call close() first.' })
+  }
+})
+
+test('load and loadBuffer take one load at a time, and a failed load lets a later one try again', async (t) => {
+  const path = join(__dirname, 'fixtures/wpt/h264.mp4')
+  const rejected = { message: 'Demuxer already loaded. Call close() first.' }
+  for (const Demuxer of [Mp4Demuxer, MkvDemuxer, WebMDemuxer]) {
+    const demuxer = new Demuxer({ videoOutput: () => {}, error: () => {} })
+    await t.throwsAsync(demuxer.load('/nonexistent/file.mp4'), { message: /^Failed to open file/ })
+    await t.throwsAsync(demuxer.loadBuffer(new Uint8Array(16)), { message: /^Failed to open buffer/ })
+    t.is(demuxer.state, 'unloaded', Demuxer.name)
+    // A second call while the first still runs is rejected.
+    const loading = demuxer.load(path)
+    const second = [
+      t.throwsAsync(demuxer.load(path), rejected),
+      t.throwsAsync(demuxer.loadBuffer(own(H264_MP4)), rejected),
+    ]
+    await loading
+    await Promise.all(second)
+    t.is(demuxer.state, 'ready', Demuxer.name)
+    t.truthy(demuxer.videoDecoderConfig, Demuxer.name)
+    demuxer.close()
+    await t.throwsAsync(demuxer.load(path), rejected)
   }
 })
