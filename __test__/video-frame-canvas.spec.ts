@@ -508,10 +508,18 @@ test('VideoFrame: opaque float encode rejects asynchronously and closes without 
 // RGBA16Float module exports: native lifetimes and argument checks
 // ============================================================================
 
+// The child's stdout carries the test result, so it must not inherit WEBCODECS_LOG
+// (CI sets it, and the log output goes to stdout).
+function childEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env }
+  delete env.WEBCODECS_LOG
+  return env
+}
+
 // Runs `script` in a child Node process, so a native crash or abort fails the
 // test instead of killing the ava worker. The script loads ./index.js itself
 // and writes its result with fs.writeSync before exiting.
-function runChild(script: string, env: NodeJS.ProcessEnv = process.env): string {
+function runChild(script: string, env: NodeJS.ProcessEnv = childEnv()): string {
   return execFileSync(process.execPath, ['--expose-gc', '-e', script], {
     cwd: process.cwd(),
     env,
