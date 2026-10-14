@@ -81,6 +81,9 @@ impl RawBufferSource {
 }
 
 /// Bytes per element for a `napi_typedarray_type` (values fixed by the Node-API ABI).
+///
+/// `None` for a type this table does not know, including
+/// [`TYPED_ARRAY_TYPE_NOT_REPORTED`].
 fn typed_array_element_size(kind: sys::napi_typedarray_type) -> Option<usize> {
   Some(match kind {
     // Int8Array, Uint8Array, Uint8ClampedArray
@@ -97,10 +100,24 @@ fn typed_array_element_size(kind: sys::napi_typedarray_type) -> Option<usize> {
   })
 }
 
+/// Starting value for the type out-parameter of `napi_get_typedarray_info`.
+///
+/// Runtimes older than the Node-API type of a TypedArray leave the
+/// out-parameter untouched: Node.js before 24.13 for a `Float16Array` (and
+/// Node.js 22 with `--js-float16array`). A starting value that is a real type
+/// would then give the wrong element size, and so the wrong byte length.
+const TYPED_ARRAY_TYPE_NOT_REPORTED: sys::napi_typedarray_type = -1;
+
+const UNSUPPORTED_TYPED_ARRAY: &str =
+  "Unsupported TypedArray type on this runtime; pass a Uint8Array or DataView over the same bytes";
+
 /// Locates the bytes of `value` with engine calls.
 ///
 /// Returns `Ok(None)` when `value` is not an ArrayBuffer, SharedArrayBuffer,
 /// TypedArray or DataView. Never runs JS.
+///
+/// Throws a TypeError for a TypedArray whose type the runtime does not report
+/// (see [`TYPED_ARRAY_TYPE_NOT_REPORTED`]): its byte length is unknown.
 ///
 /// # Safety
 ///
@@ -112,7 +129,7 @@ pub(crate) unsafe fn inspect(
   let mut is = false;
   check_status!(unsafe { sys::napi_is_typedarray(env, value, &mut is) })?;
   if is {
-    let mut kind = 0;
+    let mut kind = TYPED_ARRAY_TYPE_NOT_REPORTED;
     let mut length = 0usize;
     let mut data = ptr::null_mut();
     let mut buffer = ptr::null_mut();
@@ -129,8 +146,9 @@ pub(crate) unsafe fn inspect(
         &mut byte_offset,
       )
     })?;
-    let element_size = typed_array_element_size(kind)
-      .ok_or_else(|| Error::new(Status::InvalidArg, "Unsupported TypedArray type"))?;
+    let Some(element_size) = typed_array_element_size(kind) else {
+      return Err(throw_type_error(env, UNSUPPORTED_TYPED_ARRAY));
+    };
     let len = length
       .checked_mul(element_size)
       .ok_or_else(|| Error::new(Status::InvalidArg, "TypedArray is too large"))?;
@@ -324,5 +342,26 @@ impl FromNapiValue for Uint8ArrayCopy {
 impl ToNapiValue for Uint8ArrayCopy {
   unsafe fn to_napi_value(env: sys::napi_env, val: Self) -> Result<sys::napi_value> {
     unsafe { Uint8Array::to_napi_value(env, Uint8Array::new(val.0)) }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn element_size_is_unknown_for_an_unreported_type() {
+    // The sentinel must not be a real type, or an unreported TypedArray would
+    // get that type's element size.
+    assert_eq!(
+      typed_array_element_size(TYPED_ARRAY_TYPE_NOT_REPORTED),
+      None
+    );
+    assert_eq!(
+      typed_array_element_size(sys::TypedarrayType::uint8_array),
+      Some(1)
+    );
+    assert_eq!(typed_array_element_size(11), Some(2));
+    assert_eq!(typed_array_element_size(12), None);
   }
 }
