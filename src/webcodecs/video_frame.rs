@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 static NEXT_FRAME_ID: AtomicU64 = AtomicU64::new(1);
-// Callbacks are weak native references anchored by the frame's traceable listener map.
-// This keeps a callback that captures its frame collectible with that frame.
+// Callbacks are weak native references kept alive by the per-env anchor store in
+// event_target.rs. This keeps a callback that captures its frame collectible with that frame.
 struct FrameCloseObservers {
   env: napi::sys::napi_env,
   next_id: u64,
@@ -5076,7 +5076,8 @@ pub fn register_video_frame_close_observer(
     return throw_invalid_state_error(&env, "VideoFrame is closed");
   }
   let callback = callback.borrow_back(&env)?;
-  // Reserve the id under a short borrow. Anchoring runs JS, which may close or
+  // Reserve the id under a short borrow. Anchoring can run JS when code that ran
+  // before this module loaded replaced WeakMap methods, and that JS may close or
   // register on frames, so no borrow is held across it.
   let id = CLOSE_OBSERVERS.with(|registry| {
     let mut registry = registry.borrow_mut();
@@ -5097,14 +5098,6 @@ pub fn register_video_frame_close_observer(
     id,
     callback.raw(),
   )?;
-  // A frozen frame cannot hold the listener map: anchoring leaves a TypeError
-  // pending and a strong reference. Drop the reference so nothing is registered.
-  let mut pending = false;
-  unsafe { napi::sys::napi_is_exception_pending(env.raw(), &mut pending) };
-  if pending {
-    unsafe { napi::sys::napi_delete_reference(env.raw(), reference as napi::sys::napi_ref) };
-    return Ok(());
-  }
   // JS that ran while anchoring may have closed the frame.
   if frame.closed()? {
     super::event_target::release_callback(&env, Some(frame.value), id, reference);
