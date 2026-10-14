@@ -273,7 +273,7 @@ for (const teardown of ['close', 'reset'] as const) {
       // Only microtasks run in this loop, so the dequeue events the worker fires
       // cannot be delivered before the teardown.
       const deadline = Date.now() + 60_000
-      while (queueSize(codec) > 0 && Date.now() < deadline) await null
+      while (queueSize(codec) > 0 && Date.now() < deadline) await Promise.resolve()
       t.is(queueSize(codec), 0, `${codecCase.name}: the worker emptied the queue`)
       t.deepEqual(log.entries(), [], `${codecCase.name}: nothing delivered before ${teardown}()`)
 
