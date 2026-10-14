@@ -1,13 +1,15 @@
 /**
  * VideoFrame geometry parity with Chrome
  *
- * Display size validation, rotation rounding and orientation after close.
+ * Display size validation, rotation rounding, orientation after close, and decoder
+ * displayAspectWidth/displayAspectHeight.
  * Expected values were recorded in Chrome 155.
  */
 
 import test from 'ava'
 
-import { VideoFrame } from '../index.js'
+import { VideoDecoder, VideoEncoder, VideoFrame, EncodedVideoChunk } from '../index.js'
+import type { VideoDecoderConfig } from '../standard.js'
 
 type FrameInit = {
   visibleRect?: { x: number; y: number; width: number; height: number }
@@ -256,4 +258,139 @@ test('VideoFrame: close resets rotation and flip but keeps them on a clone', (t)
   clone.close()
   t.is(clone.rotation, 0)
   t.false(clone.flip)
+})
+
+// ============================================================================
+// VideoDecoder displayAspectWidth/displayAspectHeight
+// ============================================================================
+
+async function encodeVp8(width: number, height: number): Promise<EncodedVideoChunk[]> {
+  const chunks: EncodedVideoChunk[] = []
+  let failure: Error | null = null
+  const encoder = new VideoEncoder({
+    output: (chunk) => chunks.push(chunk),
+    error: (error) => {
+      failure = error
+    },
+  })
+  encoder.configure({ codec: 'vp8', width, height, bitrate: 500_000 })
+  const frame = new VideoFrame(new Uint8Array(width * height * 4).fill(96), {
+    format: 'RGBA',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp: 0,
+  })
+  encoder.encode(frame, { keyFrame: true })
+  frame.close()
+  await encoder.flush()
+  encoder.close()
+  if (failure) throw failure
+  return chunks
+}
+
+type Decoded = { sizes: string[]; errors: string[]; state: string }
+
+async function decodeWith(chunks: EncodedVideoChunk[], config: VideoDecoderConfig): Promise<Decoded> {
+  const sizes: string[] = []
+  const errors: string[] = []
+  const decoder = new VideoDecoder({
+    output: (frame) => {
+      sizes.push(`${frame.displayWidth}x${frame.displayHeight}`)
+      frame.close()
+    },
+    error: (error) => errors.push(`${error.constructor.name}:${error.name}`),
+  })
+  decoder.configure(config)
+  for (const chunk of chunks) decoder.decode(chunk)
+  await decoder.flush().catch(() => {})
+  const state = decoder.state
+  if (state !== 'closed') decoder.close()
+  return { sizes, errors, state }
+}
+
+test('VideoDecoder: displayAspectWidth/displayAspectHeight grow the output display size like Chrome', async (t) => {
+  const chunks = await encodeVp8(320, 240)
+  // [aspect, rotation, Chrome 155 displayWidth x displayHeight]
+  const cases: Array<[[number, number] | null, number, string]> = [
+    [null, 0, '320x240'],
+    [[16, 9], 0, '427x240'],
+    [[4, 3], 0, '320x240'],
+    [[1, 1], 0, '320x320'],
+    [[1, 2], 0, '320x640'],
+    [[3, 1], 0, '720x240'],
+    [[7, 5], 0, '336x240'],
+    [[33, 17], 0, '466x240'],
+    [[16, 9], 90, '240x427'],
+    [[16, 9], 180, '427x240'],
+    // Chromium casts the members to int: these ratios are invalid and change nothing
+    [[2 ** 31, 1], 0, '320x240'],
+    [[4294967295, 1], 0, '320x240'],
+    // ...and 2^32 - 1 is -1 twice, a square ratio
+    [[4294967295, 4294967295], 0, '320x320'],
+  ]
+  for (const [aspect, rotation, expected] of cases) {
+    const config: VideoDecoderConfig = { codec: 'vp8', codedWidth: 320, codedHeight: 240, rotation }
+    if (aspect) {
+      config.displayAspectWidth = aspect[0]
+      config.displayAspectHeight = aspect[1]
+    }
+    const result = await decodeWith(chunks, config)
+    t.deepEqual(
+      result,
+      { sizes: [expected], errors: [], state: 'configured' },
+      `aspect ${aspect?.join(':') ?? 'none'} rotation ${rotation}`,
+    )
+  }
+})
+
+test('VideoDecoder: display aspect rounding follows Chrome', async (t) => {
+  const chunks = await encodeVp8(100, 30)
+  const cases: Array<[number, number, string]> = [
+    [7, 2, '105x30'],
+    [5, 2, '100x40'],
+    [3, 7, '100x233'],
+    [1092, 1, '32760x30'],
+  ]
+  for (const [width, height, expected] of cases) {
+    const result = await decodeWith(chunks, { codec: 'vp8', displayAspectWidth: width, displayAspectHeight: height })
+    t.deepEqual(result.sizes, [expected], `aspect ${width}:${height}`)
+  }
+})
+
+test('VideoDecoder: a display aspect beyond the size limits fails the decode with EncodingError', async (t) => {
+  const chunks = await encodeVp8(100, 30)
+  for (const [width, height] of [
+    [1093, 1],
+    [1, 1092],
+  ]) {
+    const result = await decodeWith(chunks, { codec: 'vp8', displayAspectWidth: width, displayAspectHeight: height })
+    t.deepEqual(
+      result,
+      { sizes: [], errors: ['DOMException:EncodingError'], state: 'closed' },
+      `aspect ${width}:${height}`,
+    )
+  }
+})
+
+test('VideoDecoder: reconfigure applies the new display aspect', async (t) => {
+  const [chunk] = await encodeVp8(320, 240)
+  const sizes: string[] = []
+  const decoder = new VideoDecoder({
+    output: (frame) => {
+      sizes.push(`${frame.displayWidth}x${frame.displayHeight}`)
+      frame.close()
+    },
+    error: (error) => t.fail(error.message),
+  })
+  for (const aspect of [
+    { displayAspectWidth: 16, displayAspectHeight: 9 },
+    {},
+    { displayAspectWidth: 1, displayAspectHeight: 2 },
+  ]) {
+    decoder.configure({ codec: 'vp8', codedWidth: 320, codedHeight: 240, ...aspect })
+    decoder.decode(chunk)
+    await decoder.flush()
+  }
+  decoder.close()
+  t.deepEqual(sizes, ['427x240', '320x240', '320x640'])
 })
