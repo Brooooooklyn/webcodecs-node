@@ -122,6 +122,11 @@ impl Drop for WeakCodecRef {
   }
 }
 
+/// A codec's WebCodecsErrorCallback, called from any thread. The JS-side
+/// callback turns the Error payload into a native DOMException.
+pub type CodecErrorCallback =
+  ThreadsafeFunction<Error, UnknownReturnValue, Unknown<'static>, Status, false, true>;
+
 // The payload must be FnArgs — a plain tuple goes through the ToNapiValue
 // blanket impl and arrives as a single Array argument, not three args.
 type DispatcherTsf =
@@ -165,6 +170,10 @@ pub struct CodecEventState {
   /// Dequeued items the queued dispatch covers. They stay in `outstanding`
   /// until that dispatch is delivered.
   scheduled_items: usize,
+  /// Errors sent to the codec's error callback that have not run yet (see
+  /// [`Self::report_error`]). While >0 a scheduled dequeue event waits, and
+  /// runs right after the error callback.
+  errors_pending: usize,
   /// Single dispatcher invoked from the worker thread; runs the whole
   /// dispatch on the JS thread in one call.
   dispatcher: Option<Arc<DispatcherTsf>>,
@@ -224,19 +233,15 @@ impl CodecEventState {
         match cmd {
           CMD_DISPATCH => {
             let shared = unsafe { Arc::from_raw(ptr as usize as *const RwLock<CodecEventState>) };
-            // Clear the flag before dispatching: a dequeue on the worker while
-            // listeners run may come after they read the queue size, so it
-            // needs an event of its own.
             let covered = match shared.write() {
-              Ok(mut state) => {
-                state.dequeue_scheduled = false;
-                std::mem::take(&mut state.scheduled_items)
-              }
-              Err(_) => 0,
+              // Waits for an error callback, or already ran right after one
+              // (see report_error).
+              Ok(state) if state.errors_pending > 0 || !state.dequeue_scheduled => None,
+              Ok(mut state) => Some(state.take_scheduled()),
+              Err(_) => None,
             };
-            dispatch(ctx.env, &shared, "dequeue");
-            if let Ok(mut state) = shared.write() {
-              state.note_delivery(ctx.env, covered);
+            if let Some(covered) = covered {
+              CodecEventState::deliver_dequeue(ctx.env, &shared, covered);
             }
           }
           CMD_DELETE_REF => {
@@ -592,9 +597,14 @@ impl CodecEventState {
     }
     state.dequeue_scheduled = true;
     state.scheduled_items = items;
-    // The call only queues the payload (NonBlocking, unbounded queue), so it
-    // is safe while holding the state lock; holding it means no other fire
-    // can join a dispatch that turns out not to be queued.
+    state.queue_dispatch(shared, &dispatcher);
+  }
+
+  /// Queue the dispatch payload for the scheduled dequeue event. The call
+  /// only queues the payload (NonBlocking, unbounded queue), so it is safe
+  /// while holding the state lock; holding it means no other fire can join a
+  /// dispatch that turns out not to be queued.
+  fn queue_dispatch(&mut self, shared: &Arc<RwLock<CodecEventState>>, dispatcher: &DispatcherTsf) {
     let ptr = Arc::into_raw(Arc::clone(shared)) as usize as u64;
     let status = dispatcher.call(
       FnArgs::from((CMD_DISPATCH, (ptr >> 32) as u32, ptr as u32)),
@@ -608,9 +618,105 @@ impl CodecEventState {
           ptr as usize as *const RwLock<CodecEventState>,
         ));
       }
-      state.dequeue_scheduled = false;
-      let undelivered = std::mem::take(&mut state.scheduled_items);
-      state.note_undelivered(undelivered);
+      let undelivered = self.take_scheduled();
+      self.note_undelivered(undelivered);
+    }
+  }
+
+  /// Start delivering the scheduled dequeue event: returns the items it
+  /// covers. The flag is cleared before listeners run: a dequeue on the
+  /// worker while they run may come after they read the queue size, so it
+  /// needs an event of its own.
+  fn take_scheduled(&mut self) -> usize {
+    self.dequeue_scheduled = false;
+    std::mem::take(&mut self.scheduled_items)
+  }
+
+  /// JS thread: dispatch the dequeue event covering `covered` items.
+  fn deliver_dequeue(env: &Env, shared: &Arc<RwLock<CodecEventState>>, covered: usize) {
+    dispatch(env, shared, "dequeue");
+    if let Ok(mut state) = shared.write() {
+      state.note_delivery(env, covered);
+    }
+  }
+
+  /// Any thread: send a codec's error to its error callback. Every codec
+  /// error closes the codec.
+  ///
+  /// Chrome runs the error callback first, and the dequeue event for the
+  /// work the error dropped after it: closing the codec queues that event and
+  /// then invokes the callback. Here the error and the dequeue event reach JS
+  /// through two thread-safe functions, whose order is not defined, so a
+  /// dequeue event that comes due before the error callback has run waits,
+  /// and runs right after the callback, from the same call.
+  pub fn report_error(
+    shared: &Arc<RwLock<CodecEventState>>,
+    callback: &CodecErrorCallback,
+    error: Error,
+  ) {
+    if let Ok(mut state) = shared.write() {
+      state.errors_pending += 1;
+    }
+    let delivery = ErrorDelivery(Some(Arc::clone(shared)));
+    // When the call is not queued (env teardown), the closure and its guard
+    // are dropped here.
+    callback.call_with_return_value(
+      error,
+      ThreadsafeFunctionCallMode::NonBlocking,
+      move |result, env| {
+        if let Err(thrown) = result {
+          // Report what the callback threw before the dequeue event runs, as
+          // the plain call this replaces did.
+          if let Ok(value) = unsafe { Error::to_napi_value(env.raw(), thrown) } {
+            unsafe { sys::napi_fatal_exception(env.raw(), value) };
+          }
+        }
+        delivery.delivered(&env);
+        Ok(())
+      },
+    );
+  }
+}
+
+/// Settles one pending error (see [`CodecEventState::report_error`]): on the
+/// JS thread after the error callback ran, or on drop when the callback will
+/// not run (napi-rs drops a queued call whose payload it could not convert).
+struct ErrorDelivery(Option<Arc<RwLock<CodecEventState>>>);
+
+impl ErrorDelivery {
+  /// JS thread, right after the error callback: run a waiting dequeue event
+  /// when this was the last pending error.
+  fn delivered(mut self, env: &Env) {
+    let Some(shared) = self.0.take() else {
+      return;
+    };
+    let covered = shared.write().ok().and_then(|mut state| {
+      state.errors_pending = state.errors_pending.saturating_sub(1);
+      (state.errors_pending == 0 && state.dequeue_scheduled).then(|| state.take_scheduled())
+    });
+    if let Some(covered) = covered {
+      CodecEventState::deliver_dequeue(env, &shared, covered);
+    }
+  }
+}
+
+impl Drop for ErrorDelivery {
+  /// The error callback will not run: hand a waiting dequeue event to the
+  /// dispatcher instead (any thread).
+  fn drop(&mut self) {
+    let Some(shared) = self.0.take() else {
+      return;
+    };
+    let Ok(mut state) = shared.write() else {
+      return;
+    };
+    state.errors_pending = state.errors_pending.saturating_sub(1);
+    if state.errors_pending == 0
+      && state.dequeue_scheduled
+      && let Some(dispatcher) = state.dispatcher.clone()
+    {
+      // A payload consumed while the event waited does not run again.
+      state.queue_dispatch(&shared, &dispatcher);
     }
   }
 }

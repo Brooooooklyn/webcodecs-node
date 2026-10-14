@@ -349,6 +349,9 @@ struct VideoEncoderInner {
   output_callback: OutputCallback,
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
+  /// The codec's event state: report_error orders the error callback before
+  /// the dequeue events that come due meanwhile.
+  event_state: Arc<RwLock<CodecEventState>>,
   /// Retains the native failure category for pending and later flush rejections.
   failure_name: Option<DOMExceptionName>,
   /// Pending flush operations, tracked independently for overlapping calls.
@@ -578,6 +581,7 @@ impl VideoEncoder {
     )]
     init: VideoEncoderInit,
   ) -> Result<Self> {
+    let event_state = Arc::new(RwLock::new(CodecEventState::default()));
     let inner = VideoEncoderInner {
       state: CodecState::Unconfigured,
       config: None,
@@ -588,6 +592,7 @@ impl VideoEncoder {
       encode_queue_size: 0,
       output_callback: init.output,
       error_callback: init.error,
+      event_state: event_state.clone(),
       failure_name: None,
       flushes: FlushTracker::default(),
       timestamp_map: BTreeMap::new(),
@@ -625,7 +630,6 @@ impl VideoEncoder {
     let inner = Arc::new(Mutex::new(inner));
 
     // Create separate lock for event listener state (avoids contention with encode operations)
-    let event_state = Arc::new(RwLock::new(CodecEventState::default()));
 
     // Create channel for worker commands
     let (sender, receiver) = channel::unbounded();
@@ -2299,9 +2303,7 @@ impl VideoEncoder {
 
     // Create an Error object that will be passed directly to the JS callback
     let error = Error::new(Status::GenericFailure, error_msg);
-    inner
-      .error_callback
-      .call(error, ThreadsafeFunctionCallMode::NonBlocking);
+    CodecEventState::report_error(&inner.event_state, &inner.error_callback, error);
     inner.failure_name = Some(if error_msg.starts_with("OperationError:") {
       DOMExceptionName::OperationError
     } else {
