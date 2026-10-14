@@ -718,14 +718,20 @@ pub struct DOMRectReadOnly {
   height: f64,
 }
 
-// preserve nan rather than f64::min/max choosing the finite operand.
+/// NaN-safe (min, max) of `origin` and `origin + extent` (Geometry Interfaces spec).
+///
+/// Uses plain comparisons instead of `f64::min`/`f64::max`: those return the
+/// non-NaN operand, and their choice between -0.0 and +0.0 differs per CPU.
+/// Ties keep `origin`, matching Chromium.
 fn rect_edges(origin: f64, extent: f64) -> (f64, f64) {
   let end = origin + extent;
-  if origin.is_nan() || end.is_nan() {
-    (f64::NAN, f64::NAN)
-  } else {
-    (origin.min(end), origin.max(end))
+  // `end` is NaN whenever `origin` or `extent` is NaN, or for Infinity + -Infinity.
+  if end.is_nan() {
+    return (f64::NAN, f64::NAN);
   }
+  let min = if end < origin { end } else { origin };
+  let max = if origin < end { end } else { origin };
+  (min, max)
 }
 
 #[napi(object)]

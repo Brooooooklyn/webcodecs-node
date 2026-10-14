@@ -337,11 +337,20 @@ test('VideoFrame: gradient pattern creates varied data', async (t) => {
 test('DOMRectReadOnly: JSON carries normalized edges and preserves nonfinite geometry', (t) => {
   const rect = new DOMRectReadOnly(1, 2, -3, -4)
   t.deepEqual(rect.toJSON(), { x: 1, y: 2, width: -3, height: -4, top: -2, right: 1, bottom: 2, left: -2 })
+  // Key order matches Chrome
+  t.is(JSON.stringify(rect.toJSON()), '{"x":1,"y":2,"width":-3,"height":-4,"top":-2,"right":1,"bottom":2,"left":-2}')
   t.deepEqual([rect.top, rect.right, rect.bottom, rect.left], [-2, 1, 2, -2])
   const nan = new DOMRectReadOnly(1, 2, NaN, NaN)
   t.deepEqual([nan.top, nan.right, nan.bottom, nan.left], [NaN, NaN, NaN, NaN])
   const infinite = new DOMRectReadOnly(Infinity, Infinity, -Infinity, -Infinity)
   t.deepEqual([infinite.top, infinite.right, infinite.bottom, infinite.left], [NaN, NaN, NaN, NaN])
+  t.is(new DOMRectReadOnly(0, 0, Infinity, 1).right, Infinity)
+  // Ties keep the origin, so signed zero survives (Chrome: -0 for all four edges)
+  const zero = new DOMRectReadOnly(-0, -0, 0, 0)
+  t.deepEqual(
+    [zero.top, zero.right, zero.bottom, zero.left].map((edge) => Object.is(edge, -0)),
+    [true, true, true, true],
+  )
 })
 
 test('VideoFrame: explicit RGB copies preserve browser alpha and gamut conversion', async (t) => {
