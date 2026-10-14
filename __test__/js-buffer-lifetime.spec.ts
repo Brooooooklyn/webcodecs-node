@@ -25,8 +25,12 @@ import {
   EncodedAudioChunk,
   EncodedVideoChunk,
   ImageDecoder,
+  MkvDemuxer,
+  MkvMuxer,
   Mp4Demuxer,
+  Mp4Muxer,
   VideoDecoder,
+  WebMMuxer,
 } from '../index.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -553,4 +557,83 @@ test('isConfigSupported returns a copy of the description, as an ArrayBuffer', a
   const audio = await pending
   t.true(audio.config.description instanceof ArrayBuffer)
   t.deepEqual(Array.from(new Uint8Array(audio.config.description as ArrayBuffer)), [0x12, 0x10])
+})
+
+// ============================================================================
+// Muxers: a description from isConfigSupported (an ArrayBuffer) still muxes
+// ============================================================================
+
+test('muxers take a description from isConfigSupported (an ArrayBuffer) or any other BufferSource', async (t) => {
+  const chunks: EncodedVideoChunk[] = []
+  const source = new Mp4Demuxer({ videoOutput: (chunk) => chunks.push(chunk), error: () => {} })
+  await source.loadBuffer(own(H264_MP4))
+  const { codec, codedWidth, codedHeight, description } = source.videoDecoderConfig!
+  await source.demuxAsync()
+  source.close()
+  const support = await VideoDecoder.isConfigSupported({ codec, codedWidth, codedHeight, description })
+  t.true(support.config.description instanceof ArrayBuffer)
+  const width = codedWidth!
+  const height = codedHeight!
+
+  // The description the muxer wrote is the one the demuxer reads back.
+  const forms = {
+    ArrayBuffer: support.config.description as ArrayBuffer,
+    DataView: new DataView(own(description!).buffer),
+    Uint16Array: new Uint16Array(own(description!).buffer, 0, description!.length / 2),
+  }
+  for (const [name, form] of Object.entries(forms)) {
+    const expected = Array.from(own(description!).subarray(0, form.byteLength))
+    const mp4 = new Mp4Muxer()
+    mp4.addVideoTrack({ codec, width, height, description: form })
+    chunks.forEach((chunk, i) => mp4.addVideoChunk(chunk, i === 0 ? { decoderConfig: support.config } : undefined))
+    await mp4.flush()
+    const mp4Bytes = mp4.finalize()
+    mp4.close()
+    const mkv = new MkvMuxer()
+    mkv.addVideoTrack({ codec, width, height, description: form })
+    chunks.forEach((chunk) => mkv.addVideoChunk(chunk))
+    await mkv.flush()
+    const mkvBytes = mkv.finalize()
+    mkv.close()
+    for (const [Demuxer, bytes] of [
+      [Mp4Demuxer, mp4Bytes],
+      [MkvDemuxer, mkvBytes],
+    ] as const) {
+      const demuxer = new Demuxer({ videoOutput: () => {}, error: () => {} })
+      await demuxer.loadBuffer(bytes)
+      t.deepEqual(Array.from(demuxer.videoDecoderConfig!.description!), expected, `${Demuxer.name} ${name}`)
+      demuxer.close()
+    }
+  }
+
+  const audioSupport = await AudioDecoder.isConfigSupported({
+    codec: 'mp4a.40.2',
+    sampleRate: 44100,
+    numberOfChannels: 2,
+    description: new Uint8Array([0x12, 0x10]),
+  })
+  const mp4 = new Mp4Muxer()
+  t.notThrows(() =>
+    mp4.addAudioTrack({
+      codec: 'mp4a.40.2',
+      sampleRate: 44100,
+      numberOfChannels: 2,
+      description: audioSupport.config.description,
+    }),
+  )
+  mp4.close()
+  const opusHead = new Uint8Array([
+    0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, 1, 2, 0x38, 1, 0x80, 0xbb, 0, 0, 0, 0, 0,
+  ])
+  const webm = new WebMMuxer()
+  t.notThrows(() =>
+    webm.addAudioTrack({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2, description: opusHead.buffer }),
+  )
+  webm.close()
+
+  const rejects = new Mp4Muxer()
+  t.throws(() => rejects.addVideoTrack({ codec, width, height, description: {} as ArrayBuffer }), {
+    message: /Expected an ArrayBuffer, SharedArrayBuffer, TypedArray or DataView/,
+  })
+  rejects.close()
 })

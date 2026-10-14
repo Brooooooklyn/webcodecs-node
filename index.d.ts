@@ -1314,7 +1314,7 @@ export interface AudioDecoderConfigJs {
   /** Number of channels */
   numberOfChannels?: number
   /** Codec-specific description */
-  description?: Uint8Array
+  description?: BufferSource
 }
 
 /** Decoder configuration output (for passing to decoder) */
@@ -1580,7 +1580,7 @@ export interface MkvAudioTrackConfig {
   /** Number of audio channels */
   numberOfChannels: number
   /** Codec-specific description data */
-  description?: Uint8Array
+  description?: BufferSource
 }
 
 /** MKV muxer options */
@@ -1602,7 +1602,7 @@ export interface MkvVideoTrackConfig {
   /** Frame rate (frames per second) */
   framerate?: number
   /** Codec-specific description data */
-  description?: Uint8Array
+  description?: BufferSource
 }
 
 /** Audio track configuration for MP4 muxer */
@@ -1614,7 +1614,7 @@ export interface Mp4AudioTrackConfig {
   /** Number of audio channels */
   numberOfChannels: number
   /** Codec-specific description data (esds for AAC, etc.) */
-  description?: Uint8Array
+  description?: BufferSource
 }
 
 /** MP4 muxer options */
@@ -1644,7 +1644,7 @@ export interface Mp4VideoTrackConfig {
   /** Frame rate (frames per second) */
   framerate?: number
   /** Codec-specific description data (avcC/hvcC/av1C from encoder metadata) */
-  description?: Uint8Array
+  description?: BufferSource
   /**
    * HEVC sample-entry override. Default picks "hvc1" when the hvcC
    * description is well-formed, single-layer, and complete; "hev1" permits
@@ -1747,7 +1747,7 @@ export interface VideoDecoderConfigJs {
   /** Codec string */
   codec?: string
   /** Codec-specific description */
-  description?: Uint8Array
+  description?: BufferSource
   /** Coded width */
   codedWidth?: number
   /** Coded height */
@@ -1925,7 +1925,7 @@ export interface WebMAudioTrackConfig {
   /** Number of audio channels */
   numberOfChannels: number
   /** Codec-specific description data */
-  description?: Uint8Array
+  description?: BufferSource
 }
 
 /** WebM muxer options */
@@ -1947,7 +1947,7 @@ export interface WebMVideoTrackConfig {
   /** Frame rate (frames per second) */
   framerate?: number
   /** Codec-specific description data */
-  description?: Uint8Array
+  description?: BufferSource
   /** Whether the video has alpha channel (VP9 alpha support) */
   alpha?: boolean
 }

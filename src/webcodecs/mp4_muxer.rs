@@ -5,7 +5,7 @@
 
 use crate::codec::muxer::{ContainerFormat, HevcSampleEntry, MuxerOptions};
 use crate::ffi::AVCodecID;
-use crate::webcodecs::buffer_source::Uint8ArrayCopy;
+use crate::webcodecs::buffer_source::BufferSourceCopy;
 use crate::webcodecs::codec_string::parse_codec_string;
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunk;
 use crate::webcodecs::encoded_video_chunk::EncodedVideoChunk;
@@ -149,8 +149,8 @@ pub struct Mp4VideoTrackConfig {
   /// Frame rate (frames per second)
   pub framerate: Option<f64>,
   /// Codec-specific description data (avcC/hvcC/av1C from encoder metadata)
-  #[napi(ts_type = "Uint8Array")]
-  pub description: Option<Uint8ArrayCopy>,
+  #[napi(ts_type = "BufferSource")]
+  pub description: Option<BufferSourceCopy>,
   /// HEVC sample-entry override. Default picks "hvc1" when the hvcC
   /// description is well-formed, single-layer, and complete; "hev1" permits
   /// in-band parameter sets (e.g. remuxing hev1 streams with parameter-set
@@ -168,8 +168,8 @@ pub struct Mp4AudioTrackConfig {
   /// Number of audio channels
   pub number_of_channels: u32,
   /// Codec-specific description data (esds for AAC, etc.)
-  #[napi(ts_type = "Uint8Array")]
-  pub description: Option<Uint8ArrayCopy>,
+  #[napi(ts_type = "BufferSource")]
+  pub description: Option<BufferSourceCopy>,
 }
 
 // ============================================================================
