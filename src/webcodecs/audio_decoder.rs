@@ -725,15 +725,7 @@ impl AudioDecoder {
       }
     };
 
-    // W3C WebCodecs spec: FLAC codec requires description (contains STREAMINFO)
-    let codec_lower = codec.to_lowercase();
-    if codec_lower == "flac" && config.description.is_none() {
-      Self::report_error(
-        &mut guard,
-        "NotSupportedError: FLAC codec requires a description (STREAMINFO)",
-      );
-      return;
-    }
+    // configure() already rejected FLAC without a description.
 
     // Create decoder context
     let mut context = match CodecContext::new_decoder(codec_id) {
@@ -930,6 +922,15 @@ impl AudioDecoder {
           return Ok(());
         }
       };
+
+      // As for a first configure(), so reset() keeps this error either way
+      if codec.to_lowercase() == "flac" && config.description.is_none() {
+        Self::report_configure_error(
+          &mut inner,
+          "NotSupportedError: FLAC codec requires a description (STREAMINFO)",
+        );
+        return Ok(());
+      }
 
       // Queue reconfigure via microtask (runs AFTER pending decode microtasks)
       // Use Weak reference to allow close() to immediately close channel without deadlock
