@@ -6,7 +6,7 @@
 //! rgb48be, argb, yuvj*, gbrp, ...). Each decoded frame gets a format here:
 //!
 //! - same memory as a WebCodecs format: keep the frame (yuvj* is relabelled yuv*
-//!   with a full-range tag; gbrp from video is I444 with G, B, R planes)
+//!   with a full-range tag; gbrp from video or a still AVIF is I444 with G, B, R planes)
 //! - anything else: convert once, to the format real Chrome reports for the input
 //!   (images: BGRX, or BGRA when the image has alpha; video: the nearest YUV format)
 //!
@@ -35,7 +35,8 @@ pub(crate) enum DecodedSource {
   /// ImageDecoder, with what the file header says, when it says it:
   /// - `alpha`: the alpha it declares (WebP alpha flag, PNG color type or tRNS chunk).
   ///   Chrome labels the image BGRA or BGRX by it.
-  /// - `yuv`: whether Chrome decodes the image to YUV planes (JPEG sampling factors).
+  /// - `yuv`: whether Chrome decodes the image to YUV planes (JPEG: the sampling
+  ///   factors; AVIF: one still image without alpha).
   Image {
     codec: AVCodecID,
     alpha: Option<bool>,
@@ -109,20 +110,22 @@ pub(crate) fn decoded_frame_format(
     DecodedSource::HardwareVideo => Ok((frame, VideoPixelFormat::I420)),
     DecodedSource::Video => {
       // Chrome reports RGB video as I444 with the G, B, R planes.
-      let planar_rgb = match av {
-        AVPixelFormat::Gbrp => Some(VideoPixelFormat::I444),
-        AVPixelFormat::Gbrp10le => Some(VideoPixelFormat::I444P10),
-        AVPixelFormat::Gbrp12le => Some(VideoPixelFormat::I444P12),
-        _ => None,
-      };
-      if let Some(format) = planar_rgb {
+      if let Some(format) = planar_rgb_format(av) {
         return Ok((frame, format));
       }
       let desc = describe(frame.format_raw())?;
       let format = video_target(&desc);
       Ok((convert(&frame, format, &desc, false)?, format))
     }
-    DecodedSource::Image { codec, alpha, .. } => {
+    DecodedSource::Image { codec, alpha, yuv } => {
+      // Chrome reports a still AVIF with the identity matrix as I444 with the G, B, R
+      // planes (an animated one, or one with alpha, as BGRX/BGRA).
+      if codec == AVCodecID::Av1
+        && yuv == Some(true)
+        && let Some(format) = planar_rgb_format(av)
+      {
+        return Ok((frame, format));
+      }
       let desc = describe(frame.format_raw())?;
       let format = if image_has_alpha(&frame, &desc, codec, alpha) {
         VideoPixelFormat::BGRA
@@ -131,6 +134,16 @@ pub(crate) fn decoded_frame_format(
       };
       Ok((convert(&frame, format, &desc, true)?, format))
     }
+  }
+}
+
+/// I444 formats with the planes of FFmpeg's planar RGB (G, B, R).
+fn planar_rgb_format(av: AVPixelFormat) -> Option<VideoPixelFormat> {
+  match av {
+    AVPixelFormat::Gbrp => Some(VideoPixelFormat::I444),
+    AVPixelFormat::Gbrp10le => Some(VideoPixelFormat::I444P10),
+    AVPixelFormat::Gbrp12le => Some(VideoPixelFormat::I444P12),
+    _ => None,
   }
 }
 

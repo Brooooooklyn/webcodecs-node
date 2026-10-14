@@ -1022,7 +1022,9 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
   })?;
 
   // Demux and decode all frames.
-  let (context, mut frames) = decode_image_data(codec_id, &data_bytes)?;
+  let (context, mut frames, video_streams) = decode_image_data(codec_id, &data_bytes)?;
+  // One video stream with one frame: no animation, alpha or other auxiliary image
+  let still = video_streams == 1 && frames.len() == 1;
 
   // Apply preferAnimation: if false and format supports animation, only keep first frame
   if prefer_animation == Some(false) && !frames.is_empty() {
@@ -1040,6 +1042,8 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
     },
     yuv: match codec_id {
       AVCodecID::Mjpeg => jpeg_yuv_hint(&data_bytes),
+      // Chrome keeps a still AVIF without alpha as YUV planes
+      AVCodecID::Av1 => Some(still),
       _ => None,
     },
   };
@@ -1312,10 +1316,12 @@ fn create_image_decoder(codec_id: AVCodecID, extradata: Option<Vec<u8>>) -> Resu
 
 /// Decode image data using FFmpeg. Image formats are containers too: animated
 /// GIF/WebP files must be demuxed into per-frame packets before decoding.
+/// Also returns the number of video streams in the container (an AVIF alpha plane
+/// is a stream of its own); a raw bitstream counts as one.
 fn decode_image_data(
   codec_id: AVCodecID,
   data: &[u8],
-) -> Result<(CodecContext, Vec<crate::codec::Frame>)> {
+) -> Result<(CodecContext, Vec<crate::codec::Frame>, usize)> {
   if let Ok(mut demuxer) = DemuxerContext::open_buffer(data.to_vec())
     && let Some(stream) = demuxer.find_best_stream(MediaType::Video).cloned()
   {
@@ -1360,7 +1366,12 @@ fn decode_image_data(
 
     if !frames.is_empty() {
       normalize_frame_timing(&mut frames, stream.time_base);
-      return Ok((context, frames));
+      let video_streams = demuxer
+        .streams()
+        .iter()
+        .filter(|s| s.media_type == MediaType::Video)
+        .count();
+      return Ok((context, frames, video_streams));
     }
   }
 
@@ -1402,7 +1413,7 @@ fn decode_image_data(
     }
   }
 
-  Ok((context, all_frames))
+  Ok((context, all_frames, 1))
 }
 
 /// Convert container time-base ticks into the microseconds required by
