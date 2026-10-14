@@ -7,7 +7,7 @@ use crate::codec::Packet;
 use crate::ffi::{AVRational, avutil::av_rescale_q};
 use crate::webcodecs::error::{
   enforce_range_long_long, enforce_range_unsigned_long_long_optional,
-  enforce_range_unsigned_long_value, to_unsigned_long,
+  enforce_range_unsigned_long_value, get_number_member, to_unsigned_long,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -1777,8 +1777,9 @@ impl FromNapiValue for VideoEncoderConfig {
     let codec: Option<String> = obj.get("codec")?;
     let width: Option<u32> = obj.get("width")?;
     let height: Option<u32> = obj.get("height")?;
-    let display_width: Option<u32> = obj.get("displayWidth")?;
-    let display_height: Option<u32> = obj.get("displayHeight")?;
+    // null is 0, so a null display size fails the checks like Chrome
+    let display_width: Option<u32> = get_number_member(&obj, "displayWidth")?;
+    let display_height: Option<u32> = get_number_member(&obj, "displayHeight")?;
     let bitrate: Option<f64> = obj.get("bitrate")?;
     let framerate: Option<f64> = obj.get("framerate")?;
     let hardware_acceleration: Option<HardwareAcceleration> = obj.get("hardwareAcceleration")?;
@@ -1862,13 +1863,13 @@ impl FromNapiValue for VideoDecoderConfig {
     let coded_height: Option<u32> = obj.get("codedHeight")?;
     let color_space: Option<crate::webcodecs::video_frame::VideoColorSpaceInit> =
       obj.get("colorSpace")?;
-    // [EnforceRange] unsigned long, like Chrome. A plain u32 read would wrap -1 to 2^32 - 1.
-    // Chrome reads members in IDL (name) order: colorSpace before the aspect (description too,
-    // but this reader reads it later), and height before width. Like WebIDL, the read stops at
-    // the first failure: no later member is read, so no later getter can replace the TypeError.
-    // configure() throws it and isConfigSupported() rejects with it.
+    // [EnforceRange] unsigned long, like Chrome. A plain u32 read would wrap -1 to 2^32 - 1,
+    // and null is 0. Chrome reads members in IDL (name) order: colorSpace before the aspect
+    // (description too, but this reader reads it later), and height before width. Like WebIDL,
+    // the read stops at the first failure: no later member is read, so no later getter can
+    // replace the TypeError. configure() throws it and isConfigSupported() rejects with it.
     let enforce_range = |name: &str| -> Result<std::result::Result<Option<u32>, String>> {
-      let value: Option<f64> = obj.get(name)?;
+      let value: Option<f64> = get_number_member(&obj, name)?;
       Ok(
         value
           .map(|value| enforce_range_unsigned_long_value(value, name))
@@ -1906,7 +1907,7 @@ impl FromNapiValue for VideoDecoderConfig {
     };
 
     // Rotation and flip for VideoFrame orientation (W3C WebCodecs spec)
-    let rotation: Option<f64> = obj.get("rotation")?;
+    let rotation: Option<f64> = get_number_member(&obj, "rotation")?;
     let rotation = rotation.map(to_unsigned_long);
     let flip: Option<bool> = obj.get("flip")?;
 

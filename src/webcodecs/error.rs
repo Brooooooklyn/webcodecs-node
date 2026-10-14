@@ -700,6 +700,24 @@ pub fn enforce_range_unsigned_long_value(
   Err(format!("{} is out of range for unsigned long", field_name))
 }
 
+/// Read an optional number member of a WebIDL dictionary
+///
+/// A missing or undefined member is None. null is 0, like WebIDL (ToNumber(null) is +0); a
+/// plain `obj.get::<f64>` would fail on null. Other values convert as `T` does.
+pub fn get_number_member<T: FromNapiValue + Default>(
+  obj: &Object,
+  name: &str,
+) -> Result<Option<T>> {
+  let Some(value) = obj.get::<Unknown>(name)? else {
+    return Ok(None);
+  };
+  if value.get_type()? == ValueType::Null {
+    return Ok(Some(T::default()));
+  }
+  // SAFETY: `T::from_napi_value` checks the value type itself.
+  unsafe { value.cast::<T>() }.map(Some)
+}
+
 /// Convert f64 to u32 per WebIDL `unsigned long` (ECMAScript ToUint32)
 ///
 /// NaN and ±Infinity give 0. Other values truncate and wrap modulo 2^32, so -90 gives
