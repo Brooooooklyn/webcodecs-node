@@ -12,6 +12,7 @@ use crate::webcodecs::error::{
   enforce_range_unsigned_long_long_optional, error_as_dom_exception, invalid_state_error,
   not_supported_error, throw_invalid_state_error, throw_not_supported_error, type_error,
 };
+use crate::webcodecs::promise_reject::reject_with_type_error;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::UnknownReturnValue;
 use napi_derive::napi;
@@ -1319,6 +1320,345 @@ fn calculate_plane_end_checked(offset: u32, stride: u32, height: u32) -> Result<
   })
 }
 
+/// The bytes a Uint8Array views right now. They stay valid only until JS runs again, since JS
+/// can detach, transfer or shrink the buffer: look them up after every getter has run and finish
+/// writing before calling back into JS.
+unsafe fn typed_array_bytes<'a>(
+  env: napi::sys::napi_env,
+  view: napi::sys::napi_value,
+) -> Result<&'a mut [u8]> {
+  let mut length = 0;
+  let mut data = std::ptr::null_mut();
+  napi::check_status!(
+    unsafe {
+      napi::sys::napi_get_typedarray_info(
+        env,
+        view,
+        std::ptr::null_mut(),
+        &mut length,
+        &mut data,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+      )
+    },
+    "Get TypedArray info failed"
+  )?;
+  // A detached or out-of-bounds view reports length 0.
+  if length == 0 || data.is_null() {
+    return Ok(&mut []);
+  }
+  // `length` counts elements, and callers pass a Uint8Array.
+  Ok(unsafe { std::slice::from_raw_parts_mut(data.cast::<u8>(), length) })
+}
+
+/// How many row bands an RGB copy of `width` x `height` is split into: one per 256K pixels, at
+/// most 4, and at most the number of cores.
+fn rgb_copy_bands(width: u32, height: u32) -> u32 {
+  const PIXELS_PER_BAND: u64 = 256 * 1024;
+  const MAX_BANDS: u64 = 4;
+  static CORES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+  let cores =
+    *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get() as u64));
+  let by_size = width as u64 * height as u64 / PIXELS_PER_BAND;
+  by_size.min(MAX_BANDS).min(cores).min(height as u64).max(1) as u32
+}
+
+/// `Scaler::copy_rect_to_rgb`, with a large rect split into row bands that run on scoped threads.
+/// Each output row depends only on its own source row, so the bytes are the same either way.
+/// Every band is written before this returns, and the calling (JS) thread waits meanwhile.
+#[allow(clippy::too_many_arguments)]
+fn copy_rect_to_rgb_in_bands(
+  src: &Frame,
+  rect: (u32, u32, u32, u32),
+  tags: [i32; 4],
+  target_p3: bool,
+  bgr: bool,
+  same_format: bool,
+  src_x: bool,
+  dst: &mut [u8],
+  stride: usize,
+) -> Result<()> {
+  let (x, y, width, height) = rect;
+  let copy = |top: u32, rows: u32, band: &mut [u8]| {
+    Scaler::copy_rect_to_rgb(
+      src,
+      (x, y + top, width, rows),
+      tags,
+      target_p3,
+      bgr,
+      same_format,
+      src_x,
+      band,
+      stride,
+    )
+    .map_err(|e| not_supported_error(&e.to_string()))
+  };
+  let bands = rgb_copy_bands(width, height);
+  if bands <= 1 {
+    return copy(0, height, dst);
+  }
+
+  // Disjoint parts of `dst`, one per band. The last band takes the rest.
+  let rows_per_band = height.div_ceil(bands);
+  let mut parts = Vec::with_capacity(bands as usize);
+  let mut rest = dst;
+  let mut top = 0;
+  while top < height {
+    let rows = rows_per_band.min(height - top);
+    let take = if top + rows == height {
+      rest.len()
+    } else {
+      (rows as usize * stride).min(rest.len())
+    };
+    let (band, tail) = std::mem::take(&mut rest).split_at_mut(take);
+    parts.push(parking_lot::Mutex::new(Some((top, rows, band))));
+    rest = tail;
+    top += rows;
+  }
+
+  // Whoever takes a band from its slot first copies it. This thread then takes every band left,
+  // which also covers a thread that failed to spawn or has not started yet.
+  let run = |part: &parking_lot::Mutex<Option<(u32, u32, &mut [u8])>>| {
+    let taken = part.lock().take();
+    match taken {
+      Some((top, rows, band)) => copy(top, rows, band),
+      None => Ok(()),
+    }
+  };
+  std::thread::scope(|scope| {
+    let handles: Vec<_> = parts[1..]
+      .iter()
+      .filter_map(|part| {
+        std::thread::Builder::new()
+          .spawn_scoped(scope, || run(part))
+          .ok()
+      })
+      .collect();
+    let mut result = parts.iter().try_for_each(run);
+    for handle in handles {
+      let band = handle
+        .join()
+        .unwrap_or_else(|_| Err(Error::new(Status::GenericFailure, "copy thread panicked")));
+      if result.is_ok() {
+        result = band;
+      }
+    }
+    result
+  })
+}
+
+/// The engine's own `ArrayBuffer.prototype.resizable` / `.detached` and
+/// `SharedArrayBuffer.prototype.growable` getters, captured when the module loads into an env.
+/// Calling them reads the buffer's internal state and runs no page code, like Chrome: a later
+/// patch to those prototypes, or an own property on a buffer, does not change the result.
+/// A getter that was missing at load time is null and reads as `false`.
+///
+/// Limit: Node-API has no call that reads these flags (nothing for resizable or growable, and
+/// `napi_is_detached_arraybuffer` needs napi7), so they are looked up through the env's globals.
+/// Code that patches those prototypes, or `Object.getOwnPropertyDescriptor`, before the module
+/// loads gets its own getter captured: it then runs on every copyTo and can change the resizable,
+/// growable and detached answers, so the Chrome parity checks can go wrong. Memory safety does not
+/// depend on them. copyTo reads the destination's pointer and length after every JS call that
+/// comes before the write, and runs no JS while it writes (the detached check runs only on the
+/// path that writes nothing). Only the thread that owns an ArrayBuffer can resize or detach it,
+/// and that thread is inside copyTo; a growable SharedArrayBuffer can only grow.
+#[derive(Clone, Copy)]
+struct BufferFlagGetters {
+  env: napi::sys::napi_env,
+  resizable: napi::sys::napi_ref,
+  detached: napi::sys::napi_ref,
+  growable: napi::sys::napi_ref,
+}
+
+thread_local! {
+  // Each env runs on its own thread. Its cleanup hook empties the slot.
+  static BUFFER_FLAG_GETTERS: std::cell::Cell<Option<BufferFlagGetters>> =
+    const { std::cell::Cell::new(None) };
+}
+
+/// Runs each time the module loads into an env (the main thread or a worker), before page code
+/// can use the module. napi-rs keeps one `module_exports` hook per crate: add new load-time work
+/// here.
+#[napi(module_exports)]
+// Only napi's load-time registration calls this, and `cargo test` builds leave it out.
+#[cfg_attr(test, allow(dead_code))]
+pub fn on_module_load(_exports: Object, env: Env) -> Result<()> {
+  capture_buffer_flag_getters(&env)
+}
+
+/// Captures the buffer flag getters of `env`, once per env.
+fn capture_buffer_flag_getters(env: &Env) -> Result<()> {
+  if BUFFER_FLAG_GETTERS
+    .get()
+    .is_some_and(|getters| getters.env == env.raw())
+  {
+    return Ok(());
+  }
+  let getters = BufferFlagGetters {
+    env: env.raw(),
+    resizable: prototype_getter_ref(env, c"ArrayBuffer", c"resizable")?,
+    detached: prototype_getter_ref(env, c"ArrayBuffer", c"detached")?,
+    growable: prototype_getter_ref(env, c"SharedArrayBuffer", c"growable")?,
+  };
+  unsafe extern "C" fn forget(env: *mut std::ffi::c_void) {
+    let _ = BUFFER_FLAG_GETTERS.try_with(|slot| {
+      if slot.get().is_some_and(|getters| getters.env.cast() == env) {
+        slot.set(None);
+      }
+    });
+  }
+  // Node deletes the references of an env when it tears the env down.
+  napi::check_status!(unsafe {
+    napi::sys::napi_add_env_cleanup_hook(env.raw(), Some(forget), env.raw().cast())
+  })?;
+  BUFFER_FLAG_GETTERS.set(Some(getters));
+  Ok(())
+}
+
+/// A reference to `Object.getOwnPropertyDescriptor(globalThis[class].prototype, key).get`, or null
+/// if there is none.
+fn prototype_getter_ref(
+  env: &Env,
+  class: &std::ffi::CStr,
+  key: &std::ffi::CStr,
+) -> Result<napi::sys::napi_ref> {
+  use napi::sys;
+  let env = env.raw();
+  let named = |object: sys::napi_value, name: &std::ffi::CStr| -> Result<sys::napi_value> {
+    let mut value = std::ptr::null_mut();
+    napi::check_status!(unsafe {
+      sys::napi_get_named_property(env, object, name.as_ptr(), &mut value)
+    })?;
+    Ok(value)
+  };
+  let is_type = |value: sys::napi_value, expected: sys::napi_valuetype| -> Result<bool> {
+    let mut actual = 0;
+    napi::check_status!(unsafe { sys::napi_typeof(env, value, &mut actual) })?;
+    Ok(actual == expected)
+  };
+
+  let mut global = std::ptr::null_mut();
+  napi::check_status!(unsafe { sys::napi_get_global(env, &mut global) })?;
+  let constructor = named(global, class)?;
+  if !is_type(constructor, sys::ValueType::napi_function)? {
+    return Ok(std::ptr::null_mut());
+  }
+  let prototype = named(constructor, c"prototype")?;
+  let object = named(global, c"Object")?;
+  let get_own_property_descriptor = named(object, c"getOwnPropertyDescriptor")?;
+  let mut key_value = std::ptr::null_mut();
+  napi::check_status!(unsafe {
+    sys::napi_create_string_utf8(
+      env,
+      key.as_ptr(),
+      key.count_bytes() as isize,
+      &mut key_value,
+    )
+  })?;
+  let mut descriptor = std::ptr::null_mut();
+  napi::check_status!(unsafe {
+    sys::napi_call_function(
+      env,
+      object,
+      get_own_property_descriptor,
+      2,
+      [prototype, key_value].as_ptr(),
+      &mut descriptor,
+    )
+  })?;
+  if !is_type(descriptor, sys::ValueType::napi_object)? {
+    return Ok(std::ptr::null_mut());
+  }
+  let getter = named(descriptor, c"get")?;
+  if !is_type(getter, sys::ValueType::napi_function)? {
+    return Ok(std::ptr::null_mut());
+  }
+  let mut reference = std::ptr::null_mut();
+  napi::check_status!(unsafe { sys::napi_create_reference(env, getter, 1, &mut reference) })?;
+  Ok(reference)
+}
+
+/// The buffer `view` is on, read from the engine (not through `view.buffer`), and whether it is
+/// a SharedArrayBuffer.
+fn view_buffer(env: &Env, view: napi::sys::napi_value) -> Result<(napi::sys::napi_value, bool)> {
+  let mut buffer = std::ptr::null_mut();
+  napi::check_status!(
+    unsafe {
+      napi::sys::napi_get_typedarray_info(
+        env.raw(),
+        view,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        &mut buffer,
+        std::ptr::null_mut(),
+      )
+    },
+    "Get TypedArray info failed"
+  )?;
+  // False for a SharedArrayBuffer.
+  let mut is_array_buffer = false;
+  napi::check_status!(unsafe {
+    napi::sys::napi_is_arraybuffer(env.raw(), buffer, &mut is_array_buffer)
+  })?;
+  Ok((buffer, !is_array_buffer))
+}
+
+/// Calls the captured getter that `pick` selects on `buffer`.
+fn buffer_flag(
+  env: &Env,
+  buffer: napi::sys::napi_value,
+  pick: fn(&BufferFlagGetters) -> napi::sys::napi_ref,
+) -> Result<bool> {
+  let getters = match BUFFER_FLAG_GETTERS.get() {
+    Some(getters) if getters.env == env.raw() => getters,
+    // The load hook runs for every env, so this is only a fallback.
+    _ => {
+      capture_buffer_flag_getters(env)?;
+      BUFFER_FLAG_GETTERS
+        .get()
+        .ok_or_else(|| Error::new(Status::GenericFailure, "buffer flag getters missing"))?
+    }
+  };
+  let reference = pick(&getters);
+  if reference.is_null() {
+    return Ok(false);
+  }
+  let mut getter = std::ptr::null_mut();
+  napi::check_status!(unsafe {
+    napi::sys::napi_get_reference_value(env.raw(), reference, &mut getter)
+  })?;
+  let mut value = std::ptr::null_mut();
+  napi::check_status!(unsafe {
+    napi::sys::napi_call_function(env.raw(), buffer, getter, 0, std::ptr::null(), &mut value)
+  })?;
+  let mut flag = false;
+  napi::check_status!(unsafe { napi::sys::napi_get_value_bool(env.raw(), value, &mut flag) })?;
+  Ok(flag)
+}
+
+/// Whether `view` is on a resizable ArrayBuffer or a growable SharedArrayBuffer. Runs no page code
+/// (see the limit on `BufferFlagGetters`).
+fn is_resizable_view(env: &Env, view: napi::sys::napi_value) -> Result<bool> {
+  let (buffer, shared) = view_buffer(env, view)?;
+  if shared {
+    buffer_flag(env, buffer, |getters| getters.growable)
+  } else {
+    buffer_flag(env, buffer, |getters| getters.resizable)
+  }
+}
+
+/// Whether the ArrayBuffer under `view` is detached. Runs no page code (see the limit on
+/// `BufferFlagGetters`).
+fn is_detached_view(env: &Env, view: napi::sys::napi_value) -> Result<bool> {
+  let (buffer, shared) = view_buffer(env, view)?;
+  // A SharedArrayBuffer cannot be detached.
+  if shared {
+    return Ok(false);
+  }
+  buffer_flag(env, buffer, |getters| getters.detached)
+}
+
 /// Per W3C spec: Parse Visible Rect algorithm
 /// Takes default rect, optional override rect, coded dimensions, and format
 /// Returns (left, top, width, height) or error
@@ -2530,38 +2870,56 @@ impl VideoFrame {
   ///
   /// Returns a Promise that resolves with an array of PlaneLayout objects.
   /// Options can specify target format and rect for cropped copy.
-  #[napi(ts_return_type = "Promise<PlaneLayout[]>")]
+  /// Like Chrome, the bytes are written before this call returns.
+  //
+  // JS can detach, transfer or shrink `destination` from an options getter or right after the
+  // call. So the destination is looked up only after the getters have run, and it is never
+  // written once JS can run again (no later write, no write from another thread).
+  #[napi(
+    ts_args_type = "destination: Uint8Array, options?: VideoFrameCopyToOptions | undefined | null",
+    ts_return_type = "Promise<PlaneLayout[]>"
+  )]
   pub fn copy_to<'env>(
     &self,
     env: &'env Env,
     destination: Uint8Array,
-    options: Option<VideoFrameCopyToOptions>,
+    options: Unknown,
   ) -> Result<PromiseRaw<'env, Vec<PlaneLayout>>> {
-    let inner = self.inner.clone();
-    env.spawn_future_with_callback(
-      async move { Ok(Self::copy_pixels(inner, destination, options).await) },
-      |env, result| match result {
-        Ok(layout) => Ok(layout),
-        Err(error) => {
-          if let Some(message) = error.reason.strip_prefix("TypeError:") {
-            return Err(Error::from(
-              napi::JsTypeError::from(Error::new(Status::InvalidArg, message.trim_start()))
-                .into_unknown(*env),
-            ));
-          }
-          Err(Error::from(error_as_dom_exception(env, error)?))
-        }
+    // napi checks the destination type before the options, in WebIDL order. The data pointer it
+    // captured goes stale once the options getters run, so keep only the JS value.
+    let destination = unsafe { ToNapiValue::to_napi_value(env.raw(), destination)? };
+    // Chrome rejects a resizable or growable buffer while it converts the destination, before
+    // it reads the options.
+    if is_resizable_view(env, destination)? {
+      return reject_with_type_error(
+        env,
+        "The provided ArrayBufferView value must not be resizable.",
+      );
+    }
+    let options: Option<VideoFrameCopyToOptions> =
+      unsafe { FromNapiValue::from_napi_value(env.raw(), options.raw())? };
+
+    match self.copy_into(env, destination, options.as_ref()) {
+      Ok(layouts) => PromiseRaw::resolve(env, layouts),
+      Err(error) => match error.reason.strip_prefix("TypeError:") {
+        Some(message) => reject_with_type_error(env, message.trim_start()),
+        None => PromiseRaw::reject(env, error_as_dom_exception(env, error)?),
       },
-    )
+    }
   }
 
-  async fn copy_pixels(
-    inner_state: Arc<Mutex<Option<VideoFrameInner>>>,
-    mut destination: Uint8Array,
-    options: Option<VideoFrameCopyToOptions>,
+  /// The synchronous body of copyTo. `destination` is a Uint8Array. Its bytes are looked up after
+  /// every options getter has run and written before any JS runs again.
+  fn copy_into(
+    &self,
+    env: &Env,
+    destination: napi::sys::napi_value,
+    options: Option<&VideoFrameCopyToOptions>,
   ) -> Result<Vec<PlaneLayout>> {
-    // Get format, rect info and validate destination buffer (brief lock)
+    // Get format, rect info and validate the options (brief lock)
     let (
+      frame,
+      color_tags,
       format,
       rect_x,
       rect_y,
@@ -2572,7 +2930,8 @@ impl VideoFrame {
       original_format,
       needs_conversion,
     ) = {
-      let guard = inner_state
+      let guard = self
+        .inner
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
@@ -2587,10 +2946,7 @@ impl VideoFrame {
         ));
       }
       let (frame, original_format) = inner.resource.software()?;
-      let format = options
-        .as_ref()
-        .and_then(|o| o.format)
-        .unwrap_or(original_format);
+      let format = options.and_then(|o| o.format).unwrap_or(original_format);
 
       // Check if format conversion is supported
       // Per WPT: YUV→RGB and RGB→RGB work; RGB→YUV throws NotSupportedError
@@ -2610,7 +2966,7 @@ impl VideoFrame {
         inner.visible_width as f64,
         inner.visible_height as f64,
       );
-      let rect = options.as_ref().and_then(|o| o.rect.as_ref());
+      let rect = options.and_then(|o| o.rect.as_ref());
       let frame_guard = frame.read();
       let (rect_x, rect_y, rect_width, rect_height) = parse_visible_rect(
         default_rect,
@@ -2626,7 +2982,7 @@ impl VideoFrame {
       let rect_y = rect_y / v_factor * v_factor;
 
       // Get and validate custom layout if provided
-      let custom_layout = options.as_ref().and_then(|o| o.layout.clone());
+      let custom_layout = options.and_then(|o| o.layout.clone());
       if let Some(ref layout) = custom_layout {
         Self::validate_copy_layout(layout, format, rect_width)?;
       }
@@ -2656,6 +3012,9 @@ impl VideoFrame {
       };
 
       (
+        frame.clone(),
+        // color metadata belongs to the VideoFrame, not necessarily its AVFrame.
+        rgb_copy_tags(&inner.color_space),
         format,
         rect_x,
         rect_y,
@@ -2668,158 +3027,113 @@ impl VideoFrame {
       )
     };
 
-    if destination.len() < size {
+    // No JS runs from here until the copy ends, so the destination cannot change under it.
+    let destination_bytes = unsafe { typed_array_bytes(env.raw(), destination)? };
+    let available = destination_bytes.len();
+    if available < size {
+      if is_detached_view(env, destination)? {
+        return Err(type_error("destination is detached"));
+      }
       return Err(Error::new(
         Status::InvalidArg,
         format!(
           "TypeError: destination buffer too small: need {} bytes, got {}",
-          size,
-          destination.len()
+          size, available
         ),
       ));
     }
+    let dest = &mut destination_bytes[..size];
 
-    // Clone inner Arc for the blocking thread
-    let inner_clone = inner_state.clone();
-    let layout_for_thread = custom_layout.clone();
+    // Hold the frame's read lock for the duration of the copy
+    let frame_guard = frame.read();
 
-    // Perform the copy in a blocking thread to not block the event loop
-    let copied_data = spawn_blocking(move || -> Result<Vec<u8>> {
-      let guard = inner_clone
-        .lock()
-        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-      let inner = match guard.as_ref() {
-        Some(inner) => inner,
-        _ => return Err(invalid_state_error("VideoFrame is closed")),
-      };
-
-      // Calculate buffer size based on custom layout or default
-      let buffer_size = if let Some(ref layout) = layout_for_thread {
-        // For custom layout, need space for all planes at their offsets + sizes
-        let num_planes = Self::get_number_of_planes(format);
-        let (_, v_factor) = get_subsampling_factors(format);
-        let mut max_end = 0usize;
-        for plane_idx in 0..num_planes {
-          let plane_layout = &layout[plane_idx as usize];
-          let plane_height = if plane_idx == 0 || (format.has_alpha() && plane_idx == 3) {
-            rect_height
-          } else {
-            rect_height / v_factor
-          };
-          let plane_end =
-            plane_layout.offset as usize + (plane_layout.stride as usize * plane_height as usize);
-          max_end = max_end.max(plane_end);
-        }
-        max_end
-      } else {
-        size
-      };
-
-      // Acquire read lock on the frame for the duration of the copy operation
-      let frame_guard = inner.resource.software()?.0.read();
-
-      // Allocate buffer for cropped data
-      let mut temp_buffer = vec![0u8; buffer_size];
-
-      // color metadata belongs to the VideoFrame, not necessarily its AVFrame.
-      let target_color = options.as_ref().and_then(|o| {
-        o.format
-          .filter(|f| {
-            matches!(
-              f,
-              VideoPixelFormat::RGBA
-                | VideoPixelFormat::BGRA
-                | VideoPixelFormat::RGBX
-                | VideoPixelFormat::BGRX
-            )
-          })
-          .map(|_| o.color_space.unwrap_or(PredefinedColorSpace::Srgb))
-      });
-      if let Some(target) = target_color {
-        // stride/offset of the single RGB plane in temp_buffer
-        let (offset, stride) = match layout_for_thread.as_deref() {
-          Some(layout) => (layout[0].offset as usize, layout[0].stride as usize),
-          None => (0, rect_width as usize * 4),
-        };
-        Scaler::copy_rect_to_rgb(
-          &frame_guard,
-          (rect_x, rect_y, rect_width, rect_height),
-          rgb_copy_tags(&inner.color_space),
-          target == PredefinedColorSpace::DisplayP3,
-          matches!(format, VideoPixelFormat::BGRA | VideoPixelFormat::BGRX),
-          format == original_format,
+    let target_color = options.and_then(|o| {
+      o.format
+        .filter(|f| {
           matches!(
-            original_format,
-            VideoPixelFormat::RGBX | VideoPixelFormat::BGRX
-          ),
-          temp_buffer.get_mut(offset..).unwrap_or_default(),
-          stride,
-        )
-        .map_err(|e| not_supported_error(&e.to_string()))?;
-      } else if needs_conversion {
-        let src_av_format = original_format.to_av_format();
-        let dst_av_format = format.to_av_format();
-
-        // Use Scaler for format conversion (operates on full frame, then crop)
-        let scaler = Scaler::new_converter(
-          frame_guard.width(),
-          frame_guard.height(),
-          src_av_format,
-          dst_av_format,
-        )
-        .map_err(|e| {
-          Error::new(
-            Status::GenericFailure,
-            format!(
-              "NotSupportedError: Failed to create format converter: {}",
-              e
-            ),
+            f,
+            VideoPixelFormat::RGBA
+              | VideoPixelFormat::BGRA
+              | VideoPixelFormat::RGBX
+              | VideoPixelFormat::BGRX
           )
-        })?;
-
-        // scale_alloc creates a new frame with converted data
-        let converted = scaler.scale_alloc(&frame_guard).map_err(|e| {
-          Error::new(
-            Status::GenericFailure,
-            format!("EncodingError: Format conversion failed: {}", e),
-          )
-        })?;
-        drop(frame_guard);
-
-        // Copy cropped region from converted frame
-        Self::copy_cropped_data(
-          &converted,
-          format,
-          rect_x,
-          rect_y,
-          rect_width,
-          rect_height,
-          &mut temp_buffer,
-          layout_for_thread.as_deref(),
-        )?;
-      } else {
-        // No conversion needed - use the read-locked frame directly (zero-copy read)
-        Self::copy_cropped_data(
-          &frame_guard,
-          format,
-          rect_x,
-          rect_y,
-          rect_width,
-          rect_height,
-          &mut temp_buffer,
-          layout_for_thread.as_deref(),
-        )?;
+        })
+        .map(|_| o.color_space.unwrap_or(PredefinedColorSpace::Srgb))
+    });
+    if let Some(target) = target_color {
+      // stride/offset of the single RGB plane in the destination
+      let (offset, stride) = match custom_layout.as_deref() {
+        Some(layout) => (layout[0].offset as usize, layout[0].stride as usize),
+        None => (0, rect_width as usize * 4),
       };
+      copy_rect_to_rgb_in_bands(
+        &frame_guard,
+        (rect_x, rect_y, rect_width, rect_height),
+        color_tags,
+        target == PredefinedColorSpace::DisplayP3,
+        matches!(format, VideoPixelFormat::BGRA | VideoPixelFormat::BGRX),
+        format == original_format,
+        matches!(
+          original_format,
+          VideoPixelFormat::RGBX | VideoPixelFormat::BGRX
+        ),
+        dest.get_mut(offset..).unwrap_or_default(),
+        stride,
+      )?;
+    } else if needs_conversion {
+      let src_av_format = original_format.to_av_format();
+      let dst_av_format = format.to_av_format();
 
-      Ok(temp_buffer)
-    })
-    .await
-    .map_err(|e| Error::new(Status::GenericFailure, format!("Copy task failed: {}", e)))??;
+      // Use Scaler for format conversion (operates on full frame, then crop)
+      let scaler = Scaler::new_converter(
+        frame_guard.width(),
+        frame_guard.height(),
+        src_av_format,
+        dst_av_format,
+      )
+      .map_err(|e| {
+        Error::new(
+          Status::GenericFailure,
+          format!(
+            "NotSupportedError: Failed to create format converter: {}",
+            e
+          ),
+        )
+      })?;
 
-    // Copy from temp buffer to destination (this is fast since destination is already allocated)
-    let dest_buffer = unsafe { destination.as_mut() };
-    dest_buffer[..copied_data.len()].copy_from_slice(&copied_data);
+      // scale_alloc creates a new frame with converted data
+      let converted = scaler.scale_alloc(&frame_guard).map_err(|e| {
+        Error::new(
+          Status::GenericFailure,
+          format!("EncodingError: Format conversion failed: {}", e),
+        )
+      })?;
+      drop(frame_guard);
+
+      // Copy cropped region from converted frame
+      Self::copy_cropped_data(
+        &converted,
+        format,
+        rect_x,
+        rect_y,
+        rect_width,
+        rect_height,
+        dest,
+        custom_layout.as_deref(),
+      )?;
+    } else {
+      // No conversion needed - copy straight from the read-locked frame
+      Self::copy_cropped_data(
+        &frame_guard,
+        format,
+        rect_x,
+        rect_y,
+        rect_width,
+        rect_height,
+        dest,
+        custom_layout.as_deref(),
+      )?;
+    }
 
     // Return custom layout if provided, otherwise calculate default layout
     let layouts = if let Some(layout) = custom_layout {
@@ -3006,6 +3320,20 @@ impl VideoFrame {
           Status::GenericFailure,
           format!("Plane {} data is null", plane_idx),
         ));
+      }
+
+      // Callers size `dest` from the same layout. Check anyway: `dest` can be JS memory.
+      if plane_height > 0 {
+        let plane_end = (plane_height as usize - 1)
+          .checked_mul(dest_stride)
+          .and_then(|v| v.checked_add(dest_plane_offset))
+          .and_then(|v| v.checked_add(default_bytes_per_row as usize));
+        if plane_end.is_none_or(|end| end > dest.len()) {
+          return Err(Error::new(
+            Status::GenericFailure,
+            format!("Plane {} does not fit the destination", plane_idx),
+          ));
+        }
       }
 
       // Copy row by row

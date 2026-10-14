@@ -1136,6 +1136,7 @@ export declare class VideoFrame {
    *
    * Returns a Promise that resolves with an array of PlaneLayout objects.
    * Options can specify target format and rect for cropped copy.
+   * Like Chrome, the bytes are written before this call returns.
    */
   copyTo(destination: Uint8Array, options?: VideoFrameCopyToOptions | undefined | null): Promise<PlaneLayout[]>
   /**
