@@ -758,6 +758,28 @@ test('close() drops the NotSupportedError from configure(), also after reset()',
   }
 })
 
+// FLAC needs a description. A configured decoder checks that in configure() like
+// an unconfigured one, so the error does not depend on the decoder's state.
+test('AudioDecoder: reset() keeps the NotSupportedError for FLAC without a description, also when reconfiguring', async (t) => {
+  for (const configuredFirst of [false, true]) {
+    const name = configuredFirst ? 'after opus' : 'first configure'
+    const log: string[] = []
+    const decoder: AudioDecoder = new AudioDecoder({
+      output: (data) => data.close(),
+      error: (e) => log.push(`error:${e.name}:${decoder.state}`),
+    })
+    if (configuredFirst) decoder.configure({ codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 })
+    decoder.configure({ codec: 'flac', sampleRate: 48_000, numberOfChannels: 2 })
+    decoder.reset()
+    t.is(decoder.state, 'unconfigured', `${name}: state after reset()`)
+
+    await waitFor(() => log.length > 0, `${name}: error callback`)
+    await delay(50)
+    t.deepEqual(log, ['error:NotSupportedError:closed'], name)
+    t.is(decoder.state, 'closed', name)
+  }
+})
+
 // ============================================================================
 // Memory a closed encoder keeps
 // ============================================================================
