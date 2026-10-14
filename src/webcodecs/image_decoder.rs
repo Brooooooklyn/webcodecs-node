@@ -4,7 +4,7 @@
 //! See: <https://developer.mozilla.org/en-US/docs/Web/API/ImageDecoder>
 
 use crate::codec::demuxer::{DemuxerContext, MediaType};
-use crate::codec::{CodecContext, DecoderConfig, Frame, Packet, ScaleAlgorithm, Scaler};
+use crate::codec::{CodecContext, DecoderConfig, Frame, Packet};
 use crate::ffi::avutil::av_rescale_q;
 use crate::ffi::{AV_NOPTS_VALUE, AVCodecID, AVRational};
 use crate::webcodecs::buffer_source::{self, Uint8ArrayCopy};
@@ -1032,7 +1032,8 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
   }
 
   // Give every frame a WebCodecs format that describes its bytes, converting the
-  // FFmpeg formats WebCodecs has no name for (rgb24, pal8, gray, argb, ...).
+  // FFmpeg formats WebCodecs has no name for (rgb24, pal8, gray, argb, ...), and
+  // apply desiredWidth/desiredHeight scaling if both are specified.
   let source = DecodedSource::Image {
     codec: codec_id,
     alpha: match codec_id {
@@ -1046,6 +1047,7 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
       AVCodecID::Av1 => Some(still),
       _ => None,
     },
+    size: desired_width.zip(desired_height),
   };
   let frames = frames
     .into_iter()
@@ -1057,40 +1059,6 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
         format!("Failed to convert decoded image: {}", e),
       )
     })?;
-
-  // Apply desiredWidth/desiredHeight scaling if both are specified
-  let frames = if let (Some(dw), Some(dh)) = (desired_width, desired_height) {
-    let mut scaled_frames = Vec::with_capacity(frames.len());
-    for (frame, format) in frames {
-      // Create scaler for this frame's dimensions and format
-      let scaler = Scaler::new(
-        frame.width(),
-        frame.height(),
-        frame.format(),
-        dw,
-        dh,
-        frame.format(),
-        ScaleAlgorithm::Lanczos, // High quality for images
-      )
-      .map_err(|e| {
-        Error::new(
-          Status::GenericFailure,
-          format!("Failed to create scaler: {}", e),
-        )
-      })?;
-
-      let scaled = scaler.scale_alloc(&frame).map_err(|e| {
-        Error::new(
-          Status::GenericFailure,
-          format!("Failed to scale frame: {}", e),
-        )
-      })?;
-      scaled_frames.push((scaled, format));
-    }
-    scaled_frames
-  } else {
-    frames
-  };
 
   let repetition_count = if codec_id == AVCodecID::Gif {
     gif_repetition_count(&data_bytes)

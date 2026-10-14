@@ -428,6 +428,33 @@ test('ImageDecoder: desiredWidth/desiredHeight scale a gray PNG as BGRX', async 
   image.close()
 })
 
+test('ImageDecoder: desiredWidth/desiredHeight convert and resize RGB and gray PNGs in one pass', async (t) => {
+  // 64x32, left half one colour, right half another, scaled to 16x8. The converted
+  // frame is written at 16x8 directly (no full-size BGRX copy of the image).
+  const halves = (left: number[], right: number[]) =>
+    Array.from({ length: 32 }, () => Array.from({ length: 64 }, (_, x) => (x < 32 ? left : right)).flat())
+  for (const [name, data, left, right] of [
+    ['rgb24', png(64, 32, 2, 8, halves([200, 40, 10], [20, 90, 230])), [10, 40, 200, 255], [230, 90, 20, 255]],
+    ['gray', png(64, 32, 0, 8, halves([40], [210])), [40, 40, 40, 255], [210, 210, 210, 255]],
+  ] as const) {
+    const image = await decodeImage(data, 'image/png', { desiredWidth: 16, desiredHeight: 8 })
+    t.is(image.format, 'BGRX', name)
+    t.deepEqual([image.codedWidth, image.codedHeight], [16, 8], name)
+    const { bytes, layout } = await rawCopy(image)
+    t.deepEqual(layout, [[0, 64]], name)
+    const px = (x: number, y: number) => Array.from(bytes.subarray(y * 64 + x * 4, y * 64 + x * 4 + 4))
+    for (const [x, y] of [
+      [0, 0],
+      [1, 4],
+      [2, 7],
+    ]) {
+      t.deepEqual(px(x, y), left, `${name} (${x}, ${y})`)
+      t.deepEqual(px(15 - x, y), right, `${name} (${15 - x}, ${y})`)
+    }
+    image.close()
+  }
+})
+
 // ============================================================================
 // ImageDecoder: JPEG (16x8, written by Pillow)
 // ============================================================================

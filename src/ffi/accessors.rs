@@ -33,7 +33,8 @@ unsafe extern "C" {
   pub fn ffpixfmt_describe(fmt: c_int, out: *mut c_int) -> c_int;
   /// 1 when a palette frame has an entry that is not fully opaque, else 0.
   pub fn ffframe_palette_has_alpha(frame: *const AVFrame) -> c_int;
-  /// Convert all of `src` into `dst` (allocated, same size, its own format) with swscale.
+  /// Convert all of `src` into `dst` (allocated, its own format) with swscale. A `dst` of
+  /// another size is resized in the same pass (Lanczos).
   /// `unspecified_full`: treat a gray/YUV source without a range tag as full range.
   pub fn ffframe_convert_decoded(
     src: *const AVFrame,

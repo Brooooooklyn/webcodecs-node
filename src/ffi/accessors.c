@@ -1807,14 +1807,15 @@ int ffframe_palette_has_alpha(const AVFrame *f) {
   return 0;
 }
 
-// Convert all of src into dst, which has its own format and buffers at the same size. Gray and
+// Convert all of src into dst, which has its own format and buffers. A dst of another size is
+// resized in the same pass with Lanczos (ImageDecoder desiredWidth/desiredHeight). Gray and
 // YUV samples keep their range (unspecified_full picks it when src has no range tag); YUV <-> RGB
 // uses src's matrix. dst gets src's props; an RGB dst is tagged RGB matrix, full range, and a
 // YUV dst made from a full-range source is tagged full range.
 int ffframe_convert_decoded(const AVFrame *src, AVFrame *dst, int unspecified_full) {
-  if (!src || !dst || src->width != dst->width || src->height != dst->height || src->width <= 0 ||
-      src->height <= 0)
+  if (!src || !dst || src->width <= 0 || src->height <= 0 || dst->width <= 0 || dst->height <= 0)
     return AVERROR(EINVAL);
+  int resize = src->width != dst->width || src->height != dst->height;
   const AVPixFmtDescriptor *dd = av_pix_fmt_desc_get((enum AVPixelFormat)dst->format);
   if (!dd || !sws_isSupportedInput((enum AVPixelFormat)src->format) ||
       !sws_isSupportedOutput((enum AVPixelFormat)dst->format))
@@ -1832,7 +1833,8 @@ int ffframe_convert_decoded(const AVFrame *src, AVFrame *dst, int unspecified_fu
          : SWS_CS_DEFAULT;
   struct SwsContext *s = sws_getContext(src->width, src->height, (enum AVPixelFormat)f, dst->width,
                                         dst->height, (enum AVPixelFormat)dst->format,
-                                        SWS_BILINEAR | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT,
+                                        (resize ? SWS_LANCZOS : SWS_BILINEAR) | SWS_ACCURATE_RND |
+                                            SWS_FULL_CHR_H_INT,
                                         NULL, NULL, NULL);
   if (!s) return AVERROR(ENOMEM);
   sws_setColorspaceDetails(s, sws_getCoefficients(cs), full, sws_getCoefficients(cs), full, 0,
