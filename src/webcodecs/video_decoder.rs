@@ -5,6 +5,7 @@
 
 use crate::codec::{CodecContext, DecoderConfig, Frame, Packet, download_hw_frame};
 use crate::ffi::{AV_NOPTS_VALUE, AVCodecID, AVHWDeviceType, accessors::ffctx_set_hw_get_format};
+use crate::webcodecs::decoded_frame::{DecodedSource, decoded_frame_format};
 use crate::webcodecs::encoded_video_chunk::InternalSlice;
 use crate::webcodecs::error::{
   DOMExceptionName, error_as_dom_exception, native_dom_exception_error, throw_data_error,
@@ -30,6 +31,15 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
+
+/// Decoded-frame source for `decoded_frame_format`.
+fn video_source(hardware: bool) -> DecodedSource {
+  if hardware {
+    DecodedSource::HardwareVideo
+  } else {
+    DecodedSource::Video
+  }
+}
 
 /// Type alias for output callback (takes VideoFrame)
 /// Using CalleeHandled: false for direct callbacks without error-first convention
@@ -677,7 +687,8 @@ impl VideoDecoder {
         Self::resolve_frame_metadata(&mut guard, &frame, (timestamp, duration));
 
       // Download hardware frames to CPU memory if needed
-      let output_frame = if frame.format().is_hardware() {
+      let hardware = frame.format().is_hardware();
+      let output_frame = if hardware {
         match download_hw_frame(&frame) {
           Ok(sw_frame) => sw_frame,
           Err(e) => {
@@ -691,9 +702,21 @@ impl VideoDecoder {
       } else {
         frame
       };
+      let (output_frame, format) = match decoded_frame_format(output_frame, video_source(hardware))
+      {
+        Ok(converted) => converted,
+        Err(e) => {
+          Self::report_error(
+            &mut guard,
+            &format!("EncodingError: Failed to convert decoded frame: {}", e),
+          );
+          return;
+        }
+      };
 
       let video_frame = VideoFrame::from_internal_with_orientation(
         output_frame,
+        format,
         output_timestamp,
         output_duration,
         guard.config_rotation,
@@ -855,7 +878,8 @@ impl VideoDecoder {
 
         // Download hardware frames to CPU memory if needed
         // (shouldn't happen in fallback path but handle for safety)
-        let output_frame = if frame.format().is_hardware() {
+        let hardware = frame.format().is_hardware();
+        let output_frame = if hardware {
           match download_hw_frame(&frame) {
             Ok(sw_frame) => sw_frame,
             Err(_) => continue, // Skip failed frame downloads during re-decode
@@ -863,9 +887,14 @@ impl VideoDecoder {
         } else {
           frame
         };
+        let Ok((output_frame, format)) = decoded_frame_format(output_frame, video_source(hardware))
+        else {
+          continue; // Skip frames that cannot be converted, like failed downloads
+        };
 
         let video_frame = VideoFrame::from_internal_with_orientation(
           output_frame,
+          format,
           output_timestamp,
           output_duration,
           guard.config_rotation,
@@ -952,7 +981,8 @@ impl VideoDecoder {
         Self::resolve_frame_metadata(&mut guard, &frame, (0, None));
 
       // Download hardware frames to CPU memory if needed
-      let output_frame = if frame.format().is_hardware() {
+      let hardware = frame.format().is_hardware();
+      let output_frame = if hardware {
         match download_hw_frame(&frame) {
           Ok(sw_frame) => sw_frame,
           Err(e) => {
@@ -967,9 +997,22 @@ impl VideoDecoder {
       } else {
         frame
       };
+      let (output_frame, format) = match decoded_frame_format(output_frame, video_source(hardware))
+      {
+        Ok(converted) => converted,
+        Err(e) => {
+          let msg = format!("Failed to convert decoded frame: {}", e);
+          Self::report_error(&mut guard, &format!("EncodingError: {}", msg));
+          return Err(Error::new(
+            Status::GenericFailure,
+            format!("EncodingError: {}", msg),
+          ));
+        }
+      };
 
       let video_frame = VideoFrame::from_internal_with_orientation(
         output_frame,
+        format,
         output_timestamp,
         output_duration,
         guard.config_rotation,

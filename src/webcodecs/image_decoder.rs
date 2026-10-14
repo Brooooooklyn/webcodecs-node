@@ -7,12 +7,13 @@ use crate::codec::demuxer::{DemuxerContext, MediaType};
 use crate::codec::{CodecContext, DecoderConfig, Frame, Packet, ScaleAlgorithm, Scaler};
 use crate::ffi::avutil::av_rescale_q;
 use crate::ffi::{AV_NOPTS_VALUE, AVCodecID, AVRational};
-use crate::webcodecs::VideoFrame;
 use crate::webcodecs::buffer_source::{self, Uint8ArrayCopy};
+use crate::webcodecs::decoded_frame::{DecodedSource, decoded_frame_format};
 use crate::webcodecs::error::{
   DOMExceptionName, invalid_state_error, native_dom_exception_error, native_range_error,
   throw_invalid_state_error,
 };
+use crate::webcodecs::{VideoFrame, VideoPixelFormat};
 use futures::stream::StreamExt;
 use napi::bindgen_prelude::*;
 use napi::tokio::sync::Notify;
@@ -415,8 +416,9 @@ struct ImageDecoderInner {
   /// Whether decoder is closed
   closed: bool,
   /// Cached decoded frames (for animated images, populated on first decode)
-  /// Cached decoded frames wrapped in Arc for efficient sharing
-  cached_frames: Option<Vec<Arc<ParkingLotRwLock<Frame>>>>,
+  /// Cached decoded frames wrapped in Arc for efficient sharing, with the
+  /// WebCodecs format that describes each one
+  cached_frames: Option<Vec<(Arc<ParkingLotRwLock<Frame>>, VideoPixelFormat)>>,
   /// Incremented when reset/close invalidates in-flight decode work.
   cache_epoch: u64,
   /// Encoded byte length represented by the current cache. Prevents an older
@@ -928,7 +930,7 @@ fn decode_cached_frame(
   }
 
   // Clone the Arc to share the frame data (no pixel copy needed).
-  let frame_arc = frames[frame_index].clone();
+  let (frame_arc, format) = frames[frame_index].clone();
   let frame_guard = frame_arc.read();
   let pts = frame_guard.pts();
   let frame_duration = frame_guard.duration();
@@ -937,8 +939,13 @@ fn decode_cached_frame(
 
   // Per Chromium behavior: "default" extracts color space, "none" ignores it.
   let extract_color_space = guard.color_space_conversion == ColorSpaceConversion::Default;
-  let video_frame =
-    VideoFrame::from_internal_arc_with_color_space(frame_arc, pts, duration, extract_color_space);
+  let video_frame = VideoFrame::from_internal_arc_with_color_space(
+    frame_arc,
+    format,
+    pts,
+    duration,
+    extract_color_space,
+  );
 
   Ok(Some(ImageDecodeResult {
     image: video_frame,
@@ -1022,10 +1029,27 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
     frames.truncate(1);
   }
 
+  // Give every frame a WebCodecs format that describes its bytes, converting the
+  // FFmpeg formats WebCodecs has no name for (rgb24, pal8, gray, argb, ...).
+  let source = DecodedSource::Image {
+    codec: codec_id,
+    webp_alpha: webp_alpha_hint(&data_bytes),
+  };
+  let frames = frames
+    .into_iter()
+    .map(|frame| decoded_frame_format(frame, source))
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .map_err(|e| {
+      Error::new(
+        Status::GenericFailure,
+        format!("Failed to convert decoded image: {}", e),
+      )
+    })?;
+
   // Apply desiredWidth/desiredHeight scaling if both are specified
   let frames = if let (Some(dw), Some(dh)) = (desired_width, desired_height) {
     let mut scaled_frames = Vec::with_capacity(frames.len());
-    for frame in frames {
+    for (frame, format) in frames {
       // Create scaler for this frame's dimensions and format
       let scaler = Scaler::new(
         frame.width(),
@@ -1049,7 +1073,7 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
           format!("Failed to scale frame: {}", e),
         )
       })?;
-      scaled_frames.push(scaled);
+      scaled_frames.push((scaled, format));
     }
     scaled_frames
   } else {
@@ -1089,13 +1113,29 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
   }
 
   // Wrap frames in Arc for efficient sharing from cache
-  let shared_frames: Vec<Arc<ParkingLotRwLock<Frame>>> =
-    frames.into_iter().map(|f| f.into_shared()).collect();
+  let shared_frames: Vec<(Arc<ParkingLotRwLock<Frame>>, VideoPixelFormat)> = frames
+    .into_iter()
+    .map(|(f, format)| (f.into_shared(), format))
+    .collect();
   guard.cached_frames = Some(shared_frames);
   guard.context = Some(context);
   guard.cached_data_len = data_bytes.len();
 
   Ok(())
+}
+
+/// The alpha hint in a WebP header: the VP8X alpha flag, or the alpha_is_used bit of
+/// a simple lossless (VP8L) file. Chrome labels the decoded image BGRA or BGRX by it.
+fn webp_alpha_hint(data: &[u8]) -> Option<bool> {
+  if data.len() < 25 || &data[0..4] != b"RIFF" || &data[8..12] != b"WEBP" {
+    return None;
+  }
+  match &data[12..16] {
+    b"VP8X" => Some(data[20] & 0x10 != 0),
+    // 0x2f signature, then 14 bits width - 1, 14 bits height - 1, 1 bit alpha_is_used
+    b"VP8L" if data[20] == 0x2f => Some(data[24] & 0x10 != 0),
+    _ => None,
+  }
 }
 
 /// Parse the GIF application extension used for animation loop control.
@@ -1313,7 +1353,7 @@ fn normalize_frame_timing(frames: &mut [Frame], time_base: (i32, i32)) {
 
 #[cfg(test)]
 mod tests {
-  use super::{gif_repetition_count, normalize_frame_timing};
+  use super::{gif_repetition_count, normalize_frame_timing, webp_alpha_hint};
   use crate::codec::Frame;
   use crate::ffi::types::AV_NOPTS_VALUE;
 
@@ -1329,6 +1369,26 @@ mod tests {
     // the trailing block terminator is not part of the fields inspected here.
     extension.pop();
     assert_eq!(gif_repetition_count(&extension), Some(f64::INFINITY));
+  }
+
+  #[test]
+  fn reads_webp_alpha_hints() {
+    let lossless = |alpha: u8| {
+      let mut b = b"RIFF\0\0\0\0WEBPVP8L\0\0\0\0\x2f\x05\xc0\x00\x00".to_vec();
+      b[24] = alpha;
+      b
+    };
+    assert_eq!(webp_alpha_hint(&lossless(0x10)), Some(true));
+    assert_eq!(webp_alpha_hint(&lossless(0x00)), Some(false));
+    let mut extended = b"RIFF\0\0\0\0WEBPVP8X\x0a\0\0\0\x10\0\0\0\0".to_vec();
+    assert_eq!(webp_alpha_hint(&extended), Some(true));
+    extended[20] = 0x02; // animation flag only
+    assert_eq!(webp_alpha_hint(&extended), Some(false));
+    assert_eq!(
+      webp_alpha_hint(b"RIFF\0\0\0\0WEBPVP8 \0\0\0\0\0\0\0\0\0"),
+      None
+    );
+    assert_eq!(webp_alpha_hint(b"GIF89a"), None);
   }
 
   #[test]

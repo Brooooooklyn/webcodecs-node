@@ -9,6 +9,7 @@ mod audio_encoder;
 pub(crate) mod buffer_source;
 pub(crate) mod codec_pressure;
 pub mod codec_string;
+pub(crate) mod decoded_frame;
 pub mod demuxer_base;
 mod encoded_audio_chunk;
 mod encoded_video_chunk;

@@ -115,7 +115,9 @@ pub enum VideoPixelFormat {
 }
 
 impl VideoPixelFormat {
-  /// Convert from FFmpeg pixel format
+  /// The WebCodecs format with exactly the memory layout of an FFmpeg pixel format.
+  /// Formats without one (rgb24, argb, pal8, gray, ...) return None; decoders convert
+  /// those frames (see `decoded_frame`).
   pub fn from_av_format(format: AVPixelFormat) -> Option<Self> {
     match format {
       // 8-bit formats
@@ -129,12 +131,6 @@ impl VideoPixelFormat {
       AVPixelFormat::Nv21 => Some(VideoPixelFormat::NV21),
       AVPixelFormat::Rgba => Some(VideoPixelFormat::RGBA),
       AVPixelFormat::Bgra => Some(VideoPixelFormat::BGRA),
-      // ARGB/ABGR map to RGBA/BGRA (closest WebCodecs equivalent - channel order adjusted)
-      AVPixelFormat::Argb => Some(VideoPixelFormat::RGBA),
-      AVPixelFormat::Abgr => Some(VideoPixelFormat::BGRA),
-      // RGB24/BGR24 map to RGBX/BGRX (closest WebCodecs equivalent - alpha ignored)
-      AVPixelFormat::Rgb24 => Some(VideoPixelFormat::RGBX),
-      AVPixelFormat::Bgr24 => Some(VideoPixelFormat::BGRX),
       // 10-bit formats
       AVPixelFormat::Yuv420p10le => Some(VideoPixelFormat::I420P10),
       AVPixelFormat::Yuv422p10le => Some(VideoPixelFormat::I422P10),
@@ -1744,6 +1740,19 @@ fn get_subsampling_factors(format: VideoPixelFormat) -> (u32, u32) {
   }
 }
 
+/// Whether `format` describes the memory of `frame`. Decoded RGB video is I444 over
+/// FFmpeg's G, B, R planes, which have the same geometry as Y, U, V.
+fn format_describes_frame(format: VideoPixelFormat, frame: &Frame) -> bool {
+  let av = frame.format();
+  av == format.to_av_format()
+    || matches!(
+      (format, av),
+      (VideoPixelFormat::I444, AVPixelFormat::Gbrp)
+        | (VideoPixelFormat::I444P10, AVPixelFormat::Gbrp10le)
+        | (VideoPixelFormat::I444P12, AVPixelFormat::Gbrp12le)
+    )
+}
+
 /// Calculate plane end offset with overflow checking
 ///
 /// Computes `offset + stride * height` using u64 to prevent u32 overflow.
@@ -3058,75 +3067,13 @@ impl VideoFrame {
     }
   }
 
-  /// Create a VideoFrame from an internal Frame (for decoder output)
-  pub fn from_internal(frame: Frame, timestamp_us: i64, duration_us: Option<i64>) -> Self {
-    let width = frame.width();
-    let height = frame.height();
-    let original_format =
-      VideoPixelFormat::from_av_format(frame.format()).unwrap_or(VideoPixelFormat::I420);
-
-    let inner = VideoFrameInner {
-      resource: VideoFrameResource::Software {
-        frame: frame.into_shared(),
-        format: original_format,
-      },
-      timestamp_us,
-      duration_us,
-      visible_left: 0,
-      visible_top: 0,
-      visible_width: width,
-      visible_height: height,
-      display_width: width,
-      display_height: height,
-      rotation: 0.0,
-      flip: false,
-      color_space: VideoColorSpace::default(),
-    };
-
-    Self::from_inner(inner)
-  }
-
-  /// Create a VideoFrame from an Arc<RwLock<Frame>> (for sharing frame data)
-  pub fn from_internal_arc(
-    frame: Arc<RwLock<Frame>>,
-    timestamp_us: i64,
-    duration_us: Option<i64>,
-  ) -> Self {
-    let (width, height, original_format) = {
-      let guard = frame.read();
-      let width = guard.width();
-      let height = guard.height();
-      let format =
-        VideoPixelFormat::from_av_format(guard.format()).unwrap_or(VideoPixelFormat::I420);
-      (width, height, format)
-    };
-
-    let inner = VideoFrameInner {
-      resource: VideoFrameResource::Software {
-        frame,
-        format: original_format,
-      },
-      timestamp_us,
-      duration_us,
-      visible_left: 0,
-      visible_top: 0,
-      visible_width: width,
-      visible_height: height,
-      display_width: width,
-      display_height: height,
-      rotation: 0.0,
-      flip: false,
-      color_space: VideoColorSpace::default(),
-    };
-
-    Self::from_inner(inner)
-  }
-
-  /// Create a VideoFrame from an internal Frame with rotation/flip (for decoder output)
+  /// Create a VideoFrame from a decoded Frame with rotation/flip (VideoDecoder output).
   ///
+  /// `format` must describe `frame`'s memory (see `decoded_frame::decoded_frame_format`).
   /// If `color_space_init` is provided, uses those values. Otherwise extracts from FFmpeg frame.
-  pub fn from_internal_with_orientation(
+  pub(crate) fn from_internal_with_orientation(
     frame: Frame,
+    format: VideoPixelFormat,
     timestamp_us: i64,
     duration_us: Option<i64>,
     rotation: f64,
@@ -3136,8 +3083,6 @@ impl VideoFrame {
     let width = frame.width();
     let height = frame.height();
     let parsed_rotation = parse_rotation(rotation);
-    let original_format =
-      VideoPixelFormat::from_av_format(frame.format()).unwrap_or(VideoPixelFormat::I420);
 
     let display_width = width;
     let display_height = height;
@@ -3165,7 +3110,7 @@ impl VideoFrame {
     let inner = VideoFrameInner {
       resource: VideoFrameResource::Software {
         frame: frame.into_shared(),
-        format: original_format,
+        format,
       },
       timestamp_us,
       duration_us,
@@ -3183,55 +3128,14 @@ impl VideoFrame {
     Self::from_inner(inner)
   }
 
-  /// Create a VideoFrame from an internal Frame with color space control (for ImageDecoder)
-  ///
-  /// When `extract_color_space` is true, color space metadata is extracted from the FFmpeg
-  /// frame and populated in the VideoFrame (colorSpaceConversion: "default").
-  /// When false, the VideoFrame has an empty color space (colorSpaceConversion: "none").
-  pub fn from_internal_with_color_space(
-    frame: Frame,
-    timestamp_us: i64,
-    duration_us: Option<i64>,
-    extract_color_space: bool,
-  ) -> Self {
-    let width = frame.width();
-    let height = frame.height();
-    let original_format =
-      VideoPixelFormat::from_av_format(frame.format()).unwrap_or(VideoPixelFormat::I420);
-
-    let color_space = if extract_color_space {
-      color_space_from_frame(&frame)
-    } else {
-      VideoColorSpace::default()
-    };
-
-    let inner = VideoFrameInner {
-      resource: VideoFrameResource::Software {
-        frame: frame.into_shared(),
-        format: original_format,
-      },
-      timestamp_us,
-      duration_us,
-      visible_left: 0,
-      visible_top: 0,
-      visible_width: width,
-      visible_height: height,
-      display_width: width,
-      display_height: height,
-      rotation: 0.0,
-      flip: false,
-      color_space,
-    };
-
-    Self::from_inner(inner)
-  }
-
   /// Create a VideoFrame from a shared Arc<RwLock<Frame>> with color space control
   ///
   /// This constructor allows sharing the same frame data via Arc cloning,
-  /// avoiding expensive pixel copies. Used by ImageDecoder cache.
-  pub fn from_internal_arc_with_color_space(
+  /// avoiding expensive pixel copies. Used by ImageDecoder cache. `format` must
+  /// describe the frame's memory (see `decoded_frame::decoded_frame_format`).
+  pub(crate) fn from_internal_arc_with_color_space(
     frame_arc: Arc<RwLock<Frame>>,
+    format: VideoPixelFormat,
     timestamp_us: i64,
     duration_us: Option<i64>,
     extract_color_space: bool,
@@ -3239,8 +3143,6 @@ impl VideoFrame {
     let frame_guard = frame_arc.read();
     let width = frame_guard.width();
     let height = frame_guard.height();
-    let original_format =
-      VideoPixelFormat::from_av_format(frame_guard.format()).unwrap_or(VideoPixelFormat::I420);
 
     let color_space = if extract_color_space {
       color_space_from_frame(&frame_guard)
@@ -3252,7 +3154,7 @@ impl VideoFrame {
     let inner = VideoFrameInner {
       resource: VideoFrameResource::Software {
         frame: frame_arc,
-        format: original_format,
+        format,
       },
       timestamp_us,
       duration_us,
@@ -4009,6 +3911,17 @@ impl VideoFrame {
     dest: &mut [u8],
     custom_layout: Option<&[PlaneLayout]>,
   ) -> Result<()> {
+    // The planes are read with `format`'s geometry, so it must be the frame's real layout.
+    if !format_describes_frame(format, frame) {
+      return Err(Error::new(
+        Status::GenericFailure,
+        format!(
+          "VideoFrame format {:?} does not match its pixel data (FFmpeg pixel format {})",
+          format,
+          frame.format_raw()
+        ),
+      ));
+    }
     let (h_factor, v_factor) = get_subsampling_factors(format);
     let bps = format.bytes_per_sample() as u32;
     let num_planes = Self::get_number_of_planes(format);
@@ -4069,9 +3982,9 @@ impl VideoFrame {
         None => (default_dest_offset, default_bytes_per_row as usize),
       };
 
-      // Get source plane data and stride
+      // Get source plane data and stride (FFmpeg allows a negative stride)
       let src_data = frame.data(plane_idx as usize);
-      let src_stride = frame.linesize(plane_idx as usize) as usize;
+      let src_stride = frame.linesize(plane_idx as usize) as isize;
 
       if src_data.is_null() {
         return Err(Error::new(
@@ -4080,31 +3993,48 @@ impl VideoFrame {
         ));
       }
 
+      // Every row read must stay inside the plane: FFmpeg allocates `height` rows
+      // (subsampled sizes rounded up) of `|linesize|` bytes each.
+      let plane_rows = frame.height().div_ceil(plane_v_factor) as u64;
+      let src_row_start = (plane_src_x as usize) * (plane_sample_bytes as usize);
+      let row_bytes = default_bytes_per_row as usize;
+      if plane_src_y as u64 + plane_height as u64 > plane_rows
+        || src_row_start + row_bytes > src_stride.unsigned_abs()
+      {
+        return Err(Error::new(
+          Status::GenericFailure,
+          format!("Copy region is outside plane {} of the frame", plane_idx),
+        ));
+      }
       // Callers size `dest` from the same layout. Check anyway: `dest` can be JS memory.
-      if plane_height > 0 {
-        let plane_end = (plane_height as usize - 1)
+      if plane_height > 0
+        && (plane_height as usize - 1)
           .checked_mul(dest_stride)
           .and_then(|v| v.checked_add(dest_plane_offset))
-          .and_then(|v| v.checked_add(default_bytes_per_row as usize));
-        if plane_end.is_none_or(|end| end > dest.len()) {
-          return Err(Error::new(
-            Status::GenericFailure,
-            format!("Plane {} does not fit the destination", plane_idx),
-          ));
-        }
+          .and_then(|v| v.checked_add(row_bytes))
+          .is_none_or(|end| end > dest.len())
+      {
+        return Err(Error::new(
+          Status::GenericFailure,
+          format!(
+            "Copy region does not fit the destination for plane {}",
+            plane_idx
+          ),
+        ));
       }
 
       // Copy row by row
       for row in 0..plane_height {
-        let src_row_offset = ((plane_src_y + row) as usize) * src_stride
-          + (plane_src_x as usize) * (plane_sample_bytes as usize);
         let dest_row_offset = dest_plane_offset + (row as usize) * dest_stride;
 
         unsafe {
+          let src_row = src_data
+            .offset((plane_src_y + row) as isize * src_stride)
+            .add(src_row_start);
           std::ptr::copy_nonoverlapping(
-            src_data.add(src_row_offset),
+            src_row,
             dest.as_mut_ptr().add(dest_row_offset),
-            default_bytes_per_row as usize, // Always copy the actual data width, not the padded stride
+            row_bytes, // Always copy the actual data width, not the padded stride
           );
         }
       }
@@ -5146,4 +5076,72 @@ pub fn register_video_frame_close_observer(
       .push((id, reference));
   });
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn copy(
+    frame: &Frame,
+    format: VideoPixelFormat,
+    rect: (u32, u32, u32, u32),
+    dest: &mut [u8],
+  ) -> Result<()> {
+    let (x, y, w, h) = rect;
+    VideoFrame::copy_cropped_data(frame, format, x, y, w, h, dest, None)
+  }
+
+  #[test]
+  fn copy_needs_a_format_that_describes_the_frame() {
+    let mut dest = vec![0u8; 64 * 64 * 4];
+    // rgb24 labelled RGBX read 4 bytes per pixel from 3-byte pixels (#127)
+    let rgb24 = Frame::new_video(64, 64, AVPixelFormat::Rgb24).unwrap();
+    assert!(copy(&rgb24, VideoPixelFormat::RGBX, (0, 0, 64, 64), &mut dest).is_err());
+    let yuv = Frame::new_video(64, 64, AVPixelFormat::Yuv420p).unwrap();
+    assert!(copy(&yuv, VideoPixelFormat::I444, (0, 0, 64, 64), &mut dest).is_err());
+    assert!(copy(&yuv, VideoPixelFormat::I420, (0, 0, 64, 64), &mut dest).is_ok());
+    // Decoded RGB video is I444 over the G, B, R planes
+    let gbrp = Frame::new_video(64, 64, AVPixelFormat::Gbrp).unwrap();
+    assert!(copy(&gbrp, VideoPixelFormat::I444, (0, 0, 64, 64), &mut dest).is_ok());
+    let bgra = Frame::new_video(64, 64, AVPixelFormat::Bgra).unwrap();
+    assert!(copy(&bgra, VideoPixelFormat::BGRX, (0, 0, 64, 64), &mut dest).is_ok());
+    assert!(copy(&bgra, VideoPixelFormat::RGBX, (0, 0, 64, 64), &mut dest).is_err());
+  }
+
+  #[test]
+  fn copy_reads_and_writes_only_inside_the_planes() {
+    let mut frame = Frame::new_video(16, 16, AVPixelFormat::Yuv420p).unwrap();
+    for plane in 0..3 {
+      frame.plane_data_mut(plane).unwrap().fill(plane as u8 + 1);
+    }
+    let mut dest = vec![0u8; 16 * 16 * 3 / 2];
+    assert!(copy(&frame, VideoPixelFormat::I420, (0, 0, 16, 16), &mut dest).is_ok());
+    assert_eq!(&dest[..256], &[1u8; 256][..]);
+    assert_eq!(&dest[256..320], &[2u8; 64][..]);
+    assert_eq!(&dest[320..], &[3u8; 64][..]);
+    // rows below the frame
+    assert!(copy(&frame, VideoPixelFormat::I420, (0, 2, 16, 16), &mut dest).is_err());
+    // columns past the row stride
+    let stride = frame.linesize(0) as u32;
+    assert!(
+      copy(
+        &frame,
+        VideoPixelFormat::I420,
+        (stride, 0, 16, 2),
+        &mut dest
+      )
+      .is_err()
+    );
+    // destination too small
+    assert!(
+      copy(
+        &frame,
+        VideoPixelFormat::I420,
+        (0, 0, 16, 16),
+        &mut dest[..100]
+      )
+      .is_err()
+    );
+  }
 }
