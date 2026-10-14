@@ -1033,7 +1033,11 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
   // FFmpeg formats WebCodecs has no name for (rgb24, pal8, gray, argb, ...).
   let source = DecodedSource::Image {
     codec: codec_id,
-    webp_alpha: webp_alpha_hint(&data_bytes),
+    alpha: match codec_id {
+      AVCodecID::Webp => webp_alpha_hint(&data_bytes),
+      AVCodecID::Png => png_alpha_hint(&data_bytes),
+      _ => None,
+    },
   };
   let frames = frames
     .into_iter()
@@ -1136,6 +1140,31 @@ fn webp_alpha_hint(data: &[u8]) -> Option<bool> {
     b"VP8L" if data[20] == 0x2f => Some(data[24] & 0x10 != 0),
     _ => None,
   }
+}
+
+/// The alpha a PNG header declares: color type 4 or 6, or a tRNS chunk (which comes
+/// before IDAT). Chrome labels the decoded image BGRA or BGRX by it, even when every
+/// tRNS entry is 255.
+fn png_alpha_hint(data: &[u8]) -> Option<bool> {
+  const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+  if data.len() < 33 || &data[..8] != SIGNATURE || &data[12..16] != b"IHDR" {
+    return None;
+  }
+  if data[25] & 4 != 0 {
+    return Some(true);
+  }
+  let mut pos = 8usize;
+  while let Some(header) = data.get(pos..pos.checked_add(8)?) {
+    match &header[4..8] {
+      b"tRNS" => return Some(true),
+      b"IDAT" | b"IEND" => return Some(false),
+      _ => {}
+    }
+    // length, type, data, CRC
+    let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    pos = pos.checked_add(12)?.checked_add(length)?;
+  }
+  None
 }
 
 /// Parse the GIF application extension used for animation loop control.
@@ -1353,7 +1382,7 @@ fn normalize_frame_timing(frames: &mut [Frame], time_base: (i32, i32)) {
 
 #[cfg(test)]
 mod tests {
-  use super::{gif_repetition_count, normalize_frame_timing, webp_alpha_hint};
+  use super::{gif_repetition_count, normalize_frame_timing, png_alpha_hint, webp_alpha_hint};
   use crate::codec::Frame;
   use crate::ffi::types::AV_NOPTS_VALUE;
 
@@ -1389,6 +1418,46 @@ mod tests {
       None
     );
     assert_eq!(webp_alpha_hint(b"GIF89a"), None);
+  }
+
+  #[test]
+  fn reads_png_alpha_hints() {
+    let chunk = |kind: &[u8], data: &[u8]| {
+      let mut c = (data.len() as u32).to_be_bytes().to_vec();
+      c.extend_from_slice(kind);
+      c.extend_from_slice(data);
+      c.extend_from_slice(&[0; 4]); // CRC is not checked
+      c
+    };
+    let png = |color_type: u8, chunks: &[Vec<u8>]| {
+      let mut b = b"\x89PNG\r\n\x1a\n".to_vec();
+      b.extend(chunk(
+        b"IHDR",
+        &[0, 0, 0, 1, 0, 0, 0, 1, 8, color_type, 0, 0, 0],
+      ));
+      chunks.iter().for_each(|c| b.extend_from_slice(c));
+      b.extend(chunk(b"IDAT", &[]));
+      b
+    };
+    let plte = chunk(b"PLTE", &[0, 0, 0]);
+    let trns = chunk(b"tRNS", &[255]);
+    let text = chunk(b"tEXt", b"a\0b");
+    assert_eq!(
+      png_alpha_hint(&png(3, std::slice::from_ref(&plte))),
+      Some(false)
+    );
+    // tRNS declares alpha even when every entry is 255
+    assert_eq!(
+      png_alpha_hint(&png(3, &[plte, text.clone(), trns.clone()])),
+      Some(true)
+    );
+    assert_eq!(png_alpha_hint(&png(0, &[trns])), Some(true));
+    assert_eq!(png_alpha_hint(&png(2, &[text])), Some(false));
+    assert_eq!(png_alpha_hint(&png(4, &[])), Some(true));
+    assert_eq!(png_alpha_hint(&png(6, &[])), Some(true));
+    // no IDAT yet (truncated) or not a PNG
+    assert_eq!(png_alpha_hint(&png(3, &[])[..33]), None);
+    assert_eq!(png_alpha_hint(b"GIF89a"), None);
   }
 
   #[test]

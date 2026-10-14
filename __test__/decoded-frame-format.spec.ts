@@ -208,6 +208,60 @@ const IMAGE_CASES: [string, Uint8Array, string, VideoPixelFormat, number[]][] = 
     'BGRA',
     [0, 0, 255, 255, 0, 255, 0, 128, 255, 0, 0, 0],
   ],
+  // Chrome labels by the tRNS chunk, not by the alpha values in it
+  [
+    'palette PNG with a tRNS chunk of 255s (pal8)',
+    png(
+      3,
+      1,
+      3,
+      8,
+      [[0, 1, 2]],
+      [
+        ['PLTE', RGBW],
+        ['tRNS', [255, 255, 255]],
+      ],
+    ),
+    'image/png',
+    'BGRA',
+    [0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255],
+  ],
+  [
+    'palette PNG with a short tRNS chunk of 255s (pal8)',
+    png(
+      3,
+      1,
+      3,
+      8,
+      [[0, 1, 2]],
+      [
+        ['PLTE', RGBW],
+        ['tRNS', [255]],
+      ],
+    ),
+    'image/png',
+    'BGRA',
+    [0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255],
+  ],
+  [
+    '1-bit palette PNG with a tRNS chunk of 255s (pal8)',
+    png(
+      9,
+      1,
+      3,
+      1,
+      [[0b10101010, 0b10000000]],
+      [
+        ['PLTE', [10, 20, 30, 200, 210, 220]],
+        ['tRNS', [255, 255]],
+      ],
+    ),
+    'image/png',
+    'BGRA',
+    [220, 210, 200, 255, 30, 20, 10, 255, 220, 210, 200, 255, 30, 20, 10, 255, 220, 210, 200, 255].concat([
+      30, 20, 10, 255, 220, 210, 200, 255, 30, 20, 10, 255, 220, 210, 200, 255,
+    ]),
+  ],
   [
     'gray PNG (gray8)',
     png(3, 1, 0, 8, [[0, 100, 255]]),

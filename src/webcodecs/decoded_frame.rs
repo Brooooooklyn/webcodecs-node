@@ -32,10 +32,11 @@ const FLAG_XYZ: i32 = 1 << 10;
 /// Where a decoded frame comes from. Chrome picks different formats per source.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum DecodedSource {
-  /// ImageDecoder. `webp_alpha` is the alpha hint in a WebP header, when there is one.
+  /// ImageDecoder. `alpha` is the alpha the file header declares (WebP alpha flag,
+  /// PNG color type or tRNS chunk), when there is one: Chrome labels by it.
   Image {
     codec: AVCodecID,
-    webp_alpha: Option<bool>,
+    alpha: Option<bool>,
   },
   /// VideoDecoder, software decoder
   Video,
@@ -106,9 +107,9 @@ pub(crate) fn decoded_frame_format(
       let format = video_target(&desc);
       Ok((convert(&frame, format, &desc, false)?, format))
     }
-    DecodedSource::Image { codec, webp_alpha } => {
+    DecodedSource::Image { codec, alpha } => {
       let desc = describe(frame.format_raw())?;
-      let format = if image_has_alpha(&frame, &desc, codec, webp_alpha) {
+      let format = if image_has_alpha(&frame, &desc, codec, alpha) {
         VideoPixelFormat::BGRA
       } else {
         VideoPixelFormat::BGRX
@@ -123,21 +124,20 @@ fn image_has_alpha(
   frame: &Frame,
   desc: &PixDesc,
   codec: AVCodecID,
-  webp_alpha: Option<bool>,
+  header_alpha: Option<bool>,
 ) -> bool {
-  let palette = desc.flags & FLAG_PAL != 0;
-  // Chrome follows the WebP header hint, not the pixels.
-  if codec == AVCodecID::Webp
-    && let Some(hint) = webp_alpha
-  {
-    return hint;
+  // Chrome follows the header (WebP alpha flag, PNG color type or tRNS chunk), not the
+  // pixels: a PNG whose tRNS entries are all 255 is still BGRA.
+  if let Some(alpha) = header_alpha {
+    return alpha;
   }
+  let palette = desc.flags & FLAG_PAL != 0;
   match codec {
     // JPEG has no alpha (CMYK decodes to gbrap with an opaque alpha plane).
     AVCodecID::Mjpeg => false,
     // BMP palettes have no alpha; FFmpeg zero-fills the entries the file does not list.
     AVCodecID::Bmp if palette => false,
-    // PNG tRNS lowers palette alpha below 255.
+    // Other palettes (a PNG whose header was not read): an entry that is not opaque.
     _ if palette => unsafe { ffframe_palette_has_alpha(frame.as_ptr()) != 0 },
     _ => desc.flags & FLAG_ALPHA != 0,
   }
