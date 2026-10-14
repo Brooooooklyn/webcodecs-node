@@ -570,21 +570,20 @@ impl FromNapiValue for AudioDecoderConfig {
     let codec: Option<String> = obj.get("codec")?;
     let sample_rate: Option<f64> = obj.get("sampleRate")?;
     let number_of_channels: Option<u32> = obj.get("numberOfChannels")?;
-    // Description: any BufferSource, copied right away (never kept as a
-    // pointer into the caller's buffer).
-    let (description, description_detached) =
-      match buffer_source::read_buffer_source_member(env, &obj, "description")? {
-        BufferSourceMember::Copied { bytes, buffer } => (
-          Some(bytes),
-          buffer_source::is_detached_array_buffer(env, buffer)?,
-        ),
-        BufferSourceMember::Absent => (None, false),
-        BufferSourceMember::NotBufferSource => {
-          let message = format!("description {}", buffer_source::NOT_A_BUFFER_SOURCE);
-          Env::from_raw(env).throw_type_error(&message, None)?;
-          return Err(Error::new(Status::InvalidArg, message));
-        }
-      };
+    // Description: any BufferSource. It is read last, so the copy taken here
+    // already holds what earlier getters wrote (Chrome copies after reading
+    // every member).
+    let description: Unknown = obj.get_named_property("description")?;
+    let (description, description_detached) = match buffer_source::copy_member(env, &description)? {
+      BufferSourceMember::Copied(bytes) => (Some(bytes), false),
+      BufferSourceMember::Detached => (None, true),
+      BufferSourceMember::Absent => (None, false),
+      BufferSourceMember::NotBufferSource => {
+        let message = format!("description {}", buffer_source::NOT_A_BUFFER_SOURCE);
+        Env::from_raw(env).throw_type_error(&message, None)?;
+        return Err(Error::new(Status::InvalidArg, message));
+      }
+    };
 
     Ok(AudioDecoderConfig {
       codec,

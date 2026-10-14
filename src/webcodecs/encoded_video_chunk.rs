@@ -1818,23 +1818,20 @@ impl FromNapiValue for VideoDecoderConfig {
     let hardware_acceleration: Option<HardwareAcceleration> = obj.get("hardwareAcceleration")?;
     let optimize_for_latency: Option<bool> = obj.get("optimizeForLatency")?;
 
-    // Description: any BufferSource, copied now because the getters below
-    // can detach or rewrite it. A value that is not a BufferSource is ignored.
-    let (description, description_buffer) =
-      match buffer_source::read_buffer_source_member(env, &obj, "description")? {
-        BufferSourceMember::Copied { bytes, buffer } => (Some(bytes), Some(buffer)),
-        BufferSourceMember::Absent | BufferSourceMember::NotBufferSource => (None, None),
-      };
+    // Description: any BufferSource. Read here, in the same getter order as
+    // before, but copied only after the getters below ran, like Chrome.
+    let description: Unknown = obj.get_named_property("description")?;
 
     // Rotation and flip for VideoFrame orientation (W3C WebCodecs spec)
     let rotation: Option<f64> = get_number_member(&obj, "rotation")?;
     let rotation = rotation.map(to_unsigned_long);
     let flip: Option<bool> = obj.get("flip")?;
 
-    // Checked after every getter ran, like Chrome.
-    let description_detached = match description_buffer {
-      Some(buffer) => buffer_source::is_detached_array_buffer(env, buffer)?,
-      None => false,
+    // A value that is not a BufferSource (null included) is ignored, as before.
+    let (description, description_detached) = match buffer_source::copy_member(env, &description)? {
+      BufferSourceMember::Copied(bytes) => (Some(bytes), false),
+      BufferSourceMember::Detached => (None, true),
+      BufferSourceMember::Absent | BufferSourceMember::NotBufferSource => (None, false),
     };
 
     Ok(VideoDecoderConfig {
