@@ -1193,6 +1193,12 @@ impl FromNapiValue for VideoFrameConstructorInit {
       enforce_range_unsigned_long_long_optional(&env_wrapper, duration_f64, "duration")?
         .map(|v| v.min(i64::MAX as u64) as i64);
 
+    // One reader serves both VideoFrameBufferInit and VideoFrameInit, so the members keep the
+    // order it always used. The checked members sit where WebIDL (lexicographic) order puts
+    // them relative to the others: displayHeight/displayWidth after codedWidth/codedHeight and
+    // before layout, rotation after flip.
+    let coded_width: Option<u32> = obj.get("codedWidth")?;
+    let coded_height: Option<u32> = obj.get("codedHeight")?;
     // displayWidth/displayHeight are WebIDL [EnforceRange] unsigned long: a plain u32
     // conversion would wrap -1 or 2^32 + 1 into range instead of throwing. WebIDL converts
     // dictionary members in lexicographic order and stops at the first failure, so
@@ -1207,6 +1213,9 @@ impl FromNapiValue for VideoFrameConstructorInit {
       obj.get("displayWidth")?,
       "displayWidth",
     )?;
+    let layout: Option<Vec<PlaneLayout>> = obj.get("layout")?;
+    let visible_rect: Option<DOMRectInit> = obj.get("visibleRect")?;
+    let flip: Option<bool> = obj.get("flip")?;
     // rotation is a WebIDL (restricted) double.
     let rotation: Option<f64> = obj.get("rotation")?;
     if rotation.is_some_and(|rotation| !rotation.is_finite()) {
@@ -1215,14 +1224,14 @@ impl FromNapiValue for VideoFrameConstructorInit {
 
     Ok(VideoFrameConstructorInit {
       format,
-      coded_width: obj.get("codedWidth")?,
-      coded_height: obj.get("codedHeight")?,
+      coded_width,
+      coded_height,
       timestamp,
       duration,
-      layout: obj.get("layout")?,
-      visible_rect: obj.get("visibleRect")?,
+      layout,
+      visible_rect,
       rotation,
-      flip: obj.get("flip")?,
+      flip,
       display_width,
       display_height,
       color_space: obj.get("colorSpace")?,
