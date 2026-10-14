@@ -295,6 +295,22 @@ pub(crate) fn copy_to_destination(
   }
 }
 
+/// Like [`inspect`], but accepts only a `Uint8Array` (this includes Node.js
+/// `Buffer`) and fails with "Expected a Uint8Array" for anything else.
+///
+/// # Safety
+///
+/// `env` and `value` must be valid handles for the current native call.
+pub(crate) unsafe fn inspect_uint8_array(
+  env: sys::napi_env,
+  value: sys::napi_value,
+) -> Result<RawBufferSource> {
+  match unsafe { inspect(env, value)? } {
+    Some(raw) if raw.kind() == BufferSourceKind::Uint8Array => Ok(raw),
+    _ => Err(Error::new(Status::InvalidArg, "Expected a Uint8Array")),
+  }
+}
+
 /// A `Uint8Array` argument or field whose bytes are copied into native
 /// memory while the argument is converted, before any later getter or
 /// callback can run. Use it instead of `Uint8Array` for any input that native
@@ -330,10 +346,7 @@ impl ValidateNapiValue for Uint8ArrayCopy {}
 
 impl FromNapiValue for Uint8ArrayCopy {
   unsafe fn from_napi_value(env: sys::napi_env, value: sys::napi_value) -> Result<Self> {
-    match unsafe { inspect(env, value)? } {
-      Some(raw) if raw.kind() == BufferSourceKind::Uint8Array => Ok(Self(raw.to_vec())),
-      _ => Err(Error::new(Status::InvalidArg, "Expected a Uint8Array")),
-    }
+    Ok(Self(unsafe { inspect_uint8_array(env, value)? }.to_vec()))
   }
 }
 

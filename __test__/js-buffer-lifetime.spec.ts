@@ -30,6 +30,7 @@ import {
   Mp4Demuxer,
   Mp4Muxer,
   VideoDecoder,
+  WebMDemuxer,
   WebMMuxer,
 } from '../index.js'
 
@@ -143,6 +144,30 @@ test('Mp4Demuxer, MkvDemuxer and WebMDemuxer.loadBuffer copy the bytes', (t) => 
     t.true(counts[0] > 0, name)
     t.deepEqual(counts, [counts[0], counts[0], counts[0]], name)
   }
+})
+
+test('loadBuffer rejects a loaded or closed demuxer without copying the input first', (t) => {
+  // Peak RSS shows whether the rejected call copied the 256 MiB input: the
+  // copy would raise it by 256 MiB, nothing else in the child comes close.
+  const result = runChild(`${CHILD_PRELUDE}
+    const { Mp4Demuxer } = lib;
+    (async () => {
+      const demuxer = new Mp4Demuxer({ videoOutput: () => {}, error: () => {} });
+      await demuxer.loadBuffer(new Uint8Array(fs.readFileSync('__test__/fixtures/wpt/h264.mp4')));
+      const big = new Uint8Array(256 * 1024 * 1024).fill(1);
+      const peakBefore = process.resourceUsage().maxRSS;
+      const loaded = await demuxer.loadBuffer(big).then(() => 'resolved', (e) => e.message);
+      demuxer.close();
+      const closed = await demuxer.loadBuffer(big).then(() => 'resolved', (e) => e.message);
+      const peakGrowthMiB = Math.round((process.resourceUsage().maxRSS - peakBefore) / 1024);
+      print({ loaded, closed, copied: peakGrowthMiB >= 128 });
+    })();
+  `)
+  t.deepEqual(result, {
+    loaded: 'Demuxer already loaded. Call close() first.',
+    closed: 'Demuxer already loaded. Call close() first.',
+    copied: false,
+  })
 })
 
 test('ImageDecoder copies BufferSource data and ReadableStream chunks before JS runs again', (t) => {
@@ -636,4 +661,31 @@ test('muxers take a description from isConfigSupported (an ArrayBuffer) or any o
     message: /Expected an ArrayBuffer, SharedArrayBuffer, TypedArray or DataView/,
   })
   rejects.close()
+})
+
+test('loadBuffer keeps its argument check and its rejection for every demuxer', async (t) => {
+  const mkvMuxer = new MkvMuxer()
+  const { codec, description } = await avcConfig()
+  mkvMuxer.addVideoTrack({ codec, width: 320, height: 240, description })
+  mkvMuxer.addVideoChunk(new EncodedVideoChunk({ type: 'key', timestamp: 0, data: new Uint8Array(16) }))
+  await mkvMuxer.flush()
+  const mkv = mkvMuxer.finalize()
+  mkvMuxer.close()
+  for (const [Demuxer, bytes] of [
+    [Mp4Demuxer, own(H264_MP4)],
+    [MkvDemuxer, mkv],
+    [WebMDemuxer, mkv],
+  ] as const) {
+    const demuxer = new Demuxer({ videoOutput: () => {}, error: () => {} })
+    // Not a Uint8Array: a synchronous throw, as before.
+    t.throws(() => demuxer.loadBuffer(new Uint16Array(4) as unknown as Uint8Array), {
+      message: 'Expected a Uint8Array',
+    })
+    await demuxer.loadBuffer(bytes)
+    t.truthy(demuxer.videoDecoderConfig, Demuxer.name)
+    t.throws(() => demuxer.loadBuffer({} as Uint8Array), { message: 'Expected a Uint8Array' })
+    await t.throwsAsync(demuxer.loadBuffer(bytes), { message: 'Demuxer already loaded. Call close() first.' })
+    demuxer.close()
+    await t.throwsAsync(demuxer.loadBuffer(bytes), { message: 'Demuxer already loaded. Call close() first.' })
+  }
 })

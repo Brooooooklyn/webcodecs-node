@@ -6,6 +6,7 @@
 use crate::codec::demuxer::{DemuxerContext, MediaType, StreamInfo};
 use crate::codec::io_buffer::BufferSource;
 use crate::ffi::{AV_NOPTS_VALUE, AVCodecID};
+use crate::webcodecs::buffer_source;
 use crate::webcodecs::encoded_audio_chunk::{
   EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkType,
 };
@@ -318,14 +319,20 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
     }
   }
 
-  /// Load from a file path
-  pub fn load_file(&mut self, path: &str) -> Result<()> {
+  /// Fails unless no source was loaded yet (and the demuxer is not closed).
+  fn check_unloaded(&self) -> Result<()> {
     if self.state != DemuxerState::Unloaded {
       return Err(Error::new(
         Status::GenericFailure,
         "Demuxer already loaded. Call close() first.",
       ));
     }
+    Ok(())
+  }
+
+  /// Load from a file path
+  pub fn load_file(&mut self, path: &str) -> Result<()> {
+    self.check_unloaded()?;
 
     let demuxer = DemuxerContext::open_file(path).map_err(|e| {
       Error::new(
@@ -344,12 +351,7 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
   /// reads them on worker threads for as long as it is open, so it must never
   /// point into a JS buffer that JS can detach or resize.
   pub fn load_buffer(&mut self, source: impl BufferSource + 'static) -> Result<()> {
-    if self.state != DemuxerState::Unloaded {
-      return Err(Error::new(
-        Status::GenericFailure,
-        "Demuxer already loaded. Call close() first.",
-      ));
-    }
+    self.check_unloaded()?;
 
     let demuxer = DemuxerContext::open_buffer(source).map_err(|e| {
       Error::new(
@@ -668,6 +670,45 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/// `loadBuffer(data)` for every demuxer.
+///
+/// `data` must be a `Uint8Array`. Its bytes are copied on the JS thread,
+/// because JS can detach or resize the buffer while the demuxer still reads
+/// it. A call that will be rejected (a source is already loaded, or the
+/// demuxer is closed) is rejected before that copy, so it does not first copy
+/// the whole input.
+pub fn load_buffer_from_js<'env, F: DemuxerFormat>(
+  env: &'env Env,
+  inner: &Arc<Mutex<DemuxerInner<F>>>,
+  data: Unknown,
+) -> Result<PromiseRaw<'env, ()>> {
+  // Throws for a value that is not a Uint8Array, as before.
+  // SAFETY: `data` is an argument of the current native call.
+  let source = unsafe { buffer_source::inspect_uint8_array(env.raw(), data.raw())? };
+  // try_lock: a load or demux running on another thread may hold the lock.
+  // Then skip this early check; the blocking task below checks again anyway.
+  let rejection = match inner.try_lock() {
+    Ok(guard) => guard.check_unloaded().err(),
+    Err(_) => None,
+  };
+  if let Some(error) = rejection {
+    return env.spawn_future(async move { Err::<(), _>(error) });
+  }
+  // No JS ran since `source` was located.
+  let bytes = source.to_vec();
+  let inner = inner.clone();
+  env.spawn_future(async move {
+    tokio::task::spawn_blocking(move || {
+      let mut guard = inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+      guard.load_buffer(bytes)
+    })
+    .await
+    .map_err(|e| Error::new(Status::GenericFailure, format!("Task error: {}", e)))?
+  })
+}
 
 /// Read and dispatch packets without holding the demuxer mutex while a
 /// JavaScript callback is queued. Callback queues are bounded, so a slow
