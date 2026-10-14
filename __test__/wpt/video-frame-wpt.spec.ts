@@ -868,6 +868,7 @@ test('VideoFrame: visibleRect exceeding bounds throws TypeError', (t) => {
     })
   })
 
+  t.true(error instanceof TypeError)
   t.true(error?.message.includes('exceeds'))
 })
 
@@ -886,7 +887,7 @@ test('VideoFrame: visibleRect huge coordinates throw instead of overflowing u32'
       visibleRect: { x: 5e9, y: 0, width: 1, height: 1 },
     })
   })
-  t.true(error?.message.includes('TypeError'))
+  t.true(error instanceof TypeError)
 
   // x + width must not wrap in u32 arithmetic (u32::MAX - 1 + 4 wraps to 1)
   const wrapError = t.throws(() => {
@@ -898,7 +899,7 @@ test('VideoFrame: visibleRect huge coordinates throw instead of overflowing u32'
       visibleRect: { x: 4294967294, y: 0, width: 4, height: 1 },
     })
   })
-  t.true(wrapError?.message.includes('TypeError'))
+  t.true(wrapError instanceof TypeError)
 })
 
 test('VideoFrame: visibleRect non-finite and negative values throw', (t) => {
@@ -918,7 +919,7 @@ test('VideoFrame: visibleRect non-finite and negative values throw', (t) => {
         visibleRect: rect,
       })
     })
-    t.true(error?.message.includes('TypeError'))
+    t.true(error instanceof TypeError)
   }
 })
 
@@ -936,7 +937,7 @@ test('VideoFrame: visibleRect fractional offset fails subsampling alignment', (t
       visibleRect: { x: 1.5, y: 0, width: 10, height: 10 },
     })
   })
-  t.true(error?.message.includes('TypeError'))
+  t.true(error instanceof TypeError)
 })
 
 test('VideoFrame constructor (from VideoFrame): with visibleRect crops', (t) => {
@@ -1977,6 +1978,7 @@ test('VideoFrame: copyTo throws TypeError for invalid layout stride', async (t) 
       layout: [{ offset: 0, stride: 8 }],
     }),
   )
+  t.true(error instanceof TypeError)
   t.true(error?.message.includes('stride'), 'error should mention stride')
 
   frame.close()
@@ -1999,6 +2001,7 @@ test('VideoFrame: copyTo throws TypeError for wrong number of planes in layout',
       ],
     }),
   )
+  t.true(error instanceof TypeError)
   t.true(error?.message.includes('layout'), 'error should mention layout')
 
   frame.close()
@@ -2236,7 +2239,7 @@ test('VideoFrame: copyTo throws TypeError when destination too small for custom 
   // Custom layout requires 128 bytes (stride 64 * height 2), but we only provide 64
   const smallBuffer = new Uint8Array(64)
   const error = await t.throwsAsync(frame.copyTo(smallBuffer, { layout: [{ offset: 0, stride: 64 }] }))
-  t.true(error?.message.includes('TypeError') || error?.message.includes('too small'))
+  t.true(error instanceof TypeError)
 
   frame.close()
 })
@@ -2252,7 +2255,7 @@ test('VideoFrame: copyTo throws TypeError when destination too small for custom 
   // Custom layout: offset 100 + stride 16 * height 2 = 132 bytes needed, but only 100 provided
   const smallBuffer = new Uint8Array(100)
   const error = await t.throwsAsync(frame.copyTo(smallBuffer, { layout: [{ offset: 100, stride: 16 }] }))
-  t.true(error?.message.includes('TypeError') || error?.message.includes('too small'))
+  t.true(error instanceof TypeError)
 
   frame.close()
 })
@@ -2536,7 +2539,7 @@ test('VideoFrame: allocationSize throws TypeError on layout offset overflow', (t
       layout: [{ offset: 4294967294, stride: 16 }], // 2^32 - 2
     })
   })
-  t.true(error?.message.includes('TypeError'), 'should throw TypeError on overflow')
+  t.true(error instanceof TypeError, 'should throw TypeError on overflow')
 
   frame.close()
 })
@@ -2575,7 +2578,7 @@ test('VideoFrame: allocationSize throws TypeError on stride * height overflow', 
       layout: [{ offset: 0, stride: 2147483647 }], // close to i32::MAX
     })
   })
-  t.true(error?.message.includes('TypeError'), 'should throw TypeError on overflow')
+  t.true(error instanceof TypeError, 'should throw TypeError on overflow')
 
   frame.close()
 })
