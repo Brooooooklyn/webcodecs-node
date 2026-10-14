@@ -798,15 +798,20 @@ test('VideoEncoder: listener added during dispatch runs on next dispatch only', 
 
   encoder.configure(createEncoderConfig('h264', 64, 64))
   const frames = generateFrameSequence(64, 64, 2)
-  for (const f of frames) {
-    encoder.encode(f, { keyFrame: true })
-    f.close()
-  }
+  const waitFor = (count: number) =>
+    new Promise<void>((resolve) => {
+      const check = () => (fired.length >= count ? resolve() : setTimeout(check, 10))
+      check()
+    })
 
-  await new Promise<void>((resolve) => {
-    const check = () => (fired.length >= 3 ? resolve() : setTimeout(check, 10))
-    check()
-  })
+  // Dequeues before a queued event runs share it, so encode the second frame
+  // only after the first dispatch to get a second one.
+  encoder.encode(frames[0], { keyFrame: true })
+  frames[0].close()
+  await waitFor(1)
+  encoder.encode(frames[1], { keyFrame: true })
+  frames[1].close()
+  await waitFor(3)
 
   // Two dispatches: first runs l1 only, second runs l1 + l2
   t.deepEqual(fired.slice(0, 3), ['l1', 'l1', 'l2'])

@@ -152,6 +152,14 @@ pub struct CodecEventState {
   /// between the worker's fire() and delivery on the JS thread. Returns to
   /// weak when the count drains to zero.
   outstanding: usize,
+  /// WebCodecs "schedule dequeue event": true while a dequeue dispatch is
+  /// queued on the dispatcher and has not started yet. Dequeues in that window
+  /// join the queued dispatch instead of queueing another event, so one native
+  /// step that dequeues N items fires one event, as in Chrome.
+  dequeue_scheduled: bool,
+  /// Dequeued items the queued dispatch covers. They stay in `outstanding`
+  /// until that dispatch is delivered.
+  scheduled_items: usize,
   /// Single dispatcher invoked from the worker thread; runs the whole
   /// dispatch on the JS thread in one call.
   dispatcher: Option<Arc<DispatcherTsf>>,
@@ -188,9 +196,19 @@ impl CodecEventState {
         match cmd {
           CMD_DISPATCH => {
             let shared = unsafe { Arc::from_raw(ptr as usize as *const RwLock<CodecEventState>) };
+            // Clear the flag before dispatching: a dequeue on the worker while
+            // listeners run may come after they read the queue size, so it
+            // needs an event of its own.
+            let covered = match shared.write() {
+              Ok(mut state) => {
+                state.dequeue_scheduled = false;
+                std::mem::take(&mut state.scheduled_items)
+              }
+              Err(_) => 0,
+            };
             dispatch(ctx.env, &shared, "dequeue");
             if let Ok(mut state) = shared.write() {
-              state.note_delivery(ctx.env);
+              state.note_delivery(ctx.env, covered);
             }
           }
           CMD_DELETE_REF => {
@@ -239,18 +257,21 @@ impl CodecEventState {
     }
   }
 
-  /// Any thread: a work item completed without producing a dispatch (no
+  /// Any thread: work items completed without producing a dispatch (no
   /// dispatcher existed, or the TSFN was already closing). Only adjusts the
   /// counter — with no dispatcher there is no codec ref, and a closing TSFN
   /// means the env is tearing down, so no unref is required here.
-  fn note_undelivered(&mut self) {
-    self.outstanding = self.outstanding.saturating_sub(1);
+  fn note_undelivered(&mut self, items: usize) {
+    self.outstanding = self.outstanding.saturating_sub(items);
   }
 
-  /// JS thread: a queued dequeue dispatch finished delivery — its work item
-  /// is no longer outstanding.
-  fn note_delivery(&mut self, env: &Env) {
-    self.outstanding = self.outstanding.saturating_sub(1);
+  /// JS thread: a queued dequeue dispatch finished delivery — the `items` it
+  /// covered are no longer outstanding.
+  fn note_delivery(&mut self, env: &Env, items: usize) {
+    if items == 0 || self.outstanding == 0 {
+      return;
+    }
+    self.outstanding = self.outstanding.saturating_sub(items);
     if self.outstanding == 0 {
       self.set_codec_strong(env, false);
     }
@@ -444,37 +465,65 @@ impl CodecEventState {
     Ok(r as usize)
   }
 
-  /// Fire the dequeue event from the worker thread (async, non-blocking).
-  /// A strong Arc is leaked into the payload and reclaimed by the JS callback,
-  /// so a queued dispatch keeps the state (and its listeners) alive even if
-  /// the codec wrapper and worker are gone by the time it runs.
+  /// Fire the dequeue event for one dequeued item (see [`Self::fire_n`]).
   pub fn fire(shared: &Arc<RwLock<CodecEventState>>) {
-    let dispatcher = shared.read().ok().and_then(|s| s.dispatcher.clone());
-    let Some(dispatcher) = dispatcher else {
-      // No dispatcher: the item completed without a dispatch. Drain it so a
-      // listener registered later doesn't see a stale outstanding count —
-      // with no dispatcher there is no codec ref to unpin anyway.
-      if let Ok(mut state) = shared.write() {
-        state.note_undelivered();
-      }
+    Self::fire_n(shared, 1);
+  }
+
+  /// Worker: empty a codec's queue counter in one step and fire one dequeue
+  /// for everything it held. Used when an error closes the codec, and when
+  /// queued work reaches a codec that is no longer configured — in both cases
+  /// every queued item is dropped, which Chrome reports with one event.
+  pub fn dequeue_all(shared: &Arc<RwLock<CodecEventState>>, queue_size: &mut u32) {
+    let dropped = std::mem::take(queue_size) as usize;
+    Self::fire_n(shared, dropped);
+  }
+
+  /// Schedule the dequeue event for `items` dequeued items (any thread,
+  /// non-blocking). WebCodecs "schedule dequeue event": while a dispatch is
+  /// queued and has not started, the items join it and no new event is
+  /// queued. A strong Arc is leaked into the payload and reclaimed by the JS
+  /// callback, so a queued dispatch keeps the state (and its listeners) alive
+  /// even if the codec wrapper and worker are gone by the time it runs.
+  pub fn fire_n(shared: &Arc<RwLock<CodecEventState>>, items: usize) {
+    if items == 0 {
+      return;
+    }
+    let Ok(mut state) = shared.write() else {
       return;
     };
+    let Some(dispatcher) = state.dispatcher.clone() else {
+      // No dispatcher: the items completed without a dispatch. Drain them so
+      // a listener registered later doesn't see a stale outstanding count —
+      // with no dispatcher there is no codec ref to unpin anyway.
+      state.note_undelivered(items);
+      return;
+    };
+    if state.dequeue_scheduled {
+      state.scheduled_items += items;
+      return;
+    }
+    state.dequeue_scheduled = true;
+    state.scheduled_items = items;
+    // The call only queues the payload (NonBlocking, unbounded queue), so it
+    // is safe while holding the state lock; holding it means no other fire
+    // can join a dispatch that turns out not to be queued.
     let ptr = Arc::into_raw(Arc::clone(shared)) as usize as u64;
     let status = dispatcher.call(
       FnArgs::from((CMD_DISPATCH, (ptr >> 32) as u32, ptr as u32)),
       ThreadsafeFunctionCallMode::NonBlocking,
     );
     if status != Status::Ok {
-      // TSFN already closing — reclaim the leaked Arc and drain the item;
+      // TSFN already closing — reclaim the leaked Arc and drain the items;
       // the env is tearing down so no unref is needed on this thread.
       unsafe {
         drop(Arc::from_raw(
           ptr as usize as *const RwLock<CodecEventState>,
         ));
       }
-      if let Ok(mut state) = shared.write() {
-        state.note_undelivered();
-      }
+      state.dequeue_scheduled = false;
+      let undelivered = std::mem::take(&mut state.scheduled_items);
+      state.note_undelivered(undelivered);
     }
   }
 }

@@ -154,12 +154,14 @@ test('VideoEncoder: encodeQueueSize tracking', async (t) => {
   }
 
   // Track dequeue events
-  // Note: With native addon multi-threaded implementation, callbacks may not see
-  // monotonically decreasing queue sizes due to concurrent encode/process operations.
-  // We verify: (1) dequeue events fire, (2) final queue state is correct.
+  // Dequeues before a queued dequeue event runs share that event (as in Chrome),
+  // so there can be fewer events than encodes. The last event must see the
+  // emptied queue: no dequeue goes unreported.
   let dequeueCount = 0
+  let lastDequeueSize = Infinity
   encoder.ondequeue = () => {
     dequeueCount++
+    lastDequeueSize = encoder.encodeQueueSize
   }
 
   for (const frame of frames) {
@@ -173,8 +175,10 @@ test('VideoEncoder: encodeQueueSize tracking', async (t) => {
 
   // After flush, queue should be empty
   t.is(encoder.encodeQueueSize, 0, 'queue size after flush')
-  // Verify dequeue events were fired (at least framesCount events for all encodes)
-  t.true(dequeueCount >= framesCount, `at least ${framesCount} dequeue events fired, got ${dequeueCount}`)
+  // The event for the last dequeue can run after flush() resolves.
+  await waitFor(() => lastDequeueSize === 0, 'a dequeue event that sees the empty queue')
+  t.true(dequeueCount >= 1, 'dequeue events fired')
+  t.true(dequeueCount <= framesCount, `at most one event per encode, got ${dequeueCount}`)
 
   // Clean up
   for (const frame of frames) {
