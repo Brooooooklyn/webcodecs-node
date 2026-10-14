@@ -1351,6 +1351,102 @@ unsafe fn typed_array_bytes<'a>(
   Ok(unsafe { std::slice::from_raw_parts_mut(data.cast::<u8>(), length) })
 }
 
+/// How many row bands an RGB copy of `width` x `height` is split into: one per 256K pixels, at
+/// most 4, and at most the number of cores.
+fn rgb_copy_bands(width: u32, height: u32) -> u32 {
+  const PIXELS_PER_BAND: u64 = 256 * 1024;
+  const MAX_BANDS: u64 = 4;
+  static CORES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+  let cores =
+    *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get() as u64));
+  let by_size = width as u64 * height as u64 / PIXELS_PER_BAND;
+  by_size.min(MAX_BANDS).min(cores).min(height as u64).max(1) as u32
+}
+
+/// `Scaler::copy_rect_to_rgb`, with a large rect split into row bands that run on scoped threads.
+/// Each output row depends only on its own source row, so the bytes are the same either way.
+/// Every band is written before this returns, and the calling (JS) thread waits meanwhile.
+#[allow(clippy::too_many_arguments)]
+fn copy_rect_to_rgb_in_bands(
+  src: &Frame,
+  rect: (u32, u32, u32, u32),
+  tags: [i32; 4],
+  target_p3: bool,
+  bgr: bool,
+  same_format: bool,
+  src_x: bool,
+  dst: &mut [u8],
+  stride: usize,
+) -> Result<()> {
+  let (x, y, width, height) = rect;
+  let copy = |top: u32, rows: u32, band: &mut [u8]| {
+    Scaler::copy_rect_to_rgb(
+      src,
+      (x, y + top, width, rows),
+      tags,
+      target_p3,
+      bgr,
+      same_format,
+      src_x,
+      band,
+      stride,
+    )
+    .map_err(|e| not_supported_error(&e.to_string()))
+  };
+  let bands = rgb_copy_bands(width, height);
+  if bands <= 1 {
+    return copy(0, height, dst);
+  }
+
+  // Disjoint parts of `dst`, one per band. The last band takes the rest.
+  let rows_per_band = height.div_ceil(bands);
+  let mut parts = Vec::with_capacity(bands as usize);
+  let mut rest = dst;
+  let mut top = 0;
+  while top < height {
+    let rows = rows_per_band.min(height - top);
+    let take = if top + rows == height {
+      rest.len()
+    } else {
+      (rows as usize * stride).min(rest.len())
+    };
+    let (band, tail) = std::mem::take(&mut rest).split_at_mut(take);
+    parts.push(parking_lot::Mutex::new(Some((top, rows, band))));
+    rest = tail;
+    top += rows;
+  }
+
+  // Whoever takes a band from its slot first copies it. This thread then takes every band left,
+  // which also covers a thread that failed to spawn or has not started yet.
+  let run = |part: &parking_lot::Mutex<Option<(u32, u32, &mut [u8])>>| {
+    let taken = part.lock().take();
+    match taken {
+      Some((top, rows, band)) => copy(top, rows, band),
+      None => Ok(()),
+    }
+  };
+  std::thread::scope(|scope| {
+    let handles: Vec<_> = parts[1..]
+      .iter()
+      .filter_map(|part| {
+        std::thread::Builder::new()
+          .spawn_scoped(scope, || run(part))
+          .ok()
+      })
+      .collect();
+    let mut result = parts.iter().try_for_each(run);
+    for handle in handles {
+      let band = handle
+        .join()
+        .unwrap_or_else(|_| Err(Error::new(Status::GenericFailure, "copy thread panicked")));
+      if result.is_ok() {
+        result = band;
+      }
+    }
+    result
+  })
+}
+
 /// `Boolean(view.buffer[key])`. This reads through JS, so getters may run.
 fn view_buffer_flag(env: &Env, view: napi::sys::napi_value, key: &std::ffi::CStr) -> Result<bool> {
   let mut buffer = std::ptr::null_mut();
@@ -2789,7 +2885,7 @@ impl VideoFrame {
         Some(layout) => (layout[0].offset as usize, layout[0].stride as usize),
         None => (0, rect_width as usize * 4),
       };
-      Scaler::copy_rect_to_rgb(
+      copy_rect_to_rgb_in_bands(
         &frame_guard,
         (rect_x, rect_y, rect_width, rect_height),
         color_tags,
@@ -2802,8 +2898,7 @@ impl VideoFrame {
         ),
         dest.get_mut(offset..).unwrap_or_default(),
         stride,
-      )
-      .map_err(|e| not_supported_error(&e.to_string()))?;
+      )?;
     } else if needs_conversion {
       let src_av_format = original_format.to_av_format();
       let dst_av_format = format.to_av_format();

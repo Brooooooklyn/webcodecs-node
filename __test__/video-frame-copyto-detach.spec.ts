@@ -14,7 +14,7 @@ import { execFileSync } from 'node:child_process'
 
 import test from 'ava'
 
-import { VideoFrame } from '../index.js'
+import { VideoFrame, type VideoFrameCopyToOptions, type VideoPixelFormat } from '../index.js'
 
 const SENTINEL = 0xa5
 
@@ -298,4 +298,38 @@ test('copyTo: bytes outside the planes are left as they were, like Chrome', asyn
   t.true(i420Dest.subarray(W * H, W * H + 100).every((b) => b === SENTINEL))
   t.true(i420Dest.subarray(W * H * 2 + (W * H) / 4).every((b) => b === SENTINEL))
   i420.close()
+})
+
+test('copyTo: a large RGB conversion matches the same frame copied in small strips', async (t) => {
+  // A 1080p rect is split into row bands copied on several threads; a 60-row strip is copied in
+  // one piece. Strips of every height cover each band edge, whatever the core count.
+  const width = 1920
+  const height = 1080
+  const strip = 60
+  const cases: Array<[VideoPixelFormat, VideoFrameCopyToOptions]> = [
+    ['I420', { format: 'RGBA' }],
+    ['I420', { format: 'BGRA', colorSpace: 'display-p3' }],
+    ['RGBA', { format: 'RGBA', colorSpace: 'display-p3' }],
+  ]
+  for (const [format, options] of cases) {
+    const data = new Uint8Array(format === 'I420' ? (width * height * 3) / 2 : width * height * 4)
+    for (let i = 0; i < data.length; i++) data[i] = (i * 13 + (i >>> 9)) & 255
+    const frame = new VideoFrame(data, {
+      format,
+      codedWidth: width,
+      codedHeight: height,
+      timestamp: 0,
+      colorSpace: { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false },
+    })
+    const whole = new Uint8Array(width * height * 4)
+    await frame.copyTo(whole, options)
+    const strips = new Uint8Array(width * height * 4)
+    for (let y = 0; y < height; y += strip) {
+      const part = new Uint8Array(width * strip * 4)
+      await frame.copyTo(part, { ...options, rect: { x: 0, y, width, height: strip } })
+      strips.set(part, y * width * 4)
+    }
+    t.true(Buffer.from(whole).equals(Buffer.from(strips)), `${format} ${JSON.stringify(options)}`)
+    frame.close()
+  }
 })
