@@ -870,8 +870,9 @@ test('Mp4Muxer: multi-layer HEVC alpha keeps hev1 and preserves alpha pixels', a
     t.is(decodedFrames.length, 3, `fragmented=${fragmented}: all frames decode`)
     t.is(decodedFrames[0]?.format, 'I420A', `fragmented=${fragmented}: alpha format survives`)
     if (decodedFrames[0]?.format === 'I420A') {
-      const plane = new Uint8Array(decodedFrames[0].allocationSize({ format: 'I420A' }))
-      await decodedFrames[0].copyTo(plane, { format: 'I420A' })
+      // Like Chrome, copyTo takes an explicit format only for RGB; the frame's own format is I420A.
+      const plane = new Uint8Array(decodedFrames[0].allocationSize())
+      await decodedFrames[0].copyTo(plane)
       const alphaOffset = width * height * 1.5
       t.is(plane[alphaOffset], alpha, `fragmented=${fragmented}: alpha pixel preserved`)
     }

@@ -616,6 +616,8 @@ frame.close()
 
 Per WPT `videoFrame-copyTo-rgb.any.js`, RGB-to-YUV conversion throws `NotSupportedError`.
 
+Like Chrome, `copyTo()` accepts an explicit `format` only for RGBA, RGBX, BGRA and BGRX. Any other `format`, even the frame's own, rejects with `NotSupportedError`; leave `format` out to copy in the frame's own format. `allocationSize()` still accepts the frame's own format. `copyTo()` never throws: invalid arguments reject the returned promise with `TypeError`.
+
 Custom layouts with overflow-inducing values (e.g., `offset: 2³²-2`) throw `TypeError` via checked arithmetic. The copy `rect` is validated against the output format. For YUV-to-RGB conversion, the read origin is then aligned down to the source chroma grid, as Chrome does.
 
 ### ImageDecoder Options

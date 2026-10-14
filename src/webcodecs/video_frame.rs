@@ -10,7 +10,8 @@ use crate::ffi::{
 use crate::webcodecs::error::{
   enforce_range_long_long, enforce_range_long_long_optional,
   enforce_range_unsigned_long_long_optional, error_as_dom_exception, invalid_state_error,
-  not_supported_error, throw_invalid_state_error, throw_not_supported_error, type_error,
+  not_supported_error, take_pending_exception, throw_as_native_error, throw_invalid_state_error,
+  throw_not_supported_error, type_error,
 };
 use crate::webcodecs::promise_reject::reject_with_type_error;
 use napi::bindgen_prelude::*;
@@ -218,31 +219,28 @@ impl VideoPixelFormat {
     }
   }
 
+  /// Returns true for the packed RGB formats (RGBA, RGBX, BGRA, BGRX)
+  pub fn is_rgb(&self) -> bool {
+    matches!(
+      self,
+      VideoPixelFormat::RGBA
+        | VideoPixelFormat::RGBX
+        | VideoPixelFormat::BGRA
+        | VideoPixelFormat::BGRX
+    )
+  }
+
   /// Check if conversion from self to target format is supported
   ///
   /// Per WPT videoFrame-copyTo-rgb.any.js:
   /// - YUV → RGB: supported (I420, I422, I444, NV12 → RGBA, RGBX, BGRA, BGRX)
   /// - RGB → RGB: supported (between RGBA, RGBX, BGRA, BGRX)
   /// - RGB → YUV: NOT supported (throws NotSupportedError)
+  ///
+  /// The same format passes here (allocationSize takes it), but copyTo rejects an explicit
+  /// non-RGB format, as Chrome does.
   pub fn can_convert_to(&self, target: VideoPixelFormat) -> bool {
-    // Same format is always supported
-    if *self == target {
-      return true;
-    }
-
-    // Check if target is RGB family
-    let target_is_rgb = matches!(
-      target,
-      VideoPixelFormat::RGBA
-        | VideoPixelFormat::RGBX
-        | VideoPixelFormat::BGRA
-        | VideoPixelFormat::BGRX
-    );
-
-    // YUV → RGB: supported
-    // RGB → RGB: supported
-    // RGB → YUV: not supported (per WPT test_unsupported_pixel_formats)
-    target_is_rgb
+    *self == target || target.is_rgb()
   }
 }
 
@@ -1138,6 +1136,182 @@ pub struct PlaneLayout {
   pub stride: u32,
 }
 
+/// PredefinedColorSpace values that Chrome knows but cannot copy to: NotSupportedError, not
+/// TypeError.
+const UNSUPPORTED_COPY_COLOR_SPACES: [&str; 5] = [
+  "rec2020",
+  "srgb-linear",
+  "display-p3-linear",
+  "rec2100-hlg",
+  "rec2100-pq",
+];
+const UNSUPPORTED_COLOR_SPACE_MESSAGE: &str =
+  "This pixel conversion to this color space is not supported.";
+
+/// copyTo / allocationSize options after WebIDL conversion.
+struct CopyToOptions {
+  options: VideoFrameCopyToOptions,
+  /// colorSpace is one of `UNSUPPORTED_COPY_COLOR_SPACES`. Like Chrome, this NotSupportedError
+  /// comes after the closed check.
+  unsupported_color_space: bool,
+}
+
+impl CopyToOptions {
+  /// Convert a VideoFrameCopyToOptions dictionary the way Chrome's bindings do. Members are read
+  /// once each, in lexicographic order (colorSpace, format, layout, rect), and an undefined member
+  /// is absent. Bad values give a "TypeError: ..." error. An exception from a getter, `toString` or
+  /// `valueOf` stays pending.
+  fn from_js(value: Unknown) -> Result<Self> {
+    let mut options = VideoFrameCopyToOptions {
+      color_space: None,
+      format: None,
+      rect: None,
+      layout: None,
+    };
+    let mut unsupported_color_space = false;
+    let Some(dict) = webidl_dictionary(value, "VideoFrameCopyToOptions")? else {
+      return Ok(Self {
+        options,
+        unsupported_color_space,
+      });
+    };
+    if let Some(value) = webidl_member(&dict, "colorSpace")? {
+      let name = value.coerce_to_string()?;
+      match unsafe { PredefinedColorSpace::from_napi_value(name.value().env, name.raw()) } {
+        Ok(color_space) => options.color_space = Some(color_space),
+        Err(_) => {
+          let name = name.into_utf8()?.into_owned()?;
+          if !UNSUPPORTED_COPY_COLOR_SPACES.contains(&name.as_str()) {
+            return Err(invalid_enum_value(&name, "PredefinedColorSpace"));
+          }
+          unsupported_color_space = true;
+        }
+      }
+    }
+    if let Some(value) = webidl_member(&dict, "format")? {
+      let name = value.coerce_to_string()?;
+      match unsafe { VideoPixelFormat::from_napi_value(name.value().env, name.raw()) } {
+        Ok(format) => options.format = Some(format),
+        Err(_) => {
+          let name = name.into_utf8()?.into_owned()?;
+          return Err(invalid_enum_value(&name, "VideoPixelFormat"));
+        }
+      }
+    }
+    if let Some(value) = webidl_member(&dict, "layout")? {
+      options.layout = Some(plane_layouts_from_js(value)?);
+    }
+    if let Some(value) = webidl_member(&dict, "rect")? {
+      options.rect = Some(dom_rect_init_from_js(value)?);
+    }
+    Ok(Self {
+      options,
+      unsupported_color_space,
+    })
+  }
+}
+
+fn invalid_enum_value(value: &str, enum_name: &str) -> Error {
+  type_error(&format!(
+    "The provided value '{}' is not a valid enum value of type {}.",
+    value, enum_name
+  ))
+}
+
+/// WebIDL dictionary conversion: `None` (every member absent) for undefined or null, the object
+/// for an object or a function, and a TypeError for any other value.
+fn webidl_dictionary<'env>(value: Unknown<'env>, type_name: &str) -> Result<Option<Object<'env>>> {
+  match value.get_type()? {
+    ValueType::Undefined | ValueType::Null => Ok(None),
+    ValueType::Object | ValueType::Function => {
+      Ok(Some(Object::from_raw(value.value().env, value.raw())))
+    }
+    _ => Err(type_error(&format!(
+      "The provided value is not of type '{}'.",
+      type_name
+    ))),
+  }
+}
+
+/// A dictionary member, read once with [[Get]]; `None` when it is undefined.
+fn webidl_member<'env>(dict: &Object<'env>, name: &str) -> Result<Option<Unknown<'env>>> {
+  let value: Unknown = dict.get_named_property(name)?;
+  Ok((value.get_type()? != ValueType::Undefined).then_some(value))
+}
+
+/// `sequence<PlaneLayout>`. Only arrays are taken; Chrome also takes other iterables.
+fn plane_layouts_from_js(value: Unknown) -> Result<Vec<PlaneLayout>> {
+  if value.get_type()? != ValueType::Object || !value.is_array()? {
+    return Err(type_error(
+      "layout: the provided value cannot be converted to a sequence.",
+    ));
+  }
+  let array = Object::from_raw(value.value().env, value.raw());
+  let length = array.get_array_length_unchecked()?;
+  let mut layouts = Vec::with_capacity(length.min(4) as usize);
+  for index in 0..length {
+    let plane = webidl_dictionary(array.get_element::<Unknown>(index)?, "PlaneLayout")?;
+    // Required `[EnforceRange] unsigned long` members, read in lexicographic order.
+    let member = |name: &str| -> Result<u32> {
+      let value = match &plane {
+        Some(plane) => webidl_member(plane, name)?,
+        None => None,
+      };
+      let Some(value) = value else {
+        return Err(type_error(&format!(
+          "PlaneLayout.{}: required member is undefined.",
+          name
+        )));
+      };
+      let number = value.coerce_to_number()?.get_double()?;
+      if !number.is_finite() {
+        return Err(type_error(&format!(
+          "PlaneLayout.{} is not of type 'unsigned long'.",
+          name
+        )));
+      }
+      let number = number.trunc();
+      if !(0.0..=f64::from(u32::MAX)).contains(&number) {
+        return Err(type_error(&format!(
+          "PlaneLayout.{} is outside the 'unsigned long' value range.",
+          name
+        )));
+      }
+      Ok(number as u32)
+    };
+    let offset = member("offset")?;
+    let stride = member("stride")?;
+    layouts.push(PlaneLayout { offset, stride });
+  }
+  Ok(layouts)
+}
+
+/// `DOMRectInit`: `unrestricted double` members that default to 0, read in lexicographic order.
+/// Null converts to the all-zero rect.
+fn dom_rect_init_from_js(value: Unknown) -> Result<DOMRectInit> {
+  let rect = webidl_dictionary(value, "DOMRectInit")?;
+  let member = |name: &str| -> Result<f64> {
+    let value = match &rect {
+      Some(rect) => webidl_member(rect, name)?,
+      None => None,
+    };
+    match value {
+      Some(value) => value.coerce_to_number()?.get_double(),
+      None => Ok(0.0),
+    }
+  };
+  let height = member("height")?;
+  let width = member("width")?;
+  let x = member("x")?;
+  let y = member("y")?;
+  Ok(DOMRectInit {
+    x: Some(x),
+    y: Some(y),
+    width: Some(width),
+    height: Some(height),
+  })
+}
+
 /// Rectangle for specifying a region
 #[napi(object)]
 #[derive(Debug, Clone)]
@@ -1637,6 +1811,30 @@ fn buffer_flag(
   Ok(flag)
 }
 
+/// Whether `value` is a Uint8Array (a Buffer is one). Runs no page code.
+fn is_uint8_array(env: &Env, value: napi::sys::napi_value) -> Result<bool> {
+  let mut is_typed_array = false;
+  napi::check_status!(unsafe {
+    napi::sys::napi_is_typedarray(env.raw(), value, &mut is_typed_array)
+  })?;
+  if !is_typed_array {
+    return Ok(false);
+  }
+  let mut kind = 0;
+  napi::check_status!(unsafe {
+    napi::sys::napi_get_typedarray_info(
+      env.raw(),
+      value,
+      &mut kind,
+      std::ptr::null_mut(),
+      std::ptr::null_mut(),
+      std::ptr::null_mut(),
+      std::ptr::null_mut(),
+    )
+  })?;
+  Ok(kind == napi::sys::TypedarrayType::uint8_array)
+}
+
 /// Whether `view` is on a resizable ArrayBuffer or a growable SharedArrayBuffer. Runs no page code
 /// (see the limit on `BufferFlagGetters`).
 fn is_resizable_view(env: &Env, view: napi::sys::napi_value) -> Result<bool> {
@@ -1895,7 +2093,8 @@ impl VideoFrame {
         }
       }
 
-      return Self::new_from_video_frame(video_frame, init);
+      return Self::new_from_video_frame(video_frame, init)
+        .map_err(|error| throw_as_native_error(&env, error));
     }
 
     // Try Canvas (has width, height, data method, but NOT codedWidth/naturalWidth)
@@ -1914,7 +2113,8 @@ impl VideoFrame {
         if let Ok(data_prop) = source_obj.get_named_property::<Unknown>("data")
           && data_prop.get_type().unwrap_or(ValueType::Undefined) == ValueType::Function
         {
-          return Self::new_from_canvas(env, source_obj, init);
+          return Self::new_from_canvas(env, source_obj, init)
+            .map_err(|error| throw_as_native_error(&env, error));
         }
       }
     }
@@ -1931,7 +2131,7 @@ impl VideoFrame {
       )
     })?;
 
-    Self::new_from_buffer(env, &data, init)
+    Self::new_from_buffer(env, &data, init).map_err(|error| throw_as_native_error(&env, error))
   }
 
   /// Internal: Create VideoFrame from buffer data (VideoFrameBufferInit constructor form)
@@ -2764,28 +2964,44 @@ impl VideoFrame {
   /// Get the metadata associated with this VideoFrame - W3C WebCodecs spec
   /// Currently returns an empty metadata object as members are defined in the registry
   #[napi]
-  pub fn metadata(&self) -> Result<VideoFrameMetadata> {
-    self.with_inner(|_inner| Ok(VideoFrameMetadata {}))
+  pub fn metadata(&self, env: Env) -> Result<VideoFrameMetadata> {
+    self
+      .with_inner(|_inner| Ok(VideoFrameMetadata {}))
+      .map_err(|error| throw_as_native_error(&env, error))
   }
 
   /// Calculate the allocation size needed for copyTo
-  #[napi]
-  pub fn allocation_size(&self, env: Env, options: Option<VideoFrameCopyToOptions>) -> Result<u32> {
-    // Check closed state and throw native DOMException
+  #[napi(ts_args_type = "options?: VideoFrameCopyToOptions | undefined | null")]
+  pub fn allocation_size(&self, env: Env, options: Unknown) -> Result<u32> {
+    self
+      .allocation_size_of(&env, options)
+      .map_err(|error| throw_as_native_error(&env, error))
+  }
+
+  fn allocation_size_of(&self, env: &Env, options: Unknown) -> Result<u32> {
+    // Like Chrome, the options convert (and their getters run) before the closed check.
+    let CopyToOptions {
+      options,
+      unsupported_color_space,
+    } = CopyToOptions::from_js(options)?;
+    let options = Some(options);
     let guard = self
       .inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
     let inner = match guard.as_ref() {
       Some(inner) => inner,
-      _ => return throw_invalid_state_error(&env, "VideoFrame is closed"),
+      _ => return throw_invalid_state_error(env, "VideoFrame is closed"),
     };
 
     if inner.resource.format().is_none() {
       return throw_not_supported_error(
-        &env,
+        env,
         "Failed to execute 'allocationSize' on 'VideoFrame': Operation is not supported when format is null.",
       );
+    }
+    if unsupported_color_space {
+      return Err(not_supported_error(UNSUPPORTED_COLOR_SPACE_MESSAGE));
     }
 
     let (frame, original_format) = inner.resource.software()?;
@@ -2798,7 +3014,7 @@ impl VideoFrame {
     // Per WPT: YUV→RGB and RGB→RGB work; RGB→YUV throws NotSupportedError
     if format != original_format && !original_format.can_convert_to(format) {
       return throw_not_supported_error(
-        &env,
+        env,
         &format!(
           "Format conversion from {:?} to {:?} is not supported",
           original_format, format
@@ -2882,40 +3098,52 @@ impl VideoFrame {
   pub fn copy_to<'env>(
     &self,
     env: &'env Env,
-    destination: Uint8Array,
+    destination: Unknown,
     options: Unknown,
   ) -> Result<PromiseRaw<'env, Vec<PlaneLayout>>> {
-    // napi checks the destination type before the options, in WebIDL order. The data pointer it
-    // captured goes stale once the options getters run, so keep only the JS value.
-    let destination = unsafe { ToNapiValue::to_napi_value(env.raw(), destination)? };
-    // Chrome rejects a resizable or growable buffer while it converts the destination, before
-    // it reads the options.
-    if is_resizable_view(env, destination)? {
-      return reject_with_type_error(
-        env,
-        "The provided ArrayBufferView value must not be resizable.",
-      );
-    }
-    let options: Option<VideoFrameCopyToOptions> =
-      unsafe { FromNapiValue::from_napi_value(env.raw(), options.raw())? };
-
-    match self.copy_into(env, destination, options.as_ref()) {
+    // Like Chrome, every error (bad arguments included) rejects the promise; nothing throws.
+    match self.copy_into(env, destination, options) {
       Ok(layouts) => PromiseRaw::resolve(env, layouts),
-      Err(error) => match error.reason.strip_prefix("TypeError:") {
-        Some(message) => reject_with_type_error(env, message.trim_start()),
-        None => PromiseRaw::reject(env, error_as_dom_exception(env, error)?),
-      },
+      Err(error) => {
+        // An options getter, `toString` or `valueOf` threw: reject with what it threw.
+        if let Some(exception) = take_pending_exception(env)? {
+          return PromiseRaw::reject(env, exception);
+        }
+        match error.reason.strip_prefix("TypeError:") {
+          Some(message) => reject_with_type_error(env, message.trim_start()),
+          None => PromiseRaw::reject(env, error_as_dom_exception(env, error)?),
+        }
+      }
     }
   }
 
-  /// The synchronous body of copyTo. `destination` is a Uint8Array. Its bytes are looked up after
-  /// every options getter has run and written before any JS runs again.
+  /// The synchronous body of copyTo. The destination bytes are looked up after every options
+  /// getter has run and written before any JS runs again.
   fn copy_into(
     &self,
     env: &Env,
-    destination: napi::sys::napi_value,
-    options: Option<&VideoFrameCopyToOptions>,
+    destination: Unknown,
+    options: Unknown,
   ) -> Result<Vec<PlaneLayout>> {
+    // WebIDL order: the destination converts before the options, so a bad destination rejects
+    // without running the options getters. The bytes it views can change once they run, so keep
+    // only the JS value.
+    let destination = destination.raw();
+    if !is_uint8_array(env, destination)? {
+      return Err(type_error("destination is not a Uint8Array."));
+    }
+    // Chrome rejects a resizable or growable buffer while it converts the destination.
+    if is_resizable_view(env, destination)? {
+      return Err(type_error(
+        "The provided ArrayBufferView value must not be resizable.",
+      ));
+    }
+    let CopyToOptions {
+      options,
+      unsupported_color_space,
+    } = CopyToOptions::from_js(options)?;
+    let options = Some(&options);
+
     // Get format, rect info and validate the options (brief lock)
     let (
       frame,
@@ -2944,6 +3172,9 @@ impl VideoFrame {
         return Err(not_supported_error(
           "Failed to execute 'copyTo' on 'VideoFrame': Operation is not supported when format is null.",
         ));
+      }
+      if unsupported_color_space {
+        return Err(not_supported_error(UNSUPPORTED_COLOR_SPACE_MESSAGE));
       }
       let (frame, original_format) = inner.resource.software()?;
       let format = options.and_then(|o| o.format).unwrap_or(original_format);
@@ -3040,6 +3271,13 @@ impl VideoFrame {
           "TypeError: destination buffer too small: need {} bytes, got {}",
           size, available
         ),
+      ));
+    }
+    // Like Chrome, an explicit format must be an RGB one, even when it is the frame's own
+    // format. Chrome checks this after the destination.
+    if options.is_some_and(|o| o.format.is_some()) && !format.is_rgb() {
+      return Err(not_supported_error(
+        "copyTo() doesn't support explicit copy to non-RGB formats. Remove the format option to copy in the frame's pixel format.",
       ));
     }
     let dest = &mut destination_bytes[..size];

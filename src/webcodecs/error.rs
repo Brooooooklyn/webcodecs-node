@@ -122,6 +122,55 @@ pub fn native_range_error(env: &Env, message: &str) -> Result<Error> {
   Ok(Error::from(error))
 }
 
+/// Take the pending JS exception, if there is one, so that a promise can reject with it.
+pub fn take_pending_exception(env: &Env) -> Result<Option<Unknown<'_>>> {
+  let mut pending = false;
+  napi::check_status!(unsafe { napi::sys::napi_is_exception_pending(env.raw(), &mut pending) })?;
+  if !pending {
+    return Ok(None);
+  }
+  let mut exception = std::ptr::null_mut();
+  napi::check_status!(unsafe {
+    napi::sys::napi_get_and_clear_last_exception(env.raw(), &mut exception)
+  })?;
+  Ok(Some(unsafe {
+    Unknown::from_raw_unchecked(env.raw(), exception)
+  }))
+}
+
+/// For a synchronous method: throw the native JS error that `error`'s "Name: message" prefix
+/// names (a TypeError for "TypeError", a DOMException for a DOMException name), so JS gets a real
+/// `TypeError` / `DOMException` instead of a plain `Error` with the name in its message.
+/// An error with a pending exception or without such a prefix is returned unchanged.
+pub fn throw_as_native_error(env: &Env, error: Error) -> Error {
+  let mut pending = false;
+  unsafe { napi::sys::napi_is_exception_pending(env.raw(), &mut pending) };
+  if pending || error.status == Status::PendingException {
+    return error;
+  }
+  let Some((name, message)) = error.reason.split_once(':') else {
+    return error;
+  };
+  let (name, message) = (name.trim(), message.trim_start());
+  let thrown = if name == "TypeError" {
+    env.throw_type_error(message, None)
+  } else if DOM_EXCEPTION_NAMES.contains(&name) {
+    env
+      .get_global()
+      .and_then(|global| {
+        global.get_named_property_unchecked::<Function<FnArgs<(&str, &str)>>>("DOMException")
+      })
+      .and_then(|constructor| constructor.new_instance((message, name).into()))
+      .and_then(|exception| env.throw(exception))
+  } else {
+    return error;
+  };
+  match thrown {
+    Ok(()) => Error::new(Status::PendingException, error.reason),
+    Err(_) => error,
+  }
+}
+
 /// Standard DOMException names that may prefix codec error messages.
 const DOM_EXCEPTION_NAMES: &[&str] = &[
   "AbortError",
