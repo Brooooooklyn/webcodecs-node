@@ -8,7 +8,7 @@ use crate::ffi::{AV_NOPTS_VALUE, AVCodecID, AVHWDeviceType, accessors::ffctx_set
 use crate::webcodecs::encoded_video_chunk::InternalSlice;
 use crate::webcodecs::error::{
   DOMExceptionName, error_as_dom_exception, native_dom_exception_error, throw_data_error,
-  throw_invalid_state_error, throw_type_error_unit,
+  throw_invalid_state_error, throw_type_error_unit, to_unsigned_long,
 };
 use crate::webcodecs::event_target::CodecEventState;
 use crate::webcodecs::flush_tracker::FlushTracker;
@@ -244,6 +244,15 @@ struct VideoDecoderInner {
   config_color_space: Option<VideoColorSpaceInit>,
   /// displayAspectWidth/displayAspectHeight from decoder config - applied to decoded frames
   config_display_aspect: Option<(u32, u32)>,
+}
+
+/// The config's rotation, converted like Chrome 155: its VideoDecoderConfig takes rotation as
+/// `unsigned long` (ToUint32), not the spec's `double`. So -90 is 4294967206, which the output
+/// frame rounds to 180, and NaN is 0.
+fn config_rotation(config: &VideoDecoderConfig) -> f64 {
+  config
+    .rotation
+    .map_or(0.0, |rotation| f64::from(to_unsigned_long(rotation)))
 }
 
 /// Get the preferred hardware device type for the current platform
@@ -1166,7 +1175,7 @@ impl VideoDecoder {
     guard.hw_preference = hw_preference;
 
     // Store orientation from config
-    guard.config_rotation = config.rotation.unwrap_or(0.0);
+    guard.config_rotation = config_rotation(&config);
     guard.config_flip = config.flip.unwrap_or(false);
 
     // Store colorSpace from config
@@ -1590,7 +1599,7 @@ impl VideoDecoder {
     inner.pending_chunks.clear();
 
     // Store orientation metadata from config (W3C WebCodecs spec)
-    inner.config_rotation = config.rotation.unwrap_or(0.0);
+    inner.config_rotation = config_rotation(&config);
     inner.config_flip = config.flip.unwrap_or(false);
 
     // Store colorSpace from config (W3C WebCodecs spec)

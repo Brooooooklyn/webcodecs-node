@@ -395,6 +395,49 @@ test('VideoDecoder: reconfigure applies the new display aspect', async (t) => {
   t.deepEqual(sizes, ['427x240', '320x240', '320x640'])
 })
 
+test('VideoDecoder: config rotation converts like Chrome (unsigned long) before it rounds', async (t) => {
+  const [chunk] = await encodeVp8(32, 16)
+  // [config rotation, Chrome 155 output frame rotation]. Chrome applies ToUint32 first, so
+  // -90 is 4294967206 (180 after rounding) and 2^32 + 90 is 90.
+  const cases: Array<[number, number]> = [
+    [90, 90],
+    [-90, 180],
+    [-315, 270],
+    [-45, 180],
+    [-135, 90],
+    [-225, 0],
+    [-405, 180],
+    [44.9, 0],
+    [1e20, 0],
+    [-1e20, 180],
+    [2 ** 32 + 90, 90],
+    [2 ** 32 * 3 + 180, 180],
+    [-(2 ** 32), 0],
+    [2 ** 53, 0],
+    [NaN, 0],
+    [Infinity, 0],
+    [-Infinity, 0],
+  ]
+  const rotations: number[] = []
+  const decoder = new VideoDecoder({
+    output: (frame) => {
+      rotations.push(frame.rotation)
+      frame.close()
+    },
+    error: (error) => t.fail(error.message),
+  })
+  for (const [rotation] of cases) {
+    decoder.configure({ codec: 'vp8', rotation })
+    decoder.decode(chunk)
+    await decoder.flush()
+  }
+  decoder.close()
+  t.deepEqual(
+    rotations,
+    cases.map(([, expected]) => expected),
+  )
+})
+
 // ============================================================================
 // DOMRectReadOnly interface shape
 // ============================================================================
