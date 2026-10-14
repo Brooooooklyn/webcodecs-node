@@ -2693,7 +2693,18 @@ impl VideoEncoder {
       None => return throw_type_error_unit(&env, "height is required"),
     };
 
-    // Validate display dimensions if specified
+    // Validate bitrate if specified
+    if let Some(bitrate) = config.bitrate
+      && bitrate <= 0.0
+    {
+      return throw_type_error_unit(&env, "bitrate must be greater than 0");
+    }
+
+    // Validate display dimensions if specified. Chrome checks them after bitrate, and a lone
+    // member first, so a lone displayWidth of 0 is reported as lone.
+    if let Some(message) = display_size_pair_error(&config) {
+      return throw_type_error_unit(&env, message);
+    }
     if let Some(dw) = config.display_width
       && dw == 0
     {
@@ -2703,13 +2714,6 @@ impl VideoEncoder {
       && dh == 0
     {
       return throw_type_error_unit(&env, "displayHeight must be greater than 0");
-    }
-
-    // Validate bitrate if specified
-    if let Some(bitrate) = config.bitrate
-      && bitrate <= 0.0
-    {
-      return throw_type_error_unit(&env, "bitrate must be greater than 0");
     }
 
     // Validate framerate if specified
@@ -3746,6 +3750,17 @@ impl VideoEncoder {
       return reject_with_type_error(env, "height must be non-zero");
     }
 
+    if let Some(bitrate) = config.bitrate
+      && bitrate <= 0.0
+    {
+      return reject_with_type_error(env, "bitrate must be positive");
+    }
+
+    // Same order as configure(): after bitrate, a lone member first
+    if let Some(message) = display_size_pair_error(&config) {
+      return reject_with_type_error(env, message);
+    }
+
     if let Some(dw) = config.display_width
       && dw == 0
     {
@@ -3756,12 +3771,6 @@ impl VideoEncoder {
       && dh == 0
     {
       return reject_with_type_error(env, "displayHeight must be non-zero");
-    }
-
-    if let Some(bitrate) = config.bitrate
-      && bitrate <= 0.0
-    {
-      return reject_with_type_error(env, "bitrate must be positive");
     }
 
     env.spawn_future(async move {
@@ -4185,6 +4194,16 @@ fn extract_alpha_side_data(packet: &Packet, use_alpha: bool) -> Option<Uint8Arra
 /// Check if dimensions are within valid range
 fn are_dimensions_valid(width: u32, height: u32) -> bool {
   width <= MAX_DIMENSION && height <= MAX_DIMENSION
+}
+
+/// displayWidth and displayHeight must be given together, like Chrome 155 (its message). The
+/// output decoderConfig copies them to displayAspectWidth/displayAspectHeight, which
+/// VideoDecoder also requires together.
+fn display_size_pair_error(config: &VideoEncoderConfig) -> Option<&'static str> {
+  if config.display_width.is_some() != config.display_height.is_some() {
+    return Some("Invalid display size; both height and width must be set together.");
+  }
+  None
 }
 
 /// FFmpeg's FF_QP2LAMBDA constant (from libavutil/internal.h)
