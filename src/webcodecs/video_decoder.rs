@@ -6,7 +6,7 @@
 use crate::codec::{CodecContext, DecoderConfig, Frame, Packet, download_hw_frame};
 use crate::ffi::{AV_NOPTS_VALUE, AVCodecID, AVHWDeviceType, accessors::ffctx_set_hw_get_format};
 use crate::webcodecs::codec_epoch::{
-  CancelToken, CodecEpoch, GatedError, GatedOutput, gated_error, gated_output,
+  CancelToken, CodecEpoch, ErrorOrigin, GatedError, GatedOutput, gated_error, gated_output,
 };
 use crate::webcodecs::decoded_frame::{DecodedSource, decoded_frame_format};
 use crate::webcodecs::encoded_video_chunk::InternalSlice;
@@ -15,7 +15,7 @@ use crate::webcodecs::error::{
   throw_invalid_state_error, throw_type_error_unit,
 };
 use crate::webcodecs::event_target::CodecEventState;
-use crate::webcodecs::flush_tracker::FlushTracker;
+use crate::webcodecs::flush_tracker::{FlushAbort, FlushTracker};
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
 use crate::webcodecs::video_frame::VideoColorSpaceInit;
 use crate::webcodecs::{
@@ -29,7 +29,6 @@ use napi::threadsafe_function::{ThreadsafeFunctionCallMode, UnknownReturnValue};
 use napi_derive::napi;
 use std::borrow::Cow;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
@@ -293,6 +292,35 @@ impl VideoDecoderInner {
     CodecEventState::dequeue_all(event_state, &mut self.decode_queue_size);
   }
 
+  /// JS thread: close the decoder. `failure` is the error that closed it: pending
+  /// flushes reject with it, or with AbortError when close() ran.
+  fn close_codec(
+    &mut self,
+    env: &Env,
+    event_state: &Arc<RwLock<CodecEventState>>,
+    failure: Option<DOMExceptionName>,
+  ) {
+    match failure {
+      Some(name) => self.flushes.fail_all(name),
+      None => self.flushes.abort_all(),
+    }
+    self.context = None;
+    self.config = None;
+    self.codec_string.clear();
+    self.state = CodecState::Closed;
+    self.failure_name = failure;
+    let cleared_queue = self.decode_queue_size as usize;
+    self.decode_queue_size = 0;
+    CodecEventState::clear_queue(event_state, env, cleared_queue);
+
+    // Reset hardware tracking state
+    self.is_hardware = false;
+    self.silent_decode_count = 0;
+    self.first_output_produced = false;
+    self.pending_chunks.clear();
+    self.pending_frames.clear();
+  }
+
   /// Queue a decoded frame for the JS thread (dropped once stale).
   fn emit_output(&self, frame: VideoFrame) {
     if self.is_stale() {
@@ -451,6 +479,14 @@ impl VideoDecoder {
     let inner = Arc::new(Mutex::new(inner));
 
     // Create separate lock for event listener state (avoids contention with decode operations)
+
+    // An unsupported config that configure() reported still closes the decoder
+    // when its error reaches JS after reset(), as in Chrome.
+    init
+      .epoch
+      .set_close_on_error(&inner, &event_state, |inner, env, events, name| {
+        inner.close_codec(env, events, Some(name));
+      });
 
     // Create channel for worker commands
     let (sender, receiver) = channel::unbounded();
@@ -1334,6 +1370,16 @@ impl VideoDecoder {
 
   /// Report an error via callback and close the decoder
   fn report_error(inner: &mut VideoDecoderInner, error_msg: &str) {
+    Self::report_error_from(inner, error_msg, ErrorOrigin::Work);
+  }
+
+  /// Report an error configure() found on the JS thread
+  fn report_configure_error(inner: &mut VideoDecoderInner, error_msg: &str) {
+    Self::report_error_from(inner, error_msg, ErrorOrigin::of_configure_error(error_msg));
+  }
+
+  /// Report an error; `origin` decides whether reset() drops it
+  fn report_error_from(inner: &mut VideoDecoderInner, error_msg: &str, origin: ErrorOrigin) {
     // A worker cancelled by close()/reset() leaves the codec to them.
     if inner.is_stale() {
       return;
@@ -1347,7 +1393,7 @@ impl VideoDecoder {
     CodecEventState::report_error(
       &inner.event_state,
       &inner.error_callback,
-      (inner.generation, error),
+      (inner.generation, origin, error),
     );
     // A flush issued before the error callback runs fails with this same error.
     inner.failure_name = Some(DOMExceptionName::from_error_message(error_msg));
@@ -1496,7 +1542,7 @@ impl VideoDecoder {
     if inner.state == CodecState::Configured {
       // Validate codec synchronously before queueing
       if parse_codec_string(&codec).is_err() {
-        Self::report_error(
+        Self::report_configure_error(
           &mut inner,
           &format!("NotSupportedError: Invalid codec: {}", codec),
         );
@@ -1525,7 +1571,7 @@ impl VideoDecoder {
     let codec_id = match parse_codec_string(&codec) {
       Ok(id) => id,
       Err(e) => {
-        Self::report_error(
+        Self::report_configure_error(
           &mut inner,
           &format!("NotSupportedError: Invalid codec: {}", e),
         );
@@ -1562,7 +1608,7 @@ impl VideoDecoder {
         Ok(result) => (result.context, result.is_hardware, result.hw_pix_fmt_raw),
         Err(e) => {
           // Hardware decoder creation failed - report error (no fallback for prefer-hardware)
-          Self::report_error(
+          Self::report_configure_error(
             &mut inner,
             &format!("OperationError: Hardware decoder creation failed: {}", e),
           );
@@ -1574,7 +1620,7 @@ impl VideoDecoder {
       match CodecContext::new_decoder(codec_id) {
         Ok(ctx) => (ctx, false, None),
         Err(e) => {
-          Self::report_error(&mut inner, &format!("Failed to create decoder: {}", e));
+          Self::report_configure_error(&mut inner, &format!("Failed to create decoder: {}", e));
           return Ok(());
         }
       }
@@ -1621,7 +1667,7 @@ impl VideoDecoder {
     };
 
     if let Err(e) = context.configure_decoder(&decoder_config) {
-      Self::report_error(&mut inner, &format!("Failed to configure decoder: {}", e));
+      Self::report_configure_error(&mut inner, &format!("Failed to configure decoder: {}", e));
       return Ok(());
     }
 
@@ -1645,7 +1691,7 @@ impl VideoDecoder {
 
     // Open the decoder
     if let Err(e) = context.open() {
-      Self::report_error(&mut inner, &format!("Failed to open decoder: {}", e));
+      Self::report_configure_error(&mut inner, &format!("Failed to open decoder: {}", e));
       return Ok(());
     }
 
@@ -1778,7 +1824,7 @@ impl VideoDecoder {
   #[napi(ts_return_type = "Promise<void>")]
   pub fn flush<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
     // Create abort flag for this flush operation
-    let flush_abort_flag = Arc::new(AtomicBool::new(false));
+    let flush_abort = Arc::new(FlushAbort::default());
     let (response_sender, response_receiver) = channel::bounded::<Result<()>>(1);
 
     // W3C spec: Check state upfront and return rejected promise with appropriate error
@@ -1818,7 +1864,7 @@ impl VideoDecoder {
 
       inner
         .flushes
-        .register(response_sender.clone(), flush_abort_flag.clone())
+        .register(response_sender.clone(), flush_abort.clone())
     };
 
     // Send flush command through the channel (deferred to microtask for W3C spec compliance)
@@ -1869,9 +1915,9 @@ impl VideoDecoder {
         })
         .flatten();
 
-        Ok((result, inner_clone, flush_abort_flag, flush_id))
+        Ok((result, inner_clone, flush_abort, flush_id))
       },
-      move |env, (result, inner, abort_flag, flush_id)| {
+      move |env, (result, inner, abort, flush_id)| {
         // Drain pending frames and call output callback SYNCHRONOUSLY
         // This runs on the main thread with Env access
         let frames = {
@@ -1883,12 +1929,12 @@ impl VideoDecoder {
         };
 
         // Call output callback for each frame synchronously
-        // If callback calls reset(), abort_flag will be set before next iteration
+        // If callback calls reset(), abort will be set before next iteration
         let callback_result = (|| -> Result<()> {
           let callback = output_callback_ref.borrow_back(env)?;
           for frame in frames {
             // Check abort flag before each callback - exit early if reset() was called
-            if abort_flag.load(Ordering::SeqCst) {
+            if abort.is_aborted() {
               break;
             }
             callback.call(frame)?;
@@ -1906,12 +1952,10 @@ impl VideoDecoder {
         callback_result?;
 
         // Check abort flag after draining all frames
-        if abort_flag.load(Ordering::SeqCst) {
-          return Err(native_dom_exception_error(
-            env,
-            DOMExceptionName::AbortError,
-            "The operation was aborted",
-          )?);
+        // close()/reset() abort the flush; an error that closed the codec fails it
+        if abort.is_aborted() {
+          let (name, message) = abort.rejection();
+          return Err(native_dom_exception_error(env, name, message)?);
         }
 
         // Worker errors carry their DOMException name as a message prefix
@@ -2013,6 +2057,7 @@ impl VideoDecoder {
       return throw_invalid_state_error(&env, "Cannot close an already closed codec");
     }
     self.closed = true;
+    self.epoch.mark_closed();
 
     // Cancel before waiting for the worker: it finishes at most the operation
     // in progress and drops the rest of its queue, and nothing it queued for
@@ -2037,25 +2082,9 @@ impl VideoDecoder {
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    // Wake flush promises even when their deferred send microtask lost the
-    // command sender above.
-    inner.flushes.abort_all();
-
-    inner.context = None;
-    inner.config = None;
-    inner.codec_string.clear();
-    inner.state = CodecState::Closed;
-    inner.failure_name = None;
-    let cleared_queue = inner.decode_queue_size as usize;
-    inner.decode_queue_size = 0;
-    CodecEventState::clear_queue(&self.event_state, &env, cleared_queue);
-
-    // Reset hardware tracking state
-    inner.is_hardware = false;
-    inner.silent_decode_count = 0;
-    inner.first_output_produced = false;
-    inner.pending_chunks.clear();
-    inner.pending_frames.clear();
+    // Aborts the flush promises too, even when their deferred send microtask
+    // lost the command sender above.
+    inner.close_codec(&env, &self.event_state, None);
 
     Ok(())
   }

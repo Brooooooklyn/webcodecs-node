@@ -12,7 +12,7 @@ use crate::ffi::{
   avutil::av_rescale_q,
 };
 use crate::webcodecs::codec_epoch::{
-  CancelToken, CodecEpoch, GatedError, GatedOutput, gated_error, gated_output,
+  CancelToken, CodecEpoch, ErrorOrigin, GatedError, GatedOutput, gated_error, gated_output,
 };
 use crate::webcodecs::codec_pressure;
 use crate::webcodecs::error::DOMExceptionName;
@@ -21,7 +21,7 @@ use crate::webcodecs::error::{
   throw_type_error_unit,
 };
 use crate::webcodecs::event_target::CodecEventState;
-use crate::webcodecs::flush_tracker::FlushTracker;
+use crate::webcodecs::flush_tracker::{FlushAbort, FlushTracker};
 use crate::webcodecs::hw_fallback::{
   is_hw_encoding_disabled, record_hw_encoding_failure, record_hw_encoding_success,
 };
@@ -40,7 +40,6 @@ use napi_derive::napi;
 use parking_lot::RwLock as ParkingLotRwLock;
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
@@ -481,6 +480,31 @@ impl VideoEncoderInner {
     CodecEventState::dequeue_all(event_state, &mut self.encode_queue_size);
   }
 
+  /// JS thread: close the encoder. `failure` is the error that closed it: pending
+  /// flushes reject with it, or with AbortError when close() ran.
+  fn close_codec(
+    &mut self,
+    env: &Env,
+    event_state: &Arc<RwLock<CodecEventState>>,
+    failure: Option<DOMExceptionName>,
+  ) {
+    match failure {
+      Some(name) => self.flushes.fail_all(name),
+      None => self.flushes.abort_all(),
+    }
+    // Drop the codec, its scalers, buffered frames and hardware slot
+    self.release_resources();
+    self.pending_chunks.clear();
+    self.config = None;
+    self.input_color_space = None;
+    self.session_orientation = None;
+    self.state = CodecState::Closed;
+    self.failure_name = failure;
+    let cleared_queue = self.encode_queue_size as usize;
+    self.encode_queue_size = 0;
+    CodecEventState::clear_queue(event_state, env, cleared_queue);
+  }
+
   /// Queue an output chunk for the JS thread (dropped once stale).
   fn emit_output(&self, chunk: EncodedVideoChunk, metadata: EncodedVideoChunkMetadata) {
     if self.is_stale() {
@@ -695,6 +719,14 @@ impl VideoEncoder {
     let inner = Arc::new(Mutex::new(inner));
 
     // Create separate lock for event listener state (avoids contention with encode operations)
+
+    // An unsupported config that configure() reported still closes the encoder
+    // when its error reaches JS after reset(), as in Chrome.
+    init
+      .epoch
+      .set_close_on_error(&inner, &event_state, |inner, env, events, name| {
+        inner.close_codec(env, events, Some(name));
+      });
 
     // Create channel for worker commands
     let (sender, receiver) = channel::unbounded();
@@ -2339,6 +2371,16 @@ impl VideoEncoder {
 
   /// Report an error via callback and close the encoder
   fn report_error(inner: &mut VideoEncoderInner, error_msg: &str) {
+    Self::report_error_from(inner, error_msg, ErrorOrigin::Work);
+  }
+
+  /// Report an error configure() found on the JS thread
+  fn report_configure_error(inner: &mut VideoEncoderInner, error_msg: &str) {
+    Self::report_error_from(inner, error_msg, ErrorOrigin::of_configure_error(error_msg));
+  }
+
+  /// Report an error; `origin` decides whether reset() drops it
+  fn report_error_from(inner: &mut VideoEncoderInner, error_msg: &str, origin: ErrorOrigin) {
     // A worker cancelled by close()/reset() leaves the codec to them.
     if inner.is_stale() {
       return;
@@ -2360,7 +2402,7 @@ impl VideoEncoder {
     CodecEventState::report_error(
       &inner.event_state,
       &inner.error_callback,
-      (inner.generation, error),
+      (inner.generation, origin, error),
     );
   }
 
@@ -2767,7 +2809,7 @@ impl VideoEncoder {
       let _codec_id = match parse_codec_string(&codec) {
         Ok(id) => id,
         Err(e) => {
-          Self::report_error(
+          Self::report_configure_error(
             &mut inner,
             &format!("NotSupportedError: Invalid codec: {}", e),
           );
@@ -2779,7 +2821,7 @@ impl VideoEncoder {
       if let Some(ref mode) = config.scalability_mode
         && !is_valid_scalability_mode(mode)
       {
-        Self::report_error(
+        Self::report_configure_error(
           &mut inner,
           &format!("NotSupportedError: Unsupported scalability mode: {}", mode),
         );
@@ -2812,7 +2854,7 @@ impl VideoEncoder {
     let codec_id = match parse_codec_string(&codec) {
       Ok(id) => id,
       Err(e) => {
-        Self::report_error(
+        Self::report_configure_error(
           &mut inner,
           &format!("NotSupportedError: Invalid codec: {}", e),
         );
@@ -2824,7 +2866,7 @@ impl VideoEncoder {
     if let Some(ref mode) = config.scalability_mode
       && !is_valid_scalability_mode(mode)
     {
-      Self::report_error(
+      Self::report_configure_error(
         &mut inner,
         &format!("NotSupportedError: Unsupported scalability mode: {}", mode),
       );
@@ -2833,7 +2875,7 @@ impl VideoEncoder {
 
     // Validate dimensions are within reasonable limits
     if !are_dimensions_valid(width, height) {
-      Self::report_error(
+      Self::report_configure_error(
         &mut inner,
         "NotSupportedError: Dimensions exceed maximum supported size",
       );
@@ -2928,7 +2970,10 @@ impl VideoEncoder {
           match CodecContext::new_encoder_with_hw_info(codec_id, None) {
             Ok(result) => result,
             Err(e2) => {
-              Self::report_error(&mut inner, &format!("Failed to create encoder: {}", e2));
+              Self::report_configure_error(
+                &mut inner,
+                &format!("Failed to create encoder: {}", e2),
+              );
               return Ok(());
             }
           }
@@ -2937,7 +2982,7 @@ impl VideoEncoder {
           if acquired_hw_slot {
             codec_pressure::gauge().release_hw_encoder();
           }
-          Self::report_error(&mut inner, &format!("Failed to create encoder: {}", e));
+          Self::report_configure_error(&mut inner, &format!("Failed to create encoder: {}", e));
           return Ok(());
         }
       }
@@ -2979,7 +3024,7 @@ impl VideoEncoder {
       if acquired_hw_slot {
         codec_pressure::gauge().release_hw_encoder();
       }
-      Self::report_error(
+      Self::report_configure_error(
         &mut inner,
         "NotSupportedError: HEVC alpha encoding requires software encoder. Set hardwareAcceleration to 'prefer-software'",
       );
@@ -3039,7 +3084,7 @@ impl VideoEncoder {
             encoder_name = sw_name;
           }
           Err(e2) => {
-            Self::report_error(
+            Self::report_configure_error(
               &mut inner,
               &format!(
                 "Failed to configure encoder: {} (software fallback also failed: {})",
@@ -3054,7 +3099,7 @@ impl VideoEncoder {
         if acquired_hw_slot {
           codec_pressure::gauge().release_hw_encoder();
         }
-        Self::report_error(&mut inner, &format!("Failed to configure encoder: {}", e));
+        Self::report_configure_error(&mut inner, &format!("Failed to configure encoder: {}", e));
         return Ok(());
       }
     }
@@ -3125,7 +3170,7 @@ impl VideoEncoder {
             use_hw_frames = false;
           }
           Err(e2) => {
-            Self::report_error(
+            Self::report_configure_error(
               &mut inner,
               &format!(
                 "Failed to open encoder: {} (software fallback also failed: {})",
@@ -3140,7 +3185,7 @@ impl VideoEncoder {
         if acquired_hw_slot {
           codec_pressure::gauge().release_hw_encoder();
         }
-        Self::report_error(&mut inner, &format!("Failed to open encoder: {}", e));
+        Self::report_configure_error(&mut inner, &format!("Failed to open encoder: {}", e));
         return Ok(());
       }
     }
@@ -3152,7 +3197,7 @@ impl VideoEncoder {
       if acquired_hw_slot {
         codec_pressure::gauge().release_hw_encoder();
       }
-      Self::report_error(
+      Self::report_configure_error(
         &mut inner,
         "NotSupportedError: HEVC alpha encoding requires software encoder. Set hardwareAcceleration to 'prefer-software'",
       );
@@ -3367,7 +3412,7 @@ impl VideoEncoder {
   #[napi(ts_return_type = "Promise<void>")]
   pub fn flush<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
     // Create abort flag for this flush operation
-    let flush_abort_flag = Arc::new(AtomicBool::new(false));
+    let flush_abort = Arc::new(FlushAbort::default());
     // Create a response channel before registering this individual operation.
     let (response_sender, response_receiver) = channel::bounded::<Result<()>>(1);
 
@@ -3404,7 +3449,7 @@ impl VideoEncoder {
 
       inner
         .flushes
-        .register(response_sender.clone(), flush_abort_flag.clone())
+        .register(response_sender.clone(), flush_abort.clone())
     };
 
     // Send flush command through the channel (deferred to microtask for W3C spec compliance)
@@ -3455,9 +3500,9 @@ impl VideoEncoder {
         })
         .flatten();
 
-        Ok((result, inner_clone, flush_abort_flag, flush_id))
+        Ok((result, inner_clone, flush_abort, flush_id))
       },
-      move |env, (result, inner, abort_flag, flush_id)| {
+      move |env, (result, inner, abort, flush_id)| {
         // Drain pending chunks and call output callback SYNCHRONOUSLY
         // This runs on the main thread with Env access
         let chunks = {
@@ -3469,12 +3514,12 @@ impl VideoEncoder {
         };
 
         // Call output callback for each chunk synchronously
-        // If callback calls reset(), abort_flag will be set before next iteration
+        // If callback calls reset(), abort will be set before next iteration
         let callback_result = (|| -> Result<()> {
           let callback = output_callback_ref.borrow_back(env)?;
           for (chunk, metadata) in chunks {
             // Check abort flag before each callback - exit early if reset() was called
-            if abort_flag.load(Ordering::SeqCst) {
+            if abort.is_aborted() {
               break;
             }
             callback.call((chunk, metadata).into())?;
@@ -3492,12 +3537,10 @@ impl VideoEncoder {
         callback_result?;
 
         // Check abort flag after draining all chunks
-        if abort_flag.load(Ordering::SeqCst) {
-          return Err(native_dom_exception_error(
-            env,
-            DOMExceptionName::AbortError,
-            "The operation was aborted",
-          )?);
+        // close()/reset() abort the flush; an error that closed the codec fails it
+        if abort.is_aborted() {
+          let (name, message) = abort.rejection();
+          return Err(native_dom_exception_error(env, name, message)?);
         }
 
         match result {
@@ -3598,6 +3641,7 @@ impl VideoEncoder {
       return throw_invalid_state_error(&env, "Cannot close an already closed codec");
     }
     self.closed = true;
+    self.epoch.mark_closed();
 
     // Cancel before waiting for the worker: it finishes at most the operation
     // in progress and drops the rest of its queue, and nothing it queued for
@@ -3622,21 +3666,9 @@ impl VideoEncoder {
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    // Wake flush promises even when their deferred send microtask lost the
-    // command sender above.
-    inner.flushes.abort_all();
-
-    // Drop the codec, its scalers, buffered frames and hardware slot
-    inner.release_resources();
-    inner.pending_chunks.clear();
-    inner.config = None;
-    inner.input_color_space = None;
-    inner.session_orientation = None;
-    inner.state = CodecState::Closed;
-    inner.failure_name = None;
-    let cleared_queue = inner.encode_queue_size as usize;
-    inner.encode_queue_size = 0;
-    CodecEventState::clear_queue(&self.event_state, &env, cleared_queue);
+    // Aborts the flush promises too, even when their deferred send microtask
+    // lost the command sender above.
+    inner.close_codec(&env, &self.event_state, None);
 
     Ok(())
   }
