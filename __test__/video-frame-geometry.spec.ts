@@ -527,6 +527,67 @@ test('VideoDecoder: config rotation converts like Chrome (unsigned long) before 
   )
 })
 
+test('VideoDecoder.isConfigSupported returns the rotation converted like Chrome (unsigned long)', async (t) => {
+  const [chunk] = await encodeVp8(32, 16)
+  // [config rotation, Chrome 155 support.config.rotation]
+  const cases: Array<[number, number]> = [
+    [0, 0],
+    [-0, 0],
+    [90, 90],
+    [270, 270],
+    [45, 45],
+    [450, 450],
+    [90.5, 90],
+    [44.9, 44],
+    [-0.5, 0],
+    [-90, 4294967206],
+    [1e20, 1661992960],
+    [-1e20, 2632974336],
+    [2 ** 32 + 90, 90],
+    [2 ** 53, 0],
+    [NaN, 0],
+    [Infinity, 0],
+    [-Infinity, 0],
+  ]
+  const echoed: number[] = []
+  const configs: VideoDecoderConfig[] = []
+  for (const [rotation] of cases) {
+    const support = await VideoDecoder.isConfigSupported({ codec: 'vp8', rotation })
+    t.true(support.supported)
+    echoed.push(support.config.rotation as number)
+    configs.push(support.config)
+  }
+  t.deepEqual(
+    echoed,
+    cases.map(([, expected]) => expected),
+  )
+  t.true(Object.is(echoed[1], 0), '-0 is +0')
+
+  // The returned config decodes like the original one
+  const rotations: Array<[number, number]> = []
+  let original = 0
+  const decoder = new VideoDecoder({
+    output: (frame) => {
+      rotations.push([original, frame.rotation])
+      frame.close()
+    },
+    error: (error) => t.fail(error.message),
+  })
+  for (const [index, [rotation]] of cases.entries()) {
+    for (const config of [{ codec: 'vp8', rotation }, configs[index]]) {
+      original = rotation
+      decoder.configure(config)
+      decoder.decode(chunk)
+      await decoder.flush()
+    }
+  }
+  decoder.close()
+  t.is(rotations.length, cases.length * 2)
+  for (let i = 0; i < rotations.length; i += 2) {
+    t.deepEqual(rotations[i + 1], rotations[i], `rotation ${rotations[i][0]}`)
+  }
+})
+
 // ============================================================================
 // DOMRectReadOnly interface shape
 // ============================================================================
