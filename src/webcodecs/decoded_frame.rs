@@ -32,11 +32,14 @@ const FLAG_XYZ: i32 = 1 << 10;
 /// Where a decoded frame comes from. Chrome picks different formats per source.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum DecodedSource {
-  /// ImageDecoder. `alpha` is the alpha the file header declares (WebP alpha flag,
-  /// PNG color type or tRNS chunk), when there is one: Chrome labels by it.
+  /// ImageDecoder, with what the file header says, when it says it:
+  /// - `alpha`: the alpha it declares (WebP alpha flag, PNG color type or tRNS chunk).
+  ///   Chrome labels the image BGRA or BGRX by it.
+  /// - `yuv`: whether Chrome decodes the image to YUV planes (JPEG sampling factors).
   Image {
     codec: AVCodecID,
     alpha: Option<bool>,
+    yuv: Option<bool>,
   },
   /// VideoDecoder, software decoder
   Video,
@@ -71,22 +74,34 @@ pub(crate) fn decoded_frame_format(
   source: DecodedSource,
 ) -> Result<(Frame, VideoPixelFormat), CodecError> {
   let av = frame.format();
-  if let Some(format) = VideoPixelFormat::from_av_format(av) {
-    return Ok((frame, format));
-  }
+  // Chrome decodes a JPEG to BGRX unless its sampling factors are ones it reads as YUV,
+  // even when FFmpeg's planes have a WebCodecs layout (FFmpeg reads 2x2/1x2/1x2 as yuvj422p).
+  let rgb_only = matches!(
+    source,
+    DecodedSource::Image {
+      codec: AVCodecID::Mjpeg,
+      yuv: Some(false),
+      ..
+    }
+  );
+  if !rgb_only {
+    if let Some(format) = VideoPixelFormat::from_av_format(av) {
+      return Ok((frame, format));
+    }
 
-  // yuvj* is yuv* with full range: same planes, so only the format field changes.
-  let relabel = match av {
-    AVPixelFormat::Yuvj420p => Some(AVPixelFormat::Yuv420p),
-    AVPixelFormat::Yuvj422p => Some(AVPixelFormat::Yuv422p),
-    AVPixelFormat::Yuvj444p => Some(AVPixelFormat::Yuv444p),
-    _ => None,
-  };
-  if let Some(yuv) = relabel {
-    frame.set_format(yuv);
-    frame.set_color_range(AVColorRange::Jpeg);
-    let format = VideoPixelFormat::from_av_format(yuv).unwrap_or(VideoPixelFormat::I420);
-    return Ok((frame, format));
+    // yuvj* is yuv* with full range: same planes, so only the format field changes.
+    let relabel = match av {
+      AVPixelFormat::Yuvj420p => Some(AVPixelFormat::Yuv420p),
+      AVPixelFormat::Yuvj422p => Some(AVPixelFormat::Yuv422p),
+      AVPixelFormat::Yuvj444p => Some(AVPixelFormat::Yuv444p),
+      _ => None,
+    };
+    if let Some(yuv) = relabel {
+      frame.set_format(yuv);
+      frame.set_color_range(AVColorRange::Jpeg);
+      let format = VideoPixelFormat::from_av_format(yuv).unwrap_or(VideoPixelFormat::I420);
+      return Ok((frame, format));
+    }
   }
 
   match source {
@@ -107,7 +122,7 @@ pub(crate) fn decoded_frame_format(
       let format = video_target(&desc);
       Ok((convert(&frame, format, &desc, false)?, format))
     }
-    DecodedSource::Image { codec, alpha } => {
+    DecodedSource::Image { codec, alpha, .. } => {
       let desc = describe(frame.format_raw())?;
       let format = if image_has_alpha(&frame, &desc, codec, alpha) {
         VideoPixelFormat::BGRA
