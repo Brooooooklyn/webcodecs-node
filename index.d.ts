@@ -1152,7 +1152,7 @@ export declare class VideoFrame {
    * 2. Assign true to frame's [[Detached]]
    * Note: Metadata (timestamp, duration, etc.) remains accessible after close
    */
-  close(this: this): void
+  close(): void
 }
 
 /**
@@ -1377,7 +1377,11 @@ export declare function copyVideoFrameRGBA16Float(frame: VideoFrame): Uint16Arra
 /** native canvas-provider interop, separate from the browser VideoFrame interface. */
 export declare function createVideoFrameFromRGBA16Float(
   data: Uint16Array,
-  init: Omit<VideoFrameBufferInit, 'format' | 'layout' | 'transfer'> & { alpha?: 'keep' | 'discard' },
+  init: Omit<VideoFrameBufferInit, 'format' | 'layout' | 'transfer'> & {
+    rotation?: number
+    flip?: boolean
+    alpha?: 'keep' | 'discard'
+  },
 ): VideoFrame
 
 /** Audio decoder configuration exposed to JavaScript */

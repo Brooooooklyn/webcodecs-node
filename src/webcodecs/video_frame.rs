@@ -26,7 +26,9 @@ static NEXT_FRAME_ID: AtomicU64 = AtomicU64::new(1);
 // this keeps a callback that captures its frame collectible with that frame.
 struct FrameCloseObservers {
   env: napi::sys::napi_env,
-  callbacks: Vec<usize>,
+  next_id: u64,
+  // (listener map key, napi_ref) pairs
+  callbacks: Vec<(u64, usize)>,
 }
 thread_local! {
   static CLOSE_OBSERVERS: RefCell<HashMap<u64, FrameCloseObservers>> = RefCell::new(HashMap::new());
@@ -3234,7 +3236,7 @@ impl VideoFrame {
   /// 1. Assign null to frame's [[resource reference]]
   /// 2. Assign true to frame's [[Detached]]
   /// Note: Metadata (timestamp, duration, etc.) remains accessible after close
-  #[napi]
+  #[napi(ts_args_type = "")]
   pub fn close(&self, env: Env, this: This) -> Result<()> {
     let mut guard = self
       .inner
@@ -3250,13 +3252,9 @@ impl VideoFrame {
     let observers =
       CLOSE_OBSERVERS.with(|registry| registry.borrow_mut().remove(&self.observer_id));
     let mut thrown = Vec::new();
-    for (id, reference) in observers
-      .into_iter()
-      .flat_map(|entry| entry.callbacks)
-      .enumerate()
-    {
+    for (id, reference) in observers.into_iter().flat_map(|entry| entry.callbacks) {
       let callback = super::event_target::upgrade_ref(&env, reference)?;
-      super::event_target::release_callback(&env, Some(this.raw()), id as u64, reference);
+      super::event_target::release_callback(&env, Some(this.raw()), id, reference);
       let Some(callback) = callback else { continue };
       let mut result = std::ptr::null_mut();
       let mut receiver = std::ptr::null_mut();
@@ -3904,19 +3902,41 @@ impl VideoFrame {
 /// native canvas-provider interop, separate from the browser VideoFrame interface.
 #[napi(
   js_name = "createVideoFrameFromRGBA16Float",
-  ts_args_type = "data: Uint16Array, init: Omit<VideoFrameBufferInit, 'format' | 'layout' | 'transfer'> & {alpha?: 'keep' | 'discard'}"
+  ts_args_type = "data: Uint16Array, init: Omit<VideoFrameBufferInit, 'format' | 'layout' | 'transfer'> & {rotation?: number; flip?: boolean; alpha?: 'keep' | 'discard'}"
 )]
 pub fn create_video_frame_from_rgba16_float(
-  data: Uint16Array,
+  env: Env,
+  data: Unknown,
   init: VideoFrameConstructorInit,
 ) -> Result<VideoFrame> {
-  VideoFrame::from_rgba16_float(data, init)
+  // Read the typed array only after `init` is converted: its getters may detach the buffer.
+  let data = unsafe { Uint16Array::from_napi_value(env.raw(), data.raw())? };
+  VideoFrame::from_rgba16_float(data, init).map_err(|error| {
+    match error.reason.strip_prefix("TypeError:") {
+      Some(message) => throw_type_error(env.raw(), message.trim_start()),
+      None => error,
+    }
+  })
+}
+
+/// Unwraps a VideoFrame argument after a real `instanceof` check, like the constructor does.
+fn video_frame_argument<'env>(
+  env: &Env,
+  value: Unknown<'env>,
+) -> Result<ClassInstance<'env, VideoFrame>> {
+  if !VideoFrame::instance_of(env, &value).unwrap_or(false) {
+    return Err(throw_type_error(env.raw(), "frame must be a VideoFrame"));
+  }
+  unsafe { ClassInstance::<VideoFrame>::from_napi_value(env.raw(), value.raw()) }
 }
 
 /// native image-consumer interop with a real class borrow and independent half-pixel storage.
-#[napi(js_name = "copyVideoFrameRGBA16Float")]
-pub fn copy_video_frame_rgba16_float(env: Env, frame: &VideoFrame) -> Result<Uint16Array> {
-  frame.copy_rgba16_float(env)
+#[napi(
+  js_name = "copyVideoFrameRGBA16Float",
+  ts_args_type = "frame: VideoFrame"
+)]
+pub fn copy_video_frame_rgba16_float(env: Env, frame: Unknown) -> Result<Uint16Array> {
+  video_frame_argument(&env, frame)?.copy_rgba16_float(env)
 }
 
 impl Drop for VideoFrame {
@@ -3926,7 +3946,7 @@ impl Drop for VideoFrame {
     let _ = CLOSE_OBSERVERS.try_with(|registry| {
       let observers = registry.borrow_mut().remove(&self.observer_id);
       if let Some(observers) = observers {
-        for reference in observers.callbacks {
+        for (_, reference) in observers.callbacks {
           unsafe {
             napi::sys::napi_delete_reference(observers.env, reference as napi::sys::napi_ref)
           };
@@ -3943,29 +3963,59 @@ impl Drop for VideoFrame {
 )]
 pub fn register_video_frame_close_observer(
   env: Env,
-  frame: ClassInstance<VideoFrame>,
+  frame: Unknown,
   callback: FunctionRef<(), UnknownReturnValue>,
 ) -> Result<()> {
+  let frame = video_frame_argument(&env, frame)?;
   if frame.closed()? {
     return throw_invalid_state_error(&env, "VideoFrame is closed");
   }
   let callback = callback.borrow_back(&env)?;
-  CLOSE_OBSERVERS.with(|registry| {
+  // Reserve the id under a short borrow. Anchoring runs JS, which may close or
+  // register on frames, so no borrow is held across it.
+  let id = CLOSE_OBSERVERS.with(|registry| {
     let mut registry = registry.borrow_mut();
     let observers = registry
       .entry(frame.observer_id)
       .or_insert_with(|| FrameCloseObservers {
         env: env.raw(),
+        next_id: 0,
         callbacks: Vec::new(),
       });
-    let id = observers.callbacks.len() as u64;
-    let reference = super::event_target::CodecEventState::anchor_callback(
-      &env,
-      Some(frame.value),
-      id,
-      callback.raw(),
-    )?;
-    observers.callbacks.push(reference);
-    Ok(())
-  })
+    let id = observers.next_id;
+    observers.next_id += 1;
+    id
+  });
+  let reference = super::event_target::CodecEventState::anchor_callback(
+    &env,
+    Some(frame.value),
+    id,
+    callback.raw(),
+  )?;
+  // A frozen frame cannot hold the listener map: anchoring leaves a TypeError
+  // pending and a strong reference. Drop the reference so nothing is registered.
+  let mut pending = false;
+  unsafe { napi::sys::napi_is_exception_pending(env.raw(), &mut pending) };
+  if pending {
+    unsafe { napi::sys::napi_delete_reference(env.raw(), reference as napi::sys::napi_ref) };
+    return Ok(());
+  }
+  // JS that ran while anchoring may have closed the frame.
+  if frame.closed()? {
+    super::event_target::release_callback(&env, Some(frame.value), id, reference);
+    return throw_invalid_state_error(&env, "VideoFrame is closed");
+  }
+  CLOSE_OBSERVERS.with(|registry| {
+    let mut registry = registry.borrow_mut();
+    registry
+      .entry(frame.observer_id)
+      .or_insert_with(|| FrameCloseObservers {
+        env: env.raw(),
+        next_id: id + 1,
+        callbacks: Vec::new(),
+      })
+      .callbacks
+      .push((id, reference));
+  });
+  Ok(())
 }

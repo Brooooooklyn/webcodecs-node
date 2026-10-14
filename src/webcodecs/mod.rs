@@ -72,6 +72,8 @@ pub use video_frame::{
   DOMRectReadOnly, VideoColorPrimaries, VideoColorSpace, VideoColorSpaceInit, VideoFrame,
   VideoFrameBufferInit, VideoFrameCopyToOptions, VideoFrameInit, VideoFrameMetadata,
   VideoFrameRect, VideoMatrixCoefficients, VideoPixelFormat, VideoTransferCharacteristics,
+  copy_video_frame_rgba16_float, create_video_frame_from_rgba16_float,
+  register_video_frame_close_observer,
 };
 pub use webm_muxer::{WebMAudioTrackConfig, WebMMuxer, WebMMuxerOptions, WebMVideoTrackConfig};
 // Demuxer types
