@@ -156,6 +156,9 @@ struct AudioDecoderInner {
   output_callback: OutputCallback,
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
+  /// The codec's event state: report_error orders the error callback before
+  /// the dequeue events that come due meanwhile.
+  event_state: Arc<RwLock<CodecEventState>>,
   /// Whether an error has occurred during decoding (for flush error propagation)
   had_error: bool,
   /// Whether a key chunk has been decoded since the last configure (spec: [[key chunk required]])
@@ -247,6 +250,7 @@ impl AudioDecoder {
     )]
     init: AudioDecoderInit,
   ) -> Result<Self> {
+    let event_state = Arc::new(RwLock::new(CodecEventState::default()));
     let inner = AudioDecoderInner {
       state: CodecState::Unconfigured,
       config: None,
@@ -256,6 +260,7 @@ impl AudioDecoder {
       decode_queue_size: 0,
       output_callback: init.output,
       error_callback: init.error,
+      event_state: event_state.clone(),
       had_error: false,
       keyframe_received: false,
       flushes: FlushTracker::default(),
@@ -264,7 +269,6 @@ impl AudioDecoder {
     };
 
     let inner = Arc::new(Mutex::new(inner));
-    let event_state = Arc::new(RwLock::new(CodecEventState::default()));
 
     // Create channel for worker commands
     let (sender, receiver) = channel::unbounded();
@@ -707,9 +711,7 @@ impl AudioDecoder {
 
     // Create an Error object that will be passed directly to the JS callback
     let error = Error::new(Status::GenericFailure, error_msg);
-    inner
-      .error_callback
-      .call(error, ThreadsafeFunctionCallMode::NonBlocking);
+    CodecEventState::report_error(&inner.event_state, &inner.error_callback, error);
     inner.had_error = true;
     inner.state = CodecState::Closed;
   }

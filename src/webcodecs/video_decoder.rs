@@ -201,6 +201,9 @@ struct VideoDecoderInner {
   output_callback: OutputCallback,
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
+  /// The codec's event state: report_error orders the error callback before
+  /// the dequeue events that come due meanwhile.
+  event_state: Arc<RwLock<CodecEventState>>,
   /// Whether a keyframe has been received (for delta frame validation)
   keyframe_received: bool,
   /// Whether an error has occurred during decoding (for flush error propagation)
@@ -352,6 +355,7 @@ impl VideoDecoder {
     )]
     init: VideoDecoderInit,
   ) -> Result<Self> {
+    let event_state = Arc::new(RwLock::new(CodecEventState::default()));
     let inner = VideoDecoderInner {
       state: CodecState::Unconfigured,
       config: None,
@@ -361,6 +365,7 @@ impl VideoDecoder {
       decode_queue_size: 0,
       output_callback: init.output,
       error_callback: init.error,
+      event_state: event_state.clone(),
       keyframe_received: false,
       had_error: false,
       flushes: FlushTracker::default(),
@@ -384,7 +389,6 @@ impl VideoDecoder {
     let inner = Arc::new(Mutex::new(inner));
 
     // Create separate lock for event listener state (avoids contention with decode operations)
-    let event_state = Arc::new(RwLock::new(CodecEventState::default()));
 
     // Create channel for worker commands
     let (sender, receiver) = channel::unbounded();
@@ -1256,9 +1260,7 @@ impl VideoDecoder {
 
     // Create an Error object that will be passed directly to the JS callback
     let error = Error::new(Status::GenericFailure, error_msg);
-    inner
-      .error_callback
-      .call(error, ThreadsafeFunctionCallMode::NonBlocking);
+    CodecEventState::report_error(&inner.event_state, &inner.error_callback, error);
     inner.had_error = true;
     inner.state = CodecState::Closed;
   }

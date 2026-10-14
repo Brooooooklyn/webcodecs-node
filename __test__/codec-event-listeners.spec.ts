@@ -537,34 +537,41 @@ test('dequeue: items dequeued before the dequeue event runs share one event, for
 })
 
 // Child-side runner for error teardown: records the error (with the queue size and
-// state it sees) and every dequeue event.
-//
-// Not checked: whether the error comes before the dequeue events. Errors and
-// dequeue events reach JS through two thread-safe functions, so their order can
-// flip under load (origin/main does the same); Chrome reports the error first.
+// state it sees), every dequeue event, and the order of both in log.
 const TEARDOWN = `
   const N = 6;
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   async function teardown(Codec, setup) {
     const errors = [];
     const dequeues = [];
+    const log = [];
     let codec;
     const queueSize = () => codec.encodeQueueSize ?? codec.decodeQueueSize;
     codec = new Codec({
       output: (out) => out.close?.(),
-      error: (error) => errors.push(error.name + ':' + queueSize() + ':' + codec.state),
+      error: (error) => {
+        errors.push(error.name + ':' + queueSize() + ':' + codec.state);
+        log.push('error');
+      },
     });
-    codec.addEventListener('dequeue', () => dequeues.push('dequeue:' + queueSize()));
+    codec.addEventListener('dequeue', () => {
+      dequeues.push('dequeue:' + queueSize());
+      log.push(dequeues.at(-1));
+    });
     setup(codec);
     const queued = queueSize();
     for (let i = 0; i < 200 && !(errors.length > 0 && dequeues.includes('dequeue:0')); i++) await sleep(10);
     // Room for any extra event to arrive.
     await sleep(100);
-    return { queued, state: codec.state, errors, dequeues };
+    return { queued, state: codec.state, errors, dequeues, log };
   }
 `
 
-type Teardown = { queued: number; state: string; errors: string[]; dequeues: string[] }
+type Teardown = { queued: number; state: string; errors: string[]; dequeues: string[]; log: string[] }
+
+// The events from the error on: Chrome logs the error, then one dequeue event that
+// sees an empty queue.
+const fromError = (log: string[]) => log.slice(log.indexOf('error'))
 
 test('dequeue: an error that drops every queued item fires one dequeue event', (t) => {
   // Chrome 155 resets the codec on error: the queue empties at once and one
@@ -602,6 +609,7 @@ test('dequeue: an error that drops every queued item fires one dequeue event', (
       `${codec}: one error`,
     )
     t.deepEqual(entry.dequeues, ['dequeue:0'], `${codec}: one dequeue event for all dropped items`)
+    t.deepEqual(entry.log, ['error', 'dequeue:0'], `${codec}: the error comes first, as in Chrome`)
   }
   // The decode error empties the queue before the error callback runs, as in Chrome.
   // (The AudioEncoder error comes from a failed reconfiguration; on that path the
@@ -639,4 +647,107 @@ test('dequeue: an error after a decoded chunk leaves the VideoDecoder queue empt
   t.is(result.state, 'closed', 'the error closed the decoder')
   t.deepEqual(result.errors, ['EncodingError:0:closed'], 'one error, seeing an empty queue')
   t.is(result.dequeues.at(-1), 'dequeue:0', 'the last dequeue event sees an empty queue')
+  t.deepEqual(fromError(result.log), ['error', 'dequeue:0'], 'one dequeue event follows the error')
+})
+
+test('dequeue: the error callback runs before the dequeue event for the work it dropped, under load', (t) => {
+  // Chrome 155 (10 of 10 runs each, same triggers): AudioDecoder, AudioEncoder and
+  // VideoEncoder log the error, then dequeue:0; VideoDecoder logs dequeue:6, the
+  // error, then dequeue:0.
+  //
+  // The error and the dequeue event reach JS through two thread-safe functions.
+  // Each failure here starts while the JS thread is busy with the output callbacks
+  // of another encoder whose thread-safe function was created between the failing
+  // codec's error and dequeue ones, which used to deliver the dequeue event first
+  // every time. Only the order is checked; the deadline only bounds a failing run.
+  const result = runChild<Record<string, Record<string, number>>>(`
+    ${PRELUDE}
+    const m = require('./index.js');
+    const N = 6;
+    const ROUNDS = 5;
+    const PER_KIND = 4;
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const audioData = (i, sampleRate = 48000) =>
+      new m.AudioData({ format: 'f32-planar', sampleRate, numberOfFrames: 960, numberOfChannels: 2, timestamp: i * 20000, data: new Float32Array(1920) });
+    const SETUPS = {
+      AudioDecoder(codec) {
+        codec.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 });
+        for (let i = 0; i < N; i++) codec.decode(new m.EncodedAudioChunk({ type: 'key', timestamp: i, data: new Uint8Array(0) }));
+      },
+      VideoDecoder(codec, key) {
+        codec.configure({ codec: 'vp8', codedWidth: 64, codedHeight: 64 });
+        codec.decode(key);
+        for (let i = 1; i <= N; i++) codec.decode(new m.EncodedVideoChunk({ type: 'delta', timestamp: i * 33333, data: new Uint8Array(0) }));
+      },
+      AudioEncoder(codec) {
+        codec.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 });
+        codec.configure({ codec: 'opus', sampleRate: 44100, numberOfChannels: 2 });
+        for (let i = 0; i < N; i++) { const data = audioData(i); codec.encode(data); data.close(); }
+      },
+      VideoEncoder(codec) {
+        codec.configure({ codec: 'vp8', width: 16, height: 16, bitrate: 100000 });
+        for (let i = 0; i < 3; i++) {
+          const frame = m.createVideoFrameFromRGBA16Float(new Uint16Array(16 * 16 * 4).fill(0x3c00), { codedWidth: 16, codedHeight: 16, timestamp: i });
+          codec.encode(frame);
+          frame.close();
+        }
+      },
+    };
+    (async () => {
+      let key;
+      const encoder = new m.VideoEncoder({ output: (chunk) => { key = chunk; }, error: fail });
+      encoder.configure({ codec: 'vp8', width: 64, height: 64, bitrate: 200000 });
+      const frame = new m.VideoFrame(new Uint8Array(64 * 64 * 4), { format: 'RGBA', codedWidth: 64, codedHeight: 64, timestamp: 0 });
+      encoder.encode(frame, { keyFrame: true });
+      frame.close();
+      await encoder.flush();
+      encoder.close();
+      const out = {};
+      for (const kind of Object.keys(SETUPS)) out[kind] = {};
+      // One budget for all rounds: a failing round uses it up, and the rest still report.
+      const deadline = Date.now() + 40000;
+      for (let round = 0; round < ROUNDS; round++) {
+        const runs = [];
+        for (let i = 0; i < PER_KIND; i++) {
+          for (const kind of Object.keys(SETUPS)) {
+            const run = { kind, log: [] };
+            run.codec = new m[kind]({ output: (o) => o.close?.(), error: () => run.log.push('error') });
+            runs.push(run);
+          }
+        }
+        // Each output starts the next failure, then keeps the JS thread busy for a moment.
+        let next = 0;
+        const busy = new m.AudioEncoder({
+          output: () => {
+            if (next < runs.length) { const run = runs[next++]; SETUPS[run.kind](run.codec, key); }
+            const until = performance.now() + 0.5;
+            while (performance.now() < until) {}
+          },
+          error: fail,
+        });
+        busy.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 });
+        for (const run of runs) {
+          const queueSize = () => run.codec.encodeQueueSize ?? run.codec.decodeQueueSize;
+          run.codec.addEventListener('dequeue', () => run.log.push('dequeue:' + queueSize()));
+        }
+        // No flush: outputs during a flush are delivered by the flush, not by the
+        // output callback's thread-safe function.
+        for (let i = 0; i < runs.length * 3; i++) { const data = audioData(i); busy.encode(data); data.close(); }
+        const finished = (run) => run.log.includes('error') && run.log.at(-1) === 'dequeue:0';
+        while (!runs.every(finished) && Date.now() < deadline) await sleep(10);
+        // Room for any extra event to arrive.
+        await sleep(100);
+        busy.close();
+        for (const run of runs) {
+          const from = run.log.indexOf('error');
+          const tail = from < 0 ? 'no error: ' + run.log.join(',') : run.log.slice(from).join(',');
+          out[run.kind][tail] = (out[run.kind][tail] || 0) + 1;
+        }
+      }
+      done(out);
+    })().catch(fail);
+  `)
+  for (const kind of ['AudioDecoder', 'VideoDecoder', 'AudioEncoder', 'VideoEncoder']) {
+    t.deepEqual(result[kind], { 'error,dequeue:0': 20 }, `${kind}: from the error on, every run logs error, dequeue:0`)
+  }
 })
