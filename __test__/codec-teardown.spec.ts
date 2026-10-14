@@ -32,6 +32,8 @@ import { delay, waitFor } from './helpers/index.js'
 
 interface TeardownCodec {
   readonly state: string
+  readonly encodeQueueSize?: number
+  readonly decodeQueueSize?: number
   ondequeue: ((event: Event) => unknown) | null
   close(): void
   reset(): void
@@ -206,8 +208,13 @@ function phasedLog() {
     markTeardown: () => {
       after = true
     },
+    entries: () => [...entries],
     after: () => entries.filter((entry) => entry.endsWith('@after')),
   }
+}
+
+function queueSize(codec: TeardownCodec) {
+  return codec.encodeQueueSize ?? codec.decodeQueueSize ?? 0
 }
 
 for (const teardown of ['close', 'reset'] as const) {
@@ -248,6 +255,30 @@ for (const teardown of ['close', 'reset'] as const) {
       codec[teardown]()
       log.markTeardown()
       await delay(300)
+
+      t.deepEqual(log.after(), ['dequeue@after'], codecCase.name)
+      if (teardown === 'reset') codec.close()
+    }
+  })
+
+  test(`${teardown}() after the worker emptied the queue still fires the dequeue event JS has not seen`, async (t) => {
+    for (const codecCase of await codecCases()) {
+      const log = phasedLog()
+      const codec = codecCase.make(log.record)
+      codec.ondequeue = () => log.record('dequeue')
+      codecCase.queue(codec)
+      // Only microtasks run in this loop, so the dequeue events the worker fires
+      // cannot be delivered before the teardown.
+      const deadline = Date.now() + 60_000
+      while (queueSize(codec) > 0 && Date.now() < deadline) await null
+      t.is(queueSize(codec), 0, `${codecCase.name}: the worker emptied the queue`)
+      t.deepEqual(log.entries(), [], `${codecCase.name}: nothing delivered before ${teardown}()`)
+
+      codec[teardown]()
+      log.markTeardown()
+      await waitFor(() => log.after().length > 0, `${codecCase.name}: dequeue event after ${teardown}()`)
+      // A second event would be queued with the first one; give it time to arrive.
+      await delay(100)
 
       t.deepEqual(log.after(), ['dequeue@after'], codecCase.name)
       if (teardown === 'reset') codec.close()
