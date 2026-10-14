@@ -99,7 +99,8 @@ test('reset aborts pending flushes with native AbortError DOMExceptions', async 
   }
 })
 
-test('errored encoders reject flush with native EncodingError DOMExceptions', async (t) => {
+// Chrome: a flush issued before the error callback runs fails with that error.
+test('errored encoders reject a flush issued before the error callback with that error', async (t) => {
   const encoders = [
     new AudioEncoder({ output() {}, error() {} }),
     new VideoEncoder({ output() {}, error() {} }),
@@ -108,10 +109,14 @@ test('errored encoders reject flush with native EncodingError DOMExceptions', as
   encoders[0].configure({ codec: 'unsupported-audio-codec', sampleRate: 48000, numberOfChannels: 2 })
   encoders[1].configure({ codec: 'unsupported-video-codec', width: 64, height: 64 })
 
-  for (const encoder of encoders) {
+  // Issue both flushes before either error callback can run.
+  const flushes = encoders.map((encoder) => {
     t.is(encoder.state, 'closed')
-    const error = await t.throwsAsync(encoder.flush())
+    return encoder.flush()
+  })
+  for (const flush of flushes) {
+    const error = await t.throwsAsync(flush)
     t.true(error instanceof DOMException)
-    t.is((error as DOMException).name, 'EncodingError')
+    t.is((error as DOMException).name, 'NotSupportedError')
   }
 })

@@ -14,6 +14,7 @@ pub mod bmp_decoder;
 pub(crate) mod buffer_source;
 #[cfg(test)]
 mod chrome_cases;
+pub(crate) mod codec_epoch;
 pub(crate) mod codec_pressure;
 pub mod codec_string;
 pub(crate) mod decoded_frame;
