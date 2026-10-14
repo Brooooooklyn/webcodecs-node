@@ -15,6 +15,8 @@ use napi::sys;
 use napi::threadsafe_function::{
   ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
 };
+use napi_derive::napi;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,9 +35,9 @@ const CMD_DELETE_REF: u32 = 1;
 const CMD_DISPATCH: u32 = 2;
 
 /// A registered event listener. `callback` is a WEAK napi_ref — the JS
-/// callback's liveness is anchored by a GC-traceable Map on the codec object
-/// (`codec[Symbol.for("webcodecs.listeners")]`), so the codec→listener edge
-/// never roots the listener and a retained-event cycle stays collectable.
+/// callback is kept alive by the per-env anchor store (see [`AnchorStore`]),
+/// so the codec→listener edge never roots the listener and a retained-event
+/// cycle stays collectable.
 struct EventListenerEntry {
   id: u64,
   once: bool,
@@ -138,8 +140,8 @@ pub struct CodecEventState {
   /// Weak ref to the codec's JS object (`this`), captured lazily on the first
   /// event-related call so dispatched events expose it as target/currentTarget.
   codec_obj: Option<WeakCodecRef>,
-  /// The ondequeue event handler property value (weak napi_ref, same
-  /// Map-anchored liveness as ordinary listeners), plus its registration-order
+  /// The ondequeue event handler property value (weak napi_ref, kept alive by
+  /// the anchor store like ordinary listeners), plus its registration-order
   /// id — an event handler participates in listener ordering, so assigning it
   /// after addEventListener must run it after earlier registrations.
   ondequeue: Option<usize>,
@@ -421,29 +423,23 @@ impl CodecEventState {
       .map(|o| o.raw())
   }
 
-  /// Register `fn_raw` in the codec's listener Map under `id` and return a
-  /// weak napi_ref for invocation. If no Map edge can be installed (no codec
-  /// object captured), falls back to a strong ref so the callback stays
-  /// callable — trading collectability for correctness on that path.
+  /// Keep `fn_raw` alive for as long as `owner` lives (see [`AnchorStore`])
+  /// and return a weak napi_ref for invoking it. Without an owner or an anchor
+  /// store, falls back to a strong ref so the callback stays callable —
+  /// trading collectability for correctness on that path.
   pub(crate) fn anchor_callback(
     env: &Env,
-    codec: Option<sys::napi_value>,
+    owner: Option<sys::napi_value>,
     id: u64,
     fn_raw: sys::napi_value,
   ) -> Result<usize> {
-    let mut strong = true;
-    if let Some(codec) = codec
-      && let Ok(Some(map)) = listener_map(env, codec, true)
-    {
-      let mut idv = ptr::null_mut();
-      unsafe { sys::napi_create_double(env.raw(), id as f64, &mut idv) };
-      if map_op(env, map, "set", &[idv, fn_raw]).is_ok() {
-        strong = false;
-      }
-    }
+    let anchored = match owner {
+      Some(owner) => anchor_store_add(env, owner, id, fn_raw)?,
+      None => false,
+    };
     let mut r = ptr::null_mut();
     check_status!(unsafe {
-      sys::napi_create_reference(env.raw(), fn_raw, if strong { 1 } else { 0 }, &mut r)
+      sys::napi_create_reference(env.raw(), fn_raw, if anchored { 0 } else { 1 }, &mut r)
     })?;
     Ok(r as usize)
   }
@@ -760,7 +756,8 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
     // the deleted ref would be unusable.
     let func = upgrade_ref(env, callback).ok().flatten();
     if func.is_none() && !item.once {
-      // The weak ref was emptied — only possible if its Map anchor is gone.
+      // The weak ref was emptied — only possible if code that ran before this
+      // module loaded intercepted the anchor store (see [`AnchorStore`]).
       // Drop the dead entry so it can't wedge dispatch.
       if let Ok(mut state) = shared.write() {
         if item.is_ondequeue {
@@ -947,63 +944,6 @@ fn sym_prop(env: &Env, this: sys::napi_value) -> Result<Unknown<'static>> {
   Ok(as_static(unsafe { Unknown::from_napi_value(env_raw, v)? }))
 }
 
-/// Symbol.for() key for the codec's listener-liveness Map (id → callback).
-/// A plain JS edge makes the codec→listener relationship GC-traceable, so
-/// listener napi_refs can stay weak and a codec→state→listener→event→codec
-/// cycle remains collectable.
-const LISTENERS_SYM_DESC: &str = "webcodecs.listeners";
-
-/// `codec[Symbol.for(desc)]` as a Map, creating and installing it when
-/// `create` is set. None when absent and not requested.
-fn listener_map(
-  env: &Env,
-  codec: sys::napi_value,
-  create: bool,
-) -> Result<Option<sys::napi_value>> {
-  let env_raw = env.raw();
-  let sym = symbol_for(env, LISTENERS_SYM_DESC)?;
-  let mut v = ptr::null_mut();
-  check_status!(unsafe { sys::napi_get_property(env_raw, codec, sym, &mut v) })?;
-  if !is_nullish(env_raw, v) {
-    return Ok(Some(v));
-  }
-  if !create {
-    return Ok(None);
-  }
-  unsafe {
-    let global = env.get_global()?.raw();
-    let map_ctor = get_named_raw(env_raw, global, "Map")?;
-    let mut map = ptr::null_mut();
-    check_status!(sys::napi_new_instance(
-      env_raw,
-      map_ctor,
-      0,
-      ptr::null(),
-      &mut map,
-    ))?;
-    define_sym_prop(env, codec, LISTENERS_SYM_DESC, map)?;
-    Ok(Some(map))
-  }
-}
-
-/// `map[method](...args)` via raw N-API ("set" / "delete").
-fn map_op(env: &Env, map: sys::napi_value, method: &str, args: &[sys::napi_value]) -> Result<()> {
-  let env_raw = env.raw();
-  unsafe {
-    let f = get_named_raw(env_raw, map, method)?;
-    let mut out = ptr::null_mut();
-    check_status!(sys::napi_call_function(
-      env_raw,
-      map,
-      f,
-      args.len(),
-      args.as_ptr(),
-      &mut out,
-    ))?;
-    Ok(())
-  }
-}
-
 /// Upgrade a weak napi_ref to a value; `None` if it has been emptied by GC.
 pub(crate) fn upgrade_ref(env: &Env, refr: usize) -> Result<Option<Unknown<'static>>> {
   let mut v = ptr::null_mut();
@@ -1019,16 +959,219 @@ pub(crate) fn upgrade_ref(env: &Env, refr: usize) -> Result<Option<Unknown<'stat
 }
 
 /// Release one registered callback: delete its napi_ref handle and drop its
-/// liveness entry from the codec's listener Map. JS thread only.
-pub(crate) fn release_callback(env: &Env, codec: Option<sys::napi_value>, id: u64, refr: usize) {
+/// entry from the owner's anchor holder. JS thread only.
+pub(crate) fn release_callback(env: &Env, owner: Option<sys::napi_value>, id: u64, refr: usize) {
   unsafe { sys::napi_delete_reference(env.raw(), refr as sys::napi_ref) };
-  if let Some(codec) = codec
-    && let Ok(Some(map)) = listener_map(env, codec, false)
-  {
-    let mut idv = ptr::null_mut();
-    unsafe { sys::napi_create_double(env.raw(), id as f64, &mut idv) };
-    let _ = map_op(env, map, "delete", &[idv]);
+  if let Some(owner) = owner {
+    anchor_store_remove(env, owner, id);
   }
+}
+
+/// Per-env store that keeps registered callbacks (codec event listeners and
+/// VideoFrame close observers) alive through a GC-traceable edge from their
+/// owner object, with nothing visible on that object.
+///
+/// It is a `WeakMap<owner, holder>`, where each holder is a plain object with
+/// one own property per callback. A WeakMap entry keeps its value alive only
+/// while its key is alive, so a callback that captures its owner is collected
+/// with it, and the native side only keeps weak refs to the callbacks.
+///
+/// The WeakMap and the intrinsic `WeakMap.prototype.get`/`set` are captured
+/// when the module loads in each env (main thread or worker_thread) and kept
+/// by native refs, so user code cannot reach the store afterwards: patching
+/// the `WeakMap` global or its prototype later changes nothing. Holders are
+/// only touched with define/delete own-property operations on an ordinary
+/// object, which run no user code. Frozen, sealed and non-extensible owners
+/// work, since nothing is added to the owner itself.
+///
+/// Limit: code that replaces `WeakMap` or its prototype methods before this
+/// module loads is handed the store. It can drop entries, which loses events
+/// (a dropped callback is collected and then skipped), and calling into the
+/// same codec from inside those methods deadlocks, since the codec's event
+/// state stays locked while the store runs. Memory safety holds: callbacks
+/// are only invoked through weak refs that read as empty once collected. If
+/// the store cannot be created at load (no usable `WeakMap`), callbacks fall
+/// back to strong refs: no missed events, but a callback that captures its
+/// owner is not collected.
+struct AnchorStore {
+  map: sys::napi_ref,
+  get: sys::napi_ref,
+  set: sys::napi_ref,
+}
+
+thread_local! {
+  /// Anchor stores of the envs on this thread (the main thread or a
+  /// worker_thread, possibly with the module loaded more than once), by env
+  /// pointer. An env cleanup hook removes the entry before its env goes away,
+  /// so a reused pointer never finds a stale store.
+  static ANCHOR_STORES: RefCell<HashMap<usize, AnchorStore>> = RefCell::new(HashMap::new());
+}
+
+/// Create this env's anchor store when the module loads, before any user
+/// code can call into it. (Unit-test builds do not register module hooks.)
+#[cfg_attr(test, allow(dead_code))]
+#[napi(module_exports)]
+pub fn install_callback_anchor_store(_exports: Object, env: Env) -> Result<()> {
+  let key = env.raw() as usize;
+  match create_anchor_store(&env) {
+    Ok(store) => {
+      ANCHOR_STORES.with(|stores| stores.borrow_mut().insert(key, store));
+      // The env frees its own refs on teardown; only forget the handles.
+      env.add_env_cleanup_hook(key, |key| {
+        let _ = ANCHOR_STORES.try_with(|stores| stores.borrow_mut().remove(&key));
+      })?;
+      Ok(())
+    }
+    Err(_) => {
+      // No usable WeakMap: run without a store (strong-ref fallback) instead
+      // of failing the module load. Clear whatever the attempt threw.
+      let mut pending = false;
+      unsafe { sys::napi_is_exception_pending(env.raw(), &mut pending) };
+      if pending {
+        let mut exc = ptr::null_mut();
+        unsafe { sys::napi_get_and_clear_last_exception(env.raw(), &mut exc) };
+      }
+      Ok(())
+    }
+  }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn create_anchor_store(env: &Env) -> Result<AnchorStore> {
+  let env_raw = env.raw();
+  unsafe {
+    let global = env.get_global()?.raw();
+    let ctor = get_named_raw(env_raw, global, "WeakMap")?;
+    let proto = get_named_raw(env_raw, ctor, "prototype")?;
+    let get = get_named_raw(env_raw, proto, "get")?;
+    let set = get_named_raw(env_raw, proto, "set")?;
+    for f in [ctor, get, set] {
+      let mut t = sys::ValueType::napi_undefined;
+      check_status!(sys::napi_typeof(env_raw, f, &mut t))?;
+      if t != sys::ValueType::napi_function {
+        return Err(Error::new(Status::FunctionExpected, "WeakMap is unusable"));
+      }
+    }
+    let mut map = ptr::null_mut();
+    check_status!(sys::napi_new_instance(
+      env_raw,
+      ctor,
+      0,
+      ptr::null(),
+      &mut map
+    ))?;
+    let mut refs = [ptr::null_mut(); 3];
+    for (slot, value) in refs.iter_mut().zip([map, get, set]) {
+      check_status!(sys::napi_create_reference(env_raw, value, 1, slot))?;
+    }
+    Ok(AnchorStore {
+      map: refs[0],
+      get: refs[1],
+      set: refs[2],
+    })
+  }
+}
+
+/// `(map, get, set)` of this env's anchor store, fetched in the caller's
+/// handle scope. None when the module runs without a store.
+fn anchor_store(env: &Env) -> Option<[sys::napi_value; 3]> {
+  let refs = ANCHOR_STORES
+    .try_with(|stores| {
+      stores
+        .borrow()
+        .get(&(env.raw() as usize))
+        .map(|store| [store.map, store.get, store.set])
+    })
+    .ok()
+    .flatten()?;
+  let mut values = [ptr::null_mut(); 3];
+  for (value, r) in values.iter_mut().zip(refs) {
+    let status = unsafe { sys::napi_get_reference_value(env.raw(), r, value) };
+    if status != sys::Status::napi_ok || value.is_null() {
+      return None;
+    }
+  }
+  Some(values)
+}
+
+/// The owner's holder object, created and stored when `create` is set.
+fn anchor_holder(
+  env: &Env,
+  store: [sys::napi_value; 3],
+  owner: sys::napi_value,
+  create: bool,
+) -> Result<Option<sys::napi_value>> {
+  let env_raw = env.raw();
+  let [map, get, set] = store;
+  let mut holder = ptr::null_mut();
+  check_status!(unsafe {
+    sys::napi_call_function(env_raw, map, get, 1, [owner].as_ptr(), &mut holder)
+  })?;
+  let mut t = sys::ValueType::napi_undefined;
+  check_status!(unsafe { sys::napi_typeof(env_raw, holder, &mut t) })?;
+  if t == sys::ValueType::napi_object {
+    return Ok(Some(holder));
+  }
+  if !create {
+    return Ok(None);
+  }
+  check_status!(unsafe { sys::napi_create_object(env_raw, &mut holder) })?;
+  let mut out = ptr::null_mut();
+  check_status!(unsafe {
+    sys::napi_call_function(env_raw, map, set, 2, [owner, holder].as_ptr(), &mut out)
+  })?;
+  Ok(Some(holder))
+}
+
+fn anchor_key(env: &Env, id: u64) -> Result<sys::napi_value> {
+  Ok(env.create_string(id.to_string())?.raw())
+}
+
+/// Store `callback` under `id` in the owner's holder. Ok(false) when the
+/// module runs without a store; an error (with its JS exception pending)
+/// only if code that ran before the module loaded intercepted the store.
+fn anchor_store_add(
+  env: &Env,
+  owner: sys::napi_value,
+  id: u64,
+  callback: sys::napi_value,
+) -> Result<bool> {
+  let Some(store) = anchor_store(env) else {
+    return Ok(false);
+  };
+  let Some(holder) = anchor_holder(env, store, owner, true)? else {
+    return Ok(false);
+  };
+  // Define (not set) the property: a define runs no setters, so nothing on
+  // Object.prototype can observe or intercept the callback.
+  let property = sys::napi_property_descriptor {
+    utf8name: ptr::null(),
+    name: anchor_key(env, id)?,
+    method: None,
+    getter: None,
+    setter: None,
+    value: callback,
+    attributes: sys::PropertyAttributes::writable | sys::PropertyAttributes::configurable,
+    data: ptr::null_mut(),
+  };
+  check_status!(unsafe { sys::napi_define_properties(env.raw(), holder, 1, &property) })?;
+  Ok(true)
+}
+
+/// Remove the entry `id` from the owner's holder, if any. Errors are ignored:
+/// a missing entry leaves the callback alive only until the owner is collected.
+fn anchor_store_remove(env: &Env, owner: sys::napi_value, id: u64) {
+  let Some(store) = anchor_store(env) else {
+    return;
+  };
+  let Ok(Some(holder)) = anchor_holder(env, store, owner, false) else {
+    return;
+  };
+  let Ok(key) = anchor_key(env, id) else {
+    return;
+  };
+  let mut deleted = false;
+  unsafe { sys::napi_delete_property(env.raw(), holder, key, &mut deleted) };
 }
 
 /// Install `value` as a non-enumerable own data prop keyed by
