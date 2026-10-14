@@ -24,9 +24,11 @@ function childEnv(): NodeJS.ProcessEnv {
   return env
 }
 
-// Runs `body` in a child Node process after PRELUDE. The body stores its results in `out`.
-function runChild(body: string): Record<string, unknown> {
-  const script = `${PRELUDE}
+// Runs `body` in a child Node process after PRELUDE, and `beforeLoad` before it (PRELUDE loads the
+// module). The body stores its results in `out`.
+function runChild(body: string, beforeLoad = ''): Record<string, unknown> {
+  const script = `${beforeLoad}
+${PRELUDE}
 (async () => {
 ${body}
   fs.writeSync(1, JSON.stringify(out));
@@ -276,6 +278,74 @@ test('copyTo: the resizable, growable and detached checks run no page code, like
     'own detached=true, small dest': tooSmall,
     'worker, AB.resizable throws': 'resolved',
   })
+})
+
+test('copyTo: a flag getter patched before the module loads can change the resizable check, not memory safety', (t) => {
+  // Known limit: the module captures the flag getters from the globals when it loads, so a getter
+  // patched before that is the one it calls. Here it lets a real resizable buffer through and
+  // resizes it. copyTo still looks the destination up after that JS has run, so nothing is written
+  // outside it. A build that wrote through a pointer read before the getters crashed with SIGBUS.
+  const out = runChild(
+    `
+  Object.defineProperty(ArrayBuffer.prototype, 'resizable', { configurable: true, get: realResizable });
+  for (const kind of KINDS) {
+    const ref = await reference(kind);
+    const size = ref.length;
+    const result = {};
+    const copy = async (name, getters, shrinkInCheck) => {
+      const buffer = new ArrayBuffer(size, { maxByteLength: size });
+      const dest = new Uint8Array(buffer);
+      const frame = frameOf(kind);
+      // Copy the getters as getters: a spread would run them now.
+      const options = Object.defineProperties({ ...optionsOf(kind) }, Object.getOwnPropertyDescriptors(getters(buffer)));
+      globalThis.onResizableCheck = (b) => { if (shrinkInCheck && b === buffer) b.resize(0); };
+      const promise = frame.copyTo(dest, options);
+      globalThis.onResizableCheck = null;
+      result[name] = await settle(promise);
+      if (result[name] === 'resolved' && dest.length === size) result[name + ', same bytes'] = same(dest, ref);
+      frame.close();
+    };
+    await copy('passes the check', () => ({}));
+    await copy('shrunk in an options getter', (buffer) => ({ get rect() { buffer.resize(0); } }));
+    await copy('shrunk in the patched getter', () => ({}), true);
+    await copy('shrunk in the patched getter, grown back in an options getter', (buffer) => ({ get rect() { buffer.resize(size); } }), true);
+    const buffer = new ArrayBuffer(size, { maxByteLength: size });
+    const frame = frameOf(kind);
+    const promise = frame.copyTo(new Uint8Array(buffer), optionsOf(kind));
+    buffer.resize(0);
+    result['shrunk after the call'] = await settle(promise);
+    frame.close();
+    out[kind] = result;
+  }
+`,
+    `
+const realResizable = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'resizable').get;
+Object.defineProperty(ArrayBuffer.prototype, 'resizable', {
+  configurable: true,
+  get() {
+    if (globalThis.onResizableCheck) globalThis.onResizableCheck(this);
+    return false;
+  },
+});
+`,
+  )
+  for (const kind of ['RGBA', 'I420', 'I420->RGBA', 'RGBA->RGBA']) {
+    const size = kind === 'I420' ? (1920 * 1080 * 3) / 2 : 1920 * 1080 * 4
+    const shrunk = `TypeError: destination buffer too small: need ${size} bytes, got 0`
+    t.deepEqual(
+      out[kind],
+      {
+        'passes the check': 'resolved',
+        'passes the check, same bytes': true,
+        'shrunk in an options getter': shrunk,
+        'shrunk in the patched getter': shrunk,
+        'shrunk in the patched getter, grown back in an options getter': 'resolved',
+        'shrunk in the patched getter, grown back in an options getter, same bytes': true,
+        'shrunk after the call': 'resolved',
+      },
+      kind,
+    )
+  }
 })
 
 // ============================================================================

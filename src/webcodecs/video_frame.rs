@@ -1452,6 +1452,16 @@ fn copy_rect_to_rgb_in_bands(
 /// Calling them reads the buffer's internal state and runs no page code, like Chrome: a later
 /// patch to those prototypes, or an own property on a buffer, does not change the result.
 /// A getter that was missing at load time is null and reads as `false`.
+///
+/// Limit: Node-API has no call that reads these flags (nothing for resizable or growable, and
+/// `napi_is_detached_arraybuffer` needs napi7), so they are looked up through the env's globals.
+/// Code that patches those prototypes, or `Object.getOwnPropertyDescriptor`, before the module
+/// loads gets its own getter captured: it then runs on every copyTo and can change the resizable,
+/// growable and detached answers, so the Chrome parity checks can go wrong. Memory safety does not
+/// depend on them. copyTo reads the destination's pointer and length after every JS call that
+/// comes before the write, and runs no JS while it writes (the detached check runs only on the
+/// path that writes nothing). Only the thread that owns an ArrayBuffer can resize or detach it,
+/// and that thread is inside copyTo; a growable SharedArrayBuffer can only grow.
 #[derive(Clone, Copy)]
 struct BufferFlagGetters {
   env: napi::sys::napi_env,
@@ -1627,7 +1637,8 @@ fn buffer_flag(
   Ok(flag)
 }
 
-/// Whether `view` is on a resizable ArrayBuffer or a growable SharedArrayBuffer. Runs no page code.
+/// Whether `view` is on a resizable ArrayBuffer or a growable SharedArrayBuffer. Runs no page code
+/// (see the limit on `BufferFlagGetters`).
 fn is_resizable_view(env: &Env, view: napi::sys::napi_value) -> Result<bool> {
   let (buffer, shared) = view_buffer(env, view)?;
   if shared {
@@ -1637,7 +1648,8 @@ fn is_resizable_view(env: &Env, view: napi::sys::napi_value) -> Result<bool> {
   }
 }
 
-/// Whether the ArrayBuffer under `view` is detached. Runs no page code.
+/// Whether the ArrayBuffer under `view` is detached. Runs no page code (see the limit on
+/// `BufferFlagGetters`).
 fn is_detached_view(env: &Env, view: napi::sys::napi_value) -> Result<bool> {
   let (buffer, shared) = view_buffer(env, view)?;
   // A SharedArrayBuffer cannot be detached.

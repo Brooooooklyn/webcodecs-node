@@ -656,7 +656,7 @@ pub fn close(&mut self) {
 
 ### VideoFrame.copyTo
 
-Like Chrome, copyTo writes every byte on the JS thread before it returns; the Promise it returns is already settled. JS can detach, transfer or shrink the destination from an options getter or right after the call, so the destination is looked up only after the options getters have run and is never written once JS runs again. Views on resizable or growable buffers reject with TypeError (these flags are read with the engine's own getters, captured at module load, so no page code runs). RGB conversions of 512K pixels or more are split into up to 4 row bands on scoped threads; the JS thread waits for all of them.
+Like Chrome, copyTo writes every byte on the JS thread before it returns; the Promise it returns is already settled. JS can detach, transfer or shrink the destination from an options getter or right after the call, so the destination is looked up only after the options getters have run and is never written once JS runs again. Views on resizable or growable buffers reject with TypeError. These flags are read with the engine's own getters, captured at module load, so page code that runs later cannot change them; code that patches those getters (or `Object.getOwnPropertyDescriptor`) before the module loads can, but memory safety does not depend on them. RGB conversions of 512K pixels or more are split into up to 4 row bands on scoped threads; the JS thread waits for all of them.
 
 ### Pending TODOs
 
