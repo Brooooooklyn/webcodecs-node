@@ -254,7 +254,10 @@ for (const teardown of ['close', 'reset'] as const) {
       codecCase.queue(codec)
       codec[teardown]()
       log.markTeardown()
-      await delay(300)
+      // Wait for the event itself: a fixed delay can end first when another test
+      // blocks the JS thread, because timers run before queued native callbacks.
+      await waitFor(() => log.after().length > 0, `${codecCase.name}: dequeue event after ${teardown}()`)
+      await delay(100)
 
       t.deepEqual(log.after(), ['dequeue@after'], codecCase.name)
       if (teardown === 'reset') codec.close()
