@@ -145,8 +145,9 @@ Required static libraries:
 - Codec libs: `libx264.a`, `libx265.a`, `libvpx.a`
 - AV1 libs (platform-specific):
   - **Windows x64 MSVC:** `rav1e.lib` (encoder) + `dav1d.lib` (decoder)
+  - **Windows arm64 MSVC:** `aom.lib` (encoder) + `dav1d.lib` (decoder)
   - **Other platforms:** `libaom.a` (encoder + decoder)
-- JPEG XL libs (not on Windows arm64):
+- JPEG XL libs (all targets):
   - `libjxl.a`, `libjxl_threads.a` - JPEG XL core and threading
   - `libhwy.a` - Highway SIMD library
   - `libbrotlienc.a`, `libbrotlidec.a`, `libbrotlicommon.a` - Brotli compression
@@ -155,11 +156,10 @@ Required static libraries:
 Detection order:
 
 1. `FFMPEG_DIR` environment variable
-2. pkg-config
-3. Common paths (`/opt/homebrew`, `/usr/local`, etc.)
-4. Bundled in `ffmpeg/{platform}/`
-5. Auto-download from GitHub Releases (Linux/Windows CI builds)
-6. macOS: Download static libs (dav1d, libjxl + deps) from GitHub Releases (Homebrew only provides .dylib)
+2. Bundled in `ffmpeg-{target-triple}/` (or the older `ffmpeg/{platform}/`)
+3. Auto-download from GitHub Releases (all 9 targets, SHA-256 pinned in `build.rs`)
+4. pkg-config (Unix)
+5. Common paths (`/opt/homebrew`, `/usr/local`, etc.)
 
 ## JPEG XL (libjxl) Build
 
@@ -180,7 +180,7 @@ JPEG XL support requires libjxl v0.11.1 and its dependencies:
 | ------------- | --------------------------------------------- | --------------------------------- |
 | macOS         | Pre-built static libs downloaded from release | Homebrew only provides .dylib     |
 | Windows x64   | vcpkg `libjxl:x64-windows-static`             | Built with MSVC                   |
-| Windows arm64 | ❌ Not supported                              | vcpkg FFmpeg lacks jxl feature    |
+| Windows arm64 | vcpkg `libjxl:arm64-windows-static`           | Built with MSVC                   |
 | Linux (all)   | Built from source via `tools/build-ffmpeg`    | Uses zig cc for cross-compilation |
 
 ### C++ Runtime Linking (Linux)
