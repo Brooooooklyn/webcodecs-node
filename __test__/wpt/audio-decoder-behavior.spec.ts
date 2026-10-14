@@ -315,12 +315,14 @@ test('AudioDecoder: decodeQueueSize tracking', async (t) => {
   t.is(decoder.decodeQueueSize, 0)
 
   // Track dequeue events
-  // Note: With native addon multi-threaded implementation, callbacks may not see
-  // monotonically decreasing queue sizes due to concurrent decode/process operations.
-  // We verify: (1) dequeue events fire, (2) final queue state is correct.
+  // Dequeues before a queued dequeue event runs share that event (as in Chrome),
+  // so there can be fewer events than decodes. The last event must see the
+  // emptied queue: no dequeue goes unreported.
   let dequeueCount = 0
+  let lastDequeueSize = Infinity
   decoder.ondequeue = () => {
     dequeueCount++
+    lastDequeueSize = decoder.decodeQueueSize
   }
 
   for (const chunk of chunks) {
@@ -334,8 +336,10 @@ test('AudioDecoder: decodeQueueSize tracking', async (t) => {
 
   // After flush, queue should be empty
   t.is(decoder.decodeQueueSize, 0, 'queue empty after flush')
-  // Verify dequeue events were fired (at least chunks.length events)
-  t.true(dequeueCount >= chunks.length, `at least ${chunks.length} dequeue events fired, got ${dequeueCount}`)
+  // The event for the last dequeue can run after flush() resolves.
+  await waitFor(() => lastDequeueSize === 0, 'a dequeue event that sees the empty queue')
+  t.true(dequeueCount >= 1, 'dequeue events fired')
+  t.true(dequeueCount <= chunks.length, `at most one event per decode, got ${dequeueCount}`)
 
   // Reset also clears queue
   for (const chunk of chunks) {

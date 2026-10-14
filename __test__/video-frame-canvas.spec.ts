@@ -528,7 +528,8 @@ function runChild(script: string, env: NodeJS.ProcessEnv = childEnv()): string {
   })
 }
 
-test('VideoEncoder: opaque float error comes first, then one dequeue per queued encode, and the encoder is collected', (t) => {
+test('VideoEncoder: opaque float error comes first, then one dequeue for all queued encodes, and the encoder is collected', (t) => {
+  // Chrome resets the encoder on error: one dequeue event covers every dropped encode.
   const script = `
     const fs = require('node:fs');
     const { VideoEncoder, createVideoFrameFromRGBA16Float } = require('./index.js');
@@ -537,8 +538,12 @@ test('VideoEncoder: opaque float error comes first, then one dequeue per queued 
     let weak;
     let settle;
     const settled = new Promise((resolve) => { settle = resolve; });
-    const record = (entry) => { log.push(entry); if (log.length === 4) settle(); };
-    // Only reports a failure: a correct run settles as soon as the four callbacks ran.
+    // Settles once the error and a dequeue ran, after room for any extra event to arrive.
+    const record = (entry) => {
+      log.push(entry);
+      if (log.some((e) => e.startsWith('error')) && log.includes('dequeue')) setTimeout(settle, 100);
+    };
+    // Only reports a failure: a correct run settles as soon as both callbacks ran.
     const guard = setTimeout(settle, 10000);
     (() => {
       const encoder = new VideoEncoder({
@@ -571,7 +576,7 @@ test('VideoEncoder: opaque float error comes first, then one dequeue per queued 
     });
   `
   const result = JSON.parse(runChild(script))
-  t.deepEqual(result.log, ['error:OperationError:0', 'dequeue', 'dequeue', 'dequeue'])
+  t.deepEqual(result.log, ['error:OperationError:0', 'dequeue'])
   t.true(result.collected, 'the closed encoder must be collectable')
 })
 
