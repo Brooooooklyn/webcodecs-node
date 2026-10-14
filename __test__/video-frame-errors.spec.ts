@@ -471,6 +471,75 @@ test("colorSpace values Chrome's enum has but copyTo cannot target are NotSuppor
   )
 })
 
+test('copyTo rejects, never throws, when the global DOMException cannot build the error', async (t) => {
+  // Chrome 155 builds the DOMException from its own constructor, so it rejects with a real
+  // DOMException here. This package reads the global; it rejects with what it can build.
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'DOMException')!
+  const boom = new Error('boom')
+  const isPlainError = (error: unknown, name: string, message: string, label: string) => {
+    t.true(error instanceof Error, `${label}: ${String(error)} should be an Error`)
+    t.false(error instanceof DOMException, label)
+    t.is((error as Error)?.name, name, label)
+    t.is((error as Error)?.message, message, label)
+  }
+  const replacements: [
+    string,
+    PropertyDescriptor,
+    (error: unknown, name: string, message: string, label: string) => void,
+  ][] = [
+    ['undefined', { value: undefined, writable: true, configurable: true }, isPlainError],
+    [
+      'a throwing getter',
+      {
+        get() {
+          throw boom
+        },
+        configurable: true,
+      },
+      (error, _name, _message, label) => t.is(error, boom, label),
+    ],
+    [
+      'a non-constructor',
+      { value: () => {}, writable: true, configurable: true },
+      (error, _name, _message, label) => t.true(error instanceof TypeError, `${label}: ${String(error)}`),
+    ],
+    ['a plain object', { value: {}, writable: true, configurable: true }, isPlainError],
+  ]
+  const open = makeI420_4x2()
+  const closed = makeI420_4x2()
+  closed.close()
+  const calls: [string, VideoFrame, unknown, string, string][] = [
+    ['closed frame', closed, undefined, 'InvalidStateError', 'VideoFrame is closed'],
+    [
+      "colorSpace 'rec2020'",
+      open,
+      { colorSpace: 'rec2020' },
+      'NotSupportedError',
+      'This pixel conversion to this color space is not supported.',
+    ],
+  ]
+  for (const [what, replacement, check] of replacements) {
+    for (const [call, frame, options, name, message] of calls) {
+      const label = `DOMException is ${what}, ${call}`
+      let pending!: Promise<Settled>
+      Object.defineProperty(globalThis, 'DOMException', replacement)
+      try {
+        // copyTo runs synchronously, before settleCopyTo first awaits.
+        pending = settleCopyTo(frame, new Uint8Array(64), options)
+      } finally {
+        Object.defineProperty(globalThis, 'DOMException', descriptor)
+      }
+      const settled = await pending
+      t.false(settled.sync, `${label}: copyTo must not throw synchronously`)
+      t.false(settled.resolved, `${label}: copyTo must reject`)
+      check(settled.error, name, message, label)
+    }
+  }
+  t.is(globalThis.DOMException, descriptor.value)
+  await rejectsDOMException(t, 'InvalidStateError', 'restored', closed, new Uint8Array(64))
+  open.close()
+})
+
 // ============================================================================
 // Explicit non-RGB format (C3)
 // ============================================================================

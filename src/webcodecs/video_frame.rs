@@ -8,9 +8,9 @@ use crate::ffi::{
   AVColorPrimaries, AVColorRange, AVColorSpace, AVColorTransferCharacteristic, AVPixelFormat,
 };
 use crate::webcodecs::error::{
-  enforce_range_long_long, enforce_range_long_long_optional,
-  enforce_range_unsigned_long_long_optional, error_as_dom_exception, invalid_state_error,
-  not_supported_error, take_pending_exception, throw_as_native_error, throw_invalid_state_error,
+  dom_exception_for_rejection, enforce_range_long_long, enforce_range_long_long_optional,
+  enforce_range_unsigned_long_long_optional, invalid_state_error, not_supported_error,
+  take_pending_exception, throw_as_native_error, throw_invalid_state_error,
   throw_not_supported_error, type_error,
 };
 use crate::webcodecs::promise_reject::reject_with_type_error;
@@ -3112,7 +3112,8 @@ impl VideoFrame {
         }
         match error.reason.strip_prefix("TypeError:") {
           Some(message) => reject_with_type_error(env, message.trim_start()),
-          None => PromiseRaw::reject(env, error_as_dom_exception(env, error)?),
+          // Page code can break the global DOMException; that still rejects, never throws.
+          None => PromiseRaw::reject(env, dom_exception_for_rejection(env, error)?),
         }
       }
     }

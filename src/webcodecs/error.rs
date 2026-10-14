@@ -252,6 +252,74 @@ pub fn error_as_dom_exception(env: &Env, error: Error) -> Result<Unknown<'static
   dom_exception_constructor.new_instance((detail, name).into())
 }
 
+/// `error_as_dom_exception` for a promise rejection, where failing to build the value must not
+/// turn into a synchronous throw. Page code can replace the global `DOMException` (with undefined,
+/// a throwing getter, a non-constructor). Then this returns the exception left pending, or, when
+/// there is none, a plain Error with the same name and message.
+//
+// Chrome builds the DOMException from the engine's own constructor, so it always rejects with a
+// real DOMException. Doing that here means caching the constructor for every caller of
+// `error_as_dom_exception`.
+pub fn dom_exception_for_rejection(env: &Env, error: Error) -> Result<Unknown<'_>> {
+  let reason = error.reason.clone();
+  if let Ok(exception) = error_as_dom_exception(env, error) {
+    return Ok(exception);
+  }
+  if let Some(exception) = take_pending_exception(env)? {
+    return Ok(exception);
+  }
+  // The same name and message `error_as_dom_exception` takes from the reason.
+  let (name, message) = match reason.split_once(':') {
+    Some((prefix, rest)) if DOM_EXCEPTION_NAMES.contains(&prefix.trim()) => {
+      (prefix.trim(), rest.trim_start())
+    }
+    _ if DOM_EXCEPTION_NAMES.contains(&reason.trim()) => (reason.trim(), ""),
+    _ => ("EncodingError", reason.as_str()),
+  };
+  error_with_name(env, name, message)
+}
+
+/// A plain JS Error with an own `name`. Runs no page code: the Error comes from the engine and
+/// `name` is defined, not assigned.
+fn error_with_name<'env>(env: &'env Env, name: &str, message: &str) -> Result<Unknown<'env>> {
+  let string = |text: &str| -> Result<napi::sys::napi_value> {
+    let mut value = std::ptr::null_mut();
+    napi::check_status!(unsafe {
+      napi::sys::napi_create_string_utf8(
+        env.raw(),
+        text.as_ptr().cast(),
+        text.len() as isize,
+        &mut value,
+      )
+    })?;
+    Ok(value)
+  };
+  let mut error = std::ptr::null_mut();
+  napi::check_status!(unsafe {
+    napi::sys::napi_create_error(
+      env.raw(),
+      std::ptr::null_mut(),
+      string(message)?,
+      &mut error,
+    )
+  })?;
+  let name_property = napi::sys::napi_property_descriptor {
+    utf8name: c"name".as_ptr(),
+    name: std::ptr::null_mut(),
+    method: None,
+    getter: None,
+    setter: None,
+    value: string(name)?,
+    attributes: napi::sys::PropertyAttributes::writable
+      | napi::sys::PropertyAttributes::configurable,
+    data: std::ptr::null_mut(),
+  };
+  napi::check_status!(unsafe {
+    napi::sys::napi_define_properties(env.raw(), error, 1, &name_property)
+  })?;
+  Ok(unsafe { Unknown::from_raw_unchecked(env.raw(), error) })
+}
+
 /// Create a native JavaScript Event for EventTarget dispatch (dequeue, etc.).
 ///
 /// Listeners registered via addEventListener/ondequeue must receive an Event
