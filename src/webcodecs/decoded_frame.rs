@@ -36,7 +36,9 @@ pub(crate) enum DecodedSource {
   /// - `alpha`: the alpha it declares (WebP alpha flag, PNG color type or tRNS chunk).
   ///   Chrome labels the image BGRA or BGRX by it.
   /// - `yuv`: whether Chrome decodes the image to YUV planes (JPEG: the sampling
-  ///   factors; AVIF: one still image without alpha).
+  ///   factors; AVIF: one still image without alpha). An AVIF with YUV planes keeps
+  ///   them either way: WebCodecs has a format for them, its alpha plane is not
+  ///   decoded, and BGRX would lose precision. Only planar RGB (gbrp) follows Chrome.
   /// - `size`: desiredWidth/desiredHeight. A converted frame is resized in the same
   ///   swscale pass; a kept frame is resized in its own format.
   Image {
