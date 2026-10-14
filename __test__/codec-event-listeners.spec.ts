@@ -361,33 +361,40 @@ test('dequeue: items dequeued before the dequeue event runs share one event, for
   t.deepEqual(result, { VideoEncoder: [0], VideoDecoder: [0], AudioEncoder: [0], AudioDecoder: [0] })
 })
 
-// Child-side runner for error teardown: records the error and every dequeue event.
+// Child-side runner for error teardown: records the error (with the queue size and
+// state it sees) and every dequeue event.
+//
+// Not checked: whether the error comes before the dequeue events. Errors and
+// dequeue events reach JS through two thread-safe functions, so their order can
+// flip under load (origin/main does the same); Chrome reports the error first.
 const TEARDOWN = `
   const N = 6;
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   async function teardown(Codec, setup) {
-    const log = [];
+    const errors = [];
+    const dequeues = [];
     let codec;
+    const queueSize = () => codec.encodeQueueSize ?? codec.decodeQueueSize;
     codec = new Codec({
       output: (out) => out.close?.(),
-      error: (error) => log.push('error:' + error.name),
+      error: (error) => errors.push(error.name + ':' + queueSize() + ':' + codec.state),
     });
-    codec.addEventListener('dequeue', () => log.push('dequeue:' + (codec.encodeQueueSize ?? codec.decodeQueueSize)));
+    codec.addEventListener('dequeue', () => dequeues.push('dequeue:' + queueSize()));
     setup(codec);
-    const queued = codec.encodeQueueSize ?? codec.decodeQueueSize;
-    for (let i = 0; i < 200 && !log.some((entry) => entry.startsWith('dequeue')); i++) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    const queued = queueSize();
+    for (let i = 0; i < 200 && !(errors.length > 0 && dequeues.includes('dequeue:0')); i++) await sleep(10);
     // Room for any extra event to arrive.
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    return { queued, state: codec.state, dequeues: log.filter((entry) => entry.startsWith('dequeue')), errors: log.filter((entry) => entry.startsWith('error')) };
+    await sleep(100);
+    return { queued, state: codec.state, errors, dequeues };
   }
 `
 
+type Teardown = { queued: number; state: string; errors: string[]; dequeues: string[] }
+
 test('dequeue: an error that drops every queued item fires one dequeue event', (t) => {
   // Chrome 155 resets the codec on error: the queue empties at once and one
-  // dequeue event follows (checked with AudioDecoder empty chunks and a failed
-  // AudioEncoder configuration).
-  const result = runChild<Record<string, { queued: number; state: string; dequeues: string[]; errors: string[] }>>(`
+  // dequeue event reports it.
+  const result = runChild<Record<string, Teardown>>(`
     ${PRELUDE}
     const m = require('./index.js');
     ${TEARDOWN}
@@ -397,16 +404,13 @@ test('dequeue: an error that drops every queued item fires one dequeue event', (
         decoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 });
         for (let i = 0; i < N; i++) decoder.decode(new m.EncodedAudioChunk({ type: 'key', timestamp: i, data: new Uint8Array(0) }));
       });
-      out.VideoDecoder = await teardown(m.VideoDecoder, (decoder) => {
-        decoder.configure({ codec: 'vp8', codedWidth: 64, codedHeight: 64 });
-        for (let i = 0; i < N; i++) decoder.decode(new m.EncodedVideoChunk({ type: 'key', timestamp: i, data: new Uint8Array(0) }));
-      });
       out.AudioEncoder = await teardown(m.AudioEncoder, (encoder) => {
         encoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 });
-        // Opus cannot open at 44.1 kHz; the worker fails the new configuration.
         encoder.configure({ codec: 'opus', sampleRate: 44100, numberOfChannels: 2 });
+        // Chrome fails on 48 kHz data for the 44.1 kHz configuration; this repo
+        // cannot open Opus at 44.1 kHz. Both close with an EncodingError.
         for (let i = 0; i < N; i++) {
-          const data = new m.AudioData({ format: 'f32-planar', sampleRate: 44100, numberOfFrames: 882, numberOfChannels: 2, timestamp: i * 20000, data: new Float32Array(1764) });
+          const data = new m.AudioData({ format: 'f32-planar', sampleRate: 48000, numberOfFrames: 960, numberOfChannels: 2, timestamp: i * 20000, data: new Float32Array(1920) });
           encoder.encode(data);
           data.close();
         }
@@ -417,7 +421,47 @@ test('dequeue: an error that drops every queued item fires one dequeue event', (
   for (const [codec, entry] of Object.entries(result)) {
     t.is(entry.queued, 6, `${codec}: all items were queued`)
     t.is(entry.state, 'closed', `${codec}: the error closed the codec`)
-    t.is(entry.errors.length, 1, `${codec}: one error`)
+    t.deepEqual(
+      entry.errors.map((error) => error.split(':')[0]),
+      ['EncodingError'],
+      `${codec}: one error`,
+    )
     t.deepEqual(entry.dequeues, ['dequeue:0'], `${codec}: one dequeue event for all dropped items`)
   }
+  // The decode error empties the queue before the error callback runs, as in Chrome.
+  // (The AudioEncoder error comes from a failed reconfiguration; on that path the
+  // queue is emptied later, so its callback can still see the queued encodes.)
+  t.deepEqual(result.AudioDecoder.errors, ['EncodingError:0:closed'])
+})
+
+test('dequeue: an error after a decoded chunk leaves the VideoDecoder queue empty', (t) => {
+  // Chrome 155 decodes the key chunk, fails on the first empty delta chunk, and logs
+  // dequeue:6, the error with a queue of 0, then dequeue:0. Whether the first
+  // dequeue joins the teardown event here depends on timing, so the number of
+  // events is not checked. (Chrome rejects empty key chunks in decode() itself,
+  // so they cannot be the trigger.)
+  const result = runChild<Teardown>(`
+    ${PRELUDE}
+    const m = require('./index.js');
+    ${TEARDOWN}
+    (async () => {
+      const chunks = [];
+      const encoder = new m.VideoEncoder({ output: (chunk) => chunks.push(chunk), error: fail });
+      encoder.configure({ codec: 'vp8', width: 64, height: 64, bitrate: 200000 });
+      const frame = new m.VideoFrame(new Uint8Array(64 * 64 * 4), { format: 'RGBA', codedWidth: 64, codedHeight: 64, timestamp: 0 });
+      encoder.encode(frame, { keyFrame: true });
+      frame.close();
+      await encoder.flush();
+      encoder.close();
+      done(await teardown(m.VideoDecoder, (decoder) => {
+        decoder.configure({ codec: 'vp8', codedWidth: 64, codedHeight: 64 });
+        decoder.decode(chunks[0]);
+        for (let i = 1; i <= N; i++) decoder.decode(new m.EncodedVideoChunk({ type: 'delta', timestamp: i * 33333, data: new Uint8Array(0) }));
+      }));
+    })().catch(fail);
+  `)
+  t.is(result.queued, 7, 'all chunks were queued')
+  t.is(result.state, 'closed', 'the error closed the decoder')
+  t.deepEqual(result.errors, ['EncodingError:0:closed'], 'one error, seeing an empty queue')
+  t.is(result.dequeues.at(-1), 'dequeue:0', 'the last dequeue event sees an empty queue')
 })
