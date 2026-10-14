@@ -20,6 +20,7 @@ use napi_derive::napi;
 use std::any::Any;
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ============================================================================
@@ -115,6 +116,36 @@ impl DemuxerState {
       DemuxerState::Closed => "closed",
     }
   }
+}
+
+/// Whether a demuxer still takes a source, readable without its mutex.
+///
+/// The JS thread claims it when it accepts a `load()` or `loadBuffer()` call,
+/// so a call that cannot succeed (another load still running, a source already
+/// loaded, or the demuxer closed) is rejected at once, without waiting for the
+/// mutex and without copying its input. A load that fails while the demuxer is
+/// still unloaded gives the claim back; `close()` keeps it claimed.
+#[derive(Clone, Default)]
+pub struct LoadClaim(Arc<AtomicBool>);
+
+impl LoadClaim {
+  fn try_claim(&self) -> bool {
+    self
+      .0
+      .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+      .is_ok()
+  }
+
+  fn set(&self, claimed: bool) {
+    self.0.store(claimed, Ordering::Release);
+  }
+}
+
+fn already_loaded_error() -> Error {
+  Error::new(
+    Status::GenericFailure,
+    "Demuxer already loaded. Call close() first.",
+  )
 }
 
 // ============================================================================
@@ -262,6 +293,8 @@ pub struct DemuxerInner<F: DemuxerFormat> {
   /// explicit session guard, two callers can therefore enqueue adjacent
   /// packets in the opposite order.
   callback_demux_active: bool,
+  /// Set while a load runs, after a source is loaded, and after close().
+  load_claim: LoadClaim,
   /// Phantom data for format type
   _format: PhantomData<F>,
 }
@@ -283,6 +316,7 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
       audio_callback,
       error_callback: Some(error_callback),
       callback_demux_active: false,
+      load_claim: LoadClaim::default(),
       _format: PhantomData,
     }
   }
@@ -319,13 +353,15 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
     }
   }
 
+  /// The claim that `load()` and `loadBuffer()` take on the JS thread.
+  pub fn load_claim(&self) -> LoadClaim {
+    self.load_claim.clone()
+  }
+
   /// Fails unless no source was loaded yet (and the demuxer is not closed).
   fn check_unloaded(&self) -> Result<()> {
     if self.state != DemuxerState::Unloaded {
-      return Err(Error::new(
-        Status::GenericFailure,
-        "Demuxer already loaded. Call close() first.",
-      ));
+      return Err(already_loaded_error());
     }
     Ok(())
   }
@@ -659,6 +695,8 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
     self.selected_audio_track = None;
     self.callback_demux_active = false;
     self.state = DemuxerState::Closed;
+    // A closed demuxer never takes a source again.
+    self.load_claim.set(true);
   }
 
   /// Get current state as string
@@ -671,39 +709,63 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
 // Helper Functions
 // ============================================================================
 
+/// `load(path)` for every demuxer.
+pub fn load_file_from_js<'env, F: DemuxerFormat>(
+  env: &'env Env,
+  inner: &Arc<Mutex<DemuxerInner<F>>>,
+  claim: &LoadClaim,
+  path: String,
+) -> Result<PromiseRaw<'env, ()>> {
+  if !claim.try_claim() {
+    return env.spawn_future(async move { Err::<(), _>(already_loaded_error()) });
+  }
+  spawn_load(env, inner, claim, move |demuxer| demuxer.load_file(&path))
+}
+
 /// `loadBuffer(data)` for every demuxer.
 ///
 /// `data` must be a `Uint8Array`. Its bytes are copied on the JS thread,
 /// because JS can detach or resize the buffer while the demuxer still reads
-/// it. A call that will be rejected (a source is already loaded, or the
-/// demuxer is closed) is rejected before that copy, so it does not first copy
-/// the whole input.
+/// it. A call that will be rejected (another load still running, a source
+/// already loaded, or the demuxer closed) is rejected before that copy, so it
+/// does not first copy the whole input.
 pub fn load_buffer_from_js<'env, F: DemuxerFormat>(
   env: &'env Env,
   inner: &Arc<Mutex<DemuxerInner<F>>>,
+  claim: &LoadClaim,
   data: Unknown,
 ) -> Result<PromiseRaw<'env, ()>> {
   // Throws for a value that is not a Uint8Array, as before.
   // SAFETY: `data` is an argument of the current native call.
   let source = unsafe { buffer_source::inspect_uint8_array(env.raw(), data.raw())? };
-  // try_lock: a load or demux running on another thread may hold the lock.
-  // Then skip this early check; the blocking task below checks again anyway.
-  let rejection = match inner.try_lock() {
-    Ok(guard) => guard.check_unloaded().err(),
-    Err(_) => None,
-  };
-  if let Some(error) = rejection {
-    return env.spawn_future(async move { Err::<(), _>(error) });
+  if !claim.try_claim() {
+    return env.spawn_future(async move { Err::<(), _>(already_loaded_error()) });
   }
   // No JS ran since `source` was located.
   let bytes = source.to_vec();
+  spawn_load(env, inner, claim, move |demuxer| demuxer.load_buffer(bytes))
+}
+
+/// Run a claimed load on a blocking thread. When it fails and the demuxer is
+/// still unloaded, give the claim back, so a later load may try again.
+fn spawn_load<'env, F: DemuxerFormat>(
+  env: &'env Env,
+  inner: &Arc<Mutex<DemuxerInner<F>>>,
+  claim: &LoadClaim,
+  load: impl FnOnce(&mut DemuxerInner<F>) -> Result<()> + Send + 'static,
+) -> Result<PromiseRaw<'env, ()>> {
   let inner = inner.clone();
+  let claim = claim.clone();
   env.spawn_future(async move {
     tokio::task::spawn_blocking(move || {
       let mut guard = inner
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-      guard.load_buffer(bytes)
+      let result = load(&mut guard);
+      if guard.state == DemuxerState::Unloaded {
+        claim.set(false);
+      }
+      result
     })
     .await
     .map_err(|e| Error::new(Status::GenericFailure, format!("Task error: {}", e)))?

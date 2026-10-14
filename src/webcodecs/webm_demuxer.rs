@@ -6,9 +6,9 @@
 use crate::ffi::AVCodecID;
 use crate::webcodecs::demuxer_base::{
   AudioOutputCallback, DemuxerAudioDecoderConfig, DemuxerChunk, DemuxerFormat, DemuxerInner,
-  DemuxerTrackInfo, DemuxerVideoDecoderConfig, ErrorCallback, VideoOutputCallback,
-  demux_with_callbacks, load_buffer_from_js, parse_vp9_codec_string, with_demuxer_inner,
-  with_demuxer_inner_mut,
+  DemuxerTrackInfo, DemuxerVideoDecoderConfig, ErrorCallback, LoadClaim, VideoOutputCallback,
+  demux_with_callbacks, load_buffer_from_js, load_file_from_js, parse_vp9_codec_string,
+  with_demuxer_inner, with_demuxer_inner_mut,
 };
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunk;
 use crate::webcodecs::encoded_video_chunk::EncodedVideoChunk;
@@ -128,6 +128,7 @@ impl FromNapiValue for WebMDemuxerInit {
 #[napi(async_iterator)]
 pub struct WebMDemuxer {
   inner: Arc<Mutex<DemuxerInner<WebMFormat>>>,
+  load_claim: LoadClaim,
 }
 
 impl AsyncGenerator for WebMDemuxer {
@@ -158,27 +159,16 @@ impl AsyncGenerator for WebMDemuxer {
 impl WebMDemuxer {
   #[napi(constructor)]
   pub fn new(init: WebMDemuxerInit) -> Result<Self> {
+    let inner = DemuxerInner::new(init.video_output, init.audio_output, init.error);
     Ok(Self {
-      inner: Arc::new(Mutex::new(DemuxerInner::new(
-        init.video_output,
-        init.audio_output,
-        init.error,
-      ))),
+      load_claim: inner.load_claim(),
+      inner: Arc::new(Mutex::new(inner)),
     })
   }
 
-  #[napi]
-  pub async fn load(&self, path: String) -> Result<()> {
-    let inner = self.inner.clone();
-
-    tokio::task::spawn_blocking(move || {
-      let mut guard = inner
-        .lock()
-        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-      guard.load_file(&path)
-    })
-    .await
-    .map_err(|e| Error::new(Status::GenericFailure, format!("Task error: {}", e)))?
+  #[napi(ts_return_type = "Promise<void>")]
+  pub fn load<'env>(&self, env: &'env Env, path: String) -> Result<PromiseRaw<'env, ()>> {
+    load_file_from_js(env, &self.inner, &self.load_claim, path)
   }
 
   /// Load a WebM from a buffer
@@ -187,7 +177,7 @@ impl WebMDemuxer {
   /// detach or resize the buffer afterwards.
   #[napi(ts_args_type = "data: Uint8Array", ts_return_type = "Promise<void>")]
   pub fn load_buffer<'env>(&self, env: &'env Env, data: Unknown) -> Result<PromiseRaw<'env, ()>> {
-    load_buffer_from_js(env, &self.inner, data)
+    load_buffer_from_js(env, &self.inner, &self.load_claim, data)
   }
 
   #[napi(getter)]
