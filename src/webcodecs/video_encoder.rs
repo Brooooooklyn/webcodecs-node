@@ -22,6 +22,7 @@ use crate::webcodecs::flush_tracker::FlushTracker;
 use crate::webcodecs::hw_fallback::{
   is_hw_encoding_disabled, record_hw_encoding_failure, record_hw_encoding_success,
 };
+use crate::webcodecs::output_delivery::OutputDelivery;
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
 use crate::webcodecs::{
   AlphaOption, AvcBitstreamFormat, EncodedVideoChunk, HardwareAcceleration, HevcBitstreamFormat,
@@ -354,6 +355,8 @@ struct VideoEncoderInner {
   had_error: bool,
   /// Pending flush operations, tracked independently for overlapping calls.
   flushes: FlushTracker,
+  /// Outputs sent through the threadsafe output callback, awaited by flush().
+  output_delivery: Arc<OutputDelivery>,
   /// Maps frame PTS (encoder time_base units) to input timestamps (µs) and
   /// durations (µs). B-frame encoders emit packets in decode order, so a FIFO
   /// misattributes timestamps; keying by packet PTS keeps each label on its
@@ -591,6 +594,7 @@ impl VideoEncoder {
       error_callback: init.error,
       had_error: false,
       flushes: FlushTracker::default(),
+      output_delivery: Arc::new(OutputDelivery::default()),
       timestamp_map: BTreeMap::new(),
       // Hardware acceleration tracking
       is_hardware: false,
@@ -1528,9 +1532,11 @@ impl VideoEncoder {
       if guard.flushes.should_buffer_outputs() {
         guard.pending_chunks.push((chunk, metadata));
       } else {
-        guard.output_callback.call(
+        let on_delivered = guard.output_delivery.track();
+        guard.output_callback.call_with_return_value(
           (chunk, metadata).into(),
           ThreadsafeFunctionCallMode::NonBlocking,
+          on_delivered,
         );
       }
     }
@@ -3372,14 +3378,23 @@ impl VideoEncoder {
     // Clone references for the callback closure
     let inner_clone = self.inner.clone();
     let output_callback_ref = self.output_callback_ref.clone();
+    let output_delivery = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?
+      .output_delivery
+      .clone();
+    let wait_abort_flag = flush_abort_flag.clone();
 
     env.spawn_future_with_callback(
       async move {
         // Wait for worker response in a blocking thread
         let result = spawn_blocking(move || {
-          response_receiver
+          let result = response_receiver
             .recv()
-            .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?
+            .map_err(|_| Error::new(Status::GenericFailure, "Worker thread terminated"))?;
+          output_delivery.wait_until_delivered(&wait_abort_flag);
+          result
         })
         .await
         .map_err(|join_error| {
