@@ -737,8 +737,15 @@ impl VideoEncoder {
       Err(error) => {
         let old_size = guard.encode_queue_size;
         guard.encode_queue_size = 0;
-        if old_size > 0 {
-          let _ = Self::fire_dequeue_event(event_state);
+        // Release the codec and its hardware slot now; close() and reset() reject
+        // once the encoder is closed, so nothing else would free them before GC.
+        guard.context = None;
+        guard.scaler = None;
+        guard.hw_frame_ctx = None;
+        guard.hw_device_ctx = None;
+        if guard.acquired_hw_slot {
+          codec_pressure::gauge().release_hw_encoder();
+          guard.acquired_hw_slot = false;
         }
         let message = if error.reason.starts_with("NotSupportedError:") {
           "OperationError: encoder cannot read the opaque float image".to_owned()
@@ -746,6 +753,14 @@ impl VideoEncoder {
           format!("Failed to access frame: {}", error)
         };
         Self::report_error(&mut guard, &message);
+        // Closing drops every queued encode. Fire one dequeue per dropped item, after
+        // the error is queued, so the codec's outstanding count returns to zero and
+        // it can be collected. Chrome coalesces these into a single dequeue event;
+        // matching that needs a counted dispatch in the shared event_target.rs, so
+        // it is left for a separate change.
+        for _ in 0..old_size {
+          let _ = Self::fire_dequeue_event(event_state);
+        }
         return;
       }
     };
@@ -1570,13 +1585,13 @@ impl VideoEncoder {
       ));
     }
 
-    if guard.state == CodecState::Closed {
-      if let Some(name) = guard.failure_name {
-        return Err(Error::new(
-          Status::GenericFailure,
-          format!("{}: Encode error occurred", name.as_str()),
-        ));
-      }
+    if guard.state == CodecState::Closed
+      && let Some(name) = guard.failure_name
+    {
+      return Err(Error::new(
+        Status::GenericFailure,
+        format!("{}: Encode error occurred", name.as_str()),
+      ));
     }
 
     // Per W3C spec: state check happens on main thread (in flush() method).
