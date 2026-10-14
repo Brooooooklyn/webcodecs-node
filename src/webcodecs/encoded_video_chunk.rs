@@ -1815,6 +1815,7 @@ impl FromNapiValue for VideoEncoderConfig {
 /// Note: codec is Option to support the W3C spec requirement that isConfigSupported()
 /// rejects with TypeError (returns rejected Promise) for missing fields, rather than
 /// throwing synchronously.
+#[derive(Default)]
 pub struct VideoDecoderConfig {
   /// Codec string (e.g., "avc1.42001E", "vp8", "vp09.00.10.08")
   /// W3C spec: required, but stored as Option for proper error handling
@@ -1827,8 +1828,9 @@ pub struct VideoDecoderConfig {
   pub display_aspect_width: Option<u32>,
   /// Display aspect height ([EnforceRange] unsigned long)
   pub display_aspect_height: Option<u32>,
-  /// TypeError message from converting a member, e.g. a displayAspectWidth out of range.
-  /// configure() throws it and isConfigSupported() rejects with it, like Chrome.
+  /// TypeError message from converting a member, e.g. a displayAspectWidth out of range. The
+  /// read stopped there, so the other members are not set. configure() throws it and
+  /// isConfigSupported() rejects with it, like Chrome.
   pub conversion_error: Option<String>,
   /// Color space parameters (uses init object for compatibility)
   pub color_space: Option<crate::webcodecs::video_frame::VideoColorSpaceInit>,
@@ -1859,24 +1861,30 @@ impl FromNapiValue for VideoDecoderConfig {
     let coded_width: Option<u32> = obj.get("codedWidth")?;
     let coded_height: Option<u32> = obj.get("codedHeight")?;
     // [EnforceRange] unsigned long, like Chrome. A plain u32 read would wrap -1 to 2^32 - 1.
-    // The TypeError is kept for configure()/isConfigSupported(): the latter must reject, not
-    // throw. Chrome reads members in IDL (name) order, so height is checked first.
-    let mut conversion_error = None;
-    let mut enforce_range = |name: &str| -> Result<Option<u32>> {
+    // Chrome reads members in IDL (name) order, so height is checked first. Like WebIDL, the
+    // read stops at the first failure: no later member is read, so no later getter can replace
+    // the TypeError. configure() throws it and isConfigSupported() rejects with it.
+    let enforce_range = |name: &str| -> Result<std::result::Result<Option<u32>, String>> {
       let value: Option<f64> = obj.get(name)?;
-      let Some(value) = value else {
-        return Ok(None);
-      };
-      match enforce_range_unsigned_long_value(value, name) {
-        Ok(value) => Ok(Some(value)),
-        Err(message) => {
-          conversion_error.get_or_insert(message);
-          Ok(None)
-        }
+      Ok(
+        value
+          .map(|value| enforce_range_unsigned_long_value(value, name))
+          .transpose(),
+      )
+    };
+    let display_aspect = match enforce_range("displayAspectHeight")? {
+      Ok(height) => enforce_range("displayAspectWidth")?.map(|width| (width, height)),
+      Err(message) => Err(message),
+    };
+    let (display_aspect_width, display_aspect_height) = match display_aspect {
+      Ok(aspect) => aspect,
+      Err(message) => {
+        return Ok(VideoDecoderConfig {
+          conversion_error: Some(message),
+          ..Default::default()
+        });
       }
     };
-    let display_aspect_height = enforce_range("displayAspectHeight")?;
-    let display_aspect_width = enforce_range("displayAspectWidth")?;
     let color_space: Option<crate::webcodecs::video_frame::VideoColorSpaceInit> =
       obj.get("colorSpace")?;
     let hardware_acceleration: Option<HardwareAcceleration> = obj.get("hardwareAcceleration")?;
@@ -1907,7 +1915,7 @@ impl FromNapiValue for VideoDecoderConfig {
       coded_height,
       display_aspect_width,
       display_aspect_height,
-      conversion_error,
+      conversion_error: None,
       color_space,
       hardware_acceleration,
       optimize_for_latency,
