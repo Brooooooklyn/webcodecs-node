@@ -8,7 +8,7 @@ use crate::ffi::{AV_NOPTS_VALUE, AVCodecID, AVHWDeviceType, accessors::ffctx_set
 use crate::webcodecs::encoded_video_chunk::InternalSlice;
 use crate::webcodecs::error::{
   DOMExceptionName, error_as_dom_exception, native_dom_exception_error, throw_data_error,
-  throw_invalid_state_error, throw_type_error_unit, to_unsigned_long,
+  throw_invalid_state_error, throw_type_error_unit,
 };
 use crate::webcodecs::event_target::CodecEventState;
 use crate::webcodecs::flush_tracker::FlushTracker;
@@ -246,13 +246,10 @@ struct VideoDecoderInner {
   config_display_aspect: Option<(u32, u32)>,
 }
 
-/// The config's rotation, converted like Chrome 155: its VideoDecoderConfig takes rotation as
-/// `unsigned long` (ToUint32), not the spec's `double`. So -90 is 4294967206, which the output
-/// frame rounds to 180, and NaN is 0.
+/// The config's rotation, already converted like Chrome 155 (unsigned long) when the config was
+/// read, so configure() and isConfigSupported() see the same value.
 fn config_rotation(config: &VideoDecoderConfig) -> f64 {
-  config
-    .rotation
-    .map_or(0.0, |rotation| f64::from(to_unsigned_long(rotation)))
+  config.rotation.map_or(0.0, f64::from)
 }
 
 /// displayAspectWidth and displayAspectHeight must be given together (WebCodecs "valid

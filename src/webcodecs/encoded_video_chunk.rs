@@ -7,7 +7,7 @@ use crate::codec::Packet;
 use crate::ffi::{AVRational, avutil::av_rescale_q};
 use crate::webcodecs::error::{
   enforce_range_long_long, enforce_range_unsigned_long_long_optional,
-  enforce_range_unsigned_long_value,
+  enforce_range_unsigned_long_value, to_unsigned_long,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -1838,8 +1838,10 @@ pub struct VideoDecoderConfig {
   pub optimize_for_latency: Option<bool>,
   /// Codec-specific description data (e.g., avcC for H.264) - BufferSource per spec
   pub description: Option<Uint8Array>,
-  /// Rotation in degrees clockwise (0, 90, 180, 270) per W3C spec
-  pub rotation: Option<f64>,
+  /// Rotation in degrees clockwise, converted like Chrome 155: its VideoDecoderConfig takes
+  /// rotation as `unsigned long` (ToUint32), not the spec's `double`. So -90 is 4294967206,
+  /// which the output frame rounds to 180, and NaN is 0.
+  pub rotation: Option<u32>,
   /// Horizontal flip per W3C spec
   pub flip: Option<bool>,
 }
@@ -1896,6 +1898,7 @@ impl FromNapiValue for VideoDecoderConfig {
 
     // Rotation and flip for VideoFrame orientation (W3C WebCodecs spec)
     let rotation: Option<f64> = obj.get("rotation")?;
+    let rotation = rotation.map(to_unsigned_long);
     let flip: Option<bool> = obj.get("flip")?;
 
     Ok(VideoDecoderConfig {
