@@ -1447,8 +1447,130 @@ fn copy_rect_to_rgb_in_bands(
   })
 }
 
-/// `Boolean(view.buffer[key])`. This reads through JS, so getters may run.
-fn view_buffer_flag(env: &Env, view: napi::sys::napi_value, key: &std::ffi::CStr) -> Result<bool> {
+/// The engine's own `ArrayBuffer.prototype.resizable` / `.detached` and
+/// `SharedArrayBuffer.prototype.growable` getters, captured when the module loads into an env.
+/// Calling them reads the buffer's internal state and runs no page code, like Chrome: a later
+/// patch to those prototypes, or an own property on a buffer, does not change the result.
+/// A getter that was missing at load time is null and reads as `false`.
+#[derive(Clone, Copy)]
+struct BufferFlagGetters {
+  env: napi::sys::napi_env,
+  resizable: napi::sys::napi_ref,
+  detached: napi::sys::napi_ref,
+  growable: napi::sys::napi_ref,
+}
+
+thread_local! {
+  // Each env runs on its own thread. Its cleanup hook empties the slot.
+  static BUFFER_FLAG_GETTERS: std::cell::Cell<Option<BufferFlagGetters>> =
+    const { std::cell::Cell::new(None) };
+}
+
+/// Runs each time the module loads into an env (the main thread or a worker), before page code
+/// can use the module. napi-rs keeps one `module_exports` hook per crate: add new load-time work
+/// here.
+#[napi(module_exports)]
+// Only napi's load-time registration calls this, and `cargo test` builds leave it out.
+#[cfg_attr(test, allow(dead_code))]
+pub fn on_module_load(_exports: Object, env: Env) -> Result<()> {
+  capture_buffer_flag_getters(&env)
+}
+
+/// Captures the buffer flag getters of `env`, once per env.
+fn capture_buffer_flag_getters(env: &Env) -> Result<()> {
+  if BUFFER_FLAG_GETTERS
+    .get()
+    .is_some_and(|getters| getters.env == env.raw())
+  {
+    return Ok(());
+  }
+  let getters = BufferFlagGetters {
+    env: env.raw(),
+    resizable: prototype_getter_ref(env, c"ArrayBuffer", c"resizable")?,
+    detached: prototype_getter_ref(env, c"ArrayBuffer", c"detached")?,
+    growable: prototype_getter_ref(env, c"SharedArrayBuffer", c"growable")?,
+  };
+  unsafe extern "C" fn forget(env: *mut std::ffi::c_void) {
+    let _ = BUFFER_FLAG_GETTERS.try_with(|slot| {
+      if slot.get().is_some_and(|getters| getters.env.cast() == env) {
+        slot.set(None);
+      }
+    });
+  }
+  // Node deletes the references of an env when it tears the env down.
+  napi::check_status!(unsafe {
+    napi::sys::napi_add_env_cleanup_hook(env.raw(), Some(forget), env.raw().cast())
+  })?;
+  BUFFER_FLAG_GETTERS.set(Some(getters));
+  Ok(())
+}
+
+/// A reference to `Object.getOwnPropertyDescriptor(globalThis[class].prototype, key).get`, or null
+/// if there is none.
+fn prototype_getter_ref(
+  env: &Env,
+  class: &std::ffi::CStr,
+  key: &std::ffi::CStr,
+) -> Result<napi::sys::napi_ref> {
+  use napi::sys;
+  let env = env.raw();
+  let named = |object: sys::napi_value, name: &std::ffi::CStr| -> Result<sys::napi_value> {
+    let mut value = std::ptr::null_mut();
+    napi::check_status!(unsafe {
+      sys::napi_get_named_property(env, object, name.as_ptr(), &mut value)
+    })?;
+    Ok(value)
+  };
+  let is_type = |value: sys::napi_value, expected: sys::napi_valuetype| -> Result<bool> {
+    let mut actual = 0;
+    napi::check_status!(unsafe { sys::napi_typeof(env, value, &mut actual) })?;
+    Ok(actual == expected)
+  };
+
+  let mut global = std::ptr::null_mut();
+  napi::check_status!(unsafe { sys::napi_get_global(env, &mut global) })?;
+  let constructor = named(global, class)?;
+  if !is_type(constructor, sys::ValueType::napi_function)? {
+    return Ok(std::ptr::null_mut());
+  }
+  let prototype = named(constructor, c"prototype")?;
+  let object = named(global, c"Object")?;
+  let get_own_property_descriptor = named(object, c"getOwnPropertyDescriptor")?;
+  let mut key_value = std::ptr::null_mut();
+  napi::check_status!(unsafe {
+    sys::napi_create_string_utf8(
+      env,
+      key.as_ptr(),
+      key.count_bytes() as isize,
+      &mut key_value,
+    )
+  })?;
+  let mut descriptor = std::ptr::null_mut();
+  napi::check_status!(unsafe {
+    sys::napi_call_function(
+      env,
+      object,
+      get_own_property_descriptor,
+      2,
+      [prototype, key_value].as_ptr(),
+      &mut descriptor,
+    )
+  })?;
+  if !is_type(descriptor, sys::ValueType::napi_object)? {
+    return Ok(std::ptr::null_mut());
+  }
+  let getter = named(descriptor, c"get")?;
+  if !is_type(getter, sys::ValueType::napi_function)? {
+    return Ok(std::ptr::null_mut());
+  }
+  let mut reference = std::ptr::null_mut();
+  napi::check_status!(unsafe { sys::napi_create_reference(env, getter, 1, &mut reference) })?;
+  Ok(reference)
+}
+
+/// The buffer `view` is on, read from the engine (not through `view.buffer`), and whether it is
+/// a SharedArrayBuffer.
+fn view_buffer(env: &Env, view: napi::sys::napi_value) -> Result<(napi::sys::napi_value, bool)> {
   let mut buffer = std::ptr::null_mut();
   napi::check_status!(
     unsafe {
@@ -1464,15 +1586,65 @@ fn view_buffer_flag(env: &Env, view: napi::sys::napi_value, key: &std::ffi::CStr
     },
     "Get TypedArray info failed"
   )?;
+  // False for a SharedArrayBuffer.
+  let mut is_array_buffer = false;
+  napi::check_status!(unsafe {
+    napi::sys::napi_is_arraybuffer(env.raw(), buffer, &mut is_array_buffer)
+  })?;
+  Ok((buffer, !is_array_buffer))
+}
+
+/// Calls the captured getter that `pick` selects on `buffer`.
+fn buffer_flag(
+  env: &Env,
+  buffer: napi::sys::napi_value,
+  pick: fn(&BufferFlagGetters) -> napi::sys::napi_ref,
+) -> Result<bool> {
+  let getters = match BUFFER_FLAG_GETTERS.get() {
+    Some(getters) if getters.env == env.raw() => getters,
+    // The load hook runs for every env, so this is only a fallback.
+    _ => {
+      capture_buffer_flag_getters(env)?;
+      BUFFER_FLAG_GETTERS
+        .get()
+        .ok_or_else(|| Error::new(Status::GenericFailure, "buffer flag getters missing"))?
+    }
+  };
+  let reference = pick(&getters);
+  if reference.is_null() {
+    return Ok(false);
+  }
+  let mut getter = std::ptr::null_mut();
+  napi::check_status!(unsafe {
+    napi::sys::napi_get_reference_value(env.raw(), reference, &mut getter)
+  })?;
   let mut value = std::ptr::null_mut();
   napi::check_status!(unsafe {
-    napi::sys::napi_get_named_property(env.raw(), buffer, key.as_ptr(), &mut value)
+    napi::sys::napi_call_function(env.raw(), buffer, getter, 0, std::ptr::null(), &mut value)
   })?;
-  let mut flag = std::ptr::null_mut();
-  napi::check_status!(unsafe { napi::sys::napi_coerce_to_bool(env.raw(), value, &mut flag) })?;
-  let mut result = false;
-  napi::check_status!(unsafe { napi::sys::napi_get_value_bool(env.raw(), flag, &mut result) })?;
-  Ok(result)
+  let mut flag = false;
+  napi::check_status!(unsafe { napi::sys::napi_get_value_bool(env.raw(), value, &mut flag) })?;
+  Ok(flag)
+}
+
+/// Whether `view` is on a resizable ArrayBuffer or a growable SharedArrayBuffer. Runs no page code.
+fn is_resizable_view(env: &Env, view: napi::sys::napi_value) -> Result<bool> {
+  let (buffer, shared) = view_buffer(env, view)?;
+  if shared {
+    buffer_flag(env, buffer, |getters| getters.growable)
+  } else {
+    buffer_flag(env, buffer, |getters| getters.resizable)
+  }
+}
+
+/// Whether the ArrayBuffer under `view` is detached. Runs no page code.
+fn is_detached_view(env: &Env, view: napi::sys::napi_value) -> Result<bool> {
+  let (buffer, shared) = view_buffer(env, view)?;
+  // A SharedArrayBuffer cannot be detached.
+  if shared {
+    return Ok(false);
+  }
+  buffer_flag(env, buffer, |getters| getters.detached)
 }
 
 /// Per W3C spec: Parse Visible Rect algorithm
@@ -2706,9 +2878,7 @@ impl VideoFrame {
     let destination = unsafe { ToNapiValue::to_napi_value(env.raw(), destination)? };
     // Chrome rejects a resizable or growable buffer while it converts the destination, before
     // it reads the options.
-    if view_buffer_flag(env, destination, c"resizable")?
-      || view_buffer_flag(env, destination, c"growable")?
-    {
+    if is_resizable_view(env, destination)? {
       return reject_with_type_error(
         env,
         "The provided ArrayBufferView value must not be resizable.",
@@ -2849,8 +3019,7 @@ impl VideoFrame {
     let destination_bytes = unsafe { typed_array_bytes(env.raw(), destination)? };
     let available = destination_bytes.len();
     if available < size {
-      // Nothing is written on this path, so JS may run again.
-      if view_buffer_flag(env, destination, c"detached")? {
+      if is_detached_view(env, destination)? {
         return Err(type_error("destination is detached"));
       }
       return Err(Error::new(

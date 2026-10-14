@@ -186,6 +186,98 @@ test('copyTo: resizable and growable destinations reject with TypeError before t
   }
 })
 
+test('copyTo: the resizable, growable and detached checks run no page code, like Chrome', (t) => {
+  // Chrome reads these flags inside the engine. Patched prototype getters and own properties on a
+  // buffer must not run or change the outcome. They are patched after the module has loaded.
+  const out = runChild(`
+  const { Worker } = require('node:worker_threads');
+  const SIZE = 64 * 32 * 4;
+  const frame = () => new VideoFrame(new Uint8Array(SIZE), { format: 'RGBA', codedWidth: 64, codedHeight: 32, timestamp: 0 });
+  const detached = () => { const d = new Uint8Array(SIZE); d.buffer.transfer(); return d; };
+  const rab = () => new ArrayBuffer(SIZE, { maxByteLength: SIZE });
+  const growable = () => new SharedArrayBuffer(SIZE, { maxByteLength: SIZE * 2 });
+  let runs = 0;
+  async function patched(proto, key, get, dest) {
+    const original = Object.getOwnPropertyDescriptor(proto, key);
+    Object.defineProperty(proto, key, { configurable: true, get() { runs++; return get.call(this); } });
+    try {
+      let result;
+      try {
+        result = frame().copyTo(dest());
+      } catch (e) {
+        return 'threw ' + e.constructor.name + ': ' + e.message;
+      }
+      return await settle(result);
+    } finally {
+      if (original) Object.defineProperty(proto, key, original);
+      else delete proto[key];
+    }
+  }
+  const own = (buffer, key, value) => Object.defineProperty(buffer, key, { get: () => value });
+  const throws = () => { throw new RangeError('patched'); };
+  const AB = ArrayBuffer.prototype, SAB = SharedArrayBuffer.prototype;
+  const kept = new Uint8Array(SIZE);
+  out['AB.resizable throws'] = await patched(AB, 'resizable', throws, () => new Uint8Array(SIZE));
+  out['AB.resizable says true'] = await patched(AB, 'resizable', () => true, () => new Uint8Array(SIZE));
+  out['AB.resizable says false, resizable dest'] = await patched(AB, 'resizable', () => false, () => new Uint8Array(rab()));
+  out['AB.resizable detaches dest'] = await patched(AB, 'resizable', function () { this.transfer(); return false; }, () => kept);
+  out['dest length after'] = kept.length;
+  out['AB.growable throws'] = await patched(AB, 'growable', throws, () => new Uint8Array(SIZE));
+  out['SAB.growable throws'] = await patched(SAB, 'growable', throws, () => new Uint8Array(new SharedArrayBuffer(SIZE)));
+  out['SAB.growable says false, growable dest'] = await patched(SAB, 'growable', () => false, () => new Uint8Array(growable()));
+  out['AB.detached throws, detached dest'] = await patched(AB, 'detached', throws, detached);
+  out['AB.detached says false, detached dest'] = await patched(AB, 'detached', () => false, detached);
+  out['AB.detached says true, small dest'] = await patched(AB, 'detached', () => true, () => new Uint8Array(16));
+  out['getter runs'] = runs;
+  out['own resizable=false, resizable dest'] = await settle(frame().copyTo(new Uint8Array(own(rab(), 'resizable', false))));
+  out['own resizable=true'] = await settle(frame().copyTo(new Uint8Array(own(new ArrayBuffer(SIZE), 'resizable', true))));
+  out['own growable=false, growable dest'] = await settle(frame().copyTo(new Uint8Array(own(growable(), 'growable', false))));
+  out['own growable=true'] = await settle(frame().copyTo(new Uint8Array(own(new SharedArrayBuffer(SIZE), 'growable', true))));
+  const spoofed = detached();
+  own(spoofed.buffer, 'detached', false);
+  out['own detached=false, detached dest'] = await settle(frame().copyTo(spoofed));
+  out['own detached=true, small dest'] = await settle(frame().copyTo(new Uint8Array(own(new ArrayBuffer(16), 'detached', true))));
+  // A worker is a separate env: it captures the getters when it loads the module.
+  out['worker, AB.resizable throws'] = await new Promise((resolve, reject) => {
+    const worker = new Worker(\`
+      const { parentPort } = require('node:worker_threads');
+      const { VideoFrame } = require(\${JSON.stringify(require.resolve('./index.js'))});
+      Object.defineProperty(ArrayBuffer.prototype, 'resizable', { configurable: true, get() { throw new RangeError('patched'); } });
+      const frame = new VideoFrame(new Uint8Array(16), { format: 'RGBA', codedWidth: 2, codedHeight: 2, timestamp: 0 });
+      Promise.resolve()
+        .then(() => frame.copyTo(new Uint8Array(16)))
+        .then(() => 'resolved', (e) => e.constructor.name + ': ' + e.message)
+        .then((r) => parentPort.postMessage(r));
+    \`, { eval: true });
+    worker.once('message', resolve);
+    worker.once('error', reject);
+  });
+`)
+  const notResizable = 'TypeError: The provided ArrayBufferView value must not be resizable.'
+  const tooSmall = 'TypeError: destination buffer too small: need 8192 bytes, got 16'
+  t.deepEqual(out, {
+    'AB.resizable throws': 'resolved',
+    'AB.resizable says true': 'resolved',
+    'AB.resizable says false, resizable dest': notResizable,
+    'AB.resizable detaches dest': 'resolved',
+    'dest length after': 8192,
+    'AB.growable throws': 'resolved',
+    'SAB.growable throws': 'resolved',
+    'SAB.growable says false, growable dest': notResizable,
+    'AB.detached throws, detached dest': 'TypeError: destination is detached',
+    'AB.detached says false, detached dest': 'TypeError: destination is detached',
+    'AB.detached says true, small dest': tooSmall,
+    'getter runs': 0,
+    'own resizable=false, resizable dest': notResizable,
+    'own resizable=true': 'resolved',
+    'own growable=false, growable dest': notResizable,
+    'own growable=true': 'resolved',
+    'own detached=false, detached dest': 'TypeError: destination is detached',
+    'own detached=true, small dest': tooSmall,
+    'worker, AB.resizable throws': 'resolved',
+  })
+})
+
 // ============================================================================
 // In-process cases: nothing here can write into freed memory
 // ============================================================================
