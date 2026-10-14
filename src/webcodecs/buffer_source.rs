@@ -343,6 +343,53 @@ impl ToNapiValue for Uint8ArrayCopy {
   }
 }
 
+/// Like [`Uint8ArrayCopy`], but accepts any BufferSource (ArrayBuffer,
+/// SharedArrayBuffer, TypedArray or DataView).
+///
+/// For muxer inputs that are often what a WebCodecs API returned: a decoder
+/// config's `description` comes back from `isConfigSupported()` as an
+/// ArrayBuffer, like in Chrome.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BufferSourceCopy(Vec<u8>);
+
+impl std::ops::Deref for BufferSourceCopy {
+  type Target = [u8];
+
+  fn deref(&self) -> &[u8] {
+    &self.0
+  }
+}
+
+impl TypeName for BufferSourceCopy {
+  fn type_name() -> &'static str {
+    "BufferSource"
+  }
+
+  fn value_type() -> ValueType {
+    ValueType::Object
+  }
+}
+
+impl ValidateNapiValue for BufferSourceCopy {}
+
+impl FromNapiValue for BufferSourceCopy {
+  unsafe fn from_napi_value(env: sys::napi_env, value: sys::napi_value) -> Result<Self> {
+    match unsafe { inspect(env, value)? } {
+      Some(raw) => Ok(Self(raw.to_vec())),
+      None => Err(Error::new(
+        Status::InvalidArg,
+        "Expected an ArrayBuffer, SharedArrayBuffer, TypedArray or DataView",
+      )),
+    }
+  }
+}
+
+impl ToNapiValue for BufferSourceCopy {
+  unsafe fn to_napi_value(env: sys::napi_env, val: Self) -> Result<sys::napi_value> {
+    unsafe { Uint8Array::to_napi_value(env, Uint8Array::new(val.0)) }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

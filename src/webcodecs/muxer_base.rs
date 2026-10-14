@@ -10,7 +10,7 @@ use crate::codec::muxer::{
   MuxerOutput, VideoStreamConfig,
 };
 use crate::ffi::{AVCodecID, AVPixelFormat, AVRational, AVSampleFormat};
-use crate::webcodecs::buffer_source::Uint8ArrayCopy;
+use crate::webcodecs::buffer_source::{BufferSourceCopy, Uint8ArrayCopy};
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunk;
 use crate::webcodecs::encoded_video_chunk::{EncodedVideoChunk, EncodedVideoChunkType};
 use napi::bindgen_prelude::*;
@@ -136,8 +136,8 @@ pub struct VideoDecoderConfigJs {
   /// Codec string
   pub codec: Option<String>,
   /// Codec-specific description
-  #[napi(ts_type = "Uint8Array")]
-  pub description: Option<Uint8ArrayCopy>,
+  #[napi(ts_type = "BufferSource")]
+  pub description: Option<BufferSourceCopy>,
   /// Coded width
   pub coded_width: Option<u32>,
   /// Coded height
@@ -171,8 +171,8 @@ pub struct AudioDecoderConfigJs {
   /// Number of channels
   pub number_of_channels: Option<u32>,
   /// Codec-specific description
-  #[napi(ts_type = "Uint8Array")]
-  pub description: Option<Uint8ArrayCopy>,
+  #[napi(ts_type = "BufferSource")]
+  pub description: Option<BufferSourceCopy>,
 }
 
 // ============================================================================
