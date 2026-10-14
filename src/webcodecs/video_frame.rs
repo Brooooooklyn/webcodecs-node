@@ -1877,11 +1877,13 @@ thread_local! {
 /// Runs each time the module loads into an env (the main thread or a worker), after napi-rs has
 /// defined the exported classes and before page code can use the module. napi-rs keeps one
 /// `module_exports` hook per crate, and a second one silently replaces this one: add new
-/// load-time work here.
+/// load-time work here, so that a failed step cannot skip the others.
 #[napi(module_exports)]
 // Only napi's load-time registration calls this, and `cargo test` builds leave it out.
 #[cfg_attr(test, allow(dead_code))]
 pub fn on_module_load(exports: Object, env: Env) -> Result<()> {
+  // Codec event listeners and VideoFrame close observers. Cannot fail.
+  super::event_target::install_callback_anchor_store(&env);
   capture_buffer_flag_getters(&env)?;
   capture_iterator_symbol(&env)?;
   try_install_dom_rect_read_only_shape(&env, &exports);

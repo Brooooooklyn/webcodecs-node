@@ -232,6 +232,52 @@ test('listener storage: WeakMap replaced before the module loads can drop callba
   t.deepEqual(result, { handedStore: true, fired: 0, afterward: 4 })
 })
 
+test('module load: the listener store and the copyTo buffer checks are both set up when the module loads', (t) => {
+  // napi-rs keeps one load hook per crate, so all load-time work must run from it.
+  // Builtins replaced after the load must reach neither.
+  const result = runChild<{ collected: Record<string, boolean>; patchedGetterCalls: number; copied: boolean }>(`
+    ${PRELUDE}
+    const m = require('./index.js');
+    ${OWNERS}
+    for (const name of ['get', 'set', 'delete', 'has']) {
+      WeakMap.prototype[name] = function () { throw new Error('replaced WeakMap.' + name); };
+    }
+    let patchedGetterCalls = 0;
+    for (const key of ['resizable', 'detached']) {
+      const { get } = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, key);
+      Object.defineProperty(ArrayBuffer.prototype, key, {
+        configurable: true,
+        get() { patchedGetterCalls++; return get.call(this); },
+      });
+    }
+    (async () => {
+      // Without the store, callbacks are held strongly and a cycle is never collected.
+      const collected = {};
+      const registry = new FinalizationRegistry((kind) => { collected[kind] = true; });
+      for (const kind of KINDS) {
+        collected[kind] = false;
+        (() => {
+          const owner = makeOwner(m, kind);
+          register(m, kind, owner, () => owner.timestamp ?? owner.state);
+          registry.register(owner, kind);
+        })();
+      }
+      for (let i = 0; i < 20 && Object.values(collected).includes(false); i++) await fullGc();
+      // Without the load-time getters, copyTo would look up the replaced ones.
+      const frame = new m.VideoFrame(new Uint8Array(64).fill(7), { format: 'RGBA', codedWidth: 4, codedHeight: 4, timestamp: 0 });
+      const destination = new Uint8Array(64);
+      await frame.copyTo(destination);
+      frame.close();
+      done({ collected, patchedGetterCalls, copied: destination.every((byte) => byte === 7) });
+    })().catch(fail);
+  `)
+  t.deepEqual(result, {
+    collected: { VideoEncoder: true, VideoDecoder: true, AudioEncoder: true, AudioDecoder: true, VideoFrame: true },
+    patchedGetterCalls: 0,
+    copied: true,
+  })
+})
+
 // ============================================================================
 // Dequeue event coalescing
 // ============================================================================
