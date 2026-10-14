@@ -748,6 +748,61 @@ test('VideoEncoder: a lone displayWidth or displayHeight is a TypeError like Chr
   await t.throwsAsync(VideoEncoder.isConfigSupported(config), { instanceOf: TypeError, message: /bitrate/ })
 })
 
+test('a null display size or rotation converts to 0 like Chrome', async (t) => {
+  // WebIDL converts null to 0 for a number member (ToNumber(null) is +0). So, like Chrome 155, a
+  // null display size is a TypeError (lone or 0), and a null rotation is rotation 0.
+  const pairs = (width: string, height: string) =>
+    [
+      { [width]: null },
+      { [height]: null },
+      { [width]: null, [height]: null },
+      { [width]: null, [height]: 4 },
+      { [width]: 8, [height]: null },
+    ] as Array<Record<string, number | null>>
+
+  for (const aspect of pairs('displayAspectWidth', 'displayAspectHeight')) {
+    const label = `VideoDecoder ${JSON.stringify(aspect)}`
+    const config = { codec: 'vp8', ...aspect } as unknown as VideoDecoderConfig
+    const decoder = new VideoDecoder({ output: (frame) => frame.close(), error: (error) => t.fail(error.message) })
+    t.throws(() => decoder.configure(config), { instanceOf: TypeError }, `configure ${label}`)
+    decoder.close()
+    let support: Promise<unknown> | undefined
+    t.notThrows(() => {
+      support = VideoDecoder.isConfigSupported(config)
+    }, `isConfigSupported ${label} rejects instead of throwing`)
+    await t.throwsAsync(support!, { instanceOf: TypeError }, `isConfigSupported ${label}`)
+  }
+
+  for (const display of pairs('displayWidth', 'displayHeight')) {
+    const label = `VideoEncoder ${JSON.stringify(display)}`
+    const config = { codec: 'vp8', width: 320, height: 240, ...display } as unknown as VideoEncoderConfig
+    const encoder = new VideoEncoder({ output: () => {}, error: (error) => t.fail(error.message) })
+    t.throws(() => encoder.configure(config), { instanceOf: TypeError }, `configure ${label}`)
+    encoder.close()
+    let support: Promise<unknown> | undefined
+    t.notThrows(() => {
+      support = VideoEncoder.isConfigSupported(config)
+    }, `isConfigSupported ${label} rejects instead of throwing`)
+    await t.throwsAsync(support!, { instanceOf: TypeError }, `isConfigSupported ${label}`)
+  }
+
+  for (const [kind, construct] of constructors) {
+    for (const display of pairs('displayWidth', 'displayHeight')) {
+      t.throws(() => construct(display as FrameInit), { instanceOf: TypeError }, `${kind} ${JSON.stringify(display)}`)
+    }
+    const frame = construct({ rotation: null } as unknown as FrameInit)
+    t.is(frame.rotation, 0, `${kind} rotation null`)
+    frame.close()
+  }
+
+  const config = { codec: 'vp8', rotation: null } as unknown as VideoDecoderConfig
+  const decoder = new VideoDecoder({ output: (frame) => frame.close(), error: (error) => t.fail(error.message) })
+  t.notThrows(() => decoder.configure(config), 'configure VideoDecoder rotation null')
+  decoder.close()
+  const support = await VideoDecoder.isConfigSupported(config)
+  t.is(support.config.rotation, 0, 'isConfigSupported VideoDecoder rotation null')
+})
+
 test('VideoEncoder: displayWidth/displayHeight reach the decoded frame through decoderConfig like Chrome', async (t) => {
   // [display size, Chrome 155 decoderConfig displayAspectWidth/displayAspectHeight, decoded display size]
   const cases: Array<[[number, number] | null, [number, number] | null, string]> = [

@@ -1202,22 +1202,22 @@ impl FromNapiValue for VideoFrameConstructorInit {
     // displayWidth/displayHeight are WebIDL [EnforceRange] unsigned long: a plain u32
     // conversion would wrap -1 or 2^32 + 1 into range instead of throwing. WebIDL converts
     // dictionary members in lexicographic order and stops at the first failure, so
-    // displayHeight is read and checked before the displayWidth getter runs.
+    // displayHeight is read and checked before the displayWidth getter runs. null is 0.
     let display_height = super::error::enforce_range_unsigned_long_optional(
       &env_wrapper,
-      obj.get("displayHeight")?,
+      super::error::get_number_member(&obj, "displayHeight")?,
       "displayHeight",
     )?;
     let display_width = super::error::enforce_range_unsigned_long_optional(
       &env_wrapper,
-      obj.get("displayWidth")?,
+      super::error::get_number_member(&obj, "displayWidth")?,
       "displayWidth",
     )?;
     let layout: Option<Vec<PlaneLayout>> = obj.get("layout")?;
     let visible_rect: Option<DOMRectInit> = obj.get("visibleRect")?;
     let flip: Option<bool> = obj.get("flip")?;
-    // rotation is a WebIDL (restricted) double.
-    let rotation: Option<f64> = obj.get("rotation")?;
+    // rotation is a WebIDL (restricted) double. null is 0, as for displayWidth/displayHeight.
+    let rotation: Option<f64> = super::error::get_number_member(&obj, "rotation")?;
     if rotation.is_some_and(|rotation| !rotation.is_finite()) {
       return Err(throw_type_error(env, "rotation must be a finite number"));
     }
