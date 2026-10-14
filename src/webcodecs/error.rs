@@ -669,19 +669,35 @@ pub fn enforce_range_unsigned_long_optional(
   let Some(value) = value else {
     return Ok(None);
   };
-  let message = if value.is_nan() {
-    format!("{} cannot be NaN", field_name)
-  } else if value.is_infinite() {
-    format!("{} cannot be Infinity", field_name)
-  } else {
-    let truncated = value.trunc();
-    if (0.0..=f64::from(u32::MAX)).contains(&truncated) {
-      return Ok(Some(truncated as u32));
+  match enforce_range_unsigned_long_value(value, field_name) {
+    Ok(value) => Ok(Some(value)),
+    Err(message) => {
+      env.throw_type_error(&message, None)?;
+      Err(Error::new(Status::InvalidArg, message))
     }
-    format!("{} is out of range for unsigned long", field_name)
-  };
-  env.throw_type_error(&message, None)?;
-  Err(Error::new(Status::InvalidArg, message))
+  }
+}
+
+/// Convert f64 to u32 per WebIDL `[EnforceRange] unsigned long`, without throwing
+///
+/// Returns the TypeError message for NaN, ±Infinity, and values outside [0, 2^32 - 1] after
+/// truncation, so a caller that must reject a promise instead can keep it.
+pub fn enforce_range_unsigned_long_value(
+  value: f64,
+  field_name: &str,
+) -> std::result::Result<u32, String> {
+  if value.is_nan() {
+    return Err(format!("{} cannot be NaN", field_name));
+  }
+  if value.is_infinite() {
+    return Err(format!("{} cannot be Infinity", field_name));
+  }
+  let truncated = value.trunc();
+  if (0.0..=f64::from(u32::MAX)).contains(&truncated) {
+    // -0.5 truncates to -0, which is 0
+    return Ok(truncated as u32);
+  }
+  Err(format!("{} is out of range for unsigned long", field_name))
 }
 
 /// Convert f64 to u32 per WebIDL `unsigned long` (ECMAScript ToUint32)
@@ -710,7 +726,33 @@ pub fn enforce_range_unsigned_long_long_optional(
 
 #[cfg(test)]
 mod tests {
-  use super::to_unsigned_long;
+  use super::{enforce_range_unsigned_long_value, to_unsigned_long};
+
+  #[test]
+  fn enforce_range_unsigned_long_value_truncates_or_rejects() {
+    // [input, Some(value) or None for a TypeError]
+    let cases: [(f64, Option<u32>); 12] = [
+      (16.0, Some(16)),
+      (16.7, Some(16)),
+      (-0.0, Some(0)),
+      (-0.5, Some(0)),
+      (4_294_967_295.0, Some(4_294_967_295)),
+      (4_294_967_295.5, Some(4_294_967_295)),
+      (-1.0, None),
+      (-1.5, None),
+      (4_294_967_296.0, None),
+      (f64::NAN, None),
+      (f64::INFINITY, None),
+      (f64::NEG_INFINITY, None),
+    ];
+    for (input, expected) in cases {
+      assert_eq!(
+        enforce_range_unsigned_long_value(input, "x").ok(),
+        expected,
+        "[EnforceRange] unsigned long ({input})"
+      );
+    }
+  }
 
   #[test]
   fn to_unsigned_long_matches_to_uint32() {

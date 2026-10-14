@@ -255,6 +255,20 @@ fn config_rotation(config: &VideoDecoderConfig) -> f64 {
     .map_or(0.0, |rotation| f64::from(to_unsigned_long(rotation)))
 }
 
+/// displayAspectWidth and displayAspectHeight must be given together (WebCodecs "valid
+/// VideoDecoderConfig"); the messages are Chrome 155's.
+fn display_aspect_pair_error(config: &VideoDecoderConfig) -> Option<&'static str> {
+  match (config.display_aspect_width, config.display_aspect_height) {
+    (Some(_), None) => {
+      Some("Invalid config, displayAspectWidth specified without displayAspectHeight.")
+    }
+    (None, Some(_)) => {
+      Some("Invalid config, displayAspectHeight specified without displayAspectWidth.")
+    }
+    _ => None,
+  }
+}
+
 /// Get the preferred hardware device type for the current platform
 fn get_platform_hw_type() -> AVHWDeviceType {
   #[cfg(target_os = "macos")]
@@ -1356,6 +1370,11 @@ impl VideoDecoder {
     // W3C WebCodecs spec: Validate config synchronously, throw TypeError for invalid
     // https://w3c.github.io/webcodecs/#dom-videodecoder-configure
 
+    // WebIDL conversion of the config (e.g. [EnforceRange]) fails before validation
+    if let Some(message) = config.conversion_error.as_deref() {
+      return throw_type_error_unit(&env, message);
+    }
+
     // Validate codec - must be present and not empty
     let codec = match &config.codec {
       Some(c) if !c.is_empty() => c.clone(),
@@ -1375,6 +1394,9 @@ impl VideoDecoder {
     }
 
     // Validate display aspect dimensions if specified
+    if let Some(message) = display_aspect_pair_error(&config) {
+      return throw_type_error_unit(&env, message);
+    }
     if let Some(dw) = config.display_aspect_width
       && dw == 0
     {
@@ -2002,6 +2024,11 @@ impl VideoDecoder {
     // W3C WebCodecs spec: Validate config, throw TypeError for invalid
     // https://w3c.github.io/webcodecs/#dom-videodecoder-isconfigsupported
 
+    // WebIDL conversion of the config (e.g. [EnforceRange]) fails before validation
+    if let Some(message) = config.conversion_error.as_deref() {
+      return reject_with_type_error(env, message);
+    }
+
     // Validate codec - must be present and not empty
     let codec = match &config.codec {
       Some(c) if !c.is_empty() => c.clone(),
@@ -2022,6 +2049,9 @@ impl VideoDecoder {
     }
 
     // Validate display aspect dimensions if specified
+    if let Some(message) = display_aspect_pair_error(&config) {
+      return reject_with_type_error(env, message);
+    }
     if let Some(dw) = config.display_aspect_width
       && dw == 0
     {

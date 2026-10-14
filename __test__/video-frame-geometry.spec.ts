@@ -395,6 +395,95 @@ test('VideoDecoder: reconfigure applies the new display aspect', async (t) => {
   t.deepEqual(sizes, ['427x240', '320x240', '320x640'])
 })
 
+test('VideoDecoder: invalid displayAspectWidth/displayAspectHeight are a TypeError like Chrome', async (t) => {
+  // Chrome 155 takes both as [EnforceRange] unsigned long and requires them together
+  const cases: Array<[string, Partial<VideoDecoderConfig>]> = [
+    ['lone width', { displayAspectWidth: 16 }],
+    ['lone height', { displayAspectHeight: 9 }],
+    ['width, undefined height', { displayAspectWidth: 16, displayAspectHeight: undefined }],
+    ['lone height 2^32 + 1', { displayAspectHeight: 2 ** 32 + 1 }],
+    ['-1:-1', { displayAspectWidth: -1, displayAspectHeight: -1 }],
+    ['-1:9', { displayAspectWidth: -1, displayAspectHeight: 9 }],
+    ['16:-1', { displayAspectWidth: 16, displayAspectHeight: -1 }],
+    ['-1.5:9', { displayAspectWidth: -1.5, displayAspectHeight: 9 }],
+    // -0.5 and 0.5 truncate to 0
+    ['-0.5:9', { displayAspectWidth: -0.5, displayAspectHeight: 9 }],
+    ['0.5:9', { displayAspectWidth: 0.5, displayAspectHeight: 9 }],
+    ['2^32:9', { displayAspectWidth: 2 ** 32, displayAspectHeight: 9 }],
+    ['2^32 + 1:9', { displayAspectWidth: 2 ** 32 + 1, displayAspectHeight: 9 }],
+    ['-(2^32 - 1):9', { displayAspectWidth: -(2 ** 32 - 1), displayAspectHeight: 9 }],
+    ['1e20:9', { displayAspectWidth: 1e20, displayAspectHeight: 9 }],
+    ['NaN:9', { displayAspectWidth: NaN, displayAspectHeight: 9 }],
+    ['16:NaN', { displayAspectWidth: 16, displayAspectHeight: NaN }],
+    ['Infinity:9', { displayAspectWidth: Infinity, displayAspectHeight: 9 }],
+    ['-Infinity:9', { displayAspectWidth: -Infinity, displayAspectHeight: 9 }],
+  ]
+  for (const [name, aspect] of cases) {
+    const config: VideoDecoderConfig = { codec: 'vp8', codedWidth: 320, codedHeight: 240, ...aspect }
+    const decoder = new VideoDecoder({ output: (frame) => frame.close(), error: (error) => t.fail(error.message) })
+    t.throws(() => decoder.configure(config), { instanceOf: TypeError }, `configure ${name}`)
+    t.is(decoder.state, 'unconfigured', `configure ${name}`)
+    decoder.close()
+    let support: Promise<unknown> | undefined
+    t.notThrows(() => {
+      support = VideoDecoder.isConfigSupported(config)
+    }, `isConfigSupported ${name} rejects instead of throwing`)
+    await t.throwsAsync(support!, { instanceOf: TypeError }, `isConfigSupported ${name}`)
+  }
+})
+
+test('VideoDecoder: fractional displayAspectWidth/displayAspectHeight truncate like Chrome', async (t) => {
+  const chunks = await encodeVp8(320, 240)
+  // [width, height, Chrome 155 support.config members, output display size]
+  const cases: Array<[number, number, [number, number], string]> = [
+    [16.7, 9.2, [16, 9], '427x240'],
+    [16.999, 9.999, [16, 9], '427x240'],
+    [2 ** 32 - 0.5, 9, [4294967295, 9], '320x240'],
+  ]
+  for (const [width, height, members, size] of cases) {
+    const config: VideoDecoderConfig = {
+      codec: 'vp8',
+      codedWidth: 320,
+      codedHeight: 240,
+      displayAspectWidth: width,
+      displayAspectHeight: height,
+    }
+    const support = await VideoDecoder.isConfigSupported(config)
+    t.deepEqual(
+      [support.config.displayAspectWidth, support.config.displayAspectHeight],
+      members,
+      `isConfigSupported ${width}:${height}`,
+    )
+    t.deepEqual(
+      await decodeWith(chunks, config),
+      { sizes: [size], errors: [], state: 'configured' },
+      `configure ${width}:${height}`,
+    )
+  }
+})
+
+test('VideoDecoder: reconfigure with an invalid display aspect throws and keeps the old config', async (t) => {
+  const [chunk] = await encodeVp8(320, 240)
+  const sizes: string[] = []
+  const decoder = new VideoDecoder({
+    output: (frame) => {
+      sizes.push(`${frame.displayWidth}x${frame.displayHeight}`)
+      frame.close()
+    },
+    error: (error) => t.fail(error.message),
+  })
+  decoder.configure({ codec: 'vp8', displayAspectWidth: 16, displayAspectHeight: 9 })
+  t.throws(() => decoder.configure({ codec: 'vp8', displayAspectWidth: 1 }), { instanceOf: TypeError })
+  t.throws(() => decoder.configure({ codec: 'vp8', displayAspectWidth: -1, displayAspectHeight: -1 }), {
+    instanceOf: TypeError,
+  })
+  t.is(decoder.state, 'configured')
+  decoder.decode(chunk)
+  await decoder.flush()
+  decoder.close()
+  t.deepEqual(sizes, ['427x240'])
+})
+
 test('VideoDecoder: config rotation converts like Chrome (unsigned long) before it rounds', async (t) => {
   const [chunk] = await encodeVp8(32, 16)
   // [config rotation, Chrome 155 output frame rotation]. Chrome applies ToUint32 first, so
