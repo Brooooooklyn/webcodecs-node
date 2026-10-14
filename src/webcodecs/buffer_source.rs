@@ -246,9 +246,10 @@ pub(crate) fn copy_required_data(env: sys::napi_env, obj: &Object) -> Result<Vec
 /// An optional BufferSource dictionary member, such as a decoder config's
 /// `description`.
 pub(crate) enum BufferSourceMember {
-  /// `undefined` or `null`.
+  /// `undefined`.
   Absent,
-  /// A value that is not a BufferSource.
+  /// A value that is not a BufferSource. This includes `null`: the member is
+  /// not nullable, so Chrome throws a TypeError for it.
   NotBufferSource,
   /// A BufferSource. Its bytes were copied when the member was read.
   Copied {
@@ -268,7 +269,7 @@ pub(crate) fn read_buffer_source_member(
   name: &str,
 ) -> Result<BufferSourceMember> {
   let value: Unknown = obj.get_named_property(name)?;
-  if matches!(value.get_type()?, ValueType::Undefined | ValueType::Null) {
+  if value.get_type()? == ValueType::Undefined {
     return Ok(BufferSourceMember::Absent);
   }
   Ok(match unsafe { inspect(env, value.raw())? } {

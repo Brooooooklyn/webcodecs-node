@@ -501,6 +501,20 @@ test('VideoDecoder and AudioDecoder reject a description detached by a later get
 
 type VideoDecoderConfigWithRotation = Parameters<VideoDecoder['configure']>[0] & { rotation?: number }
 
+test('AudioDecoder rejects description: null with a TypeError, like Chrome', async (t) => {
+  const config = { codec: 'opus', sampleRate: 48000, numberOfChannels: 2 }
+  const nullDescription = { ...config, description: null as unknown as Uint8Array }
+  const decoder = new AudioDecoder({ output: (data) => data.close(), error: () => {} })
+  t.throws(() => decoder.configure(nullDescription), { instanceOf: TypeError })
+  t.is(decoder.state, 'unconfigured')
+  // An absent description is still fine.
+  decoder.configure({ ...config, description: undefined })
+  t.is(decoder.state, 'configured')
+  decoder.close()
+  // Chrome rejects; the async wrapper also accepts a synchronous throw.
+  await t.throwsAsync(async () => AudioDecoder.isConfigSupported(nullDescription), { instanceOf: TypeError })
+})
+
 test('isConfigSupported returns a copy of the description, as an ArrayBuffer', async (t) => {
   const { codec, description } = await avcConfig()
   const video = await VideoDecoder.isConfigSupported({ codec, description })
