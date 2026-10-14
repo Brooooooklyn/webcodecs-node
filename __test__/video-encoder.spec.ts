@@ -7,7 +7,13 @@
 
 import test from 'ava'
 
-import { resetHardwareFallbackState, VideoEncoder, type EncodedVideoChunkMetadata } from '../index.js'
+import {
+  resetHardwareFallbackState,
+  VideoDecoder,
+  VideoEncoder,
+  VideoFrame,
+  type EncodedVideoChunkMetadata,
+} from '../index.js'
 import {
   generateSolidColorI420Frame,
   generateSolidColorI420AFrame,
@@ -718,4 +724,141 @@ test('VideoEncoder: alpha discard is the default', async (t) => {
   t.true(chunks.length >= 1, 'Should produce encoded chunks')
 
   encoder.close()
+})
+
+// ============================================================================
+// Mixed input formats and sizes
+// ============================================================================
+
+const MIXED_WIDTH = 64
+const MIXED_HEIGHT = 48
+
+// Solid frame; each format gets its own color.
+function solidFrame(format: string, width: number, height: number, timestamp: number) {
+  const pixels = width * height
+  const chroma = (width / 2) * (height / 2)
+  let data: Uint8Array
+  switch (format) {
+    case 'RGBA':
+      data = new Uint8Array(pixels * 4)
+      for (let i = 0; i < pixels; i++) data.set([40, 200, 60, 255], i * 4)
+      break
+    case 'I444':
+      data = new Uint8Array(pixels * 3)
+      data
+        .fill(81, 0, pixels)
+        .fill(90, pixels, 2 * pixels)
+        .fill(240, 2 * pixels)
+      break
+    case 'I420':
+      data = new Uint8Array(pixels + 2 * chroma)
+      data
+        .fill(160, 0, pixels)
+        .fill(60, pixels, pixels + chroma)
+        .fill(100, pixels + chroma)
+      break
+    case 'NV12':
+      data = new Uint8Array(pixels + 2 * chroma)
+      data.fill(120, 0, pixels)
+      for (let i = 0; i < chroma; i++) data.set([200, 70], pixels + 2 * i)
+      break
+    default:
+      throw new Error(`unexpected format ${format}`)
+  }
+  return new VideoFrame(data, {
+    format: format as 'RGBA' | 'I444' | 'I420' | 'NV12',
+    codedWidth: width,
+    codedHeight: height,
+    timestamp,
+  })
+}
+
+// Encodes one frame per spec ("FORMAT" or "FORMAT:width:height") with VP8, decodes
+// the result and returns the RGB value at (10, 10) of each decoded frame.
+async function encodedColors(specs: string[]) {
+  const chunks: EncodedVideoChunk[] = []
+  const errors: string[] = []
+  const encoder = new VideoEncoder({
+    output: (chunk) => {
+      chunks.push(chunk)
+    },
+    error: (e) => {
+      errors.push(`${e.name}: ${e.message}`)
+    },
+  })
+  encoder.configure({
+    codec: 'vp8',
+    width: MIXED_WIDTH,
+    height: MIXED_HEIGHT,
+    bitrate: 2_000_000,
+    hardwareAcceleration: 'prefer-software',
+  })
+  specs.forEach((spec, index) => {
+    const [format, width, height] = spec.split(':')
+    const frame = solidFrame(
+      format,
+      width ? Number(width) : MIXED_WIDTH,
+      height ? Number(height) : MIXED_HEIGHT,
+      index * 33_333,
+    )
+    encoder.encode(frame, { keyFrame: true })
+    frame.close()
+  })
+  await encoder.flush()
+  encoder.close()
+
+  const frames: VideoFrame[] = []
+  const decoder = new VideoDecoder({
+    output: (frame) => {
+      frames.push(frame)
+    },
+    error: (e) => {
+      errors.push(`decoder ${e.name}: ${e.message}`)
+    },
+  })
+  decoder.configure({ codec: 'vp8', codedWidth: MIXED_WIDTH, codedHeight: MIXED_HEIGHT })
+  for (const chunk of chunks) decoder.decode(chunk)
+  await decoder.flush()
+  decoder.close()
+
+  const colors: number[][] = []
+  for (const frame of frames) {
+    const options = { format: 'RGBA' as const }
+    const data = new Uint8Array(frame.allocationSize(options))
+    const [plane] = await frame.copyTo(data, options)
+    const offset = plane.offset + 10 * plane.stride + 10 * 4
+    colors.push(Array.from(data.subarray(offset, offset + 3)))
+    frame.close()
+  }
+  return { colors, errors }
+}
+
+test('VideoEncoder: frames whose format or size changes between encode() calls keep their colors', async (t) => {
+  const sequences = [
+    ['I444', 'RGBA'],
+    ['RGBA', 'I444'],
+    ['I420', 'RGBA', 'NV12', 'I444', 'I420'],
+    ['RGBA', 'RGBA:32:24', 'RGBA'],
+  ]
+  // Each spec encoded on its own encoder gives the reference color.
+  const reference = new Map<string, number[]>()
+  for (const spec of new Set(sequences.flat())) {
+    const { colors, errors } = await encodedColors([spec])
+    t.deepEqual(errors, [], spec)
+    reference.set(spec, colors[0])
+  }
+
+  for (const sequence of sequences) {
+    const { colors, errors } = await encodedColors(sequence)
+    const name = sequence.join(' > ')
+    t.deepEqual(errors, [], name)
+    t.is(colors.length, sequence.length, name)
+    sequence.forEach((spec, index) => {
+      const diff = Math.max(...colors[index].map((value, channel) => Math.abs(value - reference.get(spec)![channel])))
+      t.true(
+        diff <= 8,
+        `${name}: frame ${index} (${spec}) is ${colors[index].join(',')}, alone ${reference.get(spec)!.join(',')}`,
+      )
+    })
+  }
 })

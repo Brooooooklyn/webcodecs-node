@@ -797,8 +797,16 @@ impl VideoEncoder {
 
     // Convert frame if needed, or deep copy if we need to mutate it
     let mut frame_to_encode = if needs_conversion {
-      // Create scaler if needed
-      if guard.scaler.is_none() {
+      // Create the scaler, or rebuild it when this frame's format or size
+      // differs from the frame it was built for
+      if !guard.scaler.as_ref().is_some_and(|scaler| {
+        scaler_matches(
+          scaler,
+          (frame_format, frame_guard.width(), frame_guard.height()),
+          (target_format, width, height),
+        )
+      }) {
+        guard.scaler = None;
         match Scaler::new(
           frame_guard.width(),
           frame_guard.height(),
@@ -2514,8 +2522,17 @@ impl VideoEncoder {
   fn try_upload_to_gpu(guard: &mut VideoEncoderInner, frame: &Frame) -> Option<Frame> {
     // Convert to NV12 if needed
     let nv12_frame = if frame.format() != AVPixelFormat::Nv12 {
-      // Create NV12 scaler if needed
-      if guard.nv12_scaler.is_none() {
+      // Create the NV12 scaler, or rebuild it when this frame's format or
+      // size differs from the frame it was built for
+      let (format, width, height) = (frame.format(), frame.width(), frame.height());
+      if !guard.nv12_scaler.as_ref().is_some_and(|scaler| {
+        scaler_matches(
+          scaler,
+          (format, width, height),
+          (AVPixelFormat::Nv12, width, height),
+        )
+      }) {
+        guard.nv12_scaler = None;
         match Scaler::new(
           frame.width(),
           frame.height(),
@@ -4158,6 +4175,16 @@ fn extract_alpha_side_data(packet: &Packet, use_alpha: bool) -> Option<Uint8Arra
   // Return the complete data (BlockAddId + actual data)
   // This matches FFmpeg's expected format
   Some(Uint8Array::from(alpha_data.to_vec()))
+}
+
+/// Whether a cached scaler converts `src` (format, width, height) into `dst`.
+fn scaler_matches(
+  scaler: &Scaler,
+  src: (AVPixelFormat, u32, u32),
+  dst: (AVPixelFormat, u32, u32),
+) -> bool {
+  (scaler.src_format(), scaler.src_width(), scaler.src_height()) == src
+    && (scaler.dst_format(), scaler.dst_width(), scaler.dst_height()) == dst
 }
 
 /// Check if dimensions are within valid range
