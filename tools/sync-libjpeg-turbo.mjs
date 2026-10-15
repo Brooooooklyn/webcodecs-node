@@ -1,8 +1,10 @@
 // Vendor the libjpeg-turbo that Chrome ships (chromium/deps/libjpeg_turbo) into
 // vendor/libjpeg-turbo: the decoder sources that build.rs compiles, the files they
-// include and the licence files, and CHROMIUM_PIN, which records the Chrome version,
-// the DEPS revision, the selection rule and the source lists for build.rs. The licence
-// files are also copied to licenses/ and listed in licenses/manifest.json for the npm packages.
+// include, the licence files and README.chromium (Chromium's changes to the IJG files),
+// Chromium's LICENSE as CHROMIUM_LICENSE, and CHROMIUM_PIN, which records the Chrome
+// version, the DEPS revision, the selection rule and the source lists for build.rs.
+// LICENSE.md and README.ijg are also copied to licenses/ and listed in
+// licenses/manifest.json for the npm packages.
 //
 //   node tools/sync-libjpeg-turbo.mjs                    re-sync the pinned revision
 //   node tools/sync-libjpeg-turbo.mjs --chrome <version> sync the revision in that Chrome's DEPS
@@ -44,13 +46,14 @@ const fetchOk = async (url) => {
 
 const chrome = args[1] ?? pin.chrome
 assert(chrome, `No ${pinFile}: pass --chrome <version>`)
+// Gitiles serves raw files base64-encoded with ?format=TEXT.
+const chromiumFile = async (path) => {
+  const response = await fetchOk(`${gitiles}/chromium/src/+/refs/tags/${chrome}/${path}?format=TEXT`)
+  return Buffer.from(await response.text(), 'base64')
+}
 let revision = pin['deps-revision']
 if (args.length) {
-  // Gitiles serves raw files base64-encoded with ?format=TEXT.
-  const deps = Buffer.from(
-    await (await fetchOk(`${gitiles}/chromium/src/+/refs/tags/${chrome}/DEPS?format=TEXT`)).text(),
-    'base64',
-  ).toString('utf8')
+  const deps = (await chromiumFile('DEPS')).toString('utf8')
   const at = deps.indexOf("'src/third_party/libjpeg_turbo'")
   assert(at >= 0, `Chrome ${chrome} DEPS has no src/third_party/libjpeg_turbo`)
   revision = deps.slice(at, at + 400).match(/libjpeg_turbo\.git'\s*\+\s*'@'\s*\+\s*'([0-9a-f]{40})'/)?.[1]
@@ -84,8 +87,16 @@ try {
 
   // Every file a compiled source includes with "...", followed through headers and the
   // .c files that jdcolor.c and jdmerge.c include, whatever #if guards them.
-  const wanted = new Map()
-  const queue = ['LICENSE.md', 'README.ijg', ...lists.bits8.map((file) => `src/${file}.c`)]
+  // jsimd.h and jsimddct.h point to the zlib notice in simd/nasm/jsimdext.inc, and
+  // jpeglibmangler.h to Chromium's LICENSE.
+  const wanted = new Map([['CHROMIUM_LICENSE', await chromiumFile('LICENSE')]])
+  const queue = [
+    'LICENSE.md',
+    'README.ijg',
+    'README.chromium',
+    'simd/nasm/jsimdext.inc',
+    ...lists.bits8.map((file) => `src/${file}.c`),
+  ]
   while (queue.length) {
     const file = queue.pop()
     if (wanted.has(file)) continue
@@ -97,7 +108,7 @@ try {
     }
   }
 
-  const readme = await readFile(join(tree, 'README.chromium'), 'utf8')
+  const readme = wanted.get('README.chromium').toString('utf8')
   const version = readme.match(/^Version: (.+)$/m)?.[1]
   const upstream = readme.match(/^Revision: (.+)$/m)?.[1]
   assert(version && upstream, 'README.chromium has no Version or Revision line')
@@ -111,7 +122,9 @@ try {
     `upstream-revision: ${upstream}`,
     'rule: BUILD.gn libjpeg16_sources, libjpeg12_sources and libjpeg_sources without the',
     'rule: compressor files (src/jc*.c but src/jcomapi.c, src/jf*.c, src/jdatadst.c,',
-    'rule: src/jpeg_nbits.c), every file they #include "...", LICENSE.md and README.ijg',
+    'rule: src/jpeg_nbits.c), every file they #include "...", LICENSE.md, README.ijg,',
+    "rule: README.chromium (Chromium's changes) and simd/nasm/jsimdext.inc (zlib notice);",
+    `rule: CHROMIUM_LICENSE is chromium/src LICENSE at ${chrome} (for jpeglibmangler.h)`,
     ...Object.entries(lists).map(([key, files]) => `${key}: ${files.join(' ')}`),
     '',
   ].join('\n')

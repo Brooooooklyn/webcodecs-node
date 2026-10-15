@@ -7,7 +7,9 @@ version: 3.1.0
 upstream-revision: 20ade4dea9589515a69793e447a6c6220b464535
 rule: BUILD.gn libjpeg16_sources, libjpeg12_sources and libjpeg_sources without the
 rule: compressor files (src/jc*.c but src/jcomapi.c, src/jf*.c, src/jdatadst.c,
-rule: src/jpeg_nbits.c), every file they #include "...", LICENSE.md and README.ijg
+rule: src/jpeg_nbits.c), every file they #include "...", LICENSE.md, README.ijg,
+rule: README.chromium (Chromium's changes) and simd/nasm/jsimdext.inc (zlib notice);
+rule: CHROMIUM_LICENSE is chromium/src LICENSE at 155.0.8059.79 (for jpeglibmangler.h)
 bits16: jdapistd jdcolor jddiffct jdlossls jdmainct jdpostct jdsample jutils
 bits12: jdapistd jdcolor jddiffct jdlossls jdmainct jdpostct jdsample jutils jdcoefct jddctmgr jdmerge jidctflt jidctfst jidctint jidctred jquant1 jquant2
 bits8: jdapistd jdcolor jddiffct jdlossls jdmainct jdpostct jdsample jutils jdcoefct jddctmgr jdmerge jidctflt jidctfst jidctint jidctred jquant1 jquant2 jcomapi jdapimin jdatasrc jdhuff jdicc jdinput jdlhuff jdmarker jdmaster jdphuff jdtrans jerror jmemmgr jmemnobs

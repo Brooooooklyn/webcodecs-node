@@ -9,6 +9,53 @@
  * decode fails, as Chrome's does once it has all the data: a truncated file, or a file without
  * its EOI marker, is an error. Only the first image of concatenated JPEGs (MPO, gain map) is
  * read. libjpeg reports errors with longjmp: every setjmp and longjmp stays in this file.
+ *
+ * Chrome gives other bytes for:
+ * - an ICC profile that Chrome applies at decode time with skcms (BGRX): a CMYK profile on a
+ *   CMYK or YCCK file, or an RGB or gray profile that Skia cannot hold exactly (a table TRC).
+ *   ICC profiles are ignored here. Other RGB profiles change only Chrome's color tags, which
+ *   are always sRGB here.
+ * - corrupt data whose coefficients overflow the IDCT: Chrome builds libjpeg-turbo with SIMD
+ *   (NEON, SSE2, AVX2), this build is C only, and the two round the overflow differently.
+ *
+ * This file is a C rewrite of the decode parts of Blink's jpeg_image_decoder.cc at Chrome
+ * 155.0.8059.79, changed in 2026 to decode from one buffer into an AVFrame. That file's notice
+ * follows; it applies to this file.
+ *
+ * Copyright (C) 2006 Apple Computer, Inc.
+ *
+ * Portions are Copyright (C) 2001-6 mozilla.org
+ *
+ * Other contributors:
+ *   Stuart Parmenter <stuart@mozilla.com>
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ *
+ * Alternatively, the contents of this file may be used under the terms
+ * of either the Mozilla Public License Version 1.1, found at
+ * http://www.mozilla.org/MPL/ (the "MPL") or the GNU General Public
+ * License Version 2.0, found at http://www.fsf.org/copyleft/gpl.html
+ * (the "GPL"), in which case the provisions of the MPL or the GPL are
+ * applicable instead of those above.  If you wish to allow use of your
+ * version of this file only under the terms of one of those two
+ * licenses (the MPL or the GPL) and not to allow others to use your
+ * version of this file under the LGPL, indicate your decision by
+ * deletingthe provisions above and replace them with the notice and
+ * other provisions required by the MPL or the GPL, as the case may be.
+ * If you do not delete the provisions above, a recipient may use your
+ * version of this file under any of the LGPL, the MPL or the GPL.
  */
 
 #include <setjmp.h>
@@ -35,6 +82,7 @@ typedef struct {
   struct jpeg_source_mgr src;
   struct jpeg_progress_mgr progress;
   int scale_num; // JPEGImageDecoder::DesiredScaleNumerator, 1-8 (8: full size)
+  int allow_yuv; // 0: BGRA even where YUV planes would do (see blink_jpeg_info)
   int yuv;       // decode to YUV planes (raw data out)
   AVFrame *dst;  // NULL: read the header only
 } Decoder;
@@ -132,9 +180,10 @@ static int read_header(Decoder *d) {
   // needs no decode-time color transform: an ICC profile is not looked at here.
   const jpeg_component_info *c = info->comp_info;
   int h = c[0].h_samp_factor, v = c[0].v_samp_factor;
-  d->yuv = d->scale_num == 8 && info->jpeg_color_space == JCS_YCbCr && info->num_components == 3 &&
-           c[1].h_samp_factor == 1 && c[1].v_samp_factor == 1 && c[2].h_samp_factor == 1 &&
-           c[2].v_samp_factor == 1 && ((v == 1 && (h == 1 || h == 2)) || (v == 2 && h == 2));
+  d->yuv = d->allow_yuv && d->scale_num == 8 && info->jpeg_color_space == JCS_YCbCr &&
+           info->num_components == 3 && c[1].h_samp_factor == 1 && c[1].v_samp_factor == 1 &&
+           c[2].h_samp_factor == 1 && c[2].v_samp_factor == 1 &&
+           ((v == 1 && (h == 1 || h == 2)) || (v == 2 && h == 2));
   return 0;
 }
 
@@ -255,10 +304,13 @@ static int decode(Decoder *d) {
   // kJpegDone. Without the EOI marker this suspends, and Blink fails.
   if (!jpeg_finish_decompress(info)) return AVERROR_INVALIDDATA;
 
-  // The color tags FFmpeg's mjpeg decoder gives (full range; BT.601 matrix for YUV).
+  // Chrome's tags for a JPEG without an ICC profile: sRGB, and for YUV the full-range BT.601
+  // matrix (image_decoder_core.cc YUVColorSpaceToGfxColorSpace for kJPEG_Full).
   dst->color_range = AVCOL_RANGE_JPEG;
+  dst->color_primaries = AVCOL_PRI_BT709;
+  dst->color_trc = AVCOL_TRC_IEC61966_2_1;
   if (d->yuv) {
-    dst->colorspace = AVCOL_SPC_BT470BG;
+    dst->colorspace = AVCOL_SPC_SMPTE170M;
     dst->chroma_location = AVCHROMA_LOC_CENTER;
   } else {
     dst->colorspace = AVCOL_SPC_RGB;
@@ -273,7 +325,8 @@ static int run(Decoder *d) {
   return ret < 0 || !d->dst ? ret : decode(d);
 }
 
-static int run_decoder(const uint8_t *data, size_t size, int scale_num, AVFrame *dst, int *out) {
+static int run_decoder(const uint8_t *data, size_t size, int scale_num, int allow_yuv, AVFrame *dst,
+                       int *out) {
   Decoder d;
   if (!data || scale_num < 1 || scale_num > 8) return AVERROR(EINVAL);
   memset(&d, 0, sizeof(d));
@@ -289,6 +342,7 @@ static int run_decoder(const uint8_t *data, size_t size, int scale_num, AVFrame 
   d.src.term_source = term_source;
   d.progress.progress_monitor = progress_monitor;
   d.scale_num = scale_num;
+  d.allow_yuv = allow_yuv;
   d.dst = dst;
   int ret = run(&d);
   if (ret >= 0 && out) {
@@ -303,15 +357,18 @@ static int run_decoder(const uint8_t *data, size_t size, int scale_num, AVFrame 
 }
 
 // Read the header for a decode at scale_num/8 (1-8): out = {image width, image height, output
-// width, output height, AVPixelFormat (yuv420p, yuv422p, yuv444p or bgra)}.
-int blink_jpeg_info(const uint8_t *data, size_t size, int scale_num, int *out) {
+// width, output height, AVPixelFormat (yuv420p, yuv422p, yuv444p or bgra)}. allow_yuv = 0 gives
+// bgra for every image: Chrome's WebCodecs ImageDecoder keeps RGB once it has decoded rows before
+// all the data came (image_decoder_core.cc have_completed_rgb_decode_; Blink's
+// allow_decode_to_yuv_ needs all the data).
+int blink_jpeg_info(const uint8_t *data, size_t size, int scale_num, int allow_yuv, int *out) {
   if (!out) return AVERROR(EINVAL);
-  return run_decoder(data, size, scale_num, NULL, out);
+  return run_decoder(data, size, scale_num, allow_yuv, NULL, out);
 }
 
 // Decode at scale_num/8 into dst, allocated with the format and output size blink_jpeg_info
-// gives. On failure dst holds partial rows.
-int blink_jpeg_decode(const uint8_t *data, size_t size, int scale_num, AVFrame *dst) {
+// gives for the same scale_num and allow_yuv. On failure dst holds partial rows.
+int blink_jpeg_decode(const uint8_t *data, size_t size, int scale_num, int allow_yuv, AVFrame *dst) {
   if (!dst) return AVERROR(EINVAL);
-  return run_decoder(data, size, scale_num, dst, NULL);
+  return run_decoder(data, size, scale_num, allow_yuv, dst, NULL);
 }
