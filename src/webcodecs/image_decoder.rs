@@ -2316,7 +2316,7 @@ fn decode_avif(
   data: &[u8],
   image: &AvifImage,
 ) -> Result<(CodecContext, Vec<(Frame, VideoPixelFormat)>)> {
-  let arrived = |samples: &AvifSamples, i| samples.sample(data, i).is_some();
+  let arrived = |samples: &AvifSamples, i| samples.arrived(data.len(), i);
   let count = (0..image.color.len())
     .take_while(|&i| arrived(&image.color, i) && image.alpha.iter().all(|a| arrived(a, i)))
     .count();
@@ -2371,9 +2371,9 @@ fn decode_av1_samples(
   let failed = |e: CodecError| Error::new(Status::GenericFailure, format!("Decode failed: {e}"));
   let mut context = create_image_decoder(AVCodecID::Av1, Some(samples.config.clone()))?;
   let mut frames = Vec::new();
-  for sample in (0..count).filter_map(|i| samples.sample(data, i)) {
+  for parts in (0..count).filter_map(|i| samples.sample(data, i)) {
     let mut packet = Packet::new().map_err(failed)?;
-    packet.copy_data_from(&sample).map_err(failed)?;
+    packet.copy_parts_from(&parts).map_err(failed)?;
     frames.extend(context.decode(Some(&packet)).map_err(failed)?);
   }
   frames.extend(context.flush_decoder().map_err(failed)?);

@@ -7,7 +7,6 @@
 //! handle (grid and other derived items, 'mini', ...), and most that Chrome rejects,
 //! give `Avif::Decline`: the caller then decodes with FFmpeg as before.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -86,32 +85,41 @@ impl AvifSamples {
     }
   }
 
-  /// The bytes of sample `index`, or None while some of them have not arrived. Also None for
-  /// an item larger than both the data and `STREAM_SIZE_HINT`, which Chrome rejects (see
-  /// `past_size_hint`).
-  pub fn sample<'d>(&self, data: &'d [u8], index: usize) -> Option<Cow<'d, [u8]>> {
+  /// Whether all the bytes of sample `index` are in the first `len` bytes. False for an item
+  /// larger than both `len` and `STREAM_SIZE_HINT`, which Chrome rejects (see
+  /// `past_size_hint`). It only compares ranges: the extents of an item can overlap, and the
+  /// item can be far larger than the data.
+  pub fn arrived(&self, len: usize, index: usize) -> bool {
+    let len = len as u64;
+    match &self.samples {
+      Samples::Item(extents) if index == 0 => {
+        item_size(extents).is_some_and(|size| size <= STREAM_SIZE_HINT.max(len))
+          && extents.iter().all(|extent| extent.end <= len)
+      }
+      Samples::Item(_) => false,
+      Samples::Track(samples) => samples
+        .get(index)
+        .is_some_and(|sample| sample.offset.saturating_add(sample.size.into()) <= len),
+    }
+  }
+
+  /// The parts of sample `index` in `data`, in order: the extents of an item, which can overlap,
+  /// or the one range of a track sample. None until it has `arrived`. The caller copies them
+  /// once, into the packet (see `Packet::copy_parts_from`).
+  pub fn sample<'d>(&self, data: &'d [u8], index: usize) -> Option<Vec<&'d [u8]>> {
+    if !self.arrived(data.len(), index) {
+      return None;
+    }
     let bytes = |range: &Range<u64>| {
       data.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
     };
     match &self.samples {
-      Samples::Item(extents) if index == 0 => match extents.as_slice() {
-        [extent] => bytes(extent).map(Cow::Borrowed),
-        extents => {
-          // Extents can overlap: the item can be larger than the data. Like CrabbyAvif,
-          // allocate the item size only once it is checked, and fail when it cannot be.
-          let limit = STREAM_SIZE_HINT.max(data.len() as u64);
-          let size = item_size(extents).filter(|&size| size <= limit)?;
-          let parts = extents.iter().map(bytes).collect::<Option<Vec<_>>>()?;
-          let mut item = Vec::new();
-          item.try_reserve_exact(usize::try_from(size).ok()?).ok()?;
-          parts.iter().for_each(|part| item.extend_from_slice(part));
-          Some(Cow::Owned(item))
-        }
-      },
-      Samples::Item(_) => None,
+      Samples::Item(extents) => extents.iter().map(bytes).collect(),
       Samples::Track(samples) => {
         let sample = samples.get(index)?;
-        bytes(&(sample.offset..sample.offset + u64::from(sample.size))).map(Cow::Borrowed)
+        Some(vec![bytes(
+          &(sample.offset..sample.offset + u64::from(sample.size)),
+        )?])
       }
     }
   }
@@ -1182,7 +1190,7 @@ mod tests {
 
   fn samples(data: &[u8], samples: &AvifSamples) -> Vec<Vec<u8>> {
     (0..samples.len())
-      .map(|i| samples.sample(data, i).expect("sample bytes").into_owned())
+      .map(|i| samples.sample(data, i).expect("sample bytes").concat())
       .collect()
   }
 
@@ -1366,7 +1374,24 @@ mod tests {
     let data = s8_with_extents(&[(0, 4100); 65535]);
     let color = parsed(&data, None).color;
     assert!(color.past_size_hint(STREAM_SIZE_HINT));
+    assert!(!color.arrived(data.len(), 0));
     assert!(color.sample(&data, 0).is_none());
+    // 65535 extents of the first 4096 bytes: 268,431,360 bytes, just under the stream size
+    // hint. Whether it has arrived needs only the data length, and its parts borrow the data:
+    // the item is built once, into the packet.
+    let data = s8_with_extents(&[(0, 4096); 65535]);
+    let color = parsed(&data, None).color;
+    assert!(!color.past_size_hint(STREAM_SIZE_HINT));
+    assert!(color.arrived(data.len(), 0));
+    assert!(color.arrived(4096, 0));
+    assert!(!color.arrived(4095, 0));
+    let parts = color.sample(&data, 0).expect("sample parts");
+    assert_eq!(parts.len(), 65535);
+    assert!(
+      parts
+        .iter()
+        .all(|part| part.len() == 4096 && part.as_ptr() == data.as_ptr())
+    );
     // 300 extents of the first 1000 bytes: the bytes of each
     let data = s8_with_extents(&[(0, 1000); 300]);
     let color = parsed(&data, None).color;
@@ -1564,6 +1589,7 @@ mod tests {
             for (part, full_part) in both {
               for i in 0..part.len() {
                 let arrived = sample_end(part, i) <= length as u64;
+                assert_eq!(part.arrived(length, i), arrived, "{name} {length}");
                 assert_eq!(part.sample(prefix, i).is_some(), arrived, "{name} {length}");
                 if arrived {
                   assert_eq!(part.sample(prefix, i), full_part.sample(&data, i));
@@ -1662,7 +1688,11 @@ mod tests {
             .flatten()
           {
             for i in 0..part.len().min(4) {
-              let _ = (part.sample(data, i), part.duration(i));
+              let _ = (
+                part.arrived(data.len(), i),
+                part.sample(data, i),
+                part.duration(i),
+              );
             }
             assert!(part.sample(data, part.len()).is_none());
           }
