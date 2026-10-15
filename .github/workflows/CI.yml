@@ -103,11 +103,14 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.settings.target }}
+          components: clippy
       - name: Install wasmtime
         if: matrix.settings.target
         uses: taiki-e/install-action@v2
         with:
           tool: wasmtime@49.0.2
+      - name: Clippy
+        run: cargo clippy --all-targets -p pixel-simd ${{ matrix.settings.target && format('--target {0}', matrix.settings.target) || '' }} -- -D warnings
       - name: Test
         run: cargo test --release -p pixel-simd ${{ matrix.settings.target && format('--target {0}', matrix.settings.target) || '' }}
       - name: Bench
