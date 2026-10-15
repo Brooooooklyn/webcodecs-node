@@ -121,6 +121,31 @@ pub fn run() {
         bitfields_to_bgra_with(isa, s, d, 4, argb2101010, true)
       })
     });
+    for layout in [Opaque::Bgr, Opaque::Bgrx, Opaque::Xbgr] {
+      time(&format!("bmp {layout:?}"), &mut |dst| {
+        rows(&src, layout.size(), dst, |s, d| {
+          opaque_to_bgra_with(isa, s, d, layout)
+        })
+      });
+    }
+    for (bits, len) in [
+      (1, 2),
+      (2, 4),
+      (4, 16),
+      (8, 16),
+      (8, 32),
+      (8, 64),
+      (8, 128),
+      (8, 256),
+    ] {
+      let palette = Palette::new(src.as_chunks().0[..len].iter().copied());
+      time(&format!("bmp {bits}-bit {len} colors"), &mut |dst| {
+        let row = WIDTH * bits / 8;
+        for (s, d) in src.chunks(row).zip(dst.chunks_mut(WIDTH * 4)) {
+          palette_to_bgra_with(isa, s, d, bits as u32, &palette)
+        }
+      });
+    }
     time("webp yuva420", &mut |dst| {
       yuva420_to_bgra_with(isa, &webp, dst, WIDTH * 4)
     });

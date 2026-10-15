@@ -221,3 +221,116 @@ fn bitfields_to_bgra_with(
     alpha,
   );
 }
+
+/// The layout of an opaque BMP pixel whose B, G and R are whole bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Opaque {
+  /// B, G, R (24-bit)
+  Bgr,
+  /// B, G, R and an unused byte (32-bit BI_RGB)
+  Bgrx,
+  /// An unused byte, then B, G, R (32-bit masks 0xFF000000, 0xFF0000 and 0xFF00, no alpha)
+  Xbgr,
+}
+
+impl Opaque {
+  /// Bytes per pixel.
+  pub fn size(self) -> usize {
+    match self {
+      Opaque::Bgr => 3,
+      Opaque::Bgrx | Opaque::Xbgr => 4,
+    }
+  }
+}
+
+/// BGRA pixels from opaque BMP pixels: their B, G and R, and 255. `dst` holds the pixels and `src`
+/// at least as many.
+pub fn opaque_to_bgra(src: &[u8], dst: &mut [u8], layout: Opaque) {
+  opaque_to_bgra_with(Isa::best(), src, dst, layout)
+}
+
+fn opaque_to_bgra_with(isa: Isa, src: &[u8], dst: &mut [u8], layout: Opaque) {
+  let size = layout.size();
+  assert!(
+    src.len() / size >= dst.len() / 4,
+    "opaque_to_bgra: short source"
+  );
+  let done = match isa.level() {
+    Level::Scalar => 0,
+    #[cfg(target_arch = "x86_64")]
+    Level::Sse2 => unsafe { x86::opaque_to_bgra_sse2(src, dst, layout) },
+    #[cfg(target_arch = "x86_64")]
+    Level::Ssse3 | Level::Avx2 => unsafe { x86::opaque_to_bgra_ssse3(src, dst, layout) },
+    #[cfg(target_arch = "aarch64")]
+    Level::Neon => unsafe { neon::opaque_to_bgra(src, dst, layout) },
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    Level::Simd128 => wasm::opaque_to_bgra(src, dst, layout),
+  };
+  scalar::opaque_to_bgra(&src[done * size..], &mut dst[done * 4..], layout);
+}
+
+/// Up to 256 opaque colors for `palette_to_bgra`. An index past them is black, like in a BMP.
+#[derive(Clone)]
+pub struct Palette {
+  len: usize,
+  bgra: [[u8; 4]; 256],
+  /// B, G and R of each color, 0 past `len`, for the SIMD lookups
+  planes: [[u8; 256]; 3],
+}
+
+impl Palette {
+  /// From B, G, R colors; the ones past 256 are left out.
+  pub fn new(colors: impl IntoIterator<Item = [u8; 3]>) -> Palette {
+    let mut palette = Palette {
+      len: 0,
+      bgra: [[0, 0, 0, 255]; 256],
+      planes: [[0; 256]; 3],
+    };
+    for (i, [b, g, r]) in colors.into_iter().take(256).enumerate() {
+      palette.bgra[i] = [b, g, r, 255];
+      for (plane, v) in palette.planes.iter_mut().zip([b, g, r]) {
+        plane[i] = v;
+      }
+      palette.len = i + 1;
+    }
+    palette
+  }
+
+  /// The BGRA color of `index`.
+  pub fn color(&self, index: u8) -> [u8; 4] {
+    self.bgra[usize::from(index)]
+  }
+}
+
+/// BGRA pixels from a BMP row of `bits`-bit palette indexes (1, 2, 4 or 8), the first pixel in
+/// the high bits of a byte. `dst` holds the pixels and `src` at least as many.
+pub fn palette_to_bgra(src: &[u8], dst: &mut [u8], bits: u32, palette: &Palette) {
+  palette_to_bgra_with(Isa::best(), src, dst, bits, palette)
+}
+
+fn palette_to_bgra_with(isa: Isa, src: &[u8], dst: &mut [u8], bits: u32, palette: &Palette) {
+  assert!(
+    matches!(bits, 1 | 2 | 4 | 8),
+    "palette_to_bgra: {bits}-bit indexes"
+  );
+  let per_byte = (8 / bits) as usize;
+  assert!(
+    src.len() * per_byte >= dst.len() / 4,
+    "palette_to_bgra: short source"
+  );
+  // Each path does whole source bytes, and leaves to the scalar code 8-bit rows whose palette
+  // is too large for its lookups to be faster.
+  let done = match isa.level() {
+    Level::Scalar => 0,
+    // SSE2 has no byte lookup (pshufb is SSSE3)
+    #[cfg(target_arch = "x86_64")]
+    Level::Sse2 => 0,
+    #[cfg(target_arch = "x86_64")]
+    Level::Ssse3 | Level::Avx2 => unsafe { x86::palette_to_bgra_ssse3(src, dst, bits, palette) },
+    #[cfg(target_arch = "aarch64")]
+    Level::Neon => unsafe { neon::palette_to_bgra(src, dst, bits, palette) },
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    Level::Simd128 => wasm::palette_to_bgra(src, dst, bits, palette),
+  };
+  scalar::palette_to_bgra(&src[done / per_byte..], &mut dst[done * 4..], bits, palette);
+}

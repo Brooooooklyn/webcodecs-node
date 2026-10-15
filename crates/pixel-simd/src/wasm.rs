@@ -5,7 +5,7 @@
 use core::arch::wasm32::*;
 
 use crate::simd::zip_chunks;
-use crate::{Alpha, Be16, Bitfield};
+use crate::{Alpha, Be16, Bitfield, Opaque, Palette};
 
 /// The first 16 bytes of `src`.
 #[inline]
@@ -185,4 +185,166 @@ pub(crate) fn bitfields32_to_bgra(
     let bg = v128_or(b.read32(w), i32x4_shl(g.read32(w), 8));
     store(d, v128_or(v128_or(bg, i32x4_shl(r.read32(w), 16)), aa));
   })
+}
+
+pub(crate) fn opaque_to_bgra(src: &[u8], dst: &mut [u8], layout: Opaque) -> usize {
+  match layout {
+    // 4 pixels from the first 12 bytes of each load and 255 (byte 0 of the second vector); the
+    // last load ends with the 48 bytes
+    Opaque::Bgr => {
+      16 * zip_chunks::<48, 64>(src, dst, |s, d| {
+        let ff = u8x16_splat(255);
+        for (i, at) in [0, 12, 24].into_iter().enumerate() {
+          let v = load(&s[at..]);
+          let v = i8x16_shuffle::<0, 1, 2, 16, 3, 4, 5, 16, 6, 7, 8, 16, 9, 10, 11, 16>(v, ff);
+          store(&mut d[16 * i..], v);
+        }
+        let v = load(&s[32..]);
+        let v = i8x16_shuffle::<4, 5, 6, 16, 7, 8, 9, 16, 10, 11, 12, 16, 13, 14, 15, 16>(v, ff);
+        store(&mut d[48..], v);
+      })
+    }
+    Opaque::Bgrx => 4 * zip_chunks::<16, 16>(src, dst, |s, d| store(d, opaque(load(s)))),
+    // a shuffle: wasm engines are slower at the 32-bit shift
+    Opaque::Xbgr => {
+      4 * zip_chunks::<16, 16>(src, dst, |s, d| {
+        let v = load(s);
+        let v = i8x16_shuffle::<1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12>(v, v);
+        store(d, opaque(v));
+      })
+    }
+  }
+}
+
+/// The B, G and R planes of a palette's first 16 * `T` colors.
+struct Planes<const T: usize>([[v128; T]; 3]);
+
+impl<const T: usize> Planes<T> {
+  #[inline]
+  fn new(palette: &Palette) -> Planes<T> {
+    Planes(
+      palette
+        .planes
+        .each_ref()
+        .map(|plane| core::array::from_fn(|i| load(&plane[16 * i..]))),
+    )
+  }
+
+  /// The colors of 16 indexes, as BGRA pixels at the start of `dst`; black past the planes.
+  #[inline]
+  fn store(&self, dst: &mut [u8], index: v128) {
+    let mut bgr = [u8x16_splat(0); 3];
+    for k in 0..T {
+      // swizzle gives 0 for 16 or more: the indexes past 16k + 15, and (wrapping) under 16k
+      let i = u8x16_sub(index, u8x16_splat((16 * k) as u8));
+      for (c, plane) in bgr.iter_mut().zip(&self.0) {
+        *c = v128_or(*c, u8x16_swizzle(plane[k], i));
+      }
+    }
+    let [b, g, r] = bgr;
+    let a = u8x16_splat(255);
+    let bg = [
+      i8x16_shuffle::<0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23>(b, g),
+      i8x16_shuffle::<8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31>(b, g),
+    ];
+    let ra = [
+      i8x16_shuffle::<0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23>(r, a),
+      i8x16_shuffle::<8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31>(r, a),
+    ];
+    for (i, (bg, ra)) in bg.into_iter().zip(ra).enumerate() {
+      store(
+        &mut dst[32 * i..],
+        i16x8_shuffle::<0, 8, 1, 9, 2, 10, 3, 11>(bg, ra),
+      );
+      store(
+        &mut dst[32 * i + 16..],
+        i16x8_shuffle::<4, 12, 5, 13, 6, 14, 7, 15>(bg, ra),
+      );
+    }
+  }
+}
+
+pub(crate) fn palette_to_bgra(src: &[u8], dst: &mut [u8], bits: u32, palette: &Palette) -> usize {
+  // 1, 2 and 4-bit indexes are under 16: one register per plane
+  match bits {
+    1 => {
+      let p = Planes::<1>::new(palette);
+      let bit = u8x16(128, 64, 32, 16, 8, 4, 2, 1, 128, 64, 32, 16, 8, 4, 2, 1);
+      128
+        * zip_chunks::<16, 512>(src, dst, |s, d| {
+          let x = load(s);
+          for i in 0..8 {
+            // bytes 2i and 2i + 1, 8 times each, to 16 indexes of 0 or 1
+            let (lo, hi) = (2 * i, 2 * i + 1);
+            let pair = u8x16_swizzle(
+              x,
+              u8x16(
+                lo, lo, lo, lo, lo, lo, lo, lo, hi, hi, hi, hi, hi, hi, hi, hi,
+              ),
+            );
+            let set = u8x16_eq(v128_and(pair, bit), bit);
+            p.store(&mut d[64 * usize::from(i)..], v128_and(set, u8x16_splat(1)));
+          }
+        })
+    }
+    2 => {
+      let p = Planes::<1>::new(palette);
+      64 * zip_chunks::<16, 256>(src, dst, |s, d| {
+        let (x, three) = (load(s), u8x16_splat(3));
+        let a = u8x16_shr(x, 6);
+        let b = v128_and(u8x16_shr(x, 4), three);
+        let c = v128_and(u8x16_shr(x, 2), three);
+        let e = v128_and(x, three);
+        // a, b, c, e of each byte in turn
+        let ab = [
+          i8x16_shuffle::<0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23>(a, b),
+          i8x16_shuffle::<8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31>(a, b),
+        ];
+        let ce = [
+          i8x16_shuffle::<0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23>(c, e),
+          i8x16_shuffle::<8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31>(c, e),
+        ];
+        for (i, (ab, ce)) in ab.into_iter().zip(ce).enumerate() {
+          p.store(
+            &mut d[128 * i..],
+            i16x8_shuffle::<0, 8, 1, 9, 2, 10, 3, 11>(ab, ce),
+          );
+          p.store(
+            &mut d[128 * i + 64..],
+            i16x8_shuffle::<4, 12, 5, 13, 6, 14, 7, 15>(ab, ce),
+          );
+        }
+      })
+    }
+    4 => {
+      let p = Planes::<1>::new(palette);
+      32 * zip_chunks::<16, 128>(src, dst, |s, d| {
+        let x = load(s);
+        let (high, low) = (u8x16_shr(x, 4), v128_and(x, u8x16_splat(15)));
+        p.store(
+          d,
+          i8x16_shuffle::<0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23>(high, low),
+        );
+        p.store(
+          &mut d[64..],
+          i8x16_shuffle::<8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31>(high, low),
+        );
+      })
+    }
+    // A swizzle per 16 colors: past 64 colors the scalar code is faster.
+    _ => match palette.len {
+      0..=16 => indexes::<1>(src, dst, palette),
+      17..=32 => indexes::<2>(src, dst, palette),
+      33..=48 => indexes::<3>(src, dst, palette),
+      49..=64 => indexes::<4>(src, dst, palette),
+      _ => 0,
+    },
+  }
+}
+
+/// 8-bit indexes, with a palette of at most 16 * `T` colors.
+#[inline]
+fn indexes<const T: usize>(src: &[u8], dst: &mut [u8], palette: &Palette) -> usize {
+  let p = Planes::<T>::new(palette);
+  16 * zip_chunks::<16, 64>(src, dst, |s, d| p.store(d, load(s)))
 }
