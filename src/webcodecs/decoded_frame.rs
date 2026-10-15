@@ -37,22 +37,19 @@ const FLAG_XYZ: i32 = 1 << 10;
 /// Where a decoded frame comes from. Chrome picks different formats per source.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum DecodedSource {
-  /// ImageDecoder, with what the file header says, when it says it:
+  /// ImageDecoder (but not JPEG, see `codec::jpeg`), with what the file header says, when it
+  /// says it:
   /// - `alpha`: the alpha it declares (WebP alpha flag; PNG, GIF and BMP: see `image_hints`,
   ///   for each frame of a GIF). Chrome labels the image BGRA or BGRX by it.
-  /// - `yuv`: whether Chrome decodes the image to YUV planes (JPEG: the sampling
-  ///   factors; AVIF: one still image without alpha; WebP: a simple lossy file, whose
-  ///   first chunk is VP8). An AVIF with YUV planes keeps them either way: WebCodecs has a
-  ///   format for them, its alpha plane is not decoded, and BGRX would lose precision.
-  ///   Only planar RGB (gbrp) follows Chrome.
-  /// - `size`: the size of a JPEG that Chrome scales for desiredWidth/desiredHeight (with
-  ///   `yuv: Some(false)`: such a JPEG is BGRX). It is resized in the conversion pass.
+  /// - `yuv`: whether Chrome decodes the image to YUV planes (AVIF: one still image without
+  ///   alpha; WebP: a simple lossy file, whose first chunk is VP8). An AVIF with YUV planes
+  ///   keeps them either way: WebCodecs has a format for them, its alpha plane is not decoded,
+  ///   and BGRX would lose precision. Only planar RGB (gbrp) follows Chrome.
   /// - `pixels`: what a PNG or BMP header says about pixels FFmpeg decodes differently.
   Image {
     codec: AVCodecID,
     alpha: Option<bool>,
     yuv: Option<bool>,
-    size: Option<(u32, u32)>,
     pixels: PixelHint,
   },
   /// VideoDecoder, software decoder
@@ -110,19 +107,13 @@ pub(crate) fn decoded_frame_format(
   {
     return skia_image(frame, codec, alpha, pixels);
   }
-  let size = match source {
-    DecodedSource::Image { size, .. } => size,
-    _ => None,
-  };
   match choose(&mut frame, source)? {
     Choice::Keep(format) => Ok((frame, format)),
-    // One swscale pass to the final size: a full-size converted copy of a large
-    // image is never made.
     Choice::Convert {
       format,
       desc,
       image,
-    } => Ok((convert(&frame, format, &desc, image, size)?, format)),
+    } => Ok((convert(&frame, format, &desc, image)?, format)),
     Choice::WebpRgb(format) => Ok((webp_rgb(&frame, format == VideoPixelFormat::BGRA)?, format)),
   }
 }
@@ -149,34 +140,22 @@ fn choose(frame: &mut Frame, source: DecodedSource) -> Result<Choice, CodecError
       },
     ));
   }
-  // Chrome decodes a JPEG to BGRX unless its sampling factors are ones it reads as YUV,
-  // even when FFmpeg's planes have a WebCodecs layout (FFmpeg reads 2x2/1x2/1x2 as yuvj422p).
-  let rgb_only = matches!(
-    source,
-    DecodedSource::Image {
-      codec: AVCodecID::Mjpeg,
-      yuv: Some(false),
-      ..
-    }
-  );
-  if !rgb_only {
-    if let Some(format) = VideoPixelFormat::from_av_format(av) {
-      return Ok(Choice::Keep(format));
-    }
+  if let Some(format) = VideoPixelFormat::from_av_format(av) {
+    return Ok(Choice::Keep(format));
+  }
 
-    // yuvj* is yuv* with full range: same planes, so only the format field changes.
-    let relabel = match av {
-      AVPixelFormat::Yuvj420p => Some(AVPixelFormat::Yuv420p),
-      AVPixelFormat::Yuvj422p => Some(AVPixelFormat::Yuv422p),
-      AVPixelFormat::Yuvj444p => Some(AVPixelFormat::Yuv444p),
-      _ => None,
-    };
-    if let Some(yuv) = relabel {
-      frame.set_format(yuv);
-      frame.set_color_range(AVColorRange::Jpeg);
-      let format = VideoPixelFormat::from_av_format(yuv).unwrap_or(VideoPixelFormat::I420);
-      return Ok(Choice::Keep(format));
-    }
+  // yuvj* is yuv* with full range: same planes, so only the format field changes.
+  let relabel = match av {
+    AVPixelFormat::Yuvj420p => Some(AVPixelFormat::Yuv420p),
+    AVPixelFormat::Yuvj422p => Some(AVPixelFormat::Yuv422p),
+    AVPixelFormat::Yuvj444p => Some(AVPixelFormat::Yuv444p),
+    _ => None,
+  };
+  if let Some(yuv) = relabel {
+    frame.set_format(yuv);
+    frame.set_color_range(AVColorRange::Jpeg);
+    let format = VideoPixelFormat::from_av_format(yuv).unwrap_or(VideoPixelFormat::I420);
+    return Ok(Choice::Keep(format));
   }
 
   match source {
@@ -273,7 +252,7 @@ fn skia_image(
     (AVPixelFormat::Ya16be, _) => be16(Be16::GrayAlpha)?,
     (AVPixelFormat::Rgb48be, _) => be16(Be16::Rgb)?,
     (AVPixelFormat::Rgba64be, _) => be16(Be16::Rgba)?,
-    _ => convert(&frame, format, &desc, true, None)?,
+    _ => convert(&frame, format, &desc, true)?,
   };
   // Only a kept frame is still RGBA.
   let swap = frame.format() == AVPixelFormat::Rgba;
@@ -382,8 +361,6 @@ fn image_has_alpha(
   }
   let palette = desc.flags & FLAG_PAL != 0;
   match codec {
-    // JPEG has no alpha (CMYK decodes to gbrap with an opaque alpha plane).
-    AVCodecID::Mjpeg => false,
     // BMP palettes have no alpha; FFmpeg zero-fills the entries the file does not list.
     AVCodecID::Bmp if palette => false,
     // Other palettes (a PNG whose header was not read): an entry that is not opaque.
@@ -434,21 +411,19 @@ fn video_target(desc: &PixDesc) -> VideoPixelFormat {
   }
 }
 
-/// Convert `src` to `format`, at `size` when given.
+/// Convert `src` to `format`.
 fn convert(
   src: &Frame,
   format: VideoPixelFormat,
   desc: &PixDesc,
   image: bool,
-  size: Option<(u32, u32)>,
 ) -> Result<Frame, CodecError> {
   if desc.flags & FLAG_HWACCEL != 0 {
     return Err(CodecError::InvalidState(
       "hardware frame was not downloaded".into(),
     ));
   }
-  let (width, height) = size.unwrap_or((src.width(), src.height()));
-  let mut dst = Frame::new_video(width, height, format.to_av_format())?;
+  let mut dst = Frame::new_video(src.width(), src.height(), format.to_av_format())?;
   // Images without a range tag are full range; video without one is limited range.
   check_error(unsafe {
     ffframe_convert_decoded(src.as_ptr(), dst.as_mut_ptr(), image as std::os::raw::c_int)

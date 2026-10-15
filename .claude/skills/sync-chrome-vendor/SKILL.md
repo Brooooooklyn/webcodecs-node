@@ -46,7 +46,11 @@ table below follows one Chrome stable version: the `chrome:` line of
      size check in `read_header`), `CalculateMaxDecodedBytes` (desired size) and
      `SetEmbeddedColorProfile` (when an ICC profile makes Chrome transform at decode time)
    - `third_party/blink/renderer/modules/webcodecs/image_decoder_core.cc`: no YUV after an
-     RGB decode of partial data (`allow_yuv`) and the color tags set at the end of `decode()`
+     RGB decode of partial data (`rgb_decode` and `jpeg_frame` in
+     `src/webcodecs/image_decoder.rs`) and the color tags set at the end of `decode()`
+   - `third_party/blink/renderer/modules/webcodecs/image_decoder_external.cc`: when a failure
+     rejects `tracks.ready`, the pending decodes and `completed` (`SetFailed`, `OnMetadata`),
+     followed by `jpeg_frame`, `close_if_failed` and `closed_error`
    - `media/base/limits.h` `kMaxDimension`: Chrome rejects a decoded frame wider or taller
      than this
    - the libjpeg-turbo `BUILD.gn` (in the vendored revision): the `defines` of `libjpeg`,
@@ -59,9 +63,9 @@ table below follows one Chrome stable version: the `chrome:` line of
      NASM flags that `assemble_libjpeg_turbo` in `build.rs` copies
 
    Port the decode changes to `src/ffi/jpeg_blink.c`, and size changes to
-   `jpeg_scale_numerator` (only on the labels branch, see the table). If `kRustyJpegFeature`
-   becomes enabled by default, or the factory picks the Rust decoder for the cases WebCodecs
-   uses, Chrome no longer decodes JPEG with libjpeg-turbo: follow RustyJpeg instead. Also look
+   `jpeg_scale_numerator`. If `kRustyJpegFeature` becomes enabled by default, or the factory
+   picks the Rust decoder for the cases WebCodecs uses, Chrome no longer decodes JPEG with
+   libjpeg-turbo: follow RustyJpeg instead. Also look
    for a RustyJpeg study in `testing/variations/fieldtrial_testing_config.json`: a field trial
    can switch some users to it, while the digests come from Chrome without field trials
    (Playwright starts Chrome with `--disable-field-trial-config`). There is none at
@@ -71,8 +75,10 @@ table below follows one Chrome stable version: the `chrome:` line of
    `apt-get install nasm`, or `NASM=<path>`); on macOS use NASM 3.00 or newer, older ones drop
    the `macho build_version` pragma and ld then warns.
    - `pnpm build`, then `cargo test --lib jpeg` (digests of Chrome's bytes for
-     `__test__/fixtures/jpeg`). The SIMD IDCTs give other bytes than the C one on corrupt
-     data, and Neon others than x86, so `decodes_chrome_simd_bytes` has one digest per
+     `__test__/fixtures/jpeg`) and the JPEG tests of `__test__/image-decoder-jpeg.spec.ts` and
+     `__test__/decoded-frame-format.spec.ts` (Chrome's formats, bytes, stream and error cases
+     through the JS API). The SIMD IDCTs give other bytes than the C one on corrupt data, and
+     Neon others than x86, so `decodes_chrome_simd_bytes` has one digest per
      family: Neon (aarch64 and armv7) from Chrome arm64, x86 from Chrome x86_64 (SSE2 and
      AVX2 give the same bytes). Keep its crafted fixtures at full size and M = 4 and 2: at
      M = 3, 5, 6 and 7 the IDCTs are C code that computes in `long`, so on such data armv7 and
@@ -132,18 +138,29 @@ table below follows one Chrome stable version: the `chrome:` line of
 - ICC profiles that Chrome applies at decode time with skcms (a CMYK profile on CMYK/YCCK,
   an RGB or gray profile Skia cannot hold exactly). Matching them needs skcms.
 
+`src/webcodecs/image_decoder.rs` has these, outside the JPEG decoder:
+
+- A stream whose last chunk and close come in the same task (both in `start()`, for
+  example), with a decode() already waiting: Chrome sees the end with the data and decodes YUV;
+  here the stream reader sees the end one task later, so the frame is BGRX (and an image that
+  fails rejects `completed`, where Chrome resolves it).
+- Size limits: Chrome fails a frame wider or taller than `kMaxDimension` (32767); here FFmpeg
+  allocates the frame, and fails it when (width + 128) × (height + 128) ≥ 2^28. Both fail the
+  metadata above 2^29 - 1 pixels.
+
 ## Ported code that follows Chrome
 
-Chrome 155.0.8059.79. Rows marked "labels branch" are on `fix/image-decoder-chrome-labels`.
+Chrome 155.0.8059.79.
 `src/ffi/jpeg_blink.c` is derived from Blink's `jpeg_image_decoder.cc` and keeps that file's
 licence notice (LGPL 2.1 or later, MPL 1.1 or GPL 2.0): keep it when you port changes.
 
-| What                                   | Chromium file and revision                                                                                      | Where here                                                                 |
-| -------------------------------------- | --------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| libjpeg-turbo, decoder and SIMD files  | `src/third_party/libjpeg_turbo` = `chromium/deps/libjpeg_turbo` @ `640f254ad0fa`                                | `vendor/libjpeg-turbo`, `tools/sync-libjpeg-turbo.mjs`                     |
-| Blink JPEG decode settings             | `third_party/blink/renderer/platform/image-decoders/jpeg/jpeg_image_decoder.cc` @ 155.0.8059.79                 | `src/ffi/jpeg_blink.c`, `src/codec/jpeg.rs`                                |
-| WebCodecs YUV gate and color tags      | `third_party/blink/renderer/modules/webcodecs/image_decoder_core.cc` @ 155.0.8059.79                            | `allow_yuv` and the color tags in `src/ffi/jpeg_blink.c`                   |
-| JPEG M/8 scale rule                    | same file, `DesiredScaleNumerator` @ 155.0.8059.79                                                              | `jpeg_scale_numerator` in `src/webcodecs/image_decoder.rs` (labels branch) |
-| libwebp fancy upsampler and YUV to RGB | `src/third_party/libwebp/src` @ `b43b2caa710c`: `src/dsp/upsampling.c`, `src/dec/io_dec.c`, `src/dsp/yuv.h`     | `webp_rgb` in `src/webcodecs/decoded_frame.rs` (labels branch)             |
-| Skia SkFrameHolder alpha rule (GIF)    | `src/third_party/skia` @ `29ed1e87a0a5`: `src/codec/SkCodec.cpp` `setAlphaAndRequiredFrame`                     | `frame_alpha` in `src/webcodecs/image_hints.rs` (labels branch)            |
-| image-rs BMP alpha rule                | `third_party/rust/chromium_crates_io/vendor/image-v0_25` (0.25.10) @ 155.0.8059.79: `src/codecs/bmp/decoder.rs` | `bmp_header` in `src/webcodecs/image_hints.rs` (labels branch)             |
+| What                                   | Chromium file and revision                                                                                      | Where here                                                                                                  |
+| -------------------------------------- | --------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| libjpeg-turbo, decoder and SIMD files  | `src/third_party/libjpeg_turbo` = `chromium/deps/libjpeg_turbo` @ `640f254ad0fa`                                | `vendor/libjpeg-turbo`, `tools/sync-libjpeg-turbo.mjs`                                                      |
+| Blink JPEG decode settings             | `third_party/blink/renderer/platform/image-decoders/jpeg/jpeg_image_decoder.cc` @ 155.0.8059.79                 | `src/ffi/jpeg_blink.c`, `src/codec/jpeg.rs`                                                                 |
+| JPEG M/8 scale rule                    | same file, `DesiredScaleNumerator` @ 155.0.8059.79                                                              | `jpeg_scale_numerator` in `src/webcodecs/image_decoder.rs`                                                  |
+| WebCodecs YUV gate and color tags      | `third_party/blink/renderer/modules/webcodecs/image_decoder_core.cc` @ 155.0.8059.79                            | `rgb_decode` and `jpeg_frame` in `src/webcodecs/image_decoder.rs`, the color tags in `src/ffi/jpeg_blink.c` |
+| WebCodecs failure schedule             | `third_party/blink/renderer/modules/webcodecs/image_decoder_external.cc` @ 155.0.8059.79                        | `jpeg_frame`, `close_if_failed` and `closed_error` in `src/webcodecs/image_decoder.rs`                      |
+| libwebp fancy upsampler and YUV to RGB | `src/third_party/libwebp/src` @ `b43b2caa710c`: `src/dsp/upsampling.c`, `src/dec/io_dec.c`, `src/dsp/yuv.h`     | `webp_rgb` in `src/webcodecs/decoded_frame.rs`                                                              |
+| Skia SkFrameHolder alpha rule (GIF)    | `src/third_party/skia` @ `29ed1e87a0a5`: `src/codec/SkCodec.cpp` `setAlphaAndRequiredFrame`                     | `frame_alpha` in `src/webcodecs/image_hints.rs`                                                             |
+| image-rs BMP alpha rule                | `third_party/rust/chromium_crates_io/vendor/image-v0_25` (0.25.10) @ 155.0.8059.79: `src/codecs/bmp/decoder.rs` | `bmp_header` in `src/webcodecs/image_hints.rs`                                                              |

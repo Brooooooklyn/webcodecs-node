@@ -9,10 +9,11 @@
  * C code that computes in long, so where long has 32 bits (armv7, Windows) such data gives
  * other bytes than Chrome on 64-bit macOS and Linux.
  *
- * All the data is here at once. Where Blink would wait for more data (libjpeg suspends), the
- * decode fails, as Chrome's does once it has all the data: a truncated file, or a file without
- * its EOI marker, is an error. Only the first image of concatenated JPEGs (MPO, gain map) is
- * read. libjpeg reports errors with longjmp: every setjmp and longjmp stays in this file.
+ * Each call reads the data given so far from the start. Where Blink would wait for more data
+ * (libjpeg suspends), it returns AVERROR(EAGAIN): Chrome fails the image if no more data comes,
+ * so a truncated file, or a file without its EOI marker, is an error once all the data is here.
+ * Only the first image of concatenated JPEGs (MPO, gain map) is read. libjpeg reports errors
+ * with longjmp: every setjmp and longjmp stays in this file.
  *
  * Chrome gives other bytes for:
  * - an ICC profile that Chrome applies at decode time with skcms (BGRX): a CMYK profile on a
@@ -151,7 +152,7 @@ static int read_header(Decoder *d) {
   jpeg_save_markers(info, JPEG_APP0 + 1, 0xFFFF);
   jpeg_save_markers(info, JPEG_APP0 + 2, 0xFFFF);
   jpeg_save_markers(info, JPEG_APP0 + 11, 0xFFFF);
-  if (jpeg_read_header(info, TRUE) != JPEG_HEADER_OK) return AVERROR_INVALIDDATA;
+  if (jpeg_read_header(info, TRUE) != JPEG_HEADER_OK) return AVERROR(EAGAIN);
 
   switch (info->jpeg_color_space) {
   case JCS_YCbCr:
@@ -216,14 +217,14 @@ static int output_rows(Decoder *d, JSAMPROW dummy) {
         rows[16 + i] = y < uv_height ? dst->data[1] + (size_t)y * dst->linesize[1] : dummy;
         rows[24 + i] = y < uv_height ? dst->data[2] + (size_t)y * dst->linesize[2] : dummy;
       }
-      if (!jpeg_read_raw_data(info, planes, DCTSIZE * v)) return AVERROR_INVALIDDATA;
+      if (!jpeg_read_raw_data(info, planes, DCTSIZE * v)) return AVERROR(EAGAIN);
     }
     if (info->output_scanline > info->output_height) info->output_scanline = info->output_height;
     return 0;
   }
   while (info->output_scanline < info->output_height) {
     JSAMPROW row = dst->data[0] + (size_t)info->output_scanline * dst->linesize[0];
-    if (jpeg_read_scanlines(info, &row, 1) != 1) return AVERROR_INVALIDDATA;
+    if (jpeg_read_scanlines(info, &row, 1) != 1) return AVERROR(EAGAIN);
     if (info->out_color_space != JCS_CMYK) continue;
     // SetPixel<JCS_CMYK>: Adobe's inverted CMYK, R = C * K / 255 (truncated), in place.
     for (JDIMENSION x = 0; x < info->output_width; x++, row += 4) {
@@ -275,7 +276,7 @@ static int decode(Decoder *d) {
   JSAMPROW dummy = NULL;
   if (d->yuv)
     dummy = info->mem->alloc_sarray((j_common_ptr)info, JPOOL_IMAGE, c[0].width_in_blocks * DCTSIZE, 1)[0];
-  if (!jpeg_start_decompress(info)) return AVERROR_INVALIDDATA;
+  if (!jpeg_start_decompress(info)) return AVERROR(EAGAIN);
 
   int ret;
   if (!info->buffered_image) {
@@ -292,19 +293,19 @@ static int decode(Decoder *d) {
           !first_scan && all_components_seen(info))
         first_scan = info->input_scan_number;
     } while (status != JPEG_SUSPENDED && status != JPEG_REACHED_EOI);
-    if (!first_scan) return AVERROR_INVALIDDATA;
+    if (!first_scan) return AVERROR(EAGAIN);
     for (;;) {
       int scan = info->input_scan_number;
       // Nothing out yet: show the last complete scan rather than one still arriving.
       if (!info->output_scan_number && scan > first_scan && status != JPEG_REACHED_EOI) --scan;
-      if (!jpeg_start_output(info, scan)) return AVERROR_INVALIDDATA;
+      if (!jpeg_start_output(info, scan)) return AVERROR(EAGAIN);
       if ((ret = output_rows(d, dummy)) < 0) return ret;
-      if (!jpeg_finish_output(info)) return AVERROR_INVALIDDATA;
+      if (!jpeg_finish_output(info)) return AVERROR(EAGAIN);
       if (jpeg_input_complete(info) && info->input_scan_number == info->output_scan_number) break;
     }
   }
-  // kJpegDone. Without the EOI marker this suspends, and Blink fails.
-  if (!jpeg_finish_decompress(info)) return AVERROR_INVALIDDATA;
+  // kJpegDone. Without the EOI marker this suspends.
+  if (!jpeg_finish_decompress(info)) return AVERROR(EAGAIN);
 
   // Chrome's tags for a JPEG without an ICC profile: sRGB, and for YUV the full-range BT.601
   // matrix (image_decoder_core.cc YUVColorSpaceToGfxColorSpace for kJPEG_Full).
@@ -362,14 +363,15 @@ static int run_decoder(const uint8_t *data, size_t size, int scale_num, int allo
 // width, output height, AVPixelFormat (yuv420p, yuv422p, yuv444p or bgra)}. allow_yuv = 0 gives
 // bgra for every image: Chrome's WebCodecs ImageDecoder keeps RGB once it has decoded rows before
 // all the data came (image_decoder_core.cc have_completed_rgb_decode_; Blink's
-// allow_decode_to_yuv_ needs all the data).
+// allow_decode_to_yuv_ needs all the data). AVERROR(EAGAIN): the data ends before the header does.
 int blink_jpeg_info(const uint8_t *data, size_t size, int scale_num, int allow_yuv, int *out) {
   if (!out) return AVERROR(EINVAL);
   return run_decoder(data, size, scale_num, allow_yuv, NULL, out);
 }
 
 // Decode at scale_num/8 into dst, allocated with the format and output size blink_jpeg_info
-// gives for the same scale_num and allow_yuv. On failure dst holds partial rows.
+// gives for the same scale_num and allow_yuv. AVERROR(EAGAIN): the data ends before the image
+// does. On failure dst holds partial rows.
 int blink_jpeg_decode(const uint8_t *data, size_t size, int scale_num, int allow_yuv, AVFrame *dst) {
   if (!dst) return AVERROR(EINVAL);
   return run_decoder(data, size, scale_num, allow_yuv, dst, NULL);

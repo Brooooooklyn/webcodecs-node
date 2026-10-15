@@ -59,13 +59,6 @@ async function decodeVideo(codec: string, data: Uint8Array): Promise<VideoFrame>
   return frames[0]
 }
 
-function maxDiff(a: Uint8Array, b: Uint8Array): number {
-  if (a.length !== b.length) return Infinity
-  let max = 0
-  for (let i = 0; i < a.length; i++) max = Math.max(max, Math.abs(a[i] - b[i]))
-  return max
-}
-
 // Runs `script` in a child Node process so a native crash or abort fails the test
 // instead of killing the ava worker. The script loads ./index.js and prints JSON.
 function runChild(script: string, extraEnv: NodeJS.ProcessEnv = {}): unknown {
@@ -753,8 +746,7 @@ test('ImageDecoder: a decoded RGB frame keeps its format and bytes through new V
 // ImageDecoder: JPEG (16x8, written by Pillow)
 // ============================================================================
 
-// [name, JPEG, Chrome format, Chrome layout, Chrome copyTo() bytes]. The two IDCTs
-// (FFmpeg, libjpeg-turbo) differ by 1 on some samples.
+// [name, JPEG, Chrome format, Chrome layout, Chrome copyTo() bytes]
 const JPEG_CASES: [string, string, VideoPixelFormat, number[][], string][] = [
   [
     '4:2:0',
@@ -804,15 +796,15 @@ for (const [name, jpeg, format, layout, chrome] of JPEG_CASES) {
     t.is(image.format, format)
     const copy = await rawCopy(image)
     t.deepEqual(copy.layout, layout)
-    t.true(maxDiff(copy.bytes, b64(chrome)) <= 1)
+    t.deepEqual(copy.bytes, b64(chrome))
     t.true(image.colorSpace.fullRange)
     image.close()
   })
 }
 
 // FFmpeg writes 4:2:2 JPEGs with 2x2/1x2/1x2 sampling factors and 4:4:4 with 1x2/1x2/1x2
-// (16x8, `ffmpeg -pix_fmt yuvj422p|yuvj444p`). FFmpeg reads them back as yuvj422p/yuvj444p,
-// but Chrome decodes a JPEG to YUV only for 1x1 chroma with 1x1, 2x1 or 2x2 luma: these are BGRX.
+// (16x8, `ffmpeg -pix_fmt yuvj422p|yuvj444p`). Chrome decodes a JPEG to YUV only for 1x1
+// chroma with 1x1, 2x1 or 2x2 luma: these are BGRX.
 // [name, JPEG, Chrome copyTo() bytes]
 const FFMPEG_JPEG_CASES: [string, string, string][] = [
   [
@@ -834,8 +826,7 @@ for (const [name, jpeg, chrome] of FFMPEG_JPEG_CASES) {
     t.is(image.allocationSize(), 16 * 8 * 4)
     const copy = await rawCopy(image)
     t.deepEqual(copy.layout, [[0, 64]])
-    // FFmpeg and libjpeg-turbo (IDCT, YCbCr -> RGB) differ by up to 2 on these samples
-    t.true(maxDiff(copy.bytes, b64(chrome)) <= 2)
+    t.deepEqual(copy.bytes, b64(chrome))
     image.close()
   })
 }
@@ -872,8 +863,7 @@ test('ImageDecoder: desiredWidth/desiredHeight do not scale PNG, GIF, WebP, AVIF
 
 // [JPEG_CASES name, desired size, Chrome's size, Chrome's copyTo() bytes (BGRX)]. Chrome
 // decodes at M/8 of the size, rounded up, with M = floor(sqrt(desired area / area) * 8),
-// and to BGRX when M < 8. libjpeg-turbo scales in its IDCT; here FFmpeg decodes the full
-// size and swscale averages areas, up to 4 apart on these samples.
+// and to BGRX when M < 8. libjpeg-turbo scales in its IDCT.
 const SCALED_JPEG_CASES: [string, [number, number], [number, number], string][] = [
   [
     '4:2:0',
@@ -904,7 +894,7 @@ for (const [name, [desiredWidth, desiredHeight], [width, height], chrome] of SCA
     t.deepEqual([image.codedWidth, image.codedHeight], [width, height])
     const copy = await rawCopy(image)
     t.deepEqual(copy.layout, [[0, width * 4]])
-    t.true(maxDiff(copy.bytes, b64(chrome)) <= 4)
+    t.deepEqual(copy.bytes, b64(chrome))
     image.close()
   })
 }
