@@ -514,6 +514,8 @@ test('ImageDecoder: a JPEG desired size below 1/64 of its area fails the metadat
   // 320x240: 39x30 needs a scale below 1/8
   const data = readFileSync(join(__dirname, 'fixtures/wpt/four-colors.jpg'))
   const decoder = new ImageDecoder({ data, type: 'image/jpeg', desiredWidth: 39, desiredHeight: 30 })
+  // Read and never awaited: like Chrome, its rejection is not reported as unhandled.
+  t.true(decoder.tracks.ready instanceof Promise)
   const completed = decoder.completed
   const pending = decoder.decode()
   const metadataError = { instanceOf: DOMException, name: 'InvalidStateError', message: 'Failed to retrieve track metadata.' }
@@ -528,7 +530,15 @@ test('ImageDecoder: a JPEG desired size below 1/64 of its area fails the metadat
 
 test('ImageDecoder: a streamed JPEG with a desired size below 1/64 of its area rejects completed, like Chrome', async (t) => {
   const data = new Uint8Array(readFileSync(join(__dirname, 'fixtures/wpt/four-colors.jpg')))
-  for (const chunks of [[data], [data.subarray(0, 300), data.subarray(300)]]) {
+  // With a COM segment bigger than the scan, cut before SOS, the metadata fails only once the last chunk is in.
+  const com = [0xff, 0xfe, 1202 >> 8, 1202 & 0xff, ...new Uint8Array(1200)]
+  const withCom = new Uint8Array([...data.subarray(0, 2), ...com, ...data.subarray(2)])
+  const sos = withCom.findIndex((byte, i) => byte === 0xff && withCom[i + 1] === 0xda)
+  for (const chunks of [
+    [data],
+    [data.subarray(0, 300), data.subarray(300)],
+    [withCom.subarray(0, sos), withCom.subarray(sos)],
+  ]) {
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(chunks[0])

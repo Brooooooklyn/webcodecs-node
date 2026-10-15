@@ -612,15 +612,19 @@ test('ImageDecoder: a BMP bitfield mask the image crate rejects fails the metada
     compression: 3,
     masks: [0x7c00, 0x3e0, 0x1f, 0x8001],
   })
-  const decoder = new ImageDecoder({ data, type: 'image/bmp' })
-  const pending = decoder.decode()
-  await t.throwsAsync(decoder.tracks.ready, {
-    instanceOf: DOMException,
-    name: 'InvalidStateError',
-    message: 'Failed to retrieve track metadata.',
-  })
-  await t.throwsAsync(pending, { instanceOf: DOMException, name: 'EncodingError', message: 'Failed to decode frame at index 0' })
-  t.true(decoder.closed)
+  // A decode() made in the constructor's task is always still pending when the decoder closes
+  // (Chrome closes it in a task of its own).
+  for (let i = 0; i < 100; i++) {
+    const decoder = new ImageDecoder({ data, type: 'image/bmp' })
+    const pending = decoder.decode()
+    await t.throwsAsync(decoder.tracks.ready, {
+      instanceOf: DOMException,
+      name: 'InvalidStateError',
+      message: 'Failed to retrieve track metadata.',
+    })
+    await t.throwsAsync(pending, { instanceOf: DOMException, name: 'EncodingError', message: 'Failed to decode frame at index 0' })
+    t.true(decoder.closed)
+  }
 })
 
 // A lossy WebP 33x17 with a VP8X header and no alpha (yuv420p)
