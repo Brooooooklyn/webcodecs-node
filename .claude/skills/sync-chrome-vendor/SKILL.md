@@ -67,15 +67,18 @@ table below follows one Chrome stable version: the `chrome:` line of
    (Playwright starts Chrome with `--disable-field-trial-config`). There is none at
    155.0.8059.79. Check the other rows of the table the same way.
 
-4. Rebuild and check. x86_64 builds need NASM (`brew install nasm`, `apt-get install nasm`,
-   or `NASM=<path>`); on macOS use NASM 3.00 or newer, older ones drop the
-   `macho build_version` pragma and ld then warns.
+4. Rebuild and check. x86_64 builds need NASM 2.15.05 or newer (`brew install nasm`,
+   `apt-get install nasm`, or `NASM=<path>`); on macOS use NASM 3.00 or newer, older ones drop
+   the `macho build_version` pragma and ld then warns.
    - `pnpm build`, then `cargo test --lib jpeg` (digests of Chrome's bytes for
      `__test__/fixtures/jpeg`). The SIMD IDCTs give other bytes than the C one on corrupt
      data, and Neon others than x86, so `decodes_chrome_simd_bytes` has one digest per
      family: Neon (aarch64 and armv7) from Chrome arm64, x86 from Chrome x86_64 (SSE2 and
-     AVX2 give the same bytes). On an Apple silicon Mac also run the tests for
-     `x86_64-apple-darwin`, once as is (SSE2) and once with `ROSETTA_ADVERTISE_AVX=1` (AVX2)
+     AVX2 give the same bytes). Keep its crafted fixtures at full size and M = 4 and 2: at
+     M = 3, 5, 6 and 7 the IDCTs are C code that computes in `long`, so on such data armv7 and
+     Windows (32-bit `long`) give other bytes than Chrome on 64-bit macOS and Linux. On an
+     Apple silicon Mac also run the tests for `x86_64-apple-darwin`, once as is (SSE2) and
+     once with `ROSETTA_ADVERTISE_AVX=1` (AVX2)
    - `nm -g --defined-only` on `target/**/build/webcodecs-node-*/out/libjpeg_turbo.a`: every
      symbol starts with `webcodecs_` (`_webcodecs_` on macOS), the `jsimd_*` and `jconst_*`
      ones too
