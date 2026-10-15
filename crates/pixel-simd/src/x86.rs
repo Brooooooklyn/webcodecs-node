@@ -378,6 +378,9 @@ impl<const T: usize> Planes<T> {
   }
 }
 
+/// The largest palette of 8-bit indexes that the lookups below take.
+pub(crate) const PALETTE_COLORS: usize = 32;
+
 #[target_feature(enable = "ssse3")]
 pub(crate) fn palette_to_bgra_ssse3(
   src: &[u8],
@@ -438,7 +441,7 @@ pub(crate) fn palette_to_bgra_ssse3(
     // A pshufb per 16 colors: past 32 colors the scalar code is faster.
     _ => match palette.len {
       0..=16 => indexes::<1>(src, dst, palette),
-      17..=32 => indexes::<2>(src, dst, palette),
+      17..=PALETTE_COLORS => indexes::<2>(src, dst, palette),
       _ => 0,
     },
   }
