@@ -571,6 +571,9 @@ test('ImageDecoder: a close() in the decode() task or a microtask wins over a fa
   // The worker thread can find the failed metadata before the JS task reaches close(). The close()
   // still wins, as on main: decode() rejects with "ImageDecoder is closed", ready and completed
   // resolve. (Chrome 155 rejects decode() with AbortError "Aborted by failure." here.)
+  const badJpeg = new Uint8Array(readFileSync(join(__dirname, 'fixtures/wpt/four-colors.jpg')))
+  const sof = badJpeg.findIndex((byte, i) => byte === 0xff && badJpeg[i + 1] === 0xc2)
+  badJpeg.fill(0, sof + 7, sof + 9)
   const cases: [string, ImageDecoderInit][] = [
     // 32-bit BI_BITFIELDS, red mask 0x00f0f000 (not contiguous): fails before any FFmpeg work
     [
@@ -586,7 +589,7 @@ test('ImageDecoder: a close() in the decode() task or a microtask wins over a fa
         ),
       },
     ],
-    // M = 0: fails after the FFmpeg decode
+    // M = 0: fails once the header is read, before any decode
     [
       'JPEG desired 39x30',
       {
@@ -596,6 +599,8 @@ test('ImageDecoder: a close() in the decode() task or a microtask wins over a fa
         desiredHeight: 30,
       },
     ],
+    // SOF width 0: libjpeg-turbo fails the header
+    ['JPEG with a bad header', { type: 'image/jpeg', data: badJpeg }],
   ]
   const busy = (ms: number) => {
     const end = performance.now() + ms
