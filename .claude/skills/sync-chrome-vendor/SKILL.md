@@ -144,6 +144,12 @@ table below follows one Chrome stable version: the `chrome:` line of
   example), with a decode() already waiting: Chrome sees the end with the data and decodes YUV;
   here the stream reader sees the end one task later, so the frame is BGRX (and an image that
   fails rejects `completed`, where Chrome resolves it).
+- A stream that stays open after its last byte: a waiting decode() resolves (or fails) at the
+  close, or at the next probe when the data has doubled, as for every format here. Chrome
+  decodes again on each chunk and answers as soon as the frame is whole.
+- reset() while a decode() made before all the data is pending: Chrome aborts that decode, so a
+  decode() after all the data gives YUV planes. Here reset() does not abort it (all formats),
+  so the frame is BGRX.
 - Size limits: Chrome fails a frame wider or taller than `kMaxDimension` (32767); here FFmpeg
   allocates the frame, and fails it when (width + 128) × (height + 128) ≥ 2^28. Both fail the
   metadata above 2^29 - 1 pixels.
