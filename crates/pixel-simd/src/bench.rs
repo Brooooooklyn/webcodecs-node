@@ -142,7 +142,7 @@ pub fn run() {
       time(&format!("bmp {bits}-bit {len} colors"), &mut |dst| {
         let row = WIDTH * bits / 8;
         for (s, d) in src.chunks(row).zip(dst.chunks_mut(WIDTH * 4)) {
-          palette_to_bgra_with(isa, s, d, bits as u32, &palette)
+          palette_to_bgra_with(isa, s, d, bits as u32, &palette);
         }
       });
     }

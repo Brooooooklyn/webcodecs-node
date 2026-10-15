@@ -300,15 +300,48 @@ impl Palette {
   pub fn color(&self, index: u8) -> [u8; 4] {
     self.bgra[usize::from(index)]
   }
+
+  /// Whether `palette_to_bgra` has a SIMD path on this CPU for `bits`-bit indexes into this
+  /// palette. Without one it runs only the scalar code, which is faster in the caller's own row
+  /// loop, without the call.
+  pub fn simd(&self, bits: u32) -> bool {
+    palette_lookup(Isa::best(), bits, self.len)
+  }
+}
+
+/// Whether `isa` has a SIMD path for `bits`-bit indexes into `colors` colors: 1 to 4-bit indexes
+/// fit one register of each plane, 8-bit ones take a register per 16 colors, up to each path's
+/// largest palette.
+fn palette_lookup(isa: Isa, bits: u32, colors: usize) -> bool {
+  let largest = match isa.level() {
+    Level::Scalar => return false,
+    // SSE2 has no byte lookup (pshufb is SSSE3)
+    #[cfg(target_arch = "x86_64")]
+    Level::Sse2 => return false,
+    #[cfg(target_arch = "x86_64")]
+    Level::Ssse3 | Level::Avx2 => x86::PALETTE_COLORS,
+    #[cfg(target_arch = "aarch64")]
+    Level::Neon => neon::PALETTE_COLORS,
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    Level::Simd128 => wasm::PALETTE_COLORS,
+  };
+  bits < 8 || colors <= largest
 }
 
 /// BGRA pixels from a BMP row of `bits`-bit palette indexes (1, 2, 4 or 8), the first pixel in
 /// the high bits of a byte. `dst` holds the pixels and `src` at least as many.
 pub fn palette_to_bgra(src: &[u8], dst: &mut [u8], bits: u32, palette: &Palette) {
-  palette_to_bgra_with(Isa::best(), src, dst, bits, palette)
+  palette_to_bgra_with(Isa::best(), src, dst, bits, palette);
 }
 
-fn palette_to_bgra_with(isa: Isa, src: &[u8], dst: &mut [u8], bits: u32, palette: &Palette) {
+/// Returns how many pixels the SIMD path did.
+fn palette_to_bgra_with(
+  isa: Isa,
+  src: &[u8],
+  dst: &mut [u8],
+  bits: u32,
+  palette: &Palette,
+) -> usize {
   assert!(
     matches!(bits, 1 | 2 | 4 | 8),
     "palette_to_bgra: {bits}-bit indexes"
@@ -333,4 +366,5 @@ fn palette_to_bgra_with(isa: Isa, src: &[u8], dst: &mut [u8], bits: u32, palette
     Level::Simd128 => wasm::palette_to_bgra(src, dst, bits, palette),
   };
   scalar::palette_to_bgra(&src[done / per_byte..], &mut dst[done * 4..], bits, palette);
+  done
 }
