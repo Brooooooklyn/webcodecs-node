@@ -1,5 +1,6 @@
-//! The pixel loops of the addon's image decoding (PNG, BMP and lossy WebP to BGRA, with Chrome's
-//! bytes). Each has SIMD paths that give exactly the bytes of its scalar code, on every input:
+//! The pixel loops of the addon's image decoding (PNG, BMP, lossy WebP and AVIF to BGRA, with
+//! Chrome's bytes). Each has SIMD paths that give exactly the bytes of its scalar code, on every
+//! input, except the AVIF rows (`avif`), which have only their scalar code:
 //!
 //! - x86_64: SSE2 (part of the target), plus SSSE3 and AVX2 when the CPU has them
 //! - aarch64: NEON (part of the target)
@@ -8,6 +9,7 @@
 //!
 //! The scalar code is the reference: the tests run every path this CPU has against it.
 
+pub mod avif;
 mod isa;
 #[cfg(target_arch = "aarch64")]
 mod neon;

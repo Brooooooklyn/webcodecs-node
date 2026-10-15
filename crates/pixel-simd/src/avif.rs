@@ -1,0 +1,387 @@
+//! The rows of a decoded AVIF's YUV(A) to BGRA, the way Chrome 155 converts them: CrabbyAvif
+//! 3da6b895 rgb::Image::convert_from_yuv (BGRA, automatic chroma upsampling, unpremultiplied
+//! output) on the C rows of libyuv 2dd42573 that its find_conversion_function picks, or
+//! CrabbyAvif's f32 rgb_impl for the matrices libyuv has no constants for. Chrome's NEON, SSSE3
+//! and AVX2 rows give the same bytes. The caller picks the rows for a frame.
+//!
+//! Samples deeper than 8 bits come in 16-bit words. One change from libyuv: chroma that is
+//! upsampled is clamped to the bit depth first (AV1 decoders never output more).
+
+/// The matrices libyuv has constants for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Matrix {
+  Bt601,
+  Bt709,
+  Bt2020,
+}
+
+/// libyuv YuvConstants (row_common.cc, LIBYUV_UNLIMITED_* off): YG, YB, UB, UG, VG, VR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Constants([i32; 6]);
+
+/// By matrix, limited range first: I601, JPEG, H709, F709, 2020, V2020.
+const CONSTANTS: [[i32; 6]; 6] = [
+  [18997, -1160, 128, 25, 52, 102],
+  [16320, 32, 113, 22, 46, 90],
+  [18997, -1160, 128, 14, 34, 115],
+  [16320, 32, 119, 12, 30, 101],
+  [19003, -1160, 128, 12, 42, 107],
+  [16320, 32, 120, 11, 37, 94],
+];
+
+impl Constants {
+  pub fn new(matrix: Matrix, full_range: bool) -> Constants {
+    Constants(CONSTANTS[2 * matrix as usize + usize::from(full_range)])
+  }
+}
+
+/// libyuv's integer YUV to RGB of one pixel (the YuvPixel math after its input stage): luma
+/// expanded to 16 bits, 8-bit chroma; B, G, R.
+#[inline(always)]
+fn yuv_pixel(y16: u16, u: u8, v: u8, k: &Constants) -> [u8; 3] {
+  let [yg, yb, ub, ug, vg, vr] = k.0;
+  let y1 = ((u32::from(y16) * yg as u32) >> 16) as i32;
+  let (u, v) = (i32::from(u), i32::from(v));
+  [
+    clamp6(y1 + u * ub - (ub * 128 - yb)),
+    clamp6(y1 + (ug * 128 + vg * 128 + yb) - (u * ug + v * vg)),
+    clamp6(y1 + v * vr - (vr * 128 - yb)),
+  ]
+}
+
+fn clamp6(z: i32) -> u8 {
+  if z < 0 { 0 } else { (z >> 6).min(255) as u8 }
+}
+
+/// libyuv I444AlphaToARGBRow_C (I444ToARGBRow_C without alpha): 8-bit Y, U and V, one of each
+/// per pixel, and alpha (None: 255) to the BGRA pixels of `dst`.
+pub fn yuv8_to_bgra(y: &[u8], u: &[u8], v: &[u8], a: Option<&[u8]>, k: &Constants, dst: &mut [u8]) {
+  for (i, px) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+    let [b, g, r] = yuv_pixel(u16::from(y[i]) * 0x0101, u[i], v[i], k);
+    *px = [b, g, r, a.map_or(255, |a| a[i])];
+  }
+}
+
+/// libyuv I410AlphaToARGBRow_C: 10-bit Y, U and V, one of each per pixel.
+pub fn yuv10_to_bgra(
+  y: &[u16],
+  u: &[u16],
+  v: &[u16],
+  a: Option<&[u8]>,
+  k: &Constants,
+  dst: &mut [u8],
+) {
+  for (i, px) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+    *px = pixel16(y[i], u[i], v[i], 10, k);
+  }
+  put_alpha(a, dst);
+}
+
+/// libyuv I212ToARGBRow_C as I012ToARGBMatrix runs it: 12-bit Y, and U and V with one sample
+/// for each pair of pixels (and the last pixel of an odd width).
+pub fn yuv12_to_bgra(
+  y: &[u16],
+  u: &[u16],
+  v: &[u16],
+  a: Option<&[u8]>,
+  k: &Constants,
+  dst: &mut [u8],
+) {
+  let (pairs, last) = dst.as_chunks_mut::<4>().0.as_chunks_mut::<2>();
+  for (c, pair) in pairs.iter_mut().enumerate() {
+    pair[0] = pixel16(y[2 * c], u[c], v[c], 12, k);
+    pair[1] = pixel16(y[2 * c + 1], u[c], v[c], 12, k);
+  }
+  let c = pairs.len();
+  if let [px] = last {
+    *px = pixel16(y[2 * c], u[c], v[c], 12, k);
+  }
+  put_alpha(a, dst);
+}
+
+/// libyuv YuvPixel10 and YuvPixel12: a `depth`-bit pixel, alpha 255. Luma expands in 16 bits
+/// (y << 6 | y >> 4 for 10 bits, which wraps above the depth), chroma saturates at 8 bits.
+#[inline(always)]
+fn pixel16(y: u16, u: u16, v: u16, depth: u32, k: &Constants) -> [u8; 4] {
+  let y16 = (u32::from(y) << (16 - depth) | u32::from(y) >> (2 * depth - 16)) as u16;
+  let chroma = |c: u16| (c >> (depth - 8)).min(255) as u8;
+  let [b, g, r] = yuv_pixel(y16, chroma(u), chroma(v), k);
+  [b, g, r, 255]
+}
+
+/// libyuv I400ToARGBRow_C: 8-bit gray (U = V = 128) and alpha (None: 255) to BGRA.
+pub fn gray8_to_bgra(y: &[u8], a: Option<&[u8]>, k: &Constants, dst: &mut [u8]) {
+  for (i, px) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+    let [b, g, r] = yuv_pixel(u16::from(y[i]) * 0x0101, 128, 128, k);
+    *px = [b, g, r, a.map_or(255, |a| a[i])];
+  }
+}
+
+/// The A bytes of the BGRA pixels of `dst` from `a`, over the 255 that `pixel16` stores. The
+/// 16-bit rows take alpha in a pass of its own: with the Option in their loops, they do not
+/// vectorize.
+fn put_alpha(a: Option<&[u8]>, dst: &mut [u8]) {
+  if let Some(a) = a {
+    for (i, px) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+      px[3] = a[i];
+    }
+  }
+}
+
+/// libyuv Convert16To8Row_C: samples shifted right by `shift` (truncating), 255 at most.
+pub fn convert16_to8(src: &[u16], shift: u32, dst: &mut [u8]) {
+  for (i, d) in dst.iter_mut().enumerate() {
+    *d = (src[i] >> shift).min(255) as u8;
+  }
+}
+
+/// The chroma rows that 4:2:0 output row `row` of `height` (4:2:2 and 4:4:4 when not
+/// `subsampled`) takes its chroma from: the nearer one and the other one, which libyuv and
+/// rgb_impl weight 3:1. The first row and the last row of an even height use the nearer row
+/// alone (twice).
+pub fn chroma_rows(row: usize, height: usize, subsampled: bool) -> [usize; 2] {
+  if !subsampled {
+    return [row; 2];
+  }
+  [row / 2, far(row, height)]
+}
+
+/// The other chroma sample (row or column) for sample `i` of `n`: the nearer one at the edges.
+fn far(i: usize, n: usize) -> usize {
+  if i == 0 || (i == n - 1 && i % 2 == 1) {
+    i / 2
+  } else if i % 2 == 1 {
+    i / 2 + 1
+  } else {
+    i / 2 - 1
+  }
+}
+
+/// libyuv ScaleRowUp2_Bilinear_Any_C for one output row of `dst.len()` samples from the chroma
+/// rows of `chroma_rows`: 3:1 between the rows, then 3:1 between the columns, with libyuv's edge
+/// pixels. With `far` == `near` it is ScaleRowUp2_Linear_Any_C.
+pub fn upsample8(near: &[u8], far: &[u8], dst: &mut [u8]) {
+  let w = dst.len();
+  upsample(
+    |x| near[x].into(),
+    |x| far[x].into(),
+    w,
+    |i, s| dst[i] = s as u8,
+  );
+}
+
+/// The same for samples of `depth` bits (9 to 12) in 16-bit words; larger samples count as
+/// (1 << depth) - 1.
+pub fn upsample16(near: &[u16], far: &[u16], depth: u32, dst: &mut [u16]) {
+  assert!((9..=12).contains(&depth), "upsample16: depth {depth}");
+  let max = (1 << depth) - 1;
+  let w = dst.len();
+  upsample(
+    |x| u32::from(near[x]).min(max),
+    |x| u32::from(far[x]).min(max),
+    w,
+    |i, s| dst[i] = s as u16,
+  );
+}
+
+fn upsample(
+  near: impl Fn(usize) -> u32,
+  far: impl Fn(usize) -> u32,
+  w: usize,
+  mut put: impl FnMut(usize, u32),
+) {
+  if w == 0 {
+    return;
+  }
+  put(0, (3 * near(0) + far(0) + 2) >> 2);
+  for x in 0..((w - 1) & !1) / 2 {
+    let (n0, n1, f0, f1) = (near(x), near(x + 1), far(x), far(x + 1));
+    put(2 * x + 1, (n0 * 9 + n1 * 3 + f0 * 3 + f1 + 8) >> 4);
+    put(2 * x + 2, (n0 * 3 + n1 * 9 + f0 + f1 * 3 + 8) >> 4);
+  }
+  let x = (w - 1) / 2;
+  put(w - 1, (3 * near(x) + far(x) + 2) >> 2);
+}
+
+/// CrabbyAvif's 8-bit alpha from `depth`-bit alpha samples: made full range first when
+/// `limited` (alpha_to_full_range), then shifted down to 8 bits (truncating, like libyuv's YUVA
+/// rows and Convert16To8), or with `scale` rescaled in f32 (import_alpha_from).
+pub fn alpha_to_8bit<T: Copy + Into<u32>>(
+  src: &[T],
+  depth: u32,
+  limited: bool,
+  scale: bool,
+  dst: &mut [u8],
+) {
+  for (i, d) in dst.iter_mut().enumerate() {
+    let a = alpha(src[i], depth, limited);
+    *d = if scale {
+      scale_alpha(a, depth)
+    } else {
+      (a >> (depth - 8)).min(255) as u8
+    };
+  }
+}
+
+/// An alpha sample, made full range when `limited`
+fn alpha<T: Into<u32>>(sample: T, depth: u32, limited: bool) -> u32 {
+  let a = sample.into();
+  if !limited {
+    return a;
+  }
+  let (lo, span, max) = (16 << (depth - 8), 219 << (depth - 8), (1 << depth) - 1);
+  (((a as i32 - lo) * max + span / 2) / span).clamp(0, max) as u32
+}
+
+/// import_alpha_from: an alpha sample rescaled to 8 bits in f32
+fn scale_alpha(a: u32, depth: u32) -> u8 {
+  ((0.5 + a as f32 / ((1 << depth) - 1) as f32 * 255.0) as u32).min(255) as u8
+}
+
+/// libyuv ARGBUnattenuateRow_C on BGRA pixels, in place. Its fixed_invtbl8 holds 0x10000 / a,
+/// except 0 for a = 0, 0xffff for a = 1 and 0x100 for a = 255.
+pub fn unattenuate(pixels: &mut [u8]) {
+  for px in pixels.as_chunks_mut::<4>().0 {
+    let a = u32::from(px[3]);
+    let ia = match a {
+      0 => 0,
+      1 => 0xffff,
+      255 => 0x100,
+      _ => 0x10000 / a,
+    };
+    for c in &mut px[..3] {
+      *c = ((u32::from(*c) * 0x101 * ia) >> 16).min(255) as u8;
+    }
+  }
+}
+
+/// How CrabbyAvif's rgb_impl makes R, G and B.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Transform {
+  /// A matrix with these Kr and Kb (Kg = 1 - Kr - Kb).
+  Coefficients {
+    kr: f32,
+    kb: f32,
+  },
+  /// G, B, R are Y, U, V.
+  Identity,
+  YCgCo,
+  /// YCgCo-Re (H.273 (62)-(65)) on Cg and Co rounded back to integers.
+  YCgCoRe,
+}
+
+/// A frame's settings for `rgb_impl_row`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RgbImpl {
+  pub transform: Transform,
+  /// Bits per sample: 8, 10 or 12.
+  pub depth: u32,
+  pub full_range: bool,
+  /// One chroma sample for every 2 pixels of a row (4:2:0, 4:2:2): bilinear, 9:3:3:1.
+  pub subsampled: bool,
+  /// The alpha samples are limited range.
+  pub alpha_limited: bool,
+  /// Undo premultiplied alpha in f32 (yuv_to_rgb_any; yuv_to_rgb_fast leaves it to
+  /// `unattenuate`).
+  pub unpremultiply: bool,
+}
+
+/// CrabbyAvif rgb_impl in f32 for one row of BGRA pixels in `dst`, from the samples of `y`, of
+/// the `chroma_rows` of U and V (None for gray: R = G = B = Y) and of alpha (None: 255).
+pub fn rgb_impl_row<T: Copy + Into<u32>>(
+  p: &RgbImpl,
+  y: &[T],
+  uv: Option<[[&[T]; 2]; 2]>,
+  a: Option<&[T]>,
+  dst: &mut [u8],
+) {
+  let depth = p.depth;
+  let mx = (1u32 << depth) - 1;
+  let maxf = mx as f32;
+  let (by, ry) = if p.full_range {
+    (0.0, maxf)
+  } else {
+    ((16 << (depth - 8)) as f32, (219 << (depth - 8)) as f32)
+  };
+  let (bc, rc) = match p.transform {
+    Transform::Identity => (by, ry),
+    _ if p.full_range => ((1 << (depth - 1)) as f32, maxf),
+    _ => ((1 << (depth - 1)) as f32, (224 << (depth - 8)) as f32),
+  };
+  let unorm = |row: &[T], x: usize| (row[x].into().min(mx) as f32 - bc) / rc;
+  let unit = |v: f32| v.clamp(0.0, 1.0);
+  let w = dst.len() / 4;
+  for (i, px) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+    let cy = y[i].into().min(mx);
+    let yf = (cy as f32 - by) / ry;
+    let (ci, fi) = if p.subsampled {
+      (i / 2, far(i, w))
+    } else {
+      (i, i)
+    };
+    let [u, v] = uv.map_or([0.5; 2], |uv| {
+      uv.map(|[near, far]| {
+        let x = unorm(near, ci);
+        if !p.subsampled {
+          return x;
+        }
+        // bilinear weights 9, 3, 3, 1 (/16)
+        x * (9.0 / 16.0)
+          + unorm(near, fi) * (3.0 / 16.0)
+          + unorm(far, ci) * (3.0 / 16.0)
+          + unorm(far, fi) * (1.0 / 16.0)
+      })
+    });
+    let (mut r, mut g, mut b) = if uv.is_none() {
+      (yf, yf, yf)
+    } else {
+      match p.transform {
+        Transform::Identity => (v, yf, u),
+        Transform::YCgCo => {
+          let t = yf - u;
+          (t + v, yf + u, t - v)
+        }
+        Transform::YCgCoRe => {
+          let cg = (0.5 + u * maxf).floor() as i32;
+          let co = (0.5 + v * maxf).floor() as i32;
+          let t = cy as i32 - (cg >> 1);
+          let gi = (t + cg).clamp(0, 255);
+          let bi = (t - (co >> 1)).clamp(0, 255);
+          let ri = (bi + co).clamp(0, 255);
+          (ri as f32 / 255.0, gi as f32 / 255.0, bi as f32 / 255.0)
+        }
+        Transform::Coefficients { kr, kb } => {
+          let kg = 1.0 - kr - kb;
+          (
+            yf + (2.0 * (1.0 - kr)) * v,
+            yf - ((2.0 * ((kr * (1.0 - kr) * v) + (kb * (1.0 - kb) * u))) / kg),
+            yf + (2.0 * (1.0 - kb)) * u,
+          )
+        }
+      }
+    };
+    (r, g, b) = (unit(r), unit(g), unit(b));
+    let av = a.map(|a| alpha(a[i], depth, p.alpha_limited));
+    if let Some(av) = av
+      && p.unpremultiply
+    {
+      let ac = unit(av.min(mx) as f32 / maxf);
+      if ac == 0.0 {
+        (r, g, b) = (0.0, 0.0, 0.0);
+      } else if ac < 1.0 {
+        (r, g, b) = ((r / ac).min(1.0), (g / ac).min(1.0), (b / ac).min(1.0));
+      }
+    }
+    let q = |c: f32| (0.5 + c * 255.0) as u8;
+    *px = [
+      q(b),
+      q(g),
+      q(r),
+      match av {
+        None => 255,
+        Some(av) if depth == 8 => av as u8,
+        Some(av) => scale_alpha(av, depth),
+      },
+    ];
+  }
+}
