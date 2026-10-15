@@ -9,7 +9,7 @@
 //!   with a full-range tag; gbrp from video or a still AVIF is I444 with G, B, R planes)
 //! - anything else: convert once, to the format real Chrome reports for the input
 //!   (images: BGRX, or BGRA when the image has alpha; video: the nearest YUV format)
-//! - PNG, GIF and BMP: always BGRA or BGRX, by the header, with Skia's bytes (see `skia_image`)
+//! - PNG: always BGRA or BGRX, by the header, with Skia's bytes (see `skia_image`)
 //! - a lossy WebP that is not simple lossy: BGRA or BGRX, with libwebp's bytes (see `webp_rgb`)
 //! - AVIF: YUV planes, or BGRA or BGRX with CrabbyAvif's bytes, by Chrome's rule (see `avif_frame`)
 //!
@@ -43,13 +43,13 @@ const FLAG_XYZ: i32 = 1 << 10;
 pub(crate) enum DecodedSource {
   /// ImageDecoder (but not JPEG, see `codec::jpeg`), with what the file header says, when it
   /// says it:
-  /// - `alpha`: the alpha it declares (WebP alpha flag; PNG, GIF and BMP: see `image_hints`,
-  ///   for each frame of a GIF). Chrome labels the image BGRA or BGRX by it.
+  /// - `alpha`: the alpha it declares (WebP alpha flag; PNG: see `image_hints`). Chrome labels
+  ///   the image BGRA or BGRX by it.
   /// - `yuv`: whether Chrome decodes the image to YUV planes (AVIF: see `avif_frame`, and
   ///   FFmpeg's single frame of an AVIF that `avif::parse` declines; WebP: a simple lossy file,
   ///   whose first chunk is VP8). FFmpeg's AVIF YUV planes stay YUV either way; only planar RGB
   ///   (gbrp) follows `yuv`.
-  /// - `pixels`: what a PNG or BMP header says about pixels FFmpeg decodes differently.
+  /// - `pixels`: what a PNG header says about pixels FFmpeg decodes differently.
   Image {
     codec: AVCodecID,
     alpha: Option<bool>,
@@ -103,13 +103,13 @@ pub(crate) fn decoded_frame_format(
   source: DecodedSource,
 ) -> Result<(Frame, VideoPixelFormat), CodecError> {
   if let DecodedSource::Image {
-    codec: codec @ (AVCodecID::Png | AVCodecID::Gif | AVCodecID::Bmp),
+    codec: AVCodecID::Png,
     alpha,
     pixels,
     ..
   } = source
   {
-    return skia_image(frame, codec, alpha, pixels);
+    return skia_image(frame, alpha, pixels);
   }
   match choose(&mut frame, source)? {
     Choice::Keep(format) => Ok((frame, format)),
@@ -256,22 +256,18 @@ pub(crate) fn avif_frame(
   Ok((dst, format))
 }
 
-/// A PNG, GIF or BMP frame as Chrome decodes it with Skia: BGRA, or BGRX (alpha 255) when the
-/// header declares no alpha, never premultiplied. FFmpeg's bytes already are Skia's for BGRA
-/// (also BMP's bgr0, which is BGRA whose alpha is all 0), for RGBA once R and B are swapped, and
-/// for the formats swscale converts exactly (palette, gray, 8-bit RGB). Skia keeps the high byte
-/// of a 16-bit PNG sample, where swscale rounds. It reads a BMP's bitfields with the header masks
-/// and the image crate's tables, where swscale replicates bits and FFmpeg takes a 32-bit pixel's
-/// alpha from the byte the color masks leave. The frame is tagged RGB matrix, full range, like a
-/// converted one.
+/// A PNG frame as Chrome decodes it with Skia: BGRA, or BGRX (alpha 255) when the header
+/// declares no alpha, never premultiplied. FFmpeg's bytes already are Skia's for RGBA once R and B
+/// are swapped, and for the formats swscale converts exactly (palette, gray, 8-bit RGB). Skia
+/// keeps the high byte of a 16-bit sample, where swscale rounds. The frame is tagged RGB matrix,
+/// full range, like a converted one.
 fn skia_image(
   frame: Frame,
-  codec: AVCodecID,
   alpha: Option<bool>,
   pixels: PixelHint,
 ) -> Result<(Frame, VideoPixelFormat), CodecError> {
   let desc = describe(frame.format_raw())?;
-  let alpha = alpha.unwrap_or_else(|| image_has_alpha(&frame, &desc, codec, None));
+  let alpha = alpha.unwrap_or_else(|| image_has_alpha(&frame, &desc, AVCodecID::Png, None));
   let format = if alpha {
     VideoPixelFormat::BGRA
   } else {
@@ -283,32 +279,12 @@ fn skia_image(
       pixel_simd::be16_to_bgra(s, d, layout, alpha)
     })
   };
-  let mut frame = match (frame.format(), pixels) {
-    // FFmpeg keeps the 16 or 32-bit words of the file, alpha bits included
-    (
-      AVPixelFormat::Rgb555le | AVPixelFormat::Rgb565le | AVPixelFormat::Rgb444le,
-      PixelHint::Bitfields(fields),
-    ) => unpack(&frame, 2, |s, d| {
-      pixel_simd::bitfields16_to_bgra(s, d, fields, alpha)
-    })?,
-    (
-      AVPixelFormat::Bgra
-      | AVPixelFormat::Bgr0
-      | AVPixelFormat::Rgba
-      | AVPixelFormat::Rgb0
-      | AVPixelFormat::Argb
-      | AVPixelFormat::Zrgb
-      | AVPixelFormat::Abgr
-      | AVPixelFormat::Zbgr,
-      PixelHint::Bitfields(fields),
-    ) => unpack(&frame, 4, |s, d| {
-      pixel_simd::bitfields32_to_bgra(s, d, fields, alpha)
-    })?,
-    (AVPixelFormat::Bgra | AVPixelFormat::Bgr0 | AVPixelFormat::Rgba, _) => frame,
-    (AVPixelFormat::Gray16be, _) => be16(Be16::Gray)?,
-    (AVPixelFormat::Ya16be, _) => be16(Be16::GrayAlpha)?,
-    (AVPixelFormat::Rgb48be, _) => be16(Be16::Rgb)?,
-    (AVPixelFormat::Rgba64be, _) => be16(Be16::Rgba)?,
+  let mut frame = match frame.format() {
+    AVPixelFormat::Rgba => frame,
+    AVPixelFormat::Gray16be => be16(Be16::Gray)?,
+    AVPixelFormat::Ya16be => be16(Be16::GrayAlpha)?,
+    AVPixelFormat::Rgb48be => be16(Be16::Rgb)?,
+    AVPixelFormat::Rgba64be => be16(Be16::Rgba)?,
     _ => convert(&frame, format, &desc, true)?,
   };
   // Only a kept frame is still RGBA.
@@ -418,8 +394,6 @@ fn image_has_alpha(
   }
   let palette = desc.flags & FLAG_PAL != 0;
   match codec {
-    // BMP palettes have no alpha; FFmpeg zero-fills the entries the file does not list.
-    AVCodecID::Bmp if palette => false,
     // Other palettes (a PNG whose header was not read): an entry that is not opaque.
     _ if palette => unsafe { ffframe_palette_has_alpha(frame.as_ptr()) != 0 },
     _ => desc.flags & FLAG_ALPHA != 0,
@@ -502,17 +476,10 @@ mod tests {
   fn image_formats_have_ffmpegs_values() {
     use AVPixelFormat as P;
     for (name, format) in [
-      ("bgr0", P::Bgr0),
-      ("rgb0", P::Rgb0),
-      ("0rgb", P::Zrgb),
-      ("0bgr", P::Zbgr),
       ("gray16be", P::Gray16be),
       ("ya16be", P::Ya16be),
       ("rgb48be", P::Rgb48be),
       ("rgba64be", P::Rgba64be),
-      ("rgb565le", P::Rgb565le),
-      ("rgb555le", P::Rgb555le),
-      ("rgb444le", P::Rgb444le),
     ] {
       let c = std::ffi::CString::new(name).unwrap();
       let raw = unsafe { crate::ffi::avutil::av_get_pix_fmt(c.as_ptr()) };

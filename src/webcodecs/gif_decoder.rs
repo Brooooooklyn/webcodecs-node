@@ -30,7 +30,8 @@ impl fmt::Display for GifError {
 
 impl std::error::Error for GifError {}
 
-const TRUNCATED: GifError = GifError("truncated data");
+/// The data ends early. While more data can come, a stream is not failed by it.
+pub const TRUNCATED: GifError = GifError("truncated data");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Disposal {
@@ -86,14 +87,14 @@ pub struct GifFrameInfo {
   pub has_alpha: bool,
   /// Graphic Control delay, in hundredths of a second
   pub delay: u16,
+  /// The frame this one is drawn on (Skia's fRequiredFrame), None for a clear canvas
+  pub required: Option<usize>,
   /// The frame rect as stored (right and bottom edges are exclusive)
   rect: Rect,
   transparent: Option<u8>,
   disposal: Disposal,
   /// Index of the Image Descriptor's flags byte
   pos: usize,
-  /// The frame this one is drawn on (Skia's fRequiredFrame), None for a clear canvas
-  required: Option<usize>,
 }
 
 /// A GIF's canvas and frame list, read the way Wuffs reads them
@@ -255,11 +256,11 @@ impl<'a> GifDecoder<'a> {
       frames.push(GifFrameInfo {
         has_alpha: false,
         delay: control.delay,
+        required: None,
         rect,
         transparent: control.transparent,
         disposal: control.disposal,
         pos: r.pos,
-        required: None,
       });
       control = Control::default();
       // Wuffs skip_frame: the next frame is only listed when this one's data is whole
@@ -318,7 +319,7 @@ impl<'a> GifDecoder<'a> {
 
   /// Decodes the frames in order. Each item is the full canvas as unpremultiplied
   /// BGRA, or the error of a frame Chrome fails to decode (ImageDecoder's `decode()`
-  /// rejects for that frame).
+  /// rejects for that frame), also when there is no memory for its canvas.
   pub fn decode(&self) -> GifFrames<'_, 'a> {
     let mut last_dependent = vec![None; self.frames.len()];
     for (i, frame) in self.frames.iter().enumerate() {
@@ -468,19 +469,23 @@ impl GifFrames<'_, '_> {
   /// fails this frame.
   fn start(&self, i: usize) -> Result<Vec<u8>, GifError> {
     let gif = self.gif;
+    let size = gif.width as usize * gif.height as usize * 4;
     let Some(required) = gif.frames[i].required else {
-      return Ok(vec![0; gif.width as usize * gif.height as usize * 4]);
+      let mut canvas = room_for(size)?;
+      canvas.resize(size, 0);
+      return Ok(canvas);
     };
     let base = self
       .latest
       .filter(|&latest| latest > required)
       .unwrap_or(required);
-    let mut canvas = self
+    let (_, kept) = self
       .kept
       .iter()
       .find(|(k, _)| *k == base)
-      .map(|(_, canvas)| canvas.clone())
       .ok_or(GifError("frame depends on a frame that failed"))?;
+    let mut canvas = room_for(size)?;
+    canvas.extend_from_slice(kept);
     let frame = &gif.frames[required];
     if base == required && frame.disposal == Disposal::RestoreBackground {
       let b = frame.rect.on(gif.screen());
@@ -508,17 +513,31 @@ impl Iterator for GifFrames<'_, '_> {
     if result.is_ok() && frame.disposal != Disposal::RestorePrevious {
       self.latest = Some(i);
     }
-    // keep the latest frame and the frames that later frames require
+    // keep the latest frame while frames follow, and the frames that later frames require
     let (latest, last_dependent) = (self.latest, &self.last_dependent);
-    let keep = |k: usize| Some(k) == latest || last_dependent[k].is_some_and(|j| j > i);
+    let more = self.next < self.gif.frames.len();
+    let keep = |k: usize| (more && Some(k) == latest) || last_dependent[k].is_some_and(|j| j > i);
     self.kept.retain(|(k, _)| keep(*k));
+    // without memory for the copy, the frames drawn on this one fail
     if let Ok(canvas) = &result
       && keep(i)
+      && let Ok(mut copy) = room_for(canvas.len())
     {
-      self.kept.push((i, canvas.clone()));
+      copy.extend_from_slice(canvas);
+      self.kept.push((i, copy));
     }
     Some(result)
   }
+}
+
+/// An empty buffer with room for `size` bytes, or an error when the memory is not there (Blink
+/// then fails the frame)
+fn room_for(size: usize) -> Result<Vec<u8>, GifError> {
+  let mut buffer = Vec::new();
+  buffer
+    .try_reserve_exact(size)
+    .map_err(|_| GifError("out of memory"))?;
+  Ok(buffer)
 }
 
 /// Writes LZW output into the frame rect (Wuffs copy_to_image_buffer)
@@ -755,5 +774,220 @@ mod tests {
     assert_eq!(gif(23170, 23170), Ok((23170, 23170)));
     assert!(gif(23171, 23171).is_err());
     assert!(gif(0, 7).is_err());
+  }
+
+  fn frame(rect: [u32; 4], transparent: bool, disposal: Disposal) -> GifFrameInfo {
+    let [x, y, w, h] = rect;
+    GifFrameInfo {
+      has_alpha: false,
+      delay: 0,
+      required: None,
+      rect: Rect {
+        x0: x,
+        y0: y,
+        x1: x + w,
+        y1: y + h,
+      },
+      transparent: transparent.then_some(0),
+      disposal,
+      pos: 0,
+    }
+  }
+
+  const FULL: [u32; 4] = [0, 0, 11, 5];
+  use Disposal::{Keep, RestoreBackground as Background, RestorePrevious as Previous};
+
+  /// Skia's alpha for each frame on an 11x5 screen
+  fn alpha(mut frames: Vec<GifFrameInfo>) -> Vec<bool> {
+    let screen = Rect {
+      x1: 11,
+      y1: 5,
+      ..Rect::default()
+    };
+    for i in 0..frames.len() {
+      (frames[i].has_alpha, frames[i].required) = alpha_and_required_frame(&frames, i, screen);
+    }
+    frames.iter().map(|frame| frame.has_alpha).collect()
+  }
+
+  #[test]
+  fn frame_alpha_follows_each_branch_of_skias_rule() {
+    // IND1: the first frame has alpha when it has a transparent index or leaves screen pixels
+    assert_eq!(alpha(vec![frame(FULL, false, Keep)]), [false]);
+    assert_eq!(alpha(vec![frame(FULL, true, Keep)]), [true]);
+    assert_eq!(alpha(vec![frame([1, 1, 4, 3], false, Keep)]), [true]);
+    // IND2: an opaque frame that fills the screen, after any frame
+    assert_eq!(
+      alpha(vec![frame(FULL, true, Keep), frame(FULL, false, Keep)]),
+      [true, false]
+    );
+    // IND3: every frame before it is restored to the previous image
+    assert_eq!(
+      alpha(vec![
+        frame(FULL, false, Previous),
+        frame([5, 0, 6, 5], false, Keep)
+      ]),
+      [false, true]
+    );
+    // IND4: the frame before is cleared and fills the screen (or is independent)
+    assert_eq!(
+      alpha(vec![
+        frame(FULL, false, Background),
+        frame([2, 1, 3, 2], false, Keep)
+      ]),
+      [false, true]
+    );
+    // DEP5: a frame with a transparent index takes the alpha of the frame below
+    assert_eq!(
+      alpha(vec![
+        frame(FULL, false, Keep),
+        frame([1, 1, 5, 3], true, Keep)
+      ]),
+      [false, false]
+    );
+    assert_eq!(
+      alpha(vec![
+        frame([0, 0, 5, 5], false, Keep),
+        frame([1, 1, 5, 3], true, Keep)
+      ]),
+      [true, true]
+    );
+    // DEP5 after a cleared dependent frame
+    assert_eq!(
+      alpha(vec![
+        frame(FULL, false, Keep),
+        frame([1, 1, 5, 3], true, Background),
+        frame([2, 2, 3, 2], true, Keep),
+      ]),
+      [false, false, true]
+    );
+    // IND6: it covers every frame back to an independent one with alpha
+    assert_eq!(
+      alpha(vec![
+        frame([1, 1, 4, 3], false, Keep),
+        frame([0, 0, 6, 5], false, Keep)
+      ]),
+      [true, true]
+    );
+    // DEP7: drawn over an opaque frame, or over a cleared one
+    assert_eq!(
+      alpha(vec![
+        frame(FULL, false, Keep),
+        frame([2, 1, 3, 2], false, Keep)
+      ]),
+      [false, false]
+    );
+    assert_eq!(
+      alpha(vec![
+        frame(FULL, false, Keep),
+        frame([2, 1, 3, 2], true, Background),
+        frame([0, 0, 4, 2], false, Keep),
+      ]),
+      [false, false, true]
+    );
+  }
+
+  #[test]
+  fn frame_alpha_matches_chrome_on_the_research_animations() {
+    // gif_anim_trans.gif: X X A A A
+    assert_eq!(
+      alpha(vec![
+        frame(FULL, false, Keep),
+        frame([1, 1, 5, 3], true, Background),
+        frame(FULL, true, Keep),
+        frame([3, 0, 4, 5], false, Previous),
+        frame([0, 2, 11, 2], false, Keep),
+      ]),
+      [false, false, true, true, true]
+    );
+    // gif_anim_f0trans.gif: A X X
+    assert_eq!(
+      alpha(vec![
+        frame(FULL, true, Keep),
+        frame(FULL, false, Keep),
+        frame(FULL, true, Keep)
+      ]),
+      [true, false, false]
+    );
+    // gif_anim_smallf0.gif: A A X
+    assert_eq!(
+      alpha(vec![
+        frame([1, 1, 4, 3], false, Background),
+        frame([5, 0, 6, 5], false, Keep),
+        frame(FULL, false, Keep),
+      ]),
+      [true, true, false]
+    );
+    // gif_anim_dispose_bg_opaque.gif: X A
+    assert_eq!(
+      alpha(vec![
+        frame(FULL, false, Background),
+        frame([2, 1, 3, 2], false, Keep)
+      ]),
+      [false, true]
+    );
+  }
+
+  /// A GIF89a: a 2-color global table, and per frame its rect and graphic control flags
+  fn gif_file(screen: (u16, u16), frames: &[([u16; 4], Option<u8>)]) -> Vec<u8> {
+    let mut b = b"GIF89a".to_vec();
+    b.extend(screen.0.to_le_bytes());
+    b.extend(screen.1.to_le_bytes());
+    b.extend([0x80, 0, 0, 0, 0, 0, 255, 255, 255]);
+    for (rect, gce) in frames {
+      if let Some(flags) = gce {
+        b.extend([0x21, 0xf9, 4, *flags, 0, 0, 0, 0]);
+      }
+      b.push(0x2c);
+      rect.iter().for_each(|v| b.extend(v.to_le_bytes()));
+      // no local table; LZW code size 2, one sub-block, terminator
+      b.extend([0, 2, 2, 0x4c, 0x01, 0]);
+    }
+    b.push(0x3b);
+    b
+  }
+
+  #[test]
+  fn reads_frame_alpha_like_wuffs() {
+    let alpha = |data: &[u8]| {
+      GifDecoder::new(data).map(|gif| gif.frames().iter().map(|f| f.has_alpha).collect::<Vec<_>>())
+    };
+    // a transparent index, and the screen growing to the first frame
+    assert_eq!(
+      alpha(&gif_file((11, 5), &[([0, 0, 11, 5], Some(1))])),
+      Ok(vec![true])
+    );
+    assert_eq!(
+      alpha(&gif_file((11, 5), &[([0, 0, 11, 5], Some(0))])),
+      Ok(vec![false])
+    );
+    assert_eq!(
+      alpha(&gif_file((4, 2), &[([0, 0, 11, 5], None)])),
+      Ok(vec![false])
+    );
+    // the graphic control extension applies to the next frame only
+    assert_eq!(
+      alpha(&gif_file(
+        (11, 5),
+        &[([0, 0, 11, 5], Some(1)), ([0, 0, 11, 5], None)]
+      )),
+      Ok(vec![true, false])
+    );
+    // disposal 4 is "restore previous" too: frame 1 has nothing opaque below it
+    for disposal in [3, 4] {
+      assert_eq!(
+        alpha(&gif_file(
+          (11, 5),
+          &[([0, 0, 11, 5], Some(disposal << 2)), ([5, 0, 6, 5], None)]
+        )),
+        Ok(vec![false, true])
+      );
+    }
+    // an application extension between frames, and a truncated last frame, still count
+    let mut data = gif_file((11, 5), &[([0, 0, 11, 5], None)]);
+    data.pop();
+    data.extend(b"\x21\xff\x0bNETSCAPE2.0\x03\x01\0\0\0");
+    data.extend([0x2c, 0, 0, 0, 0, 11, 0, 5, 0, 0, 2, 2]);
+    assert_eq!(alpha(&data), Ok(vec![false, false]));
   }
 }

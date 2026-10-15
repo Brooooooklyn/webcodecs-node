@@ -11,8 +11,7 @@ import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 
 import { ImageDecoder, type ImageDecoderInit } from '../index.js'
-
-import { bmp } from './helpers/image-files.js'
+import { bmp, gif, type GifFrame } from './helpers/image-files.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -470,6 +469,175 @@ test('ImageDecoder tracks.ready resolves for static images', async (t) => {
   t.is(track.frameCount, 1)
 
   decoder.close()
+})
+
+// ============================================================================
+// GIF and BMP: timing, errors and streams (Chrome 155 values)
+// ============================================================================
+
+const PALETTE = [
+  [255, 0, 0],
+  [0, 255, 0],
+  [0, 0, 255],
+  [255, 255, 255],
+]
+const fullFrame = (frame: Partial<GifFrame> = {}): GifFrame => ({
+  x: 0,
+  y: 0,
+  width: 4,
+  height: 2,
+  indices: [0, 1, 2, 3, 3, 2, 1, 0],
+  ...frame,
+})
+const partFrame = (frame: Partial<GifFrame> = {}): GifFrame => ({ x: 1, y: 0, width: 2, height: 1, indices: [3, 3], ...frame })
+// a clear code, then a code past the table
+const BAD_CODES = [4, 7]
+const TWO_FRAMES = gif(4, 2, PALETTE, [fullFrame({ delay: 10 }), partFrame({ delay: 10, indices: [1, 2] })])
+const BMP_3x2 = bmp(3, 2, 24, [
+  [30, 20, 10, 60, 50, 40, 90, 80, 70],
+  [3, 2, 1, 6, 5, 4, 9, 8, 7],
+])
+const unexpectedEnd = (frameIndex: number) => ({
+  instanceOf: RangeError,
+  message: `Unexpected end of image. Request for frame index ${frameIndex} can't be satisfied.`,
+})
+const failedFrame = (frameIndex: number) => ({
+  instanceOf: DOMException,
+  name: 'EncodingError',
+  message: `Failed to decode frame at index ${frameIndex}`,
+})
+
+test('ImageDecoder: GIF frames last their delay and start when the frames before them end, like Chrome', async (t) => {
+  const data = gif(4, 2, PALETTE, [fullFrame({ delay: 0 }), partFrame({ delay: 5 }), partFrame({ delay: 100, indices: [0, 0] })])
+  const decoder = new ImageDecoder({ data, type: 'image/gif' })
+  for (const [frameIndex, [timestamp, duration]] of [
+    [0, 0],
+    [0, 50_000],
+    [50_000, 1_000_000],
+  ].entries()) {
+    const { image } = await decoder.decode({ frameIndex })
+    t.is(image.timestamp, timestamp, `frame ${frameIndex}`)
+    t.is(image.duration, duration, `frame ${frameIndex}`)
+    image.close()
+  }
+  decoder.close()
+
+  // a GIF of one frame has a duration too
+  for (const [frame, duration] of [
+    [fullFrame({ delay: 50 }), 500_000],
+    [fullFrame(), 0],
+  ] as const) {
+    const single = new ImageDecoder({ data: gif(4, 2, PALETTE, [frame]), type: 'image/gif' })
+    const { image } = await single.decode()
+    t.is(image.duration, duration)
+    image.close()
+    single.close()
+  }
+})
+
+test('ImageDecoder: a GIF frame with broken data, and the frames drawn on it, reject with RangeError, like Chrome', async (t) => {
+  const data = gif(4, 2, PALETTE, [
+    fullFrame({ delay: 10 }),
+    partFrame({ delay: 10, codes: BAD_CODES }),
+    // drawn on frame 1
+    partFrame({ delay: 10, x: 0, indices: [1, 1] }),
+  ])
+  const decoder = new ImageDecoder({ data, type: 'image/gif' })
+  await t.throwsAsync(decoder.decode({ frameIndex: 1 }), unexpectedEnd(1))
+  await t.throwsAsync(decoder.decode({ frameIndex: 2 }), unexpectedEnd(2))
+  const { image } = await decoder.decode({ frameIndex: 0 })
+  t.is(image.format, 'BGRX')
+  image.close()
+  await t.throwsAsync(decoder.decode({ frameIndex: 1 }), unexpectedEnd(1))
+  t.false(decoder.closed)
+  decoder.close()
+})
+
+test('ImageDecoder: once every GIF frame failed, decode() rejects with EncodingError and the decoder closes, like Chrome', async (t) => {
+  const data = gif(4, 2, PALETTE, [fullFrame({ delay: 10, codes: BAD_CODES }), partFrame({ delay: 10 })])
+  const decoder = new ImageDecoder({ data, type: 'image/gif' })
+  await t.throwsAsync(decoder.decode({ frameIndex: 0 }), unexpectedEnd(0))
+  // frame 1 is drawn on frame 0
+  await t.throwsAsync(decoder.decode({ frameIndex: 1 }), failedFrame(1))
+  t.true(decoder.closed)
+  await t.throwsAsync(decoder.decode({ frameIndex: 0 }), { instanceOf: DOMException, name: 'InvalidStateError' })
+
+  // a decode() made before the frame failed rejects the same way
+  const single = new ImageDecoder({ data: gif(4, 2, PALETTE, [fullFrame({ codes: BAD_CODES })]), type: 'image/gif' })
+  await t.throwsAsync(single.decode(), failedFrame(0))
+  t.true(single.closed)
+})
+
+test('ImageDecoder: the truncated last frame of a GIF rejects with RangeError, like Chrome', async (t) => {
+  const decoder = new ImageDecoder({ data: TWO_FRAMES.subarray(0, TWO_FRAMES.length - 4), type: 'image/gif' })
+  await decoder.tracks.ready
+  t.is(decoder.tracks.selectedTrack!.frameCount, 2)
+  const { image } = await decoder.decode({ frameIndex: 0 })
+  image.close()
+  await t.throwsAsync(decoder.decode({ frameIndex: 1 }), unexpectedEnd(1))
+  t.false(decoder.closed)
+  decoder.close()
+})
+
+test('ImageDecoder: a GIF or BMP that Chrome cannot open rejects tracks.ready and the pending decodes', async (t) => {
+  const badMagic = Uint8Array.from([...Buffer.from('GIF88a'), ...TWO_FRAMES.subarray(6)])
+  for (const [data, type] of [
+    [badMagic, 'image/gif'],
+    [BMP_3x2.subarray(0, 20), 'image/bmp'],
+  ] as const) {
+    const decoder = new ImageDecoder({ data, type })
+    const pending = decoder.decode()
+    await t.throwsAsync(decoder.tracks.ready, {
+      instanceOf: DOMException,
+      name: 'InvalidStateError',
+      message: 'Failed to retrieve track metadata.',
+    })
+    await t.throwsAsync(pending, failedFrame(0))
+    t.true(decoder.closed, type)
+  }
+})
+
+test('ImageDecoder: a BMP with missing pixel data rejects with EncodingError and closes, like Chrome', async (t) => {
+  const decoder = new ImageDecoder({ data: BMP_3x2.subarray(0, BMP_3x2.length - 3), type: 'image/bmp' })
+  await decoder.tracks.ready
+  t.is(decoder.tracks.selectedTrack!.frameCount, 1)
+  await t.throwsAsync(decoder.decode(), failedFrame(0))
+  t.true(decoder.closed)
+})
+
+test('ImageDecoder: a streamed GIF or BMP counts a frame once its header arrives, and decode() waits for its data, like Chrome', async (t) => {
+  for (const [data, type, header, frameIndex] of [
+    // frame 0, and the rect of frame 1 (its Image Descriptor up to the flags byte)
+    [TWO_FRAMES, 'image/gif', 68, 1],
+    // the file and info headers
+    [BMP_3x2, 'image/bmp', 54, 0],
+  ] as const) {
+    let controller!: ReadableStreamDefaultController<Uint8Array>
+    const stream = new ReadableStream<Uint8Array>({
+      start(streamController) {
+        controller = streamController
+        controller.enqueue(data.slice(0, header))
+      },
+    })
+    const decoder = new ImageDecoder({ data: stream, type })
+    await decoder.tracks.ready
+    t.is(decoder.tracks.selectedTrack!.frameCount, frameIndex + 1, type)
+
+    let settled = false
+    const decoded = decoder.decode({ frameIndex }).finally(() => {
+      settled = true
+    })
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    t.false(settled, type)
+
+    controller.enqueue(data.slice(header))
+    controller.close()
+    const { image, complete } = await decoded
+    t.true(complete)
+    t.is(image.format, 'BGRX')
+    image.close()
+    decoder.close()
+  }
 })
 
 // ============================================================================
