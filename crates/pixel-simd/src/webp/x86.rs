@@ -39,7 +39,7 @@ fn pack_and_store(a: __m128i, b: __m128i, da: __m128i, db: __m128i, out: &mut [u
 /// top row in out[..32] and 32 for the bottom row in out[32..].
 #[inline]
 #[target_feature(enable = "sse2")]
-pub(super) fn upsample32(r1: &[u8], r2: &[u8], out: &mut [u8; 64]) {
+fn upsample32(r1: &[u8], r2: &[u8], out: &mut [u8; 64]) {
   let (a, b, c, d) = (load(r1), load(&r1[1..]), load(r2), load(&r2[1..]));
   let (s, t) = (_mm_avg_epu8(a, d), _mm_avg_epu8(b, c));
   let (st, ad, bc) = (
@@ -165,7 +165,7 @@ fn pack_and_store_avx2(a: __m256i, b: __m256i, da: __m256i, db: __m256i, out: &m
 /// the bottom row in out[64..].
 #[inline]
 #[target_feature(enable = "avx2")]
-pub(super) fn upsample64(r1: &[u8], r2: &[u8], out: &mut [u8; 128]) {
+fn upsample64(r1: &[u8], r2: &[u8], out: &mut [u8; 128]) {
   let (a, b, c, d) = (load32(r1), load32(&r1[1..]), load32(r2), load32(&r2[1..]));
   let (s, t) = (_mm256_avg_epu8(a, d), _mm256_avg_epu8(b, c));
   let (st, ad, bc) = (

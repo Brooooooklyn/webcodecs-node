@@ -79,55 +79,6 @@ pub(crate) fn yuva420_to_bgra_with(isa: Isa, src: &Yuva420, dst: &mut [u8], stri
   }
 }
 
-/// A chroma block of a SIMD path and its `n`: it takes 1 + n / 2 samples of two chroma rows to n
-/// for the top row in out[..n] and n for the bottom row in out[n..2n].
-#[cfg(test)]
-pub(crate) type UpsampleBlock = (Isa, usize, fn(&[u8], &[u8], &mut [u8; 128]));
-
-/// The chroma blocks of the SIMD paths this CPU runs, for the tests.
-#[cfg(test)]
-pub(crate) fn upsample_blocks() -> Vec<UpsampleBlock> {
-  // SAFETY (every SIMD arm): an `Isa` is only made for a level this CPU runs.
-  Isa::supported()
-    .filter_map(|isa| -> Option<UpsampleBlock> {
-      match isa.level() {
-        #[cfg(target_arch = "x86_64")]
-        Level::Sse2 => Some((isa, 32, |r1, r2, out| unsafe {
-          x86::upsample32(r1, r2, out.first_chunk_mut().unwrap())
-        })),
-        #[cfg(target_arch = "x86_64")]
-        Level::Avx2 => Some((isa, 64, |r1, r2, out| unsafe {
-          x86::upsample64(r1, r2, out)
-        })),
-        #[cfg(target_arch = "aarch64")]
-        Level::Neon => Some((isa, 32, |r1, r2, out| unsafe {
-          neon::upsample32(r1, r2, out.first_chunk_mut().unwrap())
-        })),
-        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-        Level::Simd128 => Some((isa, 32, |r1, r2, out| {
-          wasm::upsample32(r1, r2, out.first_chunk_mut().unwrap())
-        })),
-        // SSSE3 runs the SSE2 block
-        _ => None,
-      }
-    })
-    .collect()
-}
-
-/// What `upsample` gives the four pixels between chroma samples `top` (the nearer row for the
-/// top pixels) and `bottom`: top left, top right, bottom left, bottom right.
-#[cfg(test)]
-pub(crate) fn fancy_quad(top: [u8; 2], bottom: [u8; 2]) -> [u8; 4] {
-  let (t, b) = (&top[..], &bottom[..]);
-  [
-    upsample([t, b], (0, 1)),
-    upsample([t, b], (1, 0)),
-    upsample([b, t], (0, 1)),
-    upsample([b, t], (1, 0)),
-  ]
-  .map(|x| x as u8)
-}
-
 fn scalar(src: &Yuva420, dst: &mut [u8], stride: usize) {
   let (width, height) = (src.width, src.height);
   let cols: Vec<_> = (0..width)
@@ -148,7 +99,7 @@ fn scalar(src: &Yuva420, dst: &mut [u8], stride: usize) {
 
 /// The chroma sample nearest to sample `i` of a 4:2:0 row or column, and the next nearest (on the
 /// other side of `i`), out of `count`. At an edge there is none: the nearest is used again.
-fn chroma_neighbours(i: usize, count: usize) -> (usize, usize) {
+pub(crate) fn chroma_neighbours(i: usize, count: usize) -> (usize, usize) {
   let near = i / 2;
   let far = if i % 2 == 1 {
     near + 1
@@ -162,7 +113,7 @@ fn chroma_neighbours(i: usize, count: usize) -> (usize, usize) {
 /// row and the next nearest, at the nearest column and the next nearest (`cols`). They are weighted
 /// 9:3:3:1 and rounded in libwebp's two steps. At an edge column libwebp weights the nearest column
 /// of the two rows 3:1 instead, which gives the same value.
-fn upsample([near_row, far_row]: [&[u8]; 2], (near, far): (usize, usize)) -> i32 {
+pub(crate) fn upsample([near_row, far_row]: [&[u8]; 2], (near, far): (usize, usize)) -> i32 {
   let nearest = i32::from(near_row[near]);
   let diagonal = (nearest
     + 3 * i32::from(near_row[far])
