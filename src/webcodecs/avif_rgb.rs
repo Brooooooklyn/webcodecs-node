@@ -10,6 +10,12 @@ use crate::ffi::error::{AVERROR_EINVAL, AVERROR_ENOSYS};
 use crate::ffi::{AVColorRange, AVPixelFormat, FFmpegError};
 use pixel_simd::avif::{self, Constants, Matrix, RgbImpl, Sample, Transform};
 
+/// The pixel formats of `Layout`, by their libavutil 61 numbers (a test checks them against the
+/// linked FFmpeg).
+const FORMATS: [i32; 18] = [
+  0, 4, 5, 8, 12, 13, 14, 62, 64, 68, 71, 75, 123, 127, 131, 135, 166, 168,
+];
+
 /// A frame that `avif_to_bgra` reads: 8, 10 or 12-bit little-endian planar YUV 4:2:0, 4:2:2 or
 /// 4:4:4, gbrp or gray, as AV1 decoders output them. Planes 0, 1, 2 hold Y, U, V (G, B, R for
 /// gbrp).
@@ -24,12 +30,6 @@ struct Layout {
 
 impl Layout {
   fn of(frame: &Frame) -> Option<Layout> {
-    // libavutil 61: yuv420p, yuv422p, yuv444p, gray, yuvj420p, yuvj422p, yuvj444p, yuv420p10le,
-    // yuv422p10le, yuv444p10le, gbrp, gbrp10le, yuv420p12le, yuv422p12le, yuv444p12le,
-    // gbrp12le, gray12le, gray10le
-    const FORMATS: [i32; 18] = [
-      0, 4, 5, 8, 12, 13, 14, 62, 64, 68, 71, 75, 123, 127, 131, 135, 166, 168,
-    ];
     let format = frame.format_raw();
     let mut d = [0; 5];
     if !FORMATS.contains(&format) || unsafe { ffpixfmt_describe(format, d.as_mut_ptr()) } < 0 {
@@ -537,6 +537,58 @@ mod tests {
         case.color
       );
     }
+  }
+
+  #[test]
+  fn formats_match_the_linked_ffmpeg() {
+    let names = [
+      "yuv420p",
+      "yuv422p",
+      "yuv444p",
+      "gray",
+      "yuvj420p",
+      "yuvj422p",
+      "yuvj444p",
+      "yuv420p10le",
+      "yuv422p10le",
+      "yuv444p10le",
+      "gbrp",
+      "gbrp10le",
+      "yuv420p12le",
+      "yuv422p12le",
+      "yuv444p12le",
+      "gbrp12le",
+      "gray12le",
+      "gray10le",
+    ];
+    let formats = names.map(|name| {
+      let name = std::ffi::CString::new(name).unwrap();
+      unsafe { av_get_pix_fmt(name.as_ptr()) }
+    });
+    assert_eq!(formats, FORMATS);
+  }
+
+  /// The rows take libyuv's constants from `pixel_simd::avif`, copyTo from accessors.c kRcYuv:
+  /// the same numbers, in the same order.
+  #[test]
+  fn libyuv_constants_match_copy_to() {
+    let c = include_str!("../ffi/accessors.c");
+    let (_, table) = c.split_once("kRcYuv[6][6] = {").unwrap();
+    let (table, _) = table.split_once("};").unwrap();
+    let rows: Vec<String> = table
+      .lines()
+      .filter_map(|line| {
+        Some(format!(
+          "Constants([{}])",
+          line.split_once('{')?.1.split_once('}')?.0
+        ))
+      })
+      .collect();
+    let ours: Vec<String> = [Matrix::Bt601, Matrix::Bt709, Matrix::Bt2020]
+      .into_iter()
+      .flat_map(|m| [false, true].map(|full| format!("{:?}", Constants::new(m, full))))
+      .collect();
+    assert_eq!(rows, ours);
   }
 
   #[test]
