@@ -339,7 +339,7 @@ const IMAGE_CASES: [string, Uint8Array, string, VideoPixelFormat, number[]][] = 
     'BGRA',
     [0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 0, 0, 0, 0, 255, 0, 0, 255, 0, 255, 0, 255],
   ],
-  // FFmpeg returns only the first frame of a GIF without graphic control extensions
+  // frame 0 of 2, without graphic control extensions
   [
     'GIF with 2 frames and no graphic control extension (bgra)',
     gif(4, 2, GIF_PALETTE, [
@@ -392,6 +392,31 @@ const IMAGE_CASES: [string, Uint8Array, string, VideoPixelFormat, number[]][] = 
     'image/bmp',
     'BGRX',
     [0, 0, 255, 255, 0, 255, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255],
+  ],
+  // RLE: runs, an absolute run, a delta and early ends of line and image; the pixels they skip
+  // are opaque black
+  [
+    '8-bit RLE BMP',
+    bmp(4, 3, 8, [], {
+      compression: 1,
+      palette: GIF_PALETTE,
+      raw: [3, 1, 0, 0, 0, 3, 2, 0, 3, 0, 0, 0, 0, 2, 1, 0, 2, 2, 0, 1],
+    }),
+    'image/bmp',
+    'BGRX',
+    [0, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 0, 0, 0, 255].concat(
+      [255, 0, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255, 0, 0, 0, 255],
+      [0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 0, 0, 255],
+    ),
+  ],
+  [
+    '4-bit RLE BMP',
+    bmp(5, 2, 4, [], { compression: 2, palette: GIF_PALETTE, raw: [5, 0x12, 0, 0, 0, 3, 0x30, 0x20, 0, 1] }),
+    'image/bmp',
+    'BGRX',
+    [255, 255, 255, 255, 0, 0, 255, 255, 255, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255].concat(
+      [0, 255, 0, 255, 255, 0, 0, 255, 0, 255, 0, 255, 255, 0, 0, 255, 0, 255, 0, 255],
+    ),
   ],
   // 32-bit: alpha only from a V3+ bitfield alpha mask, or a V4+ BI_RGB alpha mask
   ['32-bit BMP with alpha bytes (bgra)', bmp(2, 1, 32, [[30, 20, 10, 128, 60, 50, 40, 0]]), 'image/bmp', 'BGRX', [30, 20, 10, 255, 60, 50, 40, 255]],

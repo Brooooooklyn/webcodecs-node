@@ -31,7 +31,8 @@ impl fmt::Display for BmpError {
 
 impl std::error::Error for BmpError {}
 
-const TRUNCATED: BmpError = BmpError("truncated data");
+/// The data ends early. While more data can come, a stream is not failed by it.
+pub const TRUNCATED: BmpError = BmpError("truncated data");
 
 const BI_RGB: u32 = 0;
 const BI_RLE8: u32 = 1;
@@ -318,7 +319,7 @@ impl<'a> BmpDecoder<'a> {
     let stride = (bits * width).div_ceil(32) * 4;
     // every row must be in the file
     let rows = bytes(self.data, self.data_offset, stride * height)?;
-    let mut out = room_for(width * height)?;
+    let mut out = room_for(width * height * 4)?;
     // output rows top first, each zeroed just before it is written
     for y in 0..height {
       let i = if self.top_down { y } else { height - 1 - y };
@@ -332,7 +333,7 @@ impl<'a> BmpDecoder<'a> {
   /// RLE4, RLE8 and RLE24 (image crate BmpDecoder::read_rle_data)
   fn decode_rle(&self, rle: Rle) -> Result<Vec<u8>, BmpError> {
     let (width, height) = (self.width as usize, self.height as usize);
-    let mut pixels = room_for(width * height)?;
+    let mut pixels = room_for(width * height * 4)?;
     pixels.resize(width * height * 4, 0);
     let mut out = RleRows {
       pixels,
@@ -449,14 +450,14 @@ impl<'a> BmpDecoder<'a> {
   }
 }
 
-/// An empty buffer with room for `count` BGRA pixels, or an error when the memory is not there
-/// (Blink fails the decode when it cannot allocate the frame)
-fn room_for(count: usize) -> Result<Vec<u8>, BmpError> {
-  let mut out = Vec::new();
-  out
-    .try_reserve_exact(count * 4)
+/// An empty buffer with room for `size` bytes, or an error when the memory is not there (Blink
+/// fails the decode when it cannot allocate the frame)
+fn room_for(size: usize) -> Result<Vec<u8>, BmpError> {
+  let mut buffer = Vec::new();
+  buffer
+    .try_reserve_exact(size)
     .map_err(|_| BmpError("out of memory"))?;
-  Ok(out)
+  Ok(buffer)
 }
 
 /// One row of `BITS`-bit palette indexes (1, 2, 4 or 8), the first pixel in the high bits
