@@ -1104,11 +1104,12 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
   // 'avis' AVIF is an animation even when only its first frame has arrived.
   let still = video_streams == 1 && frames.len() == 1 && !avif_is_sequence(&data_bytes);
 
-  // Chrome labels each GIF frame by the frames it is drawn over. A frame list that differs from
-  // FFmpeg's (damaged data) makes every frame BGRA.
+  // Chrome labels each GIF frame by the frames it is drawn over. FFmpeg's frames are the first
+  // ones of the file, but can be fewer (one for a GIF without graphic control extensions). A
+  // frame list shorter than FFmpeg's (damaged data) makes every frame BGRA.
   let gif_alpha = (codec_id == AVCodecID::Gif).then(|| {
     gif_frame_alpha(&data_bytes)
-      .filter(|alpha| alpha.len() == frames.len())
+      .filter(|alpha| alpha.len() >= frames.len())
       .unwrap_or_else(|| vec![true; frames.len()])
   });
 

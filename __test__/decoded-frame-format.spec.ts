@@ -346,6 +346,17 @@ const IMAGE_CASES: [string, Uint8Array, string, VideoPixelFormat, number[]][] = 
     'BGRA',
     [0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 0, 0, 0, 0, 255, 0, 0, 255, 0, 255, 0, 255],
   ],
+  // FFmpeg returns only the first frame of a GIF without graphic control extensions
+  [
+    'GIF with 2 frames and no graphic control extension (bgra)',
+    gif(4, 2, GIF_PALETTE, [
+      { x: 0, y: 0, width: 4, height: 2, indices: [0, 1, 2, 3, 3, 2, 1, 0] },
+      { x: 1, y: 0, width: 2, height: 1, indices: [3, 3] },
+    ]),
+    'image/gif',
+    'BGRX',
+    [0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255],
+  ],
   [
     '24-bit BMP (bgr24)',
     bmp(3, 2, 24, [
