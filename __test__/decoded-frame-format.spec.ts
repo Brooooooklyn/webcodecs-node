@@ -1031,11 +1031,11 @@ test('ImageDecoder: an animated AVIF with the identity matrix decodes to BGRX, l
   image.close()
 })
 
-test('ImageDecoder: a streamed animated AVIF with the identity matrix is BGRX from its first frame, like Chrome', async (t) => {
+test("ImageDecoder: a streamed 'avis' AVIF resolves nothing before its 'moov' box, then is BGRX, like Chrome", async (t) => {
   // avifenc -l --fps 1, two 8x4 frames (R = 32x, G = 64y, B = 200, then R = 200, G = 32x,
   // B = 64y), with the 'moov' box moved after 'mdat' and the iloc and stco offsets moved
-  // with it. Bytes 0..429 (ftyp, meta, mdat) hold every frame but not the track, so a
-  // probe there finds one stream with one frame. The 'avis' brand says it is animated.
+  // with it. Bytes 0..429 (ftyp, meta, mdat) hold every frame but not the track, which the
+  // 'avis' brand needs.
   const data = b64(
     'AAAALGZ0eXBhdmlzAAAAAGF2aWZhdmlzbXNmMWlzbzhtaWYxbWlhZk1BMUEAAADrbWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAcGljdAAAAAAAAAAAAAAAAAAAAAAOcGl0bQAAAAAAAQAAAB5pbG9jAAAAAEQAAAEAAQAAAAEAAAEfAAAASwAAAChpaW5mAAAAAAABAAAAGmluZmUCAAAAAAEAAGF2MDFDb2xvcgAAAABqaXBycAAAAEtpcGNvAAAAFGlzcGUAAAAAAAAACAAAAAQAAAAQcGl4aQAAAAADCAgIAAAADGF2MUOBIAAAAAAAE2NvbHJuY2x4AAEADQAAgAAAABdpcG1hAAAAAAAAAAEAAQQBAoMEAAAAlm1kYXQSAAoMIAAAAQ/Nr5ICGgBAMjkQAIAAhsGyOHh+ofhKRcGopR8MBJib3oMJ/fEcKQB5nPtRbwL1Pk8Q6rWvgLj/w2uZPl//QEo2JyASADI/MAOAgP34egAEAAACrct9MQt6HZPdOYifvHj/XwybUkEN39rTRHllNN7RPTSXGiHKk9yXR6d3MDftgBedoycgAAACxm1vb3YAAAB4bXZoZAEAAAAAAAAA5vVOggAAAADm9U6CAAAAAf//////////AAEAAAEAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAJGdHJhawAAAGh0a2hkAQAAAQAAAADm9U6CAAAAAOb1ToIAAAABAAAAAP//////////AAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAQAAAAAAIAAAABAAAAAAALGVkdHMAAAAkZWxzdAEAAAEAAAABAAAAAAAAAAIAAAAAAAAAAAABAAAAAAGqbWRpYQAAACxtZGhkAQAAAAAAAADm9U6CAAAAAOb1ToIAAAABAAAAAAAAAAJVxAAAAAAAIWhkbHIAAAAAAAAAAHBpY3QAAAAAAAAAAAAAAAAAAAABVW1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAARVzdGJsAAAAlXN0c2QAAAAAAAAAAQAAAIVhdjAxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAgABABIAAAASAAAAAAAAAABCkFPTSBDb2RpbmcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGP//AAAADGF2MUOBIAAAAAAAE2NvbHJuY2x4AAEADQAAgAAAABBjY3N0AAAAAHwAAAAAAAAYc3R0cwAAAAAAAAABAAAAAgAAAAEAAAAcc3RzYwAAAAAAAAABAAAAAQAAAAIAAAABAAAAHHN0c3oAAAAAAAAAAAAAAAIAAABLAAAAQwAAABRzdGNvAAAAAAAAAAEAAAEfAAAAFHN0c3MAAAAAAAAAAQAAAAE=',
   )
@@ -1044,7 +1044,7 @@ test('ImageDecoder: a streamed animated AVIF with the identity matrix is BGRX fr
   const chunks = [data.slice(0, 429), data.slice(429)]
   const stream = new ReadableStream<Uint8Array>({
     async pull(controller) {
-      // Hold the 'moov' box until the first frame has been checked.
+      // Hold the 'moov' box until the checks below are done.
       if (chunks.length === 1) await gate
       const chunk = chunks.shift()
       if (chunk) controller.enqueue(chunk)
@@ -1052,18 +1052,21 @@ test('ImageDecoder: a streamed animated AVIF with the identity matrix is BGRX fr
     },
   })
   const decoder = new ImageDecoder({ data: stream, type: 'image/avif' })
-  // tracks.ready resolves once the first 429 bytes have been decoded
-  await decoder.tracks.ready
-  const early = (await decoder.decode({ frameIndex: 0 })).image
-  t.false(decoder.complete)
+  const pending = (promise: Promise<unknown>) =>
+    Promise.race([promise.then(() => false), new Promise((resolve) => setTimeout(resolve, 300, true))])
+  const decoding = decoder.decode({ frameIndex: 0 })
+  // Chrome 155 waits for the track: neither tracks.ready nor decode() resolves
+  t.true(await pending(decoder.tracks.ready))
+  t.true(await pending(decoding))
   release()
+  const early = (await decoding).image
   await decoder.completed
   const late = (await decoder.decode({ frameIndex: 0 })).image
   t.is(decoder.tracks.selectedTrack?.frameCount, 2)
   decoder.close()
   const whole = await decodeImage(data, 'image/avif')
 
-  // Chrome 155 waits for the track and returns these BGRX bytes, streamed or not
+  // Chrome 155 returns these BGRX bytes, streamed or not
   const chrome = Array.from({ length: 32 }, (_, i) => [200, 64 * Math.floor(i / 8), 32 * (i % 8), 255]).flat()
   for (const image of [early, late, whole]) {
     t.is(image.format, 'BGRX')
@@ -1072,17 +1075,228 @@ test('ImageDecoder: a streamed animated AVIF with the identity matrix is BGRX fr
   }
 })
 
-test('ImageDecoder: an AVIF with the identity matrix and an alpha plane is not I444', async (t) => {
-  // avifenc -l, 17x5 with alpha. Chrome 155 decodes it to BGRA; the alpha plane is a
-  // separate stream that is not decoded here, so the colour planes alone become BGRX.
+test("ImageDecoder: an AVIF with the identity matrix and an alpha plane decodes to BGRA with Chrome's bytes", async (t) => {
+  // avifenc -l, 17x5 with alpha
   const image = await decodeImage(
     b64(
       'AAAAIGZ0eXBhdmlmAAAAAGF2aWZtaWYxbWlhZk1BMUEAAAGGbWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAcGljdAAAAAAAAAAAAAAAAAAAAAAOcGl0bQAAAAAAAQAAACxpbG9jAAAAAEQAAAIAAQAAAAEAAAHmAAABQwACAAAAAQAAAa4AAAA4AAAAQmlpbmYAAAAAAAIAAAAaaW5mZQIAAAAAAQAAYXYwMUNvbG9yAAAAABppbmZlAgAAAAACAABhdjAxQWxwaGEAAAAAGmlyZWYAAAAAAAAADmF1eGwAAgABAAEAAADDaXBycAAAAJ1pcGNvAAAAFGlzcGUAAAAAAAAAEQAAAAUAAAAQcGl4aQAAAAADCAgIAAAADGF2MUOBIAAAAAAAE2NvbHJuY2x4AAEADQAAgAAAAA5waXhpAAAAAAEIAAAADGF2MUOBABwAAAAAOGF1eEMAAAAAdXJuOm1wZWc6bXBlZ0I6Y2ljcDpzeXN0ZW1zOmF1eGlsaWFyeTphbHBoYQAAAAAeaXBtYQAAAAAAAAACAAEEAQKDBAACBAEFhgcAAAGDbWRhdBIACgUYEKEYVDItEACjWjEPaehqtCmzusF203x/ZVTsmKwyCl3sqTyCraasU5t45zx4fWNQIuVEEgAKCDgQoRhAQ0AIMrQCEAAAqjGf///9oHeMXcgzYCXuxYyyXuu8we3yYCYCXu3hq7M1ENxFlTlT9Tno6w77Idc60OUxsOfV8akRy73d+C4NN9oWgUH1IDH89vF57WB70P8o5weAWa7/5lYtNpm+Wiz////hWb8QGdYER1k822tL27l5XLE8HEiH/D4NKZGxg4nVqzlb9xBqcdEn6E5l4y672f+y29iCJYvT8f33BtxbFRF3x98NLd/00yvxlzCbI+gDD2x6EXUKGB1perOpMl44YbLBZZcZIztB80ogITg0GUnIp1n//zdjwkCKr3/AAIf//4fObSXMtt1t1dTCd5LIRgRttoRgRtt1toRo4eqoPOx/mibc7fw1fJOYZDmfsGIiEiPyUDERCRCRGDERGDIDEy/Ez4aMdaDU+QkvrMHLnyA=',
     ),
     'image/avif',
   )
-  t.not(image.format, 'I444')
-  t.is(image.allocationSize(), 17 * 5 * 4)
+  t.is(image.format, 'BGRA')
+  t.deepEqual(
+    (await rawCopy(image)).bytes,
+    b64(
+      'AGQHAA1pLDIablFkJ3N2ljR4m8hBfcD6ToLlLFuHCl5ojC+QdZFUwoKWefSPm54mnKDDWKml6Iq2qg28w68y7tC0VyAdqxIAELA3Mge1XGQ6uoGWKb+myFzEy/pTyfAsRs4VXnXTOpBo2F/Cn92E9JLiqSaB585YtOzziqvxGLze9j3uzftiIDryHQA390IyIPxnZB0BjJYOBrHIewvW+nQQ+yxhFSBeUhpFkE8fasK4JI/0tSm0JqYu2ViTM/6KjDgjvPk9SO7qQm0gVzkoAFo+TTJNQ3JkcEiXlmNNvMgWUuH6GVcGLAxcK14/YVCQImZ1wtVrmvTYcL8my3XkWP56CYrhfy68lIRT7oeJeCB0gDMAeYVYMm6KfWRTj6KWQJTHyDWZ7Po6nhEsL6M2XhyoW5ABrYDC9rKl9Pu3yibovO9Y3cEUisLGOby3y17upNCDIA==',
+    ),
+  )
+  image.close()
+})
+
+// ============================================================================
+// ImageDecoder: AVIF read like CrabbyAvif (alpha, animation, Chrome's RGB bytes)
+// ============================================================================
+
+const avifFixture = (name: string) =>
+  new Uint8Array(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/avif', name)))
+
+// [fixture (avifenc 1.4.2, 64x48), ImageDecoderInit, then Chrome 155's format, size, frame count
+// and the sha256 of each frame's copyTo() bytes]. Chrome keeps the YUV planes of one image
+// without alpha, unless it is 4:0:0 or YCgCo-Re/Ro. Any other image is BGRA when it has an alpha
+// image (even one whose samples are all 255), else BGRX.
+const AVIF_CASES: [string, Record<string, unknown>, VideoPixelFormat, [number, number], number, string[]][] = [
+  ['s8_420.avif', {}, 'I420', [64, 48], 1, ['9a5911d577ee9153154a4fcc263064f28e2c883d03e9b4dc6dce913354d71316']],
+  // an alpha item, at every chroma layout and depth (CrabbyAvif converts each its own way)
+  ['a8_400.avif', {}, 'BGRA', [64, 48], 1, ['b1bf7a6337e5f1c30fe35809535b68aff071bd62b8536d5b2667bccf0d267a08']],
+  ['a10_400.avif', {}, 'BGRA', [64, 48], 1, ['415c28f7359a5120024a00966d6614dc04d17f252e52bb9ce4e02b0fca63be92']],
+  ['a12_400.avif', {}, 'BGRA', [64, 48], 1, ['91aa8cf2328a7efbb8ba448218c4845fb7c93c948db3b620306f5f35a230b4ee']],
+  ['a8_420.avif', {}, 'BGRA', [64, 48], 1, ['e9ea7a5738019e824d3a4048bfebf4a1b2d5f66a497b6b444df1667b8f6fcc66']],
+  ['a10_420.avif', {}, 'BGRA', [64, 48], 1, ['7c73eefce1a87abea84b2f7105366ec1bcae093a4898c4b119985f6aebc54184']],
+  ['a12_420.avif', {}, 'BGRA', [64, 48], 1, ['f9983d8ef81cab75979d377cbf8b407d21e50af3cefee88d42b45b1059bf553f']],
+  ['a8_422.avif', {}, 'BGRA', [64, 48], 1, ['0b420ebeee7621cd23595f78e1214fd9e1e94e4ca094631770ee556719ae04a8']],
+  ['a10_422.avif', {}, 'BGRA', [64, 48], 1, ['951f167e5fdf45e0cad5a0a6c1ecb737a0b56d2f0ed560211de1e0508aad914e']],
+  ['a12_422.avif', {}, 'BGRA', [64, 48], 1, ['69cfd5f1c878fd2dac2f00bf81206123c50f15245dbdec91a53fdad1fb6e623a']],
+  ['a8_444.avif', {}, 'BGRA', [64, 48], 1, ['9f2e4f4d804611452d4abcc0791734d631654128bc2d3b3e3de7f0529d177648']],
+  ['a10_444.avif', {}, 'BGRA', [64, 48], 1, ['fc87ebc28de71c853cd91edfdf9bb80daab189fdb1bf7628f8118eab55005923']],
+  ['a12_444.avif', {}, 'BGRA', [64, 48], 1, ['684973d16ebc97c1b45713fe931b102023d6209db87b372fbb026fe59a855fea']],
+  // MP4Box: alpha samples all 255
+  ['aopitem8_420.avif', {}, 'BGRA', [64, 48], 1, ['54dc136e01cbbe386b47b3302c3d299c6f53c9b45564aefda10b05d06f854596']],
+  // 'prem': Chrome un-premultiplies
+  ['p8_420.avif', {}, 'BGRA', [64, 48], 1, ['49150539371492afc2b9dbace99e38cde0fd10d58caad6384ec7a84a976fb3fa']],
+  // limited range
+  ['l8_420a.avif', {}, 'BGRA', [64, 48], 1, ['3a64cefff2fdd769a1d464a342b07ca19a53d7ce576af5bfd93714c5962b9eee']],
+  ['odd8_420a.avif', {}, 'BGRA', [33, 17], 1, ['9a95cd90cce1fcd67ad61aabb46140c9e8f54627faf56f38a1a3e9b249bf5fb6']],
+  ['odd8_444a.avif', {}, 'BGRA', [33, 17], 1, ['bf1ab6699fda669efb8ebdd8fd981f5c1586115e8c2c0eda09a6dcdab25eff57']],
+  // a8_420 with the nclx matrix patched to BT.709 (the AV1 sequence header says BT.601): the
+  // item's nclx wins
+  ['cpatch_m1_420a.avif', {}, 'BGRA', [64, 48], 1, ['25fb011f3b3e84b281eef8b8f255aeeea9ccfd4e7a68015786c0c661c5768696']],
+  // a8_420 with iloc v2 and the colour item in 'idat', as 2 extents in reverse order
+  ['idat8_420a.avif', {}, 'BGRA', [64, 48], 1, ['e9ea7a5738019e824d3a4048bfebf4a1b2d5f66a497b6b444df1667b8f6fcc66']],
+  // avifenc --progressive: an item in 2 extents, which FFmpeg's mov demuxer cannot read
+  ['prog8_420.avif', {}, 'I420', [64, 48], 1, ['381aafb402b14a233d14a58489c086c48ec0de61f4bcc00313a8b8c11906803f']],
+  // no alpha, but 4:0:0 or YCgCo-Re
+  ['s10_400.avif', {}, 'BGRX', [64, 48], 1, ['94364978ed150d6a3974f676af44f5204964fef827681bc558658f4495591e29']],
+  ['nm16_444_10.avif', {}, 'BGRX', [64, 48], 1, ['188a34848b8092799c3e054c8d828cc9c1066ae7aedbc511353e23276f5810f8']],
+  // 'avis' tracks: one frame, three frames, three frames with an alpha track and 'prem', and
+  // that one with co64, 2 chunks and runs in stsc and stts
+  ['avis1_8_420.avif', {}, 'I420', [64, 48], 1, ['4d5585cebe94f474eb6bff24b274df89d86ea60092c90ba89c68f57647a76b07']],
+  [
+    'anim8_420.avif',
+    {},
+    'BGRX',
+    [64, 48],
+    3,
+    [
+      'bd5ed34f941a8b630305b2087591e0f53883c0c96fe69b13f8c6974ee179b495',
+      'a50824648ea584a86fcc8cedc1788d8d5c3974fe07f667daba06afd2e56fbfae',
+      '5fe876a40c42ccfadcbab00565b9a5e623310cfdf4463b97fae6258ec4ded879',
+    ],
+  ],
+  [
+    'panim8_420a.avif',
+    {},
+    'BGRA',
+    [64, 48],
+    3,
+    [
+      '72529243c81a8e8d969a3b7b7fd284a89644f4a806313e4430b8b945bfb6b3d6',
+      '3b76fd899774397f8028ec4931ac4c40489717effe5b520030311766abedd8cf',
+      '9434f3960c2b64338295e492250ca587ffc5f4ee323adc7ed3fa4fd603421119',
+    ],
+  ],
+  [
+    'tables_panim8_420a.avif',
+    {},
+    'BGRA',
+    [64, 48],
+    3,
+    [
+      '72529243c81a8e8d969a3b7b7fd284a89644f4a806313e4430b8b945bfb6b3d6',
+      '3b76fd899774397f8028ec4931ac4c40489717effe5b520030311766abedd8cf',
+      '9434f3960c2b64338295e492250ca587ffc5f4ee323adc7ed3fa4fd603421119',
+    ],
+  ],
+  // anim8_420 with the sample entry's colr patched to BT.709: Chrome ignores it
+  [
+    'cpatch_m1_anim.avif',
+    {},
+    'BGRX',
+    [64, 48],
+    3,
+    [
+      'bd5ed34f941a8b630305b2087591e0f53883c0c96fe69b13f8c6974ee179b495',
+      'a50824648ea584a86fcc8cedc1788d8d5c3974fe07f667daba06afd2e56fbfae',
+      '5fe876a40c42ccfadcbab00565b9a5e623310cfdf4463b97fae6258ec4ded879',
+    ],
+  ],
+  // preferAnimation: false decodes the primary item of an 'avis' file
+  [
+    'anim8_420.avif',
+    { preferAnimation: false },
+    'I420',
+    [64, 48],
+    1,
+    ['4d5585cebe94f474eb6bff24b274df89d86ea60092c90ba89c68f57647a76b07'],
+  ],
+  [
+    'panim8_420a.avif',
+    { preferAnimation: false },
+    'BGRA',
+    [64, 48],
+    1,
+    ['72529243c81a8e8d969a3b7b7fd284a89644f4a806313e4430b8b945bfb6b3d6'],
+  ],
+]
+
+for (const [name, init, format, size, frameCount, hashes] of AVIF_CASES) {
+  const options = Object.keys(init).length ? ` with ${JSON.stringify(init)}` : ''
+  test(`ImageDecoder: ${name}${options} decodes to ${frameCount} ${format} frame(s), like Chrome`, async (t) => {
+    const decoder = new ImageDecoder({ data: avifFixture(name), type: 'image/avif', ...init })
+    await decoder.tracks.ready
+    t.is(decoder.tracks.selectedTrack?.frameCount, frameCount)
+    for (const [i, hash] of hashes.entries()) {
+      const { image } = await decoder.decode({ frameIndex: i })
+      t.is(image.format, format)
+      t.deepEqual([image.codedWidth, image.codedHeight], size)
+      t.is(sha256((await rawCopy(image)).bytes), hash, `frame ${i}`)
+      image.close()
+    }
+    decoder.close()
+  })
+}
+
+test('ImageDecoder: AVIF track frames take their timestamps and durations from the track', async (t) => {
+  // [timestamp, duration] of each frame. Chrome 155 truncates each duration to microseconds
+  // and sums those (66666 for 2/30 s, also as a duration); here they are rounded.
+  for (const [name, timing] of [
+    ['anim8_420.avif', [0, 33333, 33333, 33333, 66667, 33333]],
+    // stts (1, 1), (2, 2) at timescale 30
+    ['tables_panim8_420a.avif', [0, 33333, 33333, 66667, 100000, 66667]],
+    ['avis1_8_420.avif', [0, null]],
+    ['a8_420.avif', [0, null]],
+  ] as const) {
+    const decoder = new ImageDecoder({ data: avifFixture(name), type: 'image/avif' })
+    const frames = []
+    for (let i = 0; i < timing.length / 2; i++) {
+      const { image } = await decoder.decode({ frameIndex: i })
+      frames.push(image.timestamp, image.duration)
+      image.close()
+    }
+    t.deepEqual(frames, [...timing], name)
+    decoder.close()
+  }
+})
+
+test('ImageDecoder: a streamed AVIF with an alpha track is BGRA from its first frame, like Chrome', async (t) => {
+  const data = avifFixture('panim8_420a.avif')
+  let offset = 0
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      if (offset >= data.length) return controller.close()
+      controller.enqueue(data.slice(offset, offset + 256))
+      offset += 256
+    },
+  })
+  const decoder = new ImageDecoder({ data: stream, type: 'image/avif' })
+  const { image } = await decoder.decode({ frameIndex: 0 })
+  t.false(decoder.complete)
+  t.is(decoder.tracks.selectedTrack?.frameCount, 3)
+  t.is(image.format, 'BGRA')
+  t.is(sha256((await rawCopy(image)).bytes), AVIF_CASES.find((c) => c[0] === 'panim8_420a.avif')![5][0])
+  image.close()
+  await decoder.completed
+  decoder.close()
+})
+
+test('ImageDecoder: an AVIF that CrabbyAvif cannot convert to RGB fails decode() with EncodingError, like Chrome', async (t) => {
+  for (const name of [
+    // 4:0:0 with the ICtCp matrix (14)
+    'n400m14.avif',
+    // SMPTE 240M 4:2:0 with alpha and an av1C chroma_sample_position of 1 (not centred)
+    'x_csp1_m240_420a.avif',
+  ]) {
+    const decoder = new ImageDecoder({ data: avifFixture(name), type: 'image/avif' })
+    await decoder.tracks.ready
+    t.is(decoder.tracks.selectedTrack?.frameCount, 1)
+    await t.throwsAsync(decoder.decode(), { name: 'EncodingError', message: 'Failed to decode frame at index 0' }, name)
+    decoder.close()
+  }
+})
+
+test('ImageDecoder: an AVIF whose track samples end past its data fails the metadata, like Chrome', async (t) => {
+  // avis1_8_420 with 3 samples in its only chunk (stsc): 2 of them past the end of the file
+  const data = avifFixture('avis1_8_420.avif')
+  new DataView(data.buffer).setUint32(Buffer.from(data).indexOf('stsc') + 16, 3)
+  const decoder = new ImageDecoder({ data, type: 'image/avif' })
+  await t.throwsAsync(decoder.tracks.ready, { name: 'InvalidStateError', message: 'Failed to retrieve track metadata.' })
+})
+
+test('ImageDecoder: a grid AVIF still decodes with FFmpeg, to its first tile', async (t) => {
+  // Chrome 155 decodes all 4 tiles (I420 128x128); grids are not read like CrabbyAvif yet
+  const image = await decodeImage(avifFixture('grid8_420.avif'), 'image/avif')
+  t.is(image.format, 'I420')
+  t.deepEqual([image.codedWidth, image.codedHeight], [64, 64])
   image.close()
 })
 
