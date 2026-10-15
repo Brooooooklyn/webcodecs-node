@@ -832,6 +832,14 @@ mod tests {
     }
   }
 
+  /// The errors of `check`, or of `decode` with each canvas as 0 bytes
+  fn check_and_decode(gif: &GifDecoder) -> [Vec<Result<usize, GifError>>; 2] {
+    [
+      gif.check().map(|r| r.map(|c| c.len())).collect(),
+      gif.decode().map(|r| r.map(|_| 0)).collect(),
+    ]
+  }
+
   #[test]
   fn check_finds_the_errors_of_decode() {
     for case in chrome_cases::cases("gif/") {
@@ -843,9 +851,96 @@ mod tests {
         if gif.width() * gif.height() > 1 << 20 {
           continue;
         }
-        let checked: Vec<_> = gif.check().map(|r| r.map(|c| c.len())).collect();
-        let decoded: Vec<_> = gif.decode().map(|r| r.map(|_| 0)).collect();
+        let [checked, decoded] = check_and_decode(&gif);
         assert_eq!(checked, decoded, "{}", case.name);
+      }
+    }
+  }
+
+  /// LZW data with literal width 2: a clear code, `pixels` codes of index 0, then `tail`. The
+  /// code width grows as in `Lzw::decode`.
+  fn lzw_data(pixels: usize, tail: &[u32]) -> Vec<u8> {
+    let (clear, end) = (4, 5);
+    let (mut bits, mut n, mut width, mut save) = (0u64, 0, 3, end);
+    let mut data = Vec::new();
+    let codes = std::iter::once(clear).chain(std::iter::repeat_n(0, pixels));
+    for code in codes.chain(tail.iter().copied()) {
+      bits |= u64::from(code) << n;
+      n += width;
+      while n >= 8 {
+        data.push(bits as u8);
+        bits >>= 8;
+        n -= 8;
+      }
+      if code == clear {
+        (width, save) = (3, end);
+      } else if code != end && save <= 4095 {
+        save += 1;
+        if width < 12 {
+          width += 1 & (save >> width);
+        }
+      }
+    }
+    if n > 0 {
+      data.push(bits as u8);
+    }
+    data
+  }
+
+  /// A GIF with one frame (`rect`: x, y, w, h) on a 4x10 screen, with `lzw` in one sub-block
+  fn one_frame_gif(rect: [u16; 4], interlaced: bool, lzw: &[u8]) -> Vec<u8> {
+    let mut file = b"GIF89a".to_vec();
+    // a 2-color global table
+    file.extend([4, 0, 10, 0, 0x80, 0, 0, 0, 0, 0, 255, 255, 255, 0x2c]);
+    rect.iter().for_each(|v| file.extend(v.to_le_bytes()));
+    file.extend([if interlaced { 0x40 } else { 0 }, 2, lzw.len() as u8]);
+    file.extend(lzw);
+    file.extend([0, 0x3b]);
+    file
+  }
+
+  #[test]
+  fn check_follows_the_rows_of_decode() {
+    // Frames of 0x0 to 3x9 pixels, interlaced or not, with pixel data that stops before, at and
+    // after the last pixel of each row and pass, then ends, has a bad code (a clear code, then
+    // the code past the next table code), or just stops. Each file is also cut inside its LZW
+    // data and before its block terminator.
+    let tails: [&[u32]; 3] = [&[5], &[4, 7], &[]];
+    let mut seen = std::collections::BTreeMap::new();
+    for w in 0..=3 {
+      for h in 0..=9 {
+        for [x, y] in [[0, 0], [1, 1]] {
+          for interlaced in [false, true] {
+            for pixels in 0..=usize::from(w * h) + 2 {
+              for tail in tails {
+                let lzw = lzw_data(pixels, tail);
+                let file = one_frame_gif([x, y, w, h], interlaced, &lzw);
+                let lzw_at = file.len() - 2 - lzw.len();
+                for len in [file.len(), file.len() - 2, lzw_at + lzw.len() / 2] {
+                  let gif = GifDecoder::new(&file[..len]).unwrap();
+                  assert_eq!(gif.frames().len(), 1);
+                  let [checked, decoded] = check_and_decode(&gif);
+                  let frame = format!("{w}x{h} at {x},{y}, interlaced {interlaced}");
+                  let data = format!("{pixels} pixels, then {tail:?}, cut at {len}");
+                  assert_eq!(checked, decoded, "{frame}, {data}");
+                  let error = decoded[0].as_ref().err().map(|e| e.0);
+                  *seen.entry((interlaced, error)).or_insert(0) += 1;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    // each result comes up, with and without interlacing
+    for interlaced in [false, true] {
+      for error in [
+        None,
+        Some("bad LZW code"),
+        Some("not enough pixel data"),
+        Some("truncated data"),
+      ] {
+        assert!(seen.contains_key(&(interlaced, error)), "{seen:?}");
       }
     }
   }
