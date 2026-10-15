@@ -396,7 +396,7 @@ impl ImageTrackList {
       }
       Ok(tracks.failed.load(Ordering::Acquire))
     };
-    env.spawn_future_with_callback(wait, |env, failed| {
+    let ready = env.spawn_future_with_callback(wait, |env, failed| {
       if failed {
         return Err(native_dom_exception_error(
           env,
@@ -405,7 +405,10 @@ impl ImageTrackList {
         )?);
       }
       Ok(())
-    })
+    })?;
+    // Like Chrome, never report a rejection of `ready` as unhandled.
+    ready.catch(|_: CallbackContext<Unknown>| Ok(()))?;
+    Ok(ready)
   }
 
   /// Get track at specified index (W3C spec)
@@ -579,19 +582,22 @@ impl ImageDecoder {
       // For buffer data: completed resolves immediately (data is already available)
       let completed_promise = env.spawn_future(async { Ok(()) })?;
 
-      // Spawn pre-parse task for ready promise
-      let inner_clone = inner.clone();
-      let ready_promise = env.spawn_future(async move {
-        let result = spawn_blocking(move || pre_parse_and_cache_frames(&inner_clone)).await;
-
-        match result {
-          Ok(Ok(())) | Ok(Err(_)) | Err(_) => {
-            // Always signal ready, even on error (per W3C spec behavior)
-          }
-        }
-
-        Ok(())
-      })?;
+      // Spawn pre-parse task for ready promise. Always signal ready, even on error (per W3C
+      // spec behavior). Like Chrome, a rejected metadata closes the decoder in a JS task of its
+      // own, so a decode() made before that task is still pending.
+      let parse_inner = inner.clone();
+      let ready_inner = inner.clone();
+      let ready_promise = env.spawn_future_with_callback(
+        async move {
+          let _ = spawn_blocking(move || cache_decoded_frames(&parse_inner)).await;
+          Ok(())
+        },
+        move |_, ()| {
+          close_if_failed(&ready_inner);
+          signal_tracks_ready(&ready_inner);
+          Ok(())
+        },
+      )?;
 
       // Store both promises as non-enumerable properties
       this.define_properties(&[
@@ -619,7 +625,6 @@ impl ImageDecoder {
 
       // Set when the metadata is rejected: Chrome then closes the decoder and stops reading.
       let failed = tracks.failed.clone();
-      let stop_reading = failed.clone();
       let data_complete = complete.clone();
       let collect = async move {
         let mut next_probe_size = 1usize;
@@ -660,21 +665,24 @@ impl ImageDecoder {
             ) {
               signal_tracks_ready(&inner_clone);
             }
-            if stop_reading.load(Ordering::Acquire) {
+            if close_if_failed(&inner_clone) {
               return Ok(());
             }
             next_probe_size = buffered_len.saturating_mul(2).max(next_probe_size * 2);
           }
         }
 
+        // Refresh once at EOF so animated images include frames that arrived
+        // after an early successful probe. Like Chrome, the data is complete only
+        // once it is decoded: a metadata rejected here still rejects `completed`.
+        let final_inner = inner_clone.clone();
+        let _ = spawn_blocking(move || cache_decoded_frames(&final_inner)).await;
+        if close_if_failed(&inner_clone) {
+          return Ok(());
+        }
         if let Ok(inner_guard) = inner_clone.lock() {
           inner_guard.complete.store(true, Ordering::Release);
         }
-
-        // Refresh once at EOF so animated images include frames that arrived
-        // after an early successful probe.
-        let final_inner = inner_clone.clone();
-        let _ = spawn_blocking(move || cache_decoded_frames(&final_inner)).await;
         signal_tracks_ready(&inner_clone);
         Ok(())
       };
@@ -953,7 +961,9 @@ fn decode_cached_frame(
     if !data_complete {
       return Ok(None);
     }
-    cache_decoded_frames(inner)?;
+    cache_decoded_frames(inner).inspect_err(|_| {
+      close_if_failed(inner);
+    })?;
   }
 
   let guard = inner
@@ -1021,13 +1031,6 @@ fn closed_error(inner: &ImageDecoderInner, frame_index: usize) -> Error {
   invalid_state_error("ImageDecoder is closed")
 }
 
-/// Pre-parse image and cache decoded frames
-fn pre_parse_and_cache_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
-  let result = cache_decoded_frames(inner);
-  signal_tracks_ready(inner);
-  result
-}
-
 fn signal_tracks_ready(inner: &Arc<Mutex<ImageDecoderInner>>) {
   if let Ok(inner_guard) = inner.lock() {
     inner_guard.tracks.ready.store(true, Ordering::Release);
@@ -1040,8 +1043,8 @@ fn signal_tracks_ready(inner: &Arc<Mutex<ImageDecoderInner>>) {
 }
 
 /// Attempt to cache every frame currently present in the buffered bytes.
-/// Unlike `pre_parse_and_cache_frames`, failures do not resolve `tracks.ready`,
-/// which lets streamed images retry as more bytes arrive.
+/// Failures do not resolve `tracks.ready`, which lets streamed images retry as
+/// more bytes arrive. A rejected metadata is left to `close_if_failed`.
 fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
   // Snapshot everything needed for FFmpeg work under the mutex, then release
   // it. Large animated images can take a long time to decode; close() and
@@ -1091,10 +1094,7 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
 
   // Chrome fails the metadata of a BMP whose bitfield masks the image crate rejects.
   let bmp = match codec_id {
-    AVCodecID::Bmp => bmp_header(&data_bytes).map_err(|()| {
-      fail_metadata(inner);
-      invalid_state_error("Failed to retrieve track metadata.")
-    })?,
+    AVCodecID::Bmp => bmp_header(&data_bytes).map_err(|()| reject_metadata(inner))?,
     _ => None,
   };
 
@@ -1125,11 +1125,8 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
   {
     let (width, height) = (frame.width(), frame.height());
     match jpeg_scale_numerator(width, height, desired) {
-      0 => {
-        // Chrome rejects the metadata and closes the decoder.
-        fail_metadata(inner);
-        return Err(invalid_state_error("Failed to retrieve track metadata."));
-      }
+      // Chrome rejects the metadata and closes the decoder.
+      0 => return Err(reject_metadata(inner)),
       8 => {}
       m => {
         let scale = |side: u32| (u64::from(side) * u64::from(m)).div_ceil(8) as u32;
@@ -1223,15 +1220,27 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
   Ok(())
 }
 
-/// Close the decoder because its metadata was rejected: `tracks.ready` rejects, and so do the
-/// decode() calls still pending (see `closed_error`).
-fn fail_metadata(inner: &Arc<Mutex<ImageDecoderInner>>) {
-  if let Ok(mut guard) = inner.lock()
+/// Reject the metadata. The caller then closes the decoder with `close_if_failed`.
+fn reject_metadata(inner: &Arc<Mutex<ImageDecoderInner>>) -> Error {
+  if let Ok(guard) = inner.lock()
     && !guard.closed
   {
     guard.tracks.failed.store(true, Ordering::Release);
+  }
+  invalid_state_error("Failed to retrieve track metadata.")
+}
+
+/// Close the decoder if its metadata was rejected: `tracks.ready` rejects, and so do the
+/// decode() calls still pending (see `closed_error`). Returns whether it was rejected.
+fn close_if_failed(inner: &Arc<Mutex<ImageDecoderInner>>) -> bool {
+  let Ok(mut guard) = inner.lock() else {
+    return false;
+  };
+  let failed = guard.tracks.failed.load(Ordering::Acquire);
+  if failed && !guard.closed {
     guard.close();
   }
+  failed
 }
 
 /// Chrome's scale numerator M: libjpeg decodes a JPEG at M/8 of its size so that its 4-byte
