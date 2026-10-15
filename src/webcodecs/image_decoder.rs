@@ -1154,6 +1154,7 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
     AVCodecID::Mjpeg => jpeg_yuv_hint(&data_bytes),
     // Chrome keeps a still AVIF without alpha as YUV planes
     AVCodecID::Av1 => Some(still),
+    AVCodecID::Webp => Some(webp_is_simple_lossy(&data_bytes)),
     _ => None,
   };
   let pixels = header.map_or(PixelHint::None, |header| header.pixels);
@@ -1275,6 +1276,12 @@ fn webp_alpha_hint(data: &[u8]) -> Option<bool> {
     b"VP8L" if data[20] == 0x2f => Some(data[24] & 0x10 != 0),
     _ => None,
   }
+}
+
+/// Whether a WebP is simple lossy: its first chunk is VP8, so it has no VP8X header (Blink's
+/// IsSimpleLossyWebPImage). Chrome decodes only these to YUV planes.
+fn webp_is_simple_lossy(data: &[u8]) -> bool {
+  data.len() >= 20 && data.starts_with(b"RIFF") && &data[8..16] == b"WEBPVP8 "
 }
 
 /// Whether Chrome decodes a JPEG to YUV planes, from its SOF sampling factors: three
@@ -1562,7 +1569,7 @@ fn normalize_frame_timing(frames: &mut [Frame], time_base: (i32, i32)) {
 mod tests {
   use super::{
     avif_is_sequence, gif_repetition_count, jpeg_scale_numerator, jpeg_yuv_hint,
-    normalize_frame_timing, webp_alpha_hint,
+    normalize_frame_timing, webp_alpha_hint, webp_is_simple_lossy,
   };
   use crate::codec::Frame;
   use crate::ffi::types::AV_NOPTS_VALUE;
@@ -1599,6 +1606,16 @@ mod tests {
       None
     );
     assert_eq!(webp_alpha_hint(b"GIF89a"), None);
+  }
+
+  #[test]
+  fn finds_simple_lossy_webps_like_blink() {
+    assert!(webp_is_simple_lossy(b"RIFF\0\0\0\0WEBPVP8 \0\0\0\0"));
+    // 20 bytes at least, like Blink's IsSimpleLossyWebPImage
+    assert!(!webp_is_simple_lossy(b"RIFF\0\0\0\0WEBPVP8 \0\0\0"));
+    assert!(!webp_is_simple_lossy(b"RIFF\0\0\0\0WEBPVP8X\x0a\0\0\0"));
+    assert!(!webp_is_simple_lossy(b"RIFF\0\0\0\0WEBPVP8L\0\0\0\0"));
+    assert!(!webp_is_simple_lossy(b"RIFX\0\0\0\0WEBPVP8 \0\0\0\0"));
   }
 
   #[test]

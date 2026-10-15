@@ -492,6 +492,61 @@ const IMAGE_CASES: [string, Uint8Array, string, VideoPixelFormat, number[]][] = 
       ),
     ),
   ],
+  // Lossy WebPs with a VP8X header and an ALPH chunk (yuva420p): Chrome decodes them with
+  // libwebp, which upsamples the chroma ("fancy upsampling")
+  [
+    'lossy WebP 7x5 with alpha (yuva420p)',
+    b64(
+      'UklGRrIAAABXRUJQVlA4WAoAAAAQAAAABgAABAAAQUxQSCQAAAAAASpVf6oA/wAqVX8A//8AKlUBqtT/AP8Af6rU/wAAVX+q1AFWUDggaAAAADACAJ0BKgcABQACADQlsAJ0ugH4AAMfRtwsAP7mC/Q+JAp/LO9pf+MWBuPBxG6prxnsXx7+nbh9YM/26R+btc85vS1/1uwx2Z6gf9//0N/7geX/1H7c/oeeIO/3+/g3B//RS7RAAAAA',
+    ),
+    'image/webp',
+    'BGRA',
+    Array.from(
+      b64(
+        'LAcBAUcSJCpkDE9VbAlxf18MkKqcQ+0AcgHX/6yKZwBfNigqdT1dVXhBhX+DWroAdUbL/5lP//+xmDoAkoU6Kmp0TlVujYgBWYieqmSIxNSOj/z/ka0WAJK6Nv9oqksAa75/f3PJqapktLnUiMn6/1PPAgBQxxAAj/xwVY7vh3+q+bOqsf/i1IT19wE=',
+      ),
+    ),
+  ],
+  [
+    'lossy WebP 7x5 with gradient-filtered raw alpha (yuva420p)',
+    b64(
+      'UklGRqoAAABXRUJQVlA4WAoAAAAQAAAABgAABAAAQUxQSCQAAAAMASkrKitW//8BAABW/wAAAACCqtUrANUBf6sAAAABVasAAAJWUDggYAAAAFACAJ0BKgcABQACADQlsAJ0ugH4AALSpJ1+AAD+7SGagBBN2zJ6YJ6ujDWXHYotO/hmfvm7F0fFfkpCjm7+/ucZUsz1A/7//g3/uB5f/a/x5/BuQR9/v4N0v/2KK2tAAA==',
+    ),
+    'image/webp',
+    'BGRA',
+    Array.from(
+      b64(
+        'PgAAAVQLGSplEEJVWQBbf2MElapyEM0AYgDf/3dIIgBtPSkqaTpLVYJRi39oM6AAfUDZ/4k///9/dhEAiIw3KmWCTFVki34BWnieqm95ztSZhP//e6wNAIvKOf9jt0cAbMN+f3zEtKqDudXUocX//2fnFQB9+TgAlf9qVY/sgH+w9L6qt/3v1I3w/wE=',
+      ),
+    ),
+  ],
+  [
+    'lossy WebP 2x1 with alpha (yuva420p)',
+    b64(
+      'UklGRlwAAABXRUJQVlA4WAoAAAAQAAAAAQAAAAAAQUxQSAMAAAAA9dMAVlA4IDIAAAAwAgCdASoCAAEAAUAmJaACdLoB+AADIPeKAAD+68PC8bWSH/82BqizfQD/43ZCofZQAA==',
+    ),
+    'image/webp',
+    'BGRA',
+    Array.from(b64('hMb/9U2Py9M=')),
+  ],
+  [
+    'lossy WebP 3x1 with alpha (yuva420p)',
+    b64(
+      'UklGRmwAAABXRUJQVlA4WAoAAAAQAAAAAgAAAAAAQUxQSAQAAAAABykLVlA4IEIAAACwAQCdASoDAAEAAUAmJagCdAEO+mBgAP78D76a7lEQ9/5cn/owL8//6m///Qd/9Mf9GBfn//U3/hq87bPAcCI28AA=',
+    ),
+    'image/webp',
+    'BGRA',
+    Array.from(b64('L2aAByozSClfDRwL')),
+  ],
+  [
+    'lossy WebP 1x3 with alpha (yuva420p)',
+    b64(
+      'UklGRnYAAABXRUJQVlA4WAoAAAAQAAAAAAAAAgAAQUxQSAQAAAAAISnJVlA4IEwAAABwAgCdASoBAAMAAUAmJagCdLoBJgLf/A9EArXgAPqeo6dX/7A6yb8keTP8Fm/g3wN5M/wWb+Df7/eb3/1mFdp/+swrtP/2M39ZQAAA',
+    ),
+    'image/webp',
+    'BGRA',
+    Array.from(b64('tHwuIeDXeClAlxXJ')),
+  ],
 ]
 
 for (const [name, data, type, format, expected] of IMAGE_CASES) {
@@ -566,6 +621,70 @@ test('ImageDecoder: a BMP bitfield mask the image crate rejects fails the metada
   })
   await t.throwsAsync(pending, { instanceOf: DOMException, name: 'EncodingError', message: 'Failed to decode frame at index 0' })
   t.true(decoder.closed)
+})
+
+// A lossy WebP 33x17 with a VP8X header and no alpha (yuv420p)
+const VP8X_WEBP_33x17 =
+  'UklGRngBAABXRUJQVlA4WAoAAAAAAAAAIAAAEAAAVlA4IFoBAADwCQCdASohABEAPpE8lkiloyIhKqwAsBIJbACdMoR6t7t5glZYTvaq9HP4g9f/PqvwA35nrAPEA90n/XPoK6RE0SgBr3IaMNsZX6n+IwMYdZNd6mtSqJ5QAP75VA5EyFbxb29DVj1Nv6GuoaqE8Z4l0g2vU33cZ2okfpnRwJJVQ3ZK4Q5ITUOrnzwtN/6h+HBJI/Boy9nzx8lDleOnz59ETc2nsh2m7MT1hY/xdlMWS6QCN+nFI/VNQX/u6KoGr3TVhXmmU5imHwPX84sU0t6KbpBOpIBiCTU0wcSTSUS1ZosuBAxydDCtnB4+eQPW1//vQ40FNf/70OM/YyxkghYEhKQSp0e7nFeenDKBx5SmYdccd7RGtZCIKj2qCHd+CJYm7srJytvh1a6kL6njOVkfa1Wzhr9ypESsdNRI/wK/Cti6v/BIASsoOEk1kP53Qu/XK/dr/d3TFAAA'
+
+test('ImageDecoder: a lossy WebP with a VP8X header is BGRA or BGRX by its alpha flag alone, like Chrome', async (t) => {
+  const opaque = b64(VP8X_WEBP_33x17)
+  // the alpha flag without an ALPH chunk: alpha 255
+  const flagged = opaque.slice()
+  flagged[20] |= 0x10
+  // an ALPH chunk (raw, all 0) without the alpha flag: not used
+  const alph = new Uint8Array(8 + 1 + 33 * 17)
+  alph.set(Buffer.from('ALPH'))
+  new DataView(alph.buffer).setUint32(4, 1 + 33 * 17, true)
+  const unflagged = new Uint8Array([...opaque.subarray(0, 30), ...alph, ...opaque.subarray(30)])
+  new DataView(unflagged.buffer).setUint32(4, unflagged.length - 8, true)
+  for (const [data, format] of [
+    [opaque, 'BGRX'],
+    [flagged, 'BGRA'],
+    [unflagged, 'BGRX'],
+  ] as const) {
+    const image = await decodeImage(data, 'image/webp')
+    t.is(image.format, format)
+    const { bytes, layout } = await rawCopy(image)
+    t.deepEqual(layout, [[0, 33 * 4]])
+    // Chrome's bytes are the same for the three files: the fourth byte is 255
+    t.is(sha256(bytes), '85d7c51efa963c202789b44aadb7868a3fcf823f933e64a06e22381b20c0c043')
+    t.is(image.colorSpace.matrix, 'rgb')
+    t.true(image.colorSpace.fullRange)
+    image.close()
+  }
+})
+
+test("ImageDecoder: a lossy WebP 3x255 with alpha decodes to BGRA with Chrome's bytes", async (t) => {
+  const image = await decodeImage(
+    b64(
+      'UklGRmwCAABXRUJQVlA4WAoAAAAQAAAAAgAA/gAAQUxQSC4AAAABFyAQSELffI2ICAe1jSQ1eI7Mw37/BZNG9L8OBqmDqW9gwFbH0AZaZ6P+Na0DVlA4IBgCAADQDwCdASoDAP8APoE2lUelIyIhOfO9UKAQCWwAnTKqeL+g/kB7AlJ/oH4K4OUrn6Xde/Yf3QKUc/VYn86Wm70xB/NwsQsZgPRXHQJc1fP1Lvu7hImr1ogGAaeTsoIxTtSMWWv5yAj+vu4HDyYbCAoYTcFuQkVxrVscz1JFqfKXUIegoczJkAAA/vUsHhCUdm+/x9vwwu1KbyGWIzN6/u34elXTT3D4cF4NBYSZm/FSSYVngEnn9R74lnCRhu1PaPNG1CJnw5l+Iu/JAwltcnMOo7IcLDTM/69zAZ3/V43aMRJ5LRJKE99kG/8DhlZkhRXunDMFZUsJN0G9Z7FKHKGXOfCuXtx4i8I8nDYjkn7KJpUaobnm6b5qWf51SnqeVR+ap9xatPohlfWSUt5uTwViEm6Hrcz03jZoQ255IXmO3cKVqdxcdXrII5ofIREI1yNDbydvhv6p7KFyLNcnMZTR+NL3AxW1sY9ahlWqArvj+DBuOd1eVoGsoQAm/aujZolMO4Ird46u6kEfGpy7hqG+MOiRMQgt+tuxDm1Dvzxi4wwDetux3t04dOg746e6VIPRXDphPZvgu8lhMSSsZX7O8SzdTpCrcuE4P37LlrTZ2zxykwx+G/YkdDUV2CEZKvaa/Sr7WZyoZgZkaIBiSIcc9Ahnf2m9Z81SLPNDUhRdoS0grJt+mUXzFZIJtJtXNTgB4tDVbjcAAA==',
+    ),
+    'image/webp',
+  )
+  t.is(image.format, 'BGRA')
+  const { bytes, layout } = await rawCopy(image)
+  t.deepEqual(layout, [[0, 3 * 4]])
+  t.is(sha256(bytes), '38fda1421cd0647de110b51369e125c43e5efafcd5106416fe51a9fa4a728ad6')
+  image.close()
+})
+
+test('ImageDecoder: a simple lossy WebP (no VP8X header) keeps its I420 planes, like Chrome', async (t) => {
+  const image = await decodeImage(
+    b64(
+      'UklGRmoAAABXRUJQVlA4IF4AAADQAgCdASoGAAQAAgA0JbACdLoA1AD9APQAA+kcQriAAP6J3+j9SBe0/ai2tqnxX1Sg/n+yB2IHbrXPPY58G/UVH076xg+J9fh//qO3/DPkbeJxwrgVUTf/YwEt6AAA',
+    ),
+    'image/webp',
+  )
+  t.is(image.format, 'I420')
+  const { bytes, layout } = await rawCopy(image)
+  t.deepEqual(layout, [
+    [0, 6],
+    [24, 3],
+    [30, 3],
+  ])
+  t.deepEqual(Array.from(bytes), Array.from(b64('Eig7OU1iU1FcfXmMcouMoKOzlbSuxtDdm5eMiVw7davSL2aN')))
+  image.close()
 })
 
 test('ImageDecoder: a decoded RGB frame keeps its format and bytes through new VideoFrame() and clone()', async (t) => {

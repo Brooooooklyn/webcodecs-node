@@ -10,6 +10,7 @@
 //! - anything else: convert once, to the format real Chrome reports for the input
 //!   (images: BGRX, or BGRA when the image has alpha; video: the nearest YUV format)
 //! - PNG, GIF and BMP: always BGRA or BGRX, by the header, with Skia's bytes (see `skia_image`)
+//! - a lossy WebP that is not simple lossy: BGRA or BGRX, with libwebp's bytes (see `webp_rgb`)
 //!
 //! Hardware frames keep the label they had before (I420 for p010 and its siblings):
 //! how to expose them is a separate product decision. `copyTo()` refuses to read
@@ -39,9 +40,10 @@ pub(crate) enum DecodedSource {
   /// - `alpha`: the alpha it declares (WebP alpha flag; PNG, GIF and BMP: see `image_hints`,
   ///   for each frame of a GIF). Chrome labels the image BGRA or BGRX by it.
   /// - `yuv`: whether Chrome decodes the image to YUV planes (JPEG: the sampling
-  ///   factors; AVIF: one still image without alpha). An AVIF with YUV planes keeps
-  ///   them either way: WebCodecs has a format for them, its alpha plane is not
-  ///   decoded, and BGRX would lose precision. Only planar RGB (gbrp) follows Chrome.
+  ///   factors; AVIF: one still image without alpha; WebP: a simple lossy file, whose
+  ///   first chunk is VP8). An AVIF with YUV planes keeps them either way: WebCodecs has a
+  ///   format for them, its alpha plane is not decoded, and BGRX would lose precision.
+  ///   Only planar RGB (gbrp) follows Chrome.
   /// - `size`: the size of a JPEG that Chrome scales for desiredWidth/desiredHeight (with
   ///   `yuv: Some(false)`: such a JPEG is BGRX). It is resized in the conversion pass.
   /// - `pixels`: what a PNG or BMP header says about pixels FFmpeg decodes differently.
@@ -88,6 +90,8 @@ enum Choice {
     desc: PixDesc,
     image: bool,
   },
+  /// Convert a lossy WebP's planes to BGRA or BGRX the way libwebp does (see `webp_rgb`).
+  WebpRgb(VideoPixelFormat),
 }
 
 /// Give a decoded frame the WebCodecs format that describes its bytes, converting
@@ -118,12 +122,32 @@ pub(crate) fn decoded_frame_format(
       desc,
       image,
     } => Ok((convert(&frame, format, &desc, image, size)?, format)),
+    Choice::WebpRgb(format) => Ok((webp_rgb(&frame, format == VideoPixelFormat::BGRA)?, format)),
   }
 }
 
 /// Pick the frame's format. A yuvj* frame is relabelled yuv* here.
 fn choose(frame: &mut Frame, source: DecodedSource) -> Result<Choice, CodecError> {
   let av = frame.format();
+  // Chrome keeps the YUV planes of a simple lossy WebP only. It decodes any other lossy WebP
+  // with libwebp, to BGRA when the VP8X header has the alpha flag and to BGRX otherwise (an
+  // ALPH chunk without the flag is not used; the flag without one gives alpha 255).
+  if let DecodedSource::Image {
+    codec: AVCodecID::Webp,
+    alpha,
+    yuv: Some(false),
+    ..
+  } = source
+    && matches!(av, AVPixelFormat::Yuv420p | AVPixelFormat::Yuva420p)
+  {
+    return Ok(Choice::WebpRgb(
+      if alpha.unwrap_or(av == AVPixelFormat::Yuva420p) {
+        VideoPixelFormat::BGRA
+      } else {
+        VideoPixelFormat::BGRX
+      },
+    ));
+  }
   // Chrome decodes a JPEG to BGRX unless its sampling factors are ones it reads as YUV,
   // even when FFmpeg's planes have a WebCodecs layout (FFmpeg reads 2x2/1x2/1x2 as yuvj422p).
   let rgb_only = matches!(
@@ -298,6 +322,88 @@ fn edit_pixels(frame: &mut Frame, edit: impl FnMut(&mut [u8; 4])) -> Result<(), 
   Ok(())
 }
 
+/// A lossy WebP frame as Chrome decodes it with libwebp: BGRA, never premultiplied, with the
+/// alpha plane when `alpha` (else alpha 255). FFmpeg's yuv(a)420p planes are libwebp's. Each
+/// pixel takes libwebp's fancy upsampling of the chroma (upsampling.c UPSAMPLE_FUNC over the row
+/// pairs of io_dec.c EmitFancyRGB) and its YUV to RGB math (yuv.h VP8YuvToBgr).
+fn webp_rgb(src: &Frame, alpha: bool) -> Result<Frame, CodecError> {
+  let (width, height) = (src.width() as usize, src.height() as usize);
+  // each plane as a function from a row number to the row's samples
+  let plane = |i: usize| {
+    let stride = src.linesize(i) as usize;
+    src
+      .plane_data(i)
+      .map(|data| move |row: usize| &data[row * stride..])
+  };
+  let [Some(y), Some(u), Some(v)] = [0, 1, 2].map(plane) else {
+    return Err(no_pixels());
+  };
+  let a = if alpha { plane(3) } else { None };
+  let mut dst = Frame::new_video(src.width(), src.height(), AVPixelFormat::Bgra)?;
+  check_error(unsafe { av_frame_copy_props(dst.as_mut_ptr(), src.as_ptr()) })?;
+  let stride = dst.linesize(0) as usize;
+  let out = dst.plane_data_mut(0).ok_or_else(no_pixels)?;
+  let cols: Vec<_> = (0..width)
+    .map(|col| chroma_neighbours(col, width.div_ceil(2)))
+    .collect();
+  for (row, line) in out.chunks_mut(stride).enumerate() {
+    let (near, far) = chroma_neighbours(row, height.div_ceil(2));
+    let [u, v] = [&u, &v].map(|plane| [plane(near), plane(far)]);
+    let (luma, alpha) = (y(row), a.as_ref().map(|a| a(row)));
+    let pixels = line[..width * 4].as_chunks_mut::<4>().0.iter_mut();
+    for (col, (px, &cols)) in pixels.zip(&cols).enumerate() {
+      let [u, v] = [u, v].map(|rows| upsample(rows, cols));
+      let y = mult_hi(i32::from(luma[col]), 19077);
+      *px = [
+        clip8(y + mult_hi(u, 33050) - 17685),
+        clip8(y - mult_hi(u, 6419) - mult_hi(v, 13320) + 8708),
+        clip8(y + mult_hi(v, 26149) - 14234),
+        alpha.map_or(255, |alpha| alpha[col]),
+      ];
+    }
+  }
+  dst.set_colorspace(AVColorSpace::Rgb);
+  dst.set_color_range(AVColorRange::Jpeg);
+  Ok(dst)
+}
+
+/// The chroma sample nearest to sample `i` of a 4:2:0 row or column, and the next nearest (on the
+/// other side of `i`), out of `count`. At an edge there is none: the nearest is used again.
+fn chroma_neighbours(i: usize, count: usize) -> (usize, usize) {
+  let near = i / 2;
+  let far = if i % 2 == 1 {
+    near + 1
+  } else {
+    near.wrapping_sub(1)
+  };
+  (near, if far < count { far } else { near })
+}
+
+/// libwebp's fancy upsampling: a pixel's chroma from the 4 samples around it, in the nearest chroma
+/// row and the next nearest, at the nearest column and the next nearest (`cols`). They are weighted
+/// 9:3:3:1 and rounded in libwebp's two steps. At an edge column libwebp weights the nearest column
+/// of the two rows 3:1 instead, which gives the same value.
+fn upsample([near_row, far_row]: [&[u8]; 2], (near, far): (usize, usize)) -> i32 {
+  let nearest = i32::from(near_row[near]);
+  let diagonal = (nearest
+    + 3 * i32::from(near_row[far])
+    + 3 * i32::from(far_row[near])
+    + i32::from(far_row[far])
+    + 8)
+    >> 3;
+  (diagonal + nearest) >> 1
+}
+
+/// libwebp yuv.h MultHi: the fixed-point product, with 6 fraction bits left for `clip8`.
+fn mult_hi(v: i32, coeff: i32) -> i32 {
+  (v * coeff) >> 8
+}
+
+/// libwebp yuv.h VP8Clip8
+fn clip8(v: i32) -> u8 {
+  (v >> 6).clamp(0, 255) as u8
+}
+
 fn no_pixels() -> CodecError {
   CodecError::InvalidState("decoded frame has no pixels".into())
 }
@@ -427,6 +533,71 @@ mod tests {
       let raw = unsafe { crate::ffi::avutil::av_get_pix_fmt(c.as_ptr()) };
       assert_eq!(raw, format.as_raw(), "{name}");
       assert_eq!(AVPixelFormat::from_raw(raw), format, "{name}");
+    }
+  }
+
+  /// FFmpeg's Y, U, V, A planes and Chrome 155's bytes for lossy WebPs with an ALPH chunk.
+  #[test]
+  fn webp_rgb_has_chromes_bytes() {
+    type Planes = [&'static [u8]; 4];
+    let cases: [(u32, u32, Planes, &[u8]); 5] = [
+      (1, 1, [&[16], &[128], &[128], &[1]], &[0, 0, 0, 1]),
+      (
+        1,
+        2,
+        [&[16, 16], &[128], &[128], &[255, 0]],
+        &[0, 0, 0, 255, 0, 0, 0, 0],
+      ),
+      (
+        2,
+        2,
+        [&[12, 95, 105, 216], &[102], &[168], &[255, 255, 0, 255]],
+        &[
+          0, 0, 59, 255, 40, 70, 156, 255, 51, 81, 167, 0, 180, 211, 255, 255,
+        ],
+      ),
+      (
+        3,
+        1,
+        [&[105, 64, 39], &[100, 183], &[143, 124], &[7, 41, 11]],
+        &[47, 102, 128, 7, 42, 51, 72, 41, 95, 13, 28, 11],
+      ),
+      (
+        1,
+        3,
+        [&[108, 177, 104], &[164, 91], &[90, 72], &[33, 41, 201]],
+        &[180, 124, 46, 33, 224, 215, 120, 41, 64, 151, 21, 201],
+      ),
+    ];
+    for (width, height, planes, chrome) in cases {
+      let mut frame = Frame::new_video(width, height, AVPixelFormat::Yuva420p).unwrap();
+      for (i, plane) in planes.into_iter().enumerate() {
+        let row_width = if matches!(i, 1 | 2) {
+          width.div_ceil(2)
+        } else {
+          width
+        } as usize;
+        let stride = frame.linesize(i) as usize;
+        let data = frame.plane_data_mut(i).unwrap();
+        for (row, from) in plane.chunks(row_width).enumerate() {
+          data[row * stride..][..row_width].copy_from_slice(from);
+        }
+      }
+      let bgra = |alpha| {
+        let out = webp_rgb(&frame, alpha).unwrap();
+        let stride = out.linesize(0) as usize;
+        let data = out.plane_data(0).unwrap();
+        (0..height as usize)
+          .flat_map(|row| data[row * stride..][..width as usize * 4].to_vec())
+          .collect::<Vec<u8>>()
+      };
+      assert_eq!(bgra(true), chrome, "{width}x{height}");
+      // without alpha (BGRX): the same colours, with 255 in the fourth byte
+      let opaque: Vec<u8> = chrome
+        .chunks(4)
+        .flat_map(|px| [px[0], px[1], px[2], 255])
+        .collect();
+      assert_eq!(bgra(false), opaque, "{width}x{height}");
     }
   }
 
