@@ -5,14 +5,15 @@
 
 use crate::codec::demuxer::{DemuxerContext, MediaType};
 use crate::codec::{CodecContext, DecoderConfig, Frame, Packet};
-use crate::ffi::avutil::av_rescale_q;
-use crate::ffi::{AV_NOPTS_VALUE, AVCodecID, AVRational};
+use crate::ffi::avutil::{av_opt_set_int, av_rescale_q, opt_flag};
+use crate::ffi::{AV_NOPTS_VALUE, AVCodecID, AVRational, check_error};
 use crate::webcodecs::buffer_source::{self, Uint8ArrayCopy};
 use crate::webcodecs::decoded_frame::{DecodedSource, decoded_frame_format};
 use crate::webcodecs::error::{
   DOMExceptionName, invalid_state_error, native_dom_exception_error, native_range_error,
   throw_invalid_state_error,
 };
+use crate::webcodecs::image_hints::{PixelHint, bmp_header, gif_frame_alpha, png_header};
 use crate::webcodecs::{VideoFrame, VideoPixelFormat};
 use futures::stream::StreamExt;
 use napi::bindgen_prelude::*;
@@ -1088,11 +1089,28 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
     )
   })?;
 
+  // Chrome fails the metadata of a BMP whose bitfield masks the image crate rejects.
+  let bmp = match codec_id {
+    AVCodecID::Bmp => bmp_header(&data_bytes).map_err(|()| {
+      fail_metadata(inner);
+      invalid_state_error("Failed to retrieve track metadata.")
+    })?,
+    _ => None,
+  };
+
   // Demux and decode all frames.
   let (context, mut frames, video_streams) = decode_image_data(codec_id, &data_bytes)?;
   // One video stream with one frame: no animation, alpha or other auxiliary image. An
   // 'avis' AVIF is an animation even when only its first frame has arrived.
   let still = video_streams == 1 && frames.len() == 1 && !avif_is_sequence(&data_bytes);
+
+  // Chrome labels each GIF frame by the frames it is drawn over. A frame list that differs from
+  // FFmpeg's (damaged data) makes every frame BGRA.
+  let gif_alpha = (codec_id == AVCodecID::Gif).then(|| {
+    gif_frame_alpha(&data_bytes)
+      .filter(|alpha| alpha.len() == frames.len())
+      .unwrap_or_else(|| vec![true; frames.len()])
+  });
 
   // Apply preferAnimation: if false and format supports animation, only keep first frame
   if prefer_animation == Some(false) && !frames.is_empty() {
@@ -1122,25 +1140,36 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
 
   // Give every frame a WebCodecs format that describes its bytes, converting the
   // FFmpeg formats WebCodecs has no name for (rgb24, pal8, gray, argb, ...).
-  let source = DecodedSource::Image {
-    codec: codec_id,
-    alpha: match codec_id {
-      AVCodecID::Webp => webp_alpha_hint(&data_bytes),
-      AVCodecID::Png => png_alpha_hint(&data_bytes),
-      _ => None,
-    },
-    yuv: match codec_id {
-      AVCodecID::Mjpeg if size.is_some() => Some(false),
-      AVCodecID::Mjpeg => jpeg_yuv_hint(&data_bytes),
-      // Chrome keeps a still AVIF without alpha as YUV planes
-      AVCodecID::Av1 => Some(still),
-      _ => None,
-    },
-    size,
+  let header = match codec_id {
+    AVCodecID::Png => png_header(&data_bytes),
+    AVCodecID::Bmp => bmp,
+    _ => None,
   };
+  let alpha = match codec_id {
+    AVCodecID::Webp => webp_alpha_hint(&data_bytes),
+    _ => header.map(|header| header.alpha),
+  };
+  let yuv = match codec_id {
+    AVCodecID::Mjpeg if size.is_some() => Some(false),
+    AVCodecID::Mjpeg => jpeg_yuv_hint(&data_bytes),
+    // Chrome keeps a still AVIF without alpha as YUV planes
+    AVCodecID::Av1 => Some(still),
+    _ => None,
+  };
+  let pixels = header.map_or(PixelHint::None, |header| header.pixels);
   let frames = frames
     .into_iter()
-    .map(|frame| decoded_frame_format(frame, source))
+    .enumerate()
+    .map(|(i, frame)| {
+      let source = DecodedSource::Image {
+        codec: codec_id,
+        alpha: gif_alpha.as_ref().map_or(alpha, |gif| Some(gif[i])),
+        yuv,
+        size,
+        pixels,
+      };
+      decoded_frame_format(frame, source)
+    })
     .collect::<std::result::Result<Vec<_>, _>>()
     .map_err(|e| {
       Error::new(
@@ -1246,31 +1275,6 @@ fn webp_alpha_hint(data: &[u8]) -> Option<bool> {
     b"VP8L" if data[20] == 0x2f => Some(data[24] & 0x10 != 0),
     _ => None,
   }
-}
-
-/// The alpha a PNG header declares: color type 4 or 6, or a tRNS chunk (which comes
-/// before IDAT). Chrome labels the decoded image BGRA or BGRX by it, even when every
-/// tRNS entry is 255.
-fn png_alpha_hint(data: &[u8]) -> Option<bool> {
-  const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
-  if data.len() < 33 || &data[..8] != SIGNATURE || &data[12..16] != b"IHDR" {
-    return None;
-  }
-  if data[25] & 4 != 0 {
-    return Some(true);
-  }
-  let mut pos = 8usize;
-  while let Some(header) = data.get(pos..pos.checked_add(8)?) {
-    match &header[4..8] {
-      b"tRNS" => return Some(true),
-      b"IDAT" | b"IEND" => return Some(false),
-      _ => {}
-    }
-    // length, type, data, CRC
-    let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
-    pos = pos.checked_add(12)?.checked_add(length)?;
-  }
-  None
 }
 
 /// Whether Chrome decodes a JPEG to YUV planes, from its SOF sampling factors: three
@@ -1403,6 +1407,23 @@ fn create_image_decoder(codec_id: AVCodecID, extradata: Option<Vec<u8>>) -> Resu
         format!("Failed to configure decoder: {}", e),
       )
     })?;
+  if codec_id == AVCodecID::Gif {
+    // Chrome's transparent GIF pixels are 0, 0, 0, 0; FFmpeg's default is transparent white.
+    check_error(unsafe {
+      av_opt_set_int(
+        context.as_mut_ptr().cast(),
+        c"trans_color".as_ptr(),
+        0,
+        opt_flag::SEARCH_CHILDREN,
+      )
+    })
+    .map_err(|e| {
+      Error::new(
+        Status::GenericFailure,
+        format!("Failed to configure decoder: {}", e),
+      )
+    })?;
+  }
   context.open().map_err(|e| {
     Error::new(
       Status::GenericFailure,
@@ -1541,7 +1562,7 @@ fn normalize_frame_timing(frames: &mut [Frame], time_base: (i32, i32)) {
 mod tests {
   use super::{
     avif_is_sequence, gif_repetition_count, jpeg_scale_numerator, jpeg_yuv_hint,
-    normalize_frame_timing, png_alpha_hint, webp_alpha_hint,
+    normalize_frame_timing, webp_alpha_hint,
   };
   use crate::codec::Frame;
   use crate::ffi::types::AV_NOPTS_VALUE;
@@ -1578,46 +1599,6 @@ mod tests {
       None
     );
     assert_eq!(webp_alpha_hint(b"GIF89a"), None);
-  }
-
-  #[test]
-  fn reads_png_alpha_hints() {
-    let chunk = |kind: &[u8], data: &[u8]| {
-      let mut c = (data.len() as u32).to_be_bytes().to_vec();
-      c.extend_from_slice(kind);
-      c.extend_from_slice(data);
-      c.extend_from_slice(&[0; 4]); // CRC is not checked
-      c
-    };
-    let png = |color_type: u8, chunks: &[Vec<u8>]| {
-      let mut b = b"\x89PNG\r\n\x1a\n".to_vec();
-      b.extend(chunk(
-        b"IHDR",
-        &[0, 0, 0, 1, 0, 0, 0, 1, 8, color_type, 0, 0, 0],
-      ));
-      chunks.iter().for_each(|c| b.extend_from_slice(c));
-      b.extend(chunk(b"IDAT", &[]));
-      b
-    };
-    let plte = chunk(b"PLTE", &[0, 0, 0]);
-    let trns = chunk(b"tRNS", &[255]);
-    let text = chunk(b"tEXt", b"a\0b");
-    assert_eq!(
-      png_alpha_hint(&png(3, std::slice::from_ref(&plte))),
-      Some(false)
-    );
-    // tRNS declares alpha even when every entry is 255
-    assert_eq!(
-      png_alpha_hint(&png(3, &[plte, text.clone(), trns.clone()])),
-      Some(true)
-    );
-    assert_eq!(png_alpha_hint(&png(0, &[trns])), Some(true));
-    assert_eq!(png_alpha_hint(&png(2, &[text])), Some(false));
-    assert_eq!(png_alpha_hint(&png(4, &[])), Some(true));
-    assert_eq!(png_alpha_hint(&png(6, &[])), Some(true));
-    // no IDAT yet (truncated) or not a PNG
-    assert_eq!(png_alpha_hint(&png(3, &[])[..33]), None);
-    assert_eq!(png_alpha_hint(b"GIF89a"), None);
   }
 
   #[test]
