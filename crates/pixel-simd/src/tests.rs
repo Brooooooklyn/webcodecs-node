@@ -515,44 +515,92 @@ fn debruijn() -> Vec<u8> {
   out
 }
 
-/// The chroma blocks of each path, over every (top left, top, left, current) sample: 2^32.
-/// Run with `cargo test --release -p pixel-simd -- --ignored`.
+/// Every chroma quad (top left, top, left, current: 2^32) through each path's whole conversion.
+/// For each (p, q), a frame of 131073 x 3 pixels with chroma rows p, q, p, q, ... and de Bruijn:
+/// its row pair (rows 1 and 2) gives every quad of p and q to both rows, nearer each in turn. U
+/// and V are the same plane, and each pixel's luma is one under which any other U changes B and
+/// any other V changes R, so equal bytes mean equal chroma. Run with
+/// `cargo test --release -p pixel-simd -- --ignored`.
 #[test]
-#[ignore = "2^32 samples per path: run with --release -- --ignored"]
+#[ignore = "2^32 chroma quads per path: run with --release -- --ignored"]
 fn webp_upsamples_every_chroma_like_scalar() {
-  use crate::webp::{fancy_quad, upsample_blocks};
+  use crate::webp::{chroma_neighbours, upsample};
+  let (scalar, simd) = levels();
+  if simd.is_empty() {
+    return;
+  }
+  let bgra = |samples: [u8; 3]| {
+    let plane = |i: usize| Plane {
+      data: &samples[i..=i],
+      stride: 1,
+    };
+    let src = Yuva420 {
+      width: 1,
+      height: 1,
+      y: plane(0),
+      u: plane(1),
+      v: plane(2),
+      a: None,
+    };
+    let mut px = [0; 4];
+    yuva420_to_bgra_with(scalar, &src, &mut px, 4);
+    px
+  };
+  let luma_for: Vec<u8> = (0..=255)
+    .map(|c| {
+      (0..=255)
+        .find(|&y| {
+          let [b, _, r, _] = bgra([y, c, c]);
+          (0..=255)
+            .filter(|&o| o != c)
+            .all(|o| bgra([y, o, c])[0] != b && bgra([y, c, o])[2] != r)
+        })
+        .expect("a luma that shows the chroma")
+    })
+    .collect();
   let debruijn = debruijn();
+  let cw = debruijn.len();
+  let (width, height) = (2 * cw - 1, 3);
+  let cols: Vec<_> = (0..width).map(|col| chroma_neighbours(col, cw)).collect();
   // wasm32-wasip1 has no threads: there the test thread does all of it
   let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-  for (isa, n, block) in upsample_blocks() {
-    let debruijn = &debruijn;
-    let check = move |t: usize| {
-      let (mut row, mut out) = (vec![0; debruijn.len() + n], [0; 128]);
-      for pair in (t..65536).step_by(threads) {
-        for (i, x) in row.iter_mut().enumerate() {
-          *x = [(pair >> 8) as u8, pair as u8][i % 2];
-        }
-        for i in (0..65536).step_by(n / 2) {
-          let (r1, r2) = (&row[i..], &debruijn[i..]);
-          block(r1, r2, &mut out);
-          for l in 0..n / 2 {
-            let want = fancy_quad([r1[l], r1[l + 1]], [r2[l], r2[l + 1]]);
-            let got = [
-              out[2 * l],
-              out[2 * l + 1],
-              out[n + 2 * l],
-              out[n + 2 * l + 1],
-            ];
-            assert_eq!(got, want, "{isa:?} at {i} lane {l}");
-          }
+  let check = |t: usize| {
+    let mut chroma = [vec![0; cw], debruijn.clone()].concat();
+    let mut luma = vec![0; width * height];
+    let (mut want, mut got) = (vec![0; 4 * width * height], vec![0; 4 * width * height]);
+    for pq in (t..65536).step_by(threads) {
+      for (i, x) in chroma[..cw].iter_mut().enumerate() {
+        *x = [(pq >> 8) as u8, pq as u8][i % 2];
+      }
+      for (row, luma) in luma.chunks_mut(width).enumerate() {
+        let (near, far) = chroma_neighbours(row, 2);
+        let rows = [&chroma[near * cw..], &chroma[far * cw..]];
+        for (y, &cols) in luma.iter_mut().zip(&cols) {
+          *y = luma_for[upsample(rows, cols) as usize];
         }
       }
-    };
-    std::thread::scope(|s| {
-      for t in 1..threads {
-        s.spawn(move || check(t));
+      let plane = |data, stride| Plane { data, stride };
+      let src = Yuva420 {
+        width,
+        height,
+        y: plane(&luma[..], width),
+        u: plane(&chroma[..], cw),
+        v: plane(&chroma[..], cw),
+        a: None,
+      };
+      yuva420_to_bgra_with(scalar, &src, &mut want, 4 * width);
+      for &isa in &simd {
+        yuva420_to_bgra_with(isa, &src, &mut got, 4 * width);
+        if let Some(i) = got.iter().zip(&want).position(|(g, w)| g != w) {
+          panic!("{isa:?} p {} q {}: byte {i}", pq >> 8, pq & 255);
+        }
       }
-      check(0);
-    });
-  }
+    }
+  };
+  std::thread::scope(|s| {
+    for t in 1..threads {
+      s.spawn(move || check(t));
+    }
+    check(0);
+  });
 }

@@ -32,7 +32,7 @@ fn pack_and_store(a: v128, b: v128, da: v128, db: v128, out: &mut [u8]) {
 /// UPSAMPLE_32PIXELS: 17 samples of the chroma row above (`r1`) and below (`r2`) to 32 for the
 /// top row in out[..32] and 32 for the bottom row in out[32..].
 #[inline]
-pub(super) fn upsample32(r1: &[u8], r2: &[u8], out: &mut [u8; 64]) {
+fn upsample32(r1: &[u8], r2: &[u8], out: &mut [u8; 64]) {
   let (a, b, c, d) = (load(r1), load(&r1[1..]), load(r2), load(&r2[1..]));
   let (s, t) = (u8x16_avgr(a, d), u8x16_avgr(b, c));
   let (st, ad, bc) = (v128_xor(s, t), v128_xor(a, d), v128_xor(b, c));

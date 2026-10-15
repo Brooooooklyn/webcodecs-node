@@ -19,7 +19,7 @@ fn store2(dst: &mut [u8], a: uint8x16_t, b: uint8x16_t) {
 /// 32 for the top row in out[..32] and 32 for the bottom row in out[32..].
 #[inline]
 #[target_feature(enable = "neon")]
-pub(super) fn upsample32(r1: &[u8], r2: &[u8], out: &mut [u8; 64]) {
+fn upsample32(r1: &[u8], r2: &[u8], out: &mut [u8; 64]) {
   let (a, b, c, d) = (load(r1), load(&r1[1..]), load(r2), load(&r2[1..]));
   let (ad_l, ad_h) = (
     vaddl_u8(vget_low_u8(a), vget_low_u8(d)),
