@@ -85,6 +85,9 @@ fn main() {
   // Compile C accessor library
   compile_accessors(&ffmpeg_dir, &target_os, &target_arch, &target_env);
 
+  // Compile Chrome's libjpeg-turbo and the Blink-style JPEG decoder
+  compile_libjpeg_turbo(&ffmpeg_dir);
+
   // Link FFmpeg libraries
   link_ffmpeg(&ffmpeg_dir, &target_os, None);
 
@@ -509,6 +512,86 @@ fn compile_accessors(ffmpeg_dir: &Path, target_os: &str, target_arch: &str, targ
   build.compile("ffmpeg_accessors");
 
   println!("cargo:rerun-if-changed=src/ffi/accessors.c");
+}
+
+/// Compile the libjpeg-turbo that Chrome ships (vendor/libjpeg-turbo, synced by
+/// tools/sync-libjpeg-turbo.mjs) and Blink's JPEG decoder on it (src/ffi/jpeg_blink.c).
+/// Like Chromium's BUILD.gn without SIMD: C only, no arithmetic decoding (jconfig.h), the
+/// 8-bit library plus the 12- and 16-bit objects that jdmaster.c links.
+fn compile_libjpeg_turbo(ffmpeg_dir: &Path) {
+  let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+  let vendor = manifest_dir.join("vendor/libjpeg-turbo");
+  let src = vendor.join("src");
+  let pin =
+    fs::read_to_string(vendor.join("CHROMIUM_PIN")).expect("vendor/libjpeg-turbo/CHROMIUM_PIN");
+  let sources = |key: &str| -> Vec<&str> {
+    pin
+      .lines()
+      .find_map(|line| line.strip_prefix(key))
+      .unwrap_or_else(|| panic!("CHROMIUM_PIN has no {key} line"))
+      .split_whitespace()
+      .collect()
+  };
+
+  let mut base = cc::Build::new();
+  base
+    .include(&src)
+    .define("NO_GETENV", None)
+    .define("NO_PUTENV", None);
+  // jconfigint.h picks the 64-bit Huffman bit buffer from __WORDSIZE, which musl's <stdint.h>
+  // does not define. Give 64-bit musl the buffer that Chrome's 64-bit builds use.
+  if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("musl")
+    && env::var("CARGO_CFG_TARGET_POINTER_WIDTH").as_deref() == Ok("64")
+  {
+    base.define("__WORDSIZE", Some("64"));
+  }
+  // Give every libjpeg global our own prefix, so that this copy cannot clash with another
+  // libjpeg in the link or in the process (a system one, jpegli, Chromium's own in Electron).
+  // Chromium's jpeglibmangler.h lists them as `#define name chromium_name`, all but
+  // jpeg_natural_order.
+  let mangler = fs::read_to_string(src.join("jpeglibmangler.h")).expect("jpeglibmangler.h");
+  let names = mangler.lines().filter_map(|line| {
+    let mut words = line.strip_prefix("#define ")?.split_whitespace();
+    let name = words.next()?;
+    (words.next()? == format!("chromium_{name}")).then_some(name)
+  });
+  for name in names.chain(["jpeg_natural_order"]) {
+    base.define(name, Some(format!("webcodecs_{name}").as_str()));
+  }
+
+  // The decoder first: the linker reads it before the library it calls.
+  base
+    .clone()
+    .file("src/ffi/jpeg_blink.c")
+    .include(ffmpeg_dir.join("include"))
+    .warnings(true)
+    .extra_warnings(true)
+    .compile("jpeg_blink");
+
+  // The 12- and 16-bit objects are the same sources with BITS_IN_JSAMPLE=12/16. A wrapper
+  // file per source gives each object its own name in the one archive.
+  let wrappers = PathBuf::from(env::var("OUT_DIR").unwrap()).join("libjpeg-turbo");
+  fs::create_dir_all(&wrappers).expect("libjpeg-turbo wrapper directory");
+  let mut lib = base;
+  lib.warnings(false);
+  for name in sources("bits8: ") {
+    lib.file(src.join(format!("{name}.c")));
+  }
+  for bits in [12, 16] {
+    for name in sources(&format!("bits{bits}: ")) {
+      let wrapper = wrappers.join(format!("{name}-{bits}.c"));
+      fs::write(
+        &wrapper,
+        format!("#define BITS_IN_JSAMPLE {bits}\n#include \"{name}.c\"\n"),
+      )
+      .expect("libjpeg-turbo wrapper");
+      lib.file(wrapper);
+    }
+  }
+  lib.compile("jpeg_turbo");
+
+  println!("cargo:rerun-if-changed=src/ffi/jpeg_blink.c");
+  println!("cargo:rerun-if-changed=vendor/libjpeg-turbo");
 }
 
 /// Link FFmpeg libraries (static only)

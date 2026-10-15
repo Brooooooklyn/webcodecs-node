@@ -11,6 +11,7 @@
     "build/**",
     "ffmpeg-build/**",
     "ffmpeg-src/**",
-    "example/*.json"
+    "example/*.json",
+    "vendor/**"
   ]
 }
