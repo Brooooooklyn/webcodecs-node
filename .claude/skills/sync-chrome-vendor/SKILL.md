@@ -140,16 +140,17 @@ table below follows one Chrome stable version: the `chrome:` line of
 
 `src/webcodecs/image_decoder.rs` has these, outside the JPEG decoder:
 
-- A stream whose last chunk and close come in the same task (both in `start()`, for
-  example), with a decode() already waiting: Chrome sees the end with the data and decodes YUV;
-  here the stream reader sees the end one task later, so the frame is BGRX (and an image that
-  fails rejects `completed`, where Chrome resolves it).
 - A stream that stays open after its last byte: a waiting decode() resolves (or fails) at the
   close, or at the next probe when the data has doubled, as for every format here. Chrome
   decodes again on each chunk and answers as soon as the frame is whole.
-- reset() while a decode() made before all the data is pending: Chrome aborts that decode, so a
-  decode() after all the data gives YUV planes. Here reset() does not abort it (all formats),
-  so the frame is BGRX.
+- reset() while a decode() waits: Chrome rejects that decode() with an AbortError; here it still
+  resolves or fails later (all formats). The frames after the reset() match Chrome: a JPEG keeps
+  the choice of RGB that a decode of part of the data made (`rgb_decode`).
+- The data or the close in a 0 ms timer right after a decode(): Chrome's first decode (made
+  before it read any data) is still on its decoder thread when the timer runs, so Chrome reads
+  the close before it decodes again, and decodes YUV planes. Here that first decode is done at
+  once, so the data is decoded before the close is read: BGRX. Both depend on timing; with
+  30 ms between the decode() and the close, Chrome is BGRX too.
 - Size limits: Chrome fails a frame wider or taller than `kMaxDimension` (32767); here FFmpeg
   allocates the frame, and fails it when (width + 128) × (height + 128) ≥ 2^28. Both fail the
   metadata above 2^29 - 1 pixels.
@@ -167,6 +168,7 @@ licence notice (LGPL 2.1 or later, MPL 1.1 or GPL 2.0): keep it when you port ch
 | JPEG M/8 scale rule                    | same file, `DesiredScaleNumerator` @ 155.0.8059.79                                                              | `jpeg_scale_numerator` in `src/webcodecs/image_decoder.rs`                                                  |
 | WebCodecs YUV gate and color tags      | `third_party/blink/renderer/modules/webcodecs/image_decoder_core.cc` @ 155.0.8059.79                            | `rgb_decode` and `jpeg_frame` in `src/webcodecs/image_decoder.rs`, the color tags in `src/ffi/jpeg_blink.c` |
 | WebCodecs failure schedule             | `third_party/blink/renderer/modules/webcodecs/image_decoder_external.cc` @ 155.0.8059.79                        | `jpeg_frame`, `close_if_failed` and `closed_error` in `src/webcodecs/image_decoder.rs`                      |
+| WebCodecs decode schedule              | `image_decoder_external.cc` and `image_decoder_core.cc` (same directory as above) @ 155.0.8059.79               | `FrameCall`, `JpegChunkReader` and `jpeg_frame` in `src/webcodecs/image_decoder.rs`                         |
 | libwebp fancy upsampler and YUV to RGB | `src/third_party/libwebp/src` @ `b43b2caa710c`: `src/dsp/upsampling.c`, `src/dec/io_dec.c`, `src/dsp/yuv.h`     | `webp_rgb` in `src/webcodecs/decoded_frame.rs`                                                              |
 | Skia SkFrameHolder alpha rule (GIF)    | `src/third_party/skia` @ `29ed1e87a0a5`: `src/codec/SkCodec.cpp` `setAlphaAndRequiredFrame`                     | `frame_alpha` in `src/webcodecs/image_hints.rs`                                                             |
 | image-rs BMP alpha rule                | `third_party/rust/chromium_crates_io/vendor/image-v0_25` (0.25.10) @ 155.0.8059.79: `src/codecs/bmp/decoder.rs` | `bmp_header` in `src/webcodecs/image_hints.rs`                                                              |

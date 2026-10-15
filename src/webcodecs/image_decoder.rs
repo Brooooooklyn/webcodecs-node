@@ -4,7 +4,7 @@
 //! See: <https://developer.mozilla.org/en-US/docs/Web/API/ImageDecoder>
 
 use crate::codec::demuxer::{DemuxerContext, MediaType};
-use crate::codec::jpeg::{decode_jpeg, jpeg_info};
+use crate::codec::jpeg::{JpegDecode, decode_jpeg, jpeg_info};
 use crate::codec::{CodecContext, DecoderConfig, Frame, Packet};
 use crate::ffi::avutil::{av_opt_set_int, av_rescale_q, opt_flag};
 use crate::ffi::{AV_NOPTS_VALUE, AVCodecID, AVPixelFormat, AVRational, check_error};
@@ -18,12 +18,13 @@ use crate::webcodecs::image_hints::{PixelHint, bmp_header, gif_frame_alpha, png_
 use crate::webcodecs::{VideoFrame, VideoPixelFormat};
 use futures::stream::StreamExt;
 use napi::bindgen_prelude::*;
-use napi::tokio::sync::Notify;
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
+use napi::tokio::sync::{Notify, oneshot};
 use napi_derive::napi;
 use parking_lot::RwLock as ParkingLotRwLock;
 use std::sync::{
-  Arc, Mutex,
-  atomic::{AtomicBool, Ordering},
+  Arc, Mutex, Weak,
+  atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
 const COMPLETED_PROMISE: &str = "[[completed]]";
@@ -446,13 +447,20 @@ struct ImageDecoderInner {
   /// Whether all the data is here: a buffer, or a stream that ended (`complete` follows once
   /// the data is decoded).
   all_data: bool,
-  /// Whether a decode() of the first frame came before all the data. Chrome then decodes a JPEG
-  /// to RGB rows as the data arrives, and never to YUV planes after that
-  /// (image_decoder_core.cc have_completed_rgb_decode_). Only the JPEG path reads it. The
-  /// stream reader sees the end of a stream one task after its last chunk, so a decode() made
-  /// before the stream is read counts even when the last chunk and the close came together,
-  /// where Chrome sees both at once and decodes YUV.
+  /// Whether a decode of the first frame of a JPEG ran on part of the data and got to output
+  /// rows. Like Chrome, the JPEG is then decoded to RGB rows as the data arrives, and never to
+  /// YUV planes after that, also not after reset() (image_decoder_core.cc
+  /// have_completed_rgb_decode_). Set by `jpeg_frame`.
   rgb_decode: bool,
+  /// A JPEG stream has nothing queued: the read made last was still waiting when the task that
+  /// made it ended, and nothing came since (see `JpegChunkReader`). A decode() decodes part of
+  /// the data only then; Chrome's never runs between results that come in one task (see
+  /// `FrameCall::Decode`).
+  stream_idle: bool,
+  /// The decode() calls of the first frame of a JPEG that still wait, made since the last
+  /// reset(), which aborts them in Chrome. While there are any, a chunk that comes to an idle
+  /// stream is decoded at once (see `FrameCall::Arrival`).
+  jpeg_requests: u32,
   /// Whether a frame failed to decode where Chrome's decoder fails (JPEG): the decoder closes,
   /// and the decode() calls still pending reject (see `closed_error`).
   frame_failed: bool,
@@ -565,6 +573,8 @@ impl ImageDecoder {
       complete: complete.clone(),
       all_data: false,
       rgb_decode: false,
+      stream_idle: false,
+      jpeg_requests: 0,
       frame_failed: false,
       tracks: tracks.clone(),
       closed: false,
@@ -607,7 +617,8 @@ impl ImageDecoder {
       let ready_inner = inner.clone();
       let ready_promise = env.spawn_future_with_callback(
         async move {
-          let _ = spawn_blocking(move || cache_decoded_frames(&parse_inner, false)).await;
+          let _ =
+            spawn_blocking(move || cache_decoded_frames(&parse_inner, FrameCall::Probe)).await;
           Ok(())
         },
         move |_, ()| {
@@ -635,7 +646,14 @@ impl ImageDecoder {
       // Stream data: append chunks incrementally and probe at geometrically
       // increasing byte thresholds. This avoids O(n^2) reparsing while letting
       // `tracks.ready` and decode() resolve before a delayed stream close.
-      let mut reader = stream.read()?;
+      let mut reader = if codec_id == Some(AVCodecID::Mjpeg) {
+        ChunkReader::Jpeg(JpegChunkReader::new(
+          unsafe { init.data.cast::<Object>() }?,
+          &inner,
+        )?)
+      } else {
+        ChunkReader::Any(stream.read()?)
+      };
       let inner_clone = inner.clone();
       if let Ok(mut inner_guard) = inner_clone.lock() {
         inner_guard.data = ImageDecoderData::Vec(Vec::new());
@@ -648,9 +666,14 @@ impl ImageDecoder {
         let mut next_probe_size = 1usize;
 
         while let Some(item) = reader.next().await {
-          let chunk = match item {
+          let (chunk, idle) = match item {
             Ok(chunk) => chunk,
             Err(error) => {
+              // A decode() of a JPEG that failed before the error closed the decoder: like
+              // Chrome, that close rejects `completed`, and the stream is no longer read.
+              if close_if_failed(&inner_clone) {
+                return Ok(!data_complete.load(Ordering::Acquire));
+              }
               // A stream error is terminal. Mark the input complete before
               // waking decode waiters so they reject instead of waiting for an
               // update that can never arrive.
@@ -676,10 +699,19 @@ impl ImageDecoder {
             }
           };
 
-          if buffered_len >= next_probe_size {
+          // A chunk that came to an idle JPEG stream while a decode() waits is decoded now,
+          // before the reader sees what came with it (the close, say), as Chrome does.
+          let arrival = idle && arrival_decode_wanted(&inner_clone);
+          let probe = buffered_len >= next_probe_size;
+          if probe || arrival {
+            let call = if arrival {
+              FrameCall::Arrival
+            } else {
+              FrameCall::Probe
+            };
             let probe_inner = inner_clone.clone();
             if matches!(
-              spawn_blocking(move || cache_decoded_frames(&probe_inner, false)).await,
+              spawn_blocking(move || cache_decoded_frames(&probe_inner, call)).await,
               Ok(Ok(()))
             ) {
               signal_tracks_ready(&inner_clone);
@@ -687,7 +719,9 @@ impl ImageDecoder {
             if close_if_failed(&inner_clone) {
               return Ok(!data_complete.load(Ordering::Acquire));
             }
-            next_probe_size = buffered_len.saturating_mul(2).max(next_probe_size * 2);
+            if probe {
+              next_probe_size = buffered_len.saturating_mul(2).max(next_probe_size * 2);
+            }
           }
         }
 
@@ -698,7 +732,7 @@ impl ImageDecoder {
           inner_guard.all_data = true;
         }
         let final_inner = inner_clone.clone();
-        let _ = spawn_blocking(move || cache_decoded_frames(&final_inner, false)).await;
+        let _ = spawn_blocking(move || cache_decoded_frames(&final_inner, FrameCall::Probe)).await;
         if close_if_failed(&inner_clone) {
           return Ok(!data_complete.load(Ordering::Acquire));
         }
@@ -823,17 +857,20 @@ impl ImageDecoder {
     let inner = self.inner.clone();
     let frame_index = options.as_ref().and_then(|o| o.frame_index).unwrap_or(0) as usize;
     // Read now: a decode() made before the decoder fails rejects differently from one made
-    // after (see `closed_error`).
-    let closed = {
+    // after (see `closed_error`), and one made before a reset() no longer decodes part of the
+    // data (see `FrameCall::Decode`).
+    let (closed, epoch, jpeg_request) = {
       let mut guard = inner
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-      // Chrome decodes the first frame as the data arrives (see `rgb_decode`).
-      if frame_index == 0 && !guard.all_data {
-        guard.rgb_decode = true;
+      let jpeg_request =
+        frame_index == 0 && !guard.closed && guard.codec_id == Some(AVCodecID::Mjpeg);
+      if jpeg_request {
+        guard.jpeg_requests += 1;
       }
-      guard.closed
+      (guard.closed, guard.cache_epoch, jpeg_request)
     };
+    let request_inner = inner.clone();
 
     // Keep the Rust error as the resolved future value so the completion
     // callback can construct the precise native JavaScript exception class.
@@ -864,7 +901,7 @@ impl ImageDecoder {
         // concurrent decode, rather than relying on a single stored permit.
         notified.as_mut().enable();
         let decode_inner = inner.clone();
-        let result = spawn_blocking(move || decode_cached_frame(&decode_inner, frame_index))
+        let result = spawn_blocking(move || decode_cached_frame(&decode_inner, frame_index, epoch))
           .await
           .map_err(|join_error| {
             Error::new(
@@ -879,6 +916,17 @@ impl ImageDecoder {
 
         notified.await;
       }
+    };
+    // The decode() no longer waits (see `jpeg_requests`).
+    let decode = async move {
+      let result = decode.await;
+      if jpeg_request
+        && let Ok(mut guard) = request_inner.lock()
+        && guard.cache_epoch == epoch
+      {
+        guard.jpeg_requests = guard.jpeg_requests.saturating_sub(1);
+      }
+      result
     };
 
     env.spawn_future_with_callback(
@@ -907,6 +955,9 @@ impl ImageDecoder {
     inner.cached_frames = None;
     inner.cache_epoch = inner.cache_epoch.wrapping_add(1);
     inner.cached_data_len = 0;
+    // Chrome aborts the decode() calls that wait: they decode nothing more (see
+    // `FrameCall::Decode`). A JPEG keeps its choice of RGB (`rgb_decode`).
+    inner.jpeg_requests = 0;
 
     // Reset frame_count for animated formats (will be re-detected on next decode)
     if let Ok(mut track_inner) = inner.tracks.inner.lock()
@@ -973,6 +1024,7 @@ fn native_image_decode_error(env: &Env, error: Error) -> Result<Error> {
 fn decode_cached_frame(
   inner: &Arc<Mutex<ImageDecoderInner>>,
   frame_index: usize,
+  epoch: u64,
 ) -> Result<Option<ImageDecodeResult>> {
   let (needs_cache, data_complete, jpeg) = {
     let guard = inner
@@ -1000,9 +1052,10 @@ fn decode_cached_frame(
 
   // A reset can clear the cache. For fully buffered input, reconstruct it now;
   // for a live stream, wait for the collector's next successful probe. Like Chrome, a
-  // JPEG is decoded now with the data so far: it gives a frame only once it is whole.
+  // JPEG is decoded now with the data so far when the stream is idle (`FrameCall::Decode`): it
+  // gives a frame only once it is whole.
   if needs_cache && (data_complete || jpeg) {
-    cache_decoded_frames(inner, true).map_err(|error| {
+    cache_decoded_frames(inner, FrameCall::Decode(epoch)).map_err(|error| {
       if !close_if_failed(inner) {
         return error;
       }
@@ -1019,7 +1072,13 @@ fn decode_cached_frame(
     return Err(closed_error(&guard, frame_index));
   }
 
-  let data_complete = guard.complete.load(Ordering::Acquire);
+  // A JPEG that was not decoded above because the data was not complete then waits for the
+  // signal that comes with `complete` (`FrameCall::Decode`), even when the data is complete now.
+  let data_complete = if jpeg {
+    data_complete
+  } else {
+    guard.complete.load(Ordering::Acquire)
+  };
   let Some(frames) = guard.cached_frames.as_ref() else {
     if !data_complete {
       return Ok(None);
@@ -1093,11 +1152,279 @@ fn signal_tracks_ready(inner: &Arc<Mutex<ImageDecoderInner>>) {
   }
 }
 
+/// Whether a chunk that came to an idle stream is decoded at once (`FrameCall::Arrival`): a
+/// decode() of a JPEG waits, and Chrome has not chosen RGB yet.
+fn arrival_decode_wanted(inner: &Arc<Mutex<ImageDecoderInner>>) -> bool {
+  inner
+    .lock()
+    .is_ok_and(|guard| guard.jpeg_requests > 0 && !guard.rgb_decode && !guard.closed)
+}
+
+/// The chunks of a stream, and whether each came to an idle stream (JPEG only)
+enum ChunkReader {
+  Any(Reader<Uint8ArrayCopy>),
+  Jpeg(JpegChunkReader),
+}
+
+impl ChunkReader {
+  async fn next(&mut self) -> Option<Result<(Uint8ArrayCopy, bool)>> {
+    match self {
+      Self::Any(reader) => reader
+        .next()
+        .await
+        .map(|item| item.map(|chunk| (chunk, false))),
+      Self::Jpeg(reader) => reader.next().await,
+    }
+  }
+}
+
+/// A JPEG stream's reader. It reads one chunk at a time like napi's `Reader`, and also tells
+/// whether a chunk came to an idle stream: its read was still waiting when the task that made
+/// it ended. Chrome decides between RGB and YUV planes by that (see `FrameCall`).
+struct JpegChunkReader {
+  read: ThreadsafeFunction<(), PromiseRaw<'static, Object<'static>>, (), Status, true, true>,
+  inner: Weak<Mutex<ImageDecoderInner>>,
+  done: bool,
+}
+
+const READ_WAITING: u8 = 0;
+const READ_IDLE: u8 = 1;
+const READ_SETTLED: u8 = 2;
+
+/// What a read gives: a chunk and whether it came to an idle stream, or the end (None)
+type JpegReadResult = Result<Option<(Uint8ArrayCopy, bool)>>;
+
+/// One read() of a JPEG stream, shared by its promise handlers and the check after its task
+struct JpegRead {
+  /// READ_WAITING, READ_IDLE (still waiting after the task that made it) or READ_SETTLED
+  state: AtomicU8,
+  sender: Mutex<Option<oneshot::Sender<JpegReadResult>>>,
+  inner: Weak<Mutex<ImageDecoderInner>>,
+}
+
+impl JpegRead {
+  /// The task that made the read ended, and the read still waits: the stream is idle.
+  fn check_idle(&self) {
+    if self
+      .state
+      .compare_exchange(READ_WAITING, READ_IDLE, Ordering::AcqRel, Ordering::Acquire)
+      .is_err()
+    {
+      return;
+    }
+    if let Some(inner) = self.inner.upgrade()
+      && let Ok(mut guard) = inner.lock()
+    {
+      guard.stream_idle = true;
+      // A decode() that waits can decode the data so far now. One that waits for the tracks
+      // goes on when they are ready: `ready_notify` would also resolve `tracks.ready`.
+      if guard.jpeg_requests > 0 && !guard.rgb_decode && guard.tracks.ready.load(Ordering::Acquire)
+      {
+        guard.tracks.ready_notify.notify_waiters();
+      }
+    }
+  }
+
+  /// The read's result (on the JS thread): a chunk, the end (None) or an error.
+  fn settle(&self, result: Result<Option<Uint8ArrayCopy>>) {
+    let idle = self.state.swap(READ_SETTLED, Ordering::AcqRel) == READ_IDLE;
+    if let Some(inner) = self.inner.upgrade()
+      && let Ok(mut guard) = inner.lock()
+    {
+      guard.stream_idle = false;
+    }
+    let sender = self.sender.lock().ok().and_then(|mut sender| sender.take());
+    if let Some(sender) = sender {
+      // A collector that is gone drops the chunk here, on the JS thread.
+      let _ = sender.send(result.map(|chunk| chunk.map(|chunk| (chunk, idle))));
+    }
+  }
+}
+
+impl JpegChunkReader {
+  fn new(stream: Object, inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<Self> {
+    let get_reader: Function<(), Object> = stream.get_named_property("getReader")?;
+    let reader = get_reader.apply(stream, ())?;
+    let read: Function<(), PromiseRaw<Object>> = reader.get_named_property("read")?;
+    let read = read
+      .bind(reader)?
+      .build_threadsafe_function()
+      .callee_handled::<true>()
+      .weak::<true>()
+      .build()?;
+    Ok(Self {
+      read,
+      inner: Arc::downgrade(inner),
+      done: false,
+    })
+  }
+
+  async fn next(&mut self) -> Option<Result<(Uint8ArrayCopy, bool)>> {
+    if self.done {
+      return None;
+    }
+    let (sender, receiver) = oneshot::channel();
+    let read = Arc::new(JpegRead {
+      state: AtomicU8::new(READ_WAITING),
+      sender: Mutex::new(Some(sender)),
+      inner: self.inner.clone(),
+    });
+    let status = self.read.call_with_return_value(
+      Ok(()),
+      ThreadsafeFunctionCallMode::NonBlocking,
+      move |promise, env| {
+        start_jpeg_read(promise, &env, read);
+        Ok(())
+      },
+    );
+    let result = if status == Status::Ok {
+      receiver.await.unwrap_or_else(|_| {
+        Err(Error::new(
+          Status::GenericFailure,
+          "ReadableStream read was dropped",
+        ))
+      })
+    } else {
+      Err(Error::new(status, "Failed to schedule ReadableStream read"))
+    };
+    match result {
+      Ok(Some(chunk)) => Some(Ok(chunk)),
+      Ok(None) => {
+        self.done = true;
+        None
+      }
+      Err(error) => {
+        self.done = true;
+        Some(Err(error))
+      }
+    }
+  }
+}
+
+/// On the JS thread, with the promise of a read(): wait for its result, and check once this task
+/// (with its microtasks) has ended whether the read still waits. Errors are owned (no JS
+/// reference), as the collector may drop them on another thread.
+fn start_jpeg_read(promise: Result<PromiseRaw<Object>>, env: &Env, read: Arc<JpegRead>) {
+  let on_value = read.clone();
+  let on_error = read.clone();
+  let handlers = promise.and_then(|promise| {
+    promise
+      .then(move |cx: CallbackContext<Object>| {
+        let chunk = if cx.value.get_named_property::<bool>("done")? {
+          Ok(None)
+        } else {
+          // Copied here, on the JS thread, like the chunks of other formats.
+          cx.value
+            .get_named_property::<Uint8ArrayCopy>("value")
+            .map(Some)
+        };
+        on_value
+          .settle(chunk.map_err(|error| Error::new(Status::GenericFailure, error.reason.clone())));
+        Ok(())
+      })?
+      .catch(move |cx: CallbackContext<Unknown>| {
+        on_error.settle(Err(Error::new(
+          Status::GenericFailure,
+          rejection_message(cx.value),
+        )));
+        Ok(())
+      })
+      .map(|_| ())
+  });
+  if let Err(error) = handlers {
+    clear_pending_exception(env);
+    let reason = if error.reason.is_empty() {
+      format!("ReadableStream read failed: {}", error.status)
+    } else {
+      error.reason.clone()
+    };
+    read.settle(Err(Error::new(Status::GenericFailure, reason)));
+    return;
+  }
+  // setImmediate runs after this task and its microtasks: a chunk or the end already queued in
+  // the stream has settled the read by then.
+  let check = read.clone();
+  let scheduled = env
+    .create_function_from_closure::<(), (), _>("checkStreamIdle", move |_| {
+      check.check_idle();
+      Ok(())
+    })
+    .and_then(|check| {
+      let global = env.get_global()?;
+      let schedule = global
+        .get_named_property::<Function<Function<(), ()>, Unknown>>("setImmediate")
+        .or_else(|_| global.get_named_property("setTimeout"))?;
+      schedule.call(check).map(|_| ())
+    });
+  if scheduled.is_err() {
+    clear_pending_exception(env);
+    read.check_idle();
+  }
+}
+
+/// The message of a rejected read, like napi's `Reader`: the `message` property, else the
+/// value as a string.
+fn rejection_message(value: Unknown) -> String {
+  fn message_property(value: Unknown) -> Result<String> {
+    let message = value
+      .coerce_to_object()?
+      .get_named_property::<Unknown>("message")?;
+    message.coerce_to_string()?.into_utf8()?.into_owned()
+  }
+  let message = if matches!(value.get_type(), Ok(ValueType::Object)) {
+    message_property(value).ok()
+  } else {
+    None
+  };
+  let message = message.unwrap_or_else(|| {
+    value
+      .coerce_to_string()
+      .and_then(|message| message.into_utf8())
+      .and_then(|message| message.into_owned())
+      .unwrap_or_else(|_| "ReadableStream read error".to_owned())
+  });
+  // A throwing getter or toString leaves an exception pending.
+  clear_pending_exception(&Env::from_raw(value.value().env));
+  message
+}
+
+fn clear_pending_exception(env: &Env) {
+  let mut exception = std::ptr::null_mut();
+  unsafe {
+    napi::sys::napi_get_and_clear_last_exception(env.raw(), &mut exception);
+  }
+}
+
+/// Who asks for the frames. Only the JPEG path tells them apart (see `jpeg_frame`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameCall {
+  /// A probe for the metadata as the data arrives
+  Probe,
+  /// A decode() made when `cache_epoch` was this. Like Chrome, it decodes part of a JPEG only
+  /// when the stream is idle (`stream_idle`): Chrome decodes a frame in a task of its own, so
+  /// results that come in one task (the last chunk and the close, say) reach it together. And
+  /// not after a reset(), which aborts it in Chrome. With all the data, it waits for `complete`:
+  /// Chrome resolves `completed` before it tries the frame.
+  Decode(u64),
+  /// The stream reader, for a chunk that came to an idle JPEG stream while a decode() waits:
+  /// Chrome decodes it before it reads the next result (`ImageDecoderExternal::OnStateChange`).
+  Arrival,
+}
+
+/// What `jpeg_frame` needs of the decoder state, read with the data
+#[derive(Clone, Copy)]
+struct JpegState {
+  all_data: bool,
+  complete: bool,
+  rgb_decode: bool,
+  stream_idle: bool,
+  cache_epoch: u64,
+}
+
 /// Attempt to cache every frame currently present in the buffered bytes.
 /// Failures do not resolve `tracks.ready`, which lets streamed images retry as
 /// more bytes arrive. A rejected metadata or a failed frame is left to `close_if_failed`.
-/// `attempt`: a decode() waits for the frames (see `jpeg_frame`).
-fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>, attempt: bool) -> Result<()> {
+fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>, call: FrameCall) -> Result<()> {
   // Snapshot everything needed for FFmpeg work under the mutex, then release
   // it. Large animated images can take a long time to decode; close() and
   // reset() must remain responsive while that work is in flight.
@@ -1108,8 +1435,7 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>, attempt: bool) ->
     prefer_animation,
     desired_width,
     desired_height,
-    all_data,
-    rgb_decode,
+    jpeg_state,
     cache_epoch,
   ) = {
     let guard = inner
@@ -1133,8 +1459,13 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>, attempt: bool) ->
       guard.prefer_animation,
       guard.desired_width,
       guard.desired_height,
-      guard.all_data,
-      guard.rgb_decode,
+      JpegState {
+        all_data: guard.all_data,
+        complete: guard.complete.load(Ordering::Acquire),
+        rgb_decode: guard.rgb_decode,
+        stream_idle: guard.stream_idle,
+        cache_epoch: guard.cache_epoch,
+      },
       guard.cache_epoch,
     )
   };
@@ -1150,7 +1481,7 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>, attempt: bool) ->
 
   if codec_id == AVCodecID::Mjpeg {
     let desired = desired_width.zip(desired_height);
-    return match jpeg_frame(inner, &data_bytes, desired, all_data, rgb_decode, attempt)? {
+    return match jpeg_frame(inner, &data_bytes, desired, jpeg_state, call)? {
       Some(frame) => store_frames(inner, cache_epoch, &data_bytes, vec![frame], None, None),
       // the metadata, but no frame yet
       None => Ok(()),
@@ -1288,19 +1619,20 @@ fn store_frames(
 /// `codec::jpeg`), at M/8 of its size for desiredWidth/desiredHeight (`jpeg_scale_numerator`).
 /// - The header is the metadata. Chrome rejects it when it is bad, when the data ends before it
 ///   does, or when M is 0.
-/// - Like Chrome, the frame is decoded only for a decode(): `attempt`, or `rgb_decode` (a
-///   decode() came before all the data, so Chrome decodes as the data arrives). It is YUV planes
-///   only when all the data was here before the first decode() of it, else BGRX.
+/// - Like Chrome, the frame is decoded only for a decode() (see `FrameCall`), or, once Chrome
+///   decodes to RGB, as the data arrives. A decode of part of the data that gets to output rows
+///   makes Chrome decode to RGB from then on (`rgb_decode`): the frame is YUV planes only when
+///   no decode got that far before all the data was here, else BGRX.
 /// - None: no frame (yet). The data so far ends before the image does, or nothing decoded it.
 fn jpeg_frame(
   inner: &Arc<Mutex<ImageDecoderInner>>,
   data: &[u8],
   desired: Option<(u32, u32)>,
-  all_data: bool,
-  rgb_decode: bool,
-  attempt: bool,
+  state: JpegState,
+  call: FrameCall,
 ) -> Result<Option<(Frame, VideoPixelFormat)>> {
-  let allow_yuv = all_data && !rgb_decode;
+  let all_data = state.all_data;
+  let allow_yuv = all_data && !state.rgb_decode;
   let info = match jpeg_info(data, 8, allow_yuv) {
     Ok(Some(info)) => info,
     Ok(None) if !all_data => {
@@ -1325,11 +1657,29 @@ fn jpeg_frame(
   if scale == 0 {
     return Err(reject_metadata(inner));
   }
-  if !(attempt || rgb_decode) {
+  let decode = match call {
+    FrameCall::Probe => state.rgb_decode,
+    FrameCall::Decode(_) if all_data => state.complete,
+    FrameCall::Decode(epoch) => state.stream_idle && epoch == state.cache_epoch,
+    FrameCall::Arrival => true,
+  };
+  if !decode {
     return Ok(None);
   }
-  match decode_jpeg(data, scale, allow_yuv) {
-    Ok(Some(mut frame)) => {
+  let attempt = call != FrameCall::Probe;
+  let result = decode_jpeg(data, scale, allow_yuv);
+  if attempt
+    && !all_data
+    && matches!(
+      result,
+      Ok(JpegDecode::Frame(_) | JpegDecode::Incomplete { rows_started: true })
+    )
+    && let Ok(mut guard) = inner.lock()
+  {
+    guard.rgb_decode = true;
+  }
+  match result {
+    Ok(JpegDecode::Frame(mut frame)) => {
       frame.set_pts(0);
       let format = match frame.format() {
         // alpha 255
@@ -1338,11 +1688,12 @@ fn jpeg_frame(
       };
       Ok(Some((frame, format)))
     }
-    // Chrome resolves `completed` before it tries the frame with all the data.
-    Ok(None)
-      if !inner
-        .lock()
-        .is_ok_and(|guard| guard.complete.load(Ordering::Acquire)) =>
+    // Part of the data. Chrome resolves `completed` before it tries the frame with all the data.
+    Ok(JpegDecode::Incomplete { .. })
+      if !all_data
+        || !inner
+          .lock()
+          .is_ok_and(|guard| guard.complete.load(Ordering::Acquire)) =>
     {
       Ok(None)
     }

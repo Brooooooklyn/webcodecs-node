@@ -60,6 +60,38 @@ function openStream(data: Uint8Array) {
   })
 }
 
+// The first half at once, the rest and the close together 30 ms later
+function lastChunkClosesStream(data: Uint8Array) {
+  const half = data.length >> 1
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(data.slice(0, half))
+      setTimeout(() => {
+        controller.enqueue(data.slice(half))
+        controller.close()
+      }, 30)
+    },
+  })
+}
+
+// All of `data` and the close in start(), or in pull()
+const closedStreams = {
+  start: (data: Uint8Array) =>
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(data)
+        controller.close()
+      },
+    }),
+  pull: (data: Uint8Array) =>
+    new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(data)
+        controller.close()
+      },
+    }),
+}
+
 // [fixture, Chrome format, size, sha256 of the bytes]. Chrome decodes 4:2:0, 4:2:2 and 4:4:4
 // YCbCr to YUV planes, everything else to BGRX.
 const BUFFER_CASES: [string, VideoPixelFormat, [number, number], string][] = [
@@ -172,15 +204,43 @@ test('ImageDecoder: a streamed JPEG closed before decode() is YUV, like a buffer
   }
 })
 
+// A stream whose data and close come in one task (here before the reader reads it): Chrome reads
+// both before it decodes, also for a decode() made at once.
+test('ImageDecoder: a JPEG stream whose data and close come together is YUV, like Chrome', async (t) => {
+  for (const [name, format, y] of [
+    ['444-progressive-33x17.jpg', 'I444', '84b069c456a420975549ec97d0d5e35561a5cec5feead9fcb0fe127f2cfdf5a9'],
+    ['420-37x9.jpg', 'I420', '61bdc52f5e08e685dd6afd1e58040901ca57b1b978736d4e8ba32200676108ce'],
+    ['422-15x15.jpg', 'I422', 'f6ba813556bdffe3894d2d6587d535a50199fa4f68d964537159884c17dfb355'],
+  ] as const) {
+    for (const [source, stream] of Object.entries(closedStreams)) {
+      const decoder = new ImageDecoder({ data: stream(fixture(name)), type: 'image/jpeg' })
+      const { image, complete } = await decoder.decode()
+      t.is(image.format, format, `${name} ${source}`)
+      t.true(complete, `${name} ${source}`)
+      t.is((await digests(image)).y, y, `${name} ${source}`)
+      image.close()
+      const again = await decoder.decode()
+      t.is(again.image.format, format, `${name} ${source}`)
+      again.image.close()
+      decoder.close()
+    }
+  }
+})
+
 test('ImageDecoder: a JPEG decode() made while the stream is open is BGRX, like Chrome', async (t) => {
   for (const [name, hash] of [
     ['444-progressive-33x17.jpg', '9aa93940af52ce3d3c37026abbc1dfe33ee2d25115367b5a6cc803ca85afa88b'],
     ['420-37x9.jpg', '634235a6bc72fe6d9a6dc91352b1124bf100d1c0b44cb912207f20af461e51b2'],
+    ['422-15x15.jpg', '065ee0bdba7f0be384ab06ad9d89fabd6cba63f8981ee9812bb3812688917e48'],
   ]) {
-    // with half the data (decode() at once), or with all of it before the close (decode() at 30 ms)
+    // With half the data (decode() at once), with all of it and the close 60 ms later (decode()
+    // at once, or at 30 ms), or with the rest and the close in one task: Chrome decodes the rest
+    // before it reads the close.
     for (const [stream, wait] of [
       [twoPartStream, 0],
+      [openStream, 0],
       [openStream, 30],
+      [lastChunkClosesStream, 0],
     ] as const) {
       const decoder = new ImageDecoder({ data: stream(fixture(name)), type: 'image/jpeg' })
       await sleep(wait)
@@ -198,6 +258,35 @@ test('ImageDecoder: a JPEG decode() made while the stream is open is BGRX, like 
   }
 })
 
+// reset() aborts a waiting decode() in Chrome, before it decodes, but keeps the choice of RGB that a
+// decode of part of the data made.
+test("ImageDecoder: reset() keeps a JPEG's choice of RGB or YUV, like Chrome", async (t) => {
+  for (const [name, resetAt, format] of [
+    // reset() in the task of the decode(): nothing was decoded
+    ['444-progressive-33x17.jpg', 0, 'I444'],
+    ['420-37x9.jpg', 0, 'I420'],
+    // reset() at 20 ms, before the rest comes at 30 ms: half of the data was decoded, with rows
+    // of the progressive JPEG (its first scan) and none of the 4:2:0 one (its header ends after
+    // the half)
+    ['444-progressive-33x17.jpg', 20, 'BGRX'],
+    ['420-37x9.jpg', 20, 'I420'],
+  ] as const) {
+    const decoder = new ImageDecoder({ data: twoPartStream(fixture(name)), type: 'image/jpeg' })
+    const pending = decoder.decode().then(
+      ({ image }) => image.close(),
+      () => {},
+    )
+    if (resetAt) await sleep(resetAt)
+    decoder.reset()
+    await decoder.completed
+    const { image } = await decoder.decode()
+    t.is(image.format, format, `${name} reset at ${resetAt} ms`)
+    image.close()
+    await pending
+    decoder.close()
+  }
+})
+
 const FAILED = { instanceOf: DOMException, name: 'EncodingError', message: 'Failed to decode frame at index 0' }
 const METADATA = { instanceOf: DOMException, name: 'InvalidStateError', message: 'Failed to retrieve track metadata.' }
 
@@ -205,15 +294,22 @@ const METADATA = { instanceOf: DOMException, name: 'InvalidStateError', message:
 const FRAME_ERRORS = ['12-bit.jpg', 'arithmetic.jpg', 'scans-100.jpg', 'truncated.jpg', 'no-eoi.jpg']
 
 test('ImageDecoder: a JPEG Chrome fails to decode rejects decode() and closes the decoder', async (t) => {
+  // a buffer, or a stream whose data and close come together: Chrome resolves `completed`
+  // before it decodes the frame with all the data
+  const sources = { buffer: (data: Uint8Array) => data, ...closedStreams }
   for (const name of FRAME_ERRORS) {
-    const decoder = new ImageDecoder({ data: fixture(name), type: 'image/jpeg' })
-    const completed = decoder.completed
-    await t.throwsAsync(decoder.decode(), FAILED, name)
-    // the header is fine
-    await t.notThrowsAsync(decoder.tracks.ready, name)
-    await t.notThrowsAsync(completed, name)
-    t.true(decoder.closed, name)
-    await t.throwsAsync(decoder.decode(), { instanceOf: DOMException, name: 'InvalidStateError' }, name)
+    for (const [source, data] of Object.entries(sources)) {
+      const label = `${name} ${source}`
+      const decoder = new ImageDecoder({ data: data(fixture(name)), type: 'image/jpeg' })
+      const completed = decoder.completed
+      await t.throwsAsync(decoder.decode(), FAILED, label)
+      // the header is fine
+      await t.notThrowsAsync(decoder.tracks.ready, label)
+      await t.notThrowsAsync(completed, label)
+      t.true(decoder.complete, label)
+      t.true(decoder.closed, label)
+      await t.throwsAsync(decoder.decode(), { instanceOf: DOMException, name: 'InvalidStateError' }, label)
+    }
   }
 })
 

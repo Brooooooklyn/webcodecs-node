@@ -1,8 +1,9 @@
 //! JPEG decoding with Chrome 155's bytes: Blink's JPEGImageDecoder settings on the
 //! libjpeg-turbo that Chrome ships (src/ffi/jpeg_blink.c, vendor/libjpeg-turbo).
 //!
-//! Each call reads the data given so far. `Ok(None)` means that the data ends before the header
-//! (or the image) does: Blink waits for more, and fails the image if no more comes.
+//! Each call reads the data given so far. `Ok(None)` (or [`JpegDecode::Incomplete`]) means that
+//! the data ends before the header (or the image) does: Blink waits for more, and fails the image
+//! if no more comes.
 
 use super::{CodecError, Frame};
 use crate::ffi::AVPixelFormat;
@@ -55,18 +56,27 @@ pub fn jpeg_info(
   }))
 }
 
+/// What a decode of the data so far gives.
+pub enum JpegDecode {
+  /// The whole image
+  Frame(Frame),
+  /// The data ends before the image does. `rows_started`: Blink got to output rows, so its frame
+  /// is partial, no longer empty (JPEGImageDecoder::OutputScanlines). From then on Chrome's
+  /// ImageDecoder keeps decoding the image to RGB.
+  Incomplete { rows_started: bool },
+}
+
 /// Decode a JPEG at `scale_num`/8 of its size, as Chrome does (`allow_yuv`: see [`jpeg_info`]).
 /// An error is an image that Chrome fails to decode.
-pub fn decode_jpeg(
-  data: &[u8],
-  scale_num: u32,
-  allow_yuv: bool,
-) -> Result<Option<Frame>, CodecError> {
+pub fn decode_jpeg(data: &[u8], scale_num: u32, allow_yuv: bool) -> Result<JpegDecode, CodecError> {
   let Some(info) = jpeg_info(data, scale_num, allow_yuv)? else {
-    return Ok(None);
+    return Ok(JpegDecode::Incomplete {
+      rows_started: false,
+    });
   };
   // av_frame_get_buffer: an image too large to allocate is an error, not an abort.
   let mut frame = Frame::new_video(info.output_width, info.output_height, info.format)?;
+  let mut rows_started: c_int = 0;
   let decoded = check_error_except_eagain(unsafe {
     blink_jpeg_decode(
       data.as_ptr(),
@@ -74,9 +84,15 @@ pub fn decode_jpeg(
       scale_num as c_int,
       allow_yuv.into(),
       frame.as_mut_ptr(),
+      &mut rows_started,
     )
   })?;
-  Ok(decoded.map(|_| frame))
+  Ok(match decoded {
+    Some(_) => JpegDecode::Frame(frame),
+    None => JpegDecode::Incomplete {
+      rows_started: rows_started != 0,
+    },
+  })
 }
 
 #[cfg(test)]
@@ -325,7 +341,9 @@ mod tests {
       (info.output_width, info.output_height, info.format),
       (width, height, format)
     );
-    let frame = decode_jpeg(data, scale, allow_yuv).unwrap().unwrap();
+    let Ok(JpegDecode::Frame(frame)) = decode_jpeg(data, scale, allow_yuv) else {
+      panic!("{width}x{height} {format:?} at {scale}/8 did not decode");
+    };
     assert_eq!(
       (frame.width(), frame.height(), frame.format()),
       (width, height, format)
@@ -361,10 +379,43 @@ mod tests {
       b"\xff\xd8\xff".as_slice(),
       b"".as_slice(),
     ] {
-      assert!(matches!(decode_jpeg(data, 8, true), Ok(None)));
+      assert!(matches!(
+        decode_jpeg(data, 8, true),
+        Ok(JpegDecode::Incomplete { .. })
+      ));
     }
     for data in [fixture!("12-bit.jpg"), fixture!("arithmetic.jpg")] {
       assert!(decode_jpeg(data, 8, true).is_err());
+    }
+  }
+
+  // Blink's frame turns partial once its output loop runs: right after the header for a
+  // sequential JPEG, once the first scan has begun for a progressive one. Chrome's ImageDecoder
+  // stays with RGB once a decode of part of the data got that far.
+  #[test]
+  fn rows_start_with_the_first_scan() {
+    for (name, data) in [
+      ("420-37x9.jpg", fixture!("420-37x9.jpg")),
+      (
+        "444-progressive-33x17.jpg",
+        fixture!("444-progressive-33x17.jpg"),
+      ),
+    ] {
+      let sos = data.windows(2).position(|w| w == [0xFF, 0xDA]).unwrap();
+      let header_end = sos + 2 + usize::from(u16::from_be_bytes([data[sos + 2], data[sos + 3]]));
+      for (cut, rows) in [(sos, false), (header_end, true), (data.len() - 2, true)] {
+        assert!(
+          matches!(
+            decode_jpeg(&data[..cut], 8, false),
+            Ok(JpegDecode::Incomplete { rows_started }) if rows_started == rows
+          ),
+          "{name} cut at {cut}"
+        );
+      }
+      assert!(matches!(
+        decode_jpeg(data, 8, false),
+        Ok(JpegDecode::Frame(_))
+      ));
     }
   }
 
