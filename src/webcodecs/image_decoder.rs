@@ -701,7 +701,8 @@ impl ImageDecoder {
       let ready_promise = env.spawn_future_with_callback(
         async move {
           let _ =
-            spawn_blocking(move || cache_decoded_frames(&parse_inner, FrameCall::Probe)).await;
+            spawn_blocking(move || cache_decoded_frames(&parse_inner, FrameCall::Probe, false))
+              .await;
           Ok(())
         },
         move |_, ()| {
@@ -768,7 +769,7 @@ impl ImageDecoder {
               if jpeg_try_wanted(&inner_clone, epoch) {
                 let decode_inner = inner_clone.clone();
                 let tried = spawn_blocking(move || {
-                  cache_decoded_frames(&decode_inner, FrameCall::Arrival(epoch))
+                  cache_decoded_frames(&decode_inner, FrameCall::Arrival(epoch), false)
                 })
                 .await;
                 // A rejected metadata closes the decoder here, as for a probe.
@@ -842,7 +843,8 @@ impl ImageDecoder {
           if probe || arrival.is_some() {
             let call = arrival.map_or(FrameCall::Probe, FrameCall::Arrival);
             let probe_inner = inner_clone.clone();
-            let tried = spawn_blocking(move || cache_decoded_frames(&probe_inner, call)).await;
+            let tried =
+              spawn_blocking(move || cache_decoded_frames(&probe_inner, call, false)).await;
             // A rejected metadata closes the decoder at once. A frame failure does not (see
             // `StreamItem::Decode`): a decode() that waits wakes and applies it.
             if close_if_metadata_failed(&inner_clone) {
@@ -859,7 +861,8 @@ impl ImageDecoder {
 
         // Refresh once at EOF so animated images include frames that arrived
         // after an early successful probe. Like Chrome, the data is complete only
-        // once it is decoded: a metadata rejected here still rejects `completed`.
+        // once it is decoded: a metadata rejected here still rejects `completed`
+        // (not for an AVIF that lacks a box, see `cache_decoded_frames`).
         // A JPEG frame failure found before the end that a decode() has not applied yet comes
         // first, as Chrome's failed decode does: the JS thread decides (`end_with_frame_failure`).
         let pending = inner_clone.lock().is_ok_and(|mut inner_guard| {
@@ -867,7 +870,8 @@ impl ImageDecoder {
           frame_failure_pending(&inner_guard)
         });
         let final_inner = inner_clone.clone();
-        let _ = spawn_blocking(move || cache_decoded_frames(&final_inner, FrameCall::Probe)).await;
+        let _ =
+          spawn_blocking(move || cache_decoded_frames(&final_inner, FrameCall::Probe, true)).await;
         if close_if_metadata_failed(&inner_clone) || closed_on_failure(&inner_clone) {
           return Ok(StreamEnd::Aborted(!data_complete.load(Ordering::Acquire)));
         }
@@ -1237,7 +1241,7 @@ fn decode_cached_frame(
   // far is tried by the collector, in the stream's order (`FrameCall::Arrival`); here only once
   // the data is complete (`FrameCall::Decode`).
   if needs_cache && (data_complete || jpeg) {
-    cache_decoded_frames(inner, FrameCall::Decode(epoch))
+    cache_decoded_frames(inner, FrameCall::Decode(epoch), false)
       .map_err(|error| decode_failure(inner, epoch, frame_index, error))?;
   }
 
@@ -2015,7 +2019,13 @@ struct JpegState {
 /// Failures do not resolve `tracks.ready`, which lets streamed images retry as
 /// more bytes arrive. A rejected metadata is left to `close_if_metadata_failed`, a failed frame
 /// to the JS thread (see `ImageDecoderInner::frame_failed`).
-fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>, call: FrameCall) -> Result<()> {
+/// `stream_ended`: the stream has ended, and this is its last refresh (an AVIF that still
+/// lacks a box then fails, see `Avif::Incomplete`).
+fn cache_decoded_frames(
+  inner: &Arc<Mutex<ImageDecoderInner>>,
+  call: FrameCall,
+  stream_ended: bool,
+) -> Result<()> {
   // Snapshot everything needed for FFmpeg work under the mutex, then release
   // it. Large animated images can take a long time to decode; close() and
   // reset() must remain responsive while that work is in flight.
@@ -2099,10 +2109,14 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>, call: FrameCall) 
   let (context, frames, frame_count) = match avif {
     Avif::Image(image) => {
       let len = data_bytes.len();
-      if data_complete
-        && std::iter::once(&image.color)
-          .chain(&image.alpha)
-          .any(|samples| samples.past_end(len))
+      let size_hint = if data_complete {
+        len as u64
+      } else {
+        avif::STREAM_SIZE_HINT
+      };
+      if std::iter::once(&image.color)
+        .chain(&image.alpha)
+        .any(|samples| samples.past_size_hint(size_hint))
       {
         return Err(reject_metadata(inner));
       }
@@ -2116,7 +2130,7 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>, call: FrameCall) 
           guard.cached_frames = None;
         }
       })?;
-      // an item that ends past the data (see `AvifSamples::past_end`)
+      // an item that ends past the data (see `AvifSamples::past_size_hint`)
       if data_complete && frames.len() < image.color.len() {
         return Err(Error::new(
           Status::GenericFailure,
@@ -2125,8 +2139,16 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>, call: FrameCall) 
       }
       (context, frames, image.color.len())
     }
-    // Chrome waits for the boxes the brands need
-    Avif::Incomplete if !data_complete => {
+    // Chrome waits for the boxes the brands need, and fails the metadata when the data ends
+    // before them. At the end of a stream it marks the data complete first: `completed`
+    // resolves.
+    Avif::Incomplete if data_complete || stream_ended => {
+      if let Ok(guard) = inner.lock() {
+        guard.complete.store(true, Ordering::Release);
+      }
+      return Err(reject_metadata(inner));
+    }
+    Avif::Incomplete => {
       return Err(Error::new(
         Status::GenericFailure,
         "The AVIF data is incomplete",
@@ -2309,13 +2331,13 @@ fn decode_avif(
       "Decode failed: an AV1 sample gave no frame",
     ));
   }
-  // Chrome's timing (CrabbyAvif's image_timing) is ticks / timescale seconds, or 0 when the
-  // timescale is 0 (an item's). Here rounded to microseconds.
-  let micros = |ticks: u64| match u128::from(image.timescale) {
+  // Chrome's timing: CrabbyAvif's image_timing gives ticks / timescale seconds as an f64, or 0
+  // when the timescale is 0 (an item's), and base::Seconds truncates it to microseconds, with
+  // the f64 product (4099999 for 41 ticks at a timescale of 10). `as` truncates and saturates
+  // like its saturated_cast.
+  let micros = |ticks: u64| match image.timescale {
     0 => 0,
-    timescale => {
-      i64::try_from((u128::from(ticks) * 1_000_000 + timescale / 2) / timescale).unwrap_or(i64::MAX)
-    }
+    timescale => (ticks as f64 / f64::from(timescale) * 1_000_000.0) as i64,
   };
   let mut ticks = 0;
   for (i, frame) in frames.iter_mut().enumerate() {
@@ -3126,7 +3148,7 @@ mod tests {
       guard.jpeg_requests = 1;
     }
     assert_eq!(
-      reason(cache_decoded_frames(&inner, FrameCall::Arrival(0))),
+      reason(cache_decoded_frames(&inner, FrameCall::Arrival(0), false)),
       "Failed to decode frame at index 0"
     );
     inner
