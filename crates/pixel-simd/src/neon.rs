@@ -303,6 +303,9 @@ impl<const T: usize> Planes<T> {
   }
 }
 
+/// The largest palette of 8-bit indexes that the lookups below take.
+pub(crate) const PALETTE_COLORS: usize = 128;
+
 #[target_feature(enable = "neon")]
 pub(crate) fn palette_to_bgra(src: &[u8], dst: &mut [u8], bits: u32, palette: &Palette) -> usize {
   // 1, 2 and 4-bit indexes are under 16: one register per plane
@@ -356,7 +359,7 @@ pub(crate) fn palette_to_bgra(src: &[u8], dst: &mut [u8], bits: u32, palette: &P
       17..=32 => indexes::<2>(src, dst, palette),
       33..=48 => indexes::<3>(src, dst, palette),
       49..=64 => indexes::<4>(src, dst, palette),
-      65..=128 => indexes::<8>(src, dst, palette),
+      65..=PALETTE_COLORS => indexes::<8>(src, dst, palette),
       _ => 0,
     },
   }

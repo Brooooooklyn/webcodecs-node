@@ -237,9 +237,10 @@ impl<'a> BmpDecoder<'a> {
       })
     };
     match self.kind {
-      Kind::Palette(bits) => self.decode_rows(bits as usize, |src, dst| {
-        pixel_simd::palette_to_bgra(src, dst, bits, &self.palette)
-      }),
+      Kind::Palette(1) => self.decode_palette::<1>(),
+      Kind::Palette(2) => self.decode_palette::<2>(),
+      Kind::Palette(4) => self.decode_palette::<4>(),
+      Kind::Palette(_) => self.decode_palette::<8>(),
       // 24-bit BI_RGB
       Kind::Packed { bytes: 3, .. } => opaque(24, Opaque::Bgr),
       Kind::Packed {
@@ -254,6 +255,12 @@ impl<'a> BmpDecoder<'a> {
         bytes: 4,
         masks: ARGB8888,
       } => self.decode_rows(32, |src, dst| dst.copy_from_slice(&src[..dst.len()])),
+      Kind::Packed { bytes: 2, masks } if self.narrow(16) => {
+        self.decode_rows(16, |src, dst| packed_row::<2>(src, dst, masks))
+      }
+      Kind::Packed { masks, .. } if self.narrow(32) => {
+        self.decode_rows(32, |src, dst| packed_row::<4>(src, dst, masks))
+      }
       // without an alpha field, alpha is 255
       Kind::Packed { bytes: 2, masks } => self.decode_rows(16, |src, dst| {
         pixel_simd::bitfields16_to_bgra(src, dst, masks, masks[3].len != 0)
@@ -263,6 +270,25 @@ impl<'a> BmpDecoder<'a> {
       }),
       Kind::Rle(rle) => self.decode_rle(rle),
     }
+  }
+
+  /// Whether rows of `bits`-bit pixels are too narrow for pixel-simd: fewer than 64 pixels, or
+  /// than one 16-byte vector of them. On such rows its call and SIMD setup cost more than its
+  /// vectors save, and `palette_row` and `packed_row`, inlined in the row loop, are faster.
+  fn narrow(&self, bits: usize) -> bool {
+    (self.width as usize) < 64.max(128 / bits)
+  }
+
+  /// Rows of `BITS`-bit palette indexes: through pixel-simd when it has a SIMD path for them
+  fn decode_palette<const BITS: u32>(&self) -> Result<Vec<u8>, BmpError> {
+    if self.narrow(BITS as usize) || !self.palette.simd(BITS) {
+      return self.decode_rows(BITS as usize, |src, dst| {
+        palette_row::<BITS>(src, dst, &self.palette)
+      });
+    }
+    self.decode_rows(BITS as usize, |src, dst| {
+      pixel_simd::palette_to_bgra(src, dst, BITS, &self.palette)
+    })
   }
 
   /// Uncompressed rows of `bits` per pixel, each padded to 4 bytes. `row` converts one.
@@ -412,6 +438,39 @@ fn room_for(size: usize) -> Result<Vec<u8>, BmpError> {
   Ok(buffer)
 }
 
+/// One row of `BITS`-bit palette indexes (1, 2, 4 or 8), the first pixel in the high bits, for
+/// the rows pixel-simd is not faster on
+fn palette_row<const BITS: u32>(src: &[u8], dst: &mut [u8], palette: &Palette) {
+  let dst = dst.as_chunks_mut::<4>().0;
+  for (pixels, &byte) in dst.chunks_mut((8 / BITS) as usize).zip(src) {
+    for (k, px) in pixels.iter_mut().enumerate() {
+      *px = palette.color((byte << (BITS * k as u32)) >> (8 - BITS));
+    }
+  }
+}
+
+/// One narrow row of little-endian `N`-byte pixels, each channel read through its bitfield.
+/// Without an alpha bitfield the alpha is 255.
+fn packed_row<const N: usize>(src: &[u8], dst: &mut [u8], [r, g, b, a]: [Bitfield; 4]) {
+  let alpha = a.len != 0;
+  for (px, pixel) in dst
+    .as_chunks_mut::<4>()
+    .0
+    .iter_mut()
+    .zip(src.as_chunks::<N>().0)
+  {
+    let mut le = [0; 4];
+    le[..N].copy_from_slice(pixel);
+    let v = u32::from_le_bytes(le);
+    *px = [
+      b.read(v),
+      g.read(v),
+      r.read(v),
+      if alpha { a.read(v) } else { 255 },
+    ];
+  }
+}
+
 const CORRUPT: BmpError = BmpError("corrupt RLE data");
 
 struct Source<'a> {
@@ -538,5 +597,67 @@ mod tests {
     data.extend([0; 24]);
     let bmp = BmpDecoder::new(&data).unwrap();
     assert_eq!(bmp.decode(), Err(TRUNCATED));
+  }
+
+  #[test]
+  fn row_loops_match_pixel_simd() {
+    // palette_row and packed_row give the bytes of pixel-simd's rows, at widths on both sides
+    // of `narrow`
+    let mut seed = 7u32;
+    let mut byte = move || {
+      seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+      (seed >> 24) as u8
+    };
+    let widths = [1, 3, 15, 16, 17, 63, 64, 65, 127, 128, 129, 300];
+    fn same_rows<const BITS: u32>(src: &[u8], width: usize, palette: &Palette) {
+      let (mut ours, mut simd) = (vec![0; 4 * width], vec![1; 4 * width]);
+      palette_row::<BITS>(src, &mut ours, palette);
+      pixel_simd::palette_to_bgra(src, &mut simd, BITS, palette);
+      assert_eq!(ours, simd, "{BITS}-bit, {width} px");
+    }
+    for colors in [2, 16, 17, 64, 65, 129, 256] {
+      let palette = Palette::new((0..colors).map(|_| [byte(), byte(), byte()]));
+      for width in widths {
+        let src: Vec<u8> = (0..width + 3).map(|_| byte()).collect();
+        same_rows::<1>(&src, width, &palette);
+        same_rows::<2>(&src, width, &palette);
+        same_rows::<4>(&src, width, &palette);
+        same_rows::<8>(&src, width, &palette);
+      }
+    }
+    // 565, 565 with R and B swapped, 1555 and 4444 with alpha; 2-10-10-10 and 10-10-10-2
+    // with and without alpha
+    let masks16 = [
+      [0xF800, 0x7E0, 0x1F, 0],
+      [0x1F, 0x7E0, 0xF800, 0],
+      [0x7C00, 0x3E0, 0x1F, 0x8000],
+      [0xF00, 0xF0, 0xF, 0xF000],
+    ];
+    let masks32 = [
+      [0x3FF0_0000, 0xF_FC00, 0x3FF, 0xC000_0000],
+      [0x3FF0_0000, 0xF_FC00, 0x3FF, 0],
+      [0xFFC0_0000, 0x3F_F000, 0xFFC, 0x3],
+      [0xFFC0_0000, 0x3F_F000, 0xFFC, 0],
+    ];
+    for width in widths {
+      let src: Vec<u8> = (0..4 * width).map(|_| byte()).collect();
+      for (bits, masks) in masks16
+        .iter()
+        .map(|m| (16, m))
+        .chain(masks32.iter().map(|m| (32, m)))
+      {
+        let fields = masks.map(|m| Bitfield::from_mask(m, bits).unwrap());
+        let alpha = fields[3].len != 0;
+        let (mut ours, mut simd) = (vec![0; 4 * width], vec![1; 4 * width]);
+        if bits == 16 {
+          packed_row::<2>(&src, &mut ours, fields);
+          pixel_simd::bitfields16_to_bgra(&src, &mut simd, fields, alpha);
+        } else {
+          packed_row::<4>(&src, &mut ours, fields);
+          pixel_simd::bitfields32_to_bgra(&src, &mut simd, fields, alpha);
+        }
+        assert_eq!(ours, simd, "{masks:x?}, {width} px");
+      }
+    }
   }
 }

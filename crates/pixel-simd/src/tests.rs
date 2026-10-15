@@ -469,17 +469,25 @@ fn palette_matches_scalar() {
         };
         let dst = rng.bytes(4 * px);
         let mut want = dst.clone();
+        assert!(!palette_lookup(scalar, bits as u32, len));
         palette_to_bgra_with(scalar, &src, &mut want, bits as u32, &palette);
         for (x, px) in want.as_chunks::<4>().0.iter().enumerate() {
           let index = src[x * bits / 8] >> (8 - bits - x * bits % 8) & ((1 << bits) - 1) as u8;
           assert_eq!(*px, palette.color(index), "{bits}-bit pixel {x}");
         }
         for &isa in &simd {
+          let mut done = 0;
           let got = fenced(&[&src, &dst], &mut rng, |b| {
             let (src, dst) = b.split_at_mut(1);
-            palette_to_bgra_with(isa, src[0].bytes(), dst[0].bytes(), bits as u32, &palette)
+            done = palette_to_bgra_with(isa, src[0].bytes(), dst[0].bytes(), bits as u32, &palette);
           });
           assert_eq!(got[1], want, "{isa:?} {px} px {bits}-bit, {len} colors");
+          // `Palette::simd` (the BMP decoder skips the call without a SIMD path) tells whether
+          // a row of a whole vector of indexes (128 pixels or more) takes one
+          if px >= 128 {
+            let lookup = palette_lookup(isa, bits as u32, len);
+            assert_eq!(done > 0, lookup, "{isa:?} {px} px {bits}-bit, {len} colors");
+          }
         }
       }
     }
