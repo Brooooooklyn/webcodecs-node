@@ -8,7 +8,7 @@ use crate::codec::{CodecError, Frame};
 use crate::ffi::accessors::ffpixfmt_describe;
 use crate::ffi::error::{AVERROR_EINVAL, AVERROR_ENOSYS};
 use crate::ffi::{AVColorRange, AVPixelFormat, FFmpegError};
-use pixel_simd::avif::{self, Constants, Matrix, RgbImpl, Transform};
+use pixel_simd::avif::{self, Constants, Matrix, RgbImpl, Sample, Transform};
 
 /// A frame that `avif_to_bgra` reads: 8, 10 or 12-bit little-endian planar YUV 4:2:0, 4:2:2 or
 /// 4:4:4, gbrp or gray, as AV1 decoders output them. Planes 0, 1, 2 hold Y, U, V (G, B, R for
@@ -268,7 +268,7 @@ fn libyuv(
 /// CrabbyAvif rgb_impl in f32, for identity above 8-bit full range, YCgCo, YCgCo-Re, FCC,
 /// SMPTE 240M and chroma-derived matrices whose primaries libyuv has no constants for. With
 /// `unattenuate`, libyuv ARGBUnattenuate undoes premultiplied alpha after it.
-fn rgb_impl<T: Copy + Into<u32>>(
+fn rgb_impl<T: Sample>(
   c: &Frame,
   a: Option<&Frame>,
   p: &RgbImpl,
