@@ -1055,6 +1055,72 @@ test('ImageDecoder: a close() in the decode() task or a microtask wins over a fa
   }
 })
 
+test('ImageDecoder: a close() in the decode() task or a microtask leaves the GIF track as built, every time', async (t) => {
+  // The worker thread can fill the track (frameCount, repetitionCount) before the JS task reaches
+  // close(). As for a failed metadata, a close() before tracks.ready wins: the track stays as the
+  // decoder built it, every time. Before, the track kept what the worker found whenever the worker
+  // finished first: almost always after sync work (as after 5 ms here), now and then in the same
+  // task or a microtask, also on main. Chrome 155 has no track then.
+  const files: [string, Uint8Array][] = [
+    ['two frames', TWO_FRAMES],
+    ['one frame', ONE_FRAME],
+    ['animated.gif', readFileSync(join(__dirname, 'fixtures/animated.gif'))],
+  ]
+  const busy = (ms: number) => {
+    const end = performance.now() + ms
+    while (performance.now() < end);
+  }
+  const closeIn: [string, (close: () => void) => void][] = [
+    ['the same task', (close) => close()],
+    [
+      'the same task, after 5 ms of sync work',
+      (close) => {
+        busy(5)
+        close()
+      },
+    ],
+    ['a microtask', (close) => queueMicrotask(close)],
+  ]
+  const outcome = (promise: Promise<unknown>) =>
+    promise.then(
+      () => 'resolves',
+      (e: Error) => `${e.name}: ${e.message}`,
+    )
+  const track = (decoder: ImageDecoder) => {
+    const { frameCount, repetitionCount, animated } = decoder.tracks.selectedTrack!
+    return `frameCount ${frameCount}, repetitionCount ${repetitionCount}, animated ${animated}`
+  }
+  // the track of a new GIF decoder
+  const built = 'frameCount 0, repetitionCount Infinity, animated true'
+  const seen: Record<string, Record<string, number>> = {}
+  const expected: Record<string, Record<string, number>> = {}
+  for (const [name, data] of files) {
+    // without a close(), the track has the metadata, and a close() after tracks.ready keeps it
+    const open = new ImageDecoder({ data, type: 'image/gif' })
+    await open.tracks.ready
+    const metadata = track(open)
+    t.not(metadata, built, name)
+    open.close()
+    t.is(track(open), metadata, `${name}, close() after tracks.ready`)
+    for (const [when, schedule] of closeIn) {
+      const counts: Record<string, number> = {}
+      for (let i = 0; i < 50; i++) {
+        const decoder = new ImageDecoder({ data, type: 'image/gif' })
+        const decoded = outcome(decoder.decode().then(({ image }) => image.close()))
+        schedule(() => decoder.close())
+        const ready = await outcome(decoder.tracks.ready)
+        const key = `decode() ${await decoded} | ready ${ready} | ${track(decoder)}`
+        counts[key] = (counts[key] ?? 0) + 1
+      }
+      seen[`${name}, close() in ${when}`] = counts
+      expected[`${name}, close() in ${when}`] = {
+        [`decode() InvalidStateError: ImageDecoder is closed | ready resolves | ${built}`]: 50,
+      }
+    }
+  }
+  t.deepEqual(seen, expected)
+})
+
 test('ImageDecoder preferAnimation false returns single frame for animated GIF', async (t) => {
   const data = readFileSync(join(__dirname, 'fixtures/animated.gif'))
   const decoder = new ImageDecoder({
