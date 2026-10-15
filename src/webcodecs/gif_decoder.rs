@@ -379,10 +379,20 @@ impl<'a> GifDecoder<'a> {
     }
     GifFrames {
       gif: self,
+      size: self.width as usize * self.height as usize * 4,
       next: 0,
       last_dependent,
       kept: Vec::new(),
       latest: None,
+    }
+  }
+
+  /// `decode` without pixels: each item is the error `decode` gives for that frame, or an empty
+  /// canvas. It allocates no canvas.
+  pub fn check(&self) -> GifFrames<'_, 'a> {
+    GifFrames {
+      size: 0,
+      ..self.decode()
     }
   }
 
@@ -406,10 +416,16 @@ impl<'a> GifDecoder<'a> {
     }
     let mut lzw = Lzw::new(r.literal_width()?);
     let rect = frame.rect;
+    // a dry run (`check`) has no canvas: it reads the same data, and writes no pixel
+    let (width, height) = if canvas.is_empty() {
+      (0, 0)
+    } else {
+      (self.width, self.height)
+    };
     let mut out = Pixels {
       canvas,
-      width: self.width,
-      height: self.height,
+      width,
+      height,
       rect,
       x: rect.x0,
       y: rect.y0,
@@ -503,6 +519,8 @@ fn alpha_and_required_frame(
 /// Frames in order, each drawn on the frame Blink would start from
 pub struct GifFrames<'g, 'a> {
   gif: &'g GifDecoder<'a>,
+  /// Bytes of a canvas, 0 in a dry run (`check`)
+  size: usize,
   next: usize,
   /// The last frame drawn on frame k, for each k
   last_dependent: Vec<Option<usize>>,
@@ -519,7 +537,7 @@ impl GifFrames<'_, '_> {
   /// fails this frame.
   fn start(&self, i: usize) -> Result<Vec<u8>, GifError> {
     let gif = self.gif;
-    let size = gif.width as usize * gif.height as usize * 4;
+    let size = self.size;
     let Some(required) = gif.frames[i].required else {
       let mut canvas = room_for(size)?;
       canvas.resize(size, 0);
@@ -537,7 +555,8 @@ impl GifFrames<'_, '_> {
     let mut canvas = room_for(size)?;
     canvas.extend_from_slice(kept);
     let frame = &gif.frames[required];
-    if base == required && frame.disposal == Disposal::RestoreBackground {
+    // (a dry run has no pixels to clear)
+    if size > 0 && base == required && frame.disposal == Disposal::RestoreBackground {
       let b = frame.rect.on(gif.screen());
       let stride = gif.width as usize * 4;
       for y in b.y0..b.y1 {
@@ -809,6 +828,24 @@ mod tests {
         }
         let size = gif.width() as usize * gif.height() as usize * 4;
         assert!(gif.decode().flatten().all(|pixels| pixels.len() == size));
+      }
+    }
+  }
+
+  #[test]
+  fn check_finds_the_errors_of_decode() {
+    for case in chrome_cases::cases("gif/") {
+      let copies = chrome_cases::broken_copies(&case.data);
+      for data in std::iter::once(case.data.clone()).chain(copies) {
+        let Ok(gif) = GifDecoder::new(&data) else {
+          continue;
+        };
+        if gif.width() * gif.height() > 1 << 20 {
+          continue;
+        }
+        let checked: Vec<_> = gif.check().map(|r| r.map(|c| c.len())).collect();
+        let decoded: Vec<_> = gif.decode().map(|r| r.map(|_| 0)).collect();
+        assert_eq!(checked, decoded, "{}", case.name);
       }
     }
   }
