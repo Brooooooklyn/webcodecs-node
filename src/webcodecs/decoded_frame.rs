@@ -14,7 +14,7 @@
 //! how to expose them is a separate product decision. `copyTo()` refuses to read
 //! them as I420 because their memory does not match.
 
-use crate::codec::{CodecError, Frame, ScaleAlgorithm, Scaler};
+use crate::codec::{CodecError, Frame};
 use crate::ffi::accessors::{
   ffframe_convert_decoded, ffframe_palette_has_alpha, ffpixfmt_describe,
 };
@@ -39,8 +39,8 @@ pub(crate) enum DecodedSource {
   ///   factors; AVIF: one still image without alpha). An AVIF with YUV planes keeps
   ///   them either way: WebCodecs has a format for them, its alpha plane is not
   ///   decoded, and BGRX would lose precision. Only planar RGB (gbrp) follows Chrome.
-  /// - `size`: desiredWidth/desiredHeight. A converted frame is resized in the same
-  ///   swscale pass; a kept frame is resized in its own format.
+  /// - `size`: the size of a JPEG that Chrome scales for desiredWidth/desiredHeight (with
+  ///   `yuv: Some(false)`: such a JPEG is BGRX). It is resized in the conversion pass.
   Image {
     codec: AVCodecID,
     alpha: Option<bool>,
@@ -96,10 +96,7 @@ pub(crate) fn decoded_frame_format(
     _ => None,
   };
   match choose(&mut frame, source)? {
-    Choice::Keep(format) => match size {
-      Some((width, height)) => Ok((resize(&frame, width, height)?, format)),
-      None => Ok((frame, format)),
-    },
+    Choice::Keep(format) => Ok((frame, format)),
     // One swscale pass to the final size: a full-size converted copy of a large
     // image is never made.
     Choice::Convert {
@@ -280,21 +277,6 @@ fn convert(
     ffframe_convert_decoded(src.as_ptr(), dst.as_mut_ptr(), image as std::os::raw::c_int)
   })?;
   Ok(dst)
-}
-
-/// Resize a kept frame in its own format (ImageDecoder desiredWidth/desiredHeight).
-fn resize(src: &Frame, width: u32, height: u32) -> Result<Frame, CodecError> {
-  let format = src.format();
-  Scaler::new(
-    src.width(),
-    src.height(),
-    format,
-    width,
-    height,
-    format,
-    ScaleAlgorithm::Lanczos, // High quality for images
-  )?
-  .scale_alloc(src)
 }
 
 #[cfg(test)]
