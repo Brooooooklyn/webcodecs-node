@@ -274,6 +274,26 @@ impl<'a> BmpDecoder<'a> {
     }
   }
 
+  /// Checks the pixel data without decoding it: Ok, or the error `decode` finds before it
+  /// allocates the output. It allocates no output.
+  pub fn check(&self) -> Result<(), BmpError> {
+    match self.kind {
+      Kind::Palette(bits) => self.rows(bits as usize).map(drop),
+      Kind::Packed { bytes, .. } => self.rows(bytes * 8).map(drop),
+      Kind::Rle(rle) => self
+        .read_rle(rle, RleRows::new(self.width as usize, Vec::new()))
+        .map(drop),
+    }
+  }
+
+  /// The uncompressed rows of `bits` per pixel, each padded to 4 bytes, and their stride. Every
+  /// row must be in the file.
+  fn rows(&self, bits: usize) -> Result<(&'a [u8], usize), BmpError> {
+    let stride = (bits * self.width as usize).div_ceil(32) * 4;
+    let rows = bytes(self.data, self.data_offset, stride * self.height as usize)?;
+    Ok((rows, stride))
+  }
+
   /// Whether rows of `bits`-bit palette indexes are too narrow for pixel-simd: fewer than 64
   /// pixels, or than one 16-byte vector of them. On such rows its call and SIMD setup cost more
   /// than its vectors save, and `palette_row`, inlined in the row loop, is faster.
@@ -296,9 +316,7 @@ impl<'a> BmpDecoder<'a> {
   /// Uncompressed rows of `bits` per pixel, each padded to 4 bytes. `row` converts one.
   fn decode_rows(&self, bits: usize, row: impl Fn(&[u8], &mut [u8])) -> Result<Vec<u8>, BmpError> {
     let (width, height) = (self.width as usize, self.height as usize);
-    let stride = (bits * width).div_ceil(32) * 4;
-    // every row must be in the file
-    let rows = bytes(self.data, self.data_offset, stride * height)?;
+    let (rows, stride) = self.rows(bits)?;
     let mut out = room_for(width * height * 4)?;
     // zeroed in one go: a memset call per row costs more than a narrow row, and the row
     // loop has to reload its constants after each call
@@ -594,6 +612,21 @@ mod tests {
         if let Ok(pixels) = bmp.decode() {
           assert_eq!(pixels.len(), (bmp.width() * bmp.height() * 4) as usize);
         }
+      }
+    }
+  }
+
+  #[test]
+  fn check_finds_the_errors_of_decode() {
+    for case in chrome_cases::cases("bmp/") {
+      for data in iter::once(case.data.clone()).chain(chrome_cases::broken_copies(&case.data)) {
+        let Ok(bmp) = BmpDecoder::new(&data) else {
+          continue;
+        };
+        if bmp.width() * bmp.height() > 1 << 20 {
+          continue;
+        }
+        assert_eq!(bmp.check(), bmp.decode().map(drop), "{}", case.name);
       }
     }
   }
