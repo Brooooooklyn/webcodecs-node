@@ -1,3 +1,9 @@
+// libwebp's notice, for the code this file ports from it (the files named below):
+// Copyright 2011 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license that can be found in
+// licenses/libwebp-COPYING.txt. An additional intellectual property rights grant can be found
+// in licenses/libwebp-PATENTS.txt.
+
 //! aarch64: libwebp's src/dsp/upsampling_neon.c (UPSAMPLE_16PIXELS, CONVERT8, STORE_Bgra) on q
 //! registers, 16 chroma samples per block instead of 8, each lane computed as upstream.
 

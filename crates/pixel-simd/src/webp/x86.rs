@@ -1,3 +1,10 @@
+// libwebp's notice, for the code this file ports from it (the files named below):
+// Copyright 2011 Google Inc. All Rights Reserved.
+// Copyright 2014 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license that can be found in
+// licenses/libwebp-COPYING.txt. An additional intellectual property rights grant can be found
+// in licenses/libwebp-PATENTS.txt.
+
 //! x86_64: libwebp's src/dsp/upsampling_sse2.c (UPSAMPLE_32PIXELS) and src/dsp/yuv_sse2.c
 //! (ConvertYUV444ToRGB_SSE2, PackAndStore4_SSE2), and the same widened to AVX2, 64 pixels per
 //! block. Every AVX2 operation works on each byte or 16-bit lane like its SSE2 one; only the
