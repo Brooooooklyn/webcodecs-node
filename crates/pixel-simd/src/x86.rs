@@ -4,7 +4,7 @@
 use core::arch::x86_64::*;
 
 use crate::simd::zip_chunks;
-use crate::{Alpha, Be16, Bitfield};
+use crate::{Alpha, Be16, Bitfield, Opaque, Palette};
 
 /// The first 16 bytes of `src`.
 #[inline]
@@ -291,4 +291,163 @@ pub(crate) fn bitfields32_to_bgra_sse2(
       _mm_or_si128(_mm_or_si128(bg, _mm_slli_epi32::<16>(r.read32(w))), aa),
     );
   })
+}
+
+#[target_feature(enable = "sse2")]
+pub(crate) fn opaque_to_bgra_sse2(src: &[u8], dst: &mut [u8], layout: Opaque) -> usize {
+  match layout {
+    // 4 pixels from the first 12 bytes of each load; the last load ends with the 48 bytes
+    Opaque::Bgr => {
+      16 * zip_chunks::<48, 64>(src, dst, |s, d| {
+        let last = _mm_srli_si128::<4>(load(&s[32..]));
+        for (i, v) in [load(s), load(&s[12..]), load(&s[24..]), last]
+          .into_iter()
+          .enumerate()
+        {
+          store(&mut d[16 * i..], _mm_or_si128(spread24(v), opaque()));
+        }
+      })
+    }
+    Opaque::Bgrx => {
+      4 * zip_chunks::<16, 16>(src, dst, |s, d| store(d, _mm_or_si128(load(s), opaque())))
+    }
+    Opaque::Xbgr => {
+      4 * zip_chunks::<16, 16>(src, dst, |s, d| {
+        store(d, _mm_or_si128(_mm_srli_epi32::<8>(load(s)), opaque()))
+      })
+    }
+  }
+}
+
+#[target_feature(enable = "ssse3")]
+pub(crate) fn opaque_to_bgra_ssse3(src: &[u8], dst: &mut [u8], layout: Opaque) -> usize {
+  if layout != Opaque::Bgr {
+    return opaque_to_bgra_sse2(src, dst, layout);
+  }
+  // pshufb: -1 gives 0, which `opaque` then sets to 255
+  let first = _mm_setr_epi8(0, 1, 2, -1, 3, 4, 5, -1, 6, 7, 8, -1, 9, 10, 11, -1);
+  let last = _mm_setr_epi8(4, 5, 6, -1, 7, 8, 9, -1, 10, 11, 12, -1, 13, 14, 15, -1);
+  16 * zip_chunks::<48, 64>(src, dst, |s, d| {
+    for (i, (at, order)) in [(0, first), (12, first), (24, first), (32, last)]
+      .into_iter()
+      .enumerate()
+    {
+      let v = _mm_shuffle_epi8(load(&s[at..]), order);
+      store(&mut d[16 * i..], _mm_or_si128(v, opaque()));
+    }
+  })
+}
+
+/// The B, G and R planes of a palette's first 16 * `T` colors.
+struct Planes<const T: usize>([[__m128i; T]; 3]);
+
+impl<const T: usize> Planes<T> {
+  #[inline]
+  #[target_feature(enable = "ssse3")]
+  fn new(palette: &Palette) -> Planes<T> {
+    Planes(
+      palette
+        .planes
+        .each_ref()
+        .map(|plane| core::array::from_fn(|i| load(&plane[16 * i..]))),
+    )
+  }
+
+  /// The colors of 16 indexes, as BGRA pixels at the start of `dst`; black past the planes.
+  #[inline]
+  #[target_feature(enable = "ssse3")]
+  fn store(&self, dst: &mut [u8], index: __m128i) {
+    let mut bgr = [_mm_setzero_si128(); 3];
+    for k in 0..T {
+      // pshufb gives 0 where the high bit is set: the indexes 16k to 16k + 15 keep their low 4
+      // bits under it, and the others saturate to 128 or more
+      let i = _mm_sub_epi8(index, _mm_set1_epi8((16 * k) as i8));
+      let i = _mm_adds_epu8(i, _mm_set1_epi8(0x70));
+      for (c, plane) in bgr.iter_mut().zip(&self.0) {
+        *c = _mm_or_si128(*c, _mm_shuffle_epi8(plane[k], i));
+      }
+    }
+    let [b, g, r] = bgr;
+    let a = _mm_set1_epi8(-1);
+    let bg = [_mm_unpacklo_epi8(b, g), _mm_unpackhi_epi8(b, g)];
+    let ra = [_mm_unpacklo_epi8(r, a), _mm_unpackhi_epi8(r, a)];
+    for (i, (bg, ra)) in bg.into_iter().zip(ra).enumerate() {
+      store(&mut dst[32 * i..], _mm_unpacklo_epi16(bg, ra));
+      store(&mut dst[32 * i + 16..], _mm_unpackhi_epi16(bg, ra));
+    }
+  }
+}
+
+#[target_feature(enable = "ssse3")]
+pub(crate) fn palette_to_bgra_ssse3(
+  src: &[u8],
+  dst: &mut [u8],
+  bits: u32,
+  palette: &Palette,
+) -> usize {
+  // 1, 2 and 4-bit indexes are under 16: one register per plane
+  match bits {
+    1 => {
+      let p = Planes::<1>::new(palette);
+      let bit = _mm_setr_epi8(-128, 64, 32, 16, 8, 4, 2, 1, -128, 64, 32, 16, 8, 4, 2, 1);
+      128
+        * zip_chunks::<16, 512>(src, dst, |s, d| {
+          let x = load(s);
+          for i in 0..8 {
+            // bytes 2i and 2i + 1, 8 times each, to 16 indexes of 0 or 1
+            let bytes = 0x0101_0101_0101_0101 * i;
+            let pair = _mm_shuffle_epi8(
+              x,
+              _mm_set_epi64x(2 * bytes + 0x0101_0101_0101_0101, 2 * bytes),
+            );
+            let set = _mm_cmpeq_epi8(_mm_and_si128(pair, bit), bit);
+            p.store(
+              &mut d[64 * i as usize..],
+              _mm_and_si128(set, _mm_set1_epi8(1)),
+            );
+          }
+        })
+    }
+    2 => {
+      let p = Planes::<1>::new(palette);
+      64 * zip_chunks::<16, 256>(src, dst, |s, d| {
+        let (x, three) = (load(s), _mm_set1_epi8(3));
+        let a = _mm_and_si128(_mm_srli_epi16::<6>(x), three);
+        let b = _mm_and_si128(_mm_srli_epi16::<4>(x), three);
+        let c = _mm_and_si128(_mm_srli_epi16::<2>(x), three);
+        let e = _mm_and_si128(x, three);
+        // a, b, c, e of each byte in turn
+        let ab = [_mm_unpacklo_epi8(a, b), _mm_unpackhi_epi8(a, b)];
+        let ce = [_mm_unpacklo_epi8(c, e), _mm_unpackhi_epi8(c, e)];
+        for (i, (ab, ce)) in ab.into_iter().zip(ce).enumerate() {
+          p.store(&mut d[128 * i..], _mm_unpacklo_epi16(ab, ce));
+          p.store(&mut d[128 * i + 64..], _mm_unpackhi_epi16(ab, ce));
+        }
+      })
+    }
+    4 => {
+      let p = Planes::<1>::new(palette);
+      32 * zip_chunks::<16, 128>(src, dst, |s, d| {
+        let (x, fifteen) = (load(s), _mm_set1_epi8(15));
+        let high = _mm_and_si128(_mm_srli_epi16::<4>(x), fifteen);
+        let low = _mm_and_si128(x, fifteen);
+        p.store(d, _mm_unpacklo_epi8(high, low));
+        p.store(&mut d[64..], _mm_unpackhi_epi8(high, low));
+      })
+    }
+    // A pshufb per 16 colors: past 32 colors the scalar code is faster.
+    _ => match palette.len {
+      0..=16 => indexes::<1>(src, dst, palette),
+      17..=32 => indexes::<2>(src, dst, palette),
+      _ => 0,
+    },
+  }
+}
+
+/// 8-bit indexes, with a palette of at most 16 * `T` colors.
+#[inline]
+#[target_feature(enable = "ssse3")]
+fn indexes<const T: usize>(src: &[u8], dst: &mut [u8], palette: &Palette) -> usize {
+  let p = Planes::<T>::new(palette);
+  16 * zip_chunks::<16, 64>(src, dst, |s, d| p.store(d, load(s)))
 }
