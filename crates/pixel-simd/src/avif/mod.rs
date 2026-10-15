@@ -10,7 +10,7 @@
 //! The matrix, upsampling, Convert16To8 and f32 rows have SIMD paths that give the bytes of their
 //! scalar code: each does whole vectors from the start and the scalar code does the rest, and the
 //! edge pixels of a row. The f32 rows of YCgCo-Re or limited-range alpha, the alpha rows and
-//! ARGBUnattenuate have only their scalar code.
+//! ARGBUnattenuate have only their scalar code, and so does the 4:0:0 row on wasm32.
 
 use std::ops::Range;
 
@@ -233,8 +233,9 @@ pub(crate) fn gray8_to_bgra_with(
     Level::Avx2 => unsafe { x86::gray8_avx2(y, a, k, dst) },
     #[cfg(target_arch = "aarch64")]
     Level::Neon => unsafe { neon::gray8(y, a, k, dst) },
+    // LLVM vectorizes the scalar code, whose chroma is constant, into faster simd128 code
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    Level::Simd128 => wasm::gray8(y, a, k, dst),
+    Level::Simd128 => 0,
   };
   let (y, a) = (&y[done..], a.map(|a| &a[done..]));
   for (i, px) in dst[4 * done..]

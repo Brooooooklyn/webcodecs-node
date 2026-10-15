@@ -136,21 +136,6 @@ pub(super) fn yuv8(
   16 * blocks.len()
 }
 
-pub(super) fn gray8(y: &[u8], a: Option<&[u8]>, k: &Constants, dst: &mut [u8]) -> usize {
-  let k = K::new(k);
-  let c = u8x16_splat(128);
-  let (blocks, _) = dst.as_chunks_mut::<64>();
-  for (n, d) in blocks.iter_mut().enumerate() {
-    let i = 16 * n;
-    let yv = load(&y[i..]);
-    let y16 = [u16x8_extend_low_u8x16(yv), u16x8_extend_high_u8x16(yv)]
-      .map(|y| v128_or(y, i16x8_shl(y, 8)));
-    let a = a.map_or(u8x16_splat(255), |a| load(&a[i..]));
-    bgra16(y16, c, c, a, k, d);
-  }
-  16 * blocks.len()
-}
-
 pub(super) fn yuv10(
   y: &[u16],
   u: &[u16],
