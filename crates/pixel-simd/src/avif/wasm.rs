@@ -205,18 +205,21 @@ pub(super) fn yuv12(
 
 pub(super) fn convert16_to8(src: &[u16], shift: u32, dst: &mut [u8]) -> usize {
   let max = u16x8_splat(255);
-  let (blocks, _) = dst.as_chunks_mut::<16>();
-  for (n, d) in blocks.iter_mut().enumerate() {
-    let s = |at: usize| u16x8_min(u16x8_shr(load16(&src[at..]), shift), max);
-    store(d, u8x16_narrow_i16x8(s(16 * n), s(16 * n + 8)));
+  let ((src, _), (dst, _)) = (src.as_chunks::<16>(), dst.as_chunks_mut::<16>());
+  for (s, d) in src.iter().zip(&mut *dst) {
+    let [lo, hi] = [&s[..8], &s[8..]].map(|s| u16x8_min(u16x8_shr(load16(s), shift), max));
+    store(d, u8x16_narrow_i16x8(lo, hi));
   }
-  16 * blocks.len()
+  16 * src.len().min(dst.len())
 }
 
 /// The sample pairs between the edges of `dst` (see `upsample`), 16 at a time: pair x is
 /// samples 2x + 1 and 2x + 2, from samples x and x + 1 of the chroma rows.
 pub(super) fn upsample8(near: &[u8], far: &[u8], dst: &mut [u8]) -> usize {
   let blocks = dst.len().saturating_sub(1) / 2 / 16;
+  if blocks == 0 {
+    return 0;
+  }
   let eight = u16x8_splat(8);
   // 8 pairs from samples in 16-bit lanes: (3p + q + 8) >> 4 and (p + 3q + 8) >> 4 in the low
   // and high byte of each lane, with p = 3a + c and q = 3b + d (at most 1020)
@@ -226,12 +229,16 @@ pub(super) fn upsample8(near: &[u8], far: &[u8], dst: &mut [u8]) -> usize {
     let even = u16x8_shr(i16x8_add(i16x8_add(times3(q), p), eight), 4);
     v128_or(odd, i16x8_shl(even, 8))
   };
-  for x in (0..blocks).map(|n| 16 * n) {
-    let [a, b, c, d] = [&near[x..], &near[x + 1..], &far[x..], &far[x + 1..]].map(load);
+  // sliced once: block k reads samples 16k..16k + 17 and writes bytes 32k + 1..32k + 33
+  let (near, far) = (&near[..16 * blocks + 1], &far[..16 * blocks + 1]);
+  let (out, _) = dst[1..].as_chunks_mut::<32>();
+  for (x, out) in (0..).step_by(16).zip(out) {
+    let (n, f) = (&near[x..][..17], &far[x..][..17]);
+    let [a, b, c, d] = [&n[..16], &n[1..], &f[..16], &f[1..]].map(load);
     let lo = |s| u16x8_extend_low_u8x16(s);
     let hi = |s| u16x8_extend_high_u8x16(s);
-    store(&mut dst[2 * x + 1..], pairs(lo(a), lo(b), lo(c), lo(d)));
-    store(&mut dst[2 * x + 17..], pairs(hi(a), hi(b), hi(c), hi(d)));
+    store(out, pairs(lo(a), lo(b), lo(c), lo(d)));
+    store(&mut out[16..], pairs(hi(a), hi(b), hi(c), hi(d)));
   }
   16 * blocks
 }

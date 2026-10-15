@@ -198,12 +198,12 @@ pub(super) fn yuv12(
 pub(super) fn convert16_to8(src: &[u16], shift: u32, dst: &mut [u8]) -> usize {
   // vshl by a negative count shifts right
   let shift = vdupq_n_s16(-(shift as i16));
-  let (blocks, _) = dst.as_chunks_mut::<16>();
-  for (n, d) in blocks.iter_mut().enumerate() {
-    let s = |at: usize| vshlq_u16(load16(&src[at..]), shift);
-    store(d, vqmovn_high_u16(vqmovn_u16(s(16 * n)), s(16 * n + 8)));
+  let ((src, _), (dst, _)) = (src.as_chunks::<16>(), dst.as_chunks_mut::<16>());
+  for (s, d) in src.iter().zip(&mut *dst) {
+    let [lo, hi] = [&s[..8], &s[8..]].map(|s| vshlq_u16(load16(s), shift));
+    store(d, vqmovn_high_u16(vqmovn_u16(lo), hi));
   }
-  16 * blocks.len()
+  16 * src.len().min(dst.len())
 }
 
 /// The sample pairs between the edges of `dst` (see `upsample`), 16 at a time: pair x is
@@ -211,9 +211,16 @@ pub(super) fn convert16_to8(src: &[u16], shift: u32, dst: &mut [u8]) -> usize {
 #[target_feature(enable = "neon")]
 pub(super) fn upsample8(near: &[u8], far: &[u8], dst: &mut [u8]) -> usize {
   let blocks = dst.len().saturating_sub(1) / 2 / 16;
+  if blocks == 0 {
+    return 0;
+  }
   let three = vdupq_n_u8(3);
-  for x in (0..blocks).map(|n| 16 * n) {
-    let [a, b, c, d] = [&near[x..], &near[x + 1..], &far[x..], &far[x + 1..]].map(|s| load(s));
+  // sliced once: block k reads samples 16k..16k + 17 and writes bytes 32k + 1..32k + 33
+  let (near, far) = (&near[..16 * blocks + 1], &far[..16 * blocks + 1]);
+  let (out, _) = dst[1..].as_chunks_mut::<32>();
+  for (x, out) in (0..).step_by(16).zip(out) {
+    let (n, f) = (&near[x..][..17], &far[x..][..17]);
+    let [a, b, c, d] = [&n[..16], &n[1..], &f[..16], &f[1..]].map(|s| load(s));
     // p = 3a + c and q = 3b + d, at most 1020
     let three_plus = |a: uint8x16_t, c: uint8x16_t| {
       [
@@ -229,7 +236,6 @@ pub(super) fn upsample8(near: &[u8], far: &[u8], dst: &mut [u8]) -> usize {
         vmlaq_n_u16(q[1], p[1], 3),
       )
     };
-    let out = &mut dst[2 * x + 1..][..32];
     // SAFETY: 32 bytes; vst2q takes any alignment.
     unsafe { vst2q_u8(out.as_mut_ptr(), uint8x16x2_t(mix(p, q), mix(q, p))) }
   }
