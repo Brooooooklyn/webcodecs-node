@@ -424,6 +424,40 @@ const IMAGE_CASES: [string, Uint8Array, string, VideoPixelFormat, number[]][] = 
     'BGRA',
     [30, 20, 10, 128, 60, 50, 40, 0],
   ],
+  // the alpha field of the header masks, even over a color field (FFmpeg reads the byte the color masks leave)
+  [
+    'V4 BMP with the alpha mask on blue (bgra)',
+    bmp(2, 1, 32, [[30, 20, 10, 128, 60, 50, 40, 0]], {
+      header: 108,
+      compression: 3,
+      masks: [0xff0000, 0xff00, 0xff, 0xff],
+    }),
+    'image/bmp',
+    'BGRA',
+    [30, 20, 10, 30, 60, 50, 40, 60],
+  ],
+  [
+    'V5 BMP with ARGB bitfields and the alpha mask on red (argb)',
+    bmp(2, 1, 32, [[128, 10, 20, 30, 0, 40, 50, 60]], {
+      header: 124,
+      compression: 3,
+      masks: [0xff00, 0xff0000, 0xff000000, 0xff00],
+    }),
+    'image/bmp',
+    'BGRA',
+    [30, 20, 10, 10, 60, 50, 40, 40],
+  ],
+  [
+    'V3 BMP with a 4-bit alpha field (bgra)',
+    bmp(2, 1, 32, [[30, 20, 10, 0x9f, 60, 50, 40, 0x0f]], {
+      header: 56,
+      compression: 3,
+      masks: [0xff0000, 0xff00, 0xff, 0xf0000000],
+    }),
+    'image/bmp',
+    'BGRA',
+    [30, 20, 10, 153, 60, 50, 40, 0],
+  ],
   // 16-bit: the image crate's round(v * 255 / (2^n - 1)) (swscale replicates bits: 3 -> 24, not 25)
   [
     '16-bit BMP (rgb555le)',
