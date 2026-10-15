@@ -6,6 +6,28 @@
 //!
 //! Samples deeper than 8 bits come in 16-bit words. One change from libyuv: chroma that is
 //! upsampled is clamped to the bit depth first (AV1 decoders never output more).
+//!
+//! The matrix, upsampling, Convert16To8 and f32 rows have SIMD paths that give the bytes of their
+//! scalar code: each does whole vectors from the start and the scalar code does the rest, and the
+//! edge pixels of a row. The f32 rows of YCgCo-Re or limited-range alpha, the alpha rows and
+//! ARGBUnattenuate have only their scalar code.
+
+use std::ops::Range;
+
+use crate::isa::{Isa, Level};
+
+#[cfg(target_arch = "aarch64")]
+mod neon;
+#[cfg(any(
+  target_arch = "x86_64",
+  target_arch = "aarch64",
+  all(target_arch = "wasm32", target_feature = "simd128")
+))]
+mod simd;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+mod wasm;
+#[cfg(target_arch = "x86_64")]
+mod x86;
 
 /// The matrices libyuv has constants for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,7 +78,38 @@ fn clamp6(z: i32) -> u8 {
 /// libyuv I444AlphaToARGBRow_C (I444ToARGBRow_C without alpha): 8-bit Y, U and V, one of each
 /// per pixel, and alpha (None: 255) to the BGRA pixels of `dst`.
 pub fn yuv8_to_bgra(y: &[u8], u: &[u8], v: &[u8], a: Option<&[u8]>, k: &Constants, dst: &mut [u8]) {
-  for (i, px) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+  yuv8_to_bgra_with(Isa::best(), y, u, v, a, k, dst)
+}
+
+pub(crate) fn yuv8_to_bgra_with(
+  isa: Isa,
+  y: &[u8],
+  u: &[u8],
+  v: &[u8],
+  a: Option<&[u8]>,
+  k: &Constants,
+  dst: &mut [u8],
+) {
+  // SAFETY (every SIMD arm here and below): an `Isa` is only made for a level this CPU runs.
+  let done = match isa.level() {
+    Level::Scalar => 0,
+    #[cfg(target_arch = "x86_64")]
+    Level::Sse2 | Level::Ssse3 => unsafe { x86::yuv8_sse2(y, u, v, a, k, dst) },
+    #[cfg(target_arch = "x86_64")]
+    Level::Avx2 => unsafe { x86::yuv8_avx2(y, u, v, a, k, dst) },
+    #[cfg(target_arch = "aarch64")]
+    Level::Neon => unsafe { neon::yuv8(y, u, v, a, k, dst) },
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    Level::Simd128 => wasm::yuv8(y, u, v, a, k, dst),
+  };
+  let a = a.map(|a| &a[done..]);
+  let (y, u, v) = (&y[done..], &u[done..], &v[done..]);
+  for (i, px) in dst[4 * done..]
+    .as_chunks_mut::<4>()
+    .0
+    .iter_mut()
+    .enumerate()
+  {
     let [b, g, r] = yuv_pixel(u16::from(y[i]) * 0x0101, u[i], v[i], k);
     *px = [b, g, r, a.map_or(255, |a| a[i])];
   }
@@ -71,10 +124,35 @@ pub fn yuv10_to_bgra(
   k: &Constants,
   dst: &mut [u8],
 ) {
+  yuv10_to_bgra_with(Isa::best(), y, u, v, a, k, dst)
+}
+
+pub(crate) fn yuv10_to_bgra_with(
+  isa: Isa,
+  y: &[u16],
+  u: &[u16],
+  v: &[u16],
+  a: Option<&[u8]>,
+  k: &Constants,
+  dst: &mut [u8],
+) {
+  let done = match isa.level() {
+    Level::Scalar => 0,
+    #[cfg(target_arch = "x86_64")]
+    Level::Sse2 | Level::Ssse3 => unsafe { x86::yuv10_sse2(y, u, v, a, k, dst) },
+    #[cfg(target_arch = "x86_64")]
+    Level::Avx2 => unsafe { x86::yuv10_avx2(y, u, v, a, k, dst) },
+    #[cfg(target_arch = "aarch64")]
+    Level::Neon => unsafe { neon::yuv10(y, u, v, a, k, dst) },
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    Level::Simd128 => wasm::yuv10(y, u, v, a, k, dst),
+  };
+  let (y, u, v) = (&y[done..], &u[done..], &v[done..]);
+  let dst = &mut dst[4 * done..];
   for (i, px) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
     *px = pixel16(y[i], u[i], v[i], 10, k);
   }
-  put_alpha(a, dst);
+  put_alpha(a.map(|a| &a[done..]), dst);
 }
 
 /// libyuv I212ToARGBRow_C as I012ToARGBMatrix runs it: 12-bit Y, and U and V with one sample
@@ -87,6 +165,32 @@ pub fn yuv12_to_bgra(
   k: &Constants,
   dst: &mut [u8],
 ) {
+  yuv12_to_bgra_with(Isa::best(), y, u, v, a, k, dst)
+}
+
+pub(crate) fn yuv12_to_bgra_with(
+  isa: Isa,
+  y: &[u16],
+  u: &[u16],
+  v: &[u16],
+  a: Option<&[u8]>,
+  k: &Constants,
+  dst: &mut [u8],
+) {
+  // an even count of pixels
+  let done = match isa.level() {
+    Level::Scalar => 0,
+    #[cfg(target_arch = "x86_64")]
+    Level::Sse2 | Level::Ssse3 => unsafe { x86::yuv12_sse2(y, u, v, a, k, dst) },
+    #[cfg(target_arch = "x86_64")]
+    Level::Avx2 => unsafe { x86::yuv12_avx2(y, u, v, a, k, dst) },
+    #[cfg(target_arch = "aarch64")]
+    Level::Neon => unsafe { neon::yuv12(y, u, v, a, k, dst) },
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    Level::Simd128 => wasm::yuv12(y, u, v, a, k, dst),
+  };
+  let (y, u, v) = (&y[done..], &u[done / 2..], &v[done / 2..]);
+  let dst = &mut dst[4 * done..];
   let (pairs, last) = dst.as_chunks_mut::<4>().0.as_chunks_mut::<2>();
   for (c, pair) in pairs.iter_mut().enumerate() {
     pair[0] = pixel16(y[2 * c], u[c], v[c], 12, k);
@@ -96,7 +200,7 @@ pub fn yuv12_to_bgra(
   if let [px] = last {
     *px = pixel16(y[2 * c], u[c], v[c], 12, k);
   }
-  put_alpha(a, dst);
+  put_alpha(a.map(|a| &a[done..]), dst);
 }
 
 /// libyuv YuvPixel10 and YuvPixel12: a `depth`-bit pixel, alpha 255. Luma expands in 16 bits
@@ -111,7 +215,34 @@ fn pixel16(y: u16, u: u16, v: u16, depth: u32, k: &Constants) -> [u8; 4] {
 
 /// libyuv I400ToARGBRow_C: 8-bit gray (U = V = 128) and alpha (None: 255) to BGRA.
 pub fn gray8_to_bgra(y: &[u8], a: Option<&[u8]>, k: &Constants, dst: &mut [u8]) {
-  for (i, px) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+  gray8_to_bgra_with(Isa::best(), y, a, k, dst)
+}
+
+pub(crate) fn gray8_to_bgra_with(
+  isa: Isa,
+  y: &[u8],
+  a: Option<&[u8]>,
+  k: &Constants,
+  dst: &mut [u8],
+) {
+  let done = match isa.level() {
+    Level::Scalar => 0,
+    #[cfg(target_arch = "x86_64")]
+    Level::Sse2 | Level::Ssse3 => unsafe { x86::gray8_sse2(y, a, k, dst) },
+    #[cfg(target_arch = "x86_64")]
+    Level::Avx2 => unsafe { x86::gray8_avx2(y, a, k, dst) },
+    #[cfg(target_arch = "aarch64")]
+    Level::Neon => unsafe { neon::gray8(y, a, k, dst) },
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    Level::Simd128 => wasm::gray8(y, a, k, dst),
+  };
+  let (y, a) = (&y[done..], a.map(|a| &a[done..]));
+  for (i, px) in dst[4 * done..]
+    .as_chunks_mut::<4>()
+    .0
+    .iter_mut()
+    .enumerate()
+  {
     let [b, g, r] = yuv_pixel(u16::from(y[i]) * 0x0101, 128, 128, k);
     *px = [b, g, r, a.map_or(255, |a| a[i])];
   }
@@ -128,9 +259,27 @@ fn put_alpha(a: Option<&[u8]>, dst: &mut [u8]) {
   }
 }
 
-/// libyuv Convert16To8Row_C: samples shifted right by `shift` (truncating), 255 at most.
+/// libyuv Convert16To8Row_C: samples shifted right by `shift` (truncating, below 16), 255 at
+/// most.
 pub fn convert16_to8(src: &[u16], shift: u32, dst: &mut [u8]) {
-  for (i, d) in dst.iter_mut().enumerate() {
+  convert16_to8_with(Isa::best(), src, shift, dst)
+}
+
+pub(crate) fn convert16_to8_with(isa: Isa, src: &[u16], shift: u32, dst: &mut [u8]) {
+  assert!(shift < 16, "convert16_to8: shift {shift}");
+  let done = match isa.level() {
+    Level::Scalar => 0,
+    #[cfg(target_arch = "x86_64")]
+    Level::Sse2 | Level::Ssse3 => unsafe { x86::convert16_to8_sse2(src, shift, dst) },
+    #[cfg(target_arch = "x86_64")]
+    Level::Avx2 => unsafe { x86::convert16_to8_avx2(src, shift, dst) },
+    #[cfg(target_arch = "aarch64")]
+    Level::Neon => unsafe { neon::convert16_to8(src, shift, dst) },
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    Level::Simd128 => wasm::convert16_to8(src, shift, dst),
+  };
+  let src = &src[done..];
+  for (i, d) in dst[done..].iter_mut().enumerate() {
     *d = (src[i] >> shift).min(255) as u8;
   }
 }
@@ -161,11 +310,28 @@ fn far(i: usize, n: usize) -> usize {
 /// rows of `chroma_rows`: 3:1 between the rows, then 3:1 between the columns, with libyuv's edge
 /// pixels. With `far` == `near` it is ScaleRowUp2_Linear_Any_C.
 pub fn upsample8(near: &[u8], far: &[u8], dst: &mut [u8]) {
+  upsample8_with(Isa::best(), near, far, dst)
+}
+
+pub(crate) fn upsample8_with(isa: Isa, near: &[u8], far: &[u8], dst: &mut [u8]) {
+  // pairs of output samples
+  let done = match isa.level() {
+    Level::Scalar => 0,
+    #[cfg(target_arch = "x86_64")]
+    Level::Sse2 | Level::Ssse3 => unsafe { x86::upsample8_sse2(near, far, dst) },
+    #[cfg(target_arch = "x86_64")]
+    Level::Avx2 => unsafe { x86::upsample8_avx2(near, far, dst) },
+    #[cfg(target_arch = "aarch64")]
+    Level::Neon => unsafe { neon::upsample8(near, far, dst) },
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    Level::Simd128 => wasm::upsample8(near, far, dst),
+  };
   let w = dst.len();
   upsample(
     |x| near[x].into(),
     |x| far[x].into(),
     w,
+    done,
     |i, s| dst[i] = s as u8,
   );
 }
@@ -173,28 +339,46 @@ pub fn upsample8(near: &[u8], far: &[u8], dst: &mut [u8]) {
 /// The same for samples of `depth` bits (9 to 12) in 16-bit words; larger samples count as
 /// (1 << depth) - 1.
 pub fn upsample16(near: &[u16], far: &[u16], depth: u32, dst: &mut [u16]) {
+  upsample16_with(Isa::best(), near, far, depth, dst)
+}
+
+pub(crate) fn upsample16_with(isa: Isa, near: &[u16], far: &[u16], depth: u32, dst: &mut [u16]) {
   assert!((9..=12).contains(&depth), "upsample16: depth {depth}");
   let max = (1 << depth) - 1;
+  let done = match isa.level() {
+    Level::Scalar => 0,
+    #[cfg(target_arch = "x86_64")]
+    Level::Sse2 | Level::Ssse3 => unsafe { x86::upsample16_sse2(near, far, max as u16, dst) },
+    #[cfg(target_arch = "x86_64")]
+    Level::Avx2 => unsafe { x86::upsample16_avx2(near, far, max as u16, dst) },
+    #[cfg(target_arch = "aarch64")]
+    Level::Neon => unsafe { neon::upsample16(near, far, max as u16, dst) },
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    Level::Simd128 => wasm::upsample16(near, far, max as u16, dst),
+  };
   let w = dst.len();
   upsample(
     |x| u32::from(near[x]).min(max),
     |x| u32::from(far[x]).min(max),
     w,
+    done,
     |i, s| dst[i] = s as u16,
   );
 }
 
+/// The upsampling of `w` samples, the pairs between the edge ones from pair `from` on.
 fn upsample(
   near: impl Fn(usize) -> u32,
   far: impl Fn(usize) -> u32,
   w: usize,
+  from: usize,
   mut put: impl FnMut(usize, u32),
 ) {
   if w == 0 {
     return;
   }
   put(0, (3 * near(0) + far(0) + 2) >> 2);
-  for x in 0..((w - 1) & !1) / 2 {
+  for x in from..((w - 1) & !1) / 2 {
     let (n0, n1, f0, f1) = (near(x), near(x + 1), far(x), far(x + 1));
     put(2 * x + 1, (n0 * 9 + n1 * 3 + f0 * 3 + f1 + 8) >> 4);
     put(2 * x + 2, (n0 * 3 + n1 * 9 + f0 + f1 * 3 + 8) >> 4);
@@ -286,32 +470,136 @@ pub struct RgbImpl {
   pub unpremultiply: bool,
 }
 
+/// The numbers of rgb_impl's unorm: the largest sample, as f32, and the offset and range of Y
+/// and of U and V.
+#[derive(Clone, Copy, Debug)]
+struct Ranges {
+  max: u32,
+  maxf: f32,
+  by: f32,
+  ry: f32,
+  bc: f32,
+  rc: f32,
+}
+
+impl RgbImpl {
+  fn ranges(&self) -> Ranges {
+    let depth = self.depth;
+    let max = (1u32 << depth) - 1;
+    let maxf = max as f32;
+    let (by, ry) = if self.full_range {
+      (0.0, maxf)
+    } else {
+      ((16 << (depth - 8)) as f32, (219 << (depth - 8)) as f32)
+    };
+    let (bc, rc) = match self.transform {
+      Transform::Identity => (by, ry),
+      _ if self.full_range => ((1 << (depth - 1)) as f32, maxf),
+      _ => ((1 << (depth - 1)) as f32, (224 << (depth - 8)) as f32),
+    };
+    Ranges {
+      max,
+      maxf,
+      by,
+      ry,
+      bc,
+      rc,
+    }
+  }
+}
+
+/// The samples of the rows of `rgb_impl_row`: 8 bits, or deeper in 16-bit words.
+pub trait Sample: Copy + Into<u32> {
+  /// The row as one of the two widths, for the SIMD paths.
+  fn samples(row: &[Self]) -> Samples<'_>;
+}
+
+/// A row of `Sample`s.
+#[derive(Clone, Copy, Debug)]
+pub enum Samples<'a> {
+  U8(&'a [u8]),
+  U16(&'a [u16]),
+}
+
+impl Sample for u8 {
+  fn samples(row: &[u8]) -> Samples<'_> {
+    Samples::U8(row)
+  }
+}
+
+impl Sample for u16 {
+  fn samples(row: &[u16]) -> Samples<'_> {
+    Samples::U16(row)
+  }
+}
+
 /// CrabbyAvif rgb_impl in f32 for one row of BGRA pixels in `dst`, from the samples of `y`, of
 /// the `chroma_rows` of U and V (None for gray: R = G = B = Y) and of alpha (None: 255).
-pub fn rgb_impl_row<T: Copy + Into<u32>>(
+pub fn rgb_impl_row<T: Sample>(
   p: &RgbImpl,
   y: &[T],
   uv: Option<[[&[T]; 2]; 2]>,
   a: Option<&[T]>,
   dst: &mut [u8],
 ) {
+  rgb_impl_row_with(Isa::best(), p, y, uv, a, dst)
+}
+
+pub(crate) fn rgb_impl_row_with<T: Sample>(
+  isa: Isa,
+  p: &RgbImpl,
+  y: &[T],
+  uv: Option<[[&[T]; 2]; 2]>,
+  a: Option<&[T]>,
+  dst: &mut [u8],
+) {
+  assert!(
+    matches!(p.depth, 8 | 10 | 12),
+    "rgb_impl_row: depth {}",
+    p.depth
+  );
+  let w = dst.len() / 4;
+  // The first two pixels of a subsampled row take the scalar code: the first is an edge, and
+  // the vectors start at an even pixel.
+  let start = if p.subsampled { w.min(2) } else { 0 };
+  let done = match isa.level() {
+    Level::Scalar => start,
+    #[cfg(target_arch = "x86_64")]
+    Level::Sse2 | Level::Ssse3 => unsafe { x86::rgb_impl_sse2(p, y, uv, a, dst, start) },
+    #[cfg(target_arch = "x86_64")]
+    Level::Avx2 => unsafe { x86::rgb_impl_avx2(p, y, uv, a, dst, start) },
+    #[cfg(target_arch = "aarch64")]
+    Level::Neon => unsafe { neon::rgb_impl(p, y, uv, a, dst, start) },
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    Level::Simd128 => wasm::rgb_impl(p, y, uv, a, dst, start),
+  };
+  rgb_impl(p, y, uv, a, dst, 0..start);
+  rgb_impl(p, y, uv, a, dst, done..w);
+}
+
+/// `rgb_impl_row` for the pixels in `pixels`.
+fn rgb_impl<T: Sample>(
+  p: &RgbImpl,
+  y: &[T],
+  uv: Option<[[&[T]; 2]; 2]>,
+  a: Option<&[T]>,
+  dst: &mut [u8],
+  pixels: Range<usize>,
+) {
   let depth = p.depth;
-  let mx = (1u32 << depth) - 1;
-  let maxf = mx as f32;
-  let (by, ry) = if p.full_range {
-    (0.0, maxf)
-  } else {
-    ((16 << (depth - 8)) as f32, (219 << (depth - 8)) as f32)
-  };
-  let (bc, rc) = match p.transform {
-    Transform::Identity => (by, ry),
-    _ if p.full_range => ((1 << (depth - 1)) as f32, maxf),
-    _ => ((1 << (depth - 1)) as f32, (224 << (depth - 8)) as f32),
-  };
+  let Ranges {
+    max: mx,
+    maxf,
+    by,
+    ry,
+    bc,
+    rc,
+  } = p.ranges();
   let unorm = |row: &[T], x: usize| (row[x].into().min(mx) as f32 - bc) / rc;
   let unit = |v: f32| v.clamp(0.0, 1.0);
   let w = dst.len() / 4;
-  for (i, px) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+  let dst = dst.as_chunks_mut::<4>().0;
+  for i in pixels {
     let cy = y[i].into().min(mx);
     let yf = (cy as f32 - by) / ry;
     let (ci, fi) = if p.subsampled {
@@ -373,7 +661,7 @@ pub fn rgb_impl_row<T: Copy + Into<u32>>(
       }
     }
     let q = |c: f32| (0.5 + c * 255.0) as u8;
-    *px = [
+    dst[i] = [
       q(b),
       q(g),
       q(r),

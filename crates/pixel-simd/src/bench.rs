@@ -3,6 +3,7 @@
 
 use std::time::Instant;
 
+use crate::avif::{Constants, Matrix, RgbImpl, Transform};
 use crate::isa::Isa;
 use crate::webp::{Plane, Yuva420, yuva420_to_bgra_with};
 use crate::*;
@@ -19,6 +20,12 @@ fn best(mut f: impl FnMut()) -> f64 {
       start.elapsed().as_secs_f64() * 1e3
     })
     .fold(f64::INFINITY, f64::min)
+}
+
+/// Row `r` of `width` samples of plane `p`, the planes WIDTH x HEIGHT samples apart in
+/// `samples`.
+fn row_of<T>(samples: &[T], p: usize, r: usize, width: usize) -> &[T] {
+  &samples[p * WIDTH * HEIGHT + r * width..][..width]
 }
 
 /// `f` on each row of `size`-byte pixels to BGRA.
@@ -54,6 +61,29 @@ pub fn run() {
     u: plane(WIDTH * HEIGHT, cw),
     v: plane(WIDTH * HEIGHT + cw * ch, cw),
     a: Some(plane(2 * WIDTH * HEIGHT, WIDTH)),
+  };
+  // 10-bit samples, and the 16-bit rows of the upsampling
+  let words: Vec<u16> = src
+    .chunks(2)
+    .map(|b| u16::from_le_bytes([b[0], b[1]]) & 1023)
+    .collect();
+  let mut up16 = vec![0; WIDTH * HEIGHT];
+  let k = Constants::new(Matrix::Bt709, false);
+  let f32_420 = RgbImpl {
+    transform: Transform::Coefficients { kr: 0.30, kb: 0.11 },
+    depth: 8,
+    full_range: false,
+    subsampled: true,
+    alpha_limited: false,
+    unpremultiply: true,
+  };
+  let f32_444 = RgbImpl {
+    transform: Transform::Identity,
+    depth: 10,
+    full_range: true,
+    subsampled: false,
+    alpha_limited: false,
+    unpremultiply: false,
   };
   println!("{WIDTH}x{HEIGHT}, best of 10, ms");
   for isa in Isa::supported() {
@@ -93,6 +123,72 @@ pub fn run() {
     });
     time("webp yuva420", &mut |dst| {
       yuva420_to_bgra_with(isa, &webp, dst, WIDTH * 4)
+    });
+    time("avif up8", &mut |dst| {
+      for (r, d) in dst.chunks_mut(WIDTH).take(HEIGHT).enumerate() {
+        avif::upsample8_with(
+          isa,
+          row_of(&src, 0, r / 2, cw),
+          row_of(&src, 1, r / 2, cw),
+          d,
+        );
+      }
+    });
+    time("avif up16 10-bit", &mut |_| {
+      for (r, d) in up16.chunks_mut(WIDTH).enumerate() {
+        let [near, far] = [0, 1].map(|p| row_of(&words, p, r / 2, cw));
+        avif::upsample16_with(isa, near, far, 10, d);
+      }
+    });
+    time("avif yuv8+a", &mut |dst| {
+      for (r, d) in dst.chunks_mut(4 * WIDTH).enumerate() {
+        let [y, u, v, a] = [0, 1, 2, 3].map(|p| row_of(&src, p, r, WIDTH));
+        avif::yuv8_to_bgra_with(isa, y, u, v, Some(a), &k, d);
+      }
+    });
+    time("avif gray8", &mut |dst| {
+      for (r, d) in dst.chunks_mut(4 * WIDTH).enumerate() {
+        avif::gray8_to_bgra_with(isa, row_of(&src, 0, r, WIDTH), None, &k, d);
+      }
+    });
+    time("avif yuv10+a", &mut |dst| {
+      for (r, d) in dst.chunks_mut(4 * WIDTH).enumerate() {
+        let [y, u, v] = [0, 1, 2].map(|p| row_of(&words, p, r, WIDTH));
+        let a = row_of(&src, 3, r, WIDTH);
+        avif::yuv10_to_bgra_with(isa, y, u, v, Some(a), &k, d);
+      }
+    });
+    time("avif yuv12", &mut |dst| {
+      for (r, d) in dst.chunks_mut(4 * WIDTH).enumerate() {
+        let [u, v] = [1, 2].map(|p| row_of(&words, p, r, cw));
+        avif::yuv12_to_bgra_with(isa, row_of(&words, 0, r, WIDTH), u, v, None, &k, d);
+      }
+    });
+    time("avif 16to8", &mut |dst| {
+      for (r, d) in dst.chunks_mut(WIDTH).take(HEIGHT).enumerate() {
+        avif::convert16_to8_with(isa, row_of(&words, 0, r, WIDTH), 2, d);
+      }
+    });
+    time("avif f32 420+a prem", &mut |dst| {
+      for (r, d) in dst.chunks_mut(4 * WIDTH).enumerate() {
+        let rows = [r / 2, (r / 2 + 1).min(ch - 1)];
+        let uv = [1, 2].map(|p| rows.map(|c| row_of(&src, p, c, cw)));
+        let [y, a] = [0, 3].map(|p| row_of(&src, p, r, WIDTH));
+        avif::rgb_impl_row_with(isa, &f32_420, y, Some(uv), Some(a), d);
+      }
+    });
+    time("avif f32 444 10-bit", &mut |dst| {
+      for (r, d) in dst.chunks_mut(4 * WIDTH).enumerate() {
+        let uv = [1, 2].map(|p| [row_of(&words, p, r, WIDTH); 2]);
+        avif::rgb_impl_row_with(
+          isa,
+          &f32_444,
+          row_of(&words, 0, r, WIDTH),
+          Some(uv),
+          None,
+          d,
+        );
+      }
     });
   }
 }

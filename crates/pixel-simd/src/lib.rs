@@ -1,6 +1,6 @@
 //! The pixel loops of the addon's image decoding (PNG, BMP, lossy WebP and AVIF to BGRA, with
 //! Chrome's bytes). Each has SIMD paths that give exactly the bytes of its scalar code, on every
-//! input, except the AVIF rows (`avif`), which have only their scalar code:
+//! input (for the AVIF rows, `avif` lists the few with only their scalar code):
 //!
 //! - x86_64: SSE2 (part of the target), plus SSSE3 and AVX2 when the CPU has them
 //! - aarch64: NEON (part of the target)
