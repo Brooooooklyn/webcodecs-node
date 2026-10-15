@@ -1,12 +1,13 @@
 //! JPEG decoding with Chrome 155's bytes: Blink's JPEGImageDecoder settings on the
 //! libjpeg-turbo that Chrome ships (src/ffi/jpeg_blink.c, vendor/libjpeg-turbo).
-
-// ImageDecoder does not use it yet.
-#![allow(dead_code)]
+//!
+//! Each call reads the data given so far. `Ok(None)` means that the data ends before the header
+//! (or the image) does: Blink waits for more, and fails the image if no more comes.
 
 use super::{CodecError, Frame};
+use crate::ffi::AVPixelFormat;
+use crate::ffi::error::check_error_except_eagain;
 use crate::ffi::jpeg_blink::{blink_jpeg_decode, blink_jpeg_info};
-use crate::ffi::{AVPixelFormat, check_error};
 use std::os::raw::c_int;
 
 /// What a decode at a given scale gives.
@@ -30,9 +31,13 @@ pub struct JpegInfo {
 ///
 /// `allow_yuv: false` gives Bgra where Chrome would give YUV planes. Chrome does that when it
 /// decoded rows to RGB before all the data came (a stream that closes after a pause).
-pub fn jpeg_info(data: &[u8], scale_num: u32, allow_yuv: bool) -> Result<JpegInfo, CodecError> {
+pub fn jpeg_info(
+  data: &[u8],
+  scale_num: u32,
+  allow_yuv: bool,
+) -> Result<Option<JpegInfo>, CodecError> {
   let mut out = [0 as c_int; 5];
-  check_error(unsafe {
+  let read = check_error_except_eagain(unsafe {
     blink_jpeg_info(
       data.as_ptr(),
       data.len(),
@@ -41,21 +46,28 @@ pub fn jpeg_info(data: &[u8], scale_num: u32, allow_yuv: bool) -> Result<JpegInf
       out.as_mut_ptr(),
     )
   })?;
-  Ok(JpegInfo {
+  Ok(read.map(|_| JpegInfo {
     width: out[0] as u32,
     height: out[1] as u32,
     output_width: out[2] as u32,
     output_height: out[3] as u32,
     format: AVPixelFormat::from_raw(out[4]),
-  })
+  }))
 }
 
 /// Decode a JPEG at `scale_num`/8 of its size, as Chrome does (`allow_yuv`: see [`jpeg_info`]).
 /// An error is an image that Chrome fails to decode.
-pub fn decode_jpeg(data: &[u8], scale_num: u32, allow_yuv: bool) -> Result<Frame, CodecError> {
-  let info = jpeg_info(data, scale_num, allow_yuv)?;
+pub fn decode_jpeg(
+  data: &[u8],
+  scale_num: u32,
+  allow_yuv: bool,
+) -> Result<Option<Frame>, CodecError> {
+  let Some(info) = jpeg_info(data, scale_num, allow_yuv)? else {
+    return Ok(None);
+  };
+  // av_frame_get_buffer: an image too large to allocate is an error, not an abort.
   let mut frame = Frame::new_video(info.output_width, info.output_height, info.format)?;
-  check_error(unsafe {
+  let decoded = check_error_except_eagain(unsafe {
     blink_jpeg_decode(
       data.as_ptr(),
       data.len(),
@@ -64,7 +76,7 @@ pub fn decode_jpeg(data: &[u8], scale_num: u32, allow_yuv: bool) -> Result<Frame
       frame.as_mut_ptr(),
     )
   })?;
-  Ok(frame)
+  Ok(decoded.map(|_| frame))
 }
 
 #[cfg(test)]
@@ -308,12 +320,12 @@ mod tests {
     format: AVPixelFormat,
     expected: &str,
   ) {
-    let info = jpeg_info(data, scale, allow_yuv).unwrap();
+    let info = jpeg_info(data, scale, allow_yuv).unwrap().unwrap();
     assert_eq!(
       (info.output_width, info.output_height, info.format),
       (width, height, format)
     );
-    let frame = decode_jpeg(data, scale, allow_yuv).unwrap();
+    let frame = decode_jpeg(data, scale, allow_yuv).unwrap().unwrap();
     assert_eq!(
       (frame.width(), frame.height(), frame.format()),
       (width, height, format)
@@ -339,17 +351,19 @@ mod tests {
     assert_eq!(frame.colorspace(), matrix);
   }
 
-  // Chrome rejects these with EncodingError once all the data is there.
+  // Chrome rejects these with EncodingError once all the data is there: some need more data,
+  // which never comes, the others are errors.
   #[test]
   fn fails_like_chrome() {
     for data in [
       fixture!("no-eoi.jpg"),
       fixture!("truncated.jpg"),
-      fixture!("12-bit.jpg"),
-      fixture!("arithmetic.jpg"),
       b"\xff\xd8\xff".as_slice(),
       b"".as_slice(),
     ] {
+      assert!(matches!(decode_jpeg(data, 8, true), Ok(None)));
+    }
+    for data in [fixture!("12-bit.jpg"), fixture!("arithmetic.jpg")] {
       assert!(decode_jpeg(data, 8, true).is_err());
     }
   }
@@ -357,12 +371,19 @@ mod tests {
   #[test]
   fn info_reads_the_header() {
     let data = fixture!("420-37x9.jpg");
-    let info = jpeg_info(data, 3, true).unwrap();
+    let info = jpeg_info(data, 3, true).unwrap().unwrap();
     assert_eq!((info.width, info.height), (37, 9));
     assert_eq!((info.output_width, info.output_height), (14, 4));
     assert!(jpeg_info(data, 0, true).is_err());
     assert!(jpeg_info(data, 9, true).is_err());
     // A 12-bit header reads; like Blink, the decode is what fails.
-    assert!(jpeg_info(fixture!("12-bit.jpg"), 8, true).is_ok());
+    assert!(matches!(
+      jpeg_info(fixture!("12-bit.jpg"), 8, true),
+      Ok(Some(_))
+    ));
+    // The header ends at the first SOS marker.
+    let sos = data.windows(2).position(|w| w == [0xFF, 0xDA]).unwrap();
+    assert!(matches!(jpeg_info(&data[..sos + 4], 8, true), Ok(None)));
+    assert!(matches!(jpeg_info(&data[..sos + 14], 8, true), Ok(Some(_))));
   }
 }
