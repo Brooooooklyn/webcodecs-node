@@ -435,6 +435,9 @@ impl ImageTrackList {
   }
 }
 
+/// A decoded frame, shared, with the WebCodecs format that describes it and its duration
+type CachedFrame = (Arc<ParkingLotRwLock<Frame>>, VideoPixelFormat, Option<i64>);
+
 /// Internal decoder state
 struct ImageDecoderInner {
   /// Original encoded data
@@ -500,9 +503,7 @@ struct ImageDecoderInner {
   /// Whether decoder is closed
   closed: bool,
   /// Cached decoded frames (for animated images, populated on first decode)
-  /// Cached decoded frames wrapped in Arc for efficient sharing, with the
-  /// WebCodecs format that describes each one
-  cached_frames: Option<Vec<(Arc<ParkingLotRwLock<Frame>>, VideoPixelFormat)>>,
+  cached_frames: Option<Vec<CachedFrame>>,
   /// Incremented when reset/close invalidates in-flight decode work.
   cache_epoch: u64,
   /// Encoded byte length represented by the current cache. Prevents an older
@@ -1272,12 +1273,8 @@ fn decode_cached_frame(
   }
 
   // Clone the Arc to share the frame data (no pixel copy needed).
-  let (frame_arc, format) = frames[frame_index].clone();
-  let frame_guard = frame_arc.read();
-  let pts = frame_guard.pts();
-  let frame_duration = frame_guard.duration();
-  let duration = (frames.len() > 1 && frame_duration > 0).then_some(frame_duration);
-  drop(frame_guard);
+  let (frame_arc, format, duration) = frames[frame_index].clone();
+  let pts = frame_arc.read().pts();
 
   // Per Chromium behavior: "default" extracts color space, "none" ignores it.
   let extract_color_space = guard.color_space_conversion == ColorSpaceConversion::Default;
@@ -2077,7 +2074,15 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>, call: FrameCall) 
   if codec_id == AVCodecID::Mjpeg {
     let desired = desired_width.zip(desired_height);
     return match jpeg_frame(inner, &data_bytes, desired, jpeg_state, call)? {
-      Some(frame) => store_frames(inner, cache_epoch, &data_bytes, vec![frame], 1, None, None),
+      Some((frame, format)) => store_frames(
+        inner,
+        cache_epoch,
+        &data_bytes,
+        vec![(frame, format, None)],
+        1,
+        None,
+        None,
+      ),
       // the metadata, but no frame yet
       None => Ok(()),
     };
@@ -2089,12 +2094,34 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>, call: FrameCall) 
     AVCodecID::Av1 => avif::parse(&data_bytes, prefer_animation),
     _ => Avif::Decline,
   };
+  // An AVIF's durations come from its track (see `decode_avif`)
+  let track_timing = matches!(avif, Avif::Image(_));
   let (context, frames, frame_count) = match avif {
     Avif::Image(image) => {
-      let (context, frames) = decode_avif(&data_bytes, &image)?;
-      // Chrome rejects a file whose samples end past its data
-      if data_complete && frames.len() < image.color.len() {
+      let len = data_bytes.len();
+      if data_complete
+        && std::iter::once(&image.color)
+          .chain(&image.alpha)
+          .any(|samples| samples.past_end(len))
+      {
         return Err(reject_metadata(inner));
+      }
+      let (context, frames) = decode_avif(&data_bytes, &image).inspect_err(|_| {
+        // The samples that have arrived do not decode: the frames cached from fewer bytes
+        // are stale, and decode() then fails like Chrome's.
+        if let Ok(mut guard) = inner.lock()
+          && guard.cache_epoch == cache_epoch
+          && len >= guard.cached_data_len
+        {
+          guard.cached_frames = None;
+        }
+      })?;
+      // an item that ends past the data (see `AvifSamples::past_end`)
+      if data_complete && frames.len() < image.color.len() {
+        return Err(Error::new(
+          Status::GenericFailure,
+          "Failed to decode frame at index 0",
+        ));
       }
       (context, frames, image.color.len())
     }
@@ -2117,6 +2144,15 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>, call: FrameCall) 
   } else {
     None
   };
+  // Chrome gives every frame of an animation its duration. FFmpeg's 0 is no duration; a
+  // track's 0 is one.
+  let frames = frames
+    .into_iter()
+    .map(|(f, format)| {
+      let duration = (frame_count > 1 && (f.duration() > 0 || track_timing)).then(|| f.duration());
+      (f, format, duration)
+    })
+    .collect();
   store_frames(
     inner,
     cache_epoch,
@@ -2128,14 +2164,14 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>, call: FrameCall) 
   )
 }
 
-/// Cache the frames decoded from `data`, unless reset()/close() or a newer probe came first.
-/// `frame_count` is the track's frame count: an AVIF track also counts the frames whose samples
-/// have not arrived yet.
+/// Cache the frames decoded from `data`, each with its format and duration, unless
+/// reset()/close() or a newer probe came first. `frame_count` is the track's frame count: an
+/// AVIF track also counts the frames whose samples have not arrived yet.
 fn store_frames(
   inner: &Arc<Mutex<ImageDecoderInner>>,
   cache_epoch: u64,
   data: &[u8],
-  frames: Vec<(Frame, VideoPixelFormat)>,
+  frames: Vec<(Frame, VideoPixelFormat, Option<i64>)>,
   frame_count: usize,
   context: Option<CodecContext>,
   repetition_count: Option<f64>,
@@ -2168,9 +2204,9 @@ fn store_frames(
   }
 
   // Wrap frames in Arc for efficient sharing from cache
-  let shared_frames: Vec<(Arc<ParkingLotRwLock<Frame>>, VideoPixelFormat)> = frames
+  let shared_frames = frames
     .into_iter()
-    .map(|(f, format)| (f.into_shared(), format))
+    .map(|(f, format, duration)| (f.into_shared(), format, duration))
     .collect();
   guard.cached_frames = Some(shared_frames);
   guard.context = context;
@@ -2273,18 +2309,21 @@ fn decode_avif(
       "Decode failed: an AV1 sample gave no frame",
     ));
   }
+  // Chrome's timing (CrabbyAvif's image_timing) is ticks / timescale seconds, or 0 when the
+  // timescale is 0 (an item's). Here rounded to microseconds.
+  let micros = |ticks: u64| match u128::from(image.timescale) {
+    0 => 0,
+    timescale => {
+      i64::try_from((u128::from(ticks) * 1_000_000 + timescale / 2) / timescale).unwrap_or(i64::MAX)
+    }
+  };
   let mut ticks = 0;
   for (i, frame) in frames.iter_mut().enumerate() {
-    let duration = i64::from(image.color.duration(i));
-    frame.set_pts(ticks);
-    frame.set_duration(duration);
+    let duration = u64::from(image.color.duration(i));
+    frame.set_pts(micros(ticks));
+    frame.set_duration(micros(duration));
     ticks += duration;
   }
-  // an item has timescale 0: timestamp 0, no duration
-  normalize_frame_timing(
-    &mut frames,
-    (1, i32::try_from(image.timescale).unwrap_or(0)),
-  );
   let mut alpha = alpha.into_iter();
   let frames = frames
     .into_iter()
