@@ -227,6 +227,26 @@ struct ImageTrackData {
   repetition_count: f64,
 }
 
+impl ImageTrackData {
+  /// The track before its metadata is known
+  fn initial(codec_id: Option<AVCodecID>) -> Self {
+    // Determine if this is an animated format
+    let animated = matches!(
+      codec_id,
+      Some(AVCodecID::Gif)
+        | Some(AVCodecID::Webp)
+        | Some(AVCodecID::Jpegxl)
+        | Some(AVCodecID::JpegxlAnim)
+    );
+    ImageTrackData {
+      animated,
+      // For static images, there's one frame; for animated, we'll detect later
+      frame_count: if animated { 0 } else { 1 },
+      repetition_count: if animated { f64::INFINITY } else { 0.0 },
+    }
+  }
+}
+
 /// Internal state for ImageTrackList (shared with ImageTrack instances)
 #[derive(Debug)]
 struct ImageTrackListInner {
@@ -664,29 +684,13 @@ impl ImageDecoder {
     // Parse MIME type to codec ID - accept invalid types (will fail at decode time per W3C spec)
     let codec_id = parse_mime_type(&init.mime_type).ok();
 
-    // Determine if this is an animated format
-    let animated = matches!(
-      codec_id,
-      Some(AVCodecID::Gif)
-        | Some(AVCodecID::Webp)
-        | Some(AVCodecID::Jpegxl)
-        | Some(AVCodecID::JpegxlAnim)
-    );
-
-    // For static images, there's one frame; for animated, we'll detect later
-    let frame_count = if animated { 0 } else { 1 };
-
     // Create async signaling primitives
     let complete = Arc::new(AtomicBool::new(false));
     let ready = Arc::new(AtomicBool::new(false));
     let ready_notify = Arc::new(Notify::new());
 
     let track_list_inner = Arc::new(Mutex::new(ImageTrackListInner {
-      tracks: vec![ImageTrackData {
-        animated,
-        frame_count,
-        repetition_count: if animated { f64::INFINITY } else { 0.0 },
-      }],
+      tracks: vec![ImageTrackData::initial(codec_id)],
       selected_index: Some(0),
     }));
 
@@ -1256,11 +1260,19 @@ impl ImageDecoder {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
     // A metadata failure counts once `close_if_metadata_failed` has closed the decoder. A close()
     // that comes first wins, also when a worker thread already found the failure
-    // (`reject_metadata`).
+    // (`reject_metadata`). It wins over metadata the same way: until `tracks.ready` is
+    // signalled, the track that a worker thread may have filled (`cache_decoded_frames`) goes
+    // back to how it was built.
     if !inner.closed {
       // The same for a frame failure (`jpeg_frame`), also one that a reset() kept
       inner.frame_failed = None;
       inner.tracks.failed.store(false, Ordering::Release);
+      if !inner.tracks.ready.load(Ordering::Acquire)
+        && let Ok(mut tracks) = inner.tracks.inner.lock()
+        && let Some(track) = tracks.tracks.get_mut(0)
+      {
+        *track = ImageTrackData::initial(inner.codec_id);
+      }
     }
     inner.close();
     Ok(())
