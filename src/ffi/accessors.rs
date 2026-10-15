@@ -40,21 +40,6 @@ unsafe extern "C" {
     dst: *mut AVFrame,
     unspecified_full: c_int,
   ) -> c_int;
-  /// Convert a decoded AVIF frame and its alpha frame (same size and depth, or null) into
-  /// `dst`, a BGRA frame of the same size, with Chrome's bytes (X = 255 without alpha).
-  /// `matrix` / `primaries` / `full_range`: the CICP Chrome uses (the item's nclx, else the
-  /// AV1 sequence header); `chroma_position`: av1C chroma_sample_position; `premultiplied`:
-  /// 'prem'. Returns AVERROR(ENOSYS) where Chrome fails the decode.
-  pub fn ffframe_avif_to_rgb(
-    color: *const AVFrame,
-    alpha: *const AVFrame,
-    premultiplied: c_int,
-    matrix: c_int,
-    primaries: c_int,
-    full_range: c_int,
-    chroma_position: c_int,
-    dst: *mut AVFrame,
-  ) -> c_int;
   // ========================================================================
   // AVCodecContext Setters
   // ========================================================================
