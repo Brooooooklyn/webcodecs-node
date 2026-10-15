@@ -12,6 +12,8 @@ import { fileURLToPath } from 'url'
 
 import { ImageDecoder, type ImageDecoderInit } from '../index.js'
 
+import { bmp } from './helpers/image-files.js'
+
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
 // ============================================================================
@@ -563,6 +565,78 @@ test('ImageDecoder: a streamed JPEG with a desired size below 1/64 of its area r
   const decoder = new ImageDecoder({ data: stream, type: 'image/jpeg', desiredWidth: 39, desiredHeight: 30 })
   await t.throwsAsync(decoder.tracks.ready, { name: 'InvalidStateError' })
   await new Promise((resolve) => setTimeout(resolve, 50))
+})
+
+test('ImageDecoder: a close() in the decode() task or a microtask wins over a failed metadata, every time', async (t) => {
+  // The worker thread can find the failed metadata before the JS task reaches close(). The close()
+  // still wins, as on main: decode() rejects with "ImageDecoder is closed", ready and completed
+  // resolve. (Chrome 155 rejects decode() with AbortError "Aborted by failure." here.)
+  const cases: [string, ImageDecoderInit][] = [
+    // 32-bit BI_BITFIELDS, red mask 0x00f0f000 (not contiguous): fails before any FFmpeg work
+    [
+      'bad BMP mask',
+      {
+        type: 'image/bmp',
+        data: bmp(
+          4,
+          4,
+          32,
+          Array.from({ length: 4 }, (_, y) => Array.from({ length: 16 }, (_, x) => (((3 - y) * 16 + x) * 37) & 255)),
+          { compression: 3, masks: [0x00f0f000, 0x0000ff00, 0x000000ff] },
+        ),
+      },
+    ],
+    // M = 0: fails after the FFmpeg decode
+    [
+      'JPEG desired 39x30',
+      {
+        type: 'image/jpeg',
+        data: readFileSync(join(__dirname, 'fixtures/wpt/four-colors.jpg')),
+        desiredWidth: 39,
+        desiredHeight: 30,
+      },
+    ],
+  ]
+  const busy = (ms: number) => {
+    const end = performance.now() + ms
+    while (performance.now() < end);
+  }
+  const closeIn: [string, (close: () => void) => void][] = [
+    ['the same task', (close) => close()],
+    // gives the worker time to finish first
+    [
+      'the same task, after 5 ms of sync work',
+      (close) => {
+        busy(5)
+        close()
+      },
+    ],
+    ['a microtask', (close) => queueMicrotask(close)],
+  ]
+  const outcome = (promise: Promise<unknown>) =>
+    promise.then(
+      () => 'resolves',
+      (e: Error) => `${e instanceof DOMException ? 'DOMException ' : ''}${e.name}: ${e.message}`,
+    )
+  for (const [name, init] of cases) {
+    for (const [when, schedule] of closeIn) {
+      const seen: Record<string, number> = {}
+      for (let i = 0; i < 50; i++) {
+        const decoder = new ImageDecoder(init)
+        const ready = outcome(decoder.tracks.ready)
+        const completed = outcome(decoder.completed)
+        const decoded = outcome(decoder.decode().then(({ image }) => image.close()))
+        schedule(() => decoder.close())
+        const key = `decode() ${await decoded} | ready ${await ready} | completed ${await completed}`
+        seen[key] = (seen[key] ?? 0) + 1
+      }
+      t.deepEqual(
+        seen,
+        { 'decode() DOMException InvalidStateError: ImageDecoder is closed | ready resolves | completed resolves': 50 },
+        `${name}, close() in ${when}`,
+      )
+    }
+  }
 })
 
 test('ImageDecoder preferAnimation false returns single frame for animated GIF', async (t) => {

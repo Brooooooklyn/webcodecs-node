@@ -895,11 +895,16 @@ impl ImageDecoder {
   /// Close the decoder
   #[napi]
   pub fn close(&self) -> Result<()> {
-    self
+    let mut inner = self
       .inner
       .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?
-      .close();
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    // A metadata failure counts once `close_if_failed` has closed the decoder. A close() that
+    // comes first wins, also when a worker thread already found the failure (`reject_metadata`).
+    if !inner.closed {
+      inner.tracks.failed.store(false, Ordering::Release);
+    }
+    inner.close();
     Ok(())
   }
 
