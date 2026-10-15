@@ -51,8 +51,10 @@ compiles it as is. Chromium's own changes to libjpeg-turbo (`jpeglibmangler.h`,
 included from `jpeglib.h`, and the hand-edited `jconfig.h` and `jconfigint.h`)
 are listed in `vendor/libjpeg-turbo/README.chromium`; `CHROMIUM_LICENSE` and
 `simd/nasm/jsimdext.inc` there hold the notices that `jpeglibmangler.h`,
-`jsimd.h` and `jsimddct.h` refer to. Other builds must document any changes to
-these files.
+`jsimd.h`, `jsimddct.h` and most SIMD files refer to (the Neon files hold their
+zlib notice themselves). The SIMD code bears the zlib License, which
+`LICENSE.md` says the IJG License subsumes in the built library. Other builds
+must document any changes to these files.
 
 `src/ffi/jpeg_blink.c` is a C rewrite of Blink's `jpeg_image_decoder.cc`:
 Copyright (C) 2006 Apple Computer, Inc.; portions Copyright (C) 2001-6

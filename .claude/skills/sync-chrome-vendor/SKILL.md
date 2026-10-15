@@ -30,9 +30,10 @@ table below follows one Chrome stable version: the `chrome:` line of
 
    It replaces `vendor/libjpeg-turbo` (with `README.chromium`, which lists Chromium's own
    changes to libjpeg-turbo, and Chromium's `LICENSE` as `CHROMIUM_LICENSE`) and the copies in
-   `licenses/`, and prints every change. Without `--chrome` it re-syncs the pinned revision and
-   prints `No changes.`. Never edit vendored files: put any difference in the `build.rs` flags
-   or in `src/ffi/jpeg_blink.c`.
+   `licenses/`, and prints every change. The source lists in `CHROMIUM_PIN`, the SIMD ones
+   (`simd-x86_64`, `simd-aarch64`, `simd-arm`) too, come from that revision's `BUILD.gn`.
+   Without `--chrome` it re-syncs the pinned revision and prints `No changes.`. Never edit
+   vendored files: put any difference in the `build.rs` flags or in `src/ffi/jpeg_blink.c`.
 
 3. Diff these files between the pinned tag and the new one. Gitiles serves a file as base64
    with `https://chromium.googlesource.com/chromium/src/+/refs/tags/<version>/<path>?format=TEXT`
@@ -49,8 +50,13 @@ table below follows one Chrome stable version: the `chrome:` line of
    - `media/base/limits.h` `kMaxDimension`: Chrome rejects a decoded frame wider or taller
      than this
    - the libjpeg-turbo `BUILD.gn` (in the vendored revision): the `defines` of `libjpeg`,
-     `libjpeg12` and `libjpeg16`. `build.rs` copies `NO_GETENV` and `NO_PUTENV` by hand;
-     `WITH_SIMD` and `NEON_INTRINSICS` belong to the SIMD build, which is not used here.
+     `libjpeg12`, `libjpeg16`, `simd` and `libjpeg_simd_config`, and the `simd_asm` flags.
+     `build.rs` copies them by hand: `NO_GETENV` and `NO_PUTENV` on the decoder files,
+     `WITH_SIMD` with `NEON_INTRINSICS` (Arm) or `USE_CLZ_INTRINSIC` (x86) on the 8-bit ones,
+     and `WITH_SIMD` (plus `NEON_INTRINSICS` on Arm) but not `NO_GETENV` on the SIMD files, so
+     `JSIMD_FORCENONE` and the other `JSIMD_*` variables work as in Chrome
+   - `third_party/nasm/nasm_assemble.gni` (`chromium/deps/nasm` at the revision in DEPS): the
+     NASM flags that `assemble_libjpeg_turbo` in `build.rs` copies
 
    Port the decode changes to `src/ffi/jpeg_blink.c`, and size changes to
    `jpeg_scale_numerator` (only on the labels branch, see the table). If `kRustyJpegFeature`
@@ -61,11 +67,18 @@ table below follows one Chrome stable version: the `chrome:` line of
    (Playwright starts Chrome with `--disable-field-trial-config`). There is none at
    155.0.8059.79. Check the other rows of the table the same way.
 
-4. Rebuild and check:
+4. Rebuild and check. x86_64 builds need NASM (`brew install nasm`, `apt-get install nasm`,
+   or `NASM=<path>`); on macOS use NASM 3.00 or newer, older ones drop the
+   `macho build_version` pragma and ld then warns.
    - `pnpm build`, then `cargo test --lib jpeg` (digests of Chrome's bytes for
-     `__test__/fixtures/jpeg`)
+     `__test__/fixtures/jpeg`). The SIMD IDCTs give other bytes than the C one on corrupt
+     data, and Neon others than x86, so `decodes_chrome_simd_bytes` has one digest per
+     family: Neon (aarch64 and armv7) from Chrome arm64, x86 from Chrome x86_64 (SSE2 and
+     AVX2 give the same bytes). On an Apple silicon Mac also run the tests for
+     `x86_64-apple-darwin`, once as is (SSE2) and once with `ROSETTA_ADVERTISE_AVX=1` (AVX2)
    - `nm -g --defined-only` on `target/**/build/webcodecs-node-*/out/libjpeg_turbo.a`: every
-     symbol starts with `webcodecs_` (`_webcodecs_` on macOS)
+     symbol starts with `webcodecs_` (`_webcodecs_` on macOS), the `jsimd_*` and `jconst_*`
+     ones too
    - decode the fixtures in the new Chrome and compare with the digests in
      `src/codec/jpeg.rs`. Change a digest only when Chrome's bytes changed. Serve the fixtures
      from `http://127.0.0.1` (ImageDecoder needs a secure context) and run this in the page,
@@ -100,7 +113,12 @@ table below follows one Chrome stable version: the `chrome:` line of
      ```
 
      The scaled cases of `420-37x9.jpg` use `{desiredWidth: 74, desiredHeight: 2}` (M = 5)
-     and `{desiredWidth: 5, desiredHeight: 2}` (M = 1).
+     and `{desiredWidth: 5, desiredHeight: 2}` (M = 1), those of `idct-overflow-*-17x9.jpg`
+     `{desiredWidth: 9, desiredHeight: 5}` (M = 4) and `{desiredWidth: 5, desiredHeight: 3}`
+     (M = 2). For the x86 digests on an Apple silicon Mac, run the x86_64 half of the
+     universal Google Chrome under Rosetta: point `executablePath` at a script that runs
+     `exec /usr/bin/arch -x86_64 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" "$@"`,
+     once as is and once with `ROSETTA_ADVERTISE_AVX=1`; both must give the same bytes.
 
 5. Update the versions in the table.
 
@@ -110,9 +128,6 @@ table below follows one Chrome stable version: the `chrome:` line of
 
 - ICC profiles that Chrome applies at decode time with skcms (a CMYK profile on CMYK/YCCK,
   an RGB or gray profile Skia cannot hold exactly). Matching them needs skcms.
-- Corrupt data whose coefficients overflow the IDCT. Chrome builds libjpeg-turbo with SIMD
-  (NEON intrinsics on Arm, NASM SSE2/AVX2 on x86); `build.rs` builds C only. Valid files give
-  the same bytes.
 
 ## Ported code that follows Chrome
 
@@ -122,7 +137,7 @@ licence notice (LGPL 2.1 or later, MPL 1.1 or GPL 2.0): keep it when you port ch
 
 | What                                   | Chromium file and revision                                                                                      | Where here                                                                 |
 | -------------------------------------- | --------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| libjpeg-turbo, decoder files           | `src/third_party/libjpeg_turbo` = `chromium/deps/libjpeg_turbo` @ `640f254ad0fa`                                | `vendor/libjpeg-turbo`, `tools/sync-libjpeg-turbo.mjs`                     |
+| libjpeg-turbo, decoder and SIMD files  | `src/third_party/libjpeg_turbo` = `chromium/deps/libjpeg_turbo` @ `640f254ad0fa`                                | `vendor/libjpeg-turbo`, `tools/sync-libjpeg-turbo.mjs`                     |
 | Blink JPEG decode settings             | `third_party/blink/renderer/platform/image-decoders/jpeg/jpeg_image_decoder.cc` @ 155.0.8059.79                 | `src/ffi/jpeg_blink.c`, `src/codec/jpeg.rs`                                |
 | WebCodecs YUV gate and color tags      | `third_party/blink/renderer/modules/webcodecs/image_decoder_core.cc` @ 155.0.8059.79                            | `allow_yuv` and the color tags in `src/ffi/jpeg_blink.c`                   |
 | JPEG M/8 scale rule                    | same file, `DesiredScaleNumerator` @ 155.0.8059.79                                                              | `jpeg_scale_numerator` in `src/webcodecs/image_decoder.rs` (labels branch) |
