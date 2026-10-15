@@ -17,7 +17,7 @@
 //! Output is unpremultiplied BGRA. `has_alpha` says whether Chrome labels the image
 //! BGRA (true) or BGRX (false, the X bytes are 255).
 
-use std::fmt;
+use std::{fmt, iter};
 
 use pixel_simd::{Bitfield, Opaque, Palette};
 
@@ -314,14 +314,18 @@ impl<'a> BmpDecoder<'a> {
   /// RLE4, RLE8 and RLE24 (image crate BmpDecoder::read_rle_data)
   fn decode_rle(&self, rle: Rle) -> Result<Vec<u8>, BmpError> {
     let (width, height) = (self.width as usize, self.height as usize);
+    // A dry run without pixels first: data that ends early or is corrupt fails before the
+    // canvas is allocated. Without it, a header of 1 KB declaring 65535 x 8191 pixels made
+    // 2 GiB of zeros before its missing pixel data failed the decode.
+    self.read_rle(rle, RleRows::new(width, Vec::new()))?;
     let mut pixels = room_for(width * height * 4)?;
     pixels.resize(width * height * 4, 0);
-    let mut out = RleRows {
-      pixels,
-      width,
-      row: 0,
-      x: 0,
-    };
+    self.read_rle(rle, RleRows::new(width, pixels))
+  }
+
+  /// Reads the RLE data into `out` and returns its pixels. With no pixels, only checks the data.
+  fn read_rle(&self, rle: Rle, mut out: RleRows) -> Result<Vec<u8>, BmpError> {
+    let height = self.height as usize;
     // output rows in file order
     let mut rows = (0..height).map(|i| if self.top_down { i } else { height - 1 - i });
     let mut src = Source {
@@ -378,22 +382,19 @@ impl<'a> BmpDecoder<'a> {
               match rle {
                 Rle::Rle8 => {
                   let run = src.take(n + n % 2)?;
-                  for &index in &run[..n] {
-                    out.put(color(index))?;
-                  }
+                  out.run(n, run.iter().map(|&index| color(index)))?;
                 }
                 Rle::Rle4 => {
                   let len = n.div_ceil(2);
                   let run = src.take(len + len % 2)?;
-                  for i in 0..n {
-                    out.put(color(nibble(run[i / 2], i)))?;
-                  }
+                  out.run(n, (0..n).map(|i| color(nibble(run[i / 2], i))))?;
                 }
                 Rle::Rle24 => {
-                  let run = src.take(n * 3 + n % 2)?;
-                  for &[b, g, r] in run.as_chunks().0.iter().take(out.left()) {
-                    out.put([b, g, r, 255])?;
-                  }
+                  let run = src.take(n * 3 + n % 2)?.as_chunks().0;
+                  out.run(
+                    n.min(out.left()),
+                    run.iter().map(|&[b, g, r]| [b, g, r, 255]),
+                  )?;
                 }
               }
               count += n;
@@ -405,21 +406,18 @@ impl<'a> BmpDecoder<'a> {
             match rle {
               Rle::Rle8 => {
                 let c = color(src.byte()?);
-                for _ in 0..n.min(out.left()) {
-                  out.put(c)?;
-                }
+                out.run(n.min(out.left()), iter::repeat(c))?;
               }
               Rle::Rle4 => {
                 let pair = src.byte()?;
-                for i in 0..n {
-                  out.put(color(nibble(pair, i)))?;
-                }
+                out.run(n, (0..n).map(|i| color(nibble(pair, i))))?;
               }
               Rle::Rle24 => {
                 let bgr = src.take(3)?;
-                for _ in 0..n.min(out.left()) {
-                  out.put([bgr[0], bgr[1], bgr[2], 255])?;
-                }
+                out.run(
+                  n.min(out.left()),
+                  iter::repeat([bgr[0], bgr[1], bgr[2], 255]),
+                )?;
               }
             }
             count += n;
@@ -493,7 +491,8 @@ impl<'a> Source<'a> {
   }
 }
 
-/// RLE output: the row being written and the next pixel in it
+/// RLE output: the row being written and the next pixel in it. With no pixels (a dry run), it
+/// only follows the position.
 struct RleRows {
   pixels: Vec<u8>,
   width: usize,
@@ -502,6 +501,15 @@ struct RleRows {
 }
 
 impl RleRows {
+  fn new(width: usize, pixels: Vec<u8>) -> Self {
+    RleRows {
+      pixels,
+      width,
+      row: 0,
+      x: 0,
+    }
+  }
+
   fn start(&mut self, row: usize) {
     self.row = row;
     self.x = 0;
@@ -511,19 +519,22 @@ impl RleRows {
     self.width - self.x
   }
 
-  /// Writes one pixel; past the row end is corrupt data
-  fn put(&mut self, color: [u8; 4]) -> Result<(), BmpError> {
-    if self.x >= self.width {
-      return Err(CORRUPT);
-    }
+  /// Writes `n` pixels of `colors`; past the row end is corrupt data. A dry run only moves the
+  /// position, so it does not cost a step per pixel.
+  fn run(&mut self, n: usize, colors: impl Iterator<Item = [u8; 4]>) -> Result<(), BmpError> {
+    let fits = n.min(self.left());
     let at = (self.row * self.width + self.x) * 4;
-    self.pixels[at..at + 4].copy_from_slice(&color);
-    self.x += 1;
-    Ok(())
+    if let Some(pixels) = self.pixels.get_mut(at..at + fits * 4) {
+      for (pixel, color) in pixels.as_chunks_mut::<4>().0.iter_mut().zip(colors) {
+        *pixel = color;
+      }
+    }
+    self.x += fits;
+    if fits < n { Err(CORRUPT) } else { Ok(()) }
   }
 
   fn black(&mut self, n: usize) -> Result<(), BmpError> {
-    (0..n).try_for_each(|_| self.put([0, 0, 0, 255]))
+    self.run(n, iter::repeat([0, 0, 0, 255]))
   }
 
   /// Black up to the row end
