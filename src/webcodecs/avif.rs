@@ -57,9 +57,6 @@ pub(crate) struct Nclx {
 
 /// The AV1 samples of an item (one sample, maybe in several extents) or of a track
 pub(crate) struct AvifSamples {
-  /// 'ispe' of an item, 'tkhd' of a track. Chrome scales a decoded frame to this size.
-  pub width: u32,
-  pub height: u32,
   /// The AV1CodecConfigurationRecord ('av1C')
   pub config: Vec<u8>,
   samples: Samples,
@@ -608,7 +605,7 @@ impl<'a> Meta<'a> {
     aux.is_some_and(|aux| ALPHA_URNS.contains(&aux)) && &self.item_type(item) != b"sato"
   }
 
-  /// The sample of an AV1 item, with its 'ispe' size and 'av1C'
+  /// The sample of an AV1 item, with its 'av1C'
   fn samples(&self, item: u32) -> Option<AvifSamples> {
     if &self.item_type(item) != b"av01" || self.skipped(item) {
       return None;
@@ -623,7 +620,8 @@ impl<'a> Meta<'a> {
     {
       return None;
     }
-    let (width, height) = properties
+    // an 'ispe' with a size
+    properties
       .iter()
       .find_map(|p| match p {
         Property::Ispe(width, height) => Some((*width, *height)),
@@ -655,8 +653,6 @@ impl<'a> Meta<'a> {
       _ => location.extents.clone(),
     };
     Some(AvifSamples {
-      width,
-      height,
       config: config.to_vec(),
       samples: Samples::Item(extents),
     })
@@ -979,8 +975,6 @@ impl<'a> Track<'a> {
       sample.duration = delta;
     }
     Some(AvifSamples {
-      width: self.width,
-      height: self.height,
       config: config.to_vec(),
       samples: Samples::Track(samples),
     })
@@ -1194,7 +1188,6 @@ mod tests {
     let data = fixture("s8_420.avif");
     let image = parsed(&data, None);
     let color = &image.color;
-    assert_eq!((color.width, color.height), (64, 48));
     assert_eq!(color.config, [0x81, 0x00, 0x0c, 0x00]);
     assert_eq!(samples(&data, color), bytes(&data, &[(275, 854)]));
     assert_eq!(color.duration(0), 0);
@@ -1219,7 +1212,6 @@ mod tests {
     assert_eq!(samples(&data, &image.color), bytes(&data, &[(852, 854)]));
     assert_eq!(samples(&data, alpha), bytes(&data, &[(430, 422)]));
     assert_eq!(alpha.config, [0x81, 0x00, 0x1c, 0x00]);
-    assert_eq!((alpha.width, alpha.height), (64, 48));
     assert!(!image.premultiplied);
 
     // Chrome: I420. A depth auxiliary image is not alpha.
@@ -1275,7 +1267,6 @@ mod tests {
       samples(&data, color),
       bytes(&data, &[(1001, 940), (1941, 830), (2771, 788)])
     );
-    assert_eq!((color.width, color.height), (64, 48));
     assert_eq!(color.config, [0x81, 0x00, 0x0c, 0x00]);
     assert_eq!(image.timescale, 30);
     assert_eq!(

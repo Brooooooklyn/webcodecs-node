@@ -6,8 +6,6 @@
 mod audio_data;
 mod audio_decoder;
 mod audio_encoder;
-// Not used yet: the ImageDecoder AVIF path moves to it in a follow-up change
-#[allow(dead_code)]
 mod avif;
 pub(crate) mod buffer_source;
 pub(crate) mod codec_pressure;
