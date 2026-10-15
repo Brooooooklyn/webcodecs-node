@@ -105,6 +105,8 @@ pub struct GifDecoder<'a> {
   /// Global Color Table as BGRA, padded with opaque black
   palette: [[u8; 4]; 256],
   frames: Vec<GifFrameInfo>,
+  /// The loop count of the last NETSCAPE2.0 or ANIMEXTS1.0 extension read
+  loops: Option<u16>,
 }
 
 struct Reader<'a> {
@@ -179,9 +181,42 @@ impl Default for Control {
   }
 }
 
+/// Application extension (Wuffs decode_ae): reads the loop count of a NETSCAPE2.0 or
+/// ANIMEXTS1.0 block into `loops`. The sub-block after their 11-byte id is read on its own,
+/// so one of size 0 does not end the extension.
+fn read_application(r: &mut Reader, loops: &mut Option<u16>) -> Result<(), GifError> {
+  match r.u8()? {
+    0 => return Ok(()),
+    11 => {
+      if matches!(r.take(11)?, b"NETSCAPE2.0" | b"ANIMEXTS1.0") {
+        match r.u8()? {
+          3 => {
+            let id = r.u8()?;
+            let count = r.u16()? as u16;
+            if id == 1 {
+              *loops = Some(count);
+            }
+          }
+          n => {
+            r.take(usize::from(n))?;
+          }
+        }
+      }
+    }
+    n => {
+      r.take(usize::from(n))?;
+    }
+  }
+  r.skip_blocks()
+}
+
 /// Reads blocks up to the next Image Descriptor rect. None at the trailer, or at any
 /// other block type (Wuffs treats it as the trailer).
-fn next_frame_rect(r: &mut Reader, control: &mut Control) -> Result<Option<Rect>, GifError> {
+fn next_frame_rect(
+  r: &mut Reader,
+  control: &mut Control,
+  loops: &mut Option<u16>,
+) -> Result<Option<Rect>, GifError> {
   loop {
     match r.u8()? {
       0x21 => match r.u8()? {
@@ -205,6 +240,7 @@ fn next_frame_rect(r: &mut Reader, control: &mut Control) -> Result<Option<Rect>
             delay,
           };
         }
+        0xFF => read_application(r, loops)?,
         _ => r.skip_blocks()?,
       },
       0x2C => {
@@ -240,10 +276,11 @@ impl<'a> GifDecoder<'a> {
 
     let mut frames: Vec<GifFrameInfo> = Vec::new();
     let mut control = Control::default();
+    let mut loops = None;
     loop {
       // Before the first frame rect, an error fails the image (Wuffs
       // decode_image_config). After it, the frame list ends at the error.
-      let rect = match next_frame_rect(&mut r, &mut control) {
+      let rect = match next_frame_rect(&mut r, &mut control, &mut loops) {
         Ok(Some(rect)) => rect,
         Ok(None) => break,
         Err(e) if frames.is_empty() => return Err(e),
@@ -287,6 +324,7 @@ impl<'a> GifDecoder<'a> {
       height,
       palette,
       frames,
+      loops,
     };
     for i in 0..gif.frames.len() {
       let (has_alpha, required) = alpha_and_required_frame(&gif.frames, i, gif.screen());
@@ -315,6 +353,18 @@ impl<'a> GifDecoder<'a> {
 
   pub fn frames(&self) -> &[GifFrameInfo] {
     &self.frames
+  }
+
+  /// Chrome's repetitionCount. Wuffs num_animation_loops counts plays: the last loop count
+  /// read plus one (0 is forever), else 1 for an animation and 0 for a still image. Skia
+  /// subtracts one and makes 0 forever (SkWuffsCodec::onGetRepetitionCount).
+  pub fn repetition_count(&self) -> f64 {
+    match self.loops {
+      Some(0) => f64::INFINITY,
+      Some(count) => f64::from(count),
+      None if self.frames.len() > 1 => 0.0,
+      None => f64::INFINITY,
+    }
   }
 
   /// Decodes the frames in order. Each item is the full canvas as unpremultiplied
@@ -989,5 +1039,50 @@ mod tests {
     data.extend(b"\x21\xff\x0bNETSCAPE2.0\x03\x01\0\0\0");
     data.extend([0x2c, 0, 0, 0, 0, 11, 0, 5, 0, 0, 2, 2]);
     assert_eq!(alpha(&data), Ok(vec![false, false]));
+  }
+
+  #[test]
+  fn reads_the_loop_count_like_wuffs() {
+    // the header and global table, the extensions, `n` frames and the trailer
+    let file = gif_file((11, 5), &[([0, 0, 11, 5], None)]);
+    let (head, frame) = file[..file.len() - 1].split_at(19);
+    let read = |extensions: &[u8], n: usize| {
+      let mut data = [head, extensions, &frame.repeat(n)].concat();
+      data.push(0x3b);
+      let gif = GifDecoder::new(&data).unwrap();
+      (gif.frames().len(), gif.repetition_count())
+    };
+    let netscape = |count: u16| {
+      [
+        b"\x21\xff\x0bNETSCAPE2.0\x03\x01",
+        &count.to_le_bytes()[..],
+        b"\0",
+      ]
+      .concat()
+    };
+    assert_eq!(read(&netscape(5), 2), (2, 5.0));
+    assert_eq!(read(&netscape(0), 2), (2, f64::INFINITY));
+    assert_eq!(
+      read(b"\x21\xff\x0bANIMEXTS1.0\x03\x01\x04\x00\x00", 1),
+      (1, 4.0)
+    );
+    // without one, an animation plays once and a still image loops forever
+    assert_eq!(read(b"", 2), (2, 0.0));
+    assert_eq!(read(b"", 1), (1, f64::INFINITY));
+    // the last one counts; one in a comment or with sub-block id 2 does not
+    assert_eq!(read(&[netscape(3), netscape(7)].concat(), 2), (2, 7.0));
+    assert_eq!(
+      read(&[b"\x21\xfe\x13", &netscape(5)[..], b"\0"].concat(), 2),
+      (2, 0.0)
+    );
+    assert_eq!(
+      read(b"\x21\xff\x0bNETSCAPE2.0\x03\x02\x05\x00\x00", 2),
+      (2, 0.0)
+    );
+    // an empty sub-block after the id does not end the extension
+    assert_eq!(
+      read(b"\x21\xff\x0bNETSCAPE2.0\x00\x00", 1),
+      (1, f64::INFINITY)
+    );
   }
 }
