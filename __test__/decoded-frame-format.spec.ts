@@ -15,82 +15,16 @@ import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { deflateSync } from 'node:zlib'
 
 import test from 'ava'
 
 import { EncodedVideoChunk, ImageDecoder, VideoDecoder, VideoFrame, type VideoPixelFormat } from '../index.js'
 
+import { be16, bmp, gif, le16, png } from './helpers/image-files.js'
+
 // ============================================================================
 // Helpers
 // ============================================================================
-
-const CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
-  let c = n
-  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
-  return c >>> 0
-})
-
-function crc32(bytes: Uint8Array): number {
-  let c = 0xffffffff
-  for (const b of bytes) c = CRC_TABLE[(c ^ b) & 0xff] ^ (c >>> 8)
-  return (c ^ 0xffffffff) >>> 0
-}
-
-function pngChunk(type: string, data: ArrayLike<number>): Buffer {
-  const body = Buffer.concat([Buffer.from(type, 'latin1'), Buffer.from(Uint8Array.from(data))])
-  const out = Buffer.alloc(body.length + 8)
-  out.writeUInt32BE(body.length - 4, 0)
-  body.copy(out, 4)
-  out.writeUInt32BE(crc32(body), body.length + 4)
-  return out
-}
-
-/** PNG with unfiltered rows; `extra` chunks go before IDAT. */
-function png(
-  width: number,
-  height: number,
-  colorType: number,
-  bitDepth: number,
-  rows: number[][],
-  extra: [string, number[]][] = [],
-): Uint8Array {
-  const ihdr = Buffer.alloc(13)
-  ihdr.writeUInt32BE(width, 0)
-  ihdr.writeUInt32BE(height, 4)
-  ihdr[8] = bitDepth
-  ihdr[9] = colorType
-  const raw = Buffer.concat(rows.map((row) => Buffer.from([0, ...row])))
-  return new Uint8Array(
-    Buffer.concat([
-      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
-      pngChunk('IHDR', ihdr),
-      ...extra.map(([type, data]) => pngChunk(type, data)),
-      pngChunk('IDAT', deflateSync(Buffer.concat([raw]))),
-      pngChunk('IEND', []),
-    ]),
-  )
-}
-
-/** Bottom-up BI_RGB BMP. `rows` are top-down, already in file byte order. */
-function bmp(width: number, height: number, bpp: number, rows: number[][], palette: number[][] = []): Uint8Array {
-  const rowBytes = Math.ceil((width * bpp) / 32) * 4
-  const offset = 54 + palette.length * 4
-  const buf = Buffer.alloc(offset + rowBytes * height)
-  buf.write('BM', 0, 'latin1')
-  buf.writeUInt32LE(buf.length, 2)
-  buf.writeUInt32LE(offset, 10)
-  buf.writeUInt32LE(40, 14)
-  buf.writeInt32LE(width, 18)
-  buf.writeInt32LE(height, 22)
-  buf.writeUInt16LE(1, 26)
-  buf.writeUInt16LE(bpp, 28)
-  buf.writeUInt32LE(rowBytes * height, 34)
-  buf.writeUInt32LE(palette.length, 46)
-  palette.forEach(([r, g, b], i) => Buffer.from([b, g, r, 0]).copy(buf, 54 + i * 4))
-  rows.forEach((row, y) => Buffer.from(row).copy(buf, offset + (height - 1 - y) * rowBytes))
-  return new Uint8Array(buf)
-}
 
 const b64 = (s: string) => new Uint8Array(Buffer.from(s, 'base64'))
 
@@ -163,7 +97,7 @@ const png = (w, h, colorType, bitDepth, row, plte) => {
 `
 
 // ============================================================================
-// ImageDecoder: PNG / BMP built in memory (Chrome 155 bytes)
+// ImageDecoder: PNG / GIF / BMP built in memory (Chrome 155 bytes)
 // ============================================================================
 
 const RGB3x2 = [
@@ -171,6 +105,13 @@ const RGB3x2 = [
   [1, 2, 3, 4, 5, 6, 7, 8, 9],
 ]
 const RGBW = [255, 0, 0, 0, 255, 0, 0, 0, 255]
+const GIF_PALETTE = [
+  [255, 0, 0],
+  [0, 255, 0],
+  [0, 0, 255],
+  [255, 255, 255],
+]
+const BGRA_MASKS = [0xff0000, 0xff00, 0xff, 0xff000000]
 
 const IMAGE_CASES: [string, Uint8Array, string, VideoPixelFormat, number[]][] = [
   // [name, data, type, Chrome format, Chrome copyTo() bytes]
@@ -303,21 +244,107 @@ const IMAGE_CASES: [string, Uint8Array, string, VideoPixelFormat, number[]][] = 
     'BGRA',
     [0, 0, 0, 255, 50, 50, 50, 0, 100, 100, 100, 255],
   ],
-  // 16-bit samples whose low byte is below 0x80: Chrome keeps the high byte and
-  // swscale rounds, which agree for these values.
+  // Chrome ignores a tRNS chunk the png crate rejects: empty, or too short for its color type
   [
-    '16-bit gray PNG (gray16be)',
-    png(2, 1, 0, 16, [[0, 0, 0x80, 0x40]]),
+    'palette PNG with an empty tRNS chunk (pal8)',
+    png(
+      3,
+      1,
+      3,
+      8,
+      [[0, 1, 2]],
+      [
+        ['PLTE', RGBW],
+        ['tRNS', []],
+      ],
+    ),
     'image/png',
     'BGRX',
-    [0, 0, 0, 255, 128, 128, 128, 255],
+    [0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255],
+  ],
+  [
+    'gray PNG with a 1-byte tRNS chunk (gray8)',
+    png(3, 1, 0, 8, [[0, 50, 100]], [['tRNS', [50]]]),
+    'image/png',
+    'BGRX',
+    [0, 0, 0, 255, 50, 50, 50, 255, 100, 100, 100, 255],
+  ],
+  // FFmpeg drops the tRNS chunk of a 1, 2 or 4-bit gray PNG; Chrome makes the key transparent
+  [
+    '1-bit gray PNG with tRNS (monob)',
+    png(9, 1, 0, 1, [[0b10101010, 0b10000000]], [['tRNS', [0, 1]]]),
+    'image/png',
+    'BGRA',
+    [255, 255, 255, 0, 0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 0, 255, 255, 255, 255, 0].concat([
+      0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 0, 255, 255, 255, 255, 0,
+    ]),
+  ],
+  [
+    '2-bit gray PNG with tRNS (gray8)',
+    png(5, 1, 0, 2, [[0b00011011, 0b10000000]], [['tRNS', [0, 2]]]),
+    'image/png',
+    'BGRA',
+    [0, 0, 0, 255, 85, 85, 85, 255, 170, 170, 170, 0, 255, 255, 255, 255, 170, 170, 170, 0],
+  ],
+  [
+    '4-bit gray PNG with tRNS (gray8)',
+    png(4, 1, 0, 4, [[0x0f, 0x7f]], [['tRNS', [0, 15]]]),
+    'image/png',
+    'BGRA',
+    [0, 0, 0, 255, 255, 255, 255, 0, 119, 119, 119, 255, 255, 255, 255, 0],
+  ],
+  // RGBA is swapped to BGRA, not premultiplied: the alpha-0 pixel keeps its color
+  ['RGBA PNG (rgba)', png(2, 1, 6, 8, [[10, 20, 30, 40, 50, 60, 70, 0]]), 'image/png', 'BGRA', [30, 20, 10, 40, 70, 60, 50, 0]],
+  [
+    'RGB PNG with tRNS (rgba)',
+    png(3, 1, 2, 8, [[1, 2, 3, 10, 20, 30, 1, 2, 3]], [['tRNS', [0, 1, 0, 2, 0, 3]]]),
+    'image/png',
+    'BGRA',
+    [3, 2, 1, 0, 30, 20, 10, 255, 3, 2, 1, 0],
+  ],
+  // Chrome keeps the high byte of each 16-bit sample (swscale rounds: 0x12ff would be 0x13)
+  [
+    '16-bit gray PNG (gray16be)',
+    png(3, 1, 0, 16, [be16([0x12ff, 0x8080, 0xff00])]),
+    'image/png',
+    'BGRX',
+    [18, 18, 18, 255, 128, 128, 128, 255, 255, 255, 255, 255],
+  ],
+  [
+    '16-bit gray + alpha PNG (ya16be)',
+    png(2, 1, 4, 16, [be16([0x40ff, 0x80ff, 0xc0c0, 0x00ff])]),
+    'image/png',
+    'BGRA',
+    [64, 64, 64, 128, 192, 192, 192, 0],
   ],
   [
     '16-bit RGB PNG (rgb48be)',
-    png(1, 1, 2, 16, [[0x11, 0x11, 0x22, 0x22, 0xff, 0xff]]),
+    png(2, 1, 2, 16, [be16([0x10ff, 0x2080, 0x30c0, 0xfe80, 0x0180, 0x7fff])]),
     'image/png',
     'BGRX',
-    [255, 34, 17, 255],
+    [48, 32, 16, 255, 127, 1, 254, 255],
+  ],
+  [
+    '16-bit RGBA PNG (rgba64be)',
+    png(2, 1, 6, 16, [be16([0x10ff, 0x2080, 0x30c0, 0x40ff, 0xfe80, 0x0180, 0x7fff, 0x0080])]),
+    'image/png',
+    'BGRA',
+    [48, 32, 16, 64, 127, 1, 254, 0],
+  ],
+  // GIF: BGRA when the frame has a transparent index, whose pixels are 0, 0, 0, 0
+  [
+    'GIF (bgra)',
+    gif(3, 2, GIF_PALETTE, [{ x: 0, y: 0, width: 3, height: 2, indices: [0, 1, 2, 3, 2, 1] }]),
+    'image/gif',
+    'BGRX',
+    [0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255, 255, 0, 0, 255, 0, 255, 0, 255],
+  ],
+  [
+    'GIF with a transparent index (bgra)',
+    gif(3, 2, GIF_PALETTE, [{ x: 0, y: 0, width: 3, height: 2, indices: [0, 1, 2, 3, 2, 1], transparent: 3 }]),
+    'image/gif',
+    'BGRA',
+    [0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 0, 0, 0, 0, 255, 0, 0, 255, 0, 255, 0, 255],
   ],
   [
     '24-bit BMP (bgr24)',
@@ -338,20 +365,109 @@ const IMAGE_CASES: [string, Uint8Array, string, VideoPixelFormat, number[]][] = 
   ],
   [
     '8-bit palette BMP (pal8)',
-    bmp(
-      3,
-      1,
-      8,
-      [[2, 1, 0]],
-      [
+    bmp(3, 1, 8, [[2, 1, 0]], {
+      palette: [
         [255, 0, 0],
         [0, 255, 0],
         [0, 0, 255],
       ],
-    ),
+    }),
     'image/bmp',
     'BGRX',
     [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255],
+  ],
+  // an index past colorsUsed is opaque black (FFmpeg's palette has alpha 0 there)
+  [
+    '4-bit palette BMP with indices past colorsUsed (pal8)',
+    bmp(4, 1, 4, [[0x01, 0x23]], {
+      palette: [
+        [255, 0, 0],
+        [0, 255, 0],
+      ],
+    }),
+    'image/bmp',
+    'BGRX',
+    [0, 0, 255, 255, 0, 255, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255],
+  ],
+  // 32-bit: alpha only from a V3+ bitfield alpha mask, or a V4+ BI_RGB alpha mask
+  ['32-bit BMP with alpha bytes (bgra)', bmp(2, 1, 32, [[30, 20, 10, 128, 60, 50, 40, 0]]), 'image/bmp', 'BGRX', [30, 20, 10, 255, 60, 50, 40, 255]],
+  [
+    'V3 BMP with BI_RGB and an alpha mask (bgra)',
+    bmp(2, 1, 32, [[30, 20, 10, 128, 60, 50, 40, 0]], { header: 56, masks: BGRA_MASKS }),
+    'image/bmp',
+    'BGRX',
+    [30, 20, 10, 255, 60, 50, 40, 255],
+  ],
+  [
+    'V4 BMP with BI_RGB and an alpha mask (bgra)',
+    bmp(2, 1, 32, [[30, 20, 10, 128, 60, 50, 40, 0]], { header: 108, masks: BGRA_MASKS }),
+    'image/bmp',
+    'BGRA',
+    [30, 20, 10, 128, 60, 50, 40, 0],
+  ],
+  // FFmpeg calls an all-zero alpha bgr0; Chrome keeps it, so the image is transparent
+  [
+    'V3 BMP with an alpha mask and zero alpha (bgr0)',
+    bmp(2, 1, 32, [[30, 20, 10, 0, 60, 50, 40, 0]], { header: 56, compression: 3, masks: BGRA_MASKS }),
+    'image/bmp',
+    'BGRA',
+    [30, 20, 10, 0, 60, 50, 40, 0],
+  ],
+  [
+    'V4 BMP with RGBA bitfields (rgba)',
+    bmp(2, 1, 32, [[10, 20, 30, 128, 40, 50, 60, 0]], {
+      header: 108,
+      compression: 3,
+      masks: [0xff, 0xff00, 0xff0000, 0xff000000],
+    }),
+    'image/bmp',
+    'BGRA',
+    [30, 20, 10, 128, 60, 50, 40, 0],
+  ],
+  // 16-bit: the image crate's round(v * 255 / (2^n - 1)) (swscale replicates bits: 3 -> 24, not 25)
+  [
+    '16-bit BMP (rgb555le)',
+    bmp(4, 1, 16, [le16([0x0c63, 0x7fff, 0x0001, 0x5294])]),
+    'image/bmp',
+    'BGRX',
+    [25, 25, 25, 255, 255, 255, 255, 255, 8, 0, 0, 255, 165, 165, 165, 255],
+  ],
+  [
+    '16-bit 5-6-5 BMP (rgb565le)',
+    bmp(3, 1, 16, [le16([0x1963, 0xffff, 0x0841])], { compression: 3, masks: [0xf800, 0x7e0, 0x1f] }),
+    'image/bmp',
+    'BGRX',
+    [25, 45, 25, 255, 255, 255, 255, 255, 8, 8, 8, 255],
+  ],
+  [
+    '16-bit 4-4-4 BMP (rgb444le)',
+    bmp(3, 1, 16, [le16([0x0123, 0x0fff, 0x0a5c])], { compression: 3, masks: [0xf00, 0xf0, 0xf] }),
+    'image/bmp',
+    'BGRX',
+    [51, 34, 17, 255, 255, 255, 255, 255, 204, 85, 170, 255],
+  ],
+  // the alpha mask of a V3+ header, which FFmpeg ignores
+  [
+    'V3 BMP with 4-4-4-4 bitfields (rgb444le)',
+    bmp(3, 1, 16, [le16([0x8123, 0xffff, 0x0a5c])], {
+      header: 56,
+      compression: 3,
+      masks: [0xf00, 0xf0, 0xf, 0xf000],
+    }),
+    'image/bmp',
+    'BGRA',
+    [51, 34, 17, 136, 255, 255, 255, 255, 204, 85, 170, 0],
+  ],
+  [
+    'V4 BMP with 1-5-5-5 bitfields (rgb555le)',
+    bmp(2, 1, 16, [le16([0x8c63, 0x0c63])], {
+      header: 108,
+      compression: 3,
+      masks: [0x7c00, 0x3e0, 0x1f, 0x8000],
+    }),
+    'image/bmp',
+    'BGRA',
+    [25, 25, 25, 255, 25, 25, 25, 0],
   ],
   // 6x4 lossless WebPs (argb): the header's alpha hint picks BGRA or BGRX
   [
@@ -399,6 +515,58 @@ for (const [name, data, type, format, expected] of IMAGE_CASES) {
     image.close()
   })
 }
+
+test('ImageDecoder: each GIF frame is BGRA or BGRX by the frames it is drawn over, like Chrome', async (t) => {
+  const data = gif(4, 2, GIF_PALETTE, [
+    { x: 0, y: 0, width: 4, height: 2, indices: [0, 1, 2, 3, 3, 2, 1, 0] },
+    // transparent index over an opaque frame, then restored to the background (transparent)
+    { x: 1, y: 0, width: 2, height: 1, indices: [0, 1], transparent: 0, dispose: 2 },
+    { x: 0, y: 0, width: 4, height: 2, indices: [2, 2, 3, 3, 1, 1, 3, 3], transparent: 3 },
+    // opaque, but drawn over a frame with a transparent pixel; restored to the frame before
+    { x: 0, y: 0, width: 2, height: 2, indices: [0, 0, 0, 0], dispose: 3 },
+    { x: 0, y: 1, width: 4, height: 1, indices: [1, 2, 1, 2] },
+  ])
+  const [R, G, B, W, T] = [
+    [0, 0, 255, 255],
+    [0, 255, 0, 255],
+    [255, 0, 0, 255],
+    [255, 255, 255, 255],
+    [0, 0, 0, 0],
+  ]
+  const chrome: [VideoPixelFormat, number[][]][] = [
+    ['BGRX', [R, G, B, W, W, B, G, R]],
+    ['BGRX', [R, G, G, W, W, B, G, R]],
+    ['BGRA', [B, B, T, W, G, G, G, R]],
+    ['BGRA', [R, R, T, W, R, R, G, R]],
+    ['BGRA', [B, B, T, W, G, B, G, B]],
+  ]
+  const decoder = new ImageDecoder({ data, type: 'image/gif' })
+  for (const [frameIndex, [format, pixels]] of chrome.entries()) {
+    const { image } = await decoder.decode({ frameIndex })
+    t.is(image.format, format, `frame ${frameIndex}`)
+    t.deepEqual(Array.from((await rawCopy(image)).bytes), pixels.flat(), `frame ${frameIndex}`)
+    image.close()
+  }
+  decoder.close()
+})
+
+test('ImageDecoder: a BMP bitfield mask the image crate rejects fails the metadata, like Chrome', async (t) => {
+  // the alpha mask 0x8001 is not contiguous (FFmpeg ignores it)
+  const data = bmp(2, 1, 16, [le16([0x8c63, 0x0c63])], {
+    header: 56,
+    compression: 3,
+    masks: [0x7c00, 0x3e0, 0x1f, 0x8001],
+  })
+  const decoder = new ImageDecoder({ data, type: 'image/bmp' })
+  const pending = decoder.decode()
+  await t.throwsAsync(decoder.tracks.ready, {
+    instanceOf: DOMException,
+    name: 'InvalidStateError',
+    message: 'Failed to retrieve track metadata.',
+  })
+  await t.throwsAsync(pending, { instanceOf: DOMException, name: 'EncodingError', message: 'Failed to decode frame at index 0' })
+  t.true(decoder.closed)
+})
 
 test('ImageDecoder: a decoded RGB frame keeps its format and bytes through new VideoFrame() and clone()', async (t) => {
   const image = await decodeImage(png(3, 2, 2, 8, RGB3x2), 'image/png')

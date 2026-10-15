@@ -47,7 +47,7 @@ use crate::ffi::{
   },
   avutil::{
     av_frame_alloc, av_frame_copy, av_frame_copy_props, av_frame_free, av_frame_get_buffer,
-    av_frame_ref, av_frame_unref,
+    av_frame_make_writable, av_frame_ref, av_frame_unref,
   },
 };
 use parking_lot::RwLock;
@@ -808,6 +808,13 @@ impl Frame {
     ffi::check_error(ret)?;
 
     Ok(new_frame)
+  }
+
+  /// Give the frame buffers of its own, copying them when they are shared (a decoder may keep
+  /// a reference to the frames it outputs), so that its pixels can be edited in place.
+  pub fn make_writable(&mut self) -> Result<(), CodecError> {
+    ffi::check_error(unsafe { av_frame_make_writable(self.as_mut_ptr()) })?;
+    Ok(())
   }
 
   /// Create a shallow clone that shares pixel buffers via FFmpeg's AVBufferRef.
