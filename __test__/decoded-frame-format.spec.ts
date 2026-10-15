@@ -413,48 +413,6 @@ test('ImageDecoder: a decoded RGB frame keeps its format and bytes through new V
   image.close()
 })
 
-test('ImageDecoder: desiredWidth/desiredHeight scale a gray PNG as BGRX', async (t) => {
-  const image = await decodeImage(
-    png(4, 2, 0, 8, [
-      [77, 77, 77, 77],
-      [77, 77, 77, 77],
-    ]),
-    'image/png',
-    { desiredWidth: 2, desiredHeight: 1 },
-  )
-  t.is(image.format, 'BGRX')
-  t.is(image.codedWidth, 2)
-  t.deepEqual(Array.from((await rawCopy(image)).bytes), [77, 77, 77, 255, 77, 77, 77, 255])
-  image.close()
-})
-
-test('ImageDecoder: desiredWidth/desiredHeight convert and resize RGB and gray PNGs in one pass', async (t) => {
-  // 64x32, left half one colour, right half another, scaled to 16x8. The converted
-  // frame is written at 16x8 directly (no full-size BGRX copy of the image).
-  const halves = (left: number[], right: number[]) =>
-    Array.from({ length: 32 }, () => Array.from({ length: 64 }, (_, x) => (x < 32 ? left : right)).flat())
-  for (const [name, data, left, right] of [
-    ['rgb24', png(64, 32, 2, 8, halves([200, 40, 10], [20, 90, 230])), [10, 40, 200, 255], [230, 90, 20, 255]],
-    ['gray', png(64, 32, 0, 8, halves([40], [210])), [40, 40, 40, 255], [210, 210, 210, 255]],
-  ] as const) {
-    const image = await decodeImage(data, 'image/png', { desiredWidth: 16, desiredHeight: 8 })
-    t.is(image.format, 'BGRX', name)
-    t.deepEqual([image.codedWidth, image.codedHeight], [16, 8], name)
-    const { bytes, layout } = await rawCopy(image)
-    t.deepEqual(layout, [[0, 64]], name)
-    const px = (x: number, y: number) => Array.from(bytes.subarray(y * 64 + x * 4, y * 64 + x * 4 + 4))
-    for (const [x, y] of [
-      [0, 0],
-      [1, 4],
-      [2, 7],
-    ]) {
-      t.deepEqual(px(x, y), left, `${name} (${x}, ${y})`)
-      t.deepEqual(px(15 - x, y), right, `${name} (${15 - x}, ${y})`)
-    }
-    image.close()
-  }
-})
-
 // ============================================================================
 // ImageDecoder: JPEG (16x8, written by Pillow)
 // ============================================================================
@@ -545,6 +503,127 @@ for (const [name, jpeg, chrome] of FFMPEG_JPEG_CASES) {
     image.close()
   })
 }
+
+// ============================================================================
+// ImageDecoder: desiredWidth/desiredHeight (Chrome uses them only for JPEG)
+// ============================================================================
+
+test('ImageDecoder: desiredWidth/desiredHeight do not scale PNG, GIF, WebP, AVIF or BMP, like Chrome', async (t) => {
+  for (const [data, type] of [
+    [wptFixture('four-colors.png'), 'image/png'],
+    [wptFixture('four-colors.gif'), 'image/gif'],
+    [wptFixture('four-colors.webp'), 'image/webp'],
+    [wptFixture('four-colors.avif'), 'image/avif'],
+    [png(4, 2, 0, 8, [Array(4).fill(77), Array(4).fill(77)]), 'image/png'],
+    [bmp(2, 1, 24, [[30, 20, 10, 60, 50, 40]]), 'image/bmp'],
+  ] as const) {
+    const full = await decodeImage(data, type)
+    const fullBytes = (await rawCopy(full)).bytes
+    for (const [desiredWidth, desiredHeight] of [
+      [1, 1],
+      [2, 1],
+      [640, 480],
+    ]) {
+      const image = await decodeImage(data, type, { desiredWidth, desiredHeight })
+      t.is(image.format, full.format, type)
+      t.deepEqual([image.codedWidth, image.codedHeight], [full.codedWidth, full.codedHeight], type)
+      t.deepEqual((await rawCopy(image)).bytes, fullBytes, type)
+      image.close()
+    }
+    full.close()
+  }
+})
+
+// [JPEG_CASES name, desired size, Chrome's size, Chrome's copyTo() bytes (BGRX)]. Chrome
+// decodes at M/8 of the size, rounded up, with M = floor(sqrt(desired area / area) * 8),
+// and to BGRX when M < 8. libjpeg-turbo scales in its IDCT; here FFmpeg decodes the full
+// size and swscale averages areas, up to 4 apart on these samples.
+const SCALED_JPEG_CASES: [string, [number, number], [number, number], string][] = [
+  [
+    '4:2:0',
+    [8, 4],
+    [8, 4],
+    'wxAJ/7YRJv+jD0v/kg9q/4YQh/91Eaf/Yw/M/1QP6P/GUAn/ulEm/6VPSf+WT2r/iVGG/3hRp/9kT8r/V1Dn/7+RCP+xkiX/n5FJ/42Qaf+BkoX/cZKm/1yRyv9Rkuf/xtAI/7vRJf+mz0j/l89q/4nRhf960Kb/ZtDK/1nQ5v8=',
+  ],
+  [
+    '4:2:2',
+    [15, 7],
+    [14, 7],
+    'wAIH/70CEv+0Aif/rAE5/58DSv+YBFz/jAJu/4gDgv99AZP/dQKl/2oEt/9iA8n/WQLe/1YC6v/DJAj/wiUV/7glKf+wJDv/oyZN/5wnXv+RJXH/jCaF/4Ellv95Jqf/bCe4/2Qny/9bJuH/WSbs/8BMBf+/TRH/tUwl/61MOP+fTUj/mE5a/45Nbf+ITYD/fkyU/3dNpf9rTrX/Yk3H/1lM3f9YTen/wm8G/75wE/+3byf/rW85/6FwSv+acVv/j3Bv/4pwgv+AbpX/eG+n/2pxtv9jccn/WXDe/1hw6v/Ckwn/wJMU/7eTKP+vkzz/opRM/5qVXv+Pk3D/ipSE/3+Sl/94k6j/a5W4/2OVyv9alOD/WJTt/766BP+9uhH/tLon/6y5Of+gukj/mLta/466bf+IuoD/frmT/3e6pf9pu7b/YbrI/1i63P9Wu+j/w90H/8HeE/+33Cj/sNw7/6LeSv+b31z/kd5v/4vegv+B3Zb/ed6n/23euP9j3sr/XN7e/1nf6/8=',
+  ],
+  ['4:4:4', [4, 2], [4, 2], 'vDAZ/5swV/97MJj/XDDX/72wGP+csFf/fLCZ/1yx2f8='],
+  [
+    'grayscale',
+    [8, 4],
+    [8, 4],
+    'IiIi/yoqKv8yMjL/OTk5/0FBQf9JSUn/UVFR/1hYWP9ISEj/UFBQ/1dXV/9fX1//Z2dn/29vb/92dnb/fn5+/21tbf91dXX/fX19/4SEhP+MjIz/lJSU/5ycnP+kpKT/k5OT/5ubm/+ioqL/qqqq/7Kysv+6urr/wsLC/8nJyf8=',
+  ],
+]
+
+for (const [name, [desiredWidth, desiredHeight], [width, height], chrome] of SCALED_JPEG_CASES) {
+  test(`ImageDecoder: a ${name} JPEG at desiredWidth/desiredHeight ${desiredWidth}x${desiredHeight} decodes to BGRX ${width}x${height}, like Chrome`, async (t) => {
+    const jpeg = b64(JPEG_CASES.find((c) => c[0] === name)![1])
+    const image = await decodeImage(jpeg, 'image/jpeg', { desiredWidth, desiredHeight })
+    t.is(image.format, 'BGRX')
+    t.deepEqual([image.codedWidth, image.codedHeight], [width, height])
+    const copy = await rawCopy(image)
+    t.deepEqual(copy.layout, [[0, width * 4]])
+    t.true(maxDiff(copy.bytes, b64(chrome)) <= 4)
+    image.close()
+  })
+}
+
+test('ImageDecoder: a JPEG with a desired area at least its own decodes at full size, like Chrome', async (t) => {
+  const jpeg = b64(JPEG_CASES[0][1])
+  for (const [desiredWidth, desiredHeight] of [
+    [16, 8],
+    [128, 1],
+    [1000, 1000],
+  ]) {
+    const image = await decodeImage(jpeg, 'image/jpeg', { desiredWidth, desiredHeight })
+    t.is(image.format, 'I420')
+    t.deepEqual([image.codedWidth, image.codedHeight], [16, 8])
+    image.close()
+  }
+})
+
+test("ImageDecoder: four-colors.jpg at desired sizes has Chrome's size and bytes, with Chrome's 32-bit math", async (t) => {
+  const data = wptFixture('four-colors.jpg')
+  // sha256 of Chrome's copyTo() bytes (BGRX)
+  const full = 'da76d824e943b611eba6c53b51254d65789dc0e2d5722ea3f10469666fce7d8a'
+  const half = '89a8e98e9d42e432c5cae4986e8b1736ad69b15545a79ff8885ecc943351894f'
+  const sevenEighths = '51ec1ecf901c289bcc7ca83158b35faf6ff79bc6363fd17842508d2c1de40d8b'
+  const eighth = '5bf78c35f1ddfe376b1305fa9d43eb6fb97b6944ed682868e5567fe01a3bd6dd'
+  for (const [desiredWidth, desiredHeight, size, hash] of [
+    [160, 120, [160, 120], half],
+    // only the area counts
+    [1280, 15, [160, 120], half],
+    // ToNumber, then truncation
+    ['160', '120', [160, 120], half],
+    [160.9, 120.9, [160, 120], half],
+    [319, 239, [280, 210], sevenEighths],
+    [40, 30, [40, 30], eighth],
+    // 4 bytes per desired pixel wrap at 2^32 (to 262144 and 18532 bytes)
+    [65536, 16385, [280, 210], sevenEighths],
+    [46341, 46341, [40, 30], eighth],
+    [640, 480, [320, 240], full],
+    // 0 (also null), or a side of 2^31 or more (a negative int): no desired size
+    [0, 120, [320, 240], full],
+    [null, 120, [320, 240], full],
+    [2 ** 31, 1, [320, 240], full],
+    [2 ** 32 - 1, 1, [320, 240], full],
+  ] as const) {
+    const image = await decodeImage(data, 'image/jpeg', { desiredWidth, desiredHeight })
+    const label = `${desiredWidth}x${desiredHeight}`
+    t.is(image.format, 'BGRX', label)
+    t.deepEqual([image.codedWidth, image.codedHeight], size, label)
+    t.is(sha256((await rawCopy(image)).bytes), hash, label)
+    image.close()
+  }
+  // the budget wraps to 0: under 1/64 of the image
+  const decoder = new ImageDecoder({ data, type: 'image/jpeg', desiredWidth: 65536, desiredHeight: 16384 })
+  await t.throwsAsync(decoder.tracks.ready, { name: 'InvalidStateError', message: 'Failed to retrieve track metadata.' })
+})
 
 // ============================================================================
 // ImageDecoder: AVIF with the identity matrix (gbrp)
@@ -809,7 +888,8 @@ test('VideoEncoder: encode() of decoded gray PNG, JPEG and RGB H.264 frames prod
 })
 
 test('ImageDecoder: desiredWidth/desiredHeight on a gray PNG does not abort', (t) => {
-  // The scaler was created with an unknown pixel format and swscale aborted (exit 134).
+  // The scaler was created with an unknown pixel format and swscale aborted (exit 134). Like
+  // Chrome, a PNG is now decoded at full size.
   const result = runChild(`
     ${CHILD_PNG}
     const { ImageDecoder } = require('./index.js');
@@ -820,7 +900,7 @@ test('ImageDecoder: desiredWidth/desiredHeight on a gray PNG does not abort', (t
       console.log('RESULT ' + JSON.stringify({ format: image.format, width: image.codedWidth, first: Array.from(b.subarray(0, 4)) }));
     })();
   `)
-  t.deepEqual(result, { format: 'BGRX', width: 32, first: [77, 77, 77, 255] })
+  t.deepEqual(result, { format: 'BGRX', width: 64, first: [77, 77, 77, 255] })
 })
 
 const darwinTest = process.platform === 'darwin' ? test : test.skip

@@ -626,11 +626,11 @@ ImageDecoder supports all W3C spec options:
 
 | Option                 | Status | Notes                                                                             |
 | ---------------------- | ------ | --------------------------------------------------------------------------------- |
-| `desiredWidth/Height`  | ✅     | Scales decoded frames to specified dimensions                                     |
+| `desiredWidth/Height`  | ✅     | Like Chrome: scales JPEG only, to M/8 of its size; other formats stay full size   |
 | `preferAnimation`      | ✅     | When `false`, only decodes first frame for animated formats                       |
 | `colorSpaceConversion` | ✅     | `"default"` extracts color space metadata, `"none"` ignores it (Chromium-aligned) |
 
-**Note:** Per W3C spec, `desiredWidth` and `desiredHeight` must both be specified or both omitted.
+**Note:** `desiredWidth` and `desiredHeight` follow Chrome, not the spec. A missing one, or a 0, is no error: the desired size is then ignored. Chrome decodes a JPEG at M/8 of its size (rounded up), where M = ⌊8 × √(desired area / image area)⌋, or 8 when the desired area is at least the image's. A JPEG scaled this way is BGRX. When even 1/8 is too large (M = 0), `tracks.ready` rejects with `InvalidStateError` and the decoder closes. The scaled pixels come from FFmpeg and an area filter, not from libjpeg-turbo, so they can differ from Chrome's.
 
 ### Platform-Specific Notes
 

@@ -10,7 +10,7 @@ import { readFileSync } from 'fs'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 
-import { ImageDecoder } from '../index.js'
+import { ImageDecoder, type ImageDecoderInit } from '../index.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -474,42 +474,85 @@ test('ImageDecoder tracks.ready resolves for static images', async (t) => {
 // ImageDecoder Options Tests (W3C spec)
 // ============================================================================
 
-test('ImageDecoder desiredWidth without desiredHeight throws TypeError', (t) => {
+test('ImageDecoder desiredWidth/desiredHeight are [EnforceRange] unsigned long, like Chrome', (t) => {
   const data = readFileSync(join(__dirname, 'fixtures/test.png'))
-
-  // Per W3C spec: both must be specified or neither
-  t.throws(() => new ImageDecoder({ data, type: 'image/png', desiredWidth: 100 }), {
-    message: /Both desiredWidth and desiredHeight must be specified/,
-  })
+  const range = "Value is outside the 'unsigned long' value range."
+  const notNumber = "Value is not of type 'unsigned long'."
+  const infinite = "Value is infinite and not of type 'unsigned long'."
+  const cases: [Record<string, unknown>, string, string][] = [
+    [{ desiredWidth: -1, desiredHeight: 24 }, 'desiredWidth', range],
+    [{ desiredWidth: 2 ** 32, desiredHeight: 24 }, 'desiredWidth', range],
+    [{ desiredWidth: NaN, desiredHeight: 24 }, 'desiredWidth', notNumber],
+    [{ desiredWidth: 'abc', desiredHeight: 24 }, 'desiredWidth', notNumber],
+    [{ desiredWidth: Infinity, desiredHeight: 24 }, 'desiredWidth', infinite],
+    // converted even when the other one is missing
+    [{ desiredHeight: -Infinity }, 'desiredHeight', infinite],
+    // dictionary members are read in name order
+    [{ desiredWidth: NaN, desiredHeight: -1 }, 'desiredHeight', range],
+  ]
+  for (const [init, member, problem] of cases) {
+    t.throws(() => new ImageDecoder({ data, type: 'image/png', ...init }), {
+      instanceOf: TypeError,
+      message: `Failed to construct 'ImageDecoder': Failed to read the '${member}' property from 'ImageDecoderInit': ${problem}`,
+    })
+  }
 })
 
-test('ImageDecoder desiredHeight without desiredWidth throws TypeError', (t) => {
+test('ImageDecoder ignores desiredWidth or desiredHeight alone, like Chrome', async (t) => {
   const data = readFileSync(join(__dirname, 'fixtures/test.png'))
-
-  // Per W3C spec: both must be specified or neither
-  t.throws(() => new ImageDecoder({ data, type: 'image/png', desiredHeight: 100 }), {
-    message: /Both desiredWidth and desiredHeight must be specified/,
-  })
+  // null converts to 0, which Chrome treats as no desired size
+  for (const init of [{ desiredWidth: 4 }, { desiredHeight: 4 }, { desiredWidth: null, desiredHeight: 4 }]) {
+    const decoder = new ImageDecoder({ data, type: 'image/png', ...init } as ImageDecoderInit)
+    const { image } = await decoder.decode()
+    t.deepEqual([image.codedWidth, image.codedHeight], [8, 8])
+    image.close()
+    decoder.close()
+  }
 })
 
-test('ImageDecoder desiredWidth and desiredHeight scale the output', async (t) => {
-  const data = readFileSync(join(__dirname, 'fixtures/test.png'))
-  const decoder = new ImageDecoder({
-    data,
-    type: 'image/png',
-    desiredWidth: 4,
-    desiredHeight: 4,
-  })
+test('ImageDecoder: a JPEG desired size below 1/64 of its area fails the metadata and closes the decoder, like Chrome', async (t) => {
+  // 320x240: 39x30 needs a scale below 1/8
+  const data = readFileSync(join(__dirname, 'fixtures/wpt/four-colors.jpg'))
+  const decoder = new ImageDecoder({ data, type: 'image/jpeg', desiredWidth: 39, desiredHeight: 30 })
+  const completed = decoder.completed
+  const pending = decoder.decode()
+  const metadataError = { instanceOf: DOMException, name: 'InvalidStateError', message: 'Failed to retrieve track metadata.' }
+  await t.throwsAsync(decoder.tracks.ready, metadataError)
+  await t.throwsAsync(pending, { instanceOf: DOMException, name: 'EncodingError', message: 'Failed to decode frame at index 0' })
+  // The data was complete before the failure.
+  await t.notThrowsAsync(completed)
+  t.true(decoder.closed)
+  await t.throwsAsync(decoder.decode(), { instanceOf: DOMException, name: 'InvalidStateError' })
+  await t.throwsAsync(decoder.tracks.ready, metadataError)
+})
 
-  const result = await decoder.decode()
-  t.true(result.complete)
-
-  // Output should be scaled to specified dimensions
-  t.is(result.image.codedWidth, 4)
-  t.is(result.image.codedHeight, 4)
-
-  result.image.close()
-  decoder.close()
+test('ImageDecoder: a streamed JPEG with a desired size below 1/64 of its area rejects completed, like Chrome', async (t) => {
+  const data = new Uint8Array(readFileSync(join(__dirname, 'fixtures/wpt/four-colors.jpg')))
+  for (const chunks of [[data], [data.subarray(0, 300), data.subarray(300)]]) {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(chunks[0])
+        setTimeout(() => {
+          chunks.slice(1).forEach((chunk) => controller.enqueue(chunk))
+          controller.close()
+        }, 50)
+      },
+    })
+    const decoder = new ImageDecoder({ data: stream, type: 'image/jpeg', desiredWidth: 39, desiredHeight: 30 })
+    // Read now, awaited after it rejects: like Chrome, the rejection is not reported as unhandled.
+    const completed = decoder.completed
+    const pending = decoder.decode()
+    await t.throwsAsync(decoder.tracks.ready, { name: 'InvalidStateError', message: 'Failed to retrieve track metadata.' })
+    await t.throwsAsync(pending, { name: 'EncodingError', message: 'Failed to decode frame at index 0' })
+    await t.throwsAsync(completed, { instanceOf: DOMException, name: 'AbortError', message: 'Aborted by close.' })
+    t.false(decoder.complete)
+    t.true(decoder.closed)
+  }
+  // `completed` never read: its rejection is not reported as unhandled either.
+  const stream = new ReadableStream<Uint8Array>({ start: (controller) => controller.enqueue(data) })
+  const decoder = new ImageDecoder({ data: stream, type: 'image/jpeg', desiredWidth: 39, desiredHeight: 30 })
+  await t.throwsAsync(decoder.tracks.ready, { name: 'InvalidStateError' })
+  await new Promise((resolve) => setTimeout(resolve, 50))
 })
 
 test('ImageDecoder preferAnimation false returns single frame for animated GIF', async (t) => {
