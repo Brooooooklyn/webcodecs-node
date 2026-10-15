@@ -23,7 +23,8 @@ use crate::ffi::accessors::{
 use crate::ffi::avutil::av_frame_copy_props;
 use crate::ffi::{AVCodecID, AVColorRange, AVColorSpace, AVPixelFormat, check_error};
 use crate::webcodecs::VideoPixelFormat;
-use crate::webcodecs::image_hints::{Bitfield, PixelHint};
+use crate::webcodecs::image_hints::PixelHint;
+use pixel_simd::{Alpha, Be16, Plane, Yuva420};
 
 // libavutil/pixdesc.h AV_PIX_FMT_FLAG_*
 const FLAG_PAL: i32 = 1 << 1;
@@ -240,12 +241,20 @@ fn skia_image(
   } else {
     VideoPixelFormat::BGRX
   };
+  // big-endian samples: Skia keeps the high byte
+  let be16 = |layout: Be16| {
+    unpack(&frame, layout.size(), |s, d| {
+      pixel_simd::be16_to_bgra(s, d, layout, alpha)
+    })
+  };
   let mut frame = match (frame.format(), pixels) {
     // FFmpeg keeps the 16 or 32-bit words of the file, alpha bits included
     (
       AVPixelFormat::Rgb555le | AVPixelFormat::Rgb565le | AVPixelFormat::Rgb444le,
       PixelHint::Bitfields(fields),
-    ) => bitfields(&frame, 2, alpha, fields)?,
+    ) => unpack(&frame, 2, |s, d| {
+      pixel_simd::bitfields16_to_bgra(s, d, fields, alpha)
+    })?,
     (
       AVPixelFormat::Bgra
       | AVPixelFormat::Bgr0
@@ -256,35 +265,29 @@ fn skia_image(
       | AVPixelFormat::Abgr
       | AVPixelFormat::Zbgr,
       PixelHint::Bitfields(fields),
-    ) => bitfields(&frame, 4, alpha, fields)?,
+    ) => unpack(&frame, 4, |s, d| {
+      pixel_simd::bitfields32_to_bgra(s, d, fields, alpha)
+    })?,
     (AVPixelFormat::Bgra | AVPixelFormat::Bgr0 | AVPixelFormat::Rgba, _) => frame,
-    // big-endian samples: the high byte comes first
-    (AVPixelFormat::Gray16be, _) => unpack(&frame, 2, alpha, |p| [p[0], p[0], p[0], 255])?,
-    (AVPixelFormat::Ya16be, _) => unpack(&frame, 4, alpha, |p| [p[0], p[0], p[0], p[2]])?,
-    (AVPixelFormat::Rgb48be, _) => unpack(&frame, 6, alpha, |p| [p[4], p[2], p[0], 255])?,
-    (AVPixelFormat::Rgba64be, _) => unpack(&frame, 8, alpha, |p| [p[4], p[2], p[0], p[6]])?,
+    (AVPixelFormat::Gray16be, _) => be16(Be16::Gray)?,
+    (AVPixelFormat::Ya16be, _) => be16(Be16::GrayAlpha)?,
+    (AVPixelFormat::Rgb48be, _) => be16(Be16::Rgb)?,
+    (AVPixelFormat::Rgba64be, _) => be16(Be16::Rgba)?,
     _ => convert(&frame, format, &desc, true, None)?,
   };
   // Only a kept frame is still RGBA.
   let swap = frame.format() == AVPixelFormat::Rgba;
-  // FFmpeg drops the tRNS chunk of a 1, 2 or 4-bit gray PNG (it compares the scaled samples).
-  let key = match pixels {
-    PixelHint::GrayKey(key) => Some(key),
-    _ => None,
+  let alpha = match pixels {
+    _ if !alpha => Alpha::Opaque,
+    // FFmpeg drops the tRNS chunk of a 1, 2 or 4-bit gray PNG (it compares the scaled samples).
+    // No sample has a key of None.
+    PixelHint::GrayKey(Some(key)) => Alpha::Key(key),
+    PixelHint::GrayKey(None) => Alpha::Opaque,
+    _ => Alpha::Keep,
   };
-  if swap || !alpha || key.is_some() {
+  if swap || alpha != Alpha::Keep {
     frame.make_writable()?;
-    edit_pixels(&mut frame, |px| {
-      if swap {
-        px.swap(0, 2);
-      }
-      if let Some(key) = key {
-        px[3] = if Some(px[0]) == key { 0 } else { 255 };
-      }
-      if !alpha {
-        px[3] = 255;
-      }
-    })?;
+    edit_pixels(&mut frame, swap, alpha)?;
   }
   frame.set_format(AVPixelFormat::Bgra);
   frame.set_colorspace(AVColorSpace::Rgb);
@@ -292,57 +295,30 @@ fn skia_image(
   Ok((frame, format))
 }
 
-/// A new BGRA frame from the packed `size`-byte pixels of `src`: `read` gives the B, G, R and A
-/// of each, and A is 255 without `alpha`.
-fn unpack(
-  src: &Frame,
-  size: usize,
-  alpha: bool,
-  read: impl Fn(&[u8]) -> [u8; 4],
-) -> Result<Frame, CodecError> {
+/// A new BGRA frame from the packed `size`-byte pixels of `src`, each row converted by `row`.
+fn unpack(src: &Frame, size: usize, row: impl Fn(&[u8], &mut [u8])) -> Result<Frame, CodecError> {
   let mut dst = Frame::new_video(src.width(), src.height(), AVPixelFormat::Bgra)?;
   check_error(unsafe { av_frame_copy_props(dst.as_mut_ptr(), src.as_ptr()) })?;
   let (width, stride, dst_stride) = (
-    src.width() as usize * size,
+    src.width() as usize,
     src.linesize(0) as usize,
     dst.linesize(0) as usize,
   );
   let from = src.plane_data(0).ok_or_else(no_pixels)?;
   let to = dst.plane_data_mut(0).ok_or_else(no_pixels)?;
   for (from, to) in from.chunks(stride).zip(to.chunks_mut(dst_stride)) {
-    for (p, px) in from[..width]
-      .chunks_exact(size)
-      .zip(to.as_chunks_mut::<4>().0)
-    {
-      let [b, g, r, a] = read(p);
-      *px = [b, g, r, if alpha { a } else { 255 }];
-    }
+    row(&from[..width * size], &mut to[..width * 4]);
   }
   Ok(dst)
 }
 
-/// A new BGRA frame from a BMP frame of little-endian `size`-byte words, each field read like the
-/// image crate does.
-fn bitfields(
-  src: &Frame,
-  size: usize,
-  alpha: bool,
-  [r, g, b, a]: [Bitfield; 4],
-) -> Result<Frame, CodecError> {
-  unpack(src, size, alpha, |p| {
-    let word = p.iter().rev().fold(0, |word, &v| word << 8 | u32::from(v));
-    [b.read(word), g.read(word), r.read(word), a.read(word)]
-  })
-}
-
-/// Run `edit` on each pixel of a packed 32-bit frame.
-fn edit_pixels(frame: &mut Frame, edit: impl FnMut(&mut [u8; 4])) -> Result<(), CodecError> {
+/// Edit each row of a packed 32-bit frame (see `pixel_simd::edit_bgra`).
+fn edit_pixels(frame: &mut Frame, swap: bool, alpha: Alpha) -> Result<(), CodecError> {
   let (width, stride) = (frame.width() as usize * 4, frame.linesize(0) as usize);
   let data = frame.plane_data_mut(0).ok_or_else(no_pixels)?;
-  data
-    .chunks_mut(stride)
-    .flat_map(|row| row[..width].as_chunks_mut::<4>().0)
-    .for_each(edit);
+  for row in data.chunks_mut(stride) {
+    pixel_simd::edit_bgra(&mut row[..width], swap, alpha);
+  }
   Ok(())
 }
 
@@ -351,81 +327,31 @@ fn edit_pixels(frame: &mut Frame, edit: impl FnMut(&mut [u8; 4])) -> Result<(), 
 /// pixel takes libwebp's fancy upsampling of the chroma (upsampling.c UPSAMPLE_FUNC over the row
 /// pairs of io_dec.c EmitFancyRGB) and its YUV to RGB math (yuv.h VP8YuvToBgr).
 fn webp_rgb(src: &Frame, alpha: bool) -> Result<Frame, CodecError> {
-  let (width, height) = (src.width() as usize, src.height() as usize);
-  // each plane as a function from a row number to the row's samples
   let plane = |i: usize| {
-    let stride = src.linesize(i) as usize;
-    src
-      .plane_data(i)
-      .map(|data| move |row: usize| &data[row * stride..])
+    src.plane_data(i).map(|data| Plane {
+      data,
+      stride: src.linesize(i) as usize,
+    })
   };
   let [Some(y), Some(u), Some(v)] = [0, 1, 2].map(plane) else {
     return Err(no_pixels());
   };
-  let a = if alpha { plane(3) } else { None };
+  let planes = Yuva420 {
+    width: src.width() as usize,
+    height: src.height() as usize,
+    y,
+    u,
+    v,
+    a: if alpha { plane(3) } else { None },
+  };
   let mut dst = Frame::new_video(src.width(), src.height(), AVPixelFormat::Bgra)?;
   check_error(unsafe { av_frame_copy_props(dst.as_mut_ptr(), src.as_ptr()) })?;
   let stride = dst.linesize(0) as usize;
   let out = dst.plane_data_mut(0).ok_or_else(no_pixels)?;
-  let cols: Vec<_> = (0..width)
-    .map(|col| chroma_neighbours(col, width.div_ceil(2)))
-    .collect();
-  for (row, line) in out.chunks_mut(stride).enumerate() {
-    let (near, far) = chroma_neighbours(row, height.div_ceil(2));
-    let [u, v] = [&u, &v].map(|plane| [plane(near), plane(far)]);
-    let (luma, alpha) = (y(row), a.as_ref().map(|a| a(row)));
-    let pixels = line[..width * 4].as_chunks_mut::<4>().0.iter_mut();
-    for (col, (px, &cols)) in pixels.zip(&cols).enumerate() {
-      let [u, v] = [u, v].map(|rows| upsample(rows, cols));
-      let y = mult_hi(i32::from(luma[col]), 19077);
-      *px = [
-        clip8(y + mult_hi(u, 33050) - 17685),
-        clip8(y - mult_hi(u, 6419) - mult_hi(v, 13320) + 8708),
-        clip8(y + mult_hi(v, 26149) - 14234),
-        alpha.map_or(255, |alpha| alpha[col]),
-      ];
-    }
-  }
+  pixel_simd::yuva420_to_bgra(&planes, out, stride);
   dst.set_colorspace(AVColorSpace::Rgb);
   dst.set_color_range(AVColorRange::Jpeg);
   Ok(dst)
-}
-
-/// The chroma sample nearest to sample `i` of a 4:2:0 row or column, and the next nearest (on the
-/// other side of `i`), out of `count`. At an edge there is none: the nearest is used again.
-fn chroma_neighbours(i: usize, count: usize) -> (usize, usize) {
-  let near = i / 2;
-  let far = if i % 2 == 1 {
-    near + 1
-  } else {
-    near.wrapping_sub(1)
-  };
-  (near, if far < count { far } else { near })
-}
-
-/// libwebp's fancy upsampling: a pixel's chroma from the 4 samples around it, in the nearest chroma
-/// row and the next nearest, at the nearest column and the next nearest (`cols`). They are weighted
-/// 9:3:3:1 and rounded in libwebp's two steps. At an edge column libwebp weights the nearest column
-/// of the two rows 3:1 instead, which gives the same value.
-fn upsample([near_row, far_row]: [&[u8]; 2], (near, far): (usize, usize)) -> i32 {
-  let nearest = i32::from(near_row[near]);
-  let diagonal = (nearest
-    + 3 * i32::from(near_row[far])
-    + 3 * i32::from(far_row[near])
-    + i32::from(far_row[far])
-    + 8)
-    >> 3;
-  (diagonal + nearest) >> 1
-}
-
-/// libwebp yuv.h MultHi: the fixed-point product, with 6 fraction bits left for `clip8`.
-fn mult_hi(v: i32, coeff: i32) -> i32 {
-  (v * coeff) >> 8
-}
-
-/// libwebp yuv.h VP8Clip8
-fn clip8(v: i32) -> u8 {
-  (v >> 6).clamp(0, 255) as u8
 }
 
 fn no_pixels() -> CodecError {

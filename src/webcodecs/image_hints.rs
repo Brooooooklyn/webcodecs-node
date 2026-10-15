@@ -4,6 +4,8 @@
 //! labels each frame BGRA or BGRX by what its header declares, not by its pixels. Some of it
 //! also changes bytes that FFmpeg decodes differently (see `PixelHint`).
 
+use pixel_simd::Bitfield;
+
 /// What a header says about pixels that FFmpeg decodes differently from Chrome.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum PixelHint {
@@ -82,13 +84,6 @@ pub(crate) fn png_header(data: &[u8]) -> Option<ImageHeader> {
   None
 }
 
-/// One field of a BMP bitfield mask, as the image crate reads it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Bitfield {
-  shift: u32,
-  len: u32,
-}
-
 /// The fields of a 16-bit BI_RGB pixel.
 const RGB555: [Bitfield; 4] = [
   Bitfield { shift: 10, len: 5 },
@@ -96,41 +91,6 @@ const RGB555: [Bitfield; 4] = [
   Bitfield { shift: 0, len: 5 },
   Bitfield { shift: 0, len: 0 },
 ];
-
-impl Bitfield {
-  /// None for a mask the image crate rejects: not contiguous, or past `bits`. A field wider
-  /// than 8 bits keeps its top 8.
-  fn from_mask(mask: u32, bits: u32) -> Option<Bitfield> {
-    if mask == 0 {
-      return Some(Bitfield::default());
-    }
-    let shift = mask.trailing_zeros();
-    let len = (!(mask >> shift)).trailing_zeros();
-    if len != mask.count_ones() || len + shift > bits {
-      return None;
-    }
-    Some(match len {
-      9.. => Bitfield {
-        shift: shift + len - 8,
-        len: 8,
-      },
-      _ => Bitfield { shift, len },
-    })
-  }
-
-  /// The field of `word` scaled to 8 bits: round(v * 255 / (2^len - 1)) for up to 6 bits
-  /// (the image crate's tables), bit replication for 7 bits.
-  pub(crate) fn read(self, word: u32) -> u8 {
-    let max = (1u32 << self.len) - 1;
-    let v = (word >> self.shift) & max;
-    match self.len {
-      0 => 0,
-      7 => ((v << 1) | (v >> 6)) as u8,
-      8 => v as u8,
-      _ => ((v * 255 + max / 2) / max) as u8,
-    }
-  }
-}
 
 /// The image crate's view of a BMP header (Skia's BMP decoder in Chrome, with Chromium's
 /// patches). Alpha: a non-zero alpha mask in a V3, V4 or V5 header (BI_BITFIELDS) or after the
