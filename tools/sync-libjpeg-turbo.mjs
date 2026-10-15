@@ -1,8 +1,9 @@
 // Vendor the libjpeg-turbo that Chrome ships (chromium/deps/libjpeg_turbo) into
-// vendor/libjpeg-turbo: the decoder sources that build.rs compiles, the files they
-// include, the licence files and README.chromium (Chromium's changes to the IJG files),
-// Chromium's LICENSE as CHROMIUM_LICENSE, and CHROMIUM_PIN, which records the Chrome
-// version, the DEPS revision, the selection rule and the source lists for build.rs.
+// vendor/libjpeg-turbo: the decoder sources and the x64, arm64 and arm SIMD code that
+// build.rs compiles, the files they include, the licence files and README.chromium
+// (Chromium's changes to the IJG files), Chromium's LICENSE as CHROMIUM_LICENSE, and
+// CHROMIUM_PIN, which records the Chrome version, the DEPS revision, the selection rule
+// and the source lists for build.rs.
 // LICENSE.md and README.ijg are also copied to licenses/ and listed in
 // licenses/manifest.json for the npm packages.
 //
@@ -85,26 +86,71 @@ try {
     ].map(([key, name]) => [key, sources(name).filter((file) => !encoderOnly.test(file))]),
   )
 
-  // Every file a compiled source includes with "...", followed through headers and the
-  // .c files that jdcolor.c and jdmerge.c include, whatever #if guards them.
-  // jsimd.h and jsimddct.h point to the zlib notice in simd/nasm/jsimdext.inc, and
-  // jpeglibmangler.h to Chromium's LICENSE.
+  // The SIMD code that Chromium links into the 8-bit library, per CPU: the NASM sources of
+  // simd_asm and simd/x86_64/jsimd.c on x64, the Neon intrinsics of the simd target plus its
+  // aarch64/ or aarch32/ files on arm64 and arm. The upstream dispatchers (jsimd.c) call the
+  // encoder kernels too, so the whole set is kept.
+  const block = (text, start) => {
+    const at = text.indexOf(start)
+    assert(at >= 0, `BUILD.gn has no ${start}`)
+    const open = text.indexOf('{', at)
+    for (let end = open, depth = 0; end < text.length; end++) {
+      depth += text[end] === '{' ? 1 : text[end] === '}' ? -1 : 0
+      if (!depth) return text.slice(open + 1, end)
+    }
+    assert.fail(`BUILD.gn: no end to ${start}`)
+  }
+  const strings = (text, assignment) =>
+    [...text.matchAll(new RegExp(`\\b${assignment} \\[([^\\]]*)\\]`, 'g'))].flatMap((list) =>
+      [...list[1].matchAll(/"([^"]+)"/g)].map((match) => match[1]),
+    )
+  const asm = block(gn, 'nasm_assemble("simd_asm")')
+  const asmX64 = block(asm, 'else if (current_cpu == "x64")')
+  const simd = block(gn, 'static_library("simd")')
+  const arm = block(simd, 'else if (current_cpu == "arm" ||')
+  const neon = strings(arm, 'sources =')
+  Object.assign(lists, {
+    'simd-x86_64': [
+      ...strings(block(simd, 'else if (current_cpu == "x64")'), 'sources ='),
+      ...strings(asmX64, 'sources ='),
+    ],
+    'simd-aarch64': [...neon, ...strings(block(arm, 'else if (current_cpu == "arm64"'), 'sources \\+=')],
+    'simd-arm': [...neon, ...strings(block(arm, 'if (current_cpu == "arm")'), 'sources \\+=')],
+  })
+  // NASM and the Neon files find some includes through these, not next to the includer.
+  const includeDirs = [
+    ...strings(asm, 'include_dirs ='),
+    ...strings(asmX64, 'include_dirs \\+='),
+    ...strings(arm, 'include_dirs \\+='),
+  ]
+
+  // Every file a compiled source includes with "..." (C) or %include (NASM), followed through
+  // headers, the .c files that jdcolor.c and jdmerge.c include and the *ext*.asm files,
+  // whatever #if guards them. jsimd.h, jsimddct.h and the SIMD files point to the zlib notice
+  // in simd/nasm/jsimdext.inc, and jpeglibmangler.h to Chromium's LICENSE.
   const wanted = new Map([['CHROMIUM_LICENSE', await chromiumFile('LICENSE')]])
   const queue = [
     'LICENSE.md',
     'README.ijg',
     'README.chromium',
-    'simd/nasm/jsimdext.inc',
     ...lists.bits8.map((file) => `src/${file}.c`),
+    ...['simd-x86_64', 'simd-aarch64', 'simd-arm'].flatMap((key) => lists[key]),
   ]
+  const resolve = async (file, include) => {
+    for (const dir of [posix.dirname(file), ...includeDirs]) {
+      const path = posix.normalize(posix.join(dir, include))
+      if (await readFile(join(tree, path)).then(Boolean, () => false)) return path
+    }
+    assert.fail(`${file} includes ${include}, which is not in the tree`)
+  }
   while (queue.length) {
     const file = queue.pop()
     if (wanted.has(file)) continue
     const data = await readFile(join(tree, file))
     wanted.set(file, data)
-    if (!file.startsWith('src/')) continue
-    for (const [, include] of data.toString('latin1').matchAll(/^\s*#\s*include\s+"([^"]+)"/gm)) {
-      queue.push(posix.normalize(`src/${include}`))
+    if (!/\.(c|h|asm|inc)$/.test(file)) continue
+    for (const [, include] of data.toString('latin1').matchAll(/^\s*[#%]\s*include\s+"([^"]+)"/gm)) {
+      queue.push(await resolve(file, include))
     }
   }
 
@@ -114,7 +160,8 @@ try {
   assert(version && upstream, 'README.chromium has no Version or Revision line')
   const pinText = [
     '# libjpeg-turbo as Chrome ships it. Written by tools/sync-libjpeg-turbo.mjs: do not edit.',
-    '# build.rs compiles bits8 as is and bits12/bits16 again with BITS_IN_JSAMPLE=12/16.',
+    '# build.rs compiles bits8 as is and bits12/bits16 again with BITS_IN_JSAMPLE=12/16,',
+    '# and simd-<Rust target arch> with WITH_SIMD on that arch (.asm with NASM).',
     `chrome: ${chrome}`,
     `deps-revision: ${revision}`,
     `source: ${url}`,
@@ -122,8 +169,9 @@ try {
     `upstream-revision: ${upstream}`,
     'rule: BUILD.gn libjpeg16_sources, libjpeg12_sources and libjpeg_sources without the',
     'rule: compressor files (src/jc*.c but src/jcomapi.c, src/jf*.c, src/jdatadst.c,',
-    'rule: src/jpeg_nbits.c), every file they #include "...", LICENSE.md, README.ijg,',
-    "rule: README.chromium (Chromium's changes) and simd/nasm/jsimdext.inc (zlib notice);",
+    'rule: src/jpeg_nbits.c), the x64 sources of simd_asm and simd, the arm64 and arm',
+    'rule: sources of simd, every file they include, LICENSE.md, README.ijg and',
+    "rule: README.chromium (Chromium's changes);",
     `rule: CHROMIUM_LICENSE is chromium/src LICENSE at ${chrome} (for jpeglibmangler.h)`,
     ...Object.entries(lists).map(([key, files]) => `${key}: ${files.join(' ')}`),
     '',

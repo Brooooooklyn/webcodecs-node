@@ -209,37 +209,134 @@ mod tests {
         "e2b941269bd8c218d10ab825d44a1d51fbc46ad57c3c633e7892fd74d0387388",
       ),
     ];
-    for (data, scale, allow_yuv, (width, height), format, expected) in cases {
-      let info = jpeg_info(data, scale, allow_yuv).unwrap();
-      assert_eq!(
-        (info.output_width, info.output_height, info.format),
-        (width, height, format)
-      );
-      let frame = decode_jpeg(data, scale, allow_yuv).unwrap();
-      assert_eq!(
-        (frame.width(), frame.height(), frame.format()),
-        (width, height, format)
-      );
-      assert_eq!(
-        digest(&frame),
-        expected,
-        "{width}x{height} {format:?} at {scale}/8"
-      );
-      // Chrome's colorSpace: {primaries: bt709, transfer: iec61966-2-1, fullRange: true} and
-      // matrix rgb, or smpte170m for YUV
-      assert_eq!(frame.color_primaries(), AVColorPrimaries::Bt709);
-      assert_eq!(
-        frame.color_trc(),
-        AVColorTransferCharacteristic::Iec61966_2_1
-      );
-      assert_eq!(frame.color_range(), AVColorRange::Jpeg);
-      let matrix = if format == Bgra {
-        AVColorSpace::Rgb
-      } else {
-        AVColorSpace::Smpte170m
-      };
-      assert_eq!(frame.colorspace(), matrix);
+    for (data, scale, allow_yuv, size, format, expected) in cases {
+      check_chrome_bytes(data, scale, allow_yuv, size, format, expected);
     }
+  }
+
+  // Coefficients that overflow the IDCT (a crafted quantization table and AC values). At
+  // M = 8, 4 and 2 Chrome runs libjpeg-turbo's SIMD IDCT, which rounds these otherwise than
+  // the C one, and Neon otherwise than SSE2 and AVX2 (which agree), so Chrome's bytes depend
+  // on the CPU. The digests come from Chrome on arm64 and on x86_64 (with and without AVX2):
+  // they fail when the SIMD code does not run.
+  #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "arm"))]
+  #[test]
+  fn decodes_chrome_simd_bytes() {
+    use AVPixelFormat::{Bgra, Yuv420p};
+    // (data, M, size, format, [Neon digest, x86 digest])
+    let cases = [
+      // the 8x8 IDCT, YUV planes
+      (
+        fixture!("idct-overflow-420-17x9.jpg"),
+        8,
+        (17, 9),
+        Yuv420p,
+        [
+          "b05ce82cd46f642a308e5bf3980f0d8a0544d4f80a4bb139ae24a22c71114df4",
+          "045947c818f8273c20067bac8892193e36357ad27d064db9812d60ebaa488d34",
+        ],
+      ),
+      // the 4x4 and 2x2 IDCTs on luma (chroma gets the 8x8 one in place of upsampling), then
+      // YCbCr to BGRA
+      (
+        fixture!("idct-overflow-420-17x9.jpg"),
+        4,
+        (9, 5),
+        Bgra,
+        [
+          "4f652a9a6a473ea76a09bea005e7a452380e460e2b32b5db1ed530b683581d78",
+          "99b7f4fdfedbfa6e442946a387d6b7404bbfc2b928e40ffe086acba1f7346513",
+        ],
+      ),
+      (
+        fixture!("idct-overflow-420-17x9.jpg"),
+        2,
+        (5, 3),
+        Bgra,
+        [
+          "fd2011e376346dc2fb35c075bdae33c8eef80b562e28245eba348206ff9bf652",
+          "390dce6990d29bbedc88fedf24e2f357bc2b38e32a77c439da3add89e3a18290",
+        ],
+      ),
+      // 4:4:0: h1v2 upsampling at 8/8 (Neon on Arm, C on x86) and YCbCr to BGRA
+      (
+        fixture!("idct-overflow-440-17x9.jpg"),
+        8,
+        (17, 9),
+        Bgra,
+        [
+          "11e9675210370ef354772bf5f89c7456a94a5c3a60cbf584d686ef45b6c15e76",
+          "740a4a6ff62357e7449da3ac4fe15fde035a6a4a894389cb1eb083643907200d",
+        ],
+      ),
+      (
+        fixture!("idct-overflow-440-17x9.jpg"),
+        4,
+        (9, 5),
+        Bgra,
+        [
+          "2d54e9ec6820d25afedfe96d8c56ec463799a8f5ebfef0b7ecbcfa7a64689aa7",
+          "4ac855b9f29d62fe38ed2affa68482a21d619ed2fe1086745f79f2758a7edff3",
+        ],
+      ),
+      (
+        fixture!("idct-overflow-440-17x9.jpg"),
+        2,
+        (5, 3),
+        Bgra,
+        [
+          "0883f1a6db87a842b9c8bbf95b2147d526f1c13cfb1d9c99867afbf8bb16f6e1",
+          "35aef74c2372daf07e2635f5bfe88e5e08f9ad03b114739ed5c6230ca6a9da17",
+        ],
+      ),
+    ];
+    for (data, scale, size, format, [neon, x86]) in cases {
+      let expected = if cfg!(target_arch = "x86_64") {
+        x86
+      } else {
+        neon
+      };
+      check_chrome_bytes(data, scale, true, size, format, expected);
+    }
+  }
+
+  fn check_chrome_bytes(
+    data: &[u8],
+    scale: u32,
+    allow_yuv: bool,
+    (width, height): (u32, u32),
+    format: AVPixelFormat,
+    expected: &str,
+  ) {
+    let info = jpeg_info(data, scale, allow_yuv).unwrap();
+    assert_eq!(
+      (info.output_width, info.output_height, info.format),
+      (width, height, format)
+    );
+    let frame = decode_jpeg(data, scale, allow_yuv).unwrap();
+    assert_eq!(
+      (frame.width(), frame.height(), frame.format()),
+      (width, height, format)
+    );
+    assert_eq!(
+      digest(&frame),
+      expected,
+      "{width}x{height} {format:?} at {scale}/8"
+    );
+    // Chrome's colorSpace: {primaries: bt709, transfer: iec61966-2-1, fullRange: true} and
+    // matrix rgb, or smpte170m for YUV
+    assert_eq!(frame.color_primaries(), AVColorPrimaries::Bt709);
+    assert_eq!(
+      frame.color_trc(),
+      AVColorTransferCharacteristic::Iec61966_2_1
+    );
+    assert_eq!(frame.color_range(), AVColorRange::Jpeg);
+    let matrix = if format == AVPixelFormat::Bgra {
+      AVColorSpace::Rgb
+    } else {
+      AVColorSpace::Smpte170m
+    };
+    assert_eq!(frame.colorspace(), matrix);
   }
 
   // Chrome rejects these with EncodingError once all the data is there.

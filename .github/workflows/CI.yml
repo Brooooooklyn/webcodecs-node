@@ -67,8 +67,8 @@ jobs:
       - name: Cargo fmt
         run: cargo fmt -- --check
 
-      - name: Setup libc++ static library
-        run: sudo apt install -y libc++-dev libc++abi-dev
+      - name: Setup libc++ static library and NASM
+        run: sudo apt install -y libc++-dev libc++abi-dev nasm
 
       - name: Clippy
         run: cargo clippy
@@ -209,6 +209,19 @@ jobs:
         run: |
           brew install llvm@20
           echo "$(brew --prefix llvm@20)/bin" >> $GITHUB_PATH
+      # libjpeg-turbo's x86_64 SIMD code is NASM source; build.rs fails without NASM.
+      - name: Install NASM
+        if: ${{ startsWith(matrix.settings.target, 'x86_64') }}
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            macOS) brew install nasm ;;
+            Linux) sudo apt-get install -y nasm ;;
+            Windows)
+              choco install nasm --no-progress -y
+              echo 'C:\Program Files\NASM' >> "$GITHUB_PATH"
+              ;;
+          esac
       - name: Setup libc++ and compiler-rt static libraries
         if: ${{ endsWith(matrix.settings.target, 'unknown-linux-gnu') }}
         run: |

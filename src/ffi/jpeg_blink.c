@@ -3,7 +3,9 @@
  * (third_party/blink/renderer/platform/image-decoders/jpeg/jpeg_image_decoder.cc) on the
  * libjpeg-turbo that Chrome ships (vendor/libjpeg-turbo). The same library with the same
  * settings gives Chrome's bytes: YUV planes for 4:4:4, 4:2:2 and 4:2:0 YCbCr at full size,
- * BGRA (alpha 255) for everything else.
+ * BGRA (alpha 255) for everything else. On x86_64, aarch64 and arm it has Chrome's SIMD code
+ * too, so corrupt data whose coefficients overflow the IDCT gives Chrome's bytes as well,
+ * which differ between Neon and x86 (SSE2 and AVX2 agree).
  *
  * All the data is here at once. Where Blink would wait for more data (libjpeg suspends), the
  * decode fails, as Chrome's does once it has all the data: a truncated file, or a file without
@@ -15,8 +17,6 @@
  *   CMYK or YCCK file, or an RGB or gray profile that Skia cannot hold exactly (a table TRC).
  *   ICC profiles are ignored here. Other RGB profiles change only Chrome's color tags, which
  *   are always sRGB here.
- * - corrupt data whose coefficients overflow the IDCT: Chrome builds libjpeg-turbo with SIMD
- *   (NEON, SSE2, AVX2), this build is C only, and the two round the overflow differently.
  *
  * This file is a C rewrite of the decode parts of Blink's jpeg_image_decoder.cc at Chrome
  * 155.0.8059.79, changed in 2026 to decode from one buffer into an AVFrame. That file's notice

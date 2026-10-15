@@ -723,6 +723,8 @@ For full API documentation, see the [W3C WebCodecs specification](https://w3c.gi
 - Rust (latest stable)
 - Node.js 18+
 - pnpm
+- NASM, for x86_64 builds (libjpeg-turbo's SIMD code): `brew install nasm`,
+  `apt-get install nasm` or `choco install nasm`, or set `NASM` to its path
 
 The build downloads the pinned FFmpeg 9.0 release by default. If you opt out
 of that download or set `FFMPEG_DIR`, the supplied FFmpeg headers and libraries

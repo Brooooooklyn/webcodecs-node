@@ -86,7 +86,7 @@ fn main() {
   compile_accessors(&ffmpeg_dir, &target_os, &target_arch, &target_env);
 
   // Compile Chrome's libjpeg-turbo and the Blink-style JPEG decoder
-  compile_libjpeg_turbo(&ffmpeg_dir);
+  compile_libjpeg_turbo(&ffmpeg_dir, &target_os, &target_arch);
 
   // Link FFmpeg libraries
   link_ffmpeg(&ffmpeg_dir, &target_os, None);
@@ -516,12 +516,16 @@ fn compile_accessors(ffmpeg_dir: &Path, target_os: &str, target_arch: &str, targ
 
 /// Compile the libjpeg-turbo that Chrome ships (vendor/libjpeg-turbo, synced by
 /// tools/sync-libjpeg-turbo.mjs) and Blink's JPEG decoder on it (src/ffi/jpeg_blink.c).
-/// Like Chromium's BUILD.gn without SIMD: C only, no arithmetic decoding (jconfig.h), the
-/// 8-bit library plus the 12- and 16-bit objects that jdmaster.c links.
-fn compile_libjpeg_turbo(ffmpeg_dir: &Path) {
+/// Like Chromium's BUILD.gn: no arithmetic decoding (jconfig.h), the 8-bit library plus the
+/// 12- and 16-bit objects that jdmaster.c links, and on x86_64, aarch64 and arm the SIMD code
+/// Chrome runs there (NASM SSE2/AVX2 picked at run time, Neon intrinsics). On corrupt data
+/// Chrome's SIMD IDCT gives other bytes than the C one, so those targets never build C only.
+fn compile_libjpeg_turbo(ffmpeg_dir: &Path, target_os: &str, target_arch: &str) {
   let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
   let vendor = manifest_dir.join("vendor/libjpeg-turbo");
   let src = vendor.join("src");
+  let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap()).join("libjpeg-turbo");
+  fs::create_dir_all(&out_dir).expect("libjpeg-turbo build directory");
   let pin =
     fs::read_to_string(vendor.join("CHROMIUM_PIN")).expect("vendor/libjpeg-turbo/CHROMIUM_PIN");
   let sources = |key: &str| -> Vec<&str> {
@@ -532,12 +536,12 @@ fn compile_libjpeg_turbo(ffmpeg_dir: &Path) {
       .split_whitespace()
       .collect()
   };
+  let simd = matches!(target_arch, "x86_64" | "aarch64" | "arm")
+    .then(|| sources(&format!("simd-{target_arch}: ")));
+  let neon = matches!(target_arch, "aarch64" | "arm");
 
   let mut base = cc::Build::new();
-  base
-    .include(&src)
-    .define("NO_GETENV", None)
-    .define("NO_PUTENV", None);
+  base.include(&src);
   // jconfigint.h picks the 64-bit Huffman bit buffer from __WORDSIZE, which musl's <stdint.h>
   // does not define. Give 64-bit musl the buffer that Chrome's 64-bit builds use.
   if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("musl")
@@ -548,17 +552,66 @@ fn compile_libjpeg_turbo(ffmpeg_dir: &Path) {
   // Give every libjpeg global our own prefix, so that this copy cannot clash with another
   // libjpeg in the link or in the process (a system one, jpegli, Chromium's own in Electron).
   // Chromium's jpeglibmangler.h lists them as `#define name chromium_name`, all but
-  // jpeg_natural_order.
+  // jpeg_natural_order and the SIMD names (jsimd_*, jconst_*, jpeg_simd_cpu_support) that
+  // the SIMD headers declare. A forced-include header holds the list, which as -D flags would
+  // make every compile line tens of KB long.
   let mangler = fs::read_to_string(src.join("jpeglibmangler.h")).expect("jpeglibmangler.h");
-  let names = mangler.lines().filter_map(|line| {
-    let mut words = line.strip_prefix("#define ")?.split_whitespace();
-    let name = words.next()?;
-    (words.next()? == format!("chromium_{name}")).then_some(name)
-  });
-  for name in names.chain(["jpeg_natural_order"]) {
-    base.define(name, Some(format!("webcodecs_{name}").as_str()));
+  let mut names: Vec<String> = mangler
+    .lines()
+    .filter_map(|line| {
+      let mut words = line.strip_prefix("#define ")?.split_whitespace();
+      let name = words.next()?;
+      (words.next()? == format!("chromium_{name}")).then(|| name.to_string())
+    })
+    .chain(["jpeg_natural_order".into(), "jpeg_simd_cpu_support".into()])
+    .collect();
+  for header in ["src/jsimd.h", "src/jsimddct.h", "simd/jsimd.h"] {
+    let text = fs::read_to_string(vendor.join(header)).expect("libjpeg-turbo SIMD header");
+    names.extend(
+      text
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|word| word.starts_with("jsimd_") || word.starts_with("jconst_"))
+        .map(str::to_string),
+    );
+  }
+  names.sort();
+  names.dedup();
+  let prefix = out_dir.join("prefix.h");
+  let defines: String = names
+    .iter()
+    .map(|name| format!("#define {name} webcodecs_{name}\n"))
+    .collect();
+  fs::write(&prefix, defines).expect("libjpeg-turbo prefix.h");
+  if base.get_compiler().is_like_msvc() {
+    base.flag(format!("/FI{}", prefix.display()));
+  } else {
+    base.flag("-include").flag(&prefix);
   }
 
+  // Chromium's simd target: the dispatcher (jsimd.c), the Neon kernels and the NASM objects.
+  let mut objects = Vec::new();
+  if let Some(files) = &simd {
+    let mut build = base.clone();
+    build.warnings(false).define("WITH_SIMD", None);
+    if neon {
+      build
+        .define("NEON_INTRINSICS", None)
+        .include(vendor.join("simd/arm"));
+    }
+    // Chromium builds 32-bit Arm with Neon (arm_use_neon) and so assumes it, as does this.
+    if target_arch == "arm" {
+      build.flag("-mfpu=neon");
+    }
+    for file in files.iter().filter(|file| file.ends_with(".c")) {
+      build.file(vendor.join(file));
+    }
+    objects.extend(build.compile_intermediates());
+    if !neon {
+      objects.extend(assemble_libjpeg_turbo(&vendor, files, target_os, &out_dir));
+    }
+  }
+
+  base.define("NO_GETENV", None).define("NO_PUTENV", None);
   // The decoder first: the linker reads it before the library it calls.
   base
     .clone()
@@ -568,18 +621,13 @@ fn compile_libjpeg_turbo(ffmpeg_dir: &Path) {
     .extra_warnings(true)
     .compile("jpeg_blink");
 
-  // The 12- and 16-bit objects are the same sources with BITS_IN_JSAMPLE=12/16. A wrapper
-  // file per source gives each object its own name in the one archive.
-  let wrappers = PathBuf::from(env::var("OUT_DIR").unwrap()).join("libjpeg-turbo");
-  fs::create_dir_all(&wrappers).expect("libjpeg-turbo wrapper directory");
-  let mut lib = base;
+  // The 12- and 16-bit objects are the same sources with BITS_IN_JSAMPLE=12/16, without SIMD.
+  // A wrapper file per source gives each object its own name in the one archive.
+  let mut lib = base.clone();
   lib.warnings(false);
-  for name in sources("bits8: ") {
-    lib.file(src.join(format!("{name}.c")));
-  }
   for bits in [12, 16] {
     for name in sources(&format!("bits{bits}: ")) {
-      let wrapper = wrappers.join(format!("{name}-{bits}.c"));
+      let wrapper = out_dir.join(format!("{name}-{bits}.c"));
       fs::write(
         &wrapper,
         format!("#define BITS_IN_JSAMPLE {bits}\n#include \"{name}.c\"\n"),
@@ -588,10 +636,101 @@ fn compile_libjpeg_turbo(ffmpeg_dir: &Path) {
       lib.file(wrapper);
     }
   }
-  lib.compile("jpeg_turbo");
+  objects.extend(lib.compile_intermediates());
+
+  // The 8-bit library, with Chromium's libjpeg_simd_config where there is SIMD.
+  let mut lib = base;
+  lib.warnings(false);
+  if simd.is_some() {
+    lib.define("WITH_SIMD", None);
+    lib.define(
+      if neon {
+        "NEON_INTRINSICS"
+      } else {
+        "USE_CLZ_INTRINSIC"
+      },
+      None,
+    );
+  }
+  for name in sources("bits8: ") {
+    lib.file(src.join(format!("{name}.c")));
+  }
+  lib.objects(objects).compile("jpeg_turbo");
 
   println!("cargo:rerun-if-changed=src/ffi/jpeg_blink.c");
   println!("cargo:rerun-if-changed=vendor/libjpeg-turbo");
+}
+
+/// Assemble libjpeg-turbo's x86_64 SIMD code (the .asm files in `files`) with NASM and the
+/// flags of Chromium's nasm_assemble.gni and BUILD.gn. Our prefix goes on every symbol with
+/// --gprefix, or on Mach-O through jsimdext.inc's EXTN macro (which adds the underscore).
+fn assemble_libjpeg_turbo(
+  vendor: &Path,
+  files: &[&str],
+  target_os: &str,
+  out_dir: &Path,
+) -> Vec<PathBuf> {
+  println!("cargo:rerun-if-env-changed=NASM");
+  println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+  let nasm = env::var_os("NASM").unwrap_or_else(|| "nasm".into());
+  let mut flags: Vec<String> = match target_os {
+    "macos" => {
+      let extn = out_dir.join("prefix.inc");
+      fs::write(&extn, "%define EXTN(name) _webcodecs_ %+ name\n").expect("prefix.inc");
+      // LC_BUILD_VERSION: the minimum macOS of the link (rustc's default if unset), with
+      // commas. NASM before 3.00 ignores this pragma, and ld then warns.
+      let macos = env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "10.12".into());
+      vec![
+        "-fmacho64".into(),
+        "--pragma".into(),
+        format!("macho build_version macos,{}", macos.replace('.', ",")),
+        "-DMACHO".into(),
+        "-P".into(),
+        extn.display().to_string(),
+      ]
+    }
+    "windows" => ["-fwin64", "-DMSVC", "-DWIN64", "--gprefix", "webcodecs_"]
+      .map(String::from)
+      .to_vec(),
+    _ => ["-felf64", "-DELF", "--gprefix", "webcodecs_"]
+      .map(String::from)
+      .to_vec(),
+  };
+  flags.extend([
+    "-D__x86_64__".into(),
+    "-DPIC".into(),
+    "--reproducible".into(),
+    format!("-I{}/", vendor.join("simd/nasm").display()),
+    format!("-I{}/", vendor.join("simd/x86_64").display()),
+  ]);
+  let extension = if target_os == "windows" { "obj" } else { "o" };
+  files
+    .iter()
+    .filter(|file| file.ends_with(".asm"))
+    .map(|file| {
+      let object = out_dir.join(
+        Path::new(file)
+          .with_extension(extension)
+          .file_name()
+          .unwrap(),
+      );
+      let status = Command::new(&nasm)
+        .args(&flags)
+        .arg("-o")
+        .arg(&object)
+        .arg(vendor.join(file))
+        .status()
+        .unwrap_or_else(|err| {
+          panic!(
+            "Cannot run NASM ({err}). libjpeg-turbo's x86_64 SIMD code needs it: install nasm \
+             or set NASM to its path. Without the SIMD code corrupt JPEGs would decode to \
+             other bytes than in Chrome."
+          )
+        });
+      assert!(status.success(), "NASM failed on {file}");
+      object
+    })
+    .collect()
 }
 
 /// Link FFmpeg libraries (static only)
