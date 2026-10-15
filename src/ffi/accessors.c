@@ -1781,6 +1781,288 @@ end:
 }
 
 /* ============================================================================
+ * Decoded AVIF YUV(A) -> 8-bit BGRA, byte for byte as Chrome 155 converts it: CrabbyAvif
+ * 3da6b895 rgb::Image::convert_from_yuv (BGRA, automatic chroma upsampling, unpremultiplied
+ * output) on the C rows of libyuv 2dd42573, or CrabbyAvif's f32 rgb_impl for the matrices
+ * libyuv has no constants for. Chrome's NEON / SSSE3 / AVX2 rows give the same bytes.
+ * ============================================================================ */
+// CrabbyAvif is Rust, which never fuses a * b + c into one rounding; neither may the f32
+// steps here (clang fuses within an expression, GCC across them, where FMA exists).
+#if defined(__clang__)
+#pragma STDC FP_CONTRACT OFF
+#elif defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC optimize("fp-contract=off")
+#endif
+
+enum { RC_AVIF_COEF, RC_AVIF_IDENTITY, RC_AVIF_YCGCO, RC_AVIF_YCGCO_RE };
+
+// 8/10/12-bit little-endian planar YUV 4:2:0, 4:2:2, 4:4:4, gbrp or gray, as AV1 decoders
+// output them: data[0..2] hold the Y, U, V planes (G, B, R for gbrp).
+static int rc_avif_planar(const AVPixFmtDescriptor *d) {
+  if (!d || (d->flags & (AV_PIX_FMT_FLAG_BE | AV_PIX_FMT_FLAG_PAL | AV_PIX_FMT_FLAG_HWACCEL |
+                         AV_PIX_FMT_FLAG_BITSTREAM | AV_PIX_FMT_FLAG_FLOAT | AV_PIX_FMT_FLAG_ALPHA)) ||
+      (d->nb_components != 1 && d->nb_components != 3) || d->log2_chroma_w > 1 ||
+      d->log2_chroma_h > d->log2_chroma_w)
+    return 0;
+  int depth = d->comp[0].depth, rgb = !!(d->flags & AV_PIX_FMT_FLAG_RGB);
+  for (int c = 0; c < d->nb_components; c++)
+    if (d->comp[c].depth != depth || d->comp[c].step != (depth > 8 ? 2 : 1) || d->comp[c].shift ||
+        d->comp[c].offset || d->comp[c].plane != (rgb ? (c + 2) % 3 : c))
+      return 0;
+  return depth == 8 || depth == 10 || depth == 12;
+}
+
+static inline unsigned rc_avif_px(const AVFrame *f, int p, int x, int y, int wide) {
+  const uint8_t *r = f->data[p] + (ptrdiff_t)y * f->linesize[p];
+  return wide ? ((const uint16_t *)r)[x] : r[x];
+}
+
+// An alpha sample; a limited-range alpha plane is made full range first (alpha_to_full_range).
+static inline unsigned rc_avif_alpha(const AVFrame *a, int x, int y, int depth, int lim) {
+  int v = (int)rc_avif_px(a, 0, x, y, depth > 8);
+  if (lim) {
+    int lo = 16 << (depth - 8), span = 219 << (depth - 8), mx = (1 << depth) - 1;
+    v = ((v - lo) * mx + span / 2) / span;
+    v = v < 0 ? 0 : v > mx ? mx : v;
+  }
+  return (unsigned)v;
+}
+
+// import_alpha_from: an alpha sample deeper than 8 bits, rescaled in f32.
+static inline uint8_t rc_avif_alpha8(unsigned v, int depth) {
+  unsigned q = (unsigned)(0.5f + (float)v / (float)((1 << depth) - 1) * 255.0f);
+  return (uint8_t)(q > 255 ? 255 : q);
+}
+
+// libyuv ARGBUnattenuateRow_C. fixed_invtbl8 holds 0x10000 / a, except 0 for a = 0, 0xffff
+// for a = 1 and 0x100 for a = 255.
+static void rc_avif_unattenuate(uint8_t *o, int n) {
+  for (int i = 0; i < n; i++, o += 4) {
+    uint32_t a = o[3], ia = a == 0 ? 0 : a == 1 ? 0xffff : a == 255 ? 0x100 : 0x10000 / a;
+    for (int c = 0; c < 3; c++) {
+      uint32_t v = (o[c] * 0x101u * ia) >> 16;
+      o[c] = (uint8_t)(v > 255 ? 255 : v);
+    }
+  }
+}
+
+// One row of plane p, shifted down to 8 bits when sh > 0 (libyuv Convert16To8, truncating).
+static void rc_avif_load(const AVFrame *f, int p, int y, int n, int wide, int sh, uint16_t *o) {
+  for (int x = 0; x < n; x++) {
+    unsigned v = rc_avif_px(f, p, x, y, wide) >> sh;
+    o[x] = (uint16_t)(sh && v > 255 ? 255 : v);
+  }
+}
+
+// The chroma row a 4:2:0 output row j blends with its own one (j >> 1): libyuv and rgb_impl
+// both use the own row alone for the first row and for the last row of an even height.
+static inline int rc_avif_far_row(int j, int h, int vs) {
+  int c = j >> vs;
+  return !vs || j == 0 || (j == h - 1 && (j & 1)) ? c : j & 1 ? c + 1 : c - 1;
+}
+
+// libyuv ScaleRowUp2_Bilinear_Any_C for one output row, 3:1 between the nearer chroma row nr
+// and the other one fr. With fr == nr it is ScaleRowUp2_Linear_Any_C (4:2:2, 4:2:0 edges).
+static void rc_avif_up2(const uint16_t *nr, const uint16_t *fr, uint16_t *o, int w) {
+  o[0] = (uint16_t)((3 * nr[0] + fr[0] + 2) >> 2);
+  for (int x = 0; x < ((w - 1) & ~1) / 2; x++) {
+    o[2 * x + 1] = (uint16_t)((nr[x] * 9 + nr[x + 1] * 3 + fr[x] * 3 + fr[x + 1] + 8) >> 4);
+    o[2 * x + 2] = (uint16_t)((nr[x] * 3 + nr[x + 1] * 9 + fr[x] + fr[x + 1] * 3 + 8) >> 4);
+  }
+  o[w - 1] = (uint16_t)((3 * nr[(w - 1) / 2] + fr[(w - 1) / 2] + 2) >> 2);
+}
+
+// libyuv I4xx(Alpha)ToARGBMatrix(Filter) as CrabbyAvif picks them (find_conversion_function):
+// 10-bit rows (I010 / I210 bilinear, I410), 12-bit 4:2:0 with nearest chroma (I012), and
+// 8-bit rows for the rest, after a truncating shift to 8 bits.
+static int rc_avif_libyuv(const AVFrame *c, const AVFrame *a, int alim, const int32_t *k,
+                          int depth, int hs, int vs, int gray, int prem, AVFrame *dst) {
+  int w = c->width, h = c->height, cw = (w + hs) >> hs, wide = depth > 8;
+  int dd = depth == 10 && !gray ? 10 : depth == 12 && vs ? 12 : 8, sh = depth - dd;
+  // Alpha goes through the YUVA row (truncated to 8 bits), except with the I400 and I012 rows:
+  // then import_alpha_from copies it in.
+  int yuva = !gray && dd != 12;
+  uint8_t *buf = av_malloc((size_t)w * 7 + (size_t)cw * 4);
+  if (!buf) return AVERROR(ENOMEM);
+  uint16_t *y16 = (uint16_t *)buf, *up = y16 + w, *nr = up + w, *fr = nr + cw;
+  uint8_t *u8 = (uint8_t *)(fr + cw), *v8 = u8 + w, *a8 = v8 + w;
+  if (gray) {
+    memset(u8, 128, (size_t)w);
+    memset(v8, 128, (size_t)w);
+  }
+  if (!a) memset(a8, 255, (size_t)w);
+  for (int j = 0; j < h; j++) {
+    uint8_t *o = dst->data[0] + (ptrdiff_t)j * dst->linesize[0];
+    rc_avif_load(c, 0, j, w, wide, sh, y16);
+    for (int i = 0; i < w; i++)
+      y16[i] = (uint16_t)((y16[i] << (16 - dd)) | (y16[i] >> (2 * dd - 16)));
+    for (int p = 1; p <= 2 && !gray; p++) {
+      uint8_t *o8 = p == 1 ? u8 : v8;
+      const uint16_t *s = nr;
+      int step = hs;
+      rc_avif_load(c, p, j >> vs, cw, wide, sh, nr);
+      if (hs && dd != 12) {
+        rc_avif_load(c, p, rc_avif_far_row(j, h, vs), cw, wide, sh, fr);
+        rc_avif_up2(nr, fr, up, w);
+        s = up;
+        step = 0;
+      }
+      for (int i = 0; i < w; i++) {
+        unsigned v = s[i >> step] >> (dd - 8);
+        o8[i] = (uint8_t)(v > 255 ? 255 : v);
+      }
+    }
+    for (int i = 0; a && i < w; i++) {
+      unsigned v = rc_avif_alpha(a, i, j, depth, alim);
+      a8[i] = yuva || depth == 8 ? (uint8_t)((v >> (depth - 8)) > 255 ? 255 : v >> (depth - 8))
+                                 : rc_avif_alpha8(v, depth);
+    }
+    rc_yuv_matrix(y16, u8, v8, a8, o, w, k, 2, 0);
+    if (a && prem) rc_avif_unattenuate(o, w);
+  }
+  av_free(buf);
+  return 0;
+}
+
+static inline float rc_avif_unorm(const AVFrame *f, int p, int x, int y, int wide, unsigned mx,
+                                  float bias, float range) {
+  unsigned v = rc_avif_px(f, p, x, y, wide);
+  return ((float)(v > mx ? mx : v) - bias) / range;
+}
+
+static inline float rc_avif_unit(float v) { return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v; }
+
+// CrabbyAvif rgb_impl in f32, for identity above 8-bit full range, YCgCo, YCgCo-Re, FCC,
+// SMPTE 240M and chroma-derived matrices whose primaries libyuv has no constants for.
+static int rc_avif_rgb_impl(const AVFrame *c, const AVFrame *a, int alim, int mat, int pri,
+                            int full, int csp, int depth, int hs, int vs, int gray, int prem,
+                            AVFrame *dst) {
+  int w = c->width, h = c->height, wide = depth > 8, mx = (1 << depth) - 1;
+  int mode = mat == 0    ? RC_AVIF_IDENTITY
+             : mat == 8  ? RC_AVIF_YCGCO
+             : mat == 16 ? RC_AVIF_YCGCO_RE
+                         : RC_AVIF_COEF;
+  // yuv_to_rgb_fast (4:4:4 or 4:0:0 with coefficients, the 8-bit full-range identity copy,
+  // which equals the f32 result) leaves 'prem' to ARGBUnattenuate. yuv_to_rgb_any undoes it
+  // per pixel in f32, and needs centred chroma to upsample.
+  int fast = !hs && (mode == RC_AVIF_COEF || (mode == RC_AVIF_IDENTITY && depth == 8 && full));
+  if (!fast && (hs || gray) && csp) return AVERROR(ENOSYS);
+  float kr = 0.212f, kb = 0.087f; // SMPTE 240M; chroma-derived uses the primaries' (y_coeffs)
+  if (mat == 4) kr = 0.30f, kb = 0.11f;
+  else if (mat == 12) switch (pri) {
+    case 4: kr = 0.299f, kb = 0.1146f; break;
+    case 8: kr = 0.2536f, kb = 0.06808f; break;
+    case 10: kr = 0.0f, kb = 0.0f; break;
+    case 11: kr = 0.2095f, kb = 0.0689f; break;
+    case 12: kr = 0.229f, kb = 0.0793f; break;
+    case 22: kr = 0.2318f, kb = 0.096f; break;
+    case 7: break;
+    default: kr = 0.2126f, kb = 0.0722f; break;
+  }
+  float kg = 1.0f - kr - kb, maxf = (float)mx;
+  float by = full ? 0.0f : (float)(16 << (depth - 8)), ry = full ? maxf : (float)(219 << (depth - 8));
+  float bc = mode == RC_AVIF_IDENTITY ? by : (float)(1 << (depth - 1));
+  float rc = mode == RC_AVIF_IDENTITY ? ry : full ? maxf : (float)(224 << (depth - 8));
+  for (int j = 0; j < h; j++) {
+    uint8_t *o = dst->data[0] + (ptrdiff_t)j * dst->linesize[0];
+    int cj = j >> vs, fj = rc_avif_far_row(j, h, vs);
+    for (int i = 0; i < w; i++) {
+      unsigned cy = rc_avif_px(c, 0, i, j, wide), av = 0;
+      cy = cy > (unsigned)mx ? (unsigned)mx : cy;
+      float y = ((float)cy - by) / ry, u = 0.5f, v = 0.5f, r, g, b;
+      int ci = i >> hs, fi = !hs || i == 0 || (i == w - 1 && (i & 1)) ? ci : i & 1 ? ci + 1 : ci - 1;
+      for (int p = 1; p <= 2 && !gray; p++) {
+        float x = rc_avif_unorm(c, p, ci, cj, wide, mx, bc, rc);
+        if (hs) // bilinear weights 9, 3, 3, 1 (/16)
+          x = x * (9.0f / 16.0f) + rc_avif_unorm(c, p, fi, cj, wide, mx, bc, rc) * (3.0f / 16.0f) +
+              rc_avif_unorm(c, p, ci, fj, wide, mx, bc, rc) * (3.0f / 16.0f) +
+              rc_avif_unorm(c, p, fi, fj, wide, mx, bc, rc) * (1.0f / 16.0f);
+        if (p == 1) u = x;
+        else v = x;
+      }
+      if (gray) {
+        r = g = b = y;
+      } else if (mode == RC_AVIF_IDENTITY) {
+        g = y, b = u, r = v;
+      } else if (mode == RC_AVIF_YCGCO) {
+        float t = y - u;
+        g = y + u, b = t - v, r = t + v;
+      } else if (mode == RC_AVIF_YCGCO_RE) { // H.273 (62)-(65) on Cg / Co rounded back to integers
+        int cg = (int)floorf(0.5f + u * maxf), co = (int)floorf(0.5f + v * maxf);
+        int t = (int)cy - (cg >> 1), gi = t + cg, bi = t - (co >> 1);
+        gi = gi < 0 ? 0 : gi > 255 ? 255 : gi;
+        bi = bi < 0 ? 0 : bi > 255 ? 255 : bi;
+        int ri = bi + co < 0 ? 0 : bi + co > 255 ? 255 : bi + co;
+        g = (float)gi / 255.0f, b = (float)bi / 255.0f, r = (float)ri / 255.0f;
+      } else {
+        r = y + (2.0f * (1.0f - kr)) * v;
+        b = y + (2.0f * (1.0f - kb)) * u;
+        g = y - ((2.0f * ((kr * (1.0f - kr) * v) + (kb * (1.0f - kb) * u))) / kg);
+      }
+      r = rc_avif_unit(r), g = rc_avif_unit(g), b = rc_avif_unit(b);
+      if (a) av = rc_avif_alpha(a, i, j, depth, alim);
+      if (a && prem && !fast) {
+        float ac = rc_avif_unit((float)(av > (unsigned)mx ? (unsigned)mx : av) / maxf);
+        if (ac == 0.0f) {
+          r = g = b = 0.0f;
+        } else if (ac < 1.0f) {
+          r = fminf(r / ac, 1.0f), g = fminf(g / ac, 1.0f), b = fminf(b / ac, 1.0f);
+        }
+      }
+      o[4 * i] = (uint8_t)(0.5f + b * 255.0f);
+      o[4 * i + 1] = (uint8_t)(0.5f + g * 255.0f);
+      o[4 * i + 2] = (uint8_t)(0.5f + r * 255.0f);
+      o[4 * i + 3] = !a ? 255 : depth == 8 ? (uint8_t)av : rc_avif_alpha8(av, depth);
+    }
+    if (a && prem && fast) rc_avif_unattenuate(o, w);
+  }
+  return 0;
+}
+
+// Convert a decoded AVIF colour frame and its alpha frame (same size and depth, or NULL) into
+// dst, a BGRA frame of the same size; without alpha the X byte is 255. mat / pri / full are
+// the CICP Chrome uses (the item's nclx, else the sequence header), csp the av1C
+// chroma_sample_position and prem the 'prem' link. Returns AVERROR(ENOSYS) where CrabbyAvif
+// returns not_implemented, which makes Chrome fail the decode.
+int ffframe_avif_to_rgb(const AVFrame *color, const AVFrame *alpha, int prem, int mat, int pri,
+                        int full, int csp, AVFrame *dst) {
+  const AVPixFmtDescriptor *d = color ? av_pix_fmt_desc_get((enum AVPixelFormat)color->format) : NULL;
+  const AVPixFmtDescriptor *da = alpha ? av_pix_fmt_desc_get((enum AVPixelFormat)alpha->format) : NULL;
+  if (!rc_avif_planar(d) || color->width <= 0 || color->height <= 0 || !dst ||
+      dst->format != AV_PIX_FMT_BGRA || dst->width != color->width ||
+      dst->height != color->height ||
+      (alpha && (!rc_avif_planar(da) || da->comp[0].depth != d->comp[0].depth ||
+                 alpha->width != color->width || alpha->height != color->height)))
+    return AVERROR(EINVAL);
+  int depth = d->comp[0].depth, hs = d->log2_chroma_w, vs = d->log2_chroma_h;
+  int gray = d->nb_components == 1;
+  // CrabbyAvif reads unknown matrix and primaries values as unspecified (2).
+  if ((unsigned)mat > 17 || mat == 15) mat = 2;
+  if ((unsigned)pri > 22 || pri == 3 || (pri > 12 && pri < 22)) pri = 2;
+  // convert_from_yuv's not_implemented cases. YCgCo-Re / -Ro must drop exactly 2 / 1 bits.
+  if (mat == 3 || mat == 10 || mat == 11 || mat == 13 || mat == 14 || (mat == 8 && !full) ||
+      ((mat == 16 || mat == 17) && (!full || depth - (mat == 16 ? 2 : 1) != 8)) || (mat == 0 && hs))
+    return AVERROR(ENOSYS);
+  // libyuv.rs find_constants: kRcYuv row or none (4:0:0 identity counts as BT.601)
+  int m = mat == 12 ? (pri == 1 || pri == 2 ? 1 : pri == 5 || pri == 6 ? 6 : pri == 9 ? 9 : -1)
+          : mat == 0 && gray ? 6
+                             : mat;
+  int k = m == 1 ? 3 : m == 2 || m == 5 || m == 6 ? 1 : m == 9 ? 5 : -1;
+  if (k >= 0 && !full) k--; // the limited-range row precedes its full-range one
+  int alim = alpha && alpha->color_range == AVCOL_RANGE_MPEG;
+  return k >= 0 ? rc_avif_libyuv(color, alpha, alim, kRcYuv[k], depth, hs, vs, gray, prem, dst)
+                : rc_avif_rgb_impl(color, alpha, alim, mat, pri, full, csp, depth, hs, vs, gray,
+                                   prem, dst);
+}
+
+#if defined(__clang__)
+#pragma STDC FP_CONTRACT DEFAULT
+#elif defined(__GNUC__)
+#pragma GCC pop_options
+#endif
+
+/* ============================================================================
  * Decoded frames whose AVPixelFormat has no WebCodecs equivalent
  * (src/webcodecs/decoded_frame.rs picks the target format)
  * ============================================================================ */
