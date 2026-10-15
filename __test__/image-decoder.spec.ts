@@ -324,6 +324,8 @@ test('ImageDecoder completed getter resolves immediately for buffered data', asy
   })
 
   decoder.close()
+  // like Chrome, also once the decoder is closed
+  await t.notThrowsAsync(decoder.completed)
 })
 
 test('ImageDecoder stream becomes ready before EOF once a frame is decodable', async (t) => {
@@ -493,6 +495,7 @@ const partFrame = (frame: Partial<GifFrame> = {}): GifFrame => ({ x: 1, y: 0, wi
 // a clear code, then a code past the table
 const BAD_CODES = [4, 7]
 const TWO_FRAMES = gif(4, 2, PALETTE, [fullFrame({ delay: 10 }), partFrame({ delay: 10, indices: [1, 2] })])
+const ONE_FRAME = gif(4, 2, PALETTE, [fullFrame({ delay: 10 })])
 const BMP_3x2 = bmp(3, 2, 24, [
   [30, 20, 10, 60, 50, 40, 90, 80, 70],
   [3, 2, 1, 6, 5, 4, 9, 8, 7],
@@ -561,11 +564,140 @@ test('ImageDecoder: once every GIF frame failed, decode() rejects with EncodingE
   await t.throwsAsync(decoder.decode({ frameIndex: 1 }), failedFrame(1))
   t.true(decoder.closed)
   await t.throwsAsync(decoder.decode({ frameIndex: 0 }), { instanceOf: DOMException, name: 'InvalidStateError' })
+  // the data was complete
+  await t.notThrowsAsync(decoder.completed)
 
   // a decode() made before the frame failed rejects the same way
   const single = new ImageDecoder({ data: gif(4, 2, PALETTE, [fullFrame({ codes: BAD_CODES })]), type: 'image/gif' })
   await t.throwsAsync(single.decode(), failedFrame(0))
   t.true(single.closed)
+})
+
+test('ImageDecoder: decode() calls are handled in call order, like Chrome', async (t) => {
+  // every frame fails: what a call finds depends on the frames that the calls before it failed
+  const data = gif(4, 2, PALETTE, [0, 1, 2].map(() => fullFrame({ delay: 10, codes: BAD_CODES })))
+  for (let run = 0; run < 20; run++) {
+    const decoder = new ImageDecoder({ data, type: 'image/gif' })
+    await decoder.tracks.ready
+    const settled: number[] = []
+    const results = await Promise.allSettled(
+      [5, 0, 2, 1, 5].map((frameIndex, call) => decoder.decode({ frameIndex }).finally(() => settled.push(call))),
+    )
+    const errors = results.map((result) =>
+      result.status === 'rejected' ? `${(result.reason as Error).name}: ${(result.reason as Error).message}` : 'ok',
+    )
+    // frame 5 is out of range
+    t.regex(errors[0], /^RangeError: /)
+    t.deepEqual(errors.slice(1), [
+      "RangeError: Unexpected end of image. Request for frame index 0 can't be satisfied.",
+      "RangeError: Unexpected end of image. Request for frame index 2 can't be satisfied.",
+      'EncodingError: Failed to decode frame at index 1',
+      'EncodingError: Failed to decode frame at index 5',
+    ])
+    t.deepEqual(settled, [0, 1, 2, 3, 4])
+    t.true(decoder.closed)
+  }
+})
+
+test('ImageDecoder: a streamed decode() waits for the decode() calls before it, like Chrome', async (t) => {
+  let controller!: ReadableStreamDefaultController<Uint8Array>
+  const stream = new ReadableStream<Uint8Array>({
+    start(streamController) {
+      controller = streamController
+      // frame 0, and the rect of frame 1
+      controller.enqueue(TWO_FRAMES.slice(0, 68))
+    },
+  })
+  const decoder = new ImageDecoder({ data: stream, type: 'image/gif' })
+  await decoder.tracks.ready
+  const settled: number[] = []
+  const decodes = [1, 0].map((frameIndex) => decoder.decode({ frameIndex }).finally(() => settled.push(frameIndex)))
+  await new Promise((resolve) => setTimeout(resolve, 25))
+  // frame 0 is in, but its decode() waits for the one of frame 1
+  t.deepEqual(settled, [])
+
+  controller.enqueue(TWO_FRAMES.slice(68))
+  controller.close()
+  const results = await Promise.all(decodes)
+  t.deepEqual(settled, [1, 0])
+  t.deepEqual(
+    results.map(({ image }) => image.timestamp),
+    [100_000, 0],
+  )
+  results.forEach(({ image }) => image.close())
+  decoder.close()
+})
+
+test('ImageDecoder: a stream error ends the GIF or BMP data, like Chrome', async (t) => {
+  const streamed = (data: Uint8Array, cut: number, type: string) => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>
+    const stream = new ReadableStream<Uint8Array>({
+      start(streamController) {
+        controller = streamController
+        controller.enqueue(data.slice(0, cut))
+      },
+    })
+    return { decoder: new ImageDecoder({ data: stream, type }), controller }
+  }
+  // the data of the only frame ends early: it fails, so the decoder fails
+  for (const [data, type] of [
+    [ONE_FRAME, 'image/gif'],
+    [BMP_3x2, 'image/bmp'],
+  ] as const) {
+    const { decoder, controller } = streamed(data, data.length - 3, type)
+    await decoder.tracks.ready
+    const pending = decoder.decode()
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    controller.error(new Error('stream broke'))
+    await t.throwsAsync(pending, failedFrame(0))
+    t.true(decoder.closed, type)
+  }
+  // the header ends early: the metadata fails
+  for (const [data, cut, type] of [
+    [TWO_FRAMES, 15, 'image/gif'],
+    [BMP_3x2, 30, 'image/bmp'],
+  ] as const) {
+    const { decoder, controller } = streamed(data, cut, type)
+    const pending = decoder.decode()
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    controller.error(new Error('stream broke'))
+    await t.throwsAsync(decoder.tracks.ready, {
+      instanceOf: DOMException,
+      name: 'InvalidStateError',
+      message: 'Failed to retrieve track metadata.',
+    })
+    await t.throwsAsync(pending, failedFrame(0))
+    t.true(decoder.closed, type)
+  }
+})
+
+test('ImageDecoder: GIF repetitionCount comes from the last loop extension, like Chrome', async (t) => {
+  const netscape = (count: number) => [0x21, 0xff, 0x0b, ...Buffer.from('NETSCAPE2.0'), 3, 1, count & 0xff, count >> 8, 0]
+  // after the header and the global palette
+  const withExtensions = (data: Uint8Array, extensions: number[]) =>
+    Uint8Array.from([...data.subarray(0, 25), ...extensions, ...data.subarray(25)])
+  for (const [data, repetitionCount] of [
+    [TWO_FRAMES, 0],
+    // a still GIF loops forever
+    [ONE_FRAME, Infinity],
+    [withExtensions(TWO_FRAMES, [...netscape(3), ...netscape(7)]), 7],
+    [withExtensions(TWO_FRAMES, [...netscape(0), ...netscape(3)]), 3],
+    // inside a comment
+    [withExtensions(TWO_FRAMES, [0x21, 0xfe, 19, ...netscape(5), 0]), 0],
+  ] as const) {
+    const decoder = new ImageDecoder({ data, type: 'image/gif' })
+    await decoder.tracks.ready
+    t.is(decoder.tracks.selectedTrack!.repetitionCount, repetitionCount)
+    decoder.close()
+  }
+
+  // an empty sub-block after the NETSCAPE2.0 id does not end the extension
+  const padded = withExtensions(ONE_FRAME, [0x21, 0xff, 0x0b, ...Buffer.from('NETSCAPE2.0'), 0, 0])
+  const decoder = new ImageDecoder({ data: padded, type: 'image/gif' })
+  const { image } = await decoder.decode()
+  t.is(decoder.tracks.selectedTrack!.frameCount, 1)
+  image.close()
+  decoder.close()
 })
 
 test('ImageDecoder: the truncated last frame of a GIF rejects with RangeError, like Chrome', async (t) => {
