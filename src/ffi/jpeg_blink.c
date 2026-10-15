@@ -87,6 +87,7 @@ typedef struct {
   int scale_num; // JPEGImageDecoder::DesiredScaleNumerator, 1-8 (8: full size)
   int allow_yuv; // 0: BGRA even where YUV planes would do (see blink_jpeg_info)
   int yuv;       // decode to YUV planes (raw data out)
+  int rows;      // output_rows() ran: Blink's frame is partial, no longer empty
   AVFrame *dst;  // NULL: read the header only
 } Decoder;
 
@@ -200,6 +201,8 @@ static int output_format(const Decoder *d) {
 static int output_rows(Decoder *d, JSAMPROW dummy) {
   j_decompress_ptr info = &d->info;
   AVFrame *dst = d->dst;
+  // OutputScanlines marks the frame partial before it reads a row.
+  d->rows = 1;
   if (d->yuv) {
     // OutputRawData. jpeg_read_raw_data writes whole iMCU rows: rows below the planes go
     // to a dummy row as wide as the Y plane's blocks.
@@ -329,7 +332,7 @@ static int run(Decoder *d) {
 }
 
 static int run_decoder(const uint8_t *data, size_t size, int scale_num, int allow_yuv, AVFrame *dst,
-                       int *out) {
+                       int *out, int *rows) {
   Decoder d;
   if (!data || scale_num < 1 || scale_num > 8) return AVERROR(EINVAL);
   memset(&d, 0, sizeof(d));
@@ -355,6 +358,7 @@ static int run_decoder(const uint8_t *data, size_t size, int scale_num, int allo
     out[3] = (int)d.info.output_height;
     out[4] = output_format(&d);
   }
+  if (rows) *rows = d.rows;
   jpeg_destroy_decompress(&d.info);
   return ret;
 }
@@ -366,13 +370,17 @@ static int run_decoder(const uint8_t *data, size_t size, int scale_num, int allo
 // allow_decode_to_yuv_ needs all the data). AVERROR(EAGAIN): the data ends before the header does.
 int blink_jpeg_info(const uint8_t *data, size_t size, int scale_num, int allow_yuv, int *out) {
   if (!out) return AVERROR(EINVAL);
-  return run_decoder(data, size, scale_num, allow_yuv, NULL, out);
+  return run_decoder(data, size, scale_num, allow_yuv, NULL, out, NULL);
 }
 
 // Decode at scale_num/8 into dst, allocated with the format and output size blink_jpeg_info
 // gives for the same scale_num and allow_yuv. AVERROR(EAGAIN): the data ends before the image
-// does. On failure dst holds partial rows.
-int blink_jpeg_decode(const uint8_t *data, size_t size, int scale_num, int allow_yuv, AVFrame *dst) {
-  if (!dst) return AVERROR(EINVAL);
-  return run_decoder(data, size, scale_num, allow_yuv, dst, NULL);
+// does; *rows is then 1 when Blink got to output rows (its frame is partial, not empty), which
+// is when Chrome's ImageDecoder stays with RGB (image_decoder_core.cc have_completed_rgb_decode_).
+// On failure dst holds partial rows.
+int blink_jpeg_decode(const uint8_t *data, size_t size, int scale_num, int allow_yuv, AVFrame *dst,
+                      int *rows) {
+  if (!dst || !rows) return AVERROR(EINVAL);
+  *rows = 0;
+  return run_decoder(data, size, scale_num, allow_yuv, dst, NULL, rows);
 }
