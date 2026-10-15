@@ -255,10 +255,12 @@ impl<'a> BmpDecoder<'a> {
         bytes: 4,
         masks: ARGB8888,
       } => self.decode_rows(32, |src, dst| dst.copy_from_slice(&src[..dst.len()])),
-      Kind::Packed { bytes: 2, masks } if self.narrow(16) => {
+      // bitfield rows under 32 pixels: packed_row, inlined in the row loop, is faster than a
+      // pixel-simd call per row
+      Kind::Packed { bytes: 2, masks } if self.width < 32 => {
         self.decode_rows(16, |src, dst| packed_row::<2>(src, dst, masks))
       }
-      Kind::Packed { masks, .. } if self.narrow(32) => {
+      Kind::Packed { masks, .. } if self.width < 32 => {
         self.decode_rows(32, |src, dst| packed_row::<4>(src, dst, masks))
       }
       // without an alpha field, alpha is 255
@@ -272,9 +274,9 @@ impl<'a> BmpDecoder<'a> {
     }
   }
 
-  /// Whether rows of `bits`-bit pixels are too narrow for pixel-simd: fewer than 64 pixels, or
-  /// than one 16-byte vector of them. On such rows its call and SIMD setup cost more than its
-  /// vectors save, and `palette_row` and `packed_row`, inlined in the row loop, are faster.
+  /// Whether rows of `bits`-bit palette indexes are too narrow for pixel-simd: fewer than 64
+  /// pixels, or than one 16-byte vector of them. On such rows its call and SIMD setup cost more
+  /// than its vectors save, and `palette_row`, inlined in the row loop, is faster.
   fn narrow(&self, bits: usize) -> bool {
     (self.width as usize) < 64.max(128 / bits)
   }
@@ -298,12 +300,13 @@ impl<'a> BmpDecoder<'a> {
     // every row must be in the file
     let rows = bytes(self.data, self.data_offset, stride * height)?;
     let mut out = room_for(width * height * 4)?;
-    // output rows top first, each zeroed just before it is written
-    for y in 0..height {
+    // zeroed in one go: a memset call per row costs more than a narrow row, and the row
+    // loop has to reload its constants after each call
+    out.resize(width * height * 4, 0);
+    // output rows top first (the header check keeps width above 0)
+    for (y, dst) in out.chunks_exact_mut(width * 4).enumerate() {
       let i = if self.top_down { y } else { height - 1 - y };
-      let at = out.len();
-      out.resize(at + width * 4, 0);
-      row(&rows[i * stride..][..stride], &mut out[at..]);
+      row(&rows[i * stride..][..stride], dst);
     }
     Ok(out)
   }
@@ -602,13 +605,13 @@ mod tests {
   #[test]
   fn row_loops_match_pixel_simd() {
     // palette_row and packed_row give the bytes of pixel-simd's rows, at widths on both sides
-    // of `narrow`
+    // of the narrow-row bounds (32 pixels for bitfields, `narrow` for palettes)
     let mut seed = 7u32;
     let mut byte = move || {
       seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
       (seed >> 24) as u8
     };
-    let widths = [1, 3, 15, 16, 17, 63, 64, 65, 127, 128, 129, 300];
+    let widths = [1, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 300];
     fn same_rows<const BITS: u32>(src: &[u8], width: usize, palette: &Palette) {
       let (mut ours, mut simd) = (vec![0; 4 * width], vec![1; 4 * width]);
       palette_row::<BITS>(src, &mut ours, palette);
