@@ -39,11 +39,13 @@ its port patches and actual resolved build inputs must also be retained.
 | Brotli                     | `v1.1.0`                                                                                         | MIT; `brotli-LICENSE.txt`                                                                                              |
 | Little CMS 2               | Unix `lcms2.16`; Windows `lcms2.17`                                                              | MIT; `lcms2-LICENSE.txt`, `lcms2-windows-LICENSE.txt`                                                                  |
 | NVIDIA codec headers       | Linux recipe `n13.0.19.0`, except armv7                                                          | MIT; `nv-codec-headers-nvEncodeAPI.h.txt`                                                                              |
+| libjpeg-turbo              | `3.1.0` from Chrome `155.0.8059.79` DEPS, in `vendor/libjpeg-turbo`, all targets                 | IJG License and BSD-3-Clause; `libjpeg-turbo-LICENSE.md.txt`, `libjpeg-turbo-README.ijg.txt`                           |
 
 This software is based in part on the work of the Independent JPEG Group.
 FFmpeg's licensing explanation identifies IJG-derived codec files requiring
-this attribution. The checked-in build recipe does not modify those files;
-other builds must document any changes to them.
+this attribution, and so does the IJG License of libjpeg-turbo. The checked-in
+build recipe does not modify those files, and `build.rs` compiles
+`vendor/libjpeg-turbo` unmodified; other builds must document any changes to them.
 
 ## Inventory still required for release
 

@@ -9,6 +9,7 @@ pub mod avformat;
 pub mod avutil;
 pub mod error;
 pub mod hwaccel;
+pub mod jpeg_blink;
 pub mod swresample;
 pub mod swscale;
 pub mod types;
