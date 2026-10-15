@@ -1,5 +1,5 @@
 [workspace]
-members = ["tools/build-ffmpeg"]
+members = ["crates/pixel-simd", "tools/build-ffmpeg"]
 
 [package]
 name = "webcodecs-node"
