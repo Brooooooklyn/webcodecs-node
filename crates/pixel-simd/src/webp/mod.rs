@@ -1,3 +1,10 @@
+// libwebp's notice, for the code this file ports from it (the files named below):
+// Copyright 2010 Google Inc. All Rights Reserved.
+// Copyright 2011 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license that can be found in
+// licenses/libwebp-COPYING.txt. An additional intellectual property rights grant can be found
+// in licenses/libwebp-PATENTS.txt.
+
 //! A lossy WebP's YUV planes to BGRA, the way libwebp decodes them for Chrome.
 //!
 //! The scalar code goes pixel by pixel. The SIMD paths go by row pairs like libwebp b43b2caa (the

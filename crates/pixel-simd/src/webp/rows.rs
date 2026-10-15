@@ -1,3 +1,9 @@
+// libwebp's notice, for the code this file ports from it (the files named below):
+// Copyright 2011 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license that can be found in
+// licenses/libwebp-COPYING.txt. An additional intellectual property rights grant can be found
+// in licenses/libwebp-PATENTS.txt.
+
 //! libwebp's row pairs, which the SIMD paths convert a block of pixels at a time.
 
 use super::{Yuva420, bgra, upsample};

@@ -1,3 +1,10 @@
+// libwebp's notice, for the code this file ports from it (the files named below):
+// Copyright 2011 Google Inc. All Rights Reserved.
+// Copyright 2014 Google Inc. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license that can be found in
+// licenses/libwebp-COPYING.txt. An additional intellectual property rights grant can be found
+// in licenses/libwebp-PATENTS.txt.
+
 //! wasm32 simd128: the SSE2 code of `x86` (libwebp has no wasm code; its Emscripten build runs
 //! the SSE2 files). simd128 has no 16-bit unsigned multiply-high, so MultHi of a sample x <= 255
 //! is x * (c >> 8) + ((x * (c & 255)) >> 8), every product under 2^16.
