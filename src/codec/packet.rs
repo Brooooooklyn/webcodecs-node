@@ -308,6 +308,34 @@ impl Packet {
 
     Ok(())
   }
+
+  /// Like `copy_data_from`, for data in several parts (the extents of an AVIF item): one
+  /// buffer of their total size, the parts copied into it one after the other
+  pub fn copy_parts_from(&mut self, parts: &[&[u8]]) -> Result<(), CodecError> {
+    let size = parts
+      .iter()
+      .try_fold(0usize, |size, part| size.checked_add(part.len()))
+      .and_then(|size| i32::try_from(size).ok())
+      .ok_or(CodecError::AllocationFailed("packet data"))?;
+
+    self.unref();
+    let ret = unsafe { av_new_packet(self.as_mut_ptr(), size) };
+    ffi::check_error(ret)?;
+
+    let mut pkt_data = unsafe { ffpkt_data(self.as_ptr()) as *mut u8 };
+    if !pkt_data.is_null() {
+      for part in parts {
+        // SAFETY: av_new_packet allocated `size` bytes, the sum of the part lengths, and
+        // each part is copied after the ones before it.
+        unsafe {
+          std::ptr::copy_nonoverlapping(part.as_ptr(), pkt_data, part.len());
+          pkt_data = pkt_data.add(part.len());
+        }
+      }
+    }
+
+    Ok(())
+  }
 }
 
 impl Drop for Packet {
@@ -354,6 +382,15 @@ mod tests {
   fn test_packet_allocation() {
     let pkt = Packet::new().unwrap();
     assert!(pkt.is_empty());
+    assert_eq!(pkt.size(), 0);
+  }
+
+  #[test]
+  fn test_packet_copy_parts() {
+    let mut pkt = Packet::new().unwrap();
+    pkt.copy_parts_from(&[b"ab", b"", b"cde", b"ab"]).unwrap();
+    assert_eq!(pkt.as_slice(), b"abcdeab");
+    pkt.copy_parts_from(&[]).unwrap();
     assert_eq!(pkt.size(), 0);
   }
 }
