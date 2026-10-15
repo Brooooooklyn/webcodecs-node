@@ -678,12 +678,18 @@ fn assemble_libjpeg_turbo(
       let extn = out_dir.join("prefix.inc");
       fs::write(&extn, "%define EXTN(name) _webcodecs_ %+ name\n").expect("prefix.inc");
       // LC_BUILD_VERSION: the minimum macOS of the link (rustc's default if unset), with
-      // commas. NASM before 3.00 ignores this pragma, and ld then warns.
+      // commas. NASM needs a minor version, which rustc lets MACOSX_DEPLOYMENT_TARGET leave
+      // out. NASM before 3.00 ignores this pragma, and ld then warns.
       let macos = env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "10.12".into());
+      let macos = if macos.contains('.') {
+        macos.replace('.', ",")
+      } else {
+        format!("{macos},0")
+      };
       vec![
         "-fmacho64".into(),
         "--pragma".into(),
-        format!("macho build_version macos,{}", macos.replace('.', ",")),
+        format!("macho build_version macos,{macos}"),
         "-DMACHO".into(),
         "-P".into(),
         extn.display().to_string(),
@@ -727,7 +733,10 @@ fn assemble_libjpeg_turbo(
              other bytes than in Chrome."
           )
         });
-      assert!(status.success(), "NASM failed on {file}");
+      assert!(
+        status.success(),
+        "NASM failed on {file}. It needs NASM 2.15.05 or newer (older ones lack --reproducible)."
+      );
       object
     })
     .collect()

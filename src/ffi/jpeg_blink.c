@@ -5,7 +5,9 @@
  * settings gives Chrome's bytes: YUV planes for 4:4:4, 4:2:2 and 4:2:0 YCbCr at full size,
  * BGRA (alpha 255) for everything else. On x86_64, aarch64 and arm it has Chrome's SIMD code
  * too, so corrupt data whose coefficients overflow the IDCT gives Chrome's bytes as well,
- * which differ between Neon and x86 (SSE2 and AVX2 agree).
+ * which differ between Neon and x86 (SSE2 and AVX2 agree). At M = 3, 5, 6 and 7 the IDCTs are
+ * C code that computes in long, so where long has 32 bits (armv7, Windows) such data gives
+ * other bytes than Chrome on 64-bit macOS and Linux.
  *
  * All the data is here at once. Where Blink would wait for more data (libjpeg suspends), the
  * decode fails, as Chrome's does once it has all the data: a truncated file, or a file without
