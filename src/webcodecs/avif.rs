@@ -84,7 +84,7 @@ impl AvifSamples {
   }
 
   /// The bytes of sample `index`, or None while some of them have not arrived. With all
-  /// the bytes in, a sample past the end makes Chrome reject the file.
+  /// the bytes in, see `past_end`.
   pub fn sample<'d>(&self, data: &'d [u8], index: usize) -> Option<Cow<'d, [u8]>> {
     let bytes = |range: &Range<u64>| {
       data.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
@@ -103,6 +103,19 @@ impl AvifSamples {
         let sample = samples.get(index)?;
         bytes(&(sample.offset..sample.offset + u64::from(sample.size))).map(Cow::Borrowed)
       }
+    }
+  }
+
+  /// Whether Chrome rejects these samples in a file of `len` bytes (CrabbyAvif's size_hint
+  /// check): a track sample ends past the file, or an item is larger than the file. An item
+  /// that is not larger but ends past the file fails to decode instead.
+  pub fn past_end(&self, len: usize) -> bool {
+    let len = len as u64;
+    match &self.samples {
+      Samples::Item(extents) => extents.iter().map(|e| e.end - e.start).sum::<u64>() > len,
+      Samples::Track(samples) => samples
+        .iter()
+        .any(|sample| sample.offset + u64::from(sample.size) > len),
     }
   }
 
@@ -1255,6 +1268,23 @@ mod tests {
       samples(&data, image.alpha.as_ref().unwrap()),
       samples(&a8, original.alpha.as_ref().unwrap())
     );
+  }
+
+  #[test]
+  fn finds_samples_past_the_end_like_crabbyavif() {
+    // s8_420: an item of 854 bytes at 275. Cut to 1029 bytes, it ends past the data but is
+    // not larger: Chrome fails the decode, not the metadata.
+    let color = parsed(&fixture("s8_420.avif"), None).color;
+    assert!(!color.past_end(1029));
+    assert!(color.past_end(853));
+    // prog8_420: 104 + 987 bytes
+    let color = parsed(&fixture("prog8_420.avif"), None).color;
+    assert!(!color.past_end(1091));
+    assert!(color.past_end(1090));
+    // anim8_420: the last track sample ends at 3559
+    let color = parsed(&fixture("anim8_420.avif"), None).color;
+    assert!(!color.past_end(3559));
+    assert!(color.past_end(3558));
   }
 
   #[test]

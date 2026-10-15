@@ -1247,10 +1247,37 @@ test('ImageDecoder: AVIF track frames take their timestamps and durations from t
   }
 })
 
-test('ImageDecoder: a streamed AVIF with an alpha track is BGRA from its first frame, like Chrome', async (t) => {
-  const data = avifFixture('panim8_420a.avif')
+test('ImageDecoder: an AVIF track with a timescale of 0 or above 2^31, or an stts delta of 0, has times of 0, like Chrome', async (t) => {
+  // anim8_420 (3 frames, timescale 30, delta 1) with its mdhd timescale or its stts delta
+  // patched. Chrome gives each frame timestamp 0 and duration 0.
+  const timescale = (data: Uint8Array) => {
+    const body = Buffer.from(data).indexOf('mdhd') + 4
+    return body + 4 + (data[body] === 1 ? 16 : 8)
+  }
+  const delta = (data: Uint8Array) => Buffer.from(data).indexOf('stts') + 4 + 12
+  for (const [label, offset, value] of [
+    ['timescale 0', timescale, 0],
+    ['timescale 0xFFFFFFF0', timescale, 0xfffffff0],
+    ['delta 0', delta, 0],
+  ] as const) {
+    const data = avifFixture('anim8_420.avif')
+    new DataView(data.buffer).setUint32(offset(data), value)
+    const decoder = new ImageDecoder({ data, type: 'image/avif' })
+    const frames = []
+    for (let i = 0; i < 3; i++) {
+      const { image } = await decoder.decode({ frameIndex: i })
+      frames.push(image.timestamp, image.duration)
+      image.close()
+    }
+    t.deepEqual(frames, [0, 0, 0, 0, 0, 0], label)
+    decoder.close()
+  }
+})
+
+// 256-byte chunks, 5 ms apart
+const avifStream = (data: Uint8Array) => {
   let offset = 0
-  const stream = new ReadableStream<Uint8Array>({
+  return new ReadableStream<Uint8Array>({
     async pull(controller) {
       await new Promise((resolve) => setTimeout(resolve, 5))
       if (offset >= data.length) return controller.close()
@@ -1258,10 +1285,15 @@ test('ImageDecoder: a streamed AVIF with an alpha track is BGRA from its first f
       offset += 256
     },
   })
-  const decoder = new ImageDecoder({ data: stream, type: 'image/avif' })
+}
+
+test('ImageDecoder: a streamed AVIF with an alpha track is BGRA from its first frame, like Chrome', async (t) => {
+  const decoder = new ImageDecoder({ data: avifStream(avifFixture('panim8_420a.avif')), type: 'image/avif' })
   const { image } = await decoder.decode({ frameIndex: 0 })
   t.false(decoder.complete)
   t.is(decoder.tracks.selectedTrack?.frameCount, 3)
+  // the track's duration, before frames 1 and 2 have arrived
+  t.is(image.duration, 33333)
   t.is(image.format, 'BGRA')
   t.is(sha256((await rawCopy(image)).bytes), AVIF_CASES.find((c) => c[0] === 'panim8_420a.avif')![5][0])
   image.close()
@@ -1284,12 +1316,33 @@ test('ImageDecoder: an AVIF that CrabbyAvif cannot convert to RGB fails decode()
   }
 })
 
+test('ImageDecoder: a streamed AVIF that CrabbyAvif cannot convert to RGB fails decode() with EncodingError, like Chrome', async (t) => {
+  // tracks.ready resolves with the boxes, before the samples arrive
+  const decoder = new ImageDecoder({ data: avifStream(avifFixture('n400m14.avif')), type: 'image/avif' })
+  await decoder.tracks.ready
+  await decoder.completed
+  await t.throwsAsync(decoder.decode(), { name: 'EncodingError', message: 'Failed to decode frame at index 0' })
+  decoder.close()
+})
+
 test('ImageDecoder: an AVIF whose track samples end past its data fails the metadata, like Chrome', async (t) => {
   // avis1_8_420 with 3 samples in its only chunk (stsc): 2 of them past the end of the file
   const data = avifFixture('avis1_8_420.avif')
   new DataView(data.buffer).setUint32(Buffer.from(data).indexOf('stsc') + 16, 3)
   const decoder = new ImageDecoder({ data, type: 'image/avif' })
   await t.throwsAsync(decoder.tracks.ready, { name: 'InvalidStateError', message: 'Failed to retrieve track metadata.' })
+})
+
+test('ImageDecoder: an AVIF item cut short fails decode(), or the metadata when the item is larger than the data, like Chrome', async (t) => {
+  // s8_420 without its last 100 bytes: the colour item ends past the data
+  const cut = new ImageDecoder({ data: avifFixture('s8_420.avif').slice(0, -100), type: 'image/avif' })
+  await cut.tracks.ready
+  t.is(cut.tracks.selectedTrack?.frameCount, 1)
+  await t.throwsAsync(cut.decode(), { name: 'EncodingError', message: 'Failed to decode frame at index 0' })
+  cut.close()
+  // the first 530 bytes of a8_420: fewer than its colour item's 854
+  const short = new ImageDecoder({ data: avifFixture('a8_420.avif').slice(0, 530), type: 'image/avif' })
+  await t.throwsAsync(short.tracks.ready, { name: 'InvalidStateError', message: 'Failed to retrieve track metadata.' })
 })
 
 test('ImageDecoder: a grid AVIF still decodes with FFmpeg, to its first tile', async (t) => {
