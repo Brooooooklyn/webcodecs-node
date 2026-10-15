@@ -889,6 +889,38 @@ test('ImageDecoder: a close() in the decode() task or a microtask wins over a fa
         ),
       },
     ],
+    // the GIF and BMP header errors (GifDecoder::new, BmpDecoder::new)
+    [
+      'GIF signature GIF8Xa',
+      { type: 'image/gif', data: Uint8Array.from([...Buffer.from('GIF8Xa'), ...TWO_FRAMES.subarray(6)]) },
+    ],
+    ['GIF cut in the logical screen descriptor', { type: 'image/gif', data: TWO_FRAMES.slice(0, 9) }],
+    [
+      'BMP header size 7',
+      {
+        type: 'image/bmp',
+        data: (() => {
+          const data = BMP_3x2.slice()
+          new DataView(data.buffer).setUint32(14, 7, true)
+          return data
+        })(),
+      },
+    ],
+    [
+      'BMP V5 header with its ICC profile past the end',
+      {
+        type: 'image/bmp',
+        data: (() => {
+          const data = bmp(1, 1, 24, [[0, 0, 0]], { header: 124 })
+          const view = new DataView(data.buffer)
+          // PROFILE_EMBEDDED, profile at 0x1000 (from the header), 16 bytes
+          view.setUint32(70, 0x4d424544, true)
+          view.setUint32(126, 0x1000, true)
+          view.setUint32(130, 16, true)
+          return data
+        })(),
+      },
+    ],
     // M = 0: fails once the header is read, before any decode
     [
       'JPEG desired 39x30',
@@ -924,6 +956,13 @@ test('ImageDecoder: a close() in the decode() task or a microtask wins over a fa
       (e: Error) => `${e instanceof DOMException ? 'DOMException ' : ''}${e.name}: ${e.message}`,
     )
   for (const [name, init] of cases) {
+    // without a close(), the metadata fails
+    const failing = new ImageDecoder(init)
+    t.is(
+      await outcome(failing.tracks.ready),
+      'DOMException InvalidStateError: Failed to retrieve track metadata.',
+      `${name}, no close()`,
+    )
     for (const [when, schedule] of closeIn) {
       const seen: Record<string, number> = {}
       for (let i = 0; i < 50; i++) {
