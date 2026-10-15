@@ -71,16 +71,27 @@ impl Bitfield {
     })
   }
 
-  /// The channel scaled to 8 bits, round(v * 255 / (2^len - 1))
+  /// The channel scaled to 8 bits, round(v * 255 / (2^len - 1)), without a division
   fn read(self, pixel: u32) -> u8 {
-    if self.len == 0 {
-      return 0;
-    }
-    let max = (1 << self.len) - 1;
-    let v = (pixel >> self.shift) & max;
-    ((v * 255 + max / 2) / max) as u8
+    let (mul, add) = SCALE[self.len as usize];
+    let v = (pixel >> self.shift) & ((1 << self.len) - 1);
+    ((v * mul + add) >> 6) as u8
   }
 }
+
+/// (mul, add) for each channel length: round(v * 255 / (2^len - 1)) == (v * mul + add) >> 6
+/// for every v of len bits (0 for len 0)
+const SCALE: [(u32, u32); 9] = [
+  (0, 0),
+  (16320, 0),
+  (5440, 0),
+  (2336, 0),
+  (1088, 0),
+  (527, 23),
+  (259, 33),
+  (129, 0),
+  (64, 0),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Rle {
@@ -280,39 +291,40 @@ impl<'a> BmpDecoder<'a> {
   /// Chrome fails (ImageDecoder's `decode()` rejects).
   pub fn decode(&self) -> Result<Vec<u8>, BmpError> {
     match self.kind {
-      Kind::Palette(bits) => self.decode_rows(bits as usize, |row, x| {
-        let per_byte = 8 / bits as usize;
-        let shift = 8 - bits as usize * (x % per_byte + 1);
-        let index = (row[x / per_byte] >> shift) & ((1 << bits) - 1) as u8;
-        self.palette[usize::from(index)]
-      }),
-      Kind::Packed { bytes, masks } => self.decode_rows(bytes * 8, |row, x| {
-        let mut le = [0; 4];
-        le[..bytes].copy_from_slice(&row[x * bytes..(x + 1) * bytes]);
-        let [r, g, b, a] = masks.map(|m| m.read(u32::from_le_bytes(le)));
-        [b, g, r, if masks[3].len == 0 { 255 } else { a }]
-      }),
+      Kind::Palette(1) => self.decode_rows(1, |src, dst| palette_row::<1>(src, dst, &self.palette)),
+      Kind::Palette(2) => self.decode_rows(2, |src, dst| palette_row::<2>(src, dst, &self.palette)),
+      Kind::Palette(4) => self.decode_rows(4, |src, dst| palette_row::<4>(src, dst, &self.palette)),
+      Kind::Palette(_) => self.decode_rows(8, |src, dst| palette_row::<8>(src, dst, &self.palette)),
+      Kind::Packed { bytes: 2, masks } => {
+        self.decode_rows(16, |src, dst| packed_row::<2>(src, dst, masks))
+      }
+      Kind::Packed { bytes: 3, masks } => {
+        self.decode_rows(24, |src, dst| packed_row::<3>(src, dst, masks))
+      }
+      Kind::Packed { masks, .. } => {
+        self.decode_rows(32, |src, dst| packed_row::<4>(src, dst, masks))
+      }
       Kind::Rle(rle) => self.decode_rle(rle),
     }
   }
 
-  /// Uncompressed rows of `bits` per pixel, each padded to 4 bytes
+  /// Uncompressed rows of `bits` per pixel, each padded to 4 bytes. `row` converts one.
   fn decode_rows(
     &self,
     bits: usize,
-    pixel: impl Fn(&[u8], usize) -> [u8; 4],
+    row: impl Fn(&[u8], &mut [[u8; 4]]),
   ) -> Result<Vec<u8>, BmpError> {
     let (width, height) = (self.width as usize, self.height as usize);
     let stride = (bits * width).div_ceil(32) * 4;
     // every row must be in the file
     let rows = bytes(self.data, self.data_offset, stride * height)?;
-    let mut out = vec![0; width * height * 4];
-    for (i, row) in rows.chunks_exact(stride).enumerate() {
-      let y = if self.top_down { i } else { height - 1 - i };
-      let dst = out[y * width * 4..(y + 1) * width * 4].as_chunks_mut().0;
-      for (x, px) in dst.iter_mut().enumerate() {
-        *px = pixel(row, x);
-      }
+    let mut out = room_for(width * height)?;
+    // output rows top first, each zeroed just before it is written
+    for y in 0..height {
+      let i = if self.top_down { y } else { height - 1 - y };
+      let at = out.len();
+      out.resize(at + width * 4, 0);
+      row(&rows[i * stride..][..stride], out[at..].as_chunks_mut().0);
     }
     Ok(out)
   }
@@ -320,8 +332,10 @@ impl<'a> BmpDecoder<'a> {
   /// RLE4, RLE8 and RLE24 (image crate BmpDecoder::read_rle_data)
   fn decode_rle(&self, rle: Rle) -> Result<Vec<u8>, BmpError> {
     let (width, height) = (self.width as usize, self.height as usize);
+    let mut pixels = room_for(width * height)?;
+    pixels.resize(width * height * 4, 0);
     let mut out = RleRows {
-      pixels: vec![0; width * height * 4],
+      pixels,
       width,
       row: 0,
       x: 0,
@@ -432,6 +446,43 @@ impl<'a> BmpDecoder<'a> {
       }
     }
     Ok(out.pixels)
+  }
+}
+
+/// An empty buffer with room for `count` BGRA pixels, or an error when the memory is not there
+/// (Blink fails the decode when it cannot allocate the frame)
+fn room_for(count: usize) -> Result<Vec<u8>, BmpError> {
+  let mut out = Vec::new();
+  out
+    .try_reserve_exact(count * 4)
+    .map_err(|_| BmpError("out of memory"))?;
+  Ok(out)
+}
+
+/// One row of `BITS`-bit palette indexes (1, 2, 4 or 8), the first pixel in the high bits
+fn palette_row<const BITS: u32>(src: &[u8], dst: &mut [[u8; 4]], palette: &[[u8; 4]; 256]) {
+  for (pixels, &byte) in dst.chunks_mut((8 / BITS) as usize).zip(src) {
+    for (k, px) in pixels.iter_mut().enumerate() {
+      let index = (byte << (BITS * k as u32)) >> (8 - BITS);
+      *px = palette[usize::from(index)];
+    }
+  }
+}
+
+/// One row of little-endian `N`-byte pixels, each channel read through its bitfield. Without an
+/// alpha bitfield the alpha is 255.
+fn packed_row<const N: usize>(src: &[u8], dst: &mut [[u8; 4]], [r, g, b, a]: [Bitfield; 4]) {
+  let alpha = a.len != 0;
+  for (px, pixel) in dst.iter_mut().zip(src.as_chunks::<N>().0) {
+    let mut le = [0; 4];
+    le[..N].copy_from_slice(pixel);
+    let v = u32::from_le_bytes(le);
+    *px = [
+      b.read(v),
+      g.read(v),
+      r.read(v),
+      if alpha { a.read(v) } else { 255 },
+    ];
   }
 }
 
@@ -574,6 +625,11 @@ mod tests {
       (73, 119, 25, 45)
     );
     assert!((0..128).all(|v| u32::from(scale(7, v)) == (v << 1) | (v >> 6)));
+    // every value of every length: the rounded division that SCALE replaces
+    for len in 1..=8 {
+      let max = (1 << len) - 1;
+      assert!((0..=max).all(|v| u32::from(scale(len, v)) == (v * 255 + max / 2) / max));
+    }
     assert_eq!(Bitfield::from_mask(0xFFC0, 16), Ok(Bitfield::new(8, 8)));
     assert!(Bitfield::from_mask(0x1F0000, 16).is_err());
     assert!(Bitfield::from_mask(0xF801, 16).is_err());
