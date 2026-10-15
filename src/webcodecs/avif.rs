@@ -13,6 +13,9 @@ use std::ops::Range;
 
 /// CrabbyAvif's image count limit: 12 hours at 60 frames per second
 const MAX_IMAGE_COUNT: usize = 12 * 3600 * 60;
+/// The size hint Chrome gives CrabbyAvif while the data streams in (kMaxAvifFileSize, 256 MB).
+/// Once all the data is in, it is the data length. See `AvifSamples::past_size_hint`.
+pub(crate) const STREAM_SIZE_HINT: u64 = 0x1000_0000;
 /// Limit for every list read from the boxes (items, extents, properties, references,
 /// tracks). An image without a grid has a few dozen entries.
 const MAX_ENTRIES: usize = 1 << 16;
@@ -83,8 +86,9 @@ impl AvifSamples {
     }
   }
 
-  /// The bytes of sample `index`, or None while some of them have not arrived. With all
-  /// the bytes in, see `past_end`.
+  /// The bytes of sample `index`, or None while some of them have not arrived. Also None for
+  /// an item larger than both the data and `STREAM_SIZE_HINT`, which Chrome rejects (see
+  /// `past_size_hint`).
   pub fn sample<'d>(&self, data: &'d [u8], index: usize) -> Option<Cow<'d, [u8]>> {
     let bytes = |range: &Range<u64>| {
       data.get(usize::try_from(range.start).ok()?..usize::try_from(range.end).ok()?)
@@ -92,11 +96,17 @@ impl AvifSamples {
     match &self.samples {
       Samples::Item(extents) if index == 0 => match extents.as_slice() {
         [extent] => bytes(extent).map(Cow::Borrowed),
-        extents => extents
-          .iter()
-          .map(bytes)
-          .collect::<Option<Vec<_>>>()
-          .map(|parts| Cow::Owned(parts.concat())),
+        extents => {
+          // Extents can overlap: the item can be larger than the data. Like CrabbyAvif,
+          // allocate the item size only once it is checked, and fail when it cannot be.
+          let limit = STREAM_SIZE_HINT.max(data.len() as u64);
+          let size = item_size(extents).filter(|&size| size <= limit)?;
+          let parts = extents.iter().map(bytes).collect::<Option<Vec<_>>>()?;
+          let mut item = Vec::new();
+          item.try_reserve_exact(usize::try_from(size).ok()?).ok()?;
+          parts.iter().for_each(|part| item.extend_from_slice(part));
+          Some(Cow::Owned(item))
+        }
       },
       Samples::Item(_) => None,
       Samples::Track(samples) => {
@@ -106,16 +116,17 @@ impl AvifSamples {
     }
   }
 
-  /// Whether Chrome rejects these samples in a file of `len` bytes (CrabbyAvif's size_hint
-  /// check): a track sample ends past the file, or an item is larger than the file. An item
-  /// that is not larger but ends past the file fails to decode instead.
-  pub fn past_end(&self, len: usize) -> bool {
-    let len = len as u64;
+  /// Whether CrabbyAvif rejects these samples for a size hint of `size_hint` bytes
+  /// (Tile::create_from_item, create_from_track): an item larger than it (the sum of its
+  /// extents, which can overlap), or a track sample that ends past it. Chrome's size hint is
+  /// `STREAM_SIZE_HINT` while the data streams in, then the data length. An item that is not
+  /// larger but ends past the data fails to decode instead.
+  pub fn past_size_hint(&self, size_hint: u64) -> bool {
     match &self.samples {
-      Samples::Item(extents) => extents.iter().map(|e| e.end - e.start).sum::<u64>() > len,
+      Samples::Item(extents) => item_size(extents).is_none_or(|size| size > size_hint),
       Samples::Track(samples) => samples
         .iter()
-        .any(|sample| sample.offset + u64::from(sample.size) > len),
+        .any(|sample| sample.offset.saturating_add(sample.size.into()) > size_hint),
     }
   }
 
@@ -1121,6 +1132,14 @@ impl<'a> Reader<'a> {
   }
 }
 
+/// The size of an item: the sum of its extent lengths, None when it overflows (CrabbyAvif's
+/// checked item.size)
+fn item_size(extents: &[Range<u64>]) -> Option<u64> {
+  extents.iter().try_fold(0u64, |size, extent| {
+    size.checked_add(extent.end - extent.start)
+  })
+}
+
 fn be32(bytes: &[u8]) -> u32 {
   u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
@@ -1131,7 +1150,10 @@ fn push<T>(list: &mut Vec<T>, value: T) -> Option<()> {
 
 #[cfg(test)]
 mod tests {
-  use super::{Avif, AvifImage, AvifSamples, Nclx, Reader, Samples, parse, parse_meta};
+  use super::{
+    Avif, AvifImage, AvifSamples, Nclx, Reader, STREAM_SIZE_HINT, Samples, item_size, parse,
+    parse_meta,
+  };
 
   /// AVIF files from the Chrome 155 comparison (avifenc 1.4.2, MP4Box), and two of them
   /// rewritten. Each test says what Chrome decodes from them.
@@ -1271,20 +1293,93 @@ mod tests {
   }
 
   #[test]
-  fn finds_samples_past_the_end_like_crabbyavif() {
+  fn finds_samples_past_the_size_hint_like_crabbyavif() {
     // s8_420: an item of 854 bytes at 275. Cut to 1029 bytes, it ends past the data but is
     // not larger: Chrome fails the decode, not the metadata.
     let color = parsed(&fixture("s8_420.avif"), None).color;
-    assert!(!color.past_end(1029));
-    assert!(color.past_end(853));
+    assert!(!color.past_size_hint(1029));
+    assert!(color.past_size_hint(853));
     // prog8_420: 104 + 987 bytes
     let color = parsed(&fixture("prog8_420.avif"), None).color;
-    assert!(!color.past_end(1091));
-    assert!(color.past_end(1090));
+    assert!(!color.past_size_hint(1091));
+    assert!(color.past_size_hint(1090));
     // anim8_420: the last track sample ends at 3559
     let color = parsed(&fixture("anim8_420.avif"), None).color;
-    assert!(!color.past_end(3559));
-    assert!(color.past_end(3558));
+    assert!(!color.past_size_hint(3559));
+    assert!(color.past_size_hint(3558));
+  }
+
+  /// s8_420.avif with its item in `extents` (offsets in the original file: from the item on,
+  /// they move with the bytes after the bigger iloc box)
+  fn s8_with_extents(extents: &[(u32, u32)]) -> Vec<u8> {
+    let s8 = fixture("s8_420.avif");
+    let (meta, iloc, item) = (32, box_at(&s8, b"iloc"), 275);
+    let count = extents.len() as u32;
+    let delta = 8 * count - 8;
+    // version 0, 4-byte offsets and lengths, item 1
+    let mut iloc_box = (22 + 8 * count).to_be_bytes().to_vec();
+    iloc_box.extend_from_slice(b"iloc\0\0\0\0\x44\0\0\x01\0\x01\0\0");
+    iloc_box.extend_from_slice(&(count as u16).to_be_bytes());
+    for &(offset, length) in extents {
+      let offset = if offset >= item {
+        offset + delta
+      } else {
+        offset
+      };
+      iloc_box.extend_from_slice(&offset.to_be_bytes());
+      iloc_box.extend_from_slice(&length.to_be_bytes());
+    }
+    let meta_size = u32::from_be_bytes(s8[meta..meta + 4].try_into().unwrap()) + delta;
+    [
+      &s8[..meta],
+      &meta_size.to_be_bytes(),
+      &s8[meta + 4..iloc],
+      &iloc_box,
+      &s8[iloc + 30..],
+    ]
+    .concat()
+  }
+
+  #[test]
+  fn bounds_items_with_overlapping_extents() {
+    let s8 = fixture("s8_420.avif");
+    assert_eq!(s8_with_extents(&[(275, 854)]), s8);
+    let item = &s8[275..1129];
+    // Extents that overlap by 100 bytes: 954 bytes, not more than the file. Chrome decodes
+    // them (EncodingError: they are not AV1).
+    let data = s8_with_extents(&[(275, 500), (675, 454)]);
+    let color = parsed(&data, None).color;
+    assert!(!color.past_size_hint(data.len() as u64));
+    assert_eq!(
+      samples(&data, &color),
+      [[&item[..500], &item[400..]].concat()]
+    );
+    // The item twice: larger than the file. Chrome rejects the complete file and decodes the
+    // stream (I420), whose size hint is 256 MB.
+    let data = s8_with_extents(&[(275, 854), (275, 854)]);
+    let color = parsed(&data, None).color;
+    assert!(color.past_size_hint(data.len() as u64));
+    assert!(!color.past_size_hint(STREAM_SIZE_HINT));
+    assert_eq!(samples(&data, &color), [item.repeat(2)]);
+    // 65535 extents of the first 4100 bytes: 269 MB from a 525 KB file. Chrome rejects it,
+    // also while it streams in, and it has no bytes here (nothing is allocated).
+    let data = s8_with_extents(&[(0, 4100); 65535]);
+    let color = parsed(&data, None).color;
+    assert!(color.past_size_hint(STREAM_SIZE_HINT));
+    assert!(color.sample(&data, 0).is_none());
+    // 300 extents of the first 1000 bytes: the bytes of each
+    let data = s8_with_extents(&[(0, 1000); 300]);
+    let color = parsed(&data, None).color;
+    assert!(!color.past_size_hint(STREAM_SIZE_HINT));
+    assert_eq!(samples(&data, &color), [data[..1000].repeat(300)]);
+    // two extents of 144 MB: past the stream size hint, and past the data
+    let data = s8_with_extents(&[(275, 0x900_0000), (275, 0x900_0000)]);
+    let color = parsed(&data, None).color;
+    assert!(color.past_size_hint(STREAM_SIZE_HINT));
+    assert!(color.sample(&data, 0).is_none());
+    // a size that overflows is past every size hint
+    assert_eq!(item_size(&[0..u64::MAX, 0..1]), None);
+    assert_eq!(item_size(&[0..u64::MAX, 5..5]), Some(u64::MAX));
   }
 
   #[test]
@@ -1397,8 +1492,9 @@ mod tests {
     assert_eq!(item.timescale, 0);
     assert!(item.alpha.is_some() && item.premultiplied);
 
-    // Chrome rejects these. 'avis' without 'moov' waits for it; a file without the
-    // 'avif' and 'avis' brands, or that needs 'mini', is declined.
+    // Chrome rejects these. 'avis' without 'moov' waits for it (the caller then fails the
+    // complete data); a file without the 'avif' and 'avis' brands, or that needs 'mini', is
+    // declined.
     for prefer_animation in [None, Some(false), Some(true)] {
       assert_eq!(
         outcome(&patch(&s8, 8, b"avis"), prefer_animation),

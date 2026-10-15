@@ -1176,7 +1176,8 @@ const AVIF_CASES: [string, Record<string, unknown>, VideoPixelFormat, [number, n
       '9434f3960c2b64338295e492250ca587ffc5f4ee323adc7ed3fa4fd603421119',
     ],
   ],
-  // anim8_420 with the sample entry's colr patched to BT.709: Chrome ignores it
+  // anim8_420 with the colr of its item and of its sample entry patched to BT.709 (the AV1
+  // sequence header says BT.601): Chrome ignores both for the track
   [
     'cpatch_m1_anim.avif',
     {},
@@ -1226,12 +1227,12 @@ for (const [name, init, format, size, frameCount, hashes] of AVIF_CASES) {
 }
 
 test('ImageDecoder: AVIF track frames take their timestamps and durations from the track', async (t) => {
-  // [timestamp, duration] of each frame. Chrome 155 truncates each duration to microseconds
-  // and sums those (66666 for 2/30 s, also as a duration); here they are rounded.
+  // [timestamp, duration] of each frame, Chrome 155's: ticks / timescale seconds, truncated
+  // to microseconds (66666 for 2/30 s)
   for (const [name, timing] of [
-    ['anim8_420.avif', [0, 33333, 33333, 33333, 66667, 33333]],
-    // stts (1, 1), (2, 2) at timescale 30
-    ['tables_panim8_420a.avif', [0, 33333, 33333, 66667, 100000, 66667]],
+    ['anim8_420.avif', [0, 33333, 33333, 33333, 66666, 33333]],
+    // colour stts runs (1, 1), (0, 9), (1, 2) at timescale 30
+    ['tables_panim8_420a.avif', [0, 33333, 33333, 66666, 100000, 66666]],
     ['avis1_8_420.avif', [0, null]],
     ['a8_420.avif', [0, null]],
   ] as const) {
@@ -1247,29 +1248,36 @@ test('ImageDecoder: AVIF track frames take their timestamps and durations from t
   }
 })
 
-test('ImageDecoder: an AVIF track with a timescale of 0 or above 2^31, or an stts delta of 0, has times of 0, like Chrome', async (t) => {
-  // anim8_420 (3 frames, timescale 30, delta 1) with its mdhd timescale or its stts delta
-  // patched. Chrome gives each frame timestamp 0 and duration 0.
-  const timescale = (data: Uint8Array) => {
-    const body = Buffer.from(data).indexOf('mdhd') + 4
-    return body + 4 + (data[body] === 1 ? 16 : 8)
-  }
-  const delta = (data: Uint8Array) => Buffer.from(data).indexOf('stts') + 4 + 12
-  for (const [label, offset, value] of [
-    ['timescale 0', timescale, 0],
-    ['timescale 0xFFFFFFF0', timescale, 0xfffffff0],
-    ['delta 0', delta, 0],
+test('ImageDecoder: AVIF track times are f64 seconds truncated to microseconds, like Chrome', async (t) => {
+  // anim8_420 (3 frames, one stts run) with its mdhd timescale and stts delta patched. Chrome
+  // (CrabbyAvif's image_timing, then base::Seconds) gives delta / timescale seconds as an f64,
+  // 0 for a timescale of 0, and truncates its product with 10^6.
+  const data = avifFixture('anim8_420.avif')
+  const body = Buffer.from(data).indexOf('mdhd') + 4
+  const timescale = body + 4 + (data[body] === 1 ? 16 : 8)
+  const delta = Buffer.from(data).indexOf('stts') + 4 + 12
+  // [timescale, delta, then Chrome 155's timestamp and duration of each frame]
+  for (const [scale, ticks, timing] of [
+    [0, 1, [0, 0, 0, 0, 0, 0]],
+    [30, 0, [0, 0, 0, 0, 0, 0]],
+    // 1 / 0xFFFFFFF0 s is less than 1 us
+    [0xfffffff0, 1, [0, 0, 0, 0, 0, 0]],
+    [0xfffffff0, 0xffffffff, [0, 1000000, 1000000, 1000000, 2000000, 1000000]],
+    // 4.1 s is 4099999.9999999995 us as an f64
+    [10, 41, [0, 4099999, 4099999, 4099999, 8199999, 4099999]],
+    [90000, 3003, [0, 33366, 33366, 33366, 66733, 33366]],
   ] as const) {
-    const data = avifFixture('anim8_420.avif')
-    new DataView(data.buffer).setUint32(offset(data), value)
-    const decoder = new ImageDecoder({ data, type: 'image/avif' })
+    const patched = data.slice()
+    new DataView(patched.buffer).setUint32(timescale, scale)
+    new DataView(patched.buffer).setUint32(delta, ticks)
+    const decoder = new ImageDecoder({ data: patched, type: 'image/avif' })
     const frames = []
     for (let i = 0; i < 3; i++) {
       const { image } = await decoder.decode({ frameIndex: i })
       frames.push(image.timestamp, image.duration)
       image.close()
     }
-    t.deepEqual(frames, [0, 0, 0, 0, 0, 0], label)
+    t.deepEqual(frames, [...timing], `timescale ${scale}, delta ${ticks}`)
     decoder.close()
   }
 })
@@ -1343,6 +1351,45 @@ test('ImageDecoder: an AVIF item cut short fails decode(), or the metadata when 
   // the first 530 bytes of a8_420: fewer than its colour item's 854
   const short = new ImageDecoder({ data: avifFixture('a8_420.avif').slice(0, 530), type: 'image/avif' })
   await t.throwsAsync(short.tracks.ready, { name: 'InvalidStateError', message: 'Failed to retrieve track metadata.' })
+})
+
+test('ImageDecoder: a complete AVIF that ends before a box its brands need fails the metadata, like Chrome', async (t) => {
+  const metadataError = { name: 'InvalidStateError', message: 'Failed to retrieve track metadata.' }
+  for (const [label, data] of [
+    // 'avis': ftyp and meta, without the moov box
+    ['anim8_420 before moov', avifFixture('anim8_420.avif').slice(0, 279)],
+    // 'avif': cut inside meta
+    ['s8_420 inside meta', avifFixture('s8_420.avif').slice(0, 100)],
+  ] as const) {
+    for (const preferAnimation of [undefined, true, false]) {
+      const decoder = new ImageDecoder({ data, type: 'image/avif', preferAnimation })
+      await t.throwsAsync(decoder.tracks.ready, metadataError, `${label}, preferAnimation ${preferAnimation}`)
+      t.true(decoder.closed)
+    }
+    // A stream fails at its end. Chrome marks the data complete first: `completed` resolves.
+    const decoder = new ImageDecoder({ data: avifStream(data), type: 'image/avif' })
+    const completed = decoder.completed
+    await t.throwsAsync(decoder.tracks.ready, metadataError, `${label}, streamed`)
+    await t.notThrowsAsync(completed)
+    t.true(decoder.complete)
+    t.true(decoder.closed)
+  }
+})
+
+test("ImageDecoder: a streamed AVIF whose samples pass Chrome's 256 MB size hint fails the metadata while it streams", async (t) => {
+  // anim8_420 with its only chunk 100 bytes before 256 MB: CrabbyAvif's size hint is 256 MB
+  // until the data is complete, then its length
+  const data = avifFixture('anim8_420.avif')
+  new DataView(data.buffer).setUint32(Buffer.from(data).indexOf('stco') + 12, 0x10000000 - 100)
+  const metadataError = { name: 'InvalidStateError', message: 'Failed to retrieve track metadata.' }
+  const streamed = new ImageDecoder({ data: avifStream(data), type: 'image/avif' })
+  const completed = streamed.completed
+  await t.throwsAsync(streamed.tracks.ready, metadataError)
+  // before the data ended
+  await t.throwsAsync(completed, { name: 'AbortError', message: 'Aborted by close.' })
+  t.false(streamed.complete)
+  const whole = new ImageDecoder({ data, type: 'image/avif' })
+  await t.throwsAsync(whole.tracks.ready, metadataError)
 })
 
 test('ImageDecoder: a grid AVIF still decodes with FFmpeg, to its first tile', async (t) => {
