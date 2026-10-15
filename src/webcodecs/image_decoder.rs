@@ -988,10 +988,20 @@ fn decode_cached_frame(
     )
   };
 
+  // Like Chrome, a JPEG has one frame: another index fails once the data is complete, before
+  // any decode.
+  if jpeg && frame_index > 0 {
+    return if data_complete {
+      Err(frame_index_error(frame_index, 1))
+    } else {
+      Ok(None)
+    };
+  }
+
   // A reset can clear the cache. For fully buffered input, reconstruct it now;
   // for a live stream, wait for the collector's next successful probe. Like Chrome, a
   // JPEG is decoded now with the data so far: it gives a frame only once it is whole.
-  if needs_cache && (data_complete || (jpeg && frame_index == 0)) {
+  if needs_cache && (data_complete || jpeg) {
     cache_decoded_frames(inner, true).map_err(|error| {
       if !close_if_failed(inner) {
         return error;
@@ -1024,14 +1034,7 @@ fn decode_cached_frame(
     if !data_complete {
       return Ok(None);
     }
-    return Err(Error::new(
-      Status::InvalidArg,
-      format!(
-        "RangeError: Frame index {} out of bounds (image has {} frames)",
-        frame_index,
-        frames.len()
-      ),
-    ));
+    return Err(frame_index_error(frame_index, frames.len()));
   }
 
   // Clone the Arc to share the frame data (no pixel copy needed).
@@ -1056,6 +1059,14 @@ fn decode_cached_frame(
     image: video_frame,
     complete: true,
   }))
+}
+
+/// The RangeError of a decode() of a frame that the image does not have.
+fn frame_index_error(frame_index: usize, frame_count: usize) -> Error {
+  Error::new(
+    Status::InvalidArg,
+    format!("RangeError: Frame index {frame_index} out of bounds (image has {frame_count} frames)"),
+  )
 }
 
 /// The error of a decode() that finds the decoder closed. When the decoder closed because its
