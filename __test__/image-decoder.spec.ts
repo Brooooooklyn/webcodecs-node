@@ -738,6 +738,42 @@ test('ImageDecoder: a BMP with missing pixel data rejects with EncodingError and
   t.true(decoder.closed)
 })
 
+/**
+ * Decodes each file from a buffer and from a stream in a child process, for its peak RSS: one
+ * "<source>: ready <result> | decode() <result>" line per decode.
+ */
+function decodeInChild(files: [Uint8Array, string][]): { results: string[]; maxRSS: number } {
+  const script = `
+const fs = require('node:fs');
+const { ImageDecoder } = require('./index.js');
+const fmt = (e) => e.name + ': ' + e.message;
+(async () => {
+  const results = [];
+  for (const arg of process.argv.slice(1)) {
+    const [type, b64] = arg.split(',');
+    for (const source of ['buffer', 'stream']) {
+      const bytes = new Uint8Array(Buffer.from(b64, 'base64'));
+      const data = source === 'stream' ? new ReadableStream({ start(c) { c.enqueue(bytes); c.close(); } }) : bytes;
+      const decoder = new ImageDecoder({ data, type });
+      const ready = await decoder.tracks.ready.then(() => 'resolves', fmt);
+      const decoded = await decoder.decode().then(() => 'resolves', fmt);
+      results.push(source + ': ready ' + ready + ' | decode() ' + decoded);
+    }
+  }
+  // on a line of its own: with WEBCODECS_LOG set, FFmpeg's log lines go to stdout too
+  fs.writeSync(1, '\\nRESULT ' + JSON.stringify({ results, maxRSS: process.resourceUsage().maxRSS * 1024 }) + '\\n');
+  process.exit(0);
+})();`
+  const args = files.map(([data, type]) => `${type},${Buffer.from(data).toString('base64')}`)
+  const stdout = execFileSync(process.execPath, ['-e', script, ...args], {
+    cwd: process.cwd(),
+    timeout: 60_000,
+    encoding: 'utf8',
+  })
+  const line = stdout.split('\n').find((l) => l.startsWith('RESULT '))!
+  return JSON.parse(line.slice('RESULT '.length)) as { results: string[]; maxRSS: number }
+}
+
 test('ImageDecoder: an RLE BMP whose data ends early fails before its canvas is allocated', (t) => {
   // RLE8, 65535 x 8191 (4 * w * h just under 2^31, Blink's limit) with no pixel data, 32 moves of
   // 255 rows down, or 8190 ends of row, then the end of the data. Like Chrome 155, tracks.ready
@@ -749,36 +785,27 @@ test('ImageDecoder: an RLE BMP whose data ends early fails before its canvas is 
     rle8(Array.from({ length: 32 }, () => [0, 2, 0, 255]).flat()),
     rle8(Array.from({ length: 8190 }, () => [0, 0]).flat()),
   ]
-  // in a child process, for its peak RSS
-  const script = `
-const fs = require('node:fs');
-const { ImageDecoder } = require('./index.js');
-const fmt = (e) => e.name + ': ' + e.message;
-(async () => {
-  const results = [];
-  for (const b64 of process.argv.slice(1)) {
-    for (const source of ['buffer', 'stream']) {
-      const bytes = new Uint8Array(Buffer.from(b64, 'base64'));
-      const data = source === 'stream' ? new ReadableStream({ start(c) { c.enqueue(bytes); c.close(); } }) : bytes;
-      const decoder = new ImageDecoder({ data, type: 'image/bmp' });
-      const ready = await decoder.tracks.ready.then(() => 'resolves', fmt);
-      const decoded = await decoder.decode().then(() => 'resolves', fmt);
-      results.push(source + ': ready ' + ready + ' | decode() ' + decoded);
-    }
-  }
-  fs.writeSync(1, JSON.stringify({ results, maxRSS: process.resourceUsage().maxRSS * 1024 }));
-  process.exit(0);
-})();`
-  const args = files.map((data) => Buffer.from(data).toString('base64'))
-  const stdout = execFileSync(process.execPath, ['-e', script, ...args], {
-    cwd: process.cwd(),
-    timeout: 60_000,
-    encoding: 'utf8',
-  })
-  const { results, maxRSS } = JSON.parse(stdout) as { results: string[]; maxRSS: number }
+  const { results, maxRSS } = decodeInChild(files.map((data) => [data, 'image/bmp']))
   const failed = 'ready resolves | decode() EncodingError: Failed to decode frame at index 0'
   t.deepEqual(results, files.flatMap(() => [`buffer: ${failed}`, `stream: ${failed}`]))
   // about 50 MiB on macOS arm64, 2 GiB before
+  t.true(maxRSS < 512 * 2 ** 20, `peak RSS ${Math.round(maxRSS / 2 ** 20)} MiB`)
+})
+
+test('ImageDecoder: a GIF or BMP too large for a frame fails before its canvas is allocated', (t) => {
+  // 65535 x 8191 passes Blink's limit (4 * w * h < 2^31), and FFmpeg cannot make the frame:
+  // av_image_check_size needs (8 * w + 1024) * (h + 128) < 2^31 - 1. An RLE8 BMP that ends at
+  // once is a black image, and the GIF has one 1x1 frame. tracks.ready resolves, and decode()
+  // rejects like Chrome 155. Each one made 2 GiB of canvas before its frame failed.
+  const black = bmp(65535, 8191, 8, [], { compression: 1, palette: [[0, 0, 0], [255, 255, 255]], raw: [0, 1] })
+  const files: [Uint8Array, string][] = [
+    [black, 'image/bmp'],
+    [gif(65535, 8191, PALETTE, [{ x: 0, y: 0, width: 1, height: 1, indices: [0] }]), 'image/gif'],
+  ]
+  const { results, maxRSS } = decodeInChild(files)
+  const failed = 'ready resolves | decode() EncodingError: Failed to decode frame at index 0'
+  t.deepEqual(results, files.flatMap(() => [`buffer: ${failed}`, `stream: ${failed}`]))
+  // about 50 MiB on macOS arm64, 4 GiB before
   t.true(maxRSS < 512 * 2 ** 20, `peak RSS ${Math.round(maxRSS / 2 ** 20)} MiB`)
 })
 

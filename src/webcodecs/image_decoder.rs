@@ -7,7 +7,7 @@
 use crate::codec::demuxer::{DemuxerContext, MediaType};
 use crate::codec::jpeg::{JpegDecode, decode_jpeg, jpeg_info};
 use crate::codec::{CodecContext, CodecError, DecoderConfig, Frame, Packet};
-use crate::ffi::avutil::av_rescale_q;
+use crate::ffi::avutil::{av_image_check_size, av_rescale_q};
 use crate::ffi::{
   AV_NOPTS_VALUE, AVCodecID, AVColorRange, AVColorSpace, AVPixelFormat, AVRational,
 };
@@ -3035,9 +3035,12 @@ fn gif_frames(
   } else {
     gif.frames().len()
   };
+  // a canvas too large for a frame only has its data checked (see `frame_fits`)
+  let fits = frame_fits(gif.width(), gif.height());
+  let decoded = if fits { gif.decode() } else { gif.check() };
   let mut frames = Vec::new();
   let mut timestamp = 0;
-  for (info, pixels) in gif.frames().iter().zip(gif.decode()).take(count) {
+  for (info, pixels) in gif.frames().iter().zip(decoded).take(count) {
     let format = if info.has_alpha {
       VideoPixelFormat::BGRA
     } else {
@@ -3048,9 +3051,8 @@ fn gif_frames(
         frames.resize(count, CachedFrame::Pending);
         break;
       }
-      pixels => pixels
-        .ok()
-        .and_then(|pixels| bgra_frame(gif.width(), gif.height(), &pixels, timestamp)),
+      Ok(pixels) if fits => bgra_frame(gif.width(), gif.height(), &pixels, timestamp),
+      _ => None,
     };
     let duration = i64::from(info.delay) * 10_000;
     frames.push(match frame {
@@ -3090,11 +3092,17 @@ fn bmp_frames(
   } else {
     VideoPixelFormat::BGRX
   };
-  let frame = match bmp.decode() {
+  // an image too large for a frame only has its data checked (see `frame_fits`)
+  let fits = frame_fits(bmp.width(), bmp.height());
+  let pixels = if fits {
+    bmp.decode()
+  } else {
+    bmp.check().map(|()| Vec::new())
+  };
+  let frame = match pixels {
     Err(bmp_decoder::TRUNCATED) if !data_complete => return Ok(vec![CachedFrame::Pending]),
-    pixels => pixels
-      .ok()
-      .and_then(|pixels| bgra_frame(bmp.width(), bmp.height(), &pixels, 0)),
+    Ok(pixels) if fits => bgra_frame(bmp.width(), bmp.height(), &pixels, 0),
+    _ => None,
   };
   Ok(vec![match frame {
     Some(frame) => CachedFrame::Decoded {
@@ -3108,6 +3116,16 @@ fn bmp_frames(
 
 fn incomplete_data() -> Error {
   Error::new(Status::GenericFailure, "Incomplete image data")
+}
+
+/// Whether `bgra_frame` can make a frame of this size. av_frame_get_buffer fails a frame that
+/// av_image_check_size rejects ((8 * width + 1024) * (height + 128) must stay under 2^31 - 1), so
+/// the decode of a larger GIF or BMP fails whatever its data holds. Their decoders then only
+/// check the data, for the same outcome: decoding it first made up to 2 GiB of canvas from a file
+/// of a few bytes.
+fn frame_fits(width: u32, height: u32) -> bool {
+  // SAFETY: av_image_check_size reads only its arguments; a null log context is allowed.
+  unsafe { av_image_check_size(width, height, 0, std::ptr::null_mut()) >= 0 }
 }
 
 /// A BGRA frame with the rows of `pixels`, tagged RGB matrix and full range like the images
