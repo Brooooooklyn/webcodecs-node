@@ -19,16 +19,16 @@
 
 use crate::codec::{CodecError, Frame};
 use crate::ffi::accessors::{
-  ffframe_avif_to_rgb, ffframe_convert_decoded, ffframe_get_color_primaries,
-  ffframe_get_colorspace, ffframe_palette_has_alpha, ffpixfmt_describe,
+  ffframe_convert_decoded, ffframe_get_color_primaries, ffframe_get_colorspace,
+  ffframe_palette_has_alpha, ffpixfmt_describe,
 };
 use crate::ffi::avutil::av_frame_copy_props;
 use crate::ffi::{AVCodecID, AVColorRange, AVColorSpace, AVPixelFormat, check_error};
 use crate::webcodecs::VideoPixelFormat;
 use crate::webcodecs::avif::AvifImage;
+use crate::webcodecs::avif_rgb::avif_to_bgra;
 use crate::webcodecs::image_hints::PixelHint;
 use pixel_simd::{Alpha, Be16, Plane, Yuva420};
-use std::os::raw::c_int;
 
 // libavutil/pixdesc.h AV_PIX_FMT_FLAG_*
 const FLAG_PAL: i32 = 1 << 1;
@@ -206,7 +206,7 @@ fn choose(frame: &mut Frame, source: DecodedSource) -> Result<Choice, CodecError
 /// An AVIF frame and its alpha frame as Chrome 155 decodes them (AVIFImageDecoder with CrabbyAvif).
 /// One image without alpha keeps its YUV planes (see `choose`), unless it is 4:0:0 or YCgCo-Re/Ro.
 /// Any other image is BGRA, or BGRX without alpha, with CrabbyAvif's bytes (see
-/// `ffframe_avif_to_rgb`), tagged like a converted frame. Its CICP is the item's nclx, else the
+/// `avif_to_bgra`), tagged like a converted frame. Its CICP is the item's nclx, else the
 /// frame's (the AV1 sequence header: Chrome ignores the colr of a track). Where CrabbyAvif cannot
 /// convert, Chrome fails the decode, and so does this.
 pub(crate) fn avif_frame(
@@ -237,18 +237,14 @@ pub(crate) fn avif_frame(
   let mut dst = Frame::new_video(color.width(), color.height(), AVPixelFormat::Bgra)?;
   // av1C chroma_sample_position
   let chroma_position = image.color.config.get(2).map_or(0, |flags| flags & 3);
-  check_error(unsafe {
-    ffframe_avif_to_rgb(
-      color.as_ptr(),
-      alpha.map_or(std::ptr::null(), Frame::as_ptr),
-      image.premultiplied as c_int,
-      matrix,
-      primaries,
-      full_range as c_int,
-      chroma_position.into(),
-      dst.as_mut_ptr(),
-    )
-  })?;
+  avif_to_bgra(
+    &color,
+    alpha,
+    image.premultiplied,
+    (matrix, primaries, full_range),
+    chroma_position.into(),
+    &mut dst,
+  )?;
   check_error(unsafe { av_frame_copy_props(dst.as_mut_ptr(), color.as_ptr()) })?;
   dst.set_colorspace(AVColorSpace::Rgb);
   dst.set_color_range(AVColorRange::Jpeg);
