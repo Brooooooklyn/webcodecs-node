@@ -279,6 +279,9 @@ pub enum AVPixelFormat {
   Abgr = 27,
   Bgra = 28,
   Bgr0 = 121,
+  Rgb0 = 119,
+  Zrgb = 118, // 0rgb
+  Zbgr = 120, // 0bgr
   // Image decoder formats with no WebCodecs equivalent (PNG 16-bit, BMP 16-bit)
   Gray16be = 29,
   Ya16be = 109,
@@ -434,6 +437,9 @@ impl AVPixelFormat {
       27 => Self::Abgr,
       28 => Self::Bgra,
       121 => Self::Bgr0,
+      119 => Self::Rgb0,
+      118 => Self::Zrgb,
+      120 => Self::Zbgr,
       29 => Self::Gray16be,
       109 => Self::Ya16be,
       34 => Self::Rgb48be,

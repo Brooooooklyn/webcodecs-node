@@ -23,7 +23,7 @@ use crate::ffi::accessors::{
 use crate::ffi::avutil::av_frame_copy_props;
 use crate::ffi::{AVCodecID, AVColorRange, AVColorSpace, AVPixelFormat, check_error};
 use crate::webcodecs::VideoPixelFormat;
-use crate::webcodecs::image_hints::PixelHint;
+use crate::webcodecs::image_hints::{Bitfield, PixelHint};
 
 // libavutil/pixdesc.h AV_PIX_FMT_FLAG_*
 const FLAG_PAL: i32 = 1 << 1;
@@ -223,8 +223,9 @@ fn choose(frame: &mut Frame, source: DecodedSource) -> Result<Choice, CodecError
 /// header declares no alpha, never premultiplied. FFmpeg's bytes already are Skia's for BGRA
 /// (also BMP's bgr0, which is BGRA whose alpha is all 0), for RGBA once R and B are swapped, and
 /// for the formats swscale converts exactly (palette, gray, 8-bit RGB). Skia keeps the high byte
-/// of a 16-bit PNG sample and scales a 16-bit BMP's bitfields with the image crate's tables,
-/// where swscale rounds or replicates bits. The frame is tagged RGB matrix, full range, like a
+/// of a 16-bit PNG sample, where swscale rounds. It reads a BMP's bitfields with the header masks
+/// and the image crate's tables, where swscale replicates bits and FFmpeg takes a 32-bit pixel's
+/// alpha from the byte the color masks leave. The frame is tagged RGB matrix, full range, like a
 /// converted one.
 fn skia_image(
   frame: Frame,
@@ -239,24 +240,33 @@ fn skia_image(
   } else {
     VideoPixelFormat::BGRX
   };
-  let swap = frame.format() == AVPixelFormat::Rgba;
   let mut frame = match (frame.format(), pixels) {
+    // FFmpeg keeps the 16 or 32-bit words of the file, alpha bits included
+    (
+      AVPixelFormat::Rgb555le | AVPixelFormat::Rgb565le | AVPixelFormat::Rgb444le,
+      PixelHint::Bitfields(fields),
+    ) => bitfields(&frame, 2, alpha, fields)?,
+    (
+      AVPixelFormat::Bgra
+      | AVPixelFormat::Bgr0
+      | AVPixelFormat::Rgba
+      | AVPixelFormat::Rgb0
+      | AVPixelFormat::Argb
+      | AVPixelFormat::Zrgb
+      | AVPixelFormat::Abgr
+      | AVPixelFormat::Zbgr,
+      PixelHint::Bitfields(fields),
+    ) => bitfields(&frame, 4, alpha, fields)?,
     (AVPixelFormat::Bgra | AVPixelFormat::Bgr0 | AVPixelFormat::Rgba, _) => frame,
     // big-endian samples: the high byte comes first
     (AVPixelFormat::Gray16be, _) => unpack(&frame, 2, alpha, |p| [p[0], p[0], p[0], 255])?,
     (AVPixelFormat::Ya16be, _) => unpack(&frame, 4, alpha, |p| [p[0], p[0], p[0], p[2]])?,
     (AVPixelFormat::Rgb48be, _) => unpack(&frame, 6, alpha, |p| [p[4], p[2], p[0], 255])?,
     (AVPixelFormat::Rgba64be, _) => unpack(&frame, 8, alpha, |p| [p[4], p[2], p[0], p[6]])?,
-    // FFmpeg keeps the 16-bit words of the file, alpha bits included
-    (
-      AVPixelFormat::Rgb555le | AVPixelFormat::Rgb565le | AVPixelFormat::Rgb444le,
-      PixelHint::Bitfields([r, g, b, a]),
-    ) => unpack(&frame, 2, alpha, |p| {
-      let word = u32::from(u16::from_le_bytes([p[0], p[1]]));
-      [b.read(word), g.read(word), r.read(word), a.read(word)]
-    })?,
     _ => convert(&frame, format, &desc, true, None)?,
   };
+  // Only a kept frame is still RGBA.
+  let swap = frame.format() == AVPixelFormat::Rgba;
   // FFmpeg drops the tRNS chunk of a 1, 2 or 4-bit gray PNG (it compares the scaled samples).
   let key = match pixels {
     PixelHint::GrayKey(key) => Some(key),
@@ -309,6 +319,20 @@ fn unpack(
     }
   }
   Ok(dst)
+}
+
+/// A new BGRA frame from a BMP frame of little-endian `size`-byte words, each field read like the
+/// image crate does.
+fn bitfields(
+  src: &Frame,
+  size: usize,
+  alpha: bool,
+  [r, g, b, a]: [Bitfield; 4],
+) -> Result<Frame, CodecError> {
+  unpack(src, size, alpha, |p| {
+    let word = p.iter().rev().fold(0, |word, &v| word << 8 | u32::from(v));
+    [b.read(word), g.read(word), r.read(word), a.read(word)]
+  })
 }
 
 /// Run `edit` on each pixel of a packed 32-bit frame.
@@ -521,6 +545,9 @@ mod tests {
     use AVPixelFormat as P;
     for (name, format) in [
       ("bgr0", P::Bgr0),
+      ("rgb0", P::Rgb0),
+      ("0rgb", P::Zrgb),
+      ("0bgr", P::Zbgr),
       ("gray16be", P::Gray16be),
       ("ya16be", P::Ya16be),
       ("rgb48be", P::Rgb48be),

@@ -12,7 +12,8 @@ pub(crate) enum PixelHint {
   /// A 1, 2 or 4-bit gray PNG with a tRNS chunk: its transparent gray value scaled to 8 bits,
   /// or None when no sample can have it. FFmpeg drops it.
   GrayKey(Option<u8>),
-  /// A 16-bit BMP: its R, G, B and A bitfields (5-5-5 without a mask).
+  /// A 16 or 32-bit BMP whose pixels are bitfields: its R, G, B and A fields (5-5-5 for a
+  /// 16-bit one without masks).
   Bitfields([Bitfield; 4]),
 }
 
@@ -189,10 +190,7 @@ pub(crate) fn bmp_header(data: &[u8]) -> Result<Option<ImageHeader>, ()> {
       };
       Ok(Some(ImageHeader {
         alpha: a.len > 0,
-        pixels: match bits {
-          16 => PixelHint::Bitfields([r, g, b, a]),
-          _ => PixelHint::None,
-        },
+        pixels: PixelHint::Bitfields([r, g, b, a]),
       }))
     }
     // BI_RGB
@@ -610,6 +608,15 @@ mod tests {
         alpha: false,
         pixels: PixelHint::Bitfields(RGB555),
       }))
+    );
+    // 32-bit: the masks too, even an alpha mask over a color field (FFmpeg reads another byte)
+    let alpha_on_blue = [0xff0000, 0xff00, 0xff, 0xff];
+    assert_eq!(
+      bmp_header(&bmp(108, 32, 3, alpha_on_blue))
+        .unwrap()
+        .unwrap()
+        .pixels,
+      PixelHint::Bitfields(alpha_on_blue.map(|m| Bitfield::from_mask(m, 32).unwrap()))
     );
     // a mask the image crate rejects, even one FFmpeg ignores
     assert_eq!(
