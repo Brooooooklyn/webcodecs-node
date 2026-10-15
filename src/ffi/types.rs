@@ -278,18 +278,11 @@ pub enum AVPixelFormat {
   Rgba = 26,
   Abgr = 27,
   Bgra = 28,
-  Bgr0 = 121,
-  Rgb0 = 119,
-  Zrgb = 118, // 0rgb
-  Zbgr = 120, // 0bgr
-  // Image decoder formats with no WebCodecs equivalent (PNG 16-bit, BMP 16-bit)
+  // Image decoder formats with no WebCodecs equivalent (PNG 16-bit)
   Gray16be = 29,
   Ya16be = 109,
   Rgb48be = 34,
   Rgba64be = 104,
-  Rgb565le = 37,
-  Rgb555le = 39,
-  Rgb444le = 52,
   // 10-bit YUV formats
   Yuv420p10le = 62, // I420P10
   Yuv422p10le = 64, // I422P10
@@ -436,17 +429,10 @@ impl AVPixelFormat {
       26 => Self::Rgba,
       27 => Self::Abgr,
       28 => Self::Bgra,
-      121 => Self::Bgr0,
-      119 => Self::Rgb0,
-      118 => Self::Zrgb,
-      120 => Self::Zbgr,
       29 => Self::Gray16be,
       109 => Self::Ya16be,
       34 => Self::Rgb48be,
       104 => Self::Rgba64be,
-      37 => Self::Rgb565le,
-      39 => Self::Rgb555le,
-      52 => Self::Rgb444le,
       62 => Self::Yuv420p10le,
       64 => Self::Yuv422p10le,
       68 => Self::Yuv444p10le,

@@ -66,6 +66,8 @@ export interface BmpOptions {
   masks?: number[]
   palette?: number[][]
   colorsUsed?: number
+  /** Pixel data as stored, in place of `rows` (RLE) */
+  raw?: number[]
 }
 
 /** Bottom-up BMP. `rows` are top-down, already in file byte order. */
@@ -74,12 +76,13 @@ export function bmp(
   height: number,
   bpp: number,
   rows: number[][],
-  { header = 40, compression = 0, masks = [], palette = [], colorsUsed = palette.length }: BmpOptions = {},
+  { header = 40, compression = 0, masks = [], palette = [], colorsUsed = palette.length, raw }: BmpOptions = {},
 ): Uint8Array {
   const rowBytes = Math.ceil((width * bpp) / 32) * 4
   const extraMasks = header === 40 ? masks.length * 4 : 0
   const offset = 14 + header + extraMasks + palette.length * 4
-  const buf = Buffer.alloc(offset + rowBytes * height)
+  const dataLength = raw ? raw.length : rowBytes * height
+  const buf = Buffer.alloc(offset + dataLength)
   buf.write('BM', 0, 'latin1')
   buf.writeUInt32LE(buf.length, 2)
   buf.writeUInt32LE(offset, 10)
@@ -89,14 +92,15 @@ export function bmp(
   buf.writeUInt16LE(1, 26)
   buf.writeUInt16LE(bpp, 28)
   buf.writeUInt32LE(compression, 30)
-  buf.writeUInt32LE(rowBytes * height, 34)
+  buf.writeUInt32LE(dataLength, 34)
   buf.writeUInt32LE(colorsUsed, 46)
   // the masks follow the first 40 header bytes, inside a V3+ header
   masks.forEach((mask, i) => buf.writeUInt32LE(mask >>> 0, 54 + i * 4))
   // V4+: LCS_sRGB
   if (header >= 108) buf.writeUInt32LE(0x73524742, 70)
   palette.forEach(([r, g, b], i) => Buffer.from([b, g, r, 0]).copy(buf, 14 + header + extraMasks + i * 4))
-  rows.forEach((row, y) => Buffer.from(row).copy(buf, offset + (height - 1 - y) * rowBytes))
+  if (raw) Buffer.from(raw).copy(buf, offset)
+  else rows.forEach((row, y) => Buffer.from(row).copy(buf, offset + (height - 1 - y) * rowBytes))
   return new Uint8Array(buf)
 }
 
@@ -111,26 +115,33 @@ export interface GifFrame {
   transparent?: number
   /** Disposal method (graphic control extension): 1 keep, 2 restore background, 3 restore previous */
   dispose?: number
+  /** Delay (graphic control extension), in hundredths of a second */
+  delay?: number
+  /** LZW codes to store in place of the codes of `indices`, for broken image data */
+  codes?: number[]
 }
 
-/** LZW image data at a fixed code width: a clear code before the table would grow. */
+/** LZW codes at a fixed code width: a clear code before the table would grow. */
 function lzw(indices: number[], minCodeSize: number): number[] {
   const clear = 1 << minCodeSize
+  const perClear = (1 << (minCodeSize + 1)) - (clear + 2)
+  const codes: number[] = []
+  for (let i = 0; i < indices.length; i += perClear) codes.push(clear, ...indices.slice(i, i + perClear))
+  codes.push(clear + 1)
+  return codes
+}
+
+/** Image data: the minimum code size, then the codes, one bit wider, in data sub-blocks. */
+function imageData(codes: number[], minCodeSize: number): number[] {
   const width = minCodeSize + 1
-  const perClear = (1 << width) - (clear + 2)
   const out: number[] = []
   let acc = 0
   let bits = 0
-  const put = (code: number) => {
+  for (const code of codes) {
     acc |= code << bits
     bits += width
     for (; bits >= 8; bits -= 8, acc >>>= 8) out.push(acc & 0xff)
   }
-  for (let i = 0; i < indices.length; i += perClear) {
-    put(clear)
-    indices.slice(i, i + perClear).forEach(put)
-  }
-  put(clear + 1)
   if (bits) out.push(acc & 0xff)
   const blocks = [minCodeSize]
   for (let i = 0; i < out.length; i += 255) blocks.push(Math.min(255, out.length - i), ...out.slice(i, i + 255))
@@ -143,12 +154,14 @@ export function gif(width: number, height: number, palette: number[][], frames: 
   const colors = Array.from({ length: 1 << bits }, (_, i) => palette[i] ?? [0, 0, 0])
   const u16 = (v: number) => [v & 0xff, v >> 8]
   const out = [...Buffer.from('GIF89a'), ...u16(width), ...u16(height), 0x80 | 0x70 | (bits - 1), 0, 0, ...colors.flat()]
+  const minCodeSize = Math.max(2, bits)
   for (const f of frames) {
-    if (f.transparent !== undefined || f.dispose !== undefined) {
-      out.push(0x21, 0xf9, 4, ((f.dispose ?? 0) << 2) | (f.transparent === undefined ? 0 : 1), 0, 0, f.transparent ?? 0, 0)
+    if (f.transparent !== undefined || f.dispose !== undefined || f.delay !== undefined) {
+      const flags = ((f.dispose ?? 0) << 2) | (f.transparent === undefined ? 0 : 1)
+      out.push(0x21, 0xf9, 4, flags, ...u16(f.delay ?? 0), f.transparent ?? 0, 0)
     }
     out.push(0x2c, ...u16(f.x), ...u16(f.y), ...u16(f.width), ...u16(f.height), 0)
-    out.push(...lzw(f.indices, Math.max(2, bits)))
+    out.push(...imageData(f.codes ?? lzw(f.indices, minCodeSize), minCodeSize))
   }
   out.push(0x3b)
   return Uint8Array.from(out)
