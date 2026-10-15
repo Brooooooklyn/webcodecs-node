@@ -653,18 +653,21 @@ impl Lzw {
         }
         // KwKwK: the code being defined is the previous string plus its first byte
         let c = if code == self.save { self.prev } else { code };
-        self.stack.clear();
-        let mut at = c as usize;
-        for _ in 0..self.len[c as usize] {
-          self.stack.push(self.suffix[at]);
-          at = usize::from(self.prefix[at]);
-        }
-        self.stack.reverse();
         let first = self.first[c as usize];
-        if code == self.save {
-          self.stack.push(first);
+        // once the frame is full, Pixels::put drops the output; only the table changes
+        if out.y < out.rect.y1 {
+          self.stack.clear();
+          let mut at = c as usize;
+          for _ in 0..self.len[c as usize] {
+            self.stack.push(self.suffix[at]);
+            at = usize::from(self.prefix[at]);
+          }
+          self.stack.reverse();
+          if code == self.save {
+            self.stack.push(first);
+          }
+          out.put(&self.stack);
         }
-        out.put(&self.stack);
         if self.save <= 4095 {
           // the first code after a clear code fills the unused end-code slot
           if self.prev != self.end {
