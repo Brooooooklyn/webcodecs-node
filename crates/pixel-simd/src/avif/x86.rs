@@ -198,12 +198,12 @@ pub(super) fn yuv12_sse2(
 #[target_feature(enable = "sse2")]
 pub(super) fn convert16_to8_sse2(src: &[u16], shift: u32, dst: &mut [u8]) -> usize {
   let (shift, max) = (_mm_cvtsi32_si128(shift as i32), _mm_set1_epi16(255));
-  let (blocks, _) = dst.as_chunks_mut::<16>();
-  for (n, d) in blocks.iter_mut().enumerate() {
-    let s = |at: usize| min16(_mm_srl_epi16(load16(&src[at..]), shift), max);
-    store(d, _mm_packus_epi16(s(16 * n), s(16 * n + 8)));
+  let ((src, _), (dst, _)) = (src.as_chunks::<16>(), dst.as_chunks_mut::<16>());
+  for (s, d) in src.iter().zip(&mut *dst) {
+    let [lo, hi] = [&s[..8], &s[8..]].map(|s| min16(_mm_srl_epi16(load16(s), shift), max));
+    store(d, _mm_packus_epi16(lo, hi));
   }
-  16 * blocks.len()
+  16 * src.len().min(dst.len())
 }
 
 /// The sample pairs between the edges of `dst` (see `upsample`), 16 at a time: pair x is
@@ -211,6 +211,9 @@ pub(super) fn convert16_to8_sse2(src: &[u16], shift: u32, dst: &mut [u8]) -> usi
 #[target_feature(enable = "sse2")]
 pub(super) fn upsample8_sse2(near: &[u8], far: &[u8], dst: &mut [u8]) -> usize {
   let blocks = dst.len().saturating_sub(1) / 2 / 16;
+  if blocks == 0 {
+    return 0;
+  }
   let (z, eight) = (_mm_setzero_si128(), _mm_set1_epi16(8));
   // 8 pairs from samples in 16-bit lanes: (3p + q + 8) >> 4 and (p + 3q + 8) >> 4 in the low
   // and high byte of each lane, with p = 3a + c and q = 3b + d (at most 1020)
@@ -220,12 +223,16 @@ pub(super) fn upsample8_sse2(near: &[u8], far: &[u8], dst: &mut [u8]) -> usize {
     let even = _mm_srli_epi16::<4>(_mm_add_epi16(_mm_add_epi16(times3(q), p), eight));
     _mm_or_si128(odd, _mm_slli_epi16::<8>(even))
   };
-  for x in (0..blocks).map(|n| 16 * n) {
-    let [a, b, c, d] = [&near[x..], &near[x + 1..], &far[x..], &far[x + 1..]].map(|s| load(s));
+  // sliced once: block k reads samples 16k..16k + 17 and writes bytes 32k + 1..32k + 33
+  let (near, far) = (&near[..16 * blocks + 1], &far[..16 * blocks + 1]);
+  let (out, _) = dst[1..].as_chunks_mut::<32>();
+  for (x, out) in (0..).step_by(16).zip(out) {
+    let (n, f) = (&near[x..][..17], &far[x..][..17]);
+    let [a, b, c, d] = [&n[..16], &n[1..], &f[..16], &f[1..]].map(|s| load(s));
     let lo = |s| _mm_unpacklo_epi8(s, z);
     let hi = |s| _mm_unpackhi_epi8(s, z);
-    store(&mut dst[2 * x + 1..], pairs(lo(a), lo(b), lo(c), lo(d)));
-    store(&mut dst[2 * x + 17..], pairs(hi(a), hi(b), hi(c), hi(d)));
+    store(out, pairs(lo(a), lo(b), lo(c), lo(d)));
+    store(&mut out[16..], pairs(hi(a), hi(b), hi(c), hi(d)));
   }
   16 * blocks
 }
@@ -577,20 +584,24 @@ pub(super) fn yuv12_avx2(
 #[target_feature(enable = "avx2")]
 pub(super) fn convert16_to8_avx2(src: &[u16], shift: u32, dst: &mut [u8]) -> usize {
   let (shift, max) = (_mm_cvtsi32_si128(shift as i32), _mm256_set1_epi16(255));
-  let (blocks, _) = dst.as_chunks_mut::<32>();
-  for (n, d) in blocks.iter_mut().enumerate() {
-    let s = |at: usize| _mm256_min_epu16(_mm256_srl_epi16(load32w(&src[at..]), shift), max);
+  let ((src, _), (dst, _)) = (src.as_chunks::<32>(), dst.as_chunks_mut::<32>());
+  for (s, d) in src.iter().zip(&mut *dst) {
+    let [lo, hi] =
+      [&s[..16], &s[16..]].map(|s| _mm256_min_epu16(_mm256_srl_epi16(load32w(s), shift), max));
     // packus works in each 128-bit half: samples 0..8, 16..24, 8..16, 24..32
-    let packed = _mm256_packus_epi16(s(32 * n), s(32 * n + 16));
+    let packed = _mm256_packus_epi16(lo, hi);
     store32(d, _mm256_permute4x64_epi64::<0b11_01_10_00>(packed));
   }
-  32 * blocks.len()
+  32 * src.len().min(dst.len())
 }
 
 /// `upsample8_sse2`, 32 pairs at a time.
 #[target_feature(enable = "avx2")]
 pub(super) fn upsample8_avx2(near: &[u8], far: &[u8], dst: &mut [u8]) -> usize {
   let blocks = dst.len().saturating_sub(1) / 2 / 32;
+  if blocks == 0 {
+    return 0;
+  }
   let (z, eight) = (_mm256_setzero_si256(), _mm256_set1_epi16(8));
   let pairs = |a, b, c, d| {
     let (p, q) = (
@@ -604,8 +615,12 @@ pub(super) fn upsample8_avx2(near: &[u8], far: &[u8], dst: &mut [u8]) -> usize {
       _mm256_slli_epi16::<8>(_mm256_srli_epi16::<4>(even)),
     )
   };
-  for x in (0..blocks).map(|n| 32 * n) {
-    let [a, b, c, d] = [&near[x..], &near[x + 1..], &far[x..], &far[x + 1..]].map(|s| load32(s));
+  // sliced once: block k reads samples 32k..32k + 33 and writes bytes 64k + 1..64k + 65
+  let (near, far) = (&near[..32 * blocks + 1], &far[..32 * blocks + 1]);
+  let (out, _) = dst[1..].as_chunks_mut::<64>();
+  for (x, out) in (0..).step_by(32).zip(out) {
+    let (n, f) = (&near[x..][..33], &far[x..][..33]);
+    let [a, b, c, d] = [&n[..32], &n[1..], &f[..32], &f[1..]].map(|s| load32(s));
     let lo = |s| _mm256_unpacklo_epi8(s, z);
     let hi = |s| _mm256_unpackhi_epi8(s, z);
     // pairs x..x + 8 and x + 16..x + 24, then x + 8..x + 16 and x + 24..x + 32
@@ -613,14 +628,8 @@ pub(super) fn upsample8_avx2(near: &[u8], far: &[u8], dst: &mut [u8]) -> usize {
       pairs(lo(a), lo(b), lo(c), lo(d)),
       pairs(hi(a), hi(b), hi(c), hi(d)),
     );
-    store32(
-      &mut dst[2 * x + 1..],
-      _mm256_permute2x128_si256::<0x20>(l, h),
-    );
-    store32(
-      &mut dst[2 * x + 33..],
-      _mm256_permute2x128_si256::<0x31>(l, h),
-    );
+    store32(out, _mm256_permute2x128_si256::<0x20>(l, h));
+    store32(&mut out[32..], _mm256_permute2x128_si256::<0x31>(l, h));
   }
   32 * blocks
 }
