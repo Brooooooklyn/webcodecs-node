@@ -217,6 +217,18 @@ test('ImageDecoder: a JPEG Chrome fails to decode rejects decode() and closes th
   }
 })
 
+test('ImageDecoder: frameIndex 1 of a JPEG is a RangeError before any decode, like Chrome', async (t) => {
+  for (const name of FRAME_ERRORS) {
+    for (const data of [fixture(name), twoPartStream(fixture(name))]) {
+      const decoder = new ImageDecoder({ data, type: 'image/jpeg' })
+      await t.throwsAsync(decoder.decode({ frameIndex: 1 }), { instanceOf: RangeError }, name)
+      // frame 0 was not decoded: the decoder is still open, and decode() fails now
+      t.false(decoder.closed, name)
+      await t.throwsAsync(decoder.decode(), FAILED, name)
+    }
+  }
+})
+
 test('ImageDecoder: a streamed JPEG fails when Chrome fails it, which rejects completed only before the end', async (t) => {
   for (const name of FRAME_ERRORS) {
     // half the data, decode() at once, the rest 30 ms later, then the close
