@@ -462,7 +462,9 @@ struct ImageDecoderInner {
   /// idle stream is decoded at once (see `FrameCall::Arrival`).
   jpeg_requests: u32,
   /// Whether a frame failed to decode where Chrome's decoder fails (JPEG): the decoder closes,
-  /// and the decode() calls still pending reject (see `closed_error`).
+  /// and the decode() calls still pending reject (see `closed_error`). A failure found by work
+  /// that a reset() made stale leaves the decoder open, and the next decode() closes it (see
+  /// `close_if_failed_in`). A close() that comes first clears it.
   frame_failed: bool,
   /// Track list
   tracks: ImageTrackList,
@@ -499,6 +501,32 @@ impl ImageDecoderInner {
     self.tracks.ready.store(true, Ordering::Release);
     self.tracks.ready_notify.notify_waiters();
     self.tracks.ready_notify.notify_one();
+  }
+
+  /// What reset() does to an open decoder. Like Chrome, whose decoder stays failed after a
+  /// reset(), it keeps `frame_failed`.
+  fn reset(&mut self) {
+    self.context = None;
+    self.cached_frames = None;
+    self.cache_epoch = self.cache_epoch.wrapping_add(1);
+    self.cached_data_len = 0;
+    // Like Chrome, the decode() calls that wait reject (`abort_if_reset`). A JPEG keeps its
+    // choice of RGB (`rgb_decode`).
+    self.jpeg_requests = 0;
+    // Wake them. Only once the tracks are ready: before that, `ready_notify` would also resolve
+    // `tracks.ready`, and the calls still wait for the tracks; they reject when the tracks are
+    // ready.
+    if self.tracks.ready.load(Ordering::Acquire) {
+      self.tracks.ready_notify.notify_waiters();
+    }
+
+    // Reset frame_count for animated formats (will be re-detected on next decode)
+    if let Ok(mut track_inner) = self.tracks.inner.lock()
+      && let Some(track) = track_inner.tracks.get_mut(0)
+      && track.animated
+    {
+      track.frame_count = 0;
+    }
   }
 }
 
@@ -954,28 +982,7 @@ impl ImageDecoder {
       return throw_invalid_state_error(&env, "ImageDecoder is closed");
     }
 
-    inner.context = None;
-    inner.cached_frames = None;
-    inner.cache_epoch = inner.cache_epoch.wrapping_add(1);
-    inner.cached_data_len = 0;
-    // Like Chrome, the decode() calls that wait reject (`abort_if_reset`). A JPEG keeps its
-    // choice of RGB (`rgb_decode`).
-    inner.jpeg_requests = 0;
-    // Wake them. Only once the tracks are ready: before that, `ready_notify` would also resolve
-    // `tracks.ready`, and the calls still wait for the tracks; they reject when the tracks are
-    // ready.
-    if inner.tracks.ready.load(Ordering::Acquire) {
-      inner.tracks.ready_notify.notify_waiters();
-    }
-
-    // Reset frame_count for animated formats (will be re-detected on next decode)
-    if let Ok(mut track_inner) = inner.tracks.inner.lock()
-      && let Some(track) = track_inner.tracks.get_mut(0)
-      && track.animated
-    {
-      track.frame_count = 0;
-    }
-
+    inner.reset();
     Ok(())
   }
 
@@ -989,6 +996,8 @@ impl ImageDecoder {
     // A metadata failure counts once `close_if_failed` has closed the decoder. A close() that
     // comes first wins, also when a worker thread already found the failure (`reject_metadata`).
     if !inner.closed {
+      // The same for a frame failure (`jpeg_frame`), also one that a reset() kept
+      inner.frame_failed = false;
       inner.tracks.failed.store(false, Ordering::Release);
     }
     inner.close();
@@ -1039,9 +1048,15 @@ fn decode_cached_frame(
   epoch: u64,
 ) -> Result<Option<ImageDecodeResult>> {
   let (needs_cache, data_complete, jpeg) = {
-    let guard = inner
+    let mut guard = inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    // A frame failure that a reset() kept from closing the decoder (`close_if_failed_in`). Like
+    // Chrome's decoder, which stays failed, the next decode() fails and closes it, whatever the
+    // frame index.
+    if !guard.closed && guard.frame_failed && guard.cache_epoch == epoch {
+      guard.close();
+    }
     if guard.closed {
       return Err(closed_error(&guard, frame_index));
     }
@@ -1068,7 +1083,7 @@ fn decode_cached_frame(
   // gives a frame only once it is whole.
   if needs_cache && (data_complete || jpeg) {
     cache_decoded_frames(inner, FrameCall::Decode(epoch)).map_err(|error| {
-      if !close_if_failed(inner) {
+      if !close_if_failed_in(inner, epoch) {
         return error;
       }
       inner
@@ -1684,7 +1699,9 @@ fn jpeg_frame(
   }
   let decode = match call {
     FrameCall::Probe => state.rgb_decode,
-    FrameCall::Decode(_) if all_data => state.complete,
+    // Not after a reset(): Chrome checks the abort flag before it decodes
+    // (image_decoder_core.cc Decode).
+    FrameCall::Decode(epoch) if all_data => state.complete && epoch == state.cache_epoch,
     FrameCall::Decode(epoch) => state.stream_idle && epoch == state.cache_epoch,
     FrameCall::Arrival => true,
   };
@@ -1693,6 +1710,7 @@ fn jpeg_frame(
   }
   let attempt = call != FrameCall::Probe;
   let result = decode_jpeg(data, scale, allow_yuv);
+  after_jpeg_decode();
   if attempt
     && !all_data
     && matches!(
@@ -1726,10 +1744,15 @@ fn jpeg_frame(
     // it: an error as soon as it decodes it, data that ends before the image does at a decode()
     // once the data is complete.
     result => {
-      if (attempt || result.is_err())
-        && let Ok(mut guard) = inner.lock()
-      {
-        guard.frame_failed = true;
+      if let Ok(mut guard) = inner.lock() {
+        // A close() that came first wins (`ImageDecoder::close`), as for a frame that decodes
+        // (`store_frames`).
+        if guard.closed {
+          return Err(invalid_state_error("ImageDecoder is closed"));
+        }
+        if attempt || result.is_err() {
+          guard.frame_failed = true;
+        }
       }
       Err(Error::new(
         Status::GenericFailure,
@@ -1755,12 +1778,46 @@ fn close_if_failed(inner: &Arc<Mutex<ImageDecoderInner>>) -> bool {
   let Ok(mut guard) = inner.lock() else {
     return false;
   };
+  close_on_failure(&mut guard)
+}
+
+/// `close_if_failed` with the lock held
+fn close_on_failure(guard: &mut ImageDecoderInner) -> bool {
   let failed = guard.tracks.failed.load(Ordering::Acquire) || guard.frame_failed;
   if failed && !guard.closed {
     guard.close();
   }
   failed
 }
+
+/// `close_if_failed` for the work of a decode() made when `cache_epoch` was `epoch`. Like Chrome,
+/// whose reset() drops the result of a decode in flight (image_decoder_external.cc
+/// decode_weak_factory_), a failure found by work that a reset() made stale does not close the
+/// decoder: the call rejects with AbortError (`abort_if_reset`), and the next decode() finds
+/// `frame_failed` (`decode_cached_frame`).
+fn close_if_failed_in(inner: &Arc<Mutex<ImageDecoderInner>>, epoch: u64) -> bool {
+  let Ok(mut guard) = inner.lock() else {
+    return false;
+  };
+  if !guard.closed && guard.cache_epoch != epoch {
+    return false;
+  }
+  close_on_failure(&mut guard)
+}
+
+/// Runs once `jpeg_frame` has decoded, before it records what it found: the tests make a reset()
+/// or a close() land there, while the work runs.
+#[cfg(test)]
+fn after_jpeg_decode() {
+  tests::AFTER_JPEG_DECODE.with(|hook| {
+    if let Some(hook) = hook.borrow_mut().as_mut() {
+      hook();
+    }
+  });
+}
+
+#[cfg(not(test))]
+fn after_jpeg_decode() {}
 
 /// Chrome's scale numerator M: libjpeg decodes a JPEG at M/8 of its size so that its 4-byte
 /// pixels fit the budget that desiredWidth/desiredHeight give
@@ -2058,6 +2115,15 @@ mod tests {
   use crate::codec::Frame;
   use crate::ffi::types::AV_NOPTS_VALUE;
 
+  use super::{
+    AVCodecID, ColorSpaceConversion, ImageDecoder, ImageDecoderData, ImageDecoderInner,
+    ImageTrackData, ImageTrackList, ImageTrackListInner, abort_if_reset, decode_cached_frame,
+  };
+  use napi::tokio::sync::Notify;
+  use std::cell::{Cell, RefCell};
+  use std::rc::Rc;
+  use std::sync::{Arc, Mutex, atomic::AtomicBool};
+
   #[test]
   fn parses_finite_and_infinite_gif_repetition_counts() {
     let mut extension = b"\x21\xff\x0bNETSCAPE2.0\x03\x01\x05\x00\x00".to_vec();
@@ -2177,5 +2243,176 @@ mod tests {
     normalize_frame_timing(&mut frames, (0, 0));
 
     assert_eq!(frames[0].pts(), 0);
+  }
+
+  thread_local! {
+    /// See `after_jpeg_decode`
+    pub(super) static AFTER_JPEG_DECODE: RefCell<Option<Box<dyn FnMut()>>> =
+      const { RefCell::new(None) };
+  }
+
+  /// A JPEG whose data ends inside its scan: Chrome fails its frame at a decode()
+  const TRUNCATED_JPEG: &[u8] = include_bytes!("../../__test__/fixtures/jpeg/truncated.jpg");
+
+  /// The state of an ImageDecoder made from a BufferSource with `data`, once its tracks are ready
+  fn jpeg_decoder(data: &[u8]) -> Arc<Mutex<ImageDecoderInner>> {
+    let tracks = ImageTrackList {
+      inner: Arc::new(Mutex::new(ImageTrackListInner {
+        tracks: vec![ImageTrackData {
+          animated: false,
+          frame_count: 1,
+          repetition_count: 0.0,
+        }],
+        selected_index: Some(0),
+      })),
+      ready: Arc::new(AtomicBool::new(true)),
+      failed: Arc::new(AtomicBool::new(false)),
+      ready_notify: Arc::new(Notify::new()),
+    };
+    Arc::new(Mutex::new(ImageDecoderInner {
+      data: ImageDecoderData::Vec(data.to_vec()),
+      mime_type: "image/jpeg".to_string(),
+      codec_id: Some(AVCodecID::Mjpeg),
+      context: None,
+      complete: Arc::new(AtomicBool::new(true)),
+      all_data: true,
+      rgb_decode: false,
+      stream_idle: false,
+      jpeg_requests: 0,
+      frame_failed: false,
+      tracks,
+      closed: false,
+      cached_frames: None,
+      cache_epoch: 0,
+      cached_data_len: 0,
+      color_space_conversion: ColorSpaceConversion::Default,
+      desired_width: None,
+      desired_height: None,
+      prefer_animation: None,
+    }))
+  }
+
+  /// The error reason of a result, or "ok"
+  fn reason<T>(result: napi::Result<T>) -> String {
+    match result {
+      Ok(_) => "ok".to_string(),
+      Err(error) => error.reason,
+    }
+  }
+
+  /// `decode_cached_frame` for a decode() made at `epoch`, with `hook` run where libjpeg has
+  /// decoded (`after_jpeg_decode`). Returns the error reason, and whether libjpeg ran.
+  fn decode_with_hook(
+    inner: &Arc<Mutex<ImageDecoderInner>>,
+    frame_index: usize,
+    epoch: u64,
+    mut hook: impl FnMut() + 'static,
+  ) -> (String, bool) {
+    let ran = Rc::new(Cell::new(false));
+    let hook_ran = ran.clone();
+    AFTER_JPEG_DECODE.with(|slot| {
+      *slot.borrow_mut() = Some(Box::new(move || {
+        hook_ran.set(true);
+        hook();
+      }))
+    });
+    let result = decode_cached_frame(inner, frame_index, epoch);
+    AFTER_JPEG_DECODE.with(|slot| *slot.borrow_mut() = None);
+    (reason(result), ran.get())
+  }
+
+  /// What `ImageDecoder::reset` does to an open decoder (the method needs an Env)
+  fn reset(inner: &Arc<Mutex<ImageDecoderInner>>) {
+    let mut guard = inner.lock().unwrap();
+    assert!(!guard.closed);
+    guard.reset();
+  }
+
+  fn close(inner: &Arc<Mutex<ImageDecoderInner>>) {
+    ImageDecoder {
+      inner: inner.clone(),
+    }
+    .close()
+    .unwrap();
+  }
+
+  #[test]
+  fn a_jpeg_frame_failure_closes_the_decoder() {
+    let inner = jpeg_decoder(TRUNCATED_JPEG);
+    let (error, ran) = decode_with_hook(&inner, 0, 0, || {});
+    assert!(ran);
+    assert_eq!(error, "Failed to decode frame at index 0");
+    assert!(inner.lock().unwrap().closed);
+  }
+
+  #[test]
+  fn a_reset_while_the_jpeg_work_runs_keeps_the_failure_for_the_next_decode() {
+    let inner = jpeg_decoder(TRUNCATED_JPEG);
+    let hook_inner = inner.clone();
+    let (error, ran) = decode_with_hook(&inner, 0, 0, move || reset(&hook_inner));
+    assert!(ran);
+    assert_eq!(error, "Failed to decode frame at index 0");
+    {
+      let guard = inner.lock().unwrap();
+      // Like Chrome, the reset() dropped what the work found: the decoder is still open
+      assert!(!guard.closed);
+      // and it stays failed, like Chrome's decoder
+      assert!(guard.frame_failed);
+    }
+    assert_eq!(
+      reason(abort_if_reset(&inner, 0)),
+      "AbortError: Aborted by reset."
+    );
+    // Like Chrome, the next decode() fails and closes the decoder, whatever the frame index
+    let (error, ran) = decode_with_hook(&inner, 1, 1, || {});
+    assert!(!ran);
+    assert_eq!(error, "Failed to decode frame at index 1");
+    assert!(inner.lock().unwrap().closed);
+  }
+
+  #[test]
+  fn a_reset_before_the_jpeg_work_starts_runs_no_libjpeg() {
+    let inner = jpeg_decoder(TRUNCATED_JPEG);
+    reset(&inner);
+    let (_, ran) = decode_with_hook(&inner, 0, 0, || {});
+    // Like Chrome, which checks the abort flag before it decodes
+    assert!(!ran);
+    {
+      let guard = inner.lock().unwrap();
+      assert!(!guard.closed);
+      assert!(!guard.frame_failed);
+    }
+    assert_eq!(
+      reason(abort_if_reset(&inner, 0)),
+      "AbortError: Aborted by reset."
+    );
+    // The next decode() does the work, and fails
+    let (error, ran) = decode_with_hook(&inner, 0, 1, || {});
+    assert!(ran);
+    assert_eq!(error, "Failed to decode frame at index 0");
+    assert!(inner.lock().unwrap().closed);
+  }
+
+  #[test]
+  fn a_close_while_the_jpeg_work_runs_wins() {
+    let inner = jpeg_decoder(TRUNCATED_JPEG);
+    let hook_inner = inner.clone();
+    let (error, ran) = decode_with_hook(&inner, 0, 0, move || close(&hook_inner));
+    assert!(ran);
+    assert_eq!(error, "InvalidStateError: ImageDecoder is closed");
+    let guard = inner.lock().unwrap();
+    assert!(guard.closed);
+    assert!(!guard.frame_failed);
+  }
+
+  #[test]
+  fn a_close_after_a_kept_jpeg_failure_wins() {
+    let inner = jpeg_decoder(TRUNCATED_JPEG);
+    let hook_inner = inner.clone();
+    decode_with_hook(&inner, 0, 0, move || reset(&hook_inner));
+    close(&inner);
+    let (error, ran) = decode_with_hook(&inner, 0, 1, || {});
+    assert!(!ran);
+    assert_eq!(error, "InvalidStateError: ImageDecoder is closed");
   }
 }

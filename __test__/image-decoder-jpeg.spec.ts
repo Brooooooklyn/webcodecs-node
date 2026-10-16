@@ -365,6 +365,54 @@ test('ImageDecoder: reset() before the JPEG header leaves tracks.ready pending',
   }
 })
 
+// @napi-rs/canvas has no aarch64 Windows build
+const canvasTest = process.platform === 'win32' && process.arch === 'arm64' ? test.skip : test
+
+// A reset() while a decode()'s frame work runs: like Chrome, the reset() drops what the work finds.
+// The work fails here, but the decode() rejects with AbortError and the decoder stays open. Chrome's
+// decoder stays failed, so the next decode() fails and closes it. A reset() before the work starts
+// gives the same results.
+canvasTest('ImageDecoder: a JPEG frame that fails after reset() closes the decoder at the next decode(), like Chrome', async (t) => {
+  const { createCanvas } = await import('@napi-rs/canvas')
+  // 4000x3000 of noise (about 10 MB): libjpeg-turbo takes tens of ms, and the reset() below comes
+  // while it runs
+  const canvas = createCanvas(4000, 3000)
+  const ctx = canvas.getContext('2d')
+  const noise = ctx.createImageData(4000, 3000)
+  const pixels = noise.data
+  let seed = 1
+  for (let i = 0; i < pixels.length; i += 4) {
+    seed = (Math.imul(seed, 1103515245) + 12345) >>> 0
+    pixels[i] = seed >>> 24
+    pixels[i + 1] = (seed >>> 16) & 255
+    pixels[i + 2] = (seed >>> 8) & 255
+    pixels[i + 3] = 255
+  }
+  ctx.putImageData(noise, 0, 0)
+  const jpeg = new Uint8Array(canvas.encodeSync('jpeg', 90))
+  const sos = jpeg.findIndex((byte, i) => byte === 0xff && jpeg[i + 1] === 0xda)
+  // the data ends inside the scan
+  const data = jpeg.subarray(0, sos + Math.floor((jpeg.length - sos) * 0.9))
+  for (let attempt = 1; ; attempt++) {
+    const decoder = new ImageDecoder({ data, type: 'image/jpeg' })
+    await decoder.tracks.ready
+    const stale = decoder.decode()
+    stale.catch(() => {})
+    await sleep(0)
+    // On a busy machine the work can fail and close the decoder before reset(): try again
+    if (decoder.closed && attempt < 5) {
+      await t.throwsAsync(stale, FAILED)
+      continue
+    }
+    decoder.reset()
+    await t.throwsAsync(stale, ABORTED)
+    t.false(decoder.closed)
+    await t.throwsAsync(decoder.decode(), FAILED)
+    t.true(decoder.closed)
+    break
+  }
+})
+
 // 12-bit, arithmetic coding, 100 scans (Blink's limit), data that ends before the image, no EOI
 const FRAME_ERRORS = ['12-bit.jpg', 'arithmetic.jpg', 'scans-100.jpg', 'truncated.jpg', 'no-eoi.jpg']
 
