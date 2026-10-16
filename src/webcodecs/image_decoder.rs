@@ -544,7 +544,9 @@ struct ImageDecoderInner {
   /// the decoder. A reset() keeps them, like Chrome's.
   failed_frames: HashSet<usize>,
   /// Whether every frame failed to decode: the decoder then closed, and the decode() calls still
-  /// pending reject with EncodingError (see `closed_error`)
+  /// pending reject with EncodingError (see `closed_error`). As for `frame_failed`, a failure
+  /// found by a decode() that a reset() made stale leaves the decoder open, and the next decode()
+  /// closes it on the JS thread (`apply_frame_failure`). A close() that comes first clears it.
   frames_failed: bool,
   /// The ticket of the next decode() call. Like Chrome, the calls are handled one at a time, in
   /// call order: each one waits until `decode_turn` is its ticket.
@@ -581,7 +583,7 @@ impl ImageDecoderInner {
   }
 
   /// What reset() does to an open decoder. Like Chrome, whose decoder stays failed after a
-  /// reset(), it keeps `frame_failed`.
+  /// reset(), it keeps `frame_failed` and `frames_failed`.
   fn reset(&mut self) {
     self.context = None;
     self.cached_frames = None;
@@ -1252,8 +1254,10 @@ impl ImageDecoder {
     // task that made the decoder reaches close(), so without this the track after an early
     // close() changes from run to run. The other formats keep what the worker found, as before.
     if !inner.closed {
-      // The same for a frame failure (`jpeg_frame`), also one that a reset() kept
+      // The same for a frame failure (`jpeg_frame`, every frame of a GIF or BMP), also one that a
+      // reset() kept
       inner.frame_failed = None;
+      inner.frames_failed = false;
       inner.tracks.failed.store(false, Ordering::Release);
       if inner.codec_id == Some(AVCodecID::Gif)
         && !inner.tracks.ready.load(Ordering::Acquire)
@@ -1315,13 +1319,16 @@ fn decode_cached_frame(
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
     // A frame failure that left the decoder open: one that the collector found for this
-    // decode(), or one that a reset() kept (`frame_failed`). Like Chrome's decoder, which stays
-    // failed, the decode() fails, whatever the frame index. It closes the decoder on the JS
-    // thread, where a reset() made first still keeps the failure (`apply_frame_failure`). Once
-    // the JS thread has read the end of the stream, it waits for the end's result (`complete`),
-    // as Chrome answers in the order it was asked, unless the collector left that to the JS
-    // thread (`end_deferred`).
-    if !guard.closed && guard.frame_failed.is_some() && guard.cache_epoch == epoch {
+    // decode(), or one that a reset() kept (`frame_failed`, and the frames that all failed
+    // below). Like Chrome's decoder, which stays failed, the decode() fails, whatever the frame
+    // index. It closes the decoder on the JS thread, where a reset() made first still keeps the
+    // failure (`apply_frame_failure`). Once the JS thread has read the end of a JPEG stream, it
+    // waits for the end's result (`complete`), as Chrome answers in the order it was asked,
+    // unless the collector left that to the JS thread (`end_deferred`).
+    if !guard.closed
+      && (guard.frame_failed.is_some() || guard.frames_failed)
+      && guard.cache_epoch == epoch
+    {
       if guard.stream_ended && !guard.complete.load(Ordering::Acquire) && !guard.end_deferred {
         return Ok(None);
       }
@@ -1442,7 +1449,12 @@ fn decode_cached_frame(
       // come, it waits for the data before it rejects.
       if guard.failed_frames.len() == count {
         guard.frames_failed = true;
-        guard.close();
+        // Not for a decode() that a reset() made stale (it built these frames after the reset()):
+        // like Chrome, whose reset() drops the result of a decode in flight, it rejects with
+        // AbortError (`abort_if_reset`), and the decoder stays failed: the next decode() closes it.
+        if guard.cache_epoch == epoch {
+          guard.close();
+        }
         return Err(Error::new(
           Status::GenericFailure,
           format!("Failed to decode frame at index {frame_index}"),
@@ -1548,11 +1560,12 @@ fn frame_failure(frame_index: usize) -> Error {
 }
 
 /// On the JS thread, as a decode() made when `cache_epoch` was `epoch` rejects with `error`: a
-/// JPEG frame failure that left the decoder open (`decode_cached_frame`) closes it now. Chrome
-/// applies a failed decode the same way, on the main thread in a task of its own
-/// (ImageDecoderExternal::OnDecodeReady, SetFailed), so a reset() made in the meantime, even in the
-/// same task as the decode(), drops it: the call rejects with AbortError and the decoder stays
-/// failed for the next decode(). A close() made first wins (`closed_error`).
+/// frame failure that left the decoder open (`decode_cached_frame`: a JPEG frame, or every frame
+/// of a GIF or BMP) closes it now. Chrome applies a failed decode the same way, on the main
+/// thread in a task of its own (ImageDecoderExternal::OnDecodeReady, SetFailed), so a reset()
+/// made in the meantime, even in the same task as the decode(), drops it: the call rejects with
+/// AbortError and the decoder stays failed for the next decode(). A close() made first wins
+/// (`closed_error`).
 fn apply_frame_failure(
   inner: &Arc<Mutex<ImageDecoderInner>>,
   epoch: u64,
@@ -1569,7 +1582,7 @@ fn apply_frame_failure(
     if guard.cache_epoch != epoch {
       return abort_error("Aborted by reset.");
     }
-    if guard.frame_failed.is_none() {
+    if guard.frame_failed.is_none() && !guard.frames_failed {
       return error;
     }
     // A failure kept from before a reset(), while the JS thread has yet to settle the end of the
@@ -3677,6 +3690,11 @@ mod tests {
 
   /// The state of an ImageDecoder made from a BufferSource with `data`, once its tracks are ready
   fn jpeg_decoder(data: &[u8]) -> Arc<Mutex<ImageDecoderInner>> {
+    decoder(data, AVCodecID::Mjpeg, "image/jpeg")
+  }
+
+  /// `jpeg_decoder` for another format
+  fn decoder(data: &[u8], codec_id: AVCodecID, mime_type: &str) -> Arc<Mutex<ImageDecoderInner>> {
     let tracks = ImageTrackList {
       inner: Arc::new(Mutex::new(ImageTrackListInner {
         tracks: vec![ImageTrackData {
@@ -3692,8 +3710,8 @@ mod tests {
     };
     Arc::new(Mutex::new(ImageDecoderInner {
       data: ImageDecoderData::Vec(data.to_vec()),
-      mime_type: "image/jpeg".to_string(),
-      codec_id: Some(AVCodecID::Mjpeg),
+      mime_type: mime_type.to_string(),
+      codec_id: Some(codec_id),
       context: None,
       complete: Arc::new(AtomicBool::new(true)),
       all_data: true,
@@ -3726,16 +3744,6 @@ mod tests {
       desired_height: None,
       prefer_animation: None,
     }))
-  }
-
-  /// The state of an ImageDecoder with `data` and a chosen codec, once its tracks are ready.
-  fn decoder(data: &[u8], codec_id: AVCodecID, mime_type: &str) -> Arc<Mutex<ImageDecoderInner>> {
-    let inner = jpeg_decoder(data);
-    let mut guard = inner.lock().unwrap();
-    guard.codec_id = Some(codec_id);
-    guard.mime_type = mime_type.to_string();
-    drop(guard);
-    inner
   }
 
   /// The error reason of a result, or "ok"
@@ -4336,7 +4344,7 @@ mod tests {
     BEFORE_STORE_FRAMES.with(|slot| {
       *slot.borrow_mut() = Some(Box::new(move || reset(&hook_inner)));
     });
-    let result = cache_decoded_frames(&inner, FrameCall::Probe, true);
+    let result = cache_decoded_frames(&inner, FrameCall::Probe, true, true);
     BEFORE_STORE_FRAMES.with(|slot| *slot.borrow_mut() = None);
     assert_eq!(reason(result), "ok");
     {
@@ -4365,6 +4373,71 @@ mod tests {
     assert_eq!(
       reason(decode_cached_frame(&inner, 2, 1)),
       "Failed to decode frame at index 2"
+    );
+  }
+
+  /// gif(4, 2, PALETTE, [fullFrame({ codes: BAD_CODES })]) of image-decoder.spec.ts: its one frame
+  /// fails, so every frame does
+  const BAD_GIF: &[u8] = &[
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x04, 0x00, 0x02, 0x00, 0xf1, 0x00, 0x00, 0xff, 0x00, 0x00,
+    0x00, 0xff, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00,
+    0x02, 0x00, 0x00, 0x02, 0x01, 0x3c, 0x00, 0x3b,
+  ];
+
+  #[test]
+  fn a_gif_whose_frames_all_fail_closes_the_decoder() {
+    let inner = decoder(BAD_GIF, AVCodecID::Gif, "image/gif");
+    assert_eq!(
+      reason(decode_cached_frame(&inner, 0, 0)),
+      "Failed to decode frame at index 0"
+    );
+    let guard = inner.lock().unwrap();
+    assert!(guard.closed);
+    assert!(guard.frames_failed);
+  }
+
+  #[test]
+  fn a_gif_decode_made_before_a_reset_keeps_the_failure_for_the_next_decode() {
+    let inner = decoder(BAD_GIF, AVCodecID::Gif, "image/gif");
+    // The reset() lands once the call's turn has come (`abort_if_reset`), before its work: the
+    // call builds the frames again, for the new cache_epoch, and they all fail
+    reset(&inner);
+    assert_eq!(
+      reason(decode_cached_frame(&inner, 0, 0)),
+      "Failed to decode frame at index 0"
+    );
+    {
+      let guard = inner.lock().unwrap();
+      // Like Chrome, the reset() dropped what the call found: the decoder is still open
+      assert!(!guard.closed);
+      // and it stays failed, like Chrome's decoder
+      assert!(guard.frames_failed);
+    }
+    assert_eq!(
+      reason(abort_if_reset(&inner, 0)),
+      "AbortError: Aborted by reset."
+    );
+    // Like Chrome, the next decode() fails, whatever the frame index (the GIF has no frame 1),
+    // and closes the decoder on the JS thread
+    let error = decode_cached_frame(&inner, 1, 1).err().unwrap();
+    assert_eq!(error.reason, "Failed to decode frame at index 1");
+    assert!(!inner.lock().unwrap().closed);
+    assert_eq!(
+      apply_frame_failure(&inner, 1, 1, error).reason,
+      "Failed to decode frame at index 1"
+    );
+    assert!(inner.lock().unwrap().closed);
+  }
+
+  #[test]
+  fn a_close_after_a_kept_gif_failure_wins() {
+    let inner = decoder(BAD_GIF, AVCodecID::Gif, "image/gif");
+    reset(&inner);
+    let _ = decode_cached_frame(&inner, 0, 0);
+    close(&inner);
+    assert_eq!(
+      reason(decode_cached_frame(&inner, 0, 1)),
+      "InvalidStateError: ImageDecoder is closed"
     );
   }
 }
