@@ -609,7 +609,19 @@ fn room_for(size: usize) -> Result<Vec<u8>, GifError> {
   Ok(buffer)
 }
 
-/// Writes LZW output into the frame rect (Wuffs copy_to_image_buffer)
+/// Counts the steps of `Pixels` and `Lzw`, for the work bounds in the tests
+#[cfg(test)]
+fn work(steps: usize) {
+  tests::WORK.with(|work| work.set(work.get() + steps as u64));
+}
+
+#[cfg(not(test))]
+fn work(_: usize) {}
+
+/// Writes LZW output into the frame rect (Wuffs copy_to_image_buffer). The pixels go in
+/// row by row, and in an interlaced frame pass by pass. Output that lands off the canvas
+/// is skipped without being read, so a frame costs steps for its codes, the pixels it
+/// writes and its rows on the canvas, whatever the size of its rect.
 struct Pixels<'c> {
   canvas: &'c mut [u8],
   width: u32,
@@ -627,36 +639,119 @@ const INTERLACE_START: [u32; 5] = [u32::MAX, 1, 2, 4, 0];
 const INTERLACE_DELTA: [u32; 5] = [1, 2, 4, 8, 8];
 
 impl Pixels<'_> {
-  fn put(&mut self, indexes: &[u8]) {
-    let mut indexes = indexes.iter();
-    // Pixel data past the frame rect is ignored. A zero-width frame moves down one
-    // row per step until it is done.
-    while self.y < self.rect.y1 {
-      if self.x < self.rect.x1 {
-        let Some(&index) = indexes.next() else {
-          return;
+  /// Puts the output of one LZW code. Pixel data past the frame rect is ignored.
+  fn put(&mut self, output: &Output) {
+    let rect = self.rect;
+    let len = output.len();
+    let mut done = 0;
+    while done < len && self.y < rect.y1 {
+      work(1);
+      if rect.x0 == rect.x1 {
+        // a zero-width frame moves down one row per step until it is done
+        self.y = if self.interlace > 0 {
+          u32::MAX
+        } else {
+          rect.y1
         };
-        if self.x < self.width && self.y < self.height {
-          let color = self.palette[usize::from(index)];
-          // the transparent index keeps the pixel below
-          if color[3] != 0 {
-            let at = (self.y as usize * self.width as usize + self.x as usize) * 4;
-            self.canvas[at..at + 4].copy_from_slice(&color);
-          }
-        }
-        self.x += 1;
-        if self.x < self.rect.x1 {
-          continue;
-        }
-      } else if indexes.len() == 0 {
+        self.interlace = 0;
         return;
       }
-      self.x = self.rect.x0;
-      self.y = self.y.saturating_add(INTERLACE_DELTA[self.interlace]);
-      while self.interlace > 0 && self.y >= self.rect.y1 {
-        self.interlace -= 1;
-        self.y = self.rect.y0.saturating_add(INTERLACE_START[self.interlace]);
-      }
+      let left = len - done;
+      let n = if self.x < self.width && self.y < self.height {
+        // on the canvas, up to its right edge or the end of the row
+        let n = ((rect.x1.min(self.width) - self.x) as usize).min(left);
+        let row = self.y as usize * self.width as usize + self.x as usize;
+        let (canvas, palette) = (&mut *self.canvas, self.palette);
+        output.each_rev(done, done + n, |i, index| {
+          let color = palette[usize::from(index)];
+          // the transparent index keeps the pixel below
+          if color[3] != 0 {
+            let at = (row + i - done) * 4;
+            canvas[at..at + 4].copy_from_slice(&color);
+          }
+        });
+        n
+      } else {
+        self.off_canvas().min(left as u64) as usize
+      };
+      self.skip(n as u64);
+      done += n;
+    }
+  }
+
+  /// Pixels from here (off the canvas) to the next one on the canvas, or to the end of
+  /// this pass
+  fn off_canvas(&self) -> u64 {
+    let rect = self.rect;
+    let delta = INTERLACE_DELTA[self.interlace];
+    let rest = u64::from(rect.x1 - self.x);
+    let rows_below = u64::from((rect.y1 - 1 - self.y) / delta);
+    // the rows below in this pass are off the canvas when it ends above them or left of the rect
+    if rect.x0 >= self.width || self.y + delta >= self.height {
+      rest + rows_below * u64::from(rect.x1 - rect.x0)
+    } else {
+      rest
+    }
+  }
+
+  /// Moves over `n` pixels without writing them, as far as one step per pixel would. `n` is at
+  /// most the pixels left in this pass, and the frame is at least one pixel wide.
+  fn skip(&mut self, n: u64) {
+    let width = u64::from(self.rect.x1 - self.rect.x0);
+    let x = u64::from(self.x - self.rect.x0) + n;
+    let rows = x / width;
+    if rows > 0 {
+      // to the last row passed, then on to the next row
+      self.y += (rows - 1) as u32 * INTERLACE_DELTA[self.interlace];
+      self.next_row();
+    }
+    self.x = self.rect.x0 + (x % width) as u32;
+  }
+
+  /// To the start of the next row, which in an interlaced frame is in the next pass that has
+  /// rows once this pass is done
+  fn next_row(&mut self) {
+    self.x = self.rect.x0;
+    self.y = self.y.saturating_add(INTERLACE_DELTA[self.interlace]);
+    while self.interlace > 0 && self.y >= self.rect.y1 {
+      self.interlace -= 1;
+      self.y = self.rect.y0.saturating_add(INTERLACE_START[self.interlace]);
+    }
+  }
+}
+
+/// The output of one LZW code: the string of table code `code`, then `extra` for a code
+/// that is being defined (KwKwK)
+struct Output<'l> {
+  lzw: &'l Lzw,
+  code: usize,
+  extra: Option<u8>,
+}
+
+impl Output<'_> {
+  fn len(&self) -> usize {
+    usize::from(self.lzw.len[self.code]) + usize::from(self.extra.is_some())
+  }
+
+  /// Calls `f` with each of bytes `start..end` (and its offset), last to first. It takes
+  /// O(log(len) + end - start) steps.
+  fn each_rev(&self, start: usize, mut end: usize, mut f: impl FnMut(usize, u8)) {
+    let lzw = self.lzw;
+    let len = usize::from(lzw.len[self.code]);
+    if let Some(extra) = self.extra
+      && end > len
+    {
+      f(len, extra);
+      end = len;
+    }
+    if start >= end {
+      return;
+    }
+    work(end - start);
+    let mut code = lzw.prefix_code(self.code, end);
+    for i in (start..end).rev() {
+      f(i, lzw.suffix[code]);
+      code = usize::from(lzw.prefix[code]);
     }
   }
 }
@@ -678,7 +773,9 @@ struct Lzw {
   suffix: Vec<u8>,
   first: Vec<u8>,
   len: Vec<u16>,
-  stack: Vec<u8>,
+  /// A shorter prefix of each code's string, so that any prefix is found in O(log len) steps
+  /// (Myers' jump pointers)
+  jump: Vec<u16>,
 }
 
 enum LzwStep {
@@ -703,15 +800,30 @@ impl Lzw {
       suffix: vec![0; 4096],
       first: vec![0; 4096],
       len: vec![0; 4096],
-      stack: Vec::with_capacity(4096),
+      jump: vec![0; 4096],
     };
     for code in 0..clear as usize {
       lzw.suffix[code] = code as u8;
       lzw.first[code] = code as u8;
       lzw.len[code] = 1;
+      lzw.jump[code] = code as u16;
     }
     lzw.reset();
     lzw
+  }
+
+  /// The code of the first `len` bytes of `code`'s string (1 <= `len` <= its length)
+  fn prefix_code(&self, mut code: usize, len: usize) -> usize {
+    while usize::from(self.len[code]) > len {
+      work(1);
+      let jump = usize::from(self.jump[code]);
+      code = if usize::from(self.len[jump]) >= len {
+        jump
+      } else {
+        usize::from(self.prefix[code])
+      };
+    }
+    code
   }
 
   fn reset(&mut self) {
@@ -739,22 +851,17 @@ impl Lzw {
         if code > self.save {
           return LzwStep::BadCode;
         }
+        work(1);
         // KwKwK: the code being defined is the previous string plus its first byte
         let c = if code == self.save { self.prev } else { code };
         let first = self.first[c as usize];
-        // once the frame is full, Pixels::put drops the output; only the table changes
+        // once the frame is full, the output is dropped; only the table changes
         if out.y < out.rect.y1 {
-          self.stack.clear();
-          let mut at = c as usize;
-          for _ in 0..self.len[c as usize] {
-            self.stack.push(self.suffix[at]);
-            at = usize::from(self.prefix[at]);
-          }
-          self.stack.reverse();
-          if code == self.save {
-            self.stack.push(first);
-          }
-          out.put(&self.stack);
+          out.put(&Output {
+            lzw: self,
+            code: c as usize,
+            extra: (code == self.save).then_some(first),
+          });
         }
         if self.save <= 4095 {
           // the first code after a clear code fills the unused end-code slot
@@ -764,6 +871,12 @@ impl Lzw {
             self.suffix[save] = first;
             self.first[save] = self.first[prev];
             self.len[save] = self.len[prev] + 1;
+            // when the jump of `prev` is as long as the jump after it, jump over both; else to `prev`
+            let jump = usize::from(self.jump[prev]);
+            let jump2 = self.jump[jump];
+            let same =
+              self.len[prev] - self.len[jump] == self.len[jump] - self.len[usize::from(jump2)];
+            self.jump[save] = if same { jump2 } else { prev as u16 };
           }
           self.save += 1;
           if self.width < 12 {
@@ -781,6 +894,175 @@ impl Lzw {
 mod tests {
   use super::*;
   use crate::webcodecs::chrome_cases::{self, Expected, fnv1a};
+  use std::cell::Cell;
+
+  thread_local! {
+    /// Steps counted by `work`
+    pub(super) static WORK: Cell<u64> = const { Cell::new(0) };
+  }
+
+  /// The output path of 33da7b1, before output off the canvas was skipped: `decode` reads each
+  /// code's whole string into a stack, and `put` steps over each index of it. The tests check
+  /// that `GifDecoder::draw` gives the same results.
+  mod reference {
+    use super::super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+      /// Bytes read into the stack
+      pub static READ: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub fn put(out: &mut Pixels, indexes: &[u8]) {
+      let mut indexes = indexes.iter();
+      // Pixel data past the frame rect is ignored. A zero-width frame moves down one
+      // row per step until it is done.
+      while out.y < out.rect.y1 {
+        if out.x < out.rect.x1 {
+          let Some(&index) = indexes.next() else {
+            return;
+          };
+          if out.x < out.width && out.y < out.height {
+            let color = out.palette[usize::from(index)];
+            // the transparent index keeps the pixel below
+            if color[3] != 0 {
+              let at = (out.y as usize * out.width as usize + out.x as usize) * 4;
+              out.canvas[at..at + 4].copy_from_slice(&color);
+            }
+          }
+          out.x += 1;
+          if out.x < out.rect.x1 {
+            continue;
+          }
+        } else if indexes.len() == 0 {
+          return;
+        }
+        out.x = out.rect.x0;
+        out.y = out.y.saturating_add(INTERLACE_DELTA[out.interlace]);
+        while out.interlace > 0 && out.y >= out.rect.y1 {
+          out.interlace -= 1;
+          out.y = out.rect.y0.saturating_add(INTERLACE_START[out.interlace]);
+        }
+      }
+    }
+
+    /// Decodes one data sub-block
+    pub fn decode(lzw: &mut Lzw, stack: &mut Vec<u8>, block: &[u8], out: &mut Pixels) -> LzwStep {
+      for &byte in block {
+        lzw.bits |= u32::from(byte) << lzw.n_bits;
+        lzw.n_bits += 8;
+        while lzw.n_bits >= lzw.width {
+          let code = lzw.bits & ((1 << lzw.width) - 1);
+          lzw.bits >>= lzw.width;
+          lzw.n_bits -= lzw.width;
+          if code == lzw.clear {
+            lzw.reset();
+            continue;
+          }
+          if code == lzw.end {
+            return LzwStep::End;
+          }
+          if code > lzw.save {
+            return LzwStep::BadCode;
+          }
+          // KwKwK: the code being defined is the previous string plus its first byte
+          let c = if code == lzw.save { lzw.prev } else { code };
+          let first = lzw.first[c as usize];
+          // once the frame is full, Pixels::put drops the output; only the table changes
+          if out.y < out.rect.y1 {
+            stack.clear();
+            let mut at = c as usize;
+            for _ in 0..lzw.len[c as usize] {
+              stack.push(lzw.suffix[at]);
+              at = usize::from(lzw.prefix[at]);
+            }
+            stack.reverse();
+            if code == lzw.save {
+              stack.push(first);
+            }
+            READ.set(READ.get() + stack.len() as u64);
+            put(out, stack);
+          }
+          if lzw.save <= 4095 {
+            // the first code after a clear code fills the unused end-code slot
+            if lzw.prev != lzw.end {
+              let (save, prev) = (lzw.save as usize, lzw.prev as usize);
+              lzw.prefix[save] = prev as u16;
+              lzw.suffix[save] = first;
+              lzw.first[save] = lzw.first[prev];
+              lzw.len[save] = lzw.len[prev] + 1;
+            }
+            lzw.save += 1;
+            if lzw.width < 12 {
+              lzw.width += 1 & (lzw.save >> lzw.width);
+            }
+            lzw.prev = code;
+          }
+        }
+      }
+      LzwStep::More
+    }
+
+    /// Draws frame `i` on `canvas` (Wuffs decode_frame with the BGRA_NONPREMUL swizzler)
+    pub fn draw(gif: &GifDecoder, frame: &GifFrameInfo, canvas: &mut [u8]) -> Result<(), GifError> {
+      let mut r = Reader {
+        data: gif.data,
+        pos: frame.pos,
+      };
+      let (flags, local) = r.flags_and_palette()?;
+      let mut palette = match local {
+        Some(table) => {
+          let mut palette = [[0, 0, 0, 255]; 256];
+          fill_palette(&mut palette, table);
+          palette
+        }
+        None => gif.palette,
+      };
+      if let Some(index) = frame.transparent {
+        palette[usize::from(index)] = [0; 4];
+      }
+      let mut lzw = Lzw::new(r.literal_width()?);
+      let mut stack = Vec::with_capacity(4096);
+      let rect = frame.rect;
+      // a dry run (`check`) has no canvas: it reads the same data, and writes no pixel
+      let (width, height) = if canvas.is_empty() {
+        (0, 0)
+      } else {
+        (gif.width, gif.height)
+      };
+      let mut out = Pixels {
+        canvas,
+        width,
+        height,
+        rect,
+        x: rect.x0,
+        y: rect.y0,
+        interlace: if flags & 0x40 != 0 { 4 } else { 0 },
+        palette: &palette,
+      };
+      let mut lzw_done = false;
+      loop {
+        let block = match r.u8()? {
+          0 => break,
+          n => r.take(usize::from(n))?,
+        };
+        if lzw_done {
+          continue;
+        }
+        match decode(&mut lzw, &mut stack, block, &mut out) {
+          LzwStep::More => {}
+          LzwStep::End => lzw_done = true,
+          // QUIRK_IGNORE_TOO_MUCH_PIXEL_DATA: a bad code after the last row is fine
+          LzwStep::BadCode if out.y >= rect.y1 && out.interlace == 0 => lzw_done = true,
+          LzwStep::BadCode => return Err(GifError("bad LZW code")),
+        }
+      }
+      if out.y < rect.y1 && rect.x0 != rect.x1 && rect.y0 != rect.y1 {
+        return Err(GifError("not enough pixel data"));
+      }
+      Ok(())
+    }
+  }
 
   #[test]
   fn frames_match_chrome() {
@@ -941,6 +1223,391 @@ mod tests {
         Some("truncated data"),
       ] {
         assert!(seen.contains_key(&(interlaced, error)), "{seen:?}");
+      }
+    }
+  }
+
+  /// SplitMix64
+  struct Rng(u64);
+
+  impl Rng {
+    /// A number in 0..n
+    fn below(&mut self, n: u64) -> u64 {
+      self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+      let mut z = self.0;
+      z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+      z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+      (z ^ (z >> 31)) % n
+    }
+  }
+
+  /// LZW data of literal width `lw` with these codes. The code width grows as in `Lzw::decode`.
+  fn pack(lw: u32, codes: &[u32]) -> Vec<u8> {
+    let (clear, end) = (1 << lw, (1 << lw) + 1);
+    let (mut bits, mut n, mut width, mut save) = (0u64, 0, lw + 1, end);
+    let mut data = Vec::new();
+    for &code in codes {
+      bits |= u64::from(code) << n;
+      n += width;
+      while n >= 8 {
+        data.push(bits as u8);
+        bits >>= 8;
+        n -= 8;
+      }
+      if code == clear {
+        (width, save) = (lw + 1, end);
+      } else if code != end && save <= 4095 {
+        save += 1;
+        if width < 12 {
+          width += 1 & (save >> width);
+        }
+      }
+    }
+    if n > 0 {
+      data.push(bits as u8);
+    }
+    data
+  }
+
+  /// `count` LZW codes of literal width 2 whose strings grow by one: a clear code, index 1,
+  /// each new code (KwKwK) up to `longest`, then `longest` again. Code `c` gives `c - 4`
+  /// indexes, so the output is far larger than the data.
+  fn growing(longest: u32, count: usize) -> Vec<u32> {
+    let codes = [4, 1].into_iter().chain(6..=longest);
+    codes
+      .chain(std::iter::repeat(longest))
+      .take(count)
+      .collect()
+  }
+
+  /// A clear code, then `count` valid LZW codes of literal width `lw`: mostly the newest table
+  /// codes, whose strings grow long, then other table codes, literals and a few clear codes
+  fn random_codes(rng: &mut Rng, lw: u32, count: usize) -> Vec<u32> {
+    let (clear, end) = (1 << lw, (1 << lw) + 1);
+    let (mut codes, mut save) = (vec![clear], end);
+    for _ in 0..count {
+      // the codes that may come: literals, and table codes up to the next one (KwKwK)
+      let last = save.min(4095);
+      let code = match rng.below(1000) {
+        _ if save == end || last <= end => rng.below(u64::from(clear)) as u32,
+        0 => clear,
+        1..800 => last - rng.below(u64::from(last - end).min(3)) as u32,
+        800..900 => end + 1 + rng.below(u64::from(last - end)) as u32,
+        _ => rng.below(u64::from(clear)) as u32,
+      };
+      codes.push(code);
+      if code == clear {
+        save = end;
+      } else if save <= 4095 {
+        save += 1;
+      }
+    }
+    codes
+  }
+
+  /// A frame for `frames_gif`: rect (x, y, w, h), interlaced, transparent index, LZW data of
+  /// literal width 2
+  type TestFrame<'a> = ([u16; 4], bool, Option<u8>, &'a [u8]);
+
+  /// A GIF89a with a 2-color global table on a `screen`, and these frames
+  fn frames_gif(screen: (u16, u16), frames: &[TestFrame]) -> Vec<u8> {
+    let mut b = b"GIF89a".to_vec();
+    b.extend(screen.0.to_le_bytes());
+    b.extend(screen.1.to_le_bytes());
+    b.extend([0x80, 0, 0, 0, 0, 0, 255, 255, 255]);
+    for &(rect, interlaced, transparent, lzw) in frames {
+      if let Some(index) = transparent {
+        b.extend([0x21, 0xf9, 4, 1, 0, 0, index, 0]);
+      }
+      b.push(0x2c);
+      rect.iter().for_each(|v| b.extend(v.to_le_bytes()));
+      b.extend([if interlaced { 0x40 } else { 0 }, 2]);
+      for block in lzw.chunks(255) {
+        b.push(block.len() as u8);
+        b.extend(block);
+      }
+      b.push(0);
+    }
+    b.push(0x3b);
+    b
+  }
+
+  /// `frames_gif` with a 1x1 first frame, so that the canvas is the screen, then `frame`
+  fn second_frame_gif(screen: (u16, u16), frame: TestFrame) -> Vec<u8> {
+    let dot = pack(2, &[4, 1, 5]);
+    frames_gif(screen, &[([0, 0, 1, 1], false, None, &dot), frame])
+  }
+
+  /// Draws each frame of `file` with `GifDecoder::draw` and with the reference, from the same
+  /// canvas and with no canvas (`check`), and checks that the results and the pixels are the
+  /// same. Returns the steps `draw` took.
+  fn same_as_reference(file: &[u8]) -> u64 {
+    let gif = GifDecoder::new(file).unwrap();
+    let size = gif.width() as usize * gif.height() as usize * 4;
+    // each pixel different, so that every write shows
+    let start: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    let before = WORK.get();
+    for (i, frame) in gif.frames().iter().enumerate() {
+      for canvas in [&start[..], &[]] {
+        let (mut new, mut old) = (canvas.to_vec(), canvas.to_vec());
+        let result = gif.draw(frame, &mut new);
+        assert_eq!(result, reference::draw(&gif, frame, &mut old), "frame {i}");
+        assert!(new == old, "frame {i}: other pixels");
+      }
+    }
+    WORK.get() - before
+  }
+
+  #[test]
+  fn output_off_the_canvas_is_skipped() {
+    // Codex G1: a 1x1 canvas, then a frame of up to 65535x65535 pixels with long LZW strings.
+    // Stepping over each index off the canvas took 6.77 s for a 1.58 MiB file.
+    let codes = growing(1000, 2000);
+    let data = |tail: &[u32]| pack(2, &[&codes[..], tail].concat());
+    let cases = [
+      // the data ends early, ends with an end code, or with a bad code
+      ([0, 0, 65535, 65535], false, data(&[])),
+      ([0, 0, 65535, 65535], true, data(&[])),
+      ([0, 0, 65535, 65535], false, data(&[5])),
+      ([0, 0, 65535, 65535], true, data(&[4, 7])),
+      // the frame fills, then a bad code comes
+      ([0, 0, 65535, 8], false, data(&[4, 7])),
+      ([0, 0, 65535, 8], true, data(&[4, 7])),
+      // strings across rows
+      ([0, 0, 999, 65535], true, data(&[])),
+      ([0, 0, 1, 65535], false, data(&[5])),
+      // right of the canvas, below it
+      ([1, 0, 65535, 65535], false, data(&[])),
+      ([0, 1, 65535, 65535], true, data(&[4, 7])),
+    ];
+    for (rect, interlaced, lzw) in cases {
+      let read = reference::READ.get();
+      let steps = same_as_reference(&second_frame_gif((1, 1), (rect, interlaced, None, &lzw)));
+      let read = reference::READ.get() - read;
+      // the two frames, with and without a canvas: a few steps per code
+      let codes = 2 * (3 + codes.len() as u64 + 2);
+      assert!(
+        steps <= 4 * codes,
+        "{rect:?}: {steps} steps for {codes} codes"
+      );
+      // the reference read every index while the frame was not full
+      assert!(
+        read > 20 * steps,
+        "{rect:?}: the reference read {read} indexes"
+      );
+    }
+  }
+
+  #[test]
+  fn long_strings_on_a_narrow_canvas_are_read_where_they_land() {
+    // a 1x1024 canvas under a frame 2043 pixels wide: one index of each row lands on the canvas,
+    // while the codes are up to 2043 indexes long (code 2047)
+    let codes = growing(2047, 2100);
+    let lzw = pack(2, &codes);
+    for interlaced in [false, true] {
+      let read = reference::READ.get();
+      let file = second_frame_gif((1, 1024), ([0, 0, 2043, 1024], interlaced, None, &lzw));
+      let steps = same_as_reference(&file);
+      let read = reference::READ.get() - read;
+      // codes and rows, with and without a canvas: for each row, one search for a prefix
+      // (about 3 log2 of the string length) and one index
+      let (codes, rows) = (2 * (3 + codes.len() as u64), 1024);
+      assert!(
+        steps <= 4 * codes + 30 * rows,
+        "{steps} steps for {codes} codes; the reference read {read} indexes"
+      );
+    }
+  }
+
+  #[test]
+  fn zero_width_frames_take_one_step() {
+    // the reference moved each frame 0 pixels wide and 65535 tall down its rows one step at a time
+    let lzw = pack(2, &[4, 1, 1, 5]);
+    let dot = pack(2, &[4, 1, 5]);
+    let mut frames = vec![([0, 0, 1, 1], false, None, &dot[..])];
+    for i in 0..100 {
+      frames.push(([0, 0, 0, 65535], i % 2 == 0, None, &lzw[..]));
+    }
+    let steps = same_as_reference(&frames_gif((1, 1), &frames));
+    // per frame and canvas: 2 codes, one put
+    assert!(steps <= 2 * 101 * 4, "{steps} steps");
+  }
+
+  #[test]
+  fn frames_off_the_right_and_bottom_match_the_reference() {
+    // Frame rects start at 0 or more, so they leave the canvas only on the right and the bottom.
+    // On a 5x7 canvas: frames inside it, across its right edge, its bottom edge or both, and
+    // wholly past them, interlaced or not. One pixel per code, stopping at each pixel of each row
+    // and pass, then long strings across the edges.
+    let tails: [&[u32]; 3] = [&[5], &[4, 7], &[]];
+    let mut rng = Rng(0x6f6666);
+    for x in [0, 2, 4, 5, 6] {
+      for y in [0, 3, 6, 7, 9] {
+        for w in [0, 1, 3, 6] {
+          for h in [0, 1, 4, 9, 13] {
+            for interlaced in [false, true] {
+              let rect = [x, y, w, h];
+              for pixels in 0..=usize::from(w * h) + 2 {
+                for tail in tails {
+                  let lzw = lzw_data(pixels, tail);
+                  same_as_reference(&second_frame_gif((5, 7), (rect, interlaced, None, &lzw)));
+                }
+              }
+              for _ in 0..8 {
+                let count = rng.below(60) as usize;
+                let mut codes = random_codes(&mut rng, 2, count);
+                codes.extend(tails[rng.below(3) as usize]);
+                let lzw = pack(2, &codes);
+                let transparent = [None, Some(0), Some(1)][rng.below(3) as usize];
+                same_as_reference(&second_frame_gif(
+                  (5, 7),
+                  (rect, interlaced, transparent, &lzw),
+                ));
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  fn step(step: LzwStep) -> u8 {
+    match step {
+      LzwStep::More => 0,
+      LzwStep::End => 1,
+      LzwStep::BadCode => 2,
+    }
+  }
+
+  #[test]
+  fn pixels_follow_the_reference_after_each_byte() {
+    // Random literal widths, canvases (none in a dry run), rects (some up to 65535 pixels wide or
+    // tall, or past the canvas), palettes with a transparent index and LZW codes, one byte at a
+    // time: the position, the pixels and the LZW result are those of the reference.
+    let mut rng = Rng(0x7069);
+    for round in 0..20000 {
+      let lw = rng.below(9) as u32;
+      let (mut width, mut height) = (rng.below(7) as u32, rng.below(7) as u32);
+      if width == 0 || height == 0 {
+        (width, height) = (0, 0);
+      }
+      let mut corner = || match rng.below(10) {
+        0 => 65535,
+        _ => rng.below(9) as u32,
+      };
+      let (x0, y0) = (corner(), corner());
+      let mut size = || match rng.below(10) {
+        0 => 65535 - rng.below(2) as u32,
+        _ => rng.below(11) as u32,
+      };
+      let (w, h) = (size(), size());
+      let rect = Rect {
+        x0,
+        y0,
+        x1: x0 + w,
+        y1: y0 + h,
+      };
+      let interlace = if rng.below(2) == 0 { 4 } else { 0 };
+      let mut palette = [[0u8; 4]; 256];
+      for color in &mut palette {
+        *color = [rng.below(256) as u8, rng.below(256) as u8, 0, 255];
+      }
+      palette[rng.below(4) as usize] = [0; 4];
+      let count = rng.below(200) as usize;
+      let mut codes = random_codes(&mut rng, lw, count);
+      let clear = 1 << lw;
+      match rng.below(3) {
+        0 => codes.push(clear + 1),
+        1 => codes.extend([clear, clear + 3]),
+        _ => {}
+      }
+      let data = pack(lw, &codes);
+      let start: Vec<u8> = (0..width * height * 4).map(|i| (i % 251) as u8).collect();
+      let (mut new_canvas, mut old_canvas) = (start.clone(), start);
+      let pixels = |canvas| Pixels {
+        canvas,
+        width,
+        height,
+        rect,
+        x: x0,
+        y: y0,
+        interlace,
+        palette: &palette,
+      };
+      let (mut new, mut old) = (pixels(&mut new_canvas[..]), pixels(&mut old_canvas[..]));
+      let (mut lzw, mut old_lzw, mut stack) = (Lzw::new(lw), Lzw::new(lw), Vec::new());
+      for (i, &byte) in data.iter().enumerate() {
+        let at = format!("round {round}, byte {i}, {rect:?} on {width}x{height}");
+        let result = step(lzw.decode(&[byte], &mut new));
+        let old_result = step(reference::decode(
+          &mut old_lzw,
+          &mut stack,
+          &[byte],
+          &mut old,
+        ));
+        assert_eq!(result, old_result, "{at}");
+        let position = |p: &Pixels| (p.x, p.y, p.interlace);
+        assert_eq!(position(&new), position(&old), "{at}");
+        assert!(new.canvas == old.canvas, "{at}");
+        if result != 0 {
+          break;
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn prefix_codes_take_few_steps() {
+    // the longest strings (code 4095 of `growing`), and random tables of each literal width
+    let mut rng = Rng(0x6a756d70);
+    for round in 0..18 {
+      let lw = if round == 0 { 2 } else { round % 9 };
+      let codes = if round == 0 {
+        growing(4095, 4092)
+      } else {
+        random_codes(&mut rng, lw, 4000)
+      };
+      let mut lzw = Lzw::new(lw);
+      // an empty frame: the codes only fill the table
+      let mut out = Pixels {
+        canvas: &mut [],
+        width: 0,
+        height: 0,
+        rect: Rect::default(),
+        x: 0,
+        y: 0,
+        interlace: 0,
+        palette: &[[0; 4]; 256],
+      };
+      lzw.decode(&pack(lw, &codes), &mut out);
+      let mut longest = 0;
+      for code in (0..lzw.clear).chain(lzw.end + 1..lzw.save.min(4096)) {
+        let code = code as usize;
+        let len = usize::from(lzw.len[code]);
+        longest = longest.max(len);
+        let mut lens = vec![1, len];
+        lens.extend((0..16).map(|_| 1 + rng.below(len as u64) as usize));
+        for n in lens {
+          let mut walked = code;
+          for _ in n..len {
+            walked = usize::from(lzw.prefix[walked]);
+          }
+          let before = WORK.get();
+          assert_eq!(
+            lzw.prefix_code(code, n),
+            walked,
+            "round {round}, code {code}, {n} of {len}"
+          );
+          // about 3 log2(len) steps
+          let steps = WORK.get() - before;
+          assert!(
+            steps <= 36,
+            "round {round}, code {code}, {n} of {len}: {steps} steps"
+          );
+        }
+      }
+      if round == 0 {
+        assert_eq!(longest, 4091);
       }
     }
   }
