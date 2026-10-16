@@ -289,6 +289,81 @@ test("ImageDecoder: reset() keeps a JPEG's choice of RGB or YUV, like Chrome", a
 
 const FAILED = { instanceOf: DOMException, name: 'EncodingError', message: 'Failed to decode frame at index 0' }
 const METADATA = { instanceOf: DOMException, name: 'InvalidStateError', message: 'Failed to retrieve track metadata.' }
+const ABORTED = { instanceOf: DOMException, name: 'AbortError', message: 'Aborted by reset.' }
+
+// The first `cut` bytes at once; the stream stays open until `close()`
+function cutStream(data: Uint8Array, cut: number) {
+  let controller!: ReadableStreamDefaultController<Uint8Array>
+  const stream = new ReadableStream<Uint8Array>({
+    start(c) {
+      controller = c
+      c.enqueue(data.slice(0, cut))
+    },
+  })
+  return { stream, rest: () => controller.enqueue(data.slice(cut)), close: () => controller.close() }
+}
+
+// Whether a promise is still pending after `ms`
+async function pendingAfter(promise: Promise<unknown>, ms: number) {
+  let pending = true
+  promise.then(
+    () => (pending = false),
+    () => (pending = false),
+  )
+  await sleep(ms)
+  return pending
+}
+
+// The data stops inside the scan, so decode() waits for the rest. Chrome rejects it at reset(). The
+// stream then ends there: the decoder is still open, and the next decode() fails, as in Chrome.
+test('ImageDecoder: reset() rejects a JPEG decode() that waits for data with AbortError, like Chrome', async (t) => {
+  for (const [name, cut] of [
+    ['444-progressive-33x17.jpg', 711],
+    ['420-37x9.jpg', 760],
+  ] as const) {
+    const { stream, close } = cutStream(fixture(name), cut)
+    const decoder = new ImageDecoder({ data: stream, type: 'image/jpeg' })
+    await decoder.tracks.ready
+    const waiting = decoder.decode()
+    t.true(await pendingAfter(waiting, 50), `${name}: decode() waits`)
+    decoder.reset()
+    await t.throwsAsync(waiting, ABORTED, name)
+    t.false(decoder.closed, name)
+    close()
+    await decoder.completed
+    t.false(decoder.closed, name)
+    await t.throwsAsync(decoder.decode(), FAILED, name)
+    t.true(decoder.closed, name)
+    await t.throwsAsync(decoder.decode(), { instanceOf: DOMException, name: 'InvalidStateError' }, name)
+  }
+})
+
+// A decode() made before the header is here waits for the tracks. reset() does not resolve
+// tracks.ready (Chrome keeps it pending too); the decode() rejects once the tracks are ready.
+test('ImageDecoder: reset() before the JPEG header leaves tracks.ready pending', async (t) => {
+  for (const [name, format] of [
+    ['444-progressive-33x17.jpg', 'I444'],
+    ['420-37x9.jpg', 'I420'],
+  ] as const) {
+    const { stream, rest, close } = cutStream(fixture(name), 100)
+    const decoder = new ImageDecoder({ data: stream, type: 'image/jpeg' })
+    const ready = decoder.tracks.ready
+    const waiting = decoder.decode()
+    waiting.catch(() => {})
+    await sleep(20)
+    decoder.reset()
+    t.true(await pendingAfter(ready, 50), `${name}: tracks.ready`)
+    rest()
+    close()
+    await t.notThrowsAsync(ready, name)
+    await t.throwsAsync(waiting, ABORTED, name)
+    // nothing decoded part of the data: YUV
+    const { image } = await decoder.decode()
+    t.is(image.format, format, name)
+    image.close()
+    decoder.close()
+  }
+})
 
 // 12-bit, arithmetic coding, 100 scans (Blink's limit), data that ends before the image, no EOI
 const FRAME_ERRORS = ['12-bit.jpg', 'arithmetic.jpg', 'scans-100.jpg', 'truncated.jpg', 'no-eoi.jpg']

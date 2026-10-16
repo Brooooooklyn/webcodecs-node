@@ -11,8 +11,8 @@ use crate::ffi::{AV_NOPTS_VALUE, AVCodecID, AVPixelFormat, AVRational, check_err
 use crate::webcodecs::buffer_source::{self, Uint8ArrayCopy};
 use crate::webcodecs::decoded_frame::{DecodedSource, decoded_frame_format};
 use crate::webcodecs::error::{
-  DOMExceptionName, invalid_state_error, native_dom_exception_error, native_range_error,
-  throw_invalid_state_error,
+  DOMExceptionName, abort_error, invalid_state_error, native_dom_exception_error,
+  native_range_error, throw_invalid_state_error,
 };
 use crate::webcodecs::image_hints::{PixelHint, bmp_header, gif_frame_alpha, png_header};
 use crate::webcodecs::{VideoFrame, VideoPixelFormat};
@@ -458,8 +458,8 @@ struct ImageDecoderInner {
   /// `FrameCall::Decode`).
   stream_idle: bool,
   /// The decode() calls of the first frame of a JPEG that still wait, made since the last
-  /// reset(), which aborts them in Chrome. While there are any, a chunk that comes to an idle
-  /// stream is decoded at once (see `FrameCall::Arrival`).
+  /// reset(), which aborts them (`abort_if_reset`). While there are any, a chunk that comes to an
+  /// idle stream is decoded at once (see `FrameCall::Arrival`).
   jpeg_requests: u32,
   /// Whether a frame failed to decode where Chrome's decoder fails (JPEG): the decoder closes,
   /// and the decode() calls still pending reject (see `closed_error`).
@@ -900,6 +900,7 @@ impl ImageDecoder {
         // before the blocking cache check so notify_waiters() reaches every
         // concurrent decode, rather than relying on a single stored permit.
         notified.as_mut().enable();
+        abort_if_reset(&inner, epoch)?;
         let decode_inner = inner.clone();
         let result = spawn_blocking(move || decode_cached_frame(&decode_inner, frame_index, epoch))
           .await
@@ -908,9 +909,11 @@ impl ImageDecoder {
               Status::GenericFailure,
               format!("Decode task failed: {}", join_error),
             )
-          })??;
+          })?;
+        // A reset() that came while it ran: what it found is dropped.
+        abort_if_reset(&inner, epoch)?;
 
-        if let Some(result) = result {
+        if let Some(result) = result? {
           return Ok(result);
         }
 
@@ -955,9 +958,15 @@ impl ImageDecoder {
     inner.cached_frames = None;
     inner.cache_epoch = inner.cache_epoch.wrapping_add(1);
     inner.cached_data_len = 0;
-    // Chrome aborts the decode() calls that wait: they decode nothing more (see
-    // `FrameCall::Decode`). A JPEG keeps its choice of RGB (`rgb_decode`).
+    // Like Chrome, the decode() calls that wait reject (`abort_if_reset`). A JPEG keeps its
+    // choice of RGB (`rgb_decode`).
     inner.jpeg_requests = 0;
+    // Wake them. Only once the tracks are ready: before that, `ready_notify` would also resolve
+    // `tracks.ready`, and the calls still wait for the tracks; they reject when the tracks are
+    // ready.
+    if inner.tracks.ready.load(Ordering::Acquire) {
+      inner.tracks.ready_notify.notify_waiters();
+    }
 
     // Reset frame_count for animated formats (will be re-detected on next decode)
     if let Ok(mut track_inner) = inner.tracks.inner.lock()
@@ -1009,6 +1018,9 @@ fn native_image_decode_error(env: &Env, error: Error) -> Result<Error> {
   }
   if let Some(message) = error.reason.strip_prefix("InvalidStateError:") {
     return native_dom_exception_error(env, DOMExceptionName::InvalidStateError, message.trim());
+  }
+  if let Some(message) = error.reason.strip_prefix("AbortError:") {
+    return native_dom_exception_error(env, DOMExceptionName::AbortError, message.trim());
   }
   if error.reason.starts_with("Unsupported image type:") {
     return native_dom_exception_error(env, DOMExceptionName::NotSupportedError, &error.reason);
@@ -1118,6 +1130,19 @@ fn decode_cached_frame(
     image: video_frame,
     complete: true,
   }))
+}
+
+/// Like Chrome, a reset() made after a decode() call rejects it with AbortError. Only a JPEG for
+/// now, whose decode() waits for the data (`FrameCall::Decode`). A close() also moves
+/// `cache_epoch`; the call then gets the error of a closed decoder (`closed_error`).
+fn abort_if_reset(inner: &Arc<Mutex<ImageDecoderInner>>, epoch: u64) -> Result<()> {
+  let guard = inner
+    .lock()
+    .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+  if !guard.closed && guard.cache_epoch != epoch && guard.codec_id == Some(AVCodecID::Mjpeg) {
+    return Err(abort_error("Aborted by reset."));
+  }
+  Ok(())
 }
 
 /// The RangeError of a decode() of a frame that the image does not have.
@@ -1403,8 +1428,8 @@ enum FrameCall {
   /// A decode() made when `cache_epoch` was this. Like Chrome, it decodes part of a JPEG only
   /// when the stream is idle (`stream_idle`): Chrome decodes a frame in a task of its own, so
   /// results that come in one task (the last chunk and the close, say) reach it together. And
-  /// not after a reset(), which aborts it in Chrome. With all the data, it waits for `complete`:
-  /// Chrome resolves `completed` before it tries the frame.
+  /// not after a reset(), which aborts it (`abort_if_reset`). With all the data, it waits for
+  /// `complete`: Chrome resolves `completed` before it tries the frame.
   Decode(u64),
   /// The stream reader, for a chunk that came to an idle JPEG stream while a decode() waits:
   /// Chrome decodes it before it reads the next result (`ImageDecoderExternal::OnStateChange`).
