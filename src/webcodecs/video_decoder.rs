@@ -704,7 +704,7 @@ impl VideoDecoder {
                 // Re-decode buffered chunks with software decoder
                 guard.dequeue_one(event_state);
                 drop(guard);
-                Self::redecode_pending_chunks(inner, pending);
+                Self::redecode_pending_chunks(inner, pending, cancel);
                 return;
               }
               // Fallback failed, report original error
@@ -746,7 +746,7 @@ impl VideoDecoder {
               if Self::fallback_to_software(&mut guard).is_ok() {
                 // Re-decode all buffered chunks with software decoder
                 drop(guard);
-                Self::redecode_pending_chunks(inner, pending);
+                Self::redecode_pending_chunks(inner, pending, cancel);
                 return;
               }
               // Fallback failed - continue with hardware (may never produce output)
@@ -876,10 +876,12 @@ impl VideoDecoder {
     Ok(())
   }
 
-  /// Re-decode buffered chunks after fallback to software
+  /// Re-decode buffered chunks after fallback to software. `cancel` is the
+  /// token of the worker that runs the replay.
   fn redecode_pending_chunks(
     inner: &Arc<Mutex<VideoDecoderInner>>,
     chunks: Vec<Arc<RwLock<Option<EncodedVideoChunkInner>>>>,
+    cancel: &CancelToken,
   ) {
     for chunk in chunks {
       let mut guard = match inner.lock() {
@@ -887,8 +889,12 @@ impl VideoDecoder {
         Err(_) => return,
       };
 
-      // Check state; close()/reset() since the fallback started end the replay
-      if guard.state != CodecState::Configured || guard.is_stale() {
+      // close() and reset() since the fallback started end the replay: both
+      // cancel this worker's token. is_stale() alone misses a reset() that a
+      // configure() followed: reset() moves inner.generation to the new
+      // generation and configure() sets the state back to Configured, so
+      // the old chunks would decode into the new generation.
+      if cancel.is_cancelled() || guard.state != CodecState::Configured || guard.is_stale() {
         return;
       }
 
