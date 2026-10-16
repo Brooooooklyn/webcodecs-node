@@ -431,6 +431,8 @@ impl<'a> GifDecoder<'a> {
       y: rect.y0,
       interlace: if flags & 0x40 != 0 { 4 } else { 0 },
       palette: &palette,
+      direct: is_inside(rect, width, height),
+      stack: Vec::new(),
       runs: Vec::new(),
     };
     let mut lzw_done = false;
@@ -455,6 +457,13 @@ impl<'a> GifDecoder<'a> {
     }
     Ok(())
   }
+}
+
+/// Whether `rect` is at least one pixel wide and inside a `width` x `height` canvas (none in a
+/// dry run). Then each index lands on the canvas until the frame is full, so `Pixels` writes
+/// the frame straight from the LZW table (`Pixels::direct`).
+fn is_inside(rect: Rect, width: u32, height: u32) -> bool {
+  rect.x0 < rect.x1 && rect.x1 <= width && rect.y1 <= height
 }
 
 /// RGB triples to BGRA, opaque
@@ -619,10 +628,24 @@ fn work(steps: usize) {
 #[cfg(not(test))]
 fn work(_: usize) {}
 
+/// Counts the indexes that `Output::read_back` reads out of the LZW table, for the tests
+#[cfg(test)]
+fn indexes_read(n: usize) {
+  tests::INDEXES.with(|read| read.set(read.get() + n as u64));
+}
+
+#[cfg(not(test))]
+fn indexes_read(_: usize) {}
+
 /// Writes LZW output into the frame rect (Wuffs copy_to_image_buffer). The pixels go in
-/// row by row, and in an interlaced frame pass by pass. Output that lands off the canvas
-/// is skipped without being read, so a frame costs steps for its codes, the pixels it
-/// writes and its rows on the canvas, whatever the size of its rect.
+/// row by row, and in an interlaced frame pass by pass. There are two ways, chosen per frame:
+///
+/// - `direct`: the frame is inside the canvas, so each index lands on it until the frame is
+///   full. Each code's string is written straight from the table (`put_direct`). A frame
+///   costs steps for its codes and its pixels, at most the canvas.
+/// - otherwise (part of the frame is off the canvas, or a dry run): output that lands off the
+///   canvas is skipped without being read (`put`), so a frame costs steps for its codes, the
+///   pixels it writes and its rows on the canvas, whatever the size of its rect.
 struct Pixels<'c> {
   canvas: &'c mut [u8],
   width: u32,
@@ -633,7 +656,11 @@ struct Pixels<'c> {
   /// 0 for non-interlaced frames and after the last interlace pass
   interlace: usize,
   palette: &'c [[u8; 4]; 256],
-  /// The parts of one LZW output that land on the canvas: (offset, length, first pixel)
+  /// The frame is inside the canvas and at least one pixel wide: `put_direct` writes it
+  direct: bool,
+  /// `put_direct`: a string that runs past the end of its row, last index first
+  stack: Vec<u8>,
+  /// `put`: the parts of one LZW output that land on the canvas (offset, length, first pixel)
   runs: Vec<(usize, usize, usize)>,
 }
 
@@ -642,7 +669,60 @@ const INTERLACE_START: [u32; 5] = [u32::MAX, 1, 2, 4, 0];
 const INTERLACE_DELTA: [u32; 5] = [1, 2, 4, 8, 8];
 
 impl Pixels<'_> {
-  /// Puts the output of one LZW code. Pixel data past the frame rect is ignored.
+  /// Puts the output of one LZW code in a frame inside the canvas (`direct`). Pixel data past
+  /// the frame rect is ignored.
+  fn put_direct(&mut self, output: &Output) {
+    let rect = self.rect;
+    let len = output.len();
+    let palette = self.palette;
+    let width = self.width as usize;
+    if len <= (rect.x1 - self.x) as usize {
+      // the rest of this row holds it: written from its last index back along its prefixes
+      let at = self.y as usize * width + self.x as usize;
+      let pixels = &mut self.canvas.as_chunks_mut::<4>().0[at..at + len];
+      output.read_back(output.code, 0, len, |i, index| {
+        let color = palette[usize::from(index)];
+        // the transparent index keeps the pixel below
+        if color[3] != 0 {
+          pixels[i] = color;
+        }
+      });
+      self.x += len as u32;
+      if self.x == rect.x1 {
+        self.next_row();
+      }
+      return;
+    }
+    // it runs past the end of the row: read into the stack, then written row by row
+    let stack = &mut self.stack;
+    stack.clear();
+    output.read_back(output.code, 0, len, |_, index| stack.push(index));
+    // the indexes still to write are stack[..left], last index first
+    let mut left = len;
+    while left > 0 && self.y < rect.y1 {
+      work(1);
+      let n = ((rect.x1 - self.x) as usize).min(left);
+      let at = self.y as usize * width + self.x as usize;
+      let pixels = &mut self.canvas.as_chunks_mut::<4>().0[at..at + n];
+      for (pixel, &index) in pixels
+        .iter_mut()
+        .zip(self.stack[left - n..left].iter().rev())
+      {
+        let color = palette[usize::from(index)];
+        if color[3] != 0 {
+          *pixel = color;
+        }
+      }
+      left -= n;
+      self.x += n as u32;
+      if self.x == rect.x1 {
+        self.next_row();
+      }
+    }
+  }
+
+  /// Puts the output of one LZW code in any frame, and reads only the indexes that land on the
+  /// canvas. Pixel data past the frame rect is ignored.
   fn put(&mut self, output: &Output) {
     let rect = self.rect;
     let len = output.len();
@@ -741,31 +821,45 @@ impl Output<'_> {
     usize::from(self.lzw.len[self.code]) + usize::from(self.extra.is_some())
   }
 
+  /// Calls `f` with each offset in `start..end` and its index, last to first. `code` is the code
+  /// of the first `end` bytes of the output (of its whole string when `end` takes the extra
+  /// byte). Returns the code of the first `start` bytes. Every output path reads its indexes
+  /// through here.
+  #[inline(always)]
+  fn read_back(
+    &self,
+    mut code: usize,
+    start: usize,
+    mut end: usize,
+    mut f: impl FnMut(usize, u8),
+  ) -> usize {
+    work(end - start);
+    indexes_read(end - start);
+    let lzw = self.lzw;
+    if let Some(extra) = self.extra
+      && end > usize::from(lzw.len[self.code])
+    {
+      end -= 1;
+      f(end, extra);
+    }
+    for i in (start..end).rev() {
+      f(i, lzw.suffix[code]);
+      code = usize::from(lzw.prefix[code]);
+    }
+    code
+  }
+
   /// Calls `f` with the pixel and the byte for each byte of `runs` (offset, length, first
   /// pixel; in order), last to first. The string is read once from its end, with a jump over
   /// each gap between runs, so it takes O(bytes + runs x log(len)) steps.
   fn read_rev(&self, runs: &[(usize, usize, usize)], mut f: impl FnMut(usize, u8)) {
-    let lzw = self.lzw;
-    let len = usize::from(lzw.len[self.code]);
+    let len = usize::from(self.lzw.len[self.code]);
     // a code whose string is at least as long as the end of the next run
     let mut code = self.code;
     for &(start, n, pixel) in runs.iter().rev() {
-      let mut end = start + n;
-      if let Some(extra) = self.extra
-        && end > len
-      {
-        f(pixel + len - start, extra);
-        end = len;
-      }
-      if start >= end {
-        continue;
-      }
-      work(end - start);
-      code = lzw.prefix_code(code, end);
-      for i in (start..end).rev() {
-        f(pixel + i - start, lzw.suffix[code]);
-        code = usize::from(lzw.prefix[code]);
-      }
+      let end = start + n;
+      code = self.lzw.prefix_code(code, end.min(len));
+      code = self.read_back(code, start, end, |i, index| f(pixel + i - start, index));
     }
   }
 }
@@ -788,8 +882,8 @@ struct Lzw {
   first: Vec<u8>,
   len: Vec<u16>,
   /// A shorter prefix of each code's string, so that any prefix is found in O(log len) steps
-  /// (Myers' jump pointers). It is filled as codes are defined, so it is not zeroed for each
-  /// frame.
+  /// (Myers' jump pointers). Only `Pixels::put` needs it: it is made on the first block decoded
+  /// for a frame that is not `direct`, and filled as codes are defined.
   jump: Vec<u16>,
 }
 
@@ -815,13 +909,12 @@ impl Lzw {
       suffix: vec![0; 4096],
       first: vec![0; 4096],
       len: vec![0; 4096],
-      jump: Vec::with_capacity(4096),
+      jump: Vec::new(),
     };
     for code in 0..clear as usize {
       lzw.suffix[code] = code as u8;
       lzw.first[code] = code as u8;
       lzw.len[code] = 1;
-      lzw.jump.push(code as u16);
     }
     lzw.reset();
     lzw
@@ -849,6 +942,21 @@ impl Lzw {
 
   /// Decodes one data sub-block
   fn decode(&mut self, block: &[u8], out: &mut Pixels) -> LzwStep {
+    if out.direct {
+      return self.decode_into::<true>(block, out);
+    }
+    if self.jump.is_empty() {
+      // each literal is its own jump
+      self.jump.reserve_exact(4096);
+      self.jump.extend(0..self.clear as u16);
+    }
+    self.decode_into::<false>(block, out)
+  }
+
+  /// `decode`, with `DIRECT` equal to `out.direct`. Kept out of line: inlined into the frame
+  /// loop of the image decoder, it ran about 1.2 times slower on GIFs with short strings.
+  #[inline(never)]
+  fn decode_into<const DIRECT: bool>(&mut self, block: &[u8], out: &mut Pixels) -> LzwStep {
     for &byte in block {
       self.bits |= u32::from(byte) << self.n_bits;
       self.n_bits += 8;
@@ -872,11 +980,16 @@ impl Lzw {
         let first = self.first[c as usize];
         // once the frame is full, the output is dropped; only the table changes
         if out.y < out.rect.y1 {
-          out.put(&Output {
+          let output = Output {
             lzw: self,
             code: c as usize,
             extra: (code == self.save).then_some(first),
-          });
+          };
+          if DIRECT {
+            out.put_direct(&output);
+          } else {
+            out.put(&output);
+          }
         }
         if self.save <= 4095 {
           // the first code after a clear code fills the unused end-code slot
@@ -886,15 +999,18 @@ impl Lzw {
             self.suffix[save] = first;
             self.first[save] = self.first[prev];
             self.len[save] = self.len[prev] + 1;
-            // when the jump of `prev` is as long as the jump after it, jump over both; else to `prev`
-            let jump = usize::from(self.jump[prev]);
-            let jump2 = self.jump[jump];
-            let same =
-              self.len[prev] - self.len[jump] == self.len[jump] - self.len[usize::from(jump2)];
-            if save >= self.jump.len() {
-              self.jump.resize(save + 1, 0);
+            if !DIRECT {
+              // when the jump of `prev` is as long as the jump after it, jump over both; else
+              // to `prev`
+              let jump = usize::from(self.jump[prev]);
+              let jump2 = self.jump[jump];
+              let same =
+                self.len[prev] - self.len[jump] == self.len[jump] - self.len[usize::from(jump2)];
+              if save >= self.jump.len() {
+                self.jump.resize(save + 1, 0);
+              }
+              self.jump[save] = if same { jump2 } else { prev as u16 };
             }
-            self.jump[save] = if same { jump2 } else { prev as u16 };
           }
           self.save += 1;
           if self.width < 12 {
@@ -917,6 +1033,8 @@ mod tests {
   thread_local! {
     /// Steps counted by `work`
     pub(super) static WORK: Cell<u64> = const { Cell::new(0) };
+    /// Indexes counted by `indexes_read`
+    pub(super) static INDEXES: Cell<u64> = const { Cell::new(0) };
   }
 
   /// The output path of 33da7b1, before output off the canvas was skipped: `decode` reads each
@@ -929,6 +1047,8 @@ mod tests {
     thread_local! {
       /// Bytes read into the stack
       pub static READ: Cell<u64> = const { Cell::new(0) };
+      /// Bytes that land on the canvas
+      pub static ON: Cell<u64> = const { Cell::new(0) };
     }
 
     pub fn put(out: &mut Pixels, indexes: &[u8]) {
@@ -941,6 +1061,7 @@ mod tests {
             return;
           };
           if out.x < out.width && out.y < out.height {
+            ON.set(ON.get() + 1);
             let color = out.palette[usize::from(index)];
             // the transparent index keeps the pixel below
             if color[3] != 0 {
@@ -1057,6 +1178,8 @@ mod tests {
         y: rect.y0,
         interlace: if flags & 0x40 != 0 { 4 } else { 0 },
         palette: &palette,
+        direct: false,
+        stack: Vec::new(),
         runs: Vec::new(),
       };
       let mut lzw_done = false;
@@ -1357,24 +1480,58 @@ mod tests {
     frames_gif(screen, &[([0, 0, 1, 1], false, None, &dot), frame])
   }
 
+  /// What `same_as_reference` counted for one canvas, summed over the frames
+  #[derive(Clone, Copy, Debug, Default)]
+  struct Counts {
+    /// steps of `draw` (`work`)
+    steps: u64,
+    /// indexes `draw` read out of the LZW table (`Output::read_back`)
+    indexes: u64,
+    /// indexes the reference read: each code's whole string
+    read: u64,
+    /// indexes the reference put on the canvas
+    on: u64,
+  }
+
   /// Draws each frame of `file` with `GifDecoder::draw` and with the reference, from the same
   /// canvas and with no canvas (`check`), and checks that the results and the pixels are the
-  /// same. Returns the steps `draw` took.
-  fn same_as_reference(file: &[u8]) -> u64 {
+  /// same. Also checks the indexes `draw` read: on a frame inside the canvas, each code's whole
+  /// string (the direct path, like the reference); on any other frame, only the indexes that
+  /// land on the canvas. Returns the counts with the canvas, then with none.
+  fn same_as_reference(file: &[u8]) -> [Counts; 2] {
     let gif = GifDecoder::new(file).unwrap();
     let size = gif.width() as usize * gif.height() as usize * 4;
     // each pixel different, so that every write shows
     let start: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-    let before = WORK.get();
+    let mut counts = [Counts::default(); 2];
     for (i, frame) in gif.frames().iter().enumerate() {
-      for canvas in [&start[..], &[]] {
+      for (canvas, counts) in [&start[..], &[]].into_iter().zip(&mut counts) {
         let (mut new, mut old) = (canvas.to_vec(), canvas.to_vec());
+        let before = (WORK.get(), INDEXES.get());
         let result = gif.draw(frame, &mut new);
+        let (steps, indexes) = (WORK.get() - before.0, INDEXES.get() - before.1);
+        let before = (reference::READ.get(), reference::ON.get());
         assert_eq!(result, reference::draw(&gif, frame, &mut old), "frame {i}");
+        let (read, on) = (
+          reference::READ.get() - before.0,
+          reference::ON.get() - before.1,
+        );
         assert!(new == old, "frame {i}: other pixels");
+        let r = frame.rect;
+        let inside =
+          !canvas.is_empty() && r.x0 < r.x1 && r.x1 <= gif.width() && r.y1 <= gif.height();
+        let expected = if inside { read } else { on };
+        assert_eq!(
+          indexes, expected,
+          "frame {i} {r:?}, inside {inside}: indexes read"
+        );
+        counts.steps += steps;
+        counts.indexes += indexes;
+        counts.read += read;
+        counts.on += on;
       }
     }
-    WORK.get() - before
+    counts
   }
 
   #[test]
@@ -1400,16 +1557,25 @@ mod tests {
       ([0, 1, 65535, 65535], true, data(&[4, 7])),
     ];
     for (rect, interlaced, lzw) in cases {
-      let read = reference::READ.get();
-      let steps = same_as_reference(&second_frame_gif((1, 1), (rect, interlaced, None, &lzw)));
-      let read = reference::READ.get() - read;
+      let [canvas, dry] =
+        same_as_reference(&second_frame_gif((1, 1), (rect, interlaced, None, &lzw)));
+      // Only the indexes that land on the canvas are read out of the LZW table: the dot of frame
+      // 0, and the first index of frame 1 when it starts on the canvas. This holds for whatever
+      // path writes the output, as each one reads the table through `Output::read_back`.
+      let on_canvas = 1 + u64::from(rect[..2] == [0, 0]);
+      assert_eq!(
+        (canvas.indexes, dry.indexes),
+        (on_canvas, 0),
+        "{rect:?}: indexes read"
+      );
       // the two frames, with and without a canvas: a few steps per code
-      let codes = 2 * (3 + codes.len() as u64 + 2);
+      let (steps, codes) = (canvas.steps + dry.steps, 2 * (3 + codes.len() as u64 + 2));
       assert!(
         steps <= 4 * codes,
         "{rect:?}: {steps} steps for {codes} codes"
       );
       // the reference read every index while the frame was not full
+      let read = canvas.read + dry.read;
       assert!(
         read > 20 * steps,
         "{rect:?}: the reference read {read} indexes"
@@ -1424,10 +1590,9 @@ mod tests {
     let codes = growing(2047, 2100);
     let lzw = pack(2, &codes);
     for interlaced in [false, true] {
-      let read = reference::READ.get();
       let file = second_frame_gif((1, 1024), ([0, 0, 2043, 1024], interlaced, None, &lzw));
-      let steps = same_as_reference(&file);
-      let read = reference::READ.get() - read;
+      let [canvas, dry] = same_as_reference(&file);
+      let (steps, read) = (canvas.steps + dry.steps, canvas.read + dry.read);
       // codes and rows, with and without a canvas: for each row, one search for a prefix
       // (about 3 log2 of the string length) and one index
       let (codes, rows) = (2 * (3 + codes.len() as u64), 1024);
@@ -1446,10 +1611,86 @@ mod tests {
     let lzw = pack(2, &codes);
     for interlaced in [false, true] {
       let file = frames_gif((1, 65535), &[([0, 0, 1, 65535], interlaced, None, &lzw)]);
-      let steps = same_as_reference(&file);
+      let [canvas, dry] = same_as_reference(&file);
+      let steps = canvas.steps + dry.steps;
       // with and without a canvas: a step per code, and per pixel a step and a byte
       let (codes, pixels) = (codes.len() as u64, 65535);
       assert!(steps <= 2 * codes + 3 * pixels, "{steps} steps");
+    }
+  }
+
+  #[test]
+  fn frames_inside_the_canvas_take_the_direct_path() {
+    // On a 6x8 canvas, codes whose strings grow by one (1, 2, 3, ... indexes): they run across
+    // rows, and the last one past the end of the frame
+    let lzw = pack(2, &growing(44, 60));
+    let inside = [
+      [0, 0, 6, 8],
+      [1, 2, 5, 6],
+      [0, 0, 1, 8],
+      [0, 3, 5, 1],
+      [5, 6, 1, 2],
+    ];
+    let partly_off = [
+      [0, 0, 7, 8],
+      [0, 0, 6, 9],
+      [1, 2, 6, 6],
+      [5, 7, 2, 2],
+      [3, 0, 65535, 3],
+    ];
+    for interlaced in [false, true] {
+      for (rects, direct) in [(inside, true), (partly_off, false)] {
+        for [x, y, w, h] in rects {
+          let rect = Rect {
+            x0: x,
+            y0: y,
+            x1: x + w,
+            y1: y + h,
+          };
+          assert_eq!(is_inside(rect, 6, 8), direct, "{rect:?}");
+          // no canvas: a dry run reads no index
+          assert!(!is_inside(rect, 0, 0), "{rect:?}");
+          let frame = (
+            [x as u16, y as u16, w as u16, h as u16],
+            interlaced,
+            None,
+            &lzw[..],
+          );
+          let [canvas, dry] = same_as_reference(&second_frame_gif((6, 8), frame));
+          // the paths read different indexes here: the reference read more than it put on the
+          // canvas
+          assert!(canvas.read > canvas.on, "{rect:?}: {canvas:?}");
+          let expected = if direct { canvas.read } else { canvas.on };
+          assert_eq!(canvas.indexes, expected, "{rect:?}: {canvas:?}");
+          assert_eq!(dry.indexes, 0, "{rect:?}");
+        }
+      }
+    }
+    // the direct path keeps no jump pointers; the other one keeps one per code
+    for direct in [true, false] {
+      let mut canvas = vec![0; 6 * 8 * 4];
+      let mut out = Pixels {
+        canvas: &mut canvas,
+        width: 6,
+        height: 8,
+        rect: Rect {
+          x0: 0,
+          y0: 0,
+          x1: 6,
+          y1: 8,
+        },
+        x: 0,
+        y: 0,
+        interlace: 0,
+        palette: &[[0; 4]; 256],
+        direct,
+        stack: Vec::new(),
+        runs: Vec::new(),
+      };
+      let mut lzw = Lzw::new(2);
+      lzw.decode(&lzw_data(30, &[]), &mut out);
+      let expected = if direct { 0 } else { lzw.save as usize };
+      assert_eq!(lzw.jump.len(), expected, "direct {direct}");
     }
   }
 
@@ -1462,7 +1703,8 @@ mod tests {
     for i in 0..100 {
       frames.push(([0, 0, 0, 65535], i % 2 == 0, None, &lzw[..]));
     }
-    let steps = same_as_reference(&frames_gif((1, 1), &frames));
+    let [canvas, dry] = same_as_reference(&frames_gif((1, 1), &frames));
+    let steps = canvas.steps + dry.steps;
     // per frame and canvas: 2 codes, one put
     assert!(steps <= 2 * 101 * 4, "{steps} steps");
   }
@@ -1542,6 +1784,8 @@ mod tests {
         y1: y0 + h,
       };
       let interlace = if rng.below(2) == 0 { 4 } else { 0 };
+      // a frame inside the canvas may take either path
+      let direct = is_inside(rect, width, height) && rng.below(2) == 0;
       let mut palette = [[0u8; 4]; 256];
       for color in &mut palette {
         *color = [rng.below(256) as u8, rng.below(256) as u8, 0, 255];
@@ -1567,10 +1811,13 @@ mod tests {
         y: y0,
         interlace,
         palette: &palette,
+        direct,
+        stack: Vec::new(),
         runs: Vec::new(),
       };
       let (mut new, mut old) = (pixels(&mut new_canvas[..]), pixels(&mut old_canvas[..]));
       let (mut lzw, mut old_lzw, mut stack) = (Lzw::new(lw), Lzw::new(lw), Vec::new());
+      let before = (INDEXES.get(), reference::READ.get(), reference::ON.get());
       for (i, &byte) in data.iter().enumerate() {
         let at = format!("round {round}, byte {i}, {rect:?} on {width}x{height}");
         let result = step(lzw.decode(&[byte], &mut new));
@@ -1588,6 +1835,14 @@ mod tests {
           break;
         }
       }
+      // the direct path reads each code's whole string, the other one the indexes on the canvas
+      let indexes = INDEXES.get() - before.0;
+      let (read, on) = (
+        reference::READ.get() - before.1,
+        reference::ON.get() - before.2,
+      );
+      let expected = if direct { read } else { on };
+      assert_eq!(indexes, expected, "round {round}, direct {direct}");
     }
   }
 
@@ -1613,6 +1868,8 @@ mod tests {
         y: 0,
         interlace: 0,
         palette: &[[0; 4]; 256],
+        direct: false,
+        stack: Vec::new(),
         runs: Vec::new(),
       };
       lzw.decode(&pack(lw, &codes), &mut out);
