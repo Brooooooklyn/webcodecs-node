@@ -657,6 +657,79 @@ pub fn enforce_range_unsigned_long_long(env: &Env, value: f64, field_name: &str)
   Ok(truncated as u64)
 }
 
+/// Convert optional f64 to u32 per WebIDL `[EnforceRange] unsigned long` algorithm
+///
+/// NaN, ±Infinity, and values outside [0, 2^32 - 1] after truncation throw TypeError.
+/// A plain `u32` napi conversion would apply ToUint32 instead and wrap them.
+pub fn enforce_range_unsigned_long_optional(
+  env: &Env,
+  value: Option<f64>,
+  field_name: &str,
+) -> Result<Option<u32>> {
+  let Some(value) = value else {
+    return Ok(None);
+  };
+  match enforce_range_unsigned_long_value(value, field_name) {
+    Ok(value) => Ok(Some(value)),
+    Err(message) => {
+      env.throw_type_error(&message, None)?;
+      Err(Error::new(Status::InvalidArg, message))
+    }
+  }
+}
+
+/// Convert f64 to u32 per WebIDL `[EnforceRange] unsigned long`, without throwing
+///
+/// Returns the TypeError message for NaN, ±Infinity, and values outside [0, 2^32 - 1] after
+/// truncation, so a caller that must reject a promise instead can keep it.
+pub fn enforce_range_unsigned_long_value(
+  value: f64,
+  field_name: &str,
+) -> std::result::Result<u32, String> {
+  if value.is_nan() {
+    return Err(format!("{} cannot be NaN", field_name));
+  }
+  if value.is_infinite() {
+    return Err(format!("{} cannot be Infinity", field_name));
+  }
+  let truncated = value.trunc();
+  if (0.0..=f64::from(u32::MAX)).contains(&truncated) {
+    // -0.5 truncates to -0, which is 0
+    return Ok(truncated as u32);
+  }
+  Err(format!("{} is out of range for unsigned long", field_name))
+}
+
+/// Read an optional number member of a WebIDL dictionary
+///
+/// A missing or undefined member is None. null is 0, like WebIDL (ToNumber(null) is +0); a
+/// plain `obj.get::<f64>` would fail on null. Other values convert as `T` does.
+pub fn get_number_member<T: FromNapiValue + Default>(
+  obj: &Object,
+  name: &str,
+) -> Result<Option<T>> {
+  let Some(value) = obj.get::<Unknown>(name)? else {
+    return Ok(None);
+  };
+  if value.get_type()? == ValueType::Null {
+    return Ok(Some(T::default()));
+  }
+  // SAFETY: `T::from_napi_value` checks the value type itself.
+  unsafe { value.cast::<T>() }.map(Some)
+}
+
+/// Convert f64 to u32 per WebIDL `unsigned long` (ECMAScript ToUint32)
+///
+/// NaN and ±Infinity give 0. Other values truncate and wrap modulo 2^32, so -90 gives
+/// 4294967206 and 2^32 + 90 gives 90.
+pub fn to_unsigned_long(value: f64) -> u32 {
+  if !value.is_finite() {
+    return 0;
+  }
+  // Exact: `%` on f64 is exact, and the result is an integer in [0, 2^32).
+  value.trunc().rem_euclid(4_294_967_296.0) as u32
+}
+
 /// Convert optional f64 to u64 per WebIDL `[EnforceRange] unsigned long long` algorithm
 pub fn enforce_range_unsigned_long_long_optional(
   env: &Env,
@@ -666,5 +739,62 @@ pub fn enforce_range_unsigned_long_long_optional(
   match value {
     Some(v) => Ok(Some(enforce_range_unsigned_long_long(env, v, field_name)?)),
     None => Ok(None),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{enforce_range_unsigned_long_value, to_unsigned_long};
+
+  #[test]
+  fn enforce_range_unsigned_long_value_truncates_or_rejects() {
+    // [input, Some(value) or None for a TypeError]
+    let cases: [(f64, Option<u32>); 12] = [
+      (16.0, Some(16)),
+      (16.7, Some(16)),
+      (-0.0, Some(0)),
+      (-0.5, Some(0)),
+      (4_294_967_295.0, Some(4_294_967_295)),
+      (4_294_967_295.5, Some(4_294_967_295)),
+      (-1.0, None),
+      (-1.5, None),
+      (4_294_967_296.0, None),
+      (f64::NAN, None),
+      (f64::INFINITY, None),
+      (f64::NEG_INFINITY, None),
+    ];
+    for (input, expected) in cases {
+      assert_eq!(
+        enforce_range_unsigned_long_value(input, "x").ok(),
+        expected,
+        "[EnforceRange] unsigned long ({input})"
+      );
+    }
+  }
+
+  #[test]
+  fn to_unsigned_long_matches_to_uint32() {
+    // [input, ToUint32(input)]; the large values are what Chrome 155 echoes for
+    // VideoDecoderConfig.rotation.
+    let cases: [(f64, u32); 15] = [
+      (0.0, 0),
+      (-0.0, 0),
+      (90.0, 90),
+      (44.9, 44),
+      (-0.5, 0),
+      (-90.0, 4_294_967_206),
+      (-315.0, 4_294_966_981),
+      (4_294_967_295.0, 4_294_967_295),
+      (4_294_967_296.0 + 90.0, 90),
+      (-4_294_967_296.0, 0),
+      (1e20, 1_661_992_960),
+      (-1e20, 2_632_974_336),
+      (f64::NAN, 0),
+      (f64::INFINITY, 0),
+      (f64::NEG_INFINITY, 0),
+    ];
+    for (input, expected) in cases {
+      assert_eq!(to_unsigned_long(input), expected, "ToUint32({input})");
+    }
   }
 }

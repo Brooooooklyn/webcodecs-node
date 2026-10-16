@@ -242,6 +242,28 @@ struct VideoDecoderInner {
   // ========================================================================
   /// Color space from decoder config - applied to decoded frames
   config_color_space: Option<VideoColorSpaceInit>,
+  /// displayAspectWidth/displayAspectHeight from decoder config - applied to decoded frames
+  config_display_aspect: Option<(u32, u32)>,
+}
+
+/// The config's rotation, already converted like Chrome 155 (unsigned long) when the config was
+/// read, so configure() and isConfigSupported() see the same value.
+fn config_rotation(config: &VideoDecoderConfig) -> f64 {
+  config.rotation.map_or(0.0, f64::from)
+}
+
+/// displayAspectWidth and displayAspectHeight must be given together (WebCodecs "valid
+/// VideoDecoderConfig"); the messages are Chrome 155's.
+fn display_aspect_pair_error(config: &VideoDecoderConfig) -> Option<&'static str> {
+  match (config.display_aspect_width, config.display_aspect_height) {
+    (Some(_), None) => {
+      Some("Invalid config, displayAspectWidth specified without displayAspectHeight.")
+    }
+    (None, Some(_)) => {
+      Some("Invalid config, displayAspectHeight specified without displayAspectWidth.")
+    }
+    _ => None,
+  }
 }
 
 /// Get the preferred hardware device type for the current platform
@@ -356,6 +378,7 @@ impl VideoDecoder {
       config_flip: false,
       // Color space from config (None = extract from FFmpeg frame)
       config_color_space: None,
+      config_display_aspect: None,
     };
 
     let inner = Arc::new(Mutex::new(inner));
@@ -695,6 +718,11 @@ impl VideoDecoder {
         guard.config_color_space.as_ref(),
       );
 
+      if let Err(e) = Self::apply_display_aspect(&guard, &video_frame) {
+        Self::report_error(&mut guard, &format!("EncodingError: {}", e));
+        return;
+      }
+
       // During flush, queue frames for synchronous delivery in resolver
       // Otherwise, use NonBlocking callback for immediate delivery
       if guard.flushes.should_buffer_outputs() {
@@ -704,6 +732,14 @@ impl VideoDecoder {
           .output_callback
           .call(video_frame, ThreadsafeFunctionCallMode::NonBlocking);
       }
+    }
+  }
+
+  /// Applies the config's displayAspectWidth:displayAspectHeight to a decoded frame.
+  fn apply_display_aspect(inner: &VideoDecoderInner, frame: &VideoFrame) -> Result<()> {
+    match inner.config_display_aspect {
+      Some((width, height)) => frame.apply_display_aspect(width, height),
+      None => Ok(()),
     }
   }
 
@@ -853,6 +889,11 @@ impl VideoDecoder {
           guard.config_flip,
           guard.config_color_space.as_ref(),
         );
+
+        if let Err(e) = Self::apply_display_aspect(&guard, &video_frame) {
+          Self::report_error(&mut guard, &format!("EncodingError: {}", e));
+          return;
+        }
         if guard.flushes.should_buffer_outputs() {
           guard.pending_frames.push(video_frame);
         } else {
@@ -951,6 +992,15 @@ impl VideoDecoder {
         guard.config_flip,
         guard.config_color_space.as_ref(),
       );
+
+      if let Err(e) = Self::apply_display_aspect(&guard, &video_frame) {
+        let msg = e.reason.clone();
+        Self::report_error(&mut guard, &format!("EncodingError: {}", msg));
+        return Err(Error::new(
+          Status::GenericFailure,
+          format!("EncodingError: {}", msg),
+        ));
+      }
       // Always queue during flush for synchronous delivery in resolver
       guard.pending_frames.push(video_frame);
     }
@@ -1136,11 +1186,14 @@ impl VideoDecoder {
     guard.hw_preference = hw_preference;
 
     // Store orientation from config
-    guard.config_rotation = config.rotation.unwrap_or(0.0);
+    guard.config_rotation = config_rotation(&config);
     guard.config_flip = config.flip.unwrap_or(false);
 
     // Store colorSpace from config
     guard.config_color_space = config.color_space;
+    guard.config_display_aspect = config
+      .display_aspect_width
+      .zip(config.display_aspect_height);
   }
 
   /// Resolve the (timestamp, duration) pair belonging to a decoded frame.
@@ -1314,6 +1367,11 @@ impl VideoDecoder {
     // W3C WebCodecs spec: Validate config synchronously, throw TypeError for invalid
     // https://w3c.github.io/webcodecs/#dom-videodecoder-configure
 
+    // WebIDL conversion of the config (e.g. [EnforceRange]) fails before validation
+    if let Some(message) = config.conversion_error.as_deref() {
+      return throw_type_error_unit(&env, message);
+    }
+
     // Validate codec - must be present and not empty
     let codec = match &config.codec {
       Some(c) if !c.is_empty() => c.clone(),
@@ -1333,6 +1391,9 @@ impl VideoDecoder {
     }
 
     // Validate display aspect dimensions if specified
+    if let Some(message) = display_aspect_pair_error(&config) {
+      return throw_type_error_unit(&env, message);
+    }
     if let Some(dw) = config.display_aspect_width
       && dw == 0
     {
@@ -1557,12 +1618,15 @@ impl VideoDecoder {
     inner.pending_chunks.clear();
 
     // Store orientation metadata from config (W3C WebCodecs spec)
-    inner.config_rotation = config.rotation.unwrap_or(0.0);
+    inner.config_rotation = config_rotation(&config);
     inner.config_flip = config.flip.unwrap_or(false);
 
     // Store colorSpace from config (W3C WebCodecs spec)
     // If provided, this colorSpace will be applied to all decoded frames
     inner.config_color_space = config.color_space;
+    inner.config_display_aspect = config
+      .display_aspect_width
+      .zip(config.display_aspect_height);
 
     // Create new channel and worker if needed (after reconfiguration)
     if self.command_sender.is_none() {
@@ -1957,6 +2021,11 @@ impl VideoDecoder {
     // W3C WebCodecs spec: Validate config, throw TypeError for invalid
     // https://w3c.github.io/webcodecs/#dom-videodecoder-isconfigsupported
 
+    // WebIDL conversion of the config (e.g. [EnforceRange]) fails before validation
+    if let Some(message) = config.conversion_error.as_deref() {
+      return reject_with_type_error(env, message);
+    }
+
     // Validate codec - must be present and not empty
     let codec = match &config.codec {
       Some(c) if !c.is_empty() => c.clone(),
@@ -1977,6 +2046,9 @@ impl VideoDecoder {
     }
 
     // Validate display aspect dimensions if specified
+    if let Some(message) = display_aspect_pair_error(&config) {
+      return reject_with_type_error(env, message);
+    }
     if let Some(dw) = config.display_aspect_width
       && dw == 0
     {

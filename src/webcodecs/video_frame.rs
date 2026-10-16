@@ -763,17 +763,138 @@ pub struct DOMRectJSON {
   pub left: f64,
 }
 
+/// WebIDL `unrestricted double` conversion (ToNumber) of an optional member that defaults to 0.
+/// Errors thrown by `valueOf`, a Symbol or a BigInt stay pending and propagate.
+fn to_unrestricted_double(value: Option<Unknown>) -> Result<f64> {
+  match value {
+    Some(value) if value.get_type()? != ValueType::Undefined => {
+      value.coerce_to_number()?.get_double()
+    }
+    _ => Ok(0.0),
+  }
+}
+
+/// IDL order of the DOMRectReadOnly prototype members (napi-derive defines them alphabetically).
+const DOM_RECT_READ_ONLY_MEMBERS: [&str; 10] = [
+  "x",
+  "y",
+  "width",
+  "height",
+  "top",
+  "right",
+  "bottom",
+  "left",
+  "toJSON",
+  "constructor",
+];
+
+/// Gives the exported DOMRectReadOnly class the shape Chrome's has: prototype members in IDL
+/// order (what `for...in` and `Object.getOwnPropertyNames` list) and a `Symbol.toStringTag`
+/// of "DOMRectReadOnly".
+fn install_dom_rect_read_only_shape(env: &Env, exports: &Object) -> Result<()> {
+  // The class is a function, which `get_named_property::<Object>` rejects.
+  let class = exports
+    .get_named_property::<Unknown>("DOMRectReadOnly")?
+    .coerce_to_object()?;
+  let prototype: Object = class.get_named_property("prototype")?;
+  let global = env.get_global()?;
+  let reflect: Object = global.get_named_property("Reflect")?;
+  let get_descriptor: Function<FnArgs<(Object, &str)>, Unknown> =
+    reflect.get_named_property("getOwnPropertyDescriptor")?;
+  let delete_property: Function<FnArgs<(Object, &str)>, bool> =
+    reflect.get_named_property("deleteProperty")?;
+  let define_property: Function<FnArgs<(Object, Unknown, Unknown)>, bool> =
+    reflect.get_named_property("defineProperty")?;
+  // Delete and redefine each member in IDL order, so every member moves to the end in turn.
+  for name in DOM_RECT_READ_ONLY_MEMBERS {
+    let descriptor = get_descriptor.call((prototype, name).into())?;
+    if descriptor.get_type()? == ValueType::Undefined {
+      return Err(Error::new(
+        Status::GenericFailure,
+        format!("DOMRectReadOnly.prototype.{} is missing", name),
+      ));
+    }
+    delete_property.call((prototype, name).into())?;
+    let key = env.create_string(name)?.to_unknown();
+    define_property.call((prototype, key, descriptor).into())?;
+  }
+  let to_string_tag: Unknown = global
+    .get_named_property::<Unknown>("Symbol")?
+    .coerce_to_object()?
+    .get_named_property("toStringTag")?;
+  let mut tag = Object::new(env)?;
+  tag.set_named_property("value", "DOMRectReadOnly")?;
+  tag.set_named_property("configurable", true)?;
+  define_property.call((prototype, to_string_tag, tag.to_unknown()).into())?;
+  Ok(())
+}
+
+/// [`install_dom_rect_read_only_shape`] for the load hook: a failure is logged and cleared, so
+/// it does not make the module fail to load.
+fn try_install_dom_rect_read_only_shape(env: &Env, exports: &Object) {
+  if let Err(error) = install_dom_rect_read_only_shape(env, exports) {
+    tracing::warn!(target: "webcodecs", error = %error, "DOMRectReadOnly shape not installed");
+    let mut exception = std::ptr::null_mut();
+    unsafe { napi::sys::napi_get_and_clear_last_exception(env.raw(), &mut exception) };
+  }
+}
+
 #[napi]
 impl DOMRectReadOnly {
   /// Create a new DOMRectReadOnly
-  #[napi(constructor)]
-  pub fn new(x: Option<f64>, y: Option<f64>, width: Option<f64>, height: Option<f64>) -> Self {
-    DOMRectReadOnly {
-      x: x.unwrap_or(0.0),
-      y: y.unwrap_or(0.0),
-      width: width.unwrap_or(0.0),
-      height: height.unwrap_or(0.0),
+  ///
+  /// Arguments convert like WebIDL `unrestricted double` (ToNumber), as in browsers.
+  #[napi(
+    constructor,
+    ts_args_type = "x?: number | undefined | null, y?: number | undefined | null, width?: number | undefined | null, height?: number | undefined | null"
+  )]
+  pub fn new(
+    x: Option<Unknown>,
+    y: Option<Unknown>,
+    width: Option<Unknown>,
+    height: Option<Unknown>,
+  ) -> Result<Self> {
+    Ok(DOMRectReadOnly {
+      x: to_unrestricted_double(x)?,
+      y: to_unrestricted_double(y)?,
+      width: to_unrestricted_double(width)?,
+      height: to_unrestricted_double(height)?,
+    })
+  }
+
+  /// Create a DOMRectReadOnly from a DOMRectInit dictionary (Geometry Interfaces `fromRect`)
+  #[napi(js_name = "fromRect", ts_args_type = "other?: DOMRectInit")]
+  pub fn from_rect(env: Env, other: Option<Unknown>) -> Result<DOMRectReadOnly> {
+    // undefined and null convert to an empty dictionary.
+    let Some(other) = other else {
+      return Ok(DOMRectReadOnly {
+        x: 0.0,
+        y: 0.0,
+        width: 0.0,
+        height: 0.0,
+      });
+    };
+    if !matches!(other.get_type()?, ValueType::Object | ValueType::Function) {
+      return Err(throw_type_error(
+        env.raw(),
+        "The provided value is not of type 'DOMRectInit'.",
+      ));
     }
+    let other = other.coerce_to_object()?;
+    let member = |name: &str| -> Result<f64> {
+      to_unrestricted_double(Some(other.get_named_property::<Unknown>(name)?))
+    };
+    // WebIDL reads dictionary members in lexicographic order.
+    let height = member("height")?;
+    let width = member("width")?;
+    let x = member("x")?;
+    let y = member("y")?;
+    Ok(DOMRectReadOnly {
+      x,
+      y,
+      width,
+      height,
+    })
   }
 
   /// X coordinate
@@ -1072,18 +1193,47 @@ impl FromNapiValue for VideoFrameConstructorInit {
       enforce_range_unsigned_long_long_optional(&env_wrapper, duration_f64, "duration")?
         .map(|v| v.min(i64::MAX as u64) as i64);
 
+    // One reader serves both VideoFrameBufferInit and VideoFrameInit, so the members keep the
+    // order it always used. The checked members sit where WebIDL (lexicographic) order puts
+    // them relative to the others: displayHeight/displayWidth after codedWidth/codedHeight and
+    // before layout, rotation after flip.
+    let coded_width: Option<u32> = obj.get("codedWidth")?;
+    let coded_height: Option<u32> = obj.get("codedHeight")?;
+    // displayWidth/displayHeight are WebIDL [EnforceRange] unsigned long: a plain u32
+    // conversion would wrap -1 or 2^32 + 1 into range instead of throwing. WebIDL converts
+    // dictionary members in lexicographic order and stops at the first failure, so
+    // displayHeight is read and checked before the displayWidth getter runs. null is 0.
+    let display_height = super::error::enforce_range_unsigned_long_optional(
+      &env_wrapper,
+      super::error::get_number_member(&obj, "displayHeight")?,
+      "displayHeight",
+    )?;
+    let display_width = super::error::enforce_range_unsigned_long_optional(
+      &env_wrapper,
+      super::error::get_number_member(&obj, "displayWidth")?,
+      "displayWidth",
+    )?;
+    let layout: Option<Vec<PlaneLayout>> = obj.get("layout")?;
+    let visible_rect: Option<DOMRectInit> = obj.get("visibleRect")?;
+    let flip: Option<bool> = obj.get("flip")?;
+    // rotation is a WebIDL (restricted) double. null is 0, as for displayWidth/displayHeight.
+    let rotation: Option<f64> = super::error::get_number_member(&obj, "rotation")?;
+    if rotation.is_some_and(|rotation| !rotation.is_finite()) {
+      return Err(throw_type_error(env, "rotation must be a finite number"));
+    }
+
     Ok(VideoFrameConstructorInit {
       format,
-      coded_width: obj.get("codedWidth")?,
-      coded_height: obj.get("codedHeight")?,
+      coded_width,
+      coded_height,
       timestamp,
       duration,
-      layout: obj.get("layout")?,
-      visible_rect: obj.get("visibleRect")?,
-      rotation: obj.get("rotation")?,
-      flip: obj.get("flip")?,
-      display_width: obj.get("displayWidth")?,
-      display_height: obj.get("displayHeight")?,
+      layout,
+      visible_rect,
+      rotation,
+      flip,
+      display_width,
+      display_height,
       color_space: obj.get("colorSpace")?,
       metadata: obj.get("metadata")?,
       transfer: obj.get("transfer")?,
@@ -1724,15 +1874,18 @@ thread_local! {
     const { std::cell::Cell::new(None) };
 }
 
-/// Runs each time the module loads into an env (the main thread or a worker), before page code
-/// can use the module. napi-rs keeps one `module_exports` hook per crate: add new load-time work
-/// here.
+/// Runs each time the module loads into an env (the main thread or a worker), after napi-rs has
+/// defined the exported classes and before page code can use the module. napi-rs keeps one
+/// `module_exports` hook per crate, and a second one silently replaces this one: add new
+/// load-time work here.
 #[napi(module_exports)]
 // Only napi's load-time registration calls this, and `cargo test` builds leave it out.
 #[cfg_attr(test, allow(dead_code))]
-pub fn on_module_load(_exports: Object, env: Env) -> Result<()> {
+pub fn on_module_load(exports: Object, env: Env) -> Result<()> {
   capture_buffer_flag_getters(&env)?;
-  capture_iterator_symbol(&env)
+  capture_iterator_symbol(&env)?;
+  try_install_dom_rect_read_only_shape(&env, &exports);
+  Ok(())
 }
 
 /// Captures the buffer flag getters of `env`, once per env.
@@ -2088,18 +2241,91 @@ pub struct VideoFrame {
   /// Frame metadata lives outside the detachable resource per WebCodecs.
   timestamp_us: i64,
   duration_us: Option<i64>,
-  rotation: f64,
-  flip: bool,
 }
 
 /// Parse rotation value per W3C spec algorithm
-/// Rounds to nearest 90 degrees, normalizes to 0-359 range
+/// Rounds to the nearest multiple of 90 (ties towards positive infinity), normalized to 0-270.
+///
+/// Same steps as Chromium's media::VideoTransformation(double, bool): flooring first keeps every
+/// step exact, so huge values and negative ties (-315 -> 90) round like the spec says.
 fn parse_rotation(rotation: f64) -> f64 {
-  // Round to nearest multiple of 90, ties towards positive infinity
-  let aligned = (rotation / 90.0).round() * 90.0;
-  // Normalize to 0-359 range
-  let full_turns = (aligned / 360.0).floor() * 360.0;
-  aligned - full_turns
+  // An integer in (-360, 360); `%` on f64 is C fmod. Non-finite input (the VideoFrame
+  // constructors reject it) gives NaN, which the cast turns into 0, so rotation 0.
+  let bounded = rotation.floor() % 360.0;
+  // Add 360 to make it non-negative and 45 to round ties up: quarter turns in [0, 8].
+  let quarter_turns = (bounded as i32 + 360 + 45) / 90;
+  f64::from((quarter_turns % 4) * 90)
+}
+
+/// Chromium media::limits::kMaxDimension and kMaxCanvas (media/base/limits.h)
+const MAX_DIMENSION: u32 = (1 << 15) - 1;
+const MAX_CANVAS: u64 = (1 << 29) - 1;
+
+/// Whether a display size fits Chromium's media::VideoFrame size limits.
+fn display_size_within_limits(width: u32, height: u32) -> bool {
+  width <= MAX_DIMENSION
+    && height <= MAX_DIMENSION
+    && u64::from(width) * u64::from(height) <= MAX_CANVAS
+}
+
+/// Validates an explicit displayWidth/displayHeight pair like Chromium's
+/// ParseAndValidateDisplaySize: both or neither, nonzero, within media limits.
+/// Returns the TypeError message on failure.
+fn parse_display_size(
+  width: Option<u32>,
+  height: Option<u32>,
+) -> std::result::Result<Option<(u32, u32)>, String> {
+  let (width, height) = match (width, height) {
+    (None, None) => return Ok(None),
+    (None, Some(_)) => return Err("displayHeight specified without displayWidth.".into()),
+    (Some(_), None) => return Err("displayWidth specified without displayHeight.".into()),
+    (Some(width), Some(height)) => (width, height),
+  };
+  if width == 0 {
+    return Err("displayWidth must be nonzero.".into());
+  }
+  if height == 0 {
+    return Err("displayHeight must be nonzero.".into());
+  }
+  if !display_size_within_limits(width, height) {
+    return Err(format!(
+      "Invalid display size ({}, {}); exceeds implementation limit.",
+      width, height
+    ));
+  }
+  Ok(Some((width, height)))
+}
+
+/// Natural size for a decoder's displayAspectWidth:displayAspectHeight, like Chromium's
+/// VideoAspectRatio::DAR(width, height).GetNaturalSize(visible_rect): grow one side of the
+/// visible size until it matches the ratio. None keeps the visible size (Chromium casts the
+/// members to int, so a value above i32::MAX makes the ratio invalid).
+fn natural_size_for_display_aspect(
+  visible_width: u32,
+  visible_height: u32,
+  aspect_width: u32,
+  aspect_height: u32,
+) -> Option<(f64, f64)> {
+  let (aspect_width, aspect_height) = (aspect_width as i32, aspect_height as i32);
+  if aspect_height == 0 || visible_width == 0 || visible_height == 0 {
+    return None;
+  }
+  let aspect = f64::from(aspect_width) / f64::from(aspect_height);
+  if !aspect.is_finite() || aspect <= 0.0 {
+    return None;
+  }
+  let (mut width, mut height) = (f64::from(visible_width), f64::from(visible_height));
+  if aspect >= width / height {
+    width = height * aspect;
+  } else {
+    height = width / aspect;
+  }
+  let (width, height) = (width.round(), height.round());
+  let int_max = f64::from(i32::MAX);
+  if width < 1.0 || width > int_max || height < 1.0 || height > int_max {
+    return None;
+  }
+  Some((width, height))
 }
 
 #[napi]
@@ -2109,8 +2335,6 @@ impl VideoFrame {
       observer_id: NEXT_FRAME_ID.fetch_add(1, Ordering::Relaxed),
       timestamp_us: inner.timestamp_us,
       duration_us: inner.duration_us,
-      rotation: inner.rotation,
-      flip: inner.flip,
       inner: Arc::new(Mutex::new(Some(inner))),
     }
   }
@@ -2149,9 +2373,10 @@ impl VideoFrame {
       height,
       VideoPixelFormat::RGBA,
     )?;
-    if init.display_width == Some(0) || init.display_height == Some(0) {
-      return Err(type_error("display dimensions must be positive"));
-    }
+    let (display_width, display_height) =
+      parse_display_size(init.display_width, init.display_height)
+        .map_err(|message| type_error(&message))?
+        .unwrap_or((visible_width, visible_height));
     if !matches!(init.alpha.as_deref(), None | Some("keep") | Some("discard")) {
       return Err(type_error("invalid alpha handling"));
     }
@@ -2183,8 +2408,8 @@ impl VideoFrame {
       visible_top,
       visible_width,
       visible_height,
-      display_width: init.display_width.unwrap_or(visible_width),
-      display_height: init.display_height.unwrap_or(visible_height),
+      display_width,
+      display_height,
       rotation: parse_rotation(init.rotation.unwrap_or(0.)),
       flip: init.flip.unwrap_or(false),
       color_space,
@@ -2241,7 +2466,7 @@ impl VideoFrame {
         }
       }
 
-      return Self::new_from_video_frame(video_frame, init)
+      return Self::new_from_video_frame(&env, video_frame, init)
         .map_err(|error| throw_as_native_error(&env, error));
     }
 
@@ -2396,8 +2621,10 @@ impl VideoFrame {
     // Store the natural (unrotated) size. Explicit displayWidth/displayHeight are
     // taken as the natural size too, like Chromium (the spec text stores them as
     // already rotated). The displayWidth/displayHeight getters apply rotation.
-    let display_width = init.display_width.unwrap_or(visible_width);
-    let display_height = init.display_height.unwrap_or(visible_height);
+    let (display_width, display_height) =
+      parse_display_size(init.display_width, init.display_height)
+        .map_err(|message| throw_type_error(env.raw(), &message))?
+        .unwrap_or((visible_width, visible_height));
 
     // Color space: use provided value, or default to sRGB for RGB formats
     let color_space = if init.color_space.is_some() {
@@ -2593,10 +2820,13 @@ impl VideoFrame {
 
   /// Internal: Create VideoFrame from another VideoFrame (image source constructor form)
   fn new_from_video_frame(
+    env: &Env,
     source: &VideoFrame,
     init: Option<VideoFrameConstructorInit>,
   ) -> Result<Self> {
-    source.with_inner(|source_inner| {
+    // The closure returns Err(message) for an OperationError, thrown once the source lock is
+    // released: constructing a DOMException runs JS.
+    let new_inner = source.with_inner(|source_inner| {
       // Check if alpha should be discarded per W3C spec
       let should_discard_alpha = init
         .as_ref()
@@ -2655,28 +2885,62 @@ impl VideoFrame {
 
       // Per spec: display dimensions scale proportionally with visible rect changes
       // If not explicitly provided, scale based on ratio of new visible rect to old
-      let display_width = init
-        .as_ref()
-        .and_then(|i| i.display_width)
-        .unwrap_or_else(|| {
-          if source_inner.visible_width > 0 {
-            let scale = visible_width as f64 / source_inner.visible_width as f64;
-            ((source_inner.display_width as f64) * scale).round() as u32
-          } else {
-            visible_width
+      let explicit_display = parse_display_size(
+        init.as_ref().and_then(|i| i.display_width),
+        init.as_ref().and_then(|i| i.display_height),
+      )
+      .map_err(|message| throw_type_error(env.raw(), &message))?;
+      let has_visible_rect = init.as_ref().is_some_and(|i| i.visible_rect.is_some());
+      let (display_width, display_height) = match explicit_display {
+        Some(size) => size,
+        // Without a new visibleRect the source display size is kept as is
+        None if !has_visible_rect => (source_inner.display_width, source_inner.display_height),
+        None => {
+          let scaled = |display: u32, visible: u32, source_visible: u32| {
+            if source_visible > 0 {
+              let scale = f64::from(visible) / f64::from(source_visible);
+              (f64::from(display) * scale).round()
+            } else {
+              f64::from(visible)
+            }
+          };
+          let width = scaled(
+            source_inner.display_width,
+            visible_width,
+            source_inner.visible_width,
+          );
+          let height = scaled(
+            source_inner.display_height,
+            visible_height,
+            source_inner.visible_height,
+          );
+          // Like Chromium's ParsedVideoFrameInit (spec step 8.5)
+          if width == 0.0 {
+            return Err(throw_type_error(
+              env.raw(),
+              "computed displayWidth must be nonzero",
+            ));
           }
-        });
-      let display_height = init
-        .as_ref()
-        .and_then(|i| i.display_height)
-        .unwrap_or_else(|| {
-          if source_inner.visible_height > 0 {
-            let scale = visible_height as f64 / source_inner.visible_height as f64;
-            ((source_inner.display_height as f64) * scale).round() as u32
-          } else {
-            visible_height
+          if height == 0.0 {
+            return Err(throw_type_error(
+              env.raw(),
+              "computed displayHeight must be nonzero",
+            ));
           }
-        });
+          // Chromium cannot wrap a frame whose natural size exceeds the media limits and
+          // throws OperationError. Checking here also keeps the u32 casts below exact.
+          if width > f64::from(MAX_DIMENSION)
+            || height > f64::from(MAX_DIMENSION)
+            || width * height > MAX_CANVAS as f64
+          {
+            return Ok(Err(format!(
+              "Failed to create a VideoFrame: computed display size {}x{} exceeds implementation limit.",
+              width, height
+            )));
+          }
+          (width as u32, height as u32)
+        }
+      };
 
       let new_inner = VideoFrameInner {
         resource,
@@ -2693,8 +2957,16 @@ impl VideoFrame {
         color_space: source_inner.color_space.clone(),
       };
 
-      Ok(VideoFrame::from_inner(new_inner))
-    })
+      Ok(Ok(new_inner))
+    })?;
+    match new_inner {
+      Ok(new_inner) => Ok(VideoFrame::from_inner(new_inner)),
+      Err(message) => super::error::throw_dom_exception(
+        env,
+        super::error::DOMExceptionName::OperationError,
+        &message,
+      ),
+    }
   }
 
   /// Create a VideoFrame from an internal Frame (for decoder output)
@@ -3098,15 +3370,25 @@ impl VideoFrame {
   }
 
   /// Get the rotation in degrees clockwise (0, 90, 180, 270) - W3C WebCodecs spec
+  /// Returns 0 after close (Close VideoFrame resets [[rotation]]).
   #[napi(getter)]
   pub fn rotation(&self) -> Result<f64> {
-    Ok(self.rotation)
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    Ok(guard.as_ref().map_or(0.0, |inner| inner.rotation))
   }
 
   /// Get whether horizontal flip is applied - W3C WebCodecs spec
+  /// Returns false after close (Close VideoFrame resets [[flip]]).
   #[napi(getter)]
   pub fn flip(&self) -> Result<bool> {
-    Ok(self.flip)
+    let guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    Ok(guard.as_ref().is_some_and(|inner| inner.flip))
   }
 
   /// Get the metadata associated with this VideoFrame - W3C WebCodecs spec
@@ -3950,8 +4232,8 @@ impl VideoFrame {
   /// Per W3C spec "Close VideoFrame" algorithm:
   /// 1. Assign null to frame's [[resource reference]]
   /// 2. Assign true to frame's [[Detached]]
-  /// Note: Metadata (timestamp, duration, etc.) remains accessible after close.
-  /// codedRect and visibleRect become null, every colorSpace field becomes null,
+  /// Note: timestamp and duration remain accessible after close; rotation becomes 0,
+  /// flip false, codedRect and visibleRect null, every colorSpace field becomes null,
   /// and callbacks registered with registerVideoFrameCloseObserver run synchronously.
   #[napi(ts_args_type = "")]
   pub fn close(&self, env: Env, this: This) -> Result<()> {
@@ -4012,6 +4294,44 @@ impl VideoFrame {
   /// that need to share the frame without deep copying.
   pub(crate) fn frame_arc(&self) -> Result<Arc<RwLock<Frame>>> {
     self.with_inner(|inner| Ok(inner.resource.software()?.0.clone()))
+  }
+
+  /// Applies a VideoDecoderConfig displayAspectWidth:displayAspectHeight to a decoded frame
+  /// (spec "Create a VideoFrame" step 8): grows the display width or height to the ratio.
+  ///
+  /// Fails when the grown size exceeds the media limits; Chromium's decoder reports an
+  /// EncodingError then.
+  pub(crate) fn apply_display_aspect(&self, aspect_width: u32, aspect_height: u32) -> Result<()> {
+    let mut guard = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    let Some(inner) = guard.as_mut() else {
+      return Ok(());
+    };
+    let Some((width, height)) = natural_size_for_display_aspect(
+      inner.visible_width,
+      inner.visible_height,
+      aspect_width,
+      aspect_height,
+    ) else {
+      return Ok(());
+    };
+    if width > f64::from(MAX_DIMENSION)
+      || height > f64::from(MAX_DIMENSION)
+      || width * height > MAX_CANVAS as f64
+    {
+      return Err(Error::new(
+        Status::GenericFailure,
+        format!(
+          "Display size {}x{} for display aspect {}:{} exceeds implementation limit",
+          width, height, aspect_width, aspect_height
+        ),
+      ));
+    }
+    inner.display_width = width as u32;
+    inner.display_height = height as u32;
+    Ok(())
   }
 
   /// Borrow internal frame for read access (crate internal use)
