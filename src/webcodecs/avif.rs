@@ -256,6 +256,7 @@ fn parse_ftyp(mut r: Reader) -> Option<Ftyp> {
 }
 
 /// An item property ('ipco' entry) or a box of a sample entry
+#[derive(Clone, Copy)]
 enum Property<'a> {
   Av1C {
     config: &'a [u8],
@@ -365,8 +366,10 @@ struct Meta<'a> {
   /// The 'idat' payload
   idat: Option<Range<usize>>,
   properties: Vec<Property<'a>>,
-  /// The (1-based property index, essential) associations of each item
-  associations: HashMap<u32, Vec<(usize, bool)>>,
+  /// The associations of each item, in the 'ipma' bytes (see `association`), and the size of
+  /// one (1 or 2 bytes). They are not copied: 65535 items of 255 associations each would take
+  /// 268 MB as lists.
+  associations: HashMap<u32, (&'a [u8], usize)>,
   /// (type, from item id, to item id)
   references: Vec<([u8; 4], u32, u32)>,
   /// Ids in the 'altr' (alternatives) entity groups
@@ -533,31 +536,37 @@ fn parse_iprp<'a>(mut r: Reader<'a>, meta: &mut Meta<'a>) -> Option<()> {
         return None;
       }
       previous = item;
-      let mut associations = Vec::new();
-      for _ in 0..ipma.u8()? {
-        // the essential bit, then a 15-bit or 7-bit property index
-        let (value, top) = match flags & 1 {
-          1 => (ipma.u16()?, 0x8000),
-          _ => (ipma.u8()?.into(), 0x80),
-        };
-        let (essential, index) = (value & top != 0, usize::from(value & (top - 1)));
+      let count = ipma.u8()?;
+      let size = 1 + usize::from(flags & 1 == 1);
+      let entries = ipma.bytes(usize::from(count) * size)?;
+      for entry in entries.chunks_exact(size) {
+        let (index, essential) = association(entry);
         if index > meta.properties.len() || (index == 0 && essential) {
           return None;
         }
-        associations.push((index, essential));
       }
-      if associations.is_empty() {
+      if entries.is_empty() {
         continue;
       }
       // at most one association list per item
       if meta.associations.len() >= MAX_ENTRIES
-        || meta.associations.insert(item, associations).is_some()
+        || meta.associations.insert(item, (entries, size)).is_some()
       {
         return None;
       }
     }
   }
   Some(())
+}
+
+/// An 'ipma' association of 1 or 2 bytes: the essential bit, then a 7-bit or 15-bit
+/// 1-based property index (0: none). Returns (index, essential).
+fn association(entry: &[u8]) -> (usize, bool) {
+  let value = entry
+    .iter()
+    .fold(0, |value, &byte| (value << 8) | usize::from(byte));
+  let top = 1 << (entry.len() * 8 - 1);
+  (value & (top - 1), value & top != 0)
 }
 
 fn parse_iref(mut r: Reader, meta: &mut Meta) -> Option<()> {
@@ -606,9 +615,10 @@ impl<'a> Meta<'a> {
       .associations
       .get(&item)
       .into_iter()
-      .flatten()
-      .filter(|(index, _)| *index > 0)
-      .map(|&(index, essential)| (&self.properties[index - 1], essential))
+      .flat_map(|&(associations, size)| associations.chunks_exact(size))
+      .map(association)
+      .filter(|&(index, _)| index > 0)
+      .map(|(index, essential)| (&self.properties[index - 1], essential))
   }
 
   /// CrabbyAvif skips an item without data (unless it is 'iden'), with an unknown
@@ -754,7 +764,7 @@ struct SampleTable<'a> {
   sample_sizes: Option<(u32, &'a [u8])>,
   /// 'stts' entries: sample count, sample delta
   time_to_sample: Option<&'a [u8]>,
-  /// The properties of the first 'av01' sample entry
+  /// The first 'av1C' and 'auxi' of the first 'av01' sample entry
   av01: Option<Vec<Property<'a>>>,
 }
 
@@ -871,13 +881,16 @@ fn parse_stbl(mut r: Reader) -> Option<SampleTable> {
             // SampleEntry and VisualSampleEntry fields
             entry.skip(78)?;
             let properties = parse_properties(entry, true)?;
-            if !properties
+            // A track reads only its first 'av1C' and 'auxi' (`Track::samples`, `is_alpha`). Keep
+            // those two, not a list of up to MAX_ENTRIES boxes for each of up to MAX_ENTRIES
+            // tracks.
+            let config = properties
               .iter()
-              .any(|p| matches!(p, Property::Av1C { .. }))
-            {
-              return None;
-            }
-            table.av01.get_or_insert(properties);
+              .find(|p| matches!(p, Property::Av1C { .. }))?;
+            let aux = properties.iter().find(|p| matches!(p, Property::Aux(_)));
+            table
+              .av01
+              .get_or_insert_with(|| [config].into_iter().chain(aux).copied().collect());
           }
         }
       }
@@ -1159,8 +1172,8 @@ fn push<T>(list: &mut Vec<T>, value: T) -> Option<()> {
 #[cfg(test)]
 mod tests {
   use super::{
-    Avif, AvifImage, AvifSamples, Nclx, Reader, STREAM_SIZE_HINT, Samples, item_size, parse,
-    parse_meta,
+    ALPHA_URNS, Avif, AvifImage, AvifSamples, Nclx, Reader, STREAM_SIZE_HINT, Samples, association,
+    be32, item_size, parse, parse_meta, parse_moov,
   };
 
   /// AVIF files from the Chrome 155 comparison (avifenc 1.4.2, MP4Box), and two of them
@@ -1199,6 +1212,13 @@ mod tests {
       .iter()
       .map(|&(offset, size)| data[offset..offset + size].to_vec())
       .collect()
+  }
+
+  fn boxed(kind: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut b = (payload.len() as u32 + 8).to_be_bytes().to_vec();
+    b.extend_from_slice(kind);
+    b.extend_from_slice(payload);
+    b
   }
 
   fn patch(data: &[u8], offset: usize, bytes: &[u8]) -> Vec<u8> {
@@ -1637,12 +1657,6 @@ mod tests {
     assert_eq!(outcome(&huge, None), "decline");
 
     // 'iloc' extents of 0 bytes each: 65535 of them for one item, more for two
-    let boxed = |kind: &[u8], payload: &[u8]| {
-      let mut b = (payload.len() as u32 + 8).to_be_bytes().to_vec();
-      b.extend_from_slice(kind);
-      b.extend_from_slice(payload);
-      b
-    };
     let meta = |items: u16| {
       let mut iloc = vec![0; 6];
       iloc.extend_from_slice(&items.to_be_bytes());
@@ -1668,6 +1682,132 @@ mod tests {
     };
     assert!(read(&meta(1)));
     assert!(!read(&meta(2)));
+  }
+
+  /// s8_420.avif with `count` 'ipma' entries (version 0, `flags`) in place of its own, and
+  /// the item's offset moved by the size change
+  fn s8_with_ipma(flags: u8, count: u32, entries: &[u8]) -> Vec<u8> {
+    let s8 = fixture("s8_420.avif");
+    let (meta, iloc, iprp, ipma) = (
+      32,
+      box_at(&s8, b"iloc"),
+      box_at(&s8, b"iprp"),
+      box_at(&s8, b"ipma"),
+    );
+    let payload = [&[0, 0, 0, flags][..], &count.to_be_bytes(), entries].concat();
+    let ipma_box = boxed(b"ipma", &payload);
+    let old = be32(&s8[ipma..]) as usize;
+    let mut data = [&s8[..ipma], &ipma_box, &s8[ipma + old..]].concat();
+    // the sizes of 'meta' and 'iprp', and the item's offset in 'iloc'
+    for at in [meta, iprp, iloc + 22] {
+      let value = be32(&data[at..]) as usize + ipma_box.len() - old;
+      data[at..at + 4].copy_from_slice(&(value as u32).to_be_bytes());
+    }
+    data
+  }
+
+  #[test]
+  fn borrows_item_property_associations() {
+    let s8 = fixture("s8_420.avif");
+    // item 1: ispe, pixi, essential av1C, colr
+    let item = [0, 1, 4, 1, 2, 0x83, 4];
+    assert_eq!(s8_with_ipma(0, 1, &item), s8);
+    let original = parsed(&s8, None);
+    let same_image = |data: &[u8]| {
+      let image = parsed(data, None);
+      assert_eq!(samples(data, &image.color), samples(&s8, &original.color));
+      assert_eq!(image.nclx, original.nclx);
+    };
+    // 2-byte associations (flags 1). Rejected: an essential one to no property, and one past
+    // the 4 properties.
+    same_image(&s8_with_ipma(1, 1, &[0, 1, 4, 0, 1, 0, 2, 0x80, 3, 0, 4]));
+    for extra in [[0x80, 0], [0, 5]] {
+      let entries = [&[0, 1, 5, 0, 1, 0, 2, 0x80, 3, 0, 4][..], &extra].concat();
+      assert_eq!(outcome(&s8_with_ipma(1, 1, &entries), None), "decline");
+    }
+    assert_eq!(association(&[0x83]), (3, true));
+    assert_eq!(association(&[0x7F]), (127, false));
+    assert_eq!(association(&[0x80, 0x03]), (3, true));
+    assert_eq!(association(&[0x7F, 0xFF]), (0x7FFF, false));
+
+    // Items 2 to 65535 with 255 associations each to no property: 16.9 MB. Chrome decodes
+    // the primary item (I420). The associations stay in the data: as lists they took 268 MB.
+    let mut entries = item.to_vec();
+    for id in 2..=u16::MAX {
+      entries.extend_from_slice(&id.to_be_bytes());
+      entries.push(255);
+      entries.extend_from_slice(&[0; 255]);
+    }
+    let data = s8_with_ipma(0, 65535, &entries);
+    same_image(&data);
+    let meta = parse_meta(Reader {
+      data: &data,
+      pos: 40,
+      end: 32 + be32(&data[32..]) as usize,
+    })
+    .expect("meta");
+    assert_eq!(meta.associations.len(), 65535);
+    let range = data.as_ptr_range();
+    assert!(
+      meta
+        .associations
+        .values()
+        .all(|(associations, _)| range.contains(&associations.as_ptr()))
+    );
+  }
+
+  #[test]
+  fn keeps_two_boxes_of_a_track_sample_entry() {
+    // An 'av01' sample entry with 3000 unknown boxes, an alpha 'auxi', two 'av1C' and a depth
+    // 'auxi'. A track reads the first 'av1C' and 'auxi', and keeps only those.
+    let unknown = boxed(b"xxxx", &[]).repeat(1000);
+    let auxi = |urn: &[u8]| boxed(b"auxi", &[&[0; 4], urn, &[0]].concat());
+    let entry = [
+      &[0; 78][..],
+      &unknown,
+      &auxi(ALPHA_URNS[0]),
+      &unknown,
+      &boxed(b"av1C", &[0x81, 0, 0x0c, 0]),
+      &boxed(b"av1C", &[0x81, 0, 0x1c, 0]),
+      &auxi(b"urn:depth"),
+      &unknown,
+    ]
+    .concat();
+    let full = |kind: &[u8], body: &[u8]| boxed(kind, &[&[0; 4], body].concat());
+    let stbl = [
+      full(
+        b"stsd",
+        &[&1u32.to_be_bytes()[..], &boxed(b"av01", &entry)].concat(),
+      ),
+      // one chunk at 0 of one 10-byte sample
+      full(b"stco", &[0, 0, 0, 1, 0, 0, 0, 0]),
+      full(b"stsc", &[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]),
+      full(b"stsz", &[0, 0, 0, 10, 0, 0, 0, 1]),
+    ]
+    .concat();
+    // track 1, 64x48
+    let mut tkhd = vec![0; 80];
+    tkhd[8..12].copy_from_slice(&1u32.to_be_bytes());
+    tkhd[72..76].copy_from_slice(&(64u32 << 16).to_be_bytes());
+    tkhd[76..80].copy_from_slice(&(48u32 << 16).to_be_bytes());
+    let hdlr = full(b"hdlr", b"\0\0\0\0pict\0\0\0\0\0\0\0\0\0\0\0\0\0");
+    let mdia = [hdlr, boxed(b"minf", &boxed(b"stbl", &stbl))].concat();
+    let trak = boxed(
+      b"trak",
+      &[full(b"tkhd", &tkhd), boxed(b"mdia", &mdia)].concat(),
+    );
+    let tracks = parse_moov(Reader {
+      data: &trak,
+      pos: 0,
+      end: trak.len(),
+    })
+    .expect("tracks");
+    let track = &tracks[0];
+    assert_eq!(track.av01().map(<[_]>::len), Some(2));
+    assert!(track.is_alpha());
+    let samples = track.samples().expect("samples");
+    assert_eq!(samples.config, [0x81, 0, 0x0c, 0]);
+    assert_eq!(samples.len(), 1);
   }
 
   #[test]
