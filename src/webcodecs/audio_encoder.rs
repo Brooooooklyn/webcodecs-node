@@ -202,6 +202,9 @@ struct AudioEncoderInner {
   output_callback: OutputCallback,
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
+  /// The codec's event state: report_error orders the error callback before
+  /// the dequeue events that come due meanwhile.
+  event_state: Arc<RwLock<CodecEventState>>,
   /// Pending flush operations, tracked independently for overlapping calls.
   flushes: FlushTracker,
   /// Queue of input timestamps for correlation with output packets
@@ -309,6 +312,7 @@ impl AudioEncoder {
     )]
     init: AudioEncoderInit,
   ) -> Result<Self> {
+    let event_state = Arc::new(RwLock::new(CodecEventState::default()));
     let inner = AudioEncoderInner {
       state: CodecState::Unconfigured,
       config: None,
@@ -322,6 +326,7 @@ impl AudioEncoder {
       encode_queue_size: 0,
       output_callback: init.output,
       error_callback: init.error,
+      event_state: event_state.clone(),
       flushes: FlushTracker::default(),
       timestamp_queue: std::collections::VecDeque::new(),
       base_timestamp: None,
@@ -336,7 +341,6 @@ impl AudioEncoder {
     let inner = Arc::new(Mutex::new(inner));
 
     // Create separate lock for event listener state (avoids contention with encode operations)
-    let event_state = Arc::new(RwLock::new(CodecEventState::default()));
 
     // Create channel for worker commands
     let (sender, receiver) = channel::unbounded();
@@ -428,14 +432,12 @@ impl AudioEncoder {
 
     // Check if encoder is still configured
     if guard.state != CodecState::Configured {
-      let old_size = guard.encode_queue_size;
-      guard.encode_queue_size = old_size.saturating_sub(1);
-      if old_size > 0 {
-        let _ = Self::fire_dequeue_event(event_state);
-      }
       // Per W3C spec: "cease producing output" - silently discard pending work
       // State could be Unconfigured (reset called) or Closed (close called)
       // Don't call report_error() - that would set state to Closed and invoke error callback
+      // Every encode still queued is discarded the same way, so dequeue them all
+      // now: one dequeue event, as Chrome fires when it resets the queue.
+      CodecEventState::dequeue_all(event_state, &mut guard.encode_queue_size);
       return;
     }
 
@@ -448,12 +450,7 @@ impl AudioEncoder {
     let codec_string = match guard.active_config.as_ref() {
       Some(config) => config.codec.clone().unwrap_or_default(),
       None => {
-        let old_size = guard.encode_queue_size;
-        guard.encode_queue_size = old_size.saturating_sub(1);
-        if old_size > 0 {
-          let _ = Self::fire_dequeue_event(event_state);
-        }
-        Self::report_error(&mut guard, "No encoder config");
+        Self::close_with_error(&mut guard, event_state, "No encoder config");
         return;
       }
     };
@@ -463,23 +460,17 @@ impl AudioEncoder {
       let sample_buffer = match guard.sample_buffer.as_mut() {
         Some(buf) => buf,
         None => {
-          let old_size = guard.encode_queue_size;
-          guard.encode_queue_size = old_size.saturating_sub(1);
-          if old_size > 0 {
-            let _ = Self::fire_dequeue_event(event_state);
-          }
-          Self::report_error(&mut guard, "No sample buffer");
+          Self::close_with_error(&mut guard, event_state, "No sample buffer");
           return;
         }
       };
 
       if let Err(e) = sample_buffer.add_frame(&frame) {
-        let old_size = guard.encode_queue_size;
-        guard.encode_queue_size = old_size.saturating_sub(1);
-        if old_size > 0 {
-          let _ = Self::fire_dequeue_event(event_state);
-        }
-        Self::report_error(&mut guard, &format!("Failed to add samples: {}", e));
+        Self::close_with_error(
+          &mut guard,
+          event_state,
+          &format!("Failed to add samples: {}", e),
+        );
         return;
       }
     }
@@ -521,12 +512,7 @@ impl AudioEncoder {
           buf.sample_rate() as i64,
         ),
         None => {
-          let old_size = guard.encode_queue_size;
-          guard.encode_queue_size = old_size.saturating_sub(1);
-          if old_size > 0 {
-            let _ = Self::fire_dequeue_event(event_state);
-          }
-          Self::report_error(&mut guard, "No sample buffer");
+          Self::close_with_error(&mut guard, event_state, "No sample buffer");
           return;
         }
       };
@@ -540,33 +526,22 @@ impl AudioEncoder {
         let sample_buffer = match guard.sample_buffer.as_mut() {
           Some(buf) => buf,
           None => {
-            let old_size = guard.encode_queue_size;
-            guard.encode_queue_size = old_size.saturating_sub(1);
-            if old_size > 0 {
-              let _ = Self::fire_dequeue_event(event_state);
-            }
-            Self::report_error(&mut guard, "No sample buffer");
+            Self::close_with_error(&mut guard, event_state, "No sample buffer");
             return;
           }
         };
         match sample_buffer.take_frame() {
           Ok(Some(f)) => f,
           Ok(None) => {
-            let old_size = guard.encode_queue_size;
-            guard.encode_queue_size = old_size.saturating_sub(1);
-            if old_size > 0 {
-              let _ = Self::fire_dequeue_event(event_state);
-            }
-            Self::report_error(&mut guard, "No frame available");
+            Self::close_with_error(&mut guard, event_state, "No frame available");
             return;
           }
           Err(e) => {
-            let old_size = guard.encode_queue_size;
-            guard.encode_queue_size = old_size.saturating_sub(1);
-            if old_size > 0 {
-              let _ = Self::fire_dequeue_event(event_state);
-            }
-            Self::report_error(&mut guard, &format!("Failed to get frame: {}", e));
+            Self::close_with_error(
+              &mut guard,
+              event_state,
+              &format!("Failed to get frame: {}", e),
+            );
             return;
           }
         }
@@ -586,12 +561,7 @@ impl AudioEncoder {
       let context = match guard.context.as_mut() {
         Some(ctx) => ctx,
         None => {
-          let old_size = guard.encode_queue_size;
-          guard.encode_queue_size = old_size.saturating_sub(1);
-          if old_size > 0 {
-            let _ = Self::fire_dequeue_event(event_state);
-          }
-          Self::report_error(&mut guard, "No encoder context");
+          Self::close_with_error(&mut guard, event_state, "No encoder context");
           return;
         }
       };
@@ -599,12 +569,7 @@ impl AudioEncoder {
       let packets = match context.encode(Some(&frame_to_encode)) {
         Ok(pkts) => pkts,
         Err(e) => {
-          let old_size = guard.encode_queue_size;
-          guard.encode_queue_size = old_size.saturating_sub(1);
-          if old_size > 0 {
-            let _ = Self::fire_dequeue_event(event_state);
-          }
-          Self::report_error(&mut guard, &format!("Encode failed: {}", e));
+          Self::close_with_error(&mut guard, event_state, &format!("Encode failed: {}", e));
           return;
         }
       };
@@ -1124,11 +1089,21 @@ impl AudioEncoder {
 
     // Create an Error object that will be passed directly to the JS callback
     let error = Error::new(Status::GenericFailure, error_msg);
-    inner
-      .error_callback
-      .call(error, ThreadsafeFunctionCallMode::NonBlocking);
+    CodecEventState::report_error(&inner.event_state, &inner.error_callback, error);
     inner.had_error = true;
     inner.state = CodecState::Closed;
+  }
+
+  /// Worker: an error closes the encoder and drops every queued encode. As in
+  /// Chrome, encodeQueueSize is already 0 when the error callback runs, and one
+  /// dequeue event follows for all the dropped encodes.
+  fn close_with_error(
+    inner: &mut AudioEncoderInner,
+    event_state: &Arc<RwLock<CodecEventState>>,
+    message: &str,
+  ) {
+    Self::report_error(inner, message);
+    CodecEventState::dequeue_all(event_state, &mut inner.encode_queue_size);
   }
 
   /// Fire dequeue event via the shared JS-side dispatcher
@@ -1172,15 +1147,7 @@ impl AudioEncoder {
     this: This,
     callback: Option<FunctionRef<Unknown<'static>, UnknownReturnValue>>,
   ) -> Result<()> {
-    let mut state = self
-      .event_state
-      .write()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-    if callback.is_some() {
-      state.ensure_dispatcher(env, this.object)?;
-    }
-    state.set_ondequeue(env, callback)?;
-    Ok(())
+    CodecEventState::set_ondequeue_handler(&self.event_state, env, this.object, callback)
   }
 
   /// Get the dequeue event handler (per WebCodecs spec)
@@ -1950,15 +1917,17 @@ impl AudioEncoder {
     callback: FunctionRef<Unknown<'static>, UnknownReturnValue>,
     options: Option<AudioEncoderAddEventListenerOptions>,
   ) -> Result<()> {
-    let mut state = self
-      .event_state
-      .write()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    state.ensure_dispatcher(&env, this.object)?;
     let once = options.as_ref().and_then(|o| o.once).unwrap_or(false);
     let capture = options.as_ref().and_then(|o| o.capture).unwrap_or(false);
-    state.add_listener(&env, &event_type, callback, once, capture)
+    CodecEventState::add_event_listener(
+      &self.event_state,
+      &env,
+      this.object,
+      &event_type,
+      callback,
+      once,
+      capture,
+    )
   }
 
   /// Remove an event listener for the specified event type
@@ -1972,14 +1941,8 @@ impl AudioEncoder {
     callback: FunctionRef<Unknown<'static>, UnknownReturnValue>,
     options: Option<AudioEncoderEventListenerOptions>,
   ) -> Result<()> {
-    let mut state = self
-      .event_state
-      .write()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
     let capture = options.as_ref().and_then(|o| o.capture).unwrap_or(false);
-    state.remove_listener(&env, &event_type, &callback, capture);
-    Ok(())
+    CodecEventState::remove_event_listener(&self.event_state, &env, &event_type, &callback, capture)
   }
 
   /// Dispatch an event to all registered listeners

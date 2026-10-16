@@ -201,6 +201,9 @@ struct VideoDecoderInner {
   output_callback: OutputCallback,
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
+  /// The codec's event state: report_error orders the error callback before
+  /// the dequeue events that come due meanwhile.
+  event_state: Arc<RwLock<CodecEventState>>,
   /// Whether a keyframe has been received (for delta frame validation)
   keyframe_received: bool,
   /// Whether an error has occurred during decoding (for flush error propagation)
@@ -352,6 +355,7 @@ impl VideoDecoder {
     )]
     init: VideoDecoderInit,
   ) -> Result<Self> {
+    let event_state = Arc::new(RwLock::new(CodecEventState::default()));
     let inner = VideoDecoderInner {
       state: CodecState::Unconfigured,
       config: None,
@@ -361,6 +365,7 @@ impl VideoDecoder {
       decode_queue_size: 0,
       output_callback: init.output,
       error_callback: init.error,
+      event_state: event_state.clone(),
       keyframe_received: false,
       had_error: false,
       flushes: FlushTracker::default(),
@@ -384,7 +389,6 @@ impl VideoDecoder {
     let inner = Arc::new(Mutex::new(inner));
 
     // Create separate lock for event listener state (avoids contention with decode operations)
-    let event_state = Arc::new(RwLock::new(CodecEventState::default()));
 
     // Create channel for worker commands
     let (sender, receiver) = channel::unbounded();
@@ -474,14 +478,12 @@ impl VideoDecoder {
 
     // Check if decoder is still configured
     if guard.state != CodecState::Configured {
-      let old_size = guard.decode_queue_size;
-      guard.decode_queue_size = old_size.saturating_sub(1);
-      if old_size > 0 {
-        let _ = Self::fire_dequeue_event(event_state);
-      }
       // Per W3C spec: "cease producing output" - silently discard pending work
       // State could be Unconfigured (reset called) or Closed (close called)
       // Don't call report_error() - that would set state to Closed and invoke error callback
+      // Every decode still queued is discarded the same way, so dequeue them all
+      // now: one dequeue event, as Chrome fires when it resets the queue.
+      CodecEventState::dequeue_all(event_state, &mut guard.decode_queue_size);
       return;
     }
 
@@ -496,12 +498,7 @@ impl VideoDecoder {
       }) {
       Ok(c) => c,
       Err(e) => {
-        let old_size = guard.decode_queue_size;
-        guard.decode_queue_size = old_size.saturating_sub(1);
-        if old_size > 0 {
-          let _ = Self::fire_dequeue_event(event_state);
-        }
-        Self::report_error(&mut guard, &e.reason);
+        Self::close_with_error(&mut guard, event_state, &e.reason);
         return;
       }
     };
@@ -574,12 +571,7 @@ impl VideoDecoder {
     let context = match guard.context.as_mut() {
       Some(ctx) => ctx,
       None => {
-        let old_size = guard.decode_queue_size;
-        guard.decode_queue_size = old_size.saturating_sub(1);
-        if old_size > 0 {
-          let _ = Self::fire_dequeue_event(event_state);
-        }
-        Self::report_error(&mut guard, "No decoder context");
+        Self::close_with_error(&mut guard, event_state, "No decoder context");
         return;
       }
     };
@@ -593,13 +585,9 @@ impl VideoDecoder {
           match &guard.hw_preference {
             HardwareAcceleration::PreferHardware => {
               // prefer-hardware: Report error, don't fall back
-              let old_size = guard.decode_queue_size;
-              guard.decode_queue_size = old_size.saturating_sub(1);
-              if old_size > 0 {
-                let _ = Self::fire_dequeue_event(event_state);
-              }
-              Self::report_error(
+              Self::close_with_error(
                 &mut guard,
+                event_state,
                 &format!("OperationError: Hardware decoding failed: {}", e),
               );
               return;
@@ -623,12 +611,7 @@ impl VideoDecoder {
             _ => {}
           }
         }
-        let old_size = guard.decode_queue_size;
-        guard.decode_queue_size = old_size.saturating_sub(1);
-        if old_size > 0 {
-          let _ = Self::fire_dequeue_event(event_state);
-        }
-        Self::report_error(&mut guard, &format!("Decode failed: {}", e));
+        Self::close_with_error(&mut guard, event_state, &format!("Decode failed: {}", e));
         return;
       }
     };
@@ -1277,11 +1260,21 @@ impl VideoDecoder {
 
     // Create an Error object that will be passed directly to the JS callback
     let error = Error::new(Status::GenericFailure, error_msg);
-    inner
-      .error_callback
-      .call(error, ThreadsafeFunctionCallMode::NonBlocking);
+    CodecEventState::report_error(&inner.event_state, &inner.error_callback, error);
     inner.had_error = true;
     inner.state = CodecState::Closed;
+  }
+
+  /// Worker: an error closes the decoder and drops every queued decode. As in
+  /// Chrome, decodeQueueSize is already 0 when the error callback runs, and one
+  /// dequeue event follows for all the dropped decodes.
+  fn close_with_error(
+    inner: &mut VideoDecoderInner,
+    event_state: &Arc<RwLock<CodecEventState>>,
+    message: &str,
+  ) {
+    Self::report_error(inner, message);
+    CodecEventState::dequeue_all(event_state, &mut inner.decode_queue_size);
   }
 
   /// Fire the dequeue event: one dispatcher call runs the whole dispatch on
@@ -1325,15 +1318,7 @@ impl VideoDecoder {
     this: This,
     callback: Option<FunctionRef<Unknown<'static>, UnknownReturnValue>>,
   ) -> Result<()> {
-    let mut state = self
-      .event_state
-      .write()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-    if callback.is_some() {
-      state.ensure_dispatcher(env, this.object)?;
-    }
-    state.set_ondequeue(env, callback)?;
-    Ok(())
+    CodecEventState::set_ondequeue_handler(&self.event_state, env, this.object, callback)
   }
 
   /// Get the dequeue event handler (per WebCodecs spec)
@@ -2111,15 +2096,17 @@ impl VideoDecoder {
     callback: FunctionRef<Unknown<'static>, UnknownReturnValue>,
     options: Option<VideoDecoderAddEventListenerOptions>,
   ) -> Result<()> {
-    let mut state = self
-      .event_state
-      .write()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    state.ensure_dispatcher(&env, this.object)?;
     let once = options.as_ref().and_then(|o| o.once).unwrap_or(false);
     let capture = options.as_ref().and_then(|o| o.capture).unwrap_or(false);
-    state.add_listener(&env, &event_type, callback, once, capture)
+    CodecEventState::add_event_listener(
+      &self.event_state,
+      &env,
+      this.object,
+      &event_type,
+      callback,
+      once,
+      capture,
+    )
   }
 
   /// Remove an event listener for the specified event type
@@ -2133,14 +2120,8 @@ impl VideoDecoder {
     callback: FunctionRef<Unknown<'static>, UnknownReturnValue>,
     options: Option<VideoDecoderEventListenerOptions>,
   ) -> Result<()> {
-    let mut state = self
-      .event_state
-      .write()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
     let capture = options.as_ref().and_then(|o| o.capture).unwrap_or(false);
-    state.remove_listener(&env, &event_type, &callback, capture);
-    Ok(())
+    CodecEventState::remove_event_listener(&self.event_state, &env, &event_type, &callback, capture)
   }
 
   /// Dispatch an event to all registered listeners

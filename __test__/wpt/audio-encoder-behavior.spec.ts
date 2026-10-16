@@ -17,6 +17,7 @@ import {
   getDefaultCodecInit,
   testClosedCodec,
   testUnconfiguredCodec,
+  waitFor,
 } from '../helpers/wpt-utils.js'
 
 // Reset hardware fallback state before each test
@@ -295,12 +296,14 @@ test('AudioEncoder: encodeQueueSize tracking', async (t) => {
   }
 
   // Track dequeue events
-  // Note: With native addon multi-threaded implementation, callbacks may not see
-  // monotonically decreasing queue sizes due to concurrent encode/process operations.
-  // We verify: (1) dequeue events fire, (2) final queue state is correct.
+  // Dequeues before a queued dequeue event runs share that event (as in Chrome),
+  // so there can be fewer events than encodes. The last event must see the
+  // emptied queue: no dequeue goes unreported.
   let dequeueCount = 0
+  let lastDequeueSize = Infinity
   encoder.ondequeue = () => {
     dequeueCount++
+    lastDequeueSize = encoder.encodeQueueSize
   }
 
   for (const data of datas) {
@@ -314,8 +317,10 @@ test('AudioEncoder: encodeQueueSize tracking', async (t) => {
 
   // After flush, queue should be empty
   t.is(encoder.encodeQueueSize, 0, 'queue empty after flush')
-  // Verify dequeue events were fired (at least dataCount events for all encodes)
-  t.true(dequeueCount >= dataCount, `at least ${dataCount} dequeue events fired, got ${dequeueCount}`)
+  // The event for the last dequeue can run after flush() resolves.
+  await waitFor(() => lastDequeueSize === 0, 'a dequeue event that sees the empty queue')
+  t.true(dequeueCount >= 1, 'dequeue events fired')
+  t.true(dequeueCount <= dataCount, `at most one event per encode, got ${dequeueCount}`)
 
   // Clean up
   for (const data of datas) {
@@ -341,8 +346,10 @@ test('AudioEncoder: flush recreation preserves queue accounting for later encode
   encoder.configure(config)
 
   let dequeueCount = 0
+  let lastDequeueSize = Infinity
   encoder.ondequeue = () => {
     dequeueCount++
+    lastDequeueSize = encoder.encodeQueueSize
   }
 
   const first = generateSilence(960, 2, 48000, 'f32', 0)
@@ -353,12 +360,12 @@ test('AudioEncoder: flush recreation preserves queue accounting for later encode
   const secondFlush = encoder.flush()
 
   await Promise.all([firstFlush, secondFlush])
-  for (let turn = 0; turn < 20 && dequeueCount < 2; turn++) {
-    await endAfterEventLoopTurn()
-  }
+  // Both dequeues can share one event (as in Chrome); the last event must see
+  // the emptied queue, so the second encode's dequeue was reported.
+  await waitFor(() => lastDequeueSize === 0, 'a dequeue event that sees the empty queue')
 
   t.is(encoder.encodeQueueSize, 0)
-  t.is(dequeueCount, 2, 'each accepted encode operation fires a dequeue event')
+  t.true(dequeueCount >= 1 && dequeueCount <= 2, `one event per encode at most, got ${dequeueCount}`)
 
   first.close()
   second.close()

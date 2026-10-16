@@ -15,10 +15,11 @@ use napi::sys;
 use napi::threadsafe_function::{
   ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
 };
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use super::error::new_event;
 
@@ -33,9 +34,9 @@ const CMD_DELETE_REF: u32 = 1;
 const CMD_DISPATCH: u32 = 2;
 
 /// A registered event listener. `callback` is a WEAK napi_ref — the JS
-/// callback's liveness is anchored by a GC-traceable Map on the codec object
-/// (`codec[Symbol.for("webcodecs.listeners")]`), so the codec→listener edge
-/// never roots the listener and a retained-event cycle stays collectable.
+/// callback is kept alive by the per-env anchor store (see [`AnchorStore`]),
+/// so the codec→listener edge never roots the listener and a retained-event
+/// cycle stays collectable.
 struct EventListenerEntry {
   id: u64,
   once: bool,
@@ -121,15 +122,26 @@ impl Drop for WeakCodecRef {
   }
 }
 
+/// A codec's WebCodecsErrorCallback, called from any thread. The JS-side
+/// callback turns the Error payload into a native DOMException.
+pub type CodecErrorCallback =
+  ThreadsafeFunction<Error, UnknownReturnValue, Unknown<'static>, Status, false, true>;
+
 // The payload must be FnArgs — a plain tuple goes through the ToNapiValue
 // blanket impl and arrives as a single Array argument, not three args.
 type DispatcherTsf =
   ThreadsafeFunction<FnArgs<(u32, u32, u32)>, (), FnArgs<(u32, u32, u32)>, Status, false, true>;
 
 /// Per-codec event state shared between the JS thread and the worker thread.
+///
+/// Nothing that holds its lock may run user JS: user JS can call back into the
+/// same codec, and the lock is not reentrant. The steps that can run user JS
+/// (see [`CodecEventState::lock_for_registration`]) run with the lock released.
 #[derive(Default)]
 pub struct CodecEventState {
   listeners: HashMap<String, Vec<Arc<EventListenerEntry>>>,
+  /// The codec's anchor holder (see [`AnchorStore`]).
+  holder: HolderRef,
   next_listener_id: u64,
   /// Registered once-listeners not yet fired. While >0 the dispatcher TSFN is
   /// ref'd (strong) so Node cannot exit before they run — matching the
@@ -138,8 +150,8 @@ pub struct CodecEventState {
   /// Weak ref to the codec's JS object (`this`), captured lazily on the first
   /// event-related call so dispatched events expose it as target/currentTarget.
   codec_obj: Option<WeakCodecRef>,
-  /// The ondequeue event handler property value (weak napi_ref, same
-  /// Map-anchored liveness as ordinary listeners), plus its registration-order
+  /// The ondequeue event handler property value (weak napi_ref, kept alive by
+  /// the anchor store like ordinary listeners), plus its registration-order
   /// id — an event handler participates in listener ordering, so assigning it
   /// after addEventListener must run it after earlier registrations.
   ondequeue: Option<usize>,
@@ -150,29 +162,64 @@ pub struct CodecEventState {
   /// between the worker's fire() and delivery on the JS thread. Returns to
   /// weak when the count drains to zero.
   outstanding: usize,
+  /// WebCodecs "schedule dequeue event": true while a dequeue dispatch is
+  /// queued on the dispatcher and has not started yet. Dequeues in that window
+  /// join the queued dispatch instead of queueing another event, so one native
+  /// step that dequeues N items fires one event, as in Chrome.
+  dequeue_scheduled: bool,
+  /// Dequeued items the queued dispatch covers. They stay in `outstanding`
+  /// until that dispatch is delivered.
+  scheduled_items: usize,
+  /// Errors sent to the codec's error callback that have not run yet (see
+  /// [`Self::report_error`]). While >0 a scheduled dequeue event waits, and
+  /// runs right after the error callback.
+  errors_pending: usize,
   /// Single dispatcher invoked from the worker thread; runs the whole
   /// dispatch on the JS thread in one call.
   dispatcher: Option<Arc<DispatcherTsf>>,
 }
 
 impl CodecEventState {
-  /// Ensure the worker→JS dispatcher exists (JS thread only).
-  ///
-  /// The codec's JS object (`this`) is captured lazily here rather than in a
-  /// separate step: a WeakCodecRef without a dispatcher would have no route to
-  /// delete its napi_ref when the final drop lands on a worker thread.
-  pub fn ensure_dispatcher(&mut self, env: &Env, this: Object) -> Result<()> {
-    if self.dispatcher.is_some() {
-      return Ok(());
-    }
+  /// Capture the codec's JS object (`this`) as the event target. JS thread,
+  /// runs no JS.
+  fn capture_codec(&mut self, env: &Env, this: Object) -> Result<()> {
     if self.codec_obj.is_none() {
-      self.codec_obj = Some(WeakCodecRef::new(env, this)?);
+      let mut codec = WeakCodecRef::new(env, this)?;
+      // Lets the ref route its deletion through the dispatcher when the final
+      // drop lands on a worker thread.
+      codec.gc = self.dispatcher.clone();
+      self.codec_obj = Some(codec);
       // A listener registered while work is already in flight must find the
       // codec pinned, matching what note_enqueue does for later enqueues.
       if self.outstanding > 0 {
         self.set_codec_strong(env, true);
       }
     }
+    Ok(())
+  }
+
+  /// Install a dispatcher made by [`Self::create_dispatcher`], unless a call
+  /// that ran while it was being made installed one first; that one is handed
+  /// back, for the caller to drop once the lock is released. JS thread.
+  #[must_use]
+  fn install_dispatcher(&mut self, dispatcher: DispatcherTsf) -> Option<DispatcherTsf> {
+    if self.dispatcher.is_some() {
+      return Some(dispatcher);
+    }
+    let dispatcher = Arc::new(dispatcher);
+    // Let the codec-obj ref route its deletion through this dispatcher when it
+    // drops on a worker thread.
+    if let Some(ref mut codec) = self.codec_obj {
+      codec.gc = Some(dispatcher.clone());
+    }
+    self.dispatcher = Some(dispatcher);
+    None
+  }
+
+  /// Make the worker→JS dispatcher. JS thread, without the state lock:
+  /// creating a thread-safe function runs `async_hooks` init hooks, which are
+  /// user JS.
+  fn create_dispatcher(env: &Env) -> Result<DispatcherTsf> {
     // The closure captures no state: each dispatch payload carries ownership
     // of a strong Arc<RwLock<CodecEventState>> (leaked via Arc::into_raw in
     // fire()), so a queued dispatch keeps the state alive until it runs —
@@ -186,9 +233,15 @@ impl CodecEventState {
         match cmd {
           CMD_DISPATCH => {
             let shared = unsafe { Arc::from_raw(ptr as usize as *const RwLock<CodecEventState>) };
-            dispatch(ctx.env, &shared, "dequeue");
-            if let Ok(mut state) = shared.write() {
-              state.note_delivery(ctx.env);
+            let covered = match shared.write() {
+              // Waits for an error callback, or already ran right after one
+              // (see report_error).
+              Ok(state) if state.errors_pending > 0 || !state.dequeue_scheduled => None,
+              Ok(mut state) => Some(state.take_scheduled()),
+              Err(_) => None,
+            };
+            if let Some(covered) = covered {
+              CodecEventState::deliver_dequeue(ctx.env, &shared, covered);
             }
           }
           CMD_DELETE_REF => {
@@ -202,19 +255,106 @@ impl CodecEventState {
         Ok(())
       },
     )?;
-    let tsf: DispatcherTsf = dispatch_fn
+    dispatch_fn
       .build_threadsafe_function()
       .callee_handled::<false>()
       .weak::<true>()
-      .build()?;
-    let dispatcher = Arc::new(tsf);
-    // Let the codec-obj ref route its deletion through this dispatcher when it
-    // drops on a worker thread.
-    if let Some(ref mut codec) = self.codec_obj {
-      codec.gc = Some(dispatcher.clone());
+      .build()
+  }
+
+  /// JS thread: get the state ready for a callback registered on the codec
+  /// `this`, and return it locked, with the holder to anchor the callback in
+  /// (None: no store, so the callback falls back to a strong ref).
+  ///
+  /// The two steps that can run user JS run while the lock is released, so
+  /// that JS can call back into this codec: creating the dispatcher (its
+  /// `async_hooks` init hooks), and linking a new holder from the codec (the
+  /// `WeakMap.prototype.set` captured at load, which is user JS if `WeakMap`
+  /// was replaced before the module loaded). A call that runs in between
+  /// finds the holder already recorded and uses it without linking again.
+  fn lock_for_registration<'a>(
+    shared: &'a RwLock<Self>,
+    env: &Env,
+    this: Object,
+  ) -> Result<(RwLockWriteGuard<'a, Self>, Option<sys::napi_value>)> {
+    let (need_dispatcher, anchor) = {
+      let mut state = write_state(shared)?;
+      state.capture_codec(env, this)?;
+      (state.dispatcher.is_none(), state.holder.prepare(env)?)
+    };
+    let linked = (|| {
+      let dispatcher = if need_dispatcher {
+        Some(Self::create_dispatcher(env)?)
+      } else {
+        None
+      };
+      if let Some(ref anchor) = anchor {
+        link_holder(env, this.raw(), anchor)?;
+      }
+      Ok(dispatcher)
+    })();
+    let dispatcher = match linked {
+      Ok(dispatcher) => dispatcher,
+      Err(error) => {
+        // A holder that is not linked from the codec would not keep callbacks
+        // alive: forget it, so the next registration makes a new one.
+        if anchor.as_ref().is_some_and(|anchor| anchor.link.is_some())
+          && let Ok(mut state) = shared.write()
+        {
+          state.holder.clear(env.raw());
+        }
+        return Err(error);
+      }
+    };
+    if let Some(dispatcher) = dispatcher {
+      let unused = write_state(shared)?.install_dispatcher(dispatcher);
+      drop(unused);
     }
-    self.dispatcher = Some(dispatcher);
+    Ok((write_state(shared)?, anchor.map(|anchor| anchor.holder)))
+  }
+
+  /// DOM addEventListener on a codec (JS thread).
+  pub fn add_event_listener(
+    shared: &RwLock<Self>,
+    env: &Env,
+    this: Object,
+    event_type: &str,
+    callback: FunctionRef<Unknown<'static>, UnknownReturnValue>,
+    once: bool,
+    capture: bool,
+  ) -> Result<()> {
+    let (mut state, holder) = Self::lock_for_registration(shared, env, this)?;
+    state.add_listener(env, holder, event_type, callback, once, capture)
+  }
+
+  /// DOM removeEventListener on a codec (JS thread). Runs no JS.
+  pub fn remove_event_listener(
+    shared: &RwLock<Self>,
+    env: &Env,
+    event_type: &str,
+    callback: &FunctionRef<Unknown<'static>, UnknownReturnValue>,
+    capture: bool,
+  ) -> Result<()> {
+    let mut state = write_state(shared)?;
+    let holder = state.holder.get(env);
+    state.remove_listener(env, holder, event_type, callback, capture);
     Ok(())
+  }
+
+  /// The codec's `ondequeue` setter (JS thread).
+  pub fn set_ondequeue_handler(
+    shared: &RwLock<Self>,
+    env: &Env,
+    this: Object,
+    handler: Option<FunctionRef<Unknown<'static>, UnknownReturnValue>>,
+  ) -> Result<()> {
+    if handler.is_none() {
+      let mut state = write_state(shared)?;
+      let holder = state.holder.get(env);
+      return state.set_ondequeue(env, holder, None);
+    }
+    let (mut state, holder) = Self::lock_for_registration(shared, env, this)?;
+    state.set_ondequeue(env, holder, handler)
   }
 
   /// JS thread: a work item was enqueued, so a dequeue dispatch will follow.
@@ -237,18 +377,21 @@ impl CodecEventState {
     }
   }
 
-  /// Any thread: a work item completed without producing a dispatch (no
+  /// Any thread: work items completed without producing a dispatch (no
   /// dispatcher existed, or the TSFN was already closing). Only adjusts the
   /// counter — with no dispatcher there is no codec ref, and a closing TSFN
   /// means the env is tearing down, so no unref is required here.
-  fn note_undelivered(&mut self) {
-    self.outstanding = self.outstanding.saturating_sub(1);
+  fn note_undelivered(&mut self, items: usize) {
+    self.outstanding = self.outstanding.saturating_sub(items);
   }
 
-  /// JS thread: a queued dequeue dispatch finished delivery — its work item
-  /// is no longer outstanding.
-  fn note_delivery(&mut self, env: &Env) {
-    self.outstanding = self.outstanding.saturating_sub(1);
+  /// JS thread: a queued dequeue dispatch finished delivery — the `items` it
+  /// covered are no longer outstanding.
+  fn note_delivery(&mut self, env: &Env, items: usize) {
+    if items == 0 || self.outstanding == 0 {
+      return;
+    }
+    self.outstanding = self.outstanding.saturating_sub(items);
     if self.outstanding == 0 {
       self.set_codec_strong(env, false);
     }
@@ -282,19 +425,19 @@ impl CodecEventState {
     }
   }
 
-  /// Register an event listener (DOM addEventListener).
+  /// Register an event listener (DOM addEventListener), anchored in `holder`.
   /// Re-registering the identical callback with the same capture flag for the
-  /// same type is a no-op per DOM spec.
-  pub fn add_listener(
+  /// same type is a no-op per DOM spec. Runs no JS.
+  fn add_listener(
     &mut self,
     env: &Env,
+    holder: Option<sys::napi_value>,
     event_type: &str,
     callback: FunctionRef<Unknown<'static>, UnknownReturnValue>,
     once: bool,
     capture: bool,
   ) -> Result<()> {
     let callback_raw = callback.borrow_back(env)?.raw();
-    let codec_raw = self.codec_raw(env);
     let dup = self
       .listeners
       .get(event_type)
@@ -318,7 +461,7 @@ impl CodecEventState {
     }
     let id = self.next_listener_id;
     self.next_listener_id += 1;
-    let refr = Self::anchor_callback(env, codec_raw, id, callback_raw)?;
+    let refr = anchor_callback(env, holder, id, callback_raw)?;
     self
       .listeners
       .entry(event_type.to_string())
@@ -340,15 +483,16 @@ impl CodecEventState {
   }
 
   /// Remove the first registered listener whose callback strict-equals the
-  /// one passed with a matching capture flag (DOM removeEventListener).
-  pub fn remove_listener(
+  /// one passed with a matching capture flag (DOM removeEventListener). Runs
+  /// no JS.
+  fn remove_listener(
     &mut self,
     env: &Env,
+    holder: Option<sys::napi_value>,
     event_type: &str,
     callback: &FunctionRef<Unknown<'static>, UnknownReturnValue>,
     capture: bool,
   ) {
-    let codec_raw = self.codec_raw(env);
     let mut removed_once = false;
     if let Some(listeners) = self.listeners.get_mut(event_type)
       && let Some(pos) = listeners.iter().position(|entry| {
@@ -366,7 +510,7 @@ impl CodecEventState {
     {
       let removed = listeners.remove(pos);
       removed_once = removed.once;
-      release_callback(env, codec_raw, removed.id, removed.callback);
+      release_callback(env, holder, removed.id, removed.callback);
       if listeners.is_empty() {
         self.listeners.remove(event_type);
       }
@@ -377,29 +521,30 @@ impl CodecEventState {
     }
   }
 
-  /// Replace the ondequeue event handler. Each non-null assignment counts as
-  /// a fresh registration for ordering purposes (DOM event-handler semantics).
-  pub fn set_ondequeue(
+  /// Replace the ondequeue event handler, anchoring a new one in `holder`.
+  /// Each non-null assignment counts as a fresh registration for ordering
+  /// purposes (DOM event-handler semantics). Runs no JS.
+  fn set_ondequeue(
     &mut self,
     env: &Env,
+    holder: Option<sys::napi_value>,
     handler: Option<FunctionRef<Unknown<'static>, UnknownReturnValue>>,
   ) -> Result<()> {
-    let codec_raw = self.codec_raw(env);
     // Re-assigning while a handler is set replaces the callback in the same
     // slot (DOM event-handler semantics); only a null -> non-null transition
     // creates a new registration.
     let replacing = self.ondequeue.is_some();
     if let Some(old) = self.ondequeue.take() {
-      release_callback(env, codec_raw, self.ondequeue_id, old);
+      release_callback(env, holder, self.ondequeue_id, old);
     }
     if let Some(h) = handler {
       if !replacing {
         self.ondequeue_id = self.next_listener_id;
         self.next_listener_id += 1;
       }
-      self.ondequeue = Some(Self::anchor_callback(
+      self.ondequeue = Some(anchor_callback(
         env,
-        codec_raw,
+        holder,
         self.ondequeue_id,
         h.borrow_back(env)?.raw(),
       )?);
@@ -412,73 +557,166 @@ impl CodecEventState {
     self.ondequeue
   }
 
-  /// The codec's JS object handle, when captured.
-  fn codec_raw(&self, env: &Env) -> Option<sys::napi_value> {
-    self
-      .codec_obj
-      .as_ref()
-      .and_then(|r| r.get(env))
-      .map(|o| o.raw())
-  }
-
-  /// Register `fn_raw` in the codec's listener Map under `id` and return a
-  /// weak napi_ref for invocation. If no Map edge can be installed (no codec
-  /// object captured), falls back to a strong ref so the callback stays
-  /// callable — trading collectability for correctness on that path.
-  pub(crate) fn anchor_callback(
-    env: &Env,
-    codec: Option<sys::napi_value>,
-    id: u64,
-    fn_raw: sys::napi_value,
-  ) -> Result<usize> {
-    let mut strong = true;
-    if let Some(codec) = codec
-      && let Ok(Some(map)) = listener_map(env, codec, true)
-    {
-      let mut idv = ptr::null_mut();
-      unsafe { sys::napi_create_double(env.raw(), id as f64, &mut idv) };
-      if map_op(env, map, "set", &[idv, fn_raw]).is_ok() {
-        strong = false;
-      }
-    }
-    let mut r = ptr::null_mut();
-    check_status!(unsafe {
-      sys::napi_create_reference(env.raw(), fn_raw, if strong { 1 } else { 0 }, &mut r)
-    })?;
-    Ok(r as usize)
-  }
-
-  /// Fire the dequeue event from the worker thread (async, non-blocking).
-  /// A strong Arc is leaked into the payload and reclaimed by the JS callback,
-  /// so a queued dispatch keeps the state (and its listeners) alive even if
-  /// the codec wrapper and worker are gone by the time it runs.
+  /// Fire the dequeue event for one dequeued item (see [`Self::fire_n`]).
   pub fn fire(shared: &Arc<RwLock<CodecEventState>>) {
-    let dispatcher = shared.read().ok().and_then(|s| s.dispatcher.clone());
-    let Some(dispatcher) = dispatcher else {
-      // No dispatcher: the item completed without a dispatch. Drain it so a
-      // listener registered later doesn't see a stale outstanding count —
-      // with no dispatcher there is no codec ref to unpin anyway.
-      if let Ok(mut state) = shared.write() {
-        state.note_undelivered();
-      }
+    Self::fire_n(shared, 1);
+  }
+
+  /// Worker: empty a codec's queue counter in one step and fire one dequeue
+  /// for everything it held. Used when an error closes the codec, and when
+  /// queued work reaches a codec that is no longer configured — in both cases
+  /// every queued item is dropped, which Chrome reports with one event.
+  pub fn dequeue_all(shared: &Arc<RwLock<CodecEventState>>, queue_size: &mut u32) {
+    let dropped = std::mem::take(queue_size) as usize;
+    Self::fire_n(shared, dropped);
+  }
+
+  /// Schedule the dequeue event for `items` dequeued items (any thread,
+  /// non-blocking). WebCodecs "schedule dequeue event": while a dispatch is
+  /// queued and has not started, the items join it and no new event is
+  /// queued. A strong Arc is leaked into the payload and reclaimed by the JS
+  /// callback, so a queued dispatch keeps the state (and its listeners) alive
+  /// even if the codec wrapper and worker are gone by the time it runs.
+  pub fn fire_n(shared: &Arc<RwLock<CodecEventState>>, items: usize) {
+    if items == 0 {
+      return;
+    }
+    let Ok(mut state) = shared.write() else {
       return;
     };
+    let Some(dispatcher) = state.dispatcher.clone() else {
+      // No dispatcher: the items completed without a dispatch. Drain them so
+      // a listener registered later doesn't see a stale outstanding count —
+      // with no dispatcher there is no codec ref to unpin anyway.
+      state.note_undelivered(items);
+      return;
+    };
+    if state.dequeue_scheduled {
+      state.scheduled_items += items;
+      return;
+    }
+    state.dequeue_scheduled = true;
+    state.scheduled_items = items;
+    state.queue_dispatch(shared, &dispatcher);
+  }
+
+  /// Queue the dispatch payload for the scheduled dequeue event. The call
+  /// only queues the payload (NonBlocking, unbounded queue), so it is safe
+  /// while holding the state lock; holding it means no other fire can join a
+  /// dispatch that turns out not to be queued.
+  fn queue_dispatch(&mut self, shared: &Arc<RwLock<CodecEventState>>, dispatcher: &DispatcherTsf) {
     let ptr = Arc::into_raw(Arc::clone(shared)) as usize as u64;
     let status = dispatcher.call(
       FnArgs::from((CMD_DISPATCH, (ptr >> 32) as u32, ptr as u32)),
       ThreadsafeFunctionCallMode::NonBlocking,
     );
     if status != Status::Ok {
-      // TSFN already closing — reclaim the leaked Arc and drain the item;
+      // TSFN already closing — reclaim the leaked Arc and drain the items;
       // the env is tearing down so no unref is needed on this thread.
       unsafe {
         drop(Arc::from_raw(
           ptr as usize as *const RwLock<CodecEventState>,
         ));
       }
-      if let Ok(mut state) = shared.write() {
-        state.note_undelivered();
-      }
+      let undelivered = self.take_scheduled();
+      self.note_undelivered(undelivered);
+    }
+  }
+
+  /// Start delivering the scheduled dequeue event: returns the items it
+  /// covers. The flag is cleared before listeners run: a dequeue on the
+  /// worker while they run may come after they read the queue size, so it
+  /// needs an event of its own.
+  fn take_scheduled(&mut self) -> usize {
+    self.dequeue_scheduled = false;
+    std::mem::take(&mut self.scheduled_items)
+  }
+
+  /// JS thread: dispatch the dequeue event covering `covered` items.
+  fn deliver_dequeue(env: &Env, shared: &Arc<RwLock<CodecEventState>>, covered: usize) {
+    dispatch(env, shared, "dequeue");
+    if let Ok(mut state) = shared.write() {
+      state.note_delivery(env, covered);
+    }
+  }
+
+  /// Any thread: send a codec's error to its error callback. Every codec
+  /// error closes the codec.
+  ///
+  /// Chrome runs the error callback first, and the dequeue event for the
+  /// work the error dropped after it: closing the codec queues that event and
+  /// then invokes the callback. Here the error and the dequeue event reach JS
+  /// through two thread-safe functions, whose order is not defined, so a
+  /// dequeue event that comes due before the error callback has run waits,
+  /// and runs right after the callback, from the same call.
+  pub fn report_error(
+    shared: &Arc<RwLock<CodecEventState>>,
+    callback: &CodecErrorCallback,
+    error: Error,
+  ) {
+    if let Ok(mut state) = shared.write() {
+      state.errors_pending += 1;
+    }
+    let delivery = ErrorDelivery(Some(Arc::clone(shared)));
+    // When the call is not queued (env teardown), the closure and its guard
+    // are dropped here.
+    callback.call_with_return_value(
+      error,
+      ThreadsafeFunctionCallMode::NonBlocking,
+      move |result, env| {
+        if let Err(thrown) = result {
+          // Report what the callback threw before the dequeue event runs, as
+          // the plain call this replaces did.
+          if let Ok(value) = unsafe { Error::to_napi_value(env.raw(), thrown) } {
+            unsafe { sys::napi_fatal_exception(env.raw(), value) };
+          }
+        }
+        delivery.delivered(&env);
+        Ok(())
+      },
+    );
+  }
+}
+
+/// Settles one pending error (see [`CodecEventState::report_error`]): on the
+/// JS thread after the error callback ran, or on drop when the callback will
+/// not run (napi-rs drops a queued call whose payload it could not convert).
+struct ErrorDelivery(Option<Arc<RwLock<CodecEventState>>>);
+
+impl ErrorDelivery {
+  /// JS thread, right after the error callback: run a waiting dequeue event
+  /// when this was the last pending error.
+  fn delivered(mut self, env: &Env) {
+    let Some(shared) = self.0.take() else {
+      return;
+    };
+    let covered = shared.write().ok().and_then(|mut state| {
+      state.errors_pending = state.errors_pending.saturating_sub(1);
+      (state.errors_pending == 0 && state.dequeue_scheduled).then(|| state.take_scheduled())
+    });
+    if let Some(covered) = covered {
+      CodecEventState::deliver_dequeue(env, &shared, covered);
+    }
+  }
+}
+
+impl Drop for ErrorDelivery {
+  /// The error callback will not run: hand a waiting dequeue event to the
+  /// dispatcher instead (any thread).
+  fn drop(&mut self) {
+    let Some(shared) = self.0.take() else {
+      return;
+    };
+    let Ok(mut state) = shared.write() else {
+      return;
+    };
+    state.errors_pending = state.errors_pending.saturating_sub(1);
+    if state.errors_pending == 0
+      && state.dequeue_scheduled
+      && let Some(dispatcher) = state.dispatcher.clone()
+    {
+      // A payload consumed while the event waited does not run again.
+      state.queue_dispatch(&shared, &dispatcher);
     }
   }
 }
@@ -497,6 +735,7 @@ impl Drop for CodecEventState {
     if let Some(r) = self.ondequeue {
       refs.push(r);
     }
+    refs.extend(self.holder.take());
     if refs.is_empty() {
       return;
     }
@@ -523,8 +762,9 @@ impl Drop for CodecEventState {
         );
       }
     }
-    // No codec ref and no dispatcher: handles leak harmlessly — listeners can
-    // only exist after ensure_dispatcher ran, so this is an env-teardown edge.
+    // No dispatcher on a worker-thread drop: handles leak harmlessly. Listeners
+    // only exist once the dispatcher is installed; a holder ref without one
+    // means making the dispatcher failed.
   }
 }
 
@@ -760,7 +1000,8 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
     // the deleted ref would be unusable.
     let func = upgrade_ref(env, callback).ok().flatten();
     if func.is_none() && !item.once {
-      // The weak ref was emptied — only possible if its Map anchor is gone.
+      // The weak ref was emptied — only possible if code that ran before this
+      // module loaded intercepted the anchor store (see [`AnchorStore`]).
       // Drop the dead entry so it can't wedge dispatch.
       if let Ok(mut state) = shared.write() {
         if item.is_ondequeue {
@@ -784,23 +1025,20 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
     // dispatchEvent inside the listener cannot observe it again.
     if item.once
       && let Ok(mut state) = shared.write()
-      && let Some(listeners) = state.listeners.get_mut(event_type)
     {
-      if let Some(pos) = listeners.iter().position(|e| e.id == item.id) {
-        let removed = listeners.remove(pos);
-        release_callback(
-          env,
-          codec_obj.as_ref().map(|o| o.raw()),
-          removed.id,
-          removed.callback,
-        );
-      }
-      if listeners.is_empty() {
-        state.listeners.remove(event_type);
-      }
-      if event_type == "dequeue" {
-        state.once_pending = state.once_pending.saturating_sub(1);
-        state.sync_once_ref(env);
+      let holder = state.holder.get(env);
+      if let Some(listeners) = state.listeners.get_mut(event_type) {
+        if let Some(pos) = listeners.iter().position(|e| e.id == item.id) {
+          let removed = listeners.remove(pos);
+          release_callback(env, holder, removed.id, removed.callback);
+        }
+        if listeners.is_empty() {
+          state.listeners.remove(event_type);
+        }
+        if event_type == "dequeue" {
+          state.once_pending = state.once_pending.saturating_sub(1);
+          state.sync_once_ref(env);
+        }
       }
     }
     if let Some(func) = func {
@@ -947,63 +1185,6 @@ fn sym_prop(env: &Env, this: sys::napi_value) -> Result<Unknown<'static>> {
   Ok(as_static(unsafe { Unknown::from_napi_value(env_raw, v)? }))
 }
 
-/// Symbol.for() key for the codec's listener-liveness Map (id → callback).
-/// A plain JS edge makes the codec→listener relationship GC-traceable, so
-/// listener napi_refs can stay weak and a codec→state→listener→event→codec
-/// cycle remains collectable.
-const LISTENERS_SYM_DESC: &str = "webcodecs.listeners";
-
-/// `codec[Symbol.for(desc)]` as a Map, creating and installing it when
-/// `create` is set. None when absent and not requested.
-fn listener_map(
-  env: &Env,
-  codec: sys::napi_value,
-  create: bool,
-) -> Result<Option<sys::napi_value>> {
-  let env_raw = env.raw();
-  let sym = symbol_for(env, LISTENERS_SYM_DESC)?;
-  let mut v = ptr::null_mut();
-  check_status!(unsafe { sys::napi_get_property(env_raw, codec, sym, &mut v) })?;
-  if !is_nullish(env_raw, v) {
-    return Ok(Some(v));
-  }
-  if !create {
-    return Ok(None);
-  }
-  unsafe {
-    let global = env.get_global()?.raw();
-    let map_ctor = get_named_raw(env_raw, global, "Map")?;
-    let mut map = ptr::null_mut();
-    check_status!(sys::napi_new_instance(
-      env_raw,
-      map_ctor,
-      0,
-      ptr::null(),
-      &mut map,
-    ))?;
-    define_sym_prop(env, codec, LISTENERS_SYM_DESC, map)?;
-    Ok(Some(map))
-  }
-}
-
-/// `map[method](...args)` via raw N-API ("set" / "delete").
-fn map_op(env: &Env, map: sys::napi_value, method: &str, args: &[sys::napi_value]) -> Result<()> {
-  let env_raw = env.raw();
-  unsafe {
-    let f = get_named_raw(env_raw, map, method)?;
-    let mut out = ptr::null_mut();
-    check_status!(sys::napi_call_function(
-      env_raw,
-      map,
-      f,
-      args.len(),
-      args.as_ptr(),
-      &mut out,
-    ))?;
-    Ok(())
-  }
-}
-
 /// Upgrade a weak napi_ref to a value; `None` if it has been emptied by GC.
 pub(crate) fn upgrade_ref(env: &Env, refr: usize) -> Result<Option<Unknown<'static>>> {
   let mut v = ptr::null_mut();
@@ -1018,17 +1199,268 @@ pub(crate) fn upgrade_ref(env: &Env, refr: usize) -> Result<Option<Unknown<'stat
   })))
 }
 
-/// Release one registered callback: delete its napi_ref handle and drop its
-/// liveness entry from the codec's listener Map. JS thread only.
-pub(crate) fn release_callback(env: &Env, codec: Option<sys::napi_value>, id: u64, refr: usize) {
-  unsafe { sys::napi_delete_reference(env.raw(), refr as sys::napi_ref) };
-  if let Some(codec) = codec
-    && let Ok(Some(map)) = listener_map(env, codec, false)
-  {
-    let mut idv = ptr::null_mut();
-    unsafe { sys::napi_create_double(env.raw(), id as f64, &mut idv) };
-    let _ = map_op(env, map, "delete", &[idv]);
+/// Write lock on a codec's event state.
+fn write_state(shared: &RwLock<CodecEventState>) -> Result<RwLockWriteGuard<'_, CodecEventState>> {
+  shared
+    .write()
+    .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))
+}
+
+/// Keep `fn_raw` alive through `holder` (see [`AnchorStore`]) and return a
+/// weak napi_ref for invoking it. Without a holder (no store), falls back to a
+/// strong ref so the callback stays callable, trading collectability for
+/// correctness on that path. JS thread; runs no JS.
+pub(crate) fn anchor_callback(
+  env: &Env,
+  holder: Option<sys::napi_value>,
+  id: u64,
+  fn_raw: sys::napi_value,
+) -> Result<usize> {
+  if let Some(holder) = holder {
+    // Define (not set) the property: a define on our own ordinary object runs
+    // no JS, and nothing on Object.prototype can observe the callback.
+    let property = sys::napi_property_descriptor {
+      utf8name: ptr::null(),
+      name: anchor_key(env, id)?,
+      method: None,
+      getter: None,
+      setter: None,
+      value: fn_raw,
+      attributes: sys::PropertyAttributes::writable | sys::PropertyAttributes::configurable,
+      data: ptr::null_mut(),
+    };
+    check_status!(unsafe { sys::napi_define_properties(env.raw(), holder, 1, &property) })?;
   }
+  let mut r = ptr::null_mut();
+  check_status!(unsafe {
+    sys::napi_create_reference(env.raw(), fn_raw, u32::from(holder.is_none()), &mut r)
+  })?;
+  Ok(r as usize)
+}
+
+/// Release one registered callback: delete its napi_ref handle and drop its
+/// entry from the owner's holder. JS thread; runs no JS.
+pub(crate) fn release_callback(env: &Env, holder: Option<sys::napi_value>, id: u64, refr: usize) {
+  unsafe { sys::napi_delete_reference(env.raw(), refr as sys::napi_ref) };
+  // A missing entry only keeps the callback alive until the owner is collected.
+  if let Some(holder) = holder
+    && let Ok(key) = anchor_key(env, id)
+  {
+    let mut deleted = false;
+    unsafe { sys::napi_delete_property(env.raw(), holder, key, &mut deleted) };
+  }
+}
+
+fn anchor_key(env: &Env, id: u64) -> Result<sys::napi_value> {
+  Ok(env.create_string(id.to_string())?.raw())
+}
+
+/// Per-env store that keeps registered callbacks (codec event listeners and
+/// VideoFrame close observers) alive through a GC-traceable edge from their
+/// owner object, with nothing visible on that object.
+///
+/// It is a `WeakMap<owner, holder>`, where each holder is a plain object with
+/// one own property per callback. A WeakMap entry keeps its value alive only
+/// while its key is alive, so a callback that captures its owner is collected
+/// with it, and the native side only keeps weak refs to the callbacks.
+///
+/// The WeakMap and the intrinsic `WeakMap.prototype.set` are captured when the
+/// module loads in each env (main thread or worker_thread; each load of the
+/// module gets its own env) and kept by native refs, so user code cannot reach
+/// the store afterwards: patching the `WeakMap` global or its prototype later
+/// changes nothing. Each owner keeps a weak ref to its holder ([`HolderRef`]),
+/// so the store is only called once per owner, to link a new holder. Holders
+/// are only touched with define/delete own-property operations on an ordinary
+/// object, which run no user code. Frozen, sealed and non-extensible owners
+/// work, since nothing is added to the owner itself.
+///
+/// Limit: code that replaces `WeakMap` or its prototype methods before this
+/// module loads is handed the store. It can drop entries, which loses events
+/// (a dropped callback is collected and then skipped). It runs while no lock
+/// is held, so it may call back into the module. Memory safety holds:
+/// callbacks are only invoked through weak refs that read as empty once
+/// collected. If the store cannot be created at load (no usable `WeakMap`),
+/// callbacks fall back to strong refs: no missed events, but a callback that
+/// captures its owner is not collected.
+struct AnchorStore {
+  map: sys::napi_ref,
+  set: sys::napi_ref,
+}
+
+thread_local! {
+  /// Anchor stores of the envs on this thread (the main thread or a
+  /// worker_thread, possibly with the module loaded more than once), by env
+  /// pointer. An env cleanup hook removes the entry before its env goes away,
+  /// so a reused pointer never finds a stale store.
+  static ANCHOR_STORES: RefCell<HashMap<usize, AnchorStore>> = RefCell::new(HashMap::new());
+}
+
+/// Create this env's anchor store. Called from the module load hook
+/// (`video_frame::on_module_load`; napi-rs keeps one such hook per crate),
+/// before any user code can call into the module.
+///
+/// Never fails, so it cannot stop the other load-time work: without a store,
+/// callbacks fall back to strong refs. (Unit-test builds do not run the hook.)
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn install_callback_anchor_store(env: &Env) {
+  let key = env.raw() as usize;
+  let Ok(store) = create_anchor_store(env) else {
+    // No usable WeakMap. Clear whatever the attempt threw.
+    let mut pending = false;
+    unsafe { sys::napi_is_exception_pending(env.raw(), &mut pending) };
+    if pending {
+      let mut exc = ptr::null_mut();
+      unsafe { sys::napi_get_and_clear_last_exception(env.raw(), &mut exc) };
+    }
+    return;
+  };
+  // The env frees its own refs on teardown; the hook only forgets the
+  // handles, so a later env at the same address never finds them.
+  let forget = env.add_env_cleanup_hook(key, |key| {
+    let _ = ANCHOR_STORES.try_with(|stores| stores.borrow_mut().remove(&key));
+  });
+  if forget.is_err() {
+    for r in [store.map, store.set] {
+      unsafe { sys::napi_delete_reference(env.raw(), r) };
+    }
+    return;
+  }
+  ANCHOR_STORES.with(|stores| stores.borrow_mut().insert(key, store));
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn create_anchor_store(env: &Env) -> Result<AnchorStore> {
+  let env_raw = env.raw();
+  unsafe {
+    let global = env.get_global()?.raw();
+    let ctor = get_named_raw(env_raw, global, "WeakMap")?;
+    let proto = get_named_raw(env_raw, ctor, "prototype")?;
+    let set = get_named_raw(env_raw, proto, "set")?;
+    for f in [ctor, set] {
+      let mut t = sys::ValueType::napi_undefined;
+      check_status!(sys::napi_typeof(env_raw, f, &mut t))?;
+      if t != sys::ValueType::napi_function {
+        return Err(Error::new(Status::FunctionExpected, "WeakMap is unusable"));
+      }
+    }
+    let mut map = ptr::null_mut();
+    check_status!(sys::napi_new_instance(
+      env_raw,
+      ctor,
+      0,
+      ptr::null(),
+      &mut map
+    ))?;
+    let mut refs = [ptr::null_mut(); 2];
+    for (slot, value) in refs.iter_mut().zip([map, set]) {
+      check_status!(sys::napi_create_reference(env_raw, value, 1, slot))?;
+    }
+    Ok(AnchorStore {
+      map: refs[0],
+      set: refs[1],
+    })
+  }
+}
+
+/// `(map, set)` of this env's anchor store, fetched in the caller's handle
+/// scope. None when the module runs without a store.
+fn anchor_store(env: &Env) -> Option<[sys::napi_value; 2]> {
+  let refs = ANCHOR_STORES
+    .try_with(|stores| {
+      stores
+        .borrow()
+        .get(&(env.raw() as usize))
+        .map(|store| [store.map, store.set])
+    })
+    .ok()
+    .flatten()?;
+  let mut values = [ptr::null_mut(); 2];
+  for (value, r) in values.iter_mut().zip(refs) {
+    let status = unsafe { sys::napi_get_reference_value(env.raw(), r, value) };
+    if status != sys::Status::napi_ok || value.is_null() {
+      return None;
+    }
+  }
+  Some(values)
+}
+
+/// An owner's weak napi_ref to its holder (see [`AnchorStore`]), so finding
+/// the holder runs no JS. JS thread only; the owner deletes the ref (with
+/// [`Self::clear`] or [`Self::take`]) when it goes away.
+#[derive(Default)]
+pub(crate) struct HolderRef(Option<usize>);
+
+/// A holder to anchor callbacks in; `link` is set when the holder is new and
+/// still has to be linked from its owner with [`link_holder`].
+pub(crate) struct Anchor {
+  pub(crate) holder: sys::napi_value,
+  link: Option<[sys::napi_value; 2]>,
+}
+
+impl HolderRef {
+  /// The holder, while it is alive. Runs no JS.
+  pub(crate) fn get(&self, env: &Env) -> Option<sys::napi_value> {
+    let r = self.0?;
+    let mut value = ptr::null_mut();
+    let status =
+      unsafe { sys::napi_get_reference_value(env.raw(), r as sys::napi_ref, &mut value) };
+    (status == sys::Status::napi_ok && !value.is_null()).then_some(value)
+  }
+
+  /// The holder to anchor in, made and recorded first if there is none. Runs
+  /// no JS. None when the module runs without a store.
+  pub(crate) fn prepare(&mut self, env: &Env) -> Result<Option<Anchor>> {
+    let Some(store) = anchor_store(env) else {
+      return Ok(None);
+    };
+    if let Some(holder) = self.get(env) {
+      return Ok(Some(Anchor { holder, link: None }));
+    }
+    // The previous holder, if any, was collected (or never linked).
+    self.clear(env.raw());
+    let mut holder = ptr::null_mut();
+    check_status!(unsafe { sys::napi_create_object(env.raw(), &mut holder) })?;
+    let mut r = ptr::null_mut();
+    check_status!(unsafe { sys::napi_create_reference(env.raw(), holder, 0, &mut r) })?;
+    self.0 = Some(r as usize);
+    Ok(Some(Anchor {
+      holder,
+      link: Some(store),
+    }))
+  }
+
+  /// Delete the ref (JS thread).
+  pub(crate) fn clear(&mut self, env: sys::napi_env) {
+    if let Some(r) = self.0.take() {
+      unsafe { sys::napi_delete_reference(env, r as sys::napi_ref) };
+    }
+  }
+
+  /// Hand the raw ref to a caller that deletes it.
+  pub(crate) fn take(&mut self) -> Option<usize> {
+    self.0.take()
+  }
+}
+
+/// Link a new holder from its owner in the store. Calls the captured
+/// `WeakMap.prototype.set`, which is user JS if `WeakMap` was replaced before
+/// the module loaded, so the caller holds no lock: that JS may call back into
+/// the module. No-op for a holder that is already linked.
+pub(crate) fn link_holder(env: &Env, owner: sys::napi_value, anchor: &Anchor) -> Result<()> {
+  let Some([map, set]) = anchor.link else {
+    return Ok(());
+  };
+  let mut out = ptr::null_mut();
+  check_status!(unsafe {
+    sys::napi_call_function(
+      env.raw(),
+      map,
+      set,
+      2,
+      [owner, anchor.holder].as_ptr(),
+      &mut out,
+    )
+  })
 }
 
 /// Install `value` as a non-enumerable own data prop keyed by
