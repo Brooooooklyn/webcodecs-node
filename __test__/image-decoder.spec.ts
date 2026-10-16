@@ -629,6 +629,55 @@ test('ImageDecoder: a streamed decode() waits for the decode() calls before it, 
   decoder.close()
 })
 
+// Chrome rejects the decode() calls that wait at reset(). So the decode() made after it does not
+// wait for them, though the calls are handled in call order.
+test('ImageDecoder: reset() rejects a waiting GIF decode() with AbortError, and the next decode() goes on, like Chrome', async (t) => {
+  // the fixture's frames are bytes 0..901, 902..1765 and 1766..2629
+  const data = new Uint8Array(readFileSync(join(__dirname, 'fixtures/animated.gif')))
+  let controller!: ReadableStreamDefaultController<Uint8Array>
+  const stream = new ReadableStream<Uint8Array>({
+    start(streamController) {
+      controller = streamController
+      controller.enqueue(data.slice(0, 902))
+    },
+  })
+  const decoder = new ImageDecoder({ data: stream, type: 'image/gif' })
+  // also when a check fails: a pending call or the open stream would keep the worker alive
+  t.teardown(() => {
+    decoder.close()
+    try {
+      controller.close()
+    } catch {}
+  })
+  await decoder.tracks.ready
+  const settled: number[] = []
+  const waiting = decoder.decode({ frameIndex: 2 }).finally(() => settled.push(2))
+  waiting.catch(() => {})
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  t.deepEqual(settled, [], 'decode(2) waits for frame 2')
+
+  decoder.reset()
+  const next = decoder.decode({ frameIndex: 0 }).finally(() => settled.push(0))
+  next.catch(() => {})
+  // more data, but frame 2 is still not whole
+  controller.enqueue(data.slice(902, 1810))
+  // fails at once if a call stays pending (the stream stays open)
+  const within = <T>(promise: Promise<T>) => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const late = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('still pending after 5 s')), 5000)
+    })
+    return Promise.race([promise, late]).finally(() => clearTimeout(timer))
+  }
+  await t.throwsAsync(within(waiting), { instanceOf: DOMException, name: 'AbortError', message: 'Aborted by reset.' })
+  const { image } = await within(next)
+  t.is(image.timestamp, 0)
+  t.is(image.duration, 1_000_000)
+  t.deepEqual(settled, [2, 0])
+  t.false(decoder.closed)
+  image.close()
+})
+
 test('ImageDecoder: a stream error ends the GIF or BMP data, like Chrome', async (t) => {
   const streamed = (data: Uint8Array, cut: number, type: string) => {
     let controller!: ReadableStreamDefaultController<Uint8Array>
