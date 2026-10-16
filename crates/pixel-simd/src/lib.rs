@@ -314,18 +314,18 @@ impl Palette {
 /// largest palette.
 fn palette_lookup(isa: Isa, bits: u32, colors: usize) -> bool {
   let largest = match isa.level() {
-    Level::Scalar => return false,
+    Level::Scalar => None,
     // SSE2 has no byte lookup (pshufb is SSSE3)
     #[cfg(target_arch = "x86_64")]
-    Level::Sse2 => return false,
+    Level::Sse2 => None,
     #[cfg(target_arch = "x86_64")]
-    Level::Ssse3 | Level::Avx2 => x86::PALETTE_COLORS,
+    Level::Ssse3 | Level::Avx2 => Some(x86::PALETTE_COLORS),
     #[cfg(target_arch = "aarch64")]
-    Level::Neon => neon::PALETTE_COLORS,
+    Level::Neon => Some(neon::PALETTE_COLORS),
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    Level::Simd128 => wasm::PALETTE_COLORS,
+    Level::Simd128 => Some(wasm::PALETTE_COLORS),
   };
-  bits < 8 || colors <= largest
+  largest.is_some_and(|largest| bits < 8 || colors <= largest)
 }
 
 /// BGRA pixels from a BMP row of `bits`-bit palette indexes (1, 2, 4 or 8), the first pixel in
