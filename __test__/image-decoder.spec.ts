@@ -1057,10 +1057,13 @@ test('ImageDecoder: a close() in the decode() task or a microtask wins over a fa
 
 test('ImageDecoder: a close() in the decode() task or a microtask leaves the GIF track as built, every time', async (t) => {
   // The worker thread can fill the track (frameCount, repetitionCount) before the JS task reaches
-  // close(). As for a failed metadata, a close() before tracks.ready wins: the track stays as the
-  // decoder built it, every time. Before, the track kept what the worker found whenever the worker
-  // finished first: almost always after sync work (as after 5 ms here), now and then in the same
-  // task or a microtask, also on main. Chrome 155 has no track then.
+  // close(). As for a failed metadata, a close() before the decoder signals tracks.ready inside
+  // wins: the track stays as the decoder built it. With buffer data, that signal comes in a later
+  // task, so a close() in the task that made the decoder or in a microtask wins every time, as
+  // here. A close() in a later task can come after the signal, and then keeps what the worker
+  // found. Before, the track kept what the worker found whenever the worker finished first: almost
+  // always after sync work (as after 5 ms here), now and then in the same task or a microtask, also
+  // on main. Chrome 155 has no track then.
   const files: [string, Uint8Array][] = [
     ['two frames', TWO_FRAMES],
     ['one frame', ONE_FRAME],
