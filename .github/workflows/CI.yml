@@ -76,6 +76,47 @@ jobs:
       - name: Rust unit tests
         run: cargo test --lib
 
+  pixel-simd:
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - host: ubuntu-latest
+            bench: true
+          - host: windows-latest
+            bench: true
+          - host: macos-latest
+          - host: ubuntu-24.04-arm
+          - host: ubuntu-latest
+            target: wasm32-wasip1
+          - host: ubuntu-latest
+            target: wasm32-wasip1
+            rustflags: -C target-feature=+simd128
+    name: pixel-simd - ${{ matrix.settings.target || matrix.settings.host }} ${{ matrix.settings.rustflags }}
+    runs-on: ${{ matrix.settings.host }}
+    env:
+      CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime
+      CARGO_TARGET_WASM32_WASIP1_RUSTFLAGS: ${{ matrix.settings.rustflags }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.settings.target }}
+          components: clippy
+      - name: Install wasmtime
+        if: matrix.settings.target
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasmtime@49.0.2
+      - name: Clippy
+        run: cargo clippy --all-targets -p pixel-simd ${{ matrix.settings.target && format('--target {0}', matrix.settings.target) || '' }} -- -D warnings
+      - name: Test
+        run: cargo test --release -p pixel-simd ${{ matrix.settings.target && format('--target {0}', matrix.settings.target) || '' }}
+      - name: Bench
+        if: matrix.settings.bench
+        run: cargo run --release -p pixel-simd --example bench
+
   build:
     strategy:
       fail-fast: false

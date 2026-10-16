@@ -19,6 +19,7 @@ mod flush_tracker;
 mod hardware;
 pub(crate) mod hw_fallback;
 mod image_decoder;
+pub(crate) mod image_hints;
 mod mkv_demuxer;
 mod mkv_muxer;
 mod mp4_demuxer;

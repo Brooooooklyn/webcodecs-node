@@ -5,14 +5,15 @@
 
 use crate::codec::demuxer::{DemuxerContext, MediaType};
 use crate::codec::{CodecContext, DecoderConfig, Frame, Packet};
-use crate::ffi::avutil::av_rescale_q;
-use crate::ffi::{AV_NOPTS_VALUE, AVCodecID, AVRational};
+use crate::ffi::avutil::{av_opt_set_int, av_rescale_q, opt_flag};
+use crate::ffi::{AV_NOPTS_VALUE, AVCodecID, AVRational, check_error};
 use crate::webcodecs::buffer_source::{self, Uint8ArrayCopy};
 use crate::webcodecs::decoded_frame::{DecodedSource, decoded_frame_format};
 use crate::webcodecs::error::{
   DOMExceptionName, invalid_state_error, native_dom_exception_error, native_range_error,
   throw_invalid_state_error,
 };
+use crate::webcodecs::image_hints::{PixelHint, bmp_header, gif_frame_alpha, png_header};
 use crate::webcodecs::{VideoFrame, VideoPixelFormat};
 use futures::stream::StreamExt;
 use napi::bindgen_prelude::*;
@@ -60,12 +61,37 @@ pub struct ImageDecoderInit<'env> {
   pub mime_type: String,
   /// Color space conversion mode (default: "default")
   pub color_space_conversion: ColorSpaceConversion,
-  /// Desired width (optional, for scaling) - must be paired with desired_height
+  /// Desired width (optional). Like Chrome, only a JPEG uses it, and only with desired_height.
   pub desired_width: Option<u32>,
-  /// Desired height (optional, for scaling) - must be paired with desired_width
+  /// Desired height (optional). Like Chrome, only a JPEG uses it, and only with desired_width.
   pub desired_height: Option<u32>,
   /// Whether to prefer animation (for animated formats)
   pub prefer_animation: Option<bool>,
+}
+
+/// Read an optional `[EnforceRange] unsigned long` member of ImageDecoderInit the way Chrome
+/// does: undefined is absent; any other value goes through ToNumber (null is 0, strings
+/// convert) and is truncated; NaN, an infinity or a value outside 0..=2^32-1 is a TypeError.
+fn enforce_range_unsigned_long(env: &Env, init: &Object, name: &str) -> Result<Option<u32>> {
+  let value: Unknown = init.get_named_property(name)?;
+  if value.get_type()? == ValueType::Undefined {
+    return Ok(None);
+  }
+  let number = value.coerce_to_number()?.get_double()?;
+  let problem = if number.is_nan() {
+    "Value is not of type 'unsigned long'."
+  } else if number.is_infinite() {
+    "Value is infinite and not of type 'unsigned long'."
+  } else if !(0.0..=f64::from(u32::MAX)).contains(&number.trunc()) {
+    "Value is outside the 'unsigned long' value range."
+  } else {
+    return Ok(Some(number.trunc() as u32));
+  };
+  let message = format!(
+    "Failed to construct 'ImageDecoder': Failed to read the '{name}' property from 'ImageDecoderInit': {problem}"
+  );
+  env.throw_type_error(&message, None)?;
+  Err(Error::new(Status::InvalidArg, message))
 }
 
 impl<'env> FromNapiValue for ImageDecoderInit<'env> {
@@ -111,21 +137,11 @@ impl<'env> FromNapiValue for ImageDecoderInit<'env> {
       }
     };
 
-    let desired_width: Option<u32> = obj.get("desiredWidth").ok().flatten();
-    let desired_height: Option<u32> = obj.get("desiredHeight").ok().flatten();
+    // WebIDL reads dictionary members in name order. One of the two alone is no error:
+    // Chrome ignores it.
+    let desired_height = enforce_range_unsigned_long(&env_wrapper, &obj, "desiredHeight")?;
+    let desired_width = enforce_range_unsigned_long(&env_wrapper, &obj, "desiredWidth")?;
     let prefer_animation: Option<bool> = obj.get("preferAnimation").ok().flatten();
-
-    // W3C spec validation: desiredWidth and desiredHeight must both exist or both be omitted
-    if desired_width.is_some() != desired_height.is_some() {
-      env_wrapper.throw_type_error(
-        "Both desiredWidth and desiredHeight must be specified, or neither",
-        None,
-      )?;
-      return Err(Error::new(
-        Status::InvalidArg,
-        "Both desiredWidth and desiredHeight must be specified, or neither",
-      ));
-    }
 
     // Get data - a BufferSource or a ReadableStream
     let data_napi_value: napi::sys::napi_value = {
@@ -303,6 +319,8 @@ pub struct ImageTrackList {
   inner: Arc<Mutex<ImageTrackListInner>>,
   /// Whether track metadata is ready (established)
   ready: Arc<AtomicBool>,
+  /// Whether the metadata was rejected: `ready` then rejects (set before `ready`)
+  failed: Arc<AtomicBool>,
   /// Notifier for when ready becomes true
   ready_notify: Arc<Notify>,
 }
@@ -312,6 +330,7 @@ impl Clone for ImageTrackList {
     ImageTrackList {
       inner: self.inner.clone(),
       ready: self.ready.clone(),
+      failed: self.failed.clone(),
       ready_notify: self.ready_notify.clone(),
     }
   }
@@ -357,27 +376,39 @@ impl ImageTrackList {
   }
 
   /// Promise that resolves when track metadata is available (W3C spec)
-  #[napi(getter)]
-  pub async fn ready(&self) -> Result<()> {
-    // Fast path: already ready
-    if self.ready.load(Ordering::Acquire) {
-      return Ok(());
-    }
+  #[napi(getter, ts_return_type = "Promise<void>")]
+  pub fn ready<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
+    let tracks = self.clone();
+    let wait = async move {
+      // Fast path: already ready
+      if !tracks.ready.load(Ordering::Acquire) {
+        // IMPORTANT: Create the listener FIRST, before checking the flag again.
+        // This prevents a race condition where notify_waiters() is called
+        // after our initial check but before we register as a waiter.
+        let notified = tracks.ready_notify.notified();
 
-    // IMPORTANT: Create the listener FIRST, before checking the flag again.
-    // This prevents a race condition where notify_waiters() is called
-    // after our initial check but before we register as a waiter.
-    let notified = self.ready_notify.notified();
-
-    // Check again - if became ready while creating listener, return immediately
-    if self.ready.load(Ordering::Acquire) {
-      return Ok(());
-    }
-
-    // Now safe to wait - the listener is registered, so any subsequent
-    // notify_waiters() call will wake us up
-    notified.await;
-    Ok(())
+        // Check again - if became ready while creating listener, do not wait.
+        // Otherwise the listener is registered, so any subsequent
+        // notify_waiters() call will wake us up
+        if !tracks.ready.load(Ordering::Acquire) {
+          notified.await;
+        }
+      }
+      Ok(tracks.failed.load(Ordering::Acquire))
+    };
+    let ready = env.spawn_future_with_callback(wait, |env, failed| {
+      if failed {
+        return Err(native_dom_exception_error(
+          env,
+          DOMExceptionName::InvalidStateError,
+          "Failed to retrieve track metadata.",
+        )?);
+      }
+      Ok(())
+    })?;
+    // Like Chrome, never report a rejection of `ready` as unhandled.
+    ready.catch(|_: CallbackContext<Unknown>| Ok(()))?;
+    Ok(ready)
   }
 
   /// Get track at specified index (W3C spec)
@@ -426,12 +457,27 @@ struct ImageDecoderInner {
   cached_data_len: usize,
   /// Color space conversion mode (W3C spec)
   color_space_conversion: ColorSpaceConversion,
-  /// Desired width for scaling (W3C spec - must be paired with desired_height)
+  /// Desired width (a JPEG decodes at M/8 of its size, see `jpeg_scale_numerator`)
   desired_width: Option<u32>,
-  /// Desired height for scaling (W3C spec - must be paired with desired_width)
+  /// Desired height (a JPEG decodes at M/8 of its size, see `jpeg_scale_numerator`)
   desired_height: Option<u32>,
   /// Whether to prefer animation for animated formats (W3C spec)
   prefer_animation: Option<bool>,
+}
+
+impl ImageDecoderInner {
+  fn close(&mut self) {
+    self.context = None;
+    self.cached_frames = None;
+    self.cache_epoch = self.cache_epoch.wrapping_add(1);
+    self.cached_data_len = 0;
+    self.closed = true;
+
+    // Wake any waiters so they can check closed state
+    self.tracks.ready.store(true, Ordering::Release);
+    self.tracks.ready_notify.notify_waiters();
+    self.tracks.ready_notify.notify_one();
+  }
 }
 
 /// ImageDecoder - WebCodecs-compliant image decoder
@@ -492,6 +538,7 @@ impl ImageDecoder {
     let tracks = ImageTrackList {
       inner: track_list_inner,
       ready: ready.clone(),
+      failed: Arc::new(AtomicBool::new(false)),
       ready_notify: ready_notify.clone(),
     };
 
@@ -535,19 +582,22 @@ impl ImageDecoder {
       // For buffer data: completed resolves immediately (data is already available)
       let completed_promise = env.spawn_future(async { Ok(()) })?;
 
-      // Spawn pre-parse task for ready promise
-      let inner_clone = inner.clone();
-      let ready_promise = env.spawn_future(async move {
-        let result = spawn_blocking(move || pre_parse_and_cache_frames(&inner_clone)).await;
-
-        match result {
-          Ok(Ok(())) | Ok(Err(_)) | Err(_) => {
-            // Always signal ready, even on error (per W3C spec behavior)
-          }
-        }
-
-        Ok(())
-      })?;
+      // Spawn pre-parse task for ready promise. Always signal ready, even on error (per W3C
+      // spec behavior). Like Chrome, a rejected metadata closes the decoder in a JS task of its
+      // own, so a decode() made before that task is still pending.
+      let parse_inner = inner.clone();
+      let ready_inner = inner.clone();
+      let ready_promise = env.spawn_future_with_callback(
+        async move {
+          let _ = spawn_blocking(move || cache_decoded_frames(&parse_inner)).await;
+          Ok(())
+        },
+        move |_, ()| {
+          close_if_failed(&ready_inner);
+          signal_tracks_ready(&ready_inner);
+          Ok(())
+        },
+      )?;
 
       // Store both promises as non-enumerable properties
       this.define_properties(&[
@@ -573,7 +623,10 @@ impl ImageDecoder {
         inner_guard.data = ImageDecoderData::Vec(Vec::new());
       }
 
-      let collection_promise = env.spawn_future(async move {
+      // Set when the metadata is rejected: Chrome then closes the decoder and stops reading.
+      let failed = tracks.failed.clone();
+      let data_complete = complete.clone();
+      let collect = async move {
         let mut next_probe_size = 1usize;
 
         while let Some(item) = reader.next().await {
@@ -612,21 +665,40 @@ impl ImageDecoder {
             ) {
               signal_tracks_ready(&inner_clone);
             }
+            if close_if_failed(&inner_clone) {
+              return Ok(());
+            }
             next_probe_size = buffered_len.saturating_mul(2).max(next_probe_size * 2);
           }
         }
 
+        // Refresh once at EOF so animated images include frames that arrived
+        // after an early successful probe. Like Chrome, the data is complete only
+        // once it is decoded: a metadata rejected here still rejects `completed`.
+        let final_inner = inner_clone.clone();
+        let _ = spawn_blocking(move || cache_decoded_frames(&final_inner)).await;
+        if close_if_failed(&inner_clone) {
+          return Ok(());
+        }
         if let Ok(inner_guard) = inner_clone.lock() {
           inner_guard.complete.store(true, Ordering::Release);
         }
-
-        // Refresh once at EOF so animated images include frames that arrived
-        // after an early successful probe.
-        let final_inner = inner_clone.clone();
-        let _ = spawn_blocking(move || cache_decoded_frames(&final_inner)).await;
         signal_tracks_ready(&inner_clone);
         Ok(())
+      };
+      let collection_promise = env.spawn_future_with_callback(collect, move |env, ()| {
+        // Closing the decoder before the data ended rejects `completed`.
+        if failed.load(Ordering::Acquire) && !data_complete.load(Ordering::Acquire) {
+          return Err(native_dom_exception_error(
+            env,
+            DOMExceptionName::AbortError,
+            "Aborted by close.",
+          )?);
+        }
+        Ok(())
       })?;
+      // Like Chrome, never report a rejection of `completed` as unhandled.
+      collection_promise.catch(|_: CallbackContext<Unknown>| Ok(()))?;
 
       let ready_flag = ready.clone();
       let ready_notifier = ready_notify.clone();
@@ -685,9 +757,12 @@ impl ImageDecoder {
       }
     }
 
-    // Get stored promise from this and chain a new promise for this access
+    // Get stored promise from this and chain a new promise for this access. Like Chrome,
+    // never report its rejection as unhandled.
     let promise: PromiseRaw<()> = this.get_named_property(COMPLETED_PROMISE)?;
-    promise.then(|_| Ok(()))
+    let completed = promise.then(|_| Ok(()))?;
+    completed.catch(|_: CallbackContext<Unknown>| Ok(()))?;
+    Ok(completed)
   }
 
   /// Get the MIME type
@@ -725,18 +800,18 @@ impl ImageDecoder {
     };
 
     let inner = self.inner.clone();
+    // Read now: a decode() made before the decoder fails rejects differently from one made
+    // after (see `closed_error`).
+    let closed = inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?
+      .closed;
 
     // Keep the Rust error as the resolved future value so the completion
     // callback can construct the precise native JavaScript exception class.
     let decode = async move {
-      // Check if closed before waiting
-      {
-        let inner_guard = inner
-          .lock()
-          .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-        if inner_guard.closed {
-          return Err(invalid_state_error("ImageDecoder is closed"));
-        }
+      if closed {
+        return Err(invalid_state_error("ImageDecoder is closed"));
       }
 
       // Wait for ready promise (ensures initial pre-parsing is complete)
@@ -824,18 +899,12 @@ impl ImageDecoder {
       .inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    inner.context = None;
-    inner.cached_frames = None;
-    inner.cache_epoch = inner.cache_epoch.wrapping_add(1);
-    inner.cached_data_len = 0;
-    inner.closed = true;
-
-    // Wake any waiters so they can check closed state
-    inner.tracks.ready.store(true, Ordering::Release);
-    inner.tracks.ready_notify.notify_waiters();
-    inner.tracks.ready_notify.notify_one();
-
+    // A metadata failure counts once `close_if_failed` has closed the decoder. A close() that
+    // comes first wins, also when a worker thread already found the failure (`reject_metadata`).
+    if !inner.closed {
+      inner.tracks.failed.store(false, Ordering::Release);
+    }
+    inner.close();
     Ok(())
   }
 
@@ -883,7 +952,7 @@ fn decode_cached_frame(
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
     if guard.closed {
-      return Err(invalid_state_error("ImageDecoder is closed"));
+      return Err(closed_error(&guard, frame_index));
     }
     (
       guard.cached_frames.is_none(),
@@ -897,14 +966,16 @@ fn decode_cached_frame(
     if !data_complete {
       return Ok(None);
     }
-    cache_decoded_frames(inner)?;
+    cache_decoded_frames(inner).inspect_err(|_| {
+      close_if_failed(inner);
+    })?;
   }
 
   let guard = inner
     .lock()
     .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
   if guard.closed {
-    return Err(invalid_state_error("ImageDecoder is closed"));
+    return Err(closed_error(&guard, frame_index));
   }
 
   let frames = guard.cached_frames.as_ref().ok_or_else(|| {
@@ -953,11 +1024,16 @@ fn decode_cached_frame(
   }))
 }
 
-/// Pre-parse image and cache decoded frames
-fn pre_parse_and_cache_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
-  let result = cache_decoded_frames(inner);
-  signal_tracks_ready(inner);
-  result
+/// The error of a decode() that finds the decoder closed. When the decoder closed because its
+/// metadata was rejected, Chrome rejects the decodes still pending with EncodingError.
+fn closed_error(inner: &ImageDecoderInner, frame_index: usize) -> Error {
+  if inner.tracks.failed.load(Ordering::Acquire) {
+    return Error::new(
+      Status::GenericFailure,
+      format!("Failed to decode frame at index {frame_index}"),
+    );
+  }
+  invalid_state_error("ImageDecoder is closed")
 }
 
 fn signal_tracks_ready(inner: &Arc<Mutex<ImageDecoderInner>>) {
@@ -972,8 +1048,8 @@ fn signal_tracks_ready(inner: &Arc<Mutex<ImageDecoderInner>>) {
 }
 
 /// Attempt to cache every frame currently present in the buffered bytes.
-/// Unlike `pre_parse_and_cache_frames`, failures do not resolve `tracks.ready`,
-/// which lets streamed images retry as more bytes arrive.
+/// Failures do not resolve `tracks.ready`, which lets streamed images retry as
+/// more bytes arrive. A rejected metadata is left to `close_if_failed`.
 fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
   // Snapshot everything needed for FFmpeg work under the mutex, then release
   // it. Large animated images can take a long time to decode; close() and
@@ -1021,38 +1097,83 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
     )
   })?;
 
+  // Chrome fails the metadata of a BMP whose bitfield masks the image crate rejects.
+  let bmp = match codec_id {
+    AVCodecID::Bmp => bmp_header(&data_bytes).map_err(|()| reject_metadata(inner))?,
+    _ => None,
+  };
+
   // Demux and decode all frames.
   let (context, mut frames, video_streams) = decode_image_data(codec_id, &data_bytes)?;
   // One video stream with one frame: no animation, alpha or other auxiliary image. An
   // 'avis' AVIF is an animation even when only its first frame has arrived.
   let still = video_streams == 1 && frames.len() == 1 && !avif_is_sequence(&data_bytes);
 
+  // Chrome labels each GIF frame by the frames it is drawn over. FFmpeg's frames are the first
+  // ones of the file, but can be fewer (one for a GIF without graphic control extensions). A
+  // frame list shorter than FFmpeg's (damaged data) makes every frame BGRA.
+  let gif_alpha = (codec_id == AVCodecID::Gif).then(|| {
+    gif_frame_alpha(&data_bytes)
+      .filter(|alpha| alpha.len() >= frames.len())
+      .unwrap_or_else(|| vec![true; frames.len()])
+  });
+
   // Apply preferAnimation: if false and format supports animation, only keep first frame
   if prefer_animation == Some(false) && !frames.is_empty() {
     frames.truncate(1);
   }
 
+  // Chrome uses desiredWidth/desiredHeight only for a JPEG, which libjpeg decodes at M/8 of
+  // its size (rounded up), to BGRX when M < 8.
+  let mut size = None;
+  if let (AVCodecID::Mjpeg, Some(desired), Some(frame)) =
+    (codec_id, desired_width.zip(desired_height), frames.first())
+  {
+    let (width, height) = (frame.width(), frame.height());
+    match jpeg_scale_numerator(width, height, desired) {
+      // Chrome rejects the metadata and closes the decoder.
+      0 => return Err(reject_metadata(inner)),
+      8 => {}
+      m => {
+        let scale = |side: u32| (u64::from(side) * u64::from(m)).div_ceil(8) as u32;
+        size = Some((scale(width), scale(height)));
+      }
+    }
+  }
+
   // Give every frame a WebCodecs format that describes its bytes, converting the
-  // FFmpeg formats WebCodecs has no name for (rgb24, pal8, gray, argb, ...), and
-  // apply desiredWidth/desiredHeight scaling if both are specified.
-  let source = DecodedSource::Image {
-    codec: codec_id,
-    alpha: match codec_id {
-      AVCodecID::Webp => webp_alpha_hint(&data_bytes),
-      AVCodecID::Png => png_alpha_hint(&data_bytes),
-      _ => None,
-    },
-    yuv: match codec_id {
-      AVCodecID::Mjpeg => jpeg_yuv_hint(&data_bytes),
-      // Chrome keeps a still AVIF without alpha as YUV planes
-      AVCodecID::Av1 => Some(still),
-      _ => None,
-    },
-    size: desired_width.zip(desired_height),
+  // FFmpeg formats WebCodecs has no name for (rgb24, pal8, gray, argb, ...).
+  let header = match codec_id {
+    AVCodecID::Png => png_header(&data_bytes),
+    AVCodecID::Bmp => bmp,
+    _ => None,
   };
+  let alpha = match codec_id {
+    AVCodecID::Webp => webp_alpha_hint(&data_bytes),
+    _ => header.map(|header| header.alpha),
+  };
+  let yuv = match codec_id {
+    AVCodecID::Mjpeg if size.is_some() => Some(false),
+    AVCodecID::Mjpeg => jpeg_yuv_hint(&data_bytes),
+    // Chrome keeps a still AVIF without alpha as YUV planes
+    AVCodecID::Av1 => Some(still),
+    AVCodecID::Webp => Some(webp_is_simple_lossy(&data_bytes)),
+    _ => None,
+  };
+  let pixels = header.map_or(PixelHint::None, |header| header.pixels);
   let frames = frames
     .into_iter()
-    .map(|frame| decoded_frame_format(frame, source))
+    .enumerate()
+    .map(|(i, frame)| {
+      let source = DecodedSource::Image {
+        codec: codec_id,
+        alpha: gif_alpha.as_ref().map_or(alpha, |gif| Some(gif[i])),
+        yuv,
+        size,
+        pixels,
+      };
+      decoded_frame_format(frame, source)
+    })
     .collect::<std::result::Result<Vec<_>, _>>()
     .map_err(|e| {
       Error::new(
@@ -1105,6 +1226,50 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
   Ok(())
 }
 
+/// Reject the metadata. The caller then closes the decoder with `close_if_failed`.
+fn reject_metadata(inner: &Arc<Mutex<ImageDecoderInner>>) -> Error {
+  if let Ok(guard) = inner.lock()
+    && !guard.closed
+  {
+    guard.tracks.failed.store(true, Ordering::Release);
+  }
+  invalid_state_error("Failed to retrieve track metadata.")
+}
+
+/// Close the decoder if its metadata was rejected: `tracks.ready` rejects, and so do the
+/// decode() calls still pending (see `closed_error`). Returns whether it was rejected.
+fn close_if_failed(inner: &Arc<Mutex<ImageDecoderInner>>) -> bool {
+  let Ok(mut guard) = inner.lock() else {
+    return false;
+  };
+  let failed = guard.tracks.failed.load(Ordering::Acquire);
+  if failed && !guard.closed {
+    guard.close();
+  }
+  failed
+}
+
+/// Chrome's scale numerator M: libjpeg decodes a JPEG at M/8 of its size so that its 4-byte
+/// pixels fit the budget that desiredWidth/desiredHeight give
+/// (JPEGImageDecoder::DesiredScaleNumerator, CalculateMaxDecodedBytes). 8 is full size; 0 means
+/// that even 1/8 is over the budget, and Chrome then fails. Chrome computes in 32 bits: a side
+/// of 2^31 or more is a negative int (no budget), and the byte counts wrap.
+fn jpeg_scale_numerator(width: u32, height: u32, desired: (u32, u32)) -> u32 {
+  let (desired_width, desired_height) = (desired.0 as i32, desired.1 as i32);
+  // An empty SkISize sets no budget.
+  if desired_width <= 0 || desired_height <= 0 {
+    return 8;
+  }
+  let max_bytes = (desired_width as u32)
+    .wrapping_mul(desired_height as u32)
+    .wrapping_mul(4);
+  let original_bytes = width.wrapping_mul(height).wrapping_mul(4);
+  if original_bytes <= max_bytes {
+    return 8;
+  }
+  ((f64::from(max_bytes) / f64::from(original_bytes)).sqrt() * 8.0).floor() as u32
+}
+
 /// Whether an AVIF's major brand is 'avis', an image sequence. Chrome then decodes its
 /// track, not the still image, and resolves no frame before the track header ('moov').
 /// The ftyp box comes first, so this is known before any frame. The frame count is
@@ -1128,29 +1293,10 @@ fn webp_alpha_hint(data: &[u8]) -> Option<bool> {
   }
 }
 
-/// The alpha a PNG header declares: color type 4 or 6, or a tRNS chunk (which comes
-/// before IDAT). Chrome labels the decoded image BGRA or BGRX by it, even when every
-/// tRNS entry is 255.
-fn png_alpha_hint(data: &[u8]) -> Option<bool> {
-  const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
-  if data.len() < 33 || &data[..8] != SIGNATURE || &data[12..16] != b"IHDR" {
-    return None;
-  }
-  if data[25] & 4 != 0 {
-    return Some(true);
-  }
-  let mut pos = 8usize;
-  while let Some(header) = data.get(pos..pos.checked_add(8)?) {
-    match &header[4..8] {
-      b"tRNS" => return Some(true),
-      b"IDAT" | b"IEND" => return Some(false),
-      _ => {}
-    }
-    // length, type, data, CRC
-    let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
-    pos = pos.checked_add(12)?.checked_add(length)?;
-  }
-  None
+/// Whether a WebP is simple lossy: its first chunk is VP8, so it has no VP8X header (Blink's
+/// IsSimpleLossyWebPImage). Chrome decodes only these to YUV planes.
+fn webp_is_simple_lossy(data: &[u8]) -> bool {
+  data.len() >= 20 && data.starts_with(b"RIFF") && &data[8..16] == b"WEBPVP8 "
 }
 
 /// Whether Chrome decodes a JPEG to YUV planes, from its SOF sampling factors: three
@@ -1283,6 +1429,23 @@ fn create_image_decoder(codec_id: AVCodecID, extradata: Option<Vec<u8>>) -> Resu
         format!("Failed to configure decoder: {}", e),
       )
     })?;
+  if codec_id == AVCodecID::Gif {
+    // Chrome's transparent GIF pixels are 0, 0, 0, 0; FFmpeg's default is transparent white.
+    check_error(unsafe {
+      av_opt_set_int(
+        context.as_mut_ptr().cast(),
+        c"trans_color".as_ptr(),
+        0,
+        opt_flag::SEARCH_CHILDREN,
+      )
+    })
+    .map_err(|e| {
+      Error::new(
+        Status::GenericFailure,
+        format!("Failed to configure decoder: {}", e),
+      )
+    })?;
+  }
   context.open().map_err(|e| {
     Error::new(
       Status::GenericFailure,
@@ -1420,8 +1583,8 @@ fn normalize_frame_timing(frames: &mut [Frame], time_base: (i32, i32)) {
 #[cfg(test)]
 mod tests {
   use super::{
-    avif_is_sequence, gif_repetition_count, jpeg_yuv_hint, normalize_frame_timing, png_alpha_hint,
-    webp_alpha_hint,
+    avif_is_sequence, gif_repetition_count, jpeg_scale_numerator, jpeg_yuv_hint,
+    normalize_frame_timing, webp_alpha_hint, webp_is_simple_lossy,
   };
   use crate::codec::Frame;
   use crate::ffi::types::AV_NOPTS_VALUE;
@@ -1461,43 +1624,13 @@ mod tests {
   }
 
   #[test]
-  fn reads_png_alpha_hints() {
-    let chunk = |kind: &[u8], data: &[u8]| {
-      let mut c = (data.len() as u32).to_be_bytes().to_vec();
-      c.extend_from_slice(kind);
-      c.extend_from_slice(data);
-      c.extend_from_slice(&[0; 4]); // CRC is not checked
-      c
-    };
-    let png = |color_type: u8, chunks: &[Vec<u8>]| {
-      let mut b = b"\x89PNG\r\n\x1a\n".to_vec();
-      b.extend(chunk(
-        b"IHDR",
-        &[0, 0, 0, 1, 0, 0, 0, 1, 8, color_type, 0, 0, 0],
-      ));
-      chunks.iter().for_each(|c| b.extend_from_slice(c));
-      b.extend(chunk(b"IDAT", &[]));
-      b
-    };
-    let plte = chunk(b"PLTE", &[0, 0, 0]);
-    let trns = chunk(b"tRNS", &[255]);
-    let text = chunk(b"tEXt", b"a\0b");
-    assert_eq!(
-      png_alpha_hint(&png(3, std::slice::from_ref(&plte))),
-      Some(false)
-    );
-    // tRNS declares alpha even when every entry is 255
-    assert_eq!(
-      png_alpha_hint(&png(3, &[plte, text.clone(), trns.clone()])),
-      Some(true)
-    );
-    assert_eq!(png_alpha_hint(&png(0, &[trns])), Some(true));
-    assert_eq!(png_alpha_hint(&png(2, &[text])), Some(false));
-    assert_eq!(png_alpha_hint(&png(4, &[])), Some(true));
-    assert_eq!(png_alpha_hint(&png(6, &[])), Some(true));
-    // no IDAT yet (truncated) or not a PNG
-    assert_eq!(png_alpha_hint(&png(3, &[])[..33]), None);
-    assert_eq!(png_alpha_hint(b"GIF89a"), None);
+  fn finds_simple_lossy_webps_like_blink() {
+    assert!(webp_is_simple_lossy(b"RIFF\0\0\0\0WEBPVP8 \0\0\0\0"));
+    // 20 bytes at least, like Blink's IsSimpleLossyWebPImage
+    assert!(!webp_is_simple_lossy(b"RIFF\0\0\0\0WEBPVP8 \0\0\0"));
+    assert!(!webp_is_simple_lossy(b"RIFF\0\0\0\0WEBPVP8X\x0a\0\0\0"));
+    assert!(!webp_is_simple_lossy(b"RIFF\0\0\0\0WEBPVP8L\0\0\0\0"));
+    assert!(!webp_is_simple_lossy(b"RIFX\0\0\0\0WEBPVP8 \0\0\0\0"));
   }
 
   #[test]
@@ -1542,6 +1675,47 @@ mod tests {
     assert_eq!(jpeg_yuv_hint(&jpeg(0xC0, &[0x22, 0x11, 0x11])[..15]), None);
     assert_eq!(jpeg_yuv_hint(&[0xFF, 0xD8, 0xFF, 0xDA]), None);
     assert_eq!(jpeg_yuv_hint(b"GIF89a"), None);
+  }
+
+  #[test]
+  fn computes_chromes_jpeg_scale_numerator() {
+    // (JPEG size, desired size, M): Chrome 155 decodes at ceil(size * M / 8), and fails for 0
+    for ((width, height), desired, m) in [
+      ((64, 48), (32, 24), 4),
+      ((64, 48), (63, 47), 7),
+      ((64, 48), (64, 12), 4),
+      ((64, 48), (31, 23), 3),
+      ((64, 48), (64, 48), 8),
+      ((64, 48), (128, 96), 8),
+      ((64, 48), (7, 6), 0),
+      ((64, 48), (0, 24), 8),
+      ((37, 9), (36, 8), 7),
+      ((4000, 3000), (800, 600), 1),
+      ((4000, 3000), (999, 749), 1),
+      ((4000, 3000), (1000, 750), 2),
+      ((4000, 3000), (3999, 2999), 7),
+      ((4000, 3000), (499, 374), 0),
+      ((4000, 3000), (16000, 1), 0),
+      // the budget (4 bytes per desired pixel) wraps at 2^32
+      ((4000, 3000), (32768, 32768), 0),
+      ((4000, 3000), (32768, 32769), 0),
+      ((4000, 3000), (46341, 46341), 0),
+      ((4000, 3000), (65535, 65535), 8),
+      ((64, 48), (65536, 16384), 0),
+      ((64, 48), (65536, 16385), 8),
+      ((320, 240), (65536, 16385), 7),
+      ((320, 240), (46341, 46341), 1),
+      // a side of 2^31 or more is a negative int: no budget
+      ((4000, 3000), (1 << 31, 24), 8),
+      ((4000, 3000), (1 << 31, 1 << 31), 8),
+      ((320, 240), (u32::MAX, 1), 8),
+    ] {
+      assert_eq!(
+        jpeg_scale_numerator(width, height, desired),
+        m,
+        "{width}x{height} at {desired:?}"
+      );
+    }
   }
 
   #[test]
