@@ -1058,9 +1058,9 @@ impl ImageDecoder {
     let inner = self.inner.clone();
     let frame_index = options.as_ref().and_then(|o| o.frame_index).unwrap_or(0) as usize;
     // Read now: a decode() made before the decoder fails rejects differently from one made
-    // after (see `closed_error`), and one made before a reset() no longer decodes part of the
-    // data (see `FrameCall::Decode`). Like Chrome, the calls are handled in call order: what one
-    // finds can depend on the frames that the ones before it failed.
+    // after (see `closed_error`), and one made before a reset() rejects (see `abort_if_reset`).
+    // Like Chrome, the calls are handled in call order: what one finds can depend on the frames
+    // that the ones before it failed.
     let (ticket, epoch, jpeg_request, post) = {
       let mut guard = inner
         .lock()
@@ -1134,6 +1134,7 @@ impl ImageDecoder {
           .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?
           .decode_turn;
         if turn == ticket {
+          // Only on its turn: every result, this error too, gives the turn to the next call.
           abort_if_reset(&inner, epoch)?;
           let decode_inner = inner.clone();
           let result =
@@ -1420,14 +1421,16 @@ fn decode_cached_frame(
   }))
 }
 
-/// Like Chrome, a reset() made after a decode() call rejects it with AbortError. Only a JPEG for
-/// now, whose decode() waits for the data (`FrameCall::Decode`). A close() also moves
-/// `cache_epoch`; the call then gets the error of a closed decoder (`closed_error`).
+/// Like Chrome, a reset() made after a decode() call rejects it with AbortError, in every format.
+/// decode() checks it on the call's turn, so the calls made before the reset() reject in call
+/// order, and each one gives the turn to the next: the calls made after it do not wait for them.
+/// A close() also moves `cache_epoch`; the call then gets the error of a closed decoder
+/// (`closed_error`).
 fn abort_if_reset(inner: &Arc<Mutex<ImageDecoderInner>>, epoch: u64) -> Result<()> {
   let guard = inner
     .lock()
     .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-  if !guard.closed && guard.cache_epoch != epoch && guard.codec_id == Some(AVCodecID::Mjpeg) {
+  if !guard.closed && guard.cache_epoch != epoch {
     return Err(abort_error("Aborted by reset."));
   }
   Ok(())
