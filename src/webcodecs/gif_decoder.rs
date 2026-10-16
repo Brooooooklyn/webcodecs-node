@@ -788,7 +788,8 @@ struct Lzw {
   first: Vec<u8>,
   len: Vec<u16>,
   /// A shorter prefix of each code's string, so that any prefix is found in O(log len) steps
-  /// (Myers' jump pointers)
+  /// (Myers' jump pointers). It is filled as codes are defined, so it is not zeroed for each
+  /// frame.
   jump: Vec<u16>,
 }
 
@@ -814,13 +815,13 @@ impl Lzw {
       suffix: vec![0; 4096],
       first: vec![0; 4096],
       len: vec![0; 4096],
-      jump: vec![0; 4096],
+      jump: Vec::with_capacity(4096),
     };
     for code in 0..clear as usize {
       lzw.suffix[code] = code as u8;
       lzw.first[code] = code as u8;
       lzw.len[code] = 1;
-      lzw.jump[code] = code as u16;
+      lzw.jump.push(code as u16);
     }
     lzw.reset();
     lzw
@@ -890,6 +891,9 @@ impl Lzw {
             let jump2 = self.jump[jump];
             let same =
               self.len[prev] - self.len[jump] == self.len[jump] - self.len[usize::from(jump2)];
+            if save >= self.jump.len() {
+              self.jump.resize(save + 1, 0);
+            }
             self.jump[save] = if same { jump2 } else { prev as u16 };
           }
           self.save += 1;
