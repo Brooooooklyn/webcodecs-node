@@ -1216,14 +1216,17 @@ impl ImageDecoder {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
     // A metadata failure counts once `close_if_metadata_failed` has closed the decoder. A close()
     // that comes first wins, also when a worker thread already found the failure
-    // (`reject_metadata`). It wins over metadata the same way: until `tracks.ready` is
-    // signalled, the track that a worker thread may have filled (`cache_decoded_frames`) goes
-    // back to how it was built.
+    // (`reject_metadata`). A GIF track goes back to how it was built the same way: until
+    // `tracks.ready` is signalled, what a worker thread may have filled in
+    // (`cache_decoded_frames`) does not count. Only GIF: gif_decoder often finishes before the JS
+    // task that made the decoder reaches close(), so without this the track after an early
+    // close() changes from run to run. The other formats keep what the worker found, as before.
     if !inner.closed {
       // The same for a frame failure (`jpeg_frame`), also one that a reset() kept
       inner.frame_failed = None;
       inner.tracks.failed.store(false, Ordering::Release);
-      if !inner.tracks.ready.load(Ordering::Acquire)
+      if inner.codec_id == Some(AVCodecID::Gif)
+        && !inner.tracks.ready.load(Ordering::Acquire)
         && let Ok(mut tracks) = inner.tracks.inner.lock()
         && let Some(track) = tracks.tracks.get_mut(0)
       {
