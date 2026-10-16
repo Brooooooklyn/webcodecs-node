@@ -1348,7 +1348,7 @@ impl VideoDecoder {
   /// - `no-preference`: Try hardware first, silently fall back to software
   /// - `prefer-software`: Use software only
   #[napi]
-  pub fn configure(&mut self, env: Env, mut config: VideoDecoderConfig) -> Result<()> {
+  pub fn configure(&mut self, env: Env, config: VideoDecoderConfig) -> Result<()> {
     // W3C WebCodecs spec: Validate config synchronously, throw TypeError for invalid
     // https://w3c.github.io/webcodecs/#dom-videodecoder-configure
 
@@ -1362,6 +1362,10 @@ impl VideoDecoder {
       Some(c) if !c.is_empty() => c.clone(),
       _ => return throw_type_error_unit(&env, "codec is required"),
     };
+
+    if config.description_detached {
+      return throw_type_error_unit(&env, "Invalid config, description is detached.");
+    }
 
     // Validate coded dimensions if specified
     if let Some(w) = config.coded_width
@@ -1415,13 +1419,6 @@ impl VideoDecoder {
           &format!("NotSupportedError: Invalid codec: {}", codec),
         );
         return Ok(());
-      }
-
-      // Snapshot the description before queueing: it borrows the caller's
-      // ArrayBuffer and is only copied in process_reconfigure() on the worker
-      // thread, so a post-configure() write would race the applied extradata.
-      if let Some(desc) = config.description.as_mut() {
-        *desc = Uint8Array::new(desc.to_vec());
       }
 
       // Queue reconfigure via microtask (runs AFTER pending decode microtasks)
@@ -2017,6 +2014,10 @@ impl VideoDecoder {
       Some(_) => return reject_with_type_error(env, "codec is required"),
       None => return reject_with_type_error(env, "codec is required"),
     };
+
+    if config.description_detached {
+      return reject_with_type_error(env, "Invalid config, description is detached.");
+    }
 
     // Validate coded dimensions if specified
     if let Some(w) = config.coded_width

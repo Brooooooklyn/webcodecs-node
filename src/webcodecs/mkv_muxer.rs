@@ -5,6 +5,7 @@
 
 use crate::codec::muxer::{ContainerFormat, MuxerOptions};
 use crate::ffi::AVCodecID;
+use crate::webcodecs::buffer_source::BufferSourceCopy;
 use crate::webcodecs::codec_string::parse_codec_string;
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunk;
 use crate::webcodecs::encoded_video_chunk::EncodedVideoChunk;
@@ -113,7 +114,8 @@ pub struct MkvVideoTrackConfig {
   /// Frame rate (frames per second)
   pub framerate: Option<f64>,
   /// Codec-specific description data
-  pub description: Option<Uint8Array>,
+  #[napi(ts_type = "BufferSource")]
+  pub description: Option<BufferSourceCopy>,
 }
 
 /// Audio track configuration for MKV muxer
@@ -126,7 +128,8 @@ pub struct MkvAudioTrackConfig {
   /// Number of audio channels
   pub number_of_channels: u32,
   /// Codec-specific description data
-  pub description: Option<Uint8Array>,
+  #[napi(ts_type = "BufferSource")]
+  pub description: Option<BufferSourceCopy>,
 }
 
 // ============================================================================

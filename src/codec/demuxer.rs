@@ -126,8 +126,7 @@ impl DemuxerContext {
 
   /// Open a buffer for demuxing
   ///
-  /// This method accepts any type implementing `BufferSource`, enabling
-  /// zero-copy buffer loading from `Uint8Array` without intermediate copies.
+  /// The source must own its bytes (see `BufferSource`).
   pub fn open_buffer(source: impl BufferSource + 'static) -> Result<Self, CodecError> {
     // Create custom I/O context for reading
     let custom_io = CustomIOContext::new_buffer_read(source).map_err(CodecError::InvalidConfig)?;
