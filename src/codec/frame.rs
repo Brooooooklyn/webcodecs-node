@@ -532,6 +532,7 @@ impl Frame {
         // 8-bit and 10/12-bit 4:2:0 formats: U/V planes are half height
         AVPixelFormat::Yuv420p
         | AVPixelFormat::Nv12
+        | AVPixelFormat::Nv21
         | AVPixelFormat::Yuva420p
         | AVPixelFormat::Yuv420p10le
         | AVPixelFormat::Yuv420p12le
