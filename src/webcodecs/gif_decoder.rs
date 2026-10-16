@@ -431,6 +431,7 @@ impl<'a> GifDecoder<'a> {
       y: rect.y0,
       interlace: if flags & 0x40 != 0 { 4 } else { 0 },
       palette: &palette,
+      runs: Vec::new(),
     };
     let mut lzw_done = false;
     loop {
@@ -632,6 +633,8 @@ struct Pixels<'c> {
   /// 0 for non-interlaced frames and after the last interlace pass
   interlace: usize,
   palette: &'c [[u8; 4]; 256],
+  /// The parts of one LZW output that land on the canvas: (offset, length, first pixel)
+  runs: Vec<(usize, usize, usize)>,
 }
 
 // Interlace passes, last to first (index 4 is the first pass)
@@ -643,6 +646,7 @@ impl Pixels<'_> {
   fn put(&mut self, output: &Output) {
     let rect = self.rect;
     let len = output.len();
+    self.runs.clear();
     let mut done = 0;
     while done < len && self.y < rect.y1 {
       work(1);
@@ -654,29 +658,33 @@ impl Pixels<'_> {
           rect.y1
         };
         self.interlace = 0;
-        return;
+        break;
       }
       let left = len - done;
-      let n = if self.x < self.width && self.y < self.height {
+      if self.x < self.width && self.y < self.height {
         // on the canvas, up to its right edge or the end of the row
         let n = ((rect.x1.min(self.width) - self.x) as usize).min(left);
-        let row = self.y as usize * self.width as usize + self.x as usize;
-        let (canvas, palette) = (&mut *self.canvas, self.palette);
-        output.each_rev(done, done + n, |i, index| {
-          let color = palette[usize::from(index)];
-          // the transparent index keeps the pixel below
-          if color[3] != 0 {
-            let at = (row + i - done) * 4;
-            canvas[at..at + 4].copy_from_slice(&color);
-          }
-        });
-        n
+        let pixel = self.y as usize * self.width as usize + self.x as usize;
+        self.runs.push((done, n, pixel));
+        done += n;
+        self.x += n as u32;
+        if self.x == rect.x1 {
+          self.next_row();
+        }
       } else {
-        self.off_canvas().min(left as u64) as usize
-      };
-      self.skip(n as u64);
-      done += n;
+        let n = self.off_canvas().min(left as u64);
+        done += n as usize;
+        self.skip(n);
+      }
     }
+    let (canvas, palette) = (&mut *self.canvas, self.palette);
+    output.read_rev(&self.runs, |pixel, index| {
+      let color = palette[usize::from(index)];
+      // the transparent index keeps the pixel below
+      if color[3] != 0 {
+        canvas[pixel * 4..pixel * 4 + 4].copy_from_slice(&color);
+      }
+    });
   }
 
   /// Pixels from here (off the canvas) to the next one on the canvas, or to the end of
@@ -733,25 +741,31 @@ impl Output<'_> {
     usize::from(self.lzw.len[self.code]) + usize::from(self.extra.is_some())
   }
 
-  /// Calls `f` with each of bytes `start..end` (and its offset), last to first. It takes
-  /// O(log(len) + end - start) steps.
-  fn each_rev(&self, start: usize, mut end: usize, mut f: impl FnMut(usize, u8)) {
+  /// Calls `f` with the pixel and the byte for each byte of `runs` (offset, length, first
+  /// pixel; in order), last to first. The string is read once from its end, with a jump over
+  /// each gap between runs, so it takes O(bytes + runs x log(len)) steps.
+  fn read_rev(&self, runs: &[(usize, usize, usize)], mut f: impl FnMut(usize, u8)) {
     let lzw = self.lzw;
     let len = usize::from(lzw.len[self.code]);
-    if let Some(extra) = self.extra
-      && end > len
-    {
-      f(len, extra);
-      end = len;
-    }
-    if start >= end {
-      return;
-    }
-    work(end - start);
-    let mut code = lzw.prefix_code(self.code, end);
-    for i in (start..end).rev() {
-      f(i, lzw.suffix[code]);
-      code = usize::from(lzw.prefix[code]);
+    // a code whose string is at least as long as the end of the next run
+    let mut code = self.code;
+    for &(start, n, pixel) in runs.iter().rev() {
+      let mut end = start + n;
+      if let Some(extra) = self.extra
+        && end > len
+      {
+        f(pixel + len - start, extra);
+        end = len;
+      }
+      if start >= end {
+        continue;
+      }
+      work(end - start);
+      code = lzw.prefix_code(code, end);
+      for i in (start..end).rev() {
+        f(pixel + i - start, lzw.suffix[code]);
+        code = usize::from(lzw.prefix[code]);
+      }
     }
   }
 }
@@ -1039,6 +1053,7 @@ mod tests {
         y: rect.y0,
         interlace: if flags & 0x40 != 0 { 4 } else { 0 },
         palette: &palette,
+        runs: Vec::new(),
       };
       let mut lzw_done = false;
       loop {
@@ -1420,6 +1435,21 @@ mod tests {
   }
 
   #[test]
+  fn narrow_frames_on_the_canvas_read_each_string_once() {
+    // a frame 1 pixel wide on a 1x65535 canvas: each index of a code is a row of its own, so each
+    // string lands on the canvas in as many parts as it has indexes
+    let codes = growing(1000, 1100);
+    let lzw = pack(2, &codes);
+    for interlaced in [false, true] {
+      let file = frames_gif((1, 65535), &[([0, 0, 1, 65535], interlaced, None, &lzw)]);
+      let steps = same_as_reference(&file);
+      // with and without a canvas: a step per code, and per pixel a step and a byte
+      let (codes, pixels) = (codes.len() as u64, 65535);
+      assert!(steps <= 2 * codes + 3 * pixels, "{steps} steps");
+    }
+  }
+
+  #[test]
   fn zero_width_frames_take_one_step() {
     // the reference moved each frame 0 pixels wide and 65535 tall down its rows one step at a time
     let lzw = pack(2, &[4, 1, 1, 5]);
@@ -1533,6 +1563,7 @@ mod tests {
         y: y0,
         interlace,
         palette: &palette,
+        runs: Vec::new(),
       };
       let (mut new, mut old) = (pixels(&mut new_canvas[..]), pixels(&mut old_canvas[..]));
       let (mut lzw, mut old_lzw, mut stack) = (Lzw::new(lw), Lzw::new(lw), Vec::new());
@@ -1578,6 +1609,7 @@ mod tests {
         y: 0,
         interlace: 0,
         palette: &[[0; 4]; 256],
+        runs: Vec::new(),
       };
       lzw.decode(&pack(lw, &codes), &mut out);
       let mut longest = 0;
