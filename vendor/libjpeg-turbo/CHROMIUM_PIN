@@ -1,0 +1,20 @@
+# libjpeg-turbo as Chrome ships it. Written by tools/sync-libjpeg-turbo.mjs: do not edit.
+# build.rs compiles bits8 as is and bits12/bits16 again with BITS_IN_JSAMPLE=12/16,
+# and simd-<Rust target arch> with WITH_SIMD on that arch (.asm with NASM).
+chrome: 155.0.8059.79
+deps-revision: 640f254ad0fa03f6b1f29f89b7dd9366f2f6e533
+source: https://chromium.googlesource.com/chromium/deps/libjpeg_turbo/+archive/640f254ad0fa03f6b1f29f89b7dd9366f2f6e533.tar.gz
+version: 3.1.0
+upstream-revision: 20ade4dea9589515a69793e447a6c6220b464535
+rule: BUILD.gn libjpeg16_sources, libjpeg12_sources and libjpeg_sources without the
+rule: compressor files (src/jc*.c but src/jcomapi.c, src/jf*.c, src/jdatadst.c,
+rule: src/jpeg_nbits.c), the x64 sources of simd_asm and simd, the arm64 and arm
+rule: sources of simd, every file they include, LICENSE.md, README.ijg and
+rule: README.chromium (Chromium's changes);
+rule: CHROMIUM_LICENSE is chromium/src LICENSE at 155.0.8059.79 (for jpeglibmangler.h)
+bits16: jdapistd jdcolor jddiffct jdlossls jdmainct jdpostct jdsample jutils
+bits12: jdapistd jdcolor jddiffct jdlossls jdmainct jdpostct jdsample jutils jdcoefct jddctmgr jdmerge jidctflt jidctfst jidctint jidctred jquant1 jquant2
+bits8: jdapistd jdcolor jddiffct jdlossls jdmainct jdpostct jdsample jutils jdcoefct jddctmgr jdmerge jidctflt jidctfst jidctint jidctred jquant1 jquant2 jcomapi jdapimin jdatasrc jdhuff jdicc jdinput jdlhuff jdmarker jdmaster jdphuff jdtrans jerror jmemmgr jmemnobs
+simd-x86_64: simd/x86_64/jsimd.c simd/x86_64/jccolor-avx2.asm simd/x86_64/jccolor-sse2.asm simd/x86_64/jcgray-avx2.asm simd/x86_64/jcgray-sse2.asm simd/x86_64/jchuff-sse2.asm simd/x86_64/jcphuff-sse2.asm simd/x86_64/jcsample-avx2.asm simd/x86_64/jcsample-sse2.asm simd/x86_64/jdcolor-avx2.asm simd/x86_64/jdcolor-sse2.asm simd/x86_64/jdmerge-avx2.asm simd/x86_64/jdmerge-sse2.asm simd/x86_64/jdsample-avx2.asm simd/x86_64/jdsample-sse2.asm simd/x86_64/jfdctflt-sse.asm simd/x86_64/jfdctfst-sse2.asm simd/x86_64/jfdctint-avx2.asm simd/x86_64/jfdctint-sse2.asm simd/x86_64/jidctflt-sse2.asm simd/x86_64/jidctfst-sse2.asm simd/x86_64/jidctint-avx2.asm simd/x86_64/jidctint-sse2.asm simd/x86_64/jidctred-sse2.asm simd/x86_64/jquantf-sse2.asm simd/x86_64/jquanti-avx2.asm simd/x86_64/jquanti-sse2.asm simd/x86_64/jsimdcpu.asm
+simd-aarch64: simd/arm/jccolor-neon.c simd/arm/jcgray-neon.c simd/arm/jcphuff-neon.c simd/arm/jcsample-neon.c simd/arm/jdcolor-neon.c simd/arm/jdmerge-neon.c simd/arm/jdsample-neon.c simd/arm/jfdctfst-neon.c simd/arm/jfdctint-neon.c simd/arm/jidctfst-neon.c simd/arm/jidctint-neon.c simd/arm/jidctred-neon.c simd/arm/jquanti-neon.c simd/arm/aarch64/jchuff-neon.c simd/arm/aarch64/jsimd.c
+simd-arm: simd/arm/jccolor-neon.c simd/arm/jcgray-neon.c simd/arm/jcphuff-neon.c simd/arm/jcsample-neon.c simd/arm/jdcolor-neon.c simd/arm/jdmerge-neon.c simd/arm/jdsample-neon.c simd/arm/jfdctfst-neon.c simd/arm/jfdctint-neon.c simd/arm/jidctfst-neon.c simd/arm/jidctint-neon.c simd/arm/jidctred-neon.c simd/arm/jquanti-neon.c simd/arm/aarch32/jchuff-neon.c simd/arm/aarch32/jsimd.c

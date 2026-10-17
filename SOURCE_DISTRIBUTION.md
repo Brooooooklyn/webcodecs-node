@@ -72,6 +72,10 @@ Before another release using this configuration:
    policy settings and FFmpeg's generated `config.h` for Zig, emits compiler
    wrappers/toolchain files, and rewrites pkg-config files. Preserve those
    instructions and the actual patches/configuration, with change notices.
+   libjpeg-turbo is vendored in `vendor/libjpeg-turbo` as an unmodified copy
+   of Chromium's tree; Chromium's changes are listed in its `README.chromium`,
+   `CHROMIUM_PIN` records the Chromium revision, and `build.rs` holds the
+   compile flags (symbol prefix, 12/16-bit objects, SIMD defines, NASM flags).
 4. For Windows, retain the pinned vcpkg ports, resolved source archives and
    patches, triplets, feature selections, installed copyright files, and the
    source/build dependencies for the separately downloaded rav1e staticlib.
