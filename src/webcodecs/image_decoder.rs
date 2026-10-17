@@ -504,6 +504,10 @@ struct ImageDecoderInner {
   /// decode() of the current epoch: the JS thread then decides how `completed` settles
   /// (`StreamEnd::FrameFailure`).
   end_deferred: bool,
+  /// The frame count of an AVIF track whose stream ended before the samples of its last frames
+  /// arrived (`cached_frames` holds the frames before them). Chrome counts those frames, and the
+  /// decode() of one fails (see `decode_cached_frame`).
+  missing_samples: Option<usize>,
   /// Track list
   tracks: ImageTrackList,
   /// Whether decoder is closed
@@ -666,6 +670,7 @@ impl ImageDecoder {
       jpeg_fill: None,
       frame_failed: None,
       end_deferred: false,
+      missing_samples: None,
       tracks: tracks.clone(),
       closed: false,
       cached_frames: None,
@@ -1290,7 +1295,7 @@ fn decode_cached_frame(
       .map_err(|error| decode_failure(inner, epoch, frame_index, error))?;
   }
 
-  let guard = inner
+  let mut guard = inner
     .lock()
     .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
   if guard.closed {
@@ -1318,7 +1323,15 @@ fn decode_cached_frame(
     if !data_complete {
       return Ok(None);
     }
-    return Err(frame_index_error(frame_index, frames.len()));
+    // A frame of an AVIF track whose samples did not all arrive before the stream ended: like
+    // Chrome, the decode() fails with EncodingError, and the decoder closes on the JS thread
+    // (`apply_frame_failure`).
+    let frame_count = guard.missing_samples.unwrap_or(frames.len());
+    if frame_index < frame_count {
+      guard.frame_failed = Some(epoch);
+      return Err(frame_failure(frame_index));
+    }
+    return Err(frame_index_error(frame_index, frame_count));
   }
 
   // Clone the Arc to share the frame data (no pixel copy needed).
@@ -2577,6 +2590,7 @@ fn cache_decoded_frames(
         1,
         None,
         None,
+        None,
       ),
       // the metadata, but no frame yet
       None => Ok(()),
@@ -2591,7 +2605,7 @@ fn cache_decoded_frames(
   };
   // An AVIF's durations come from its track (see `decode_avif`)
   let track_timing = matches!(avif, Avif::Image(_));
-  let (context, frames, frame_count) = match avif {
+  let (context, frames, frame_count, missing_samples) = match avif {
     Avif::Image(image) => {
       let len = data_bytes.len();
       let size_hint = if data_complete {
@@ -2622,7 +2636,12 @@ fn cache_decoded_frames(
           "Failed to decode frame at index 0",
         ));
       }
-      (context, frames, image.color.len())
+      // A stream that ended before the samples of a track's last frames: Chrome counts them, and
+      // the decode() of one fails (CrabbyAvif's data is cut short); the frames before them decode
+      let missing_samples =
+        (stream_ended && image.color.is_track() && frames.len() < image.color.len())
+          .then_some(image.color.len());
+      (context, frames, image.color.len(), missing_samples)
     }
     // Chrome waits for the boxes the brands need, and fails the metadata when the data ends
     // before them. At the end of a stream it marks the data complete first: `completed`
@@ -2642,7 +2661,7 @@ fn cache_decoded_frames(
     _ => {
       let (context, frames) = decode_frames(inner, codec_id, &data_bytes, prefer_animation)?;
       let frame_count = frames.len();
-      (context, frames, frame_count)
+      (context, frames, frame_count, None)
     }
   };
 
@@ -2668,12 +2687,15 @@ fn cache_decoded_frames(
     frame_count,
     Some(context),
     repetition_count,
+    missing_samples,
   )
 }
 
 /// Cache the frames decoded from `data`, each with its format and duration, unless
 /// reset()/close() or a newer probe came first. `frame_count` is the track's frame count: an
-/// AVIF track also counts the frames whose samples have not arrived yet.
+/// AVIF track also counts the frames whose samples have not arrived yet. `missing_samples`: see
+/// `ImageDecoderInner::missing_samples`.
+#[allow(clippy::too_many_arguments)]
 fn store_frames(
   inner: &Arc<Mutex<ImageDecoderInner>>,
   cache_epoch: u64,
@@ -2682,6 +2704,7 @@ fn store_frames(
   frame_count: usize,
   context: Option<CodecContext>,
   repetition_count: Option<f64>,
+  missing_samples: Option<usize>,
 ) -> Result<()> {
   let mut guard = inner
     .lock()
@@ -2718,6 +2741,7 @@ fn store_frames(
   guard.cached_frames = Some(shared_frames);
   guard.context = context;
   guard.cached_data_len = data.len();
+  guard.missing_samples = missing_samples;
 
   Ok(())
 }
@@ -3465,6 +3489,7 @@ mod tests {
       jpeg_fill: None,
       frame_failed: None,
       end_deferred: false,
+      missing_samples: None,
       tracks,
       closed: false,
       cached_frames: None,

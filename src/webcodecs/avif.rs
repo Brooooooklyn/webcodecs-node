@@ -138,6 +138,11 @@ impl AvifSamples {
     }
   }
 
+  /// Whether these are the samples of a track, not of an item
+  pub fn is_track(&self) -> bool {
+    matches!(self.samples, Samples::Track(_))
+  }
+
   /// The duration of sample `index` in timescale ticks, 0 for an item
   pub fn duration(&self, index: usize) -> u32 {
     match &self.samples {

@@ -1353,6 +1353,43 @@ test('ImageDecoder: an AVIF item cut short fails decode(), or the metadata when 
   await t.throwsAsync(short.tracks.ready, { name: 'InvalidStateError', message: 'Failed to retrieve track metadata.' })
 })
 
+test('ImageDecoder: a streamed AVIF track that ends before its last samples fails the decode() of a missing frame, like Chrome', async (t) => {
+  // anim8_420: 3 track samples, at bytes 1001, 1941 and 2771 of 3559
+  const data = avifFixture('anim8_420.avif')
+  // cut 100 bytes into sample 2: frames 0 and 1 decode, frame 2 is counted but has no data
+  const decoder = new ImageDecoder({ data: avifStream(data.slice(0, 2871)), type: 'image/avif' })
+  await decoder.completed
+  t.is(decoder.tracks.selectedTrack?.frameCount, 3)
+  for (const [frameIndex, timestamp] of [
+    [0, 0],
+    [1, 33333],
+  ]) {
+    const { image } = await decoder.decode({ frameIndex })
+    t.is(image.timestamp, timestamp)
+    image.close()
+  }
+  // past the track: RangeError, and the decoder stays open
+  await t.throwsAsync(decoder.decode({ frameIndex: 3 }), { name: 'RangeError' })
+  t.false(decoder.closed)
+  // Chrome 155: EncodingError, then the decoder closes
+  await t.throwsAsync(decoder.decode({ frameIndex: 2 }), {
+    name: 'EncodingError',
+    message: 'Failed to decode frame at index 2',
+  })
+  t.true(decoder.closed)
+  await t.throwsAsync(decoder.decode({ frameIndex: 0 }), { name: 'InvalidStateError' })
+
+  // A decode() made before the data ended, of a frame whose samples never come (cut 100 bytes
+  // into sample 1)
+  const early = new ImageDecoder({ data: avifStream(data.slice(0, 2041)), type: 'image/avif' })
+  await t.throwsAsync(early.decode({ frameIndex: 1 }), {
+    name: 'EncodingError',
+    message: 'Failed to decode frame at index 1',
+  })
+  t.is(early.tracks.selectedTrack?.frameCount, 3)
+  t.true(early.closed)
+})
+
 test('ImageDecoder: a complete AVIF that ends before a box its brands need fails the metadata, like Chrome', async (t) => {
   const metadataError = { name: 'InvalidStateError', message: 'Failed to retrieve track metadata.' }
   for (const [label, data] of [
