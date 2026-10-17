@@ -50,7 +50,8 @@ table below follows one Chrome stable version: the `chrome:` line of
      `src/webcodecs/image_decoder.rs`) and the color tags set at the end of `decode()`
    - `third_party/blink/renderer/modules/webcodecs/image_decoder_external.cc`: when a failure
      rejects `tracks.ready`, the pending decodes and `completed` (`SetFailed`, `OnMetadata`),
-     followed by `jpeg_frame`, `close_if_failed` and `closed_error`
+     followed by `jpeg_frame`, `apply_frame_failure`, `end_with_frame_failure`,
+     `close_if_metadata_failed` and `closed_error`
    - `media/base/limits.h` `kMaxDimension`: Chrome rejects a decoded frame wider or taller
      than this
    - the libjpeg-turbo `BUILD.gn` (in the vendored revision): the `defines` of `libjpeg`,
@@ -141,16 +142,32 @@ table below follows one Chrome stable version: the `chrome:` line of
 `src/webcodecs/image_decoder.rs` has these, outside the JPEG decoder:
 
 - A stream that stays open after its last byte: a waiting decode() resolves (or fails) at the
-  close, or at the next probe when the data has doubled, as for every format here. Chrome
-  decodes again on each chunk and answers as soon as the frame is whole.
-- reset() while a decode() waits: Chrome rejects that decode() with an AbortError; here it still
-  resolves or fails later (all formats). The frames after the reset() match Chrome: a JPEG keeps
-  the choice of RGB that a decode of part of the data made (`rgb_decode`).
+  close, or at the next probe when the data has doubled (all formats but JPEG). Chrome decodes
+  again on each chunk and answers as soon as the frame is whole. A JPEG does the same here: a
+  decode() that waits tries the data read so far when it is made, when a chunk comes to an idle
+  stream and when the stream goes idle (`post_jpeg_decode`).
+- reset() while a decode() waits: Chrome rejects that decode() with an AbortError ("Aborted by
+  reset."). Here only a JPEG decode() does, before and after each try; for the other formats it
+  still resolves or fails later. Like Chrome, a JPEG failure found by work that started before
+  the reset() does not close the decoder: it is kept, and the next decode() fails and closes
+  it. Chrome can also close on a kept failure when the next chunk comes (`completed` rejects)
+  or the stream ends (`completed` resolves), but only when its decode ran before the reset(): it
+  reads the metadata again then, and its decoder is still failed (OnMetadata). With reset() 3
+  microtasks after decode(), that was 9 of 30 runs at the chunk and 4 of 30 at the end. Here
+  only the next decode() closes it, and that decode() rejects with EncodingError where Chrome's
+  is InvalidStateError. The frames after the reset() match Chrome: a JPEG keeps the choice of RGB
+  that a decode of part of the data made (`rgb_decode`).
 - The data or the close in a 0 ms timer right after a decode(): Chrome's first decode (made
   before it read any data) is still on its decoder thread when the timer runs, so Chrome reads
-  the close before it decodes again, and decodes YUV planes. Here that first decode is done at
-  once, so the data is decoded before the close is read: BGRX. Both depend on timing; with
-  30 ms between the decode() and the close, Chrome is BGRX too.
+  the close before it decodes again, and decodes YUV planes. Here no decode is in flight: the
+  data is tried as soon as it is read, before the close is read: BGRX. Both depend on timing;
+  with 30 ms between the decode() and the close, Chrome is BGRX too.
+- Stream results and a JPEG decode() in one task: Chrome reads a chunk, the close or an error
+  inside enqueue(), close() or error(), so its decode() sees what came before it in the task and
+  nothing after. Here reads settle in microtasks (`queue_jpeg_post`). That gives the same order,
+  except after two or more chunks in one task: a decode() made between them, or before the close
+  that follows them, sees all of them, and the close. It then decodes YUV planes where Chrome
+  gives BGRX (a frame that fails: `completed` resolves where Chrome's rejects).
 - Size limits: Chrome fails a frame wider or taller than `kMaxDimension` (32767); here FFmpeg
   allocates the frame, and fails it when (width + 128) × (height + 128) ≥ 2^28. Both fail the
   metadata above 2^29 - 1 pixels.
@@ -169,7 +186,7 @@ The files in `crates/pixel-simd/src/webp` port libwebp and keep its notice (BSD-
 | Blink JPEG decode settings             | `third_party/blink/renderer/platform/image-decoders/jpeg/jpeg_image_decoder.cc` @ 155.0.8059.79                                                         | `src/ffi/jpeg_blink.c`, `src/codec/jpeg.rs`                                                                                                                                    |
 | JPEG M/8 scale rule                    | same file, `DesiredScaleNumerator` @ 155.0.8059.79                                                                                                      | `jpeg_scale_numerator` in `src/webcodecs/image_decoder.rs`                                                                                                                     |
 | WebCodecs YUV gate and color tags      | `third_party/blink/renderer/modules/webcodecs/image_decoder_core.cc` @ 155.0.8059.79                                                                    | `rgb_decode` and `jpeg_frame` in `src/webcodecs/image_decoder.rs`, the color tags in `src/ffi/jpeg_blink.c`                                                                    |
-| WebCodecs failure schedule             | `third_party/blink/renderer/modules/webcodecs/image_decoder_external.cc` @ 155.0.8059.79                                                                | `jpeg_frame`, `close_if_failed` and `closed_error` in `src/webcodecs/image_decoder.rs`                                                                                         |
+| WebCodecs failure schedule             | `third_party/blink/renderer/modules/webcodecs/image_decoder_external.cc` @ 155.0.8059.79                                                                | `jpeg_frame`, `apply_frame_failure`, `close_if_metadata_failed` and `closed_error` in `src/webcodecs/image_decoder.rs`                                                         |
 | WebCodecs decode schedule              | `image_decoder_external.cc` and `image_decoder_core.cc` (same directory as above) @ 155.0.8059.79                                                       | `FrameCall`, `JpegChunkReader` and `jpeg_frame` in `src/webcodecs/image_decoder.rs`                                                                                            |
 | libwebp fancy upsampler and YUV to RGB | `src/third_party/libwebp/src` @ `b43b2caa710c`: `src/dsp/upsampling.c`, `src/dec/io_dec.c`, `src/dsp/yuv.h`                                             | `scalar`, `upsample`, `bgra` in `crates/pixel-simd/src/webp/mod.rs`; `fancy` in `crates/pixel-simd/src/webp/rows.rs`                                                           |
 | libwebp SSE2 upsampler and YUV to RGB  | same @ `b43b2caa710c`: `src/dsp/upsampling_sse2.c`, `src/dsp/yuv_sse2.c`                                                                                | `crates/pixel-simd/src/webp/x86.rs`, `row_pair` in `webp/rows.rs`; `webp/wasm.rs` is the same code in simd128 and the AVX2 code is SSE2 widened (neither has an upstream file) |
