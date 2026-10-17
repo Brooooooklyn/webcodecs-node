@@ -227,12 +227,15 @@ test('ImageDecoder: a JPEG stream whose data and close come together is YUV, lik
   }
 })
 
+// Chrome's BGRX frames of JPEGs decoded while the stream is open
+const OPEN_STREAM_BGRX = [
+  ['444-progressive-33x17.jpg', '9aa93940af52ce3d3c37026abbc1dfe33ee2d25115367b5a6cc803ca85afa88b'],
+  ['420-37x9.jpg', '634235a6bc72fe6d9a6dc91352b1124bf100d1c0b44cb912207f20af461e51b2'],
+  ['422-15x15.jpg', '065ee0bdba7f0be384ab06ad9d89fabd6cba63f8981ee9812bb3812688917e48'],
+] as const
+
 test('ImageDecoder: a JPEG decode() made while the stream is open is BGRX, like Chrome', async (t) => {
-  for (const [name, hash] of [
-    ['444-progressive-33x17.jpg', '9aa93940af52ce3d3c37026abbc1dfe33ee2d25115367b5a6cc803ca85afa88b'],
-    ['420-37x9.jpg', '634235a6bc72fe6d9a6dc91352b1124bf100d1c0b44cb912207f20af461e51b2'],
-    ['422-15x15.jpg', '065ee0bdba7f0be384ab06ad9d89fabd6cba63f8981ee9812bb3812688917e48'],
-  ]) {
+  for (const [name, hash] of OPEN_STREAM_BGRX) {
     // With half the data (decode() at once), with all of it and the close 60 ms later (decode()
     // at once, or at 30 ms), or with the rest and the close in one task: Chrome decodes the rest
     // before it reads the close.
@@ -255,6 +258,24 @@ test('ImageDecoder: a JPEG decode() made while the stream is open is BGRX, like 
       again.image.close()
       decoder.close()
     }
+  }
+})
+
+// All the data is read, and the close comes in the task of the decode(): Chrome decodes the data
+// before it reads the close, however long the decode takes. No timer: the test sets the order.
+test('ImageDecoder: a JPEG decode() made just before the stream closes is BGRX, like Chrome', async (t) => {
+  for (const [name, hash] of OPEN_STREAM_BGRX) {
+    const data = fixture(name)
+    const { stream, close } = cutStream(data, data.length)
+    const decoder = new ImageDecoder({ data: stream, type: 'image/jpeg' })
+    await decoder.tracks.ready
+    const pending = decoder.decode()
+    close()
+    const { image } = await pending
+    t.is(image.format, 'BGRX', name)
+    t.is((await digests(image)).all, hash, name)
+    image.close()
+    decoder.close()
   }
 })
 
@@ -300,7 +321,12 @@ function cutStream(data: Uint8Array, cut: number) {
       c.enqueue(data.slice(0, cut))
     },
   })
-  return { stream, rest: () => controller.enqueue(data.slice(cut)), close: () => controller.close() }
+  return {
+    stream,
+    rest: () => controller.enqueue(data.slice(cut)),
+    enqueue: (chunk: Uint8Array) => controller.enqueue(chunk),
+    close: () => controller.close(),
+  }
 }
 
 // Whether a promise is still pending after `ms`
@@ -463,6 +489,155 @@ test('ImageDecoder: a streamed JPEG fails when Chrome fails it, which rejects co
     t.is(await completed, early ? 'AbortError: Aborted by close.' : 'resolved', name)
     t.is(decoder.complete, !early, name)
     t.true(decoder.closed, name)
+  }
+})
+
+// The same with all the data read and the close in the task of the decode() (no timer): a bad
+// image fails before Chrome reads the close, one that ends too early only after it.
+test('ImageDecoder: a JPEG decode() made just before the stream closes fails where Chrome fails it', async (t) => {
+  for (const name of FRAME_ERRORS) {
+    const data = fixture(name)
+    const { stream, close } = cutStream(data, data.length)
+    const decoder = new ImageDecoder({ data: stream, type: 'image/jpeg' })
+    const completed = decoder.completed.then(
+      () => 'resolved',
+      (error: DOMException) => `${error.name}: ${error.message}`,
+    )
+    await decoder.tracks.ready
+    const pending = decoder.decode()
+    close()
+    await t.throwsAsync(pending, FAILED, name)
+    const early = !['truncated.jpg', 'no-eoi.jpg'].includes(name)
+    t.is(await completed, early ? 'AbortError: Aborted by close.' : 'resolved', name)
+    t.is(decoder.complete, !early, name)
+    t.true(decoder.closed, name)
+  }
+})
+
+// The stream ends just before decode(), in the same task: the close alone (all the data is read),
+// or the rest in one or two chunks and the close. Chrome reads them inside enqueue() and close(),
+// before the decode(), so it decodes all the data: YUV planes, or a failure found after the end
+// (`completed` resolves). No timer: the test sets the order. The reader waits for data when the
+// stream ends (its idle check has run), so the rest comes to an idle stream.
+test('ImageDecoder: a JPEG decode() made just after the stream ends decodes all the data, like Chrome', async (t) => {
+  type End = (rest: Uint8Array, enqueue: (chunk: Uint8Array) => void, close: () => void) => void
+  const ends: Record<string, End> = {
+    'close()': (_rest, _enqueue, close) => close(),
+    'the rest and close()': (rest, enqueue, close) => {
+      enqueue(rest)
+      close()
+    },
+    'the rest in two chunks and close()': (rest, enqueue, close) => {
+      enqueue(rest.slice(0, rest.length >> 1))
+      enqueue(rest.slice(rest.length >> 1))
+      close()
+    },
+  }
+  // [fixture, the bytes read before, Chrome's format (none: the frame fails), Y plane]
+  const cases = [
+    ['444-progressive-33x17.jpg', 711, 'I444', '84b069c456a420975549ec97d0d5e35561a5cec5feead9fcb0fe127f2cfdf5a9'],
+    ['420-37x9.jpg', 760, 'I420', '61bdc52f5e08e685dd6afd1e58040901ca57b1b978736d4e8ba32200676108ce'],
+    ['12-bit.jpg', 2355, null, null],
+    ['arithmetic.jpg', 1033, null, null],
+    ['scans-100.jpg', 3392, null, null],
+  ] as const
+  for (const [order, end] of Object.entries(ends)) {
+    for (const [name, half, format, y] of cases) {
+      const label = `${name}: ${order}, decode()`
+      const data = fixture(name)
+      const cut = order === 'close()' ? data.length : half
+      const { stream, enqueue, close } = cutStream(data, cut)
+      const decoder = new ImageDecoder({ data: stream, type: 'image/jpeg' })
+      const completed = decoder.completed.then(
+        () => 'resolved',
+        (error: DOMException) => `${error.name}: ${error.message}`,
+      )
+      await decoder.tracks.ready
+      await new Promise((resolve) => setImmediate(resolve))
+      end(data.slice(cut), enqueue, close)
+      const pending = decoder.decode()
+      if (format) {
+        const { image } = await pending
+        t.is(image.format, format, label)
+        t.is((await digests(image)).y, y, label)
+        image.close()
+        t.false(decoder.closed, label)
+      } else {
+        await t.throwsAsync(pending, FAILED, label)
+        t.true(decoder.closed, label)
+      }
+      t.is(await completed, 'resolved', label)
+      t.true(decoder.complete, label)
+      decoder.close()
+    }
+  }
+})
+
+// All the data is read and the stream stays open; decode(), then reset() in the same task or 3
+// microtasks later. Chrome applies a failed decode in a task of its own, so the reset() drops the
+// failure: reset() does not throw, the decode() rejects with AbortError, and the next decode()
+// fails and closes the decoder. In the same task, the test waits until the try has surely failed.
+test('ImageDecoder: a reset() right after a JPEG decode() on an open stream drops the frame failure, like Chrome', async (t) => {
+  for (const name of ['12-bit.jpg', 'arithmetic.jpg', 'scans-100.jpg']) {
+    for (const gap of ['same task', 'microtasks'] as const) {
+      const label = `${name}, reset() in the ${gap}`
+      const data = fixture(name)
+      const { stream, close } = cutStream(data, data.length)
+      const decoder = new ImageDecoder({ data: stream, type: 'image/jpeg' })
+      await decoder.tracks.ready
+      const pending = decoder.decode()
+      pending.catch(() => {})
+      if (gap === 'same task') {
+        const end = performance.now() + 20
+        while (!decoder.closed && performance.now() < end) {}
+      } else {
+        for (let i = 0; i < 3; i++) await Promise.resolve()
+      }
+      t.false(decoder.closed, label)
+      t.notThrows(() => decoder.reset(), label)
+      await t.throwsAsync(pending, ABORTED, label)
+      t.false(decoder.closed, label)
+      await t.throwsAsync(decoder.decode(), FAILED, label)
+      t.true(decoder.closed, label)
+      close()
+    }
+  }
+})
+
+// The same, but the stream ends in the task of the decode(), and the reset() comes after 3
+// microtasks (the end is read by then) or after 20 ms more of that task. Chrome answers in the
+// order it was asked: the failed decode, which the reset() drops, then the end, which resolves
+// `completed`. So reset() does not throw, the decode() rejects with AbortError, `completed`
+// resolves, and the next decode() fails and closes the decoder.
+test('ImageDecoder: a reset() after a JPEG decode() and the end of the stream drops the frame failure, like Chrome', async (t) => {
+  for (const name of ['12-bit.jpg', 'arithmetic.jpg', 'scans-100.jpg']) {
+    for (const wait of ['microtasks', 'same task'] as const) {
+      const label = `${name}, reset() after the ${wait}`
+      const data = fixture(name)
+      const { stream, close } = cutStream(data, data.length)
+      const decoder = new ImageDecoder({ data: stream, type: 'image/jpeg' })
+      const completed = decoder.completed.then(
+        () => 'resolved',
+        (error: DOMException) => `${error.name}: ${error.message}`,
+      )
+      await decoder.tracks.ready
+      const pending = decoder.decode()
+      pending.catch(() => {})
+      close()
+      for (let i = 0; i < 3; i++) await Promise.resolve()
+      if (wait === 'same task') {
+        const end = performance.now() + 20
+        while (!decoder.closed && performance.now() < end) {}
+      }
+      t.false(decoder.closed, label)
+      t.notThrows(() => decoder.reset(), label)
+      await t.throwsAsync(pending, ABORTED, label)
+      t.false(decoder.closed, label)
+      await t.throwsAsync(decoder.decode(), FAILED, label)
+      t.true(decoder.closed, label)
+      t.is(await completed, 'resolved', label)
+      t.true(decoder.complete, label)
+    }
   }
 })
 
