@@ -629,6 +629,48 @@ test('ImageDecoder: a streamed decode() waits for the decode() calls before it, 
   decoder.close()
 })
 
+// Chrome's close() rejects the decode() calls that wait at once, so a decode() made after it
+// settles last.
+test('ImageDecoder: a decode() made after close() settles after the calls made before it, like Chrome', async (t) => {
+  const jpeg = new Uint8Array(readFileSync(join(__dirname, 'fixtures/jpeg/420-37x9.jpg')))
+  const animated = new Uint8Array(readFileSync(join(__dirname, 'fixtures/animated.gif')))
+  // the JPEG data is cut inside the scan, and the GIF has no frame 50: the calls wait
+  for (const [data, type, cut, frameIndex] of [
+    [jpeg, 'image/jpeg', Math.floor(jpeg.length * 0.8), 0],
+    [animated, 'image/gif', animated.length, 50],
+  ] as const) {
+    for (let run = 0; run < 10; run++) {
+      let controller!: ReadableStreamDefaultController<Uint8Array>
+      const stream = new ReadableStream<Uint8Array>({
+        start(streamController) {
+          controller = streamController
+          controller.enqueue(data.slice(0, cut))
+        },
+      })
+      const decoder = new ImageDecoder({ data: stream, type })
+      // the open stream would keep the worker alive
+      t.teardown(() => {
+        try {
+          controller.close()
+        } catch {}
+      })
+      await decoder.tracks.ready
+      const settled: number[] = []
+      const decodes = [0, 1, 2].map((call) => decoder.decode({ frameIndex }).finally(() => settled.push(call)))
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      decoder.close()
+      decodes.push(decoder.decode({ frameIndex }).finally(() => settled.push(3)))
+      const results = await Promise.allSettled(decodes)
+      t.deepEqual(settled, [0, 1, 2, 3], type)
+      t.true(
+        results.every((result) => result.status === 'rejected'),
+        type,
+      )
+      t.is(((results[3] as PromiseRejectedResult).reason as DOMException).name, 'InvalidStateError', type)
+    }
+  }
+})
+
 // Chrome rejects the decode() calls that wait at reset(). So the decode() made after it does not
 // wait for them, though the calls are handled in call order.
 test('ImageDecoder: reset() rejects a waiting GIF decode() with AbortError, and the next decode() goes on, like Chrome', async (t) => {

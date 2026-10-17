@@ -549,7 +549,8 @@ struct ImageDecoderInner {
   /// closes it on the JS thread (`apply_frame_failure`). A close() that comes first clears it.
   frames_failed: bool,
   /// The ticket of the next decode() call. Like Chrome, the calls are handled one at a time, in
-  /// call order: each one waits until `decode_turn` is its ticket.
+  /// call order: each one waits until `decode_turn` is its ticket, also one made on a closed
+  /// decoder, so the promises settle in call order.
   next_decode: u64,
   /// The ticket of the decode() call being handled
   decode_turn: u64,
@@ -1092,7 +1093,7 @@ impl ImageDecoder {
     // after (see `closed_error`), and one made before a reset() rejects (see `abort_if_reset`).
     // Like Chrome, the calls are handled in call order: what one finds can depend on the frames
     // that the ones before it failed.
-    let (ticket, epoch, jpeg_request, post) = {
+    let (ticket, closed, epoch, jpeg_request, post) = {
       let mut guard = inner
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
@@ -1108,12 +1109,12 @@ impl ImageDecoder {
       if post {
         guard.jpeg_unposted += 1;
       }
-      let ticket = (!guard.closed).then(|| {
-        guard.next_decode += 1;
-        guard.next_decode - 1
-      });
+      // Every call takes a ticket, also one made on a closed decoder (see `DecodeTurn`)
+      let ticket = guard.next_decode;
+      guard.next_decode += 1;
       (
         ticket,
+        guard.closed,
         guard.cache_epoch,
         jpeg_request,
         post.then_some(guard.stream_reads),
@@ -1135,9 +1136,13 @@ impl ImageDecoder {
     // callback can construct the precise native JavaScript exception class.
     let turn_inner = inner.clone();
     let decode = async move {
-      let Some(ticket) = ticket else {
+      // Like Chrome, a call made on a closed decoder rejects with InvalidStateError. Chrome's
+      // close() rejects the calls made before it at once; here they reject on their turns, so it
+      // waits for them, and the promises settle in call order.
+      if closed {
+        wait_for_turn(&inner, ticket).await?;
         return Err(invalid_state_error("ImageDecoder is closed"));
-      };
+      }
 
       // Wait for ready promise (ensures initial pre-parsing is complete)
       ready_promise.await?;
@@ -1200,26 +1205,18 @@ impl ImageDecoder {
       result
     };
 
-    env.spawn_future_with_callback(
-      async move {
-        let result = decode.await;
-        // The next decode() call's turn
-        if ticket.is_some()
-          && let Ok(mut guard) = turn_inner.lock()
-        {
-          guard.decode_turn += 1;
-          guard.tracks.ready_notify.notify_waiters();
-        }
-        Ok(result)
-      },
-      move |env, result| match result {
+    let turn = DecodeTurn(turn_inner);
+    env.spawn_future_with_callback(async move { Ok(decode.await) }, move |env, result| {
+      // A frame failure counts first (`apply_frame_failure`), then the next decode() call's
+      // turn (see `DecodeTurn`)
+      let result =
+        result.map_err(|error| apply_frame_failure(&settle_inner, epoch, frame_index, error));
+      drop(turn);
+      match result {
         Ok(result) => Ok(result),
-        Err(error) => Err(native_image_decode_error(
-          env,
-          apply_frame_failure(&settle_inner, epoch, frame_index, error),
-        )?),
-      },
-    )
+        Err(error) => Err(native_image_decode_error(env, error)?),
+      }
+    })
   }
 
   /// Reset the decoder
@@ -1487,6 +1484,46 @@ fn decode_cached_frame(
     image: video_frame,
     complete: true,
   }))
+}
+
+/// The turn of a decode() call: dropping it gives the turn to the next call. decode() drops it on
+/// the JS thread, in the callback that settles the call's promise, so the next call starts only
+/// once this one settles, and the promises settle in call order, like Chrome's. Given away on the
+/// worker thread instead, the next call could finish and settle first while that thread waits to
+/// settle this one. It also drops when the callback never runs (the environment goes away), so
+/// the calls after it do not wait forever.
+struct DecodeTurn(Arc<Mutex<ImageDecoderInner>>);
+
+impl Drop for DecodeTurn {
+  fn drop(&mut self) {
+    if let Ok(mut guard) = self.0.lock() {
+      guard.decode_turn += 1;
+      guard.tracks.ready_notify.notify_waiters();
+    }
+  }
+}
+
+/// Wait for the turn of the decode() call with this ticket (see `DecodeTurn`)
+async fn wait_for_turn(inner: &Arc<Mutex<ImageDecoderInner>>, ticket: u64) -> Result<()> {
+  let notify = inner
+    .lock()
+    .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?
+    .tracks
+    .ready_notify
+    .clone();
+  loop {
+    // Registered before the check, so a turn given in between still wakes it
+    let mut notified = std::pin::pin!(notify.notified());
+    notified.as_mut().enable();
+    let turn = inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?
+      .decode_turn;
+    if turn == ticket {
+      return Ok(());
+    }
+    notified.await;
+  }
 }
 
 /// Like Chrome, a reset() made after a decode() call rejects it with AbortError, in every format.
