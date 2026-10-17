@@ -1341,6 +1341,37 @@ test('ImageDecoder: an AVIF whose track samples end past its data fails the meta
   await t.throwsAsync(decoder.tracks.ready, { name: 'InvalidStateError', message: 'Failed to retrieve track metadata.' })
 })
 
+test('ImageDecoder: a complete AVIF fails the metadata at its first track sample past the data, before it lists the others', (t) => {
+  // panim8_420a (5623 bytes) with 2,592,000 samples of 1 byte in each track (CrabbyAvif's image
+  // count limit): the samples from byte 5623 on are past the data. CrabbyAvif checks each sample
+  // against the data length before it keeps it, so Chrome rejects the file at once and its
+  // renderer does not grow. Listing all of them first takes 82 MB here.
+  const data = avifFixture('panim8_420a.avif')
+  const bytes = Buffer.from(data.buffer, data.byteOffset, data.byteLength)
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+  for (let at = bytes.indexOf('stsc'); at !== -1; at = bytes.indexOf('stsc', at + 1)) {
+    view.setUint32(at + 16, 2_592_000) // samples per chunk of the only entry
+  }
+  for (let at = bytes.indexOf('stsz'); at !== -1; at = bytes.indexOf('stsz', at + 1)) {
+    view.setUint32(at + 8, 1) // one size for every sample: 1 byte
+  }
+  // In a process of its own: the tests in this file run at the same time as this one.
+  const child = `
+    const { ImageDecoder } = require(process.argv[1])
+    const data = new Uint8Array(require('node:fs').readFileSync(0))
+    const before = process.resourceUsage().maxRSS
+    new ImageDecoder({ data, type: 'image/avif' }).tracks.ready.then(
+      () => 'resolved',
+      (e) => e.name,
+    ).then((ready) => {
+      console.log(JSON.stringify({ ready, grownKB: process.resourceUsage().maxRSS - before }))
+    })`
+  const indexJs = join(dirname(fileURLToPath(import.meta.url)), '..', 'index.js')
+  const result = JSON.parse(execFileSync(process.execPath, ['-e', child, indexJs], { input: data, encoding: 'utf8' }))
+  t.is(result.ready, 'InvalidStateError')
+  t.true(result.grownKB < 24 * 1024, `the decoder grew by ${Math.round(result.grownKB / 1024)} MB`)
+})
+
 test('ImageDecoder: an AVIF item cut short fails decode(), or the metadata when the item is larger than the data, like Chrome', async (t) => {
   // s8_420 without its last 100 bytes: the colour item ends past the data
   const cut = new ImageDecoder({ data: avifFixture('s8_420.avif').slice(0, -100), type: 'image/avif' })

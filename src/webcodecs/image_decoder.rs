@@ -2599,8 +2599,13 @@ fn cache_decoded_frames(
 
   // Chrome reads an AVIF with CrabbyAvif, and so does `avif`. FFmpeg's mov demuxer decodes
   // what it declines (a grid, ...) as before.
+  let size_hint = if data_complete {
+    data_bytes.len() as u64
+  } else {
+    avif::STREAM_SIZE_HINT
+  };
   let avif = match codec_id {
-    AVCodecID::Av1 => avif::parse(&data_bytes, prefer_animation),
+    AVCodecID::Av1 => avif::parse(&data_bytes, prefer_animation, size_hint),
     _ => Avif::Decline,
   };
   // An AVIF's durations come from its track (see `decode_avif`)
@@ -2608,11 +2613,6 @@ fn cache_decoded_frames(
   let (context, frames, frame_count, missing_samples) = match avif {
     Avif::Image(image) => {
       let len = data_bytes.len();
-      let size_hint = if data_complete {
-        len as u64
-      } else {
-        avif::STREAM_SIZE_HINT
-      };
       if std::iter::once(&image.color)
         .chain(&image.alpha)
         .any(|samples| samples.past_size_hint(size_hint))
@@ -2643,6 +2643,8 @@ fn cache_decoded_frames(
           .then_some(image.color.len());
       (context, frames, image.color.len(), missing_samples)
     }
+    // a track sample past the size hint (see `Avif::PastSizeHint`)
+    Avif::PastSizeHint => return Err(reject_metadata(inner)),
     // Chrome waits for the boxes the brands need, and fails the metadata when the data ends
     // before them. At the end of a stream it marks the data complete first: `completed`
     // resolves.

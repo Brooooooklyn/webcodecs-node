@@ -32,6 +32,9 @@ pub(crate) enum Avif {
   Incomplete,
   /// A structure this reader does not handle, or that Chrome rejects
   Decline,
+  /// A track sample ends past the size hint. CrabbyAvif fails the metadata there
+  /// (Tile::create_from_track), before it builds the samples after it.
+  PastSizeHint,
 }
 
 /// What Chrome decodes from an AVIF file
@@ -155,7 +158,9 @@ impl AvifSamples {
 /// Read an AVIF file, or as much of it as has arrived. `prefer_animation` is the
 /// ImageDecoderInit option: true decodes the track, false the primary item, and
 /// unset follows the major brand ('avis' track, 'avif' item, else a track if any).
-pub(crate) fn parse(data: &[u8], prefer_animation: Option<bool>) -> Avif {
+/// `size_hint` is CrabbyAvif's size hint (see `STREAM_SIZE_HINT`): the track samples are
+/// checked against it while they are built.
+pub(crate) fn parse(data: &[u8], prefer_animation: Option<bool>, size_hint: u64) -> Avif {
   let mut file = Reader {
     data,
     pos: 0,
@@ -223,12 +228,15 @@ pub(crate) fn parse(data: &[u8], prefer_animation: Option<bool>) -> Avif {
     b"avif" => false,
     _ => tracks.is_some(),
   });
-  let image = if from_tracks {
-    tracks.as_deref().and_then(track_image)
-  } else {
-    meta.as_ref().and_then(item_image)
-  };
-  image.map_or(Avif::Decline, Avif::Image)
+  if from_tracks {
+    return tracks
+      .as_deref()
+      .map_or(Avif::Decline, |tracks| track_image(tracks, size_hint));
+  }
+  meta
+    .as_ref()
+    .and_then(item_image)
+    .map_or(Avif::Decline, Avif::Image)
 }
 
 struct Ftyp {
@@ -961,13 +969,20 @@ impl<'a> Track<'a> {
     aux.is_none_or(|aux| ALPHA_URNS.contains(&aux))
   }
 
-  fn samples(&self) -> Option<AvifSamples> {
-    let config = self.av01()?.iter().find_map(|p| match p {
-      Property::Av1C { config, .. } => Some(*config),
-      _ => None,
-    })?;
-    let table = self.table.as_ref()?;
-    let (offsets, width) = table.chunk_offsets?;
+  /// The samples, or why there are none: this reader does not handle them, or one ends past
+  /// `size_hint` (the first one, like CrabbyAvif)
+  fn samples(&self, size_hint: u64) -> Result<AvifSamples, NoSamples> {
+    let config = self
+      .av01()
+      .and_then(|properties| {
+        properties.iter().find_map(|p| match p {
+          Property::Av1C { config, .. } => Some(*config),
+          _ => None,
+        })
+      })
+      .ok_or(NoSamples::Decline)?;
+    let table = self.table.as_ref().ok_or(NoSamples::Decline)?;
+    let (offsets, width) = table.chunk_offsets.ok_or(NoSamples::Decline)?;
     let (size, sizes) = table.sample_sizes.unwrap_or_default();
     let mut sample_to_chunk = table
       .sample_to_chunk
@@ -985,26 +1000,36 @@ impl<'a> Track<'a> {
         next_entry = sample_to_chunk.next();
       }
       if per_chunk == 0 || per_chunk > MAX_IMAGE_COUNT - samples.len() {
-        return None;
+        return Err(NoSamples::Decline);
       }
       let mut offset = match width {
         4 => be32(offset).into(),
-        _ => u64::from_be_bytes(offset.try_into().ok()?),
+        _ => u64::from_be_bytes(offset.try_into().map_err(|_| NoSamples::Decline)?),
       };
       for _ in 0..per_chunk {
         let size = match size {
-          0 => be32(sizes.get(samples.len() * 4..samples.len() * 4 + 4)?),
+          0 => be32(
+            sizes
+              .get(samples.len() * 4..samples.len() * 4 + 4)
+              .ok_or(NoSamples::Decline)?,
+          ),
           size => size,
         };
         if size == 0 {
-          return None;
+          return Err(NoSamples::Decline);
+        }
+        // checked before the sample is kept: a complete file stops at the first sample past
+        // its end, not after millions of them
+        let end = offset.saturating_add(size.into());
+        if end > size_hint {
+          return Err(NoSamples::PastSizeHint);
         }
         samples.push(TrackSample {
           offset,
           size,
           duration: 0,
         });
-        offset = offset.checked_add(size.into())?;
+        offset = end;
       }
     }
     // the delta of the 'stts' run a sample is in; samples past the table keep the
@@ -1024,28 +1049,53 @@ impl<'a> Track<'a> {
       }
       sample.duration = delta;
     }
-    Some(AvifSamples {
+    Ok(AvifSamples {
       config: config.to_vec(),
       samples: Samples::Track(samples),
     })
   }
 }
 
+/// Why `Track::samples` gives none
+enum NoSamples {
+  /// `Avif::Decline`
+  Decline,
+  /// `Avif::PastSizeHint`
+  PastSizeHint,
+}
+
 /// The first colour track, its alpha track and their 'prem' link
-fn track_image(tracks: &[Track]) -> Option<AvifImage> {
-  let color = tracks
+fn track_image(tracks: &[Track], size_hint: u64) -> Avif {
+  let Some(color) = tracks
     .iter()
-    .find(|t| t.av01().is_some() && t.aux_for.is_none())?;
+    .find(|t| t.av01().is_some() && t.aux_for.is_none())
+  else {
+    return Avif::Decline;
+  };
   let alpha = tracks
     .iter()
     .find(|t| t.av01().is_some() && t.aux_for == Some(color.id) && t.is_alpha());
-  let color_samples = color.samples()?;
-  Some(AvifImage {
-    alpha: match alpha {
-      // Chrome rejects an alpha track with another sample count
-      Some(alpha) => Some(alpha.samples().filter(|a| a.len() == color_samples.len())?),
-      None => None,
-    },
+  // CrabbyAvif builds the colour samples, then the alpha samples, then compares their counts
+  let samples = color.samples(size_hint).and_then(|color_samples| {
+    Ok((
+      color_samples,
+      alpha.map(|a| a.samples(size_hint)).transpose()?,
+    ))
+  });
+  let (color_samples, alpha_samples) = match samples {
+    Ok(samples) => samples,
+    Err(NoSamples::Decline) => return Avif::Decline,
+    Err(NoSamples::PastSizeHint) => return Avif::PastSizeHint,
+  };
+  // Chrome rejects an alpha track with another sample count
+  if alpha_samples
+    .as_ref()
+    .is_some_and(|a| a.len() != color_samples.len())
+  {
+    return Avif::Decline;
+  }
+  Avif::Image(AvifImage {
+    alpha: alpha_samples,
     color: color_samples,
     premultiplied: alpha.is_some_and(|alpha| color.prem_by == Some(alpha.id)),
     nclx: None,
@@ -1192,15 +1242,16 @@ mod tests {
   }
 
   fn outcome(data: &[u8], prefer_animation: Option<bool>) -> &'static str {
-    match parse(data, prefer_animation) {
+    match parse(data, prefer_animation, STREAM_SIZE_HINT) {
       Avif::Image(_) => "image",
       Avif::Incomplete => "incomplete",
       Avif::Decline => "decline",
+      Avif::PastSizeHint => "past size hint",
     }
   }
 
   fn parsed(data: &[u8], prefer_animation: Option<bool>) -> AvifImage {
-    match parse(data, prefer_animation) {
+    match parse(data, prefer_animation, STREAM_SIZE_HINT) {
       Avif::Image(image) => image,
       _ => panic!("{}", outcome(data, prefer_animation)),
     }
@@ -1247,7 +1298,7 @@ mod tests {
   }
 
   fn without_alpha(data: &[u8]) -> bool {
-    matches!(parse(data, None), Avif::Image(image) if image.alpha.is_none())
+    matches!(parse(data, None, STREAM_SIZE_HINT), Avif::Image(image) if image.alpha.is_none())
   }
 
   #[test]
@@ -1340,6 +1391,51 @@ mod tests {
     let color = parsed(&fixture("anim8_420.avif"), None).color;
     assert!(!color.past_size_hint(3559));
     assert!(color.past_size_hint(3558));
+  }
+
+  #[test]
+  fn stops_at_the_first_track_sample_past_the_size_hint() {
+    // avis1_8_420 with 2,592,000 samples of 1 byte in its one chunk at 962 (CrabbyAvif's image
+    // count limit): the ones from sample 996 on end past the 1958-byte file
+    let data = fixture("avis1_8_420.avif");
+    let data = patch(
+      &data,
+      box_at(&data, b"stsc") + 20,
+      &2_592_000u32.to_be_bytes(),
+    );
+    let data = patch(&data, box_at(&data, b"stsz") + 12, &1u32.to_be_bytes());
+    // All the data is in: Chrome fails the metadata at sample 996, before it builds the others
+    // (CrabbyAvif's Tile::create_from_track checks the size hint, then pushes the sample).
+    let len = data.len() as u64;
+    assert_eq!(outcome_with(&data, len), "past size hint");
+    // The same bytes while they stream in (256 MB size hint): all 2,592,000, like Chrome
+    let Avif::Image(image) = parse(&data, None, STREAM_SIZE_HINT) else {
+      panic!("{}", outcome_with(&data, STREAM_SIZE_HINT));
+    };
+    assert_eq!(image.color.len(), 2_592_000);
+    // the last sample that fits, and the first that does not
+    assert_eq!(outcome_with(&data, 962 + 2_592_000), "image");
+    assert_eq!(outcome_with(&data, 962 + 2_592_000 - 1), "past size hint");
+
+    // panim8_420a: colour track 1 at 2641, alpha track 2 at 1833, 3 samples each. Only the
+    // alpha track past the hint: CrabbyAvif fails the alpha tile, not the sample counts.
+    let data = fixture("panim8_420a.avif");
+    let alpha_per_chunk = find(&data, b"stsc")[1] + 16;
+    let data = patch(&data, alpha_per_chunk, &2_592_000u32.to_be_bytes());
+    let alpha_size = find(&data, b"stsz")[1] + 8;
+    let data = patch(&data, alpha_size, &1u32.to_be_bytes());
+    assert_eq!(outcome_with(&data, data.len() as u64), "past size hint");
+    // while it streams in, the sample counts differ (3 and 2,592,000): Chrome rejects it
+    assert_eq!(outcome_with(&data, STREAM_SIZE_HINT), "decline");
+  }
+
+  fn outcome_with(data: &[u8], size_hint: u64) -> &'static str {
+    match parse(data, None, size_hint) {
+      Avif::Image(_) => "image",
+      Avif::Incomplete => "incomplete",
+      Avif::Decline => "decline",
+      Avif::PastSizeHint => "past size hint",
+    }
   }
 
   /// s8_420.avif with its item in `extents` (offsets in the original file: from the item on,
@@ -1529,7 +1625,7 @@ mod tests {
       (s8.clone(), Some(true), 0),
     ];
     for (i, (data, prefer_animation, frames)) in cases.iter().enumerate() {
-      match parse(data, *prefer_animation) {
+      match parse(data, *prefer_animation, STREAM_SIZE_HINT) {
         Avif::Image(image) => assert_eq!(image.color.len(), *frames, "case {i}"),
         _ => assert_eq!(*frames, 0, "case {i}"),
       }
@@ -1598,10 +1694,10 @@ mod tests {
       let data = fixture(name);
       // the boxes the brands need ('meta', also 'moov' for 'avis') come before 'mdat'
       let needed = box_at(&data, b"mdat");
-      let full = parse(&data, None);
+      let full = parse(&data, None, STREAM_SIZE_HINT);
       for length in 0..=data.len() {
         let prefix = &data[..length];
-        match (parse(prefix, None), &full) {
+        match (parse(prefix, None, STREAM_SIZE_HINT), &full) {
           (Avif::Incomplete, _) => assert!(length < needed, "{name} {length}"),
           (Avif::Decline, Avif::Decline) => assert!(length >= needed, "{name} {length}"),
           (Avif::Image(image), Avif::Image(full)) => {
@@ -1810,7 +1906,9 @@ mod tests {
     let track = &tracks[0];
     assert_eq!(track.av01().map(<[_]>::len), Some(2));
     assert!(track.is_alpha());
-    let samples = track.samples().expect("samples");
+    let Ok(samples) = track.samples(STREAM_SIZE_HINT) else {
+      panic!("samples");
+    };
     assert_eq!(samples.config, [0x81, 0, 0x0c, 0]);
     assert_eq!(samples.len(), 1);
   }
@@ -1827,7 +1925,7 @@ mod tests {
     };
     let exercise = |data: &[u8]| {
       for prefer_animation in [None, Some(false), Some(true)] {
-        if let Avif::Image(image) = parse(data, prefer_animation) {
+        if let Avif::Image(image) = parse(data, prefer_animation, STREAM_SIZE_HINT) {
           for part in [Some(&image.color), image.alpha.as_ref()]
             .into_iter()
             .flatten()
