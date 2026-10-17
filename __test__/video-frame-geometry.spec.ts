@@ -146,6 +146,50 @@ test('VideoFrame: displayHeight converts before displayWidth like Chrome', (t) =
   }
 })
 
+test('VideoFrame: colorSpace (buffer) and alpha (wrap) convert before the display size and rotation like Chrome', (t) => {
+  // WebIDL converts dictionary members in lexicographic order. Before displayHeight, displayWidth
+  // and rotation, VideoFrameBufferInit has colorSpace and VideoFrameInit has alpha (and no
+  // colorSpace). In Chrome 155 that member's throwing getter wins over an invalid display size or
+  // a non-finite rotation, and the getter of a member the dictionary does not have never runs first.
+  const invalid: Array<[string, FrameInit]> = [
+    ['rotation Infinity', { rotation: Infinity }],
+    ['rotation -Infinity', { rotation: -Infinity }],
+    ['rotation NaN', { rotation: NaN }],
+    ['displayHeight -1', { displayWidth: 4, displayHeight: -1 }],
+    ['displayWidth -1', { displayWidth: -1, displayHeight: 4 }],
+    ['displayWidth 2^32', { displayWidth: 2 ** 32, displayHeight: 4 }],
+  ]
+  // [constructor, member whose getter throws, whether the getter's error wins]
+  const getters: Array<[string, string, boolean]> = [
+    ['buffer', 'colorSpace', true],
+    ['buffer', 'alpha', false],
+    ['wrap', 'alpha', true],
+    ['wrap', 'colorSpace', false],
+  ]
+  for (const [kind, getter, getterWins] of getters) {
+    for (const [name, members] of invalid) {
+      const label = `${kind}: ${name}, ${getter} getter throws`
+      let calls = 0
+      const base = kind === 'buffer' ? { format: 'RGBX', codedWidth: 4, codedHeight: 2, timestamp: 0 } : {}
+      const init = Object.defineProperty({ ...base, ...members }, getter, {
+        enumerable: true,
+        get() {
+          calls++
+          throw new Error(`${getter} getter`)
+        },
+      }) as VideoFrameBufferInit
+      const source = kind === 'buffer' ? new Uint8Array(4 * 2 * 4) : rgbx(4, 2)
+      try {
+        const expected = getterWins ? { message: `${getter} getter` } : { instanceOf: TypeError }
+        t.throws(() => new VideoFrame(source, init).close(), expected, label)
+      } finally {
+        if (source instanceof VideoFrame) source.close()
+      }
+      t.is(calls, getterWins ? 1 : 0, `${label}: getter calls`)
+    }
+  }
+})
+
 // ============================================================================
 // Computed display size of a cropped wrap (spec step 8.5)
 // ============================================================================

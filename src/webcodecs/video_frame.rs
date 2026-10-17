@@ -1146,10 +1146,28 @@ pub struct VideoFrameConstructorInit {
   pub alpha: Option<String>,
 }
 
+/// Which WebIDL dictionary a VideoFrame init is. VideoFrameBufferInit has `colorSpace`;
+/// VideoFrameInit (VideoFrame and canvas sources) has none, so Chrome never reads it there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InitDictionary {
+  Buffer,
+  Image,
+}
+
 impl FromNapiValue for VideoFrameConstructorInit {
   unsafe fn from_napi_value(
     env: napi::sys::napi_env,
     value: napi::sys::napi_value,
+  ) -> Result<Self> {
+    unsafe { Self::read(env, value, InitDictionary::Buffer) }
+  }
+}
+
+impl VideoFrameConstructorInit {
+  unsafe fn read(
+    env: napi::sys::napi_env,
+    value: napi::sys::napi_value,
+    dictionary: InitDictionary,
   ) -> Result<Self> {
     let obj = unsafe { Object::from_napi_value(env, value)? };
 
@@ -1196,9 +1214,16 @@ impl FromNapiValue for VideoFrameConstructorInit {
     // One reader serves both VideoFrameBufferInit and VideoFrameInit, so the members keep the
     // order it always used. The checked members sit where WebIDL (lexicographic) order puts
     // them relative to the others: displayHeight/displayWidth after codedWidth/codedHeight and
-    // before layout, rotation after flip.
+    // before layout, rotation after flip. Before displayHeight, VideoFrameBufferInit has
+    // colorSpace and VideoFrameInit has alpha.
     let coded_width: Option<u32> = obj.get("codedWidth")?;
     let coded_height: Option<u32> = obj.get("codedHeight")?;
+    let mut color_space: Option<VideoColorSpaceInit> = None;
+    let mut alpha: Option<String> = None;
+    match dictionary {
+      InitDictionary::Buffer => color_space = obj.get("colorSpace")?,
+      InitDictionary::Image => alpha = obj.get("alpha")?,
+    }
     // displayWidth/displayHeight are WebIDL [EnforceRange] unsigned long: a plain u32
     // conversion would wrap -1 or 2^32 + 1 into range instead of throwing. WebIDL converts
     // dictionary members in lexicographic order and stops at the first failure, so
@@ -1221,6 +1246,11 @@ impl FromNapiValue for VideoFrameConstructorInit {
     if rotation.is_some_and(|rotation| !rotation.is_finite()) {
       return Err(throw_type_error(env, "rotation must be a finite number"));
     }
+    // VideoFrameInit has no colorSpace, but the canvas constructor still honours it: read it
+    // after the members Chrome reads.
+    if dictionary == InitDictionary::Image {
+      color_space = obj.get("colorSpace")?;
+    }
 
     Ok(VideoFrameConstructorInit {
       format,
@@ -1234,10 +1264,13 @@ impl FromNapiValue for VideoFrameConstructorInit {
       flip,
       display_width,
       display_height,
-      color_space: obj.get("colorSpace")?,
+      color_space,
       metadata: obj.get("metadata")?,
       transfer: obj.get("transfer")?,
-      alpha: obj.get("alpha")?,
+      alpha: match dictionary {
+        InitDictionary::Buffer => obj.get("alpha")?,
+        InitDictionary::Image => alpha,
+      },
     })
   }
 }
@@ -2246,6 +2279,32 @@ pub struct VideoFrame {
   duration_us: Option<i64>,
 }
 
+/// A @napi-rs/canvas Canvas, found by duck typing: width, height and a data() method, but no
+/// codedWidth/naturalWidth. Only objects are probed, so no exception is left pending.
+fn canvas_source<'env>(source: &Unknown<'env>) -> Option<Object<'env>> {
+  if !matches!(
+    source.get_type(),
+    Ok(ValueType::Object | ValueType::Function)
+  ) {
+    return None;
+  }
+  let source_obj = source.coerce_to_object().ok()?;
+  let has_width = source_obj.has_named_property("width").unwrap_or(false);
+  let has_height = source_obj.has_named_property("height").unwrap_or(false);
+  let has_data = source_obj.has_named_property("data").unwrap_or(false);
+  let has_coded_width = source_obj.has_named_property("codedWidth").unwrap_or(false);
+  let has_natural_width = source_obj
+    .has_named_property("naturalWidth")
+    .unwrap_or(false);
+  if !(has_width && has_height && has_data && !has_coded_width && !has_natural_width) {
+    return None;
+  }
+  // Verify data is a function (Canvas.data() method vs property)
+  let data_prop = source_obj.get_named_property::<Unknown>("data").ok()?;
+  (data_prop.get_type().unwrap_or(ValueType::Undefined) == ValueType::Function)
+    .then_some(source_obj)
+}
+
 /// Parse rotation value per W3C spec algorithm
 /// Rounds to the nearest multiple of 90 (ties towards positive infinity), normalized to 0-270.
 ///
@@ -2445,11 +2504,31 @@ impl VideoFrame {
     constructor,
     ts_args_type = "source: VideoFrame | Uint8Array | CanvasLike, init?: VideoFrameBufferInit | VideoFrameInit"
   )]
-  pub fn new(env: Env, source: Unknown, init: Option<VideoFrameConstructorInit>) -> Result<Self> {
+  pub fn new(env: Env, source: Unknown, init: Option<Unknown>) -> Result<Self> {
     // Try VideoFrame first. This is a real `instanceof` check rather than a probe for
     // `codedWidth`: any object could carry that property, and unwrapping a non-VideoFrame
     // would blindly cast a foreign pointer to `&VideoFrame`.
-    if VideoFrame::instance_of(&env, &source).unwrap_or(false) {
+    let is_video_frame = VideoFrame::instance_of(&env, &source).unwrap_or(false);
+    let canvas = if is_video_frame {
+      None
+    } else {
+      canvas_source(&source)
+    };
+    // The source picks the dictionary (VideoFrameInit or VideoFrameBufferInit), and WebIDL
+    // converts it before any constructor step below.
+    let dictionary = if is_video_frame || canvas.is_some() {
+      InitDictionary::Image
+    } else {
+      InitDictionary::Buffer
+    };
+    let init = match init {
+      Some(init) => {
+        Some(unsafe { VideoFrameConstructorInit::read(env.raw(), init.raw(), dictionary)? })
+      }
+      None => None,
+    };
+
+    if is_video_frame {
       // It's a VideoFrame - unwrap and use frame clone path.
       // `ClassInstance` is the only unwrap permitted inside a native call; `<&VideoFrame>`
       // registers a native borrow, which napi only allows while the generated argument
@@ -2473,26 +2552,9 @@ impl VideoFrame {
         .map_err(|error| throw_as_native_error(&env, error));
     }
 
-    // Try Canvas (has width, height, data method, but NOT codedWidth/naturalWidth)
-    // This uses duck typing to detect @napi-rs/canvas Canvas objects
-    if let Ok(source_obj) = source.coerce_to_object() {
-      let has_width = source_obj.has_named_property("width").unwrap_or(false);
-      let has_height = source_obj.has_named_property("height").unwrap_or(false);
-      let has_data = source_obj.has_named_property("data").unwrap_or(false);
-      let has_coded_width = source_obj.has_named_property("codedWidth").unwrap_or(false);
-      let has_natural_width = source_obj
-        .has_named_property("naturalWidth")
-        .unwrap_or(false);
-
-      if has_width && has_height && has_data && !has_coded_width && !has_natural_width {
-        // Verify data is a function (Canvas.data() method vs property)
-        if let Ok(data_prop) = source_obj.get_named_property::<Unknown>("data")
-          && data_prop.get_type().unwrap_or(ValueType::Undefined) == ValueType::Function
-        {
-          return Self::new_from_canvas(env, source_obj, init)
-            .map_err(|error| throw_as_native_error(&env, error));
-        }
-      }
+    if let Some(source_obj) = canvas {
+      return Self::new_from_canvas(env, source_obj, init)
+        .map_err(|error| throw_as_native_error(&env, error));
     }
 
     // Try as Uint8Array/Buffer
