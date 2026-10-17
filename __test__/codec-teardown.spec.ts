@@ -391,6 +391,36 @@ for (const teardown of ['close', 'reset'] as const) {
       if (teardown === 'reset') codec.close()
     }
   })
+
+  // Building the dropped error's DOMException would read the page's global
+  // DOMException, and a throw there would become an uncaught exception. Chrome
+  // builds it natively, so no page code runs for a dropped error.
+  // Serial: the global stays replaced across an await.
+  test.serial(`${teardown}() drops a worker error without reading the global DOMException`, async (t) => {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'DOMException')!
+    for (const [name, make] of workerErrorCases) {
+      const log: string[] = []
+      const codec = make((entry) => log.push(entry))
+      await sendQueued()
+      blockJsThread(300)
+
+      codec[teardown]()
+      Object.defineProperty(globalThis, 'DOMException', {
+        configurable: true,
+        get: () => {
+          log.push('DOMException read')
+          return descriptor.value
+        },
+      })
+      try {
+        await delay(300)
+      } finally {
+        Object.defineProperty(globalThis, 'DOMException', descriptor)
+      }
+      t.deepEqual(log, [], `${name}: nothing runs after ${teardown}()`)
+      if (teardown === 'reset') codec.close()
+    }
+  })
 }
 
 test('reset() leaves an encoder usable after dropping a worker error', async (t) => {
@@ -755,6 +785,29 @@ test('close() drops the NotSupportedError from configure(), also after reset()',
       t.deepEqual(log, [], `${config.name}${resetFirst ? ' after reset()' : ''}`)
       t.is(codec.state, 'closed', config.name)
     }
+  }
+})
+
+test.serial('close() drops the configure() NotSupportedError without reading the global DOMException', async (t) => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'DOMException')!
+  for (const config of unsupportedConfigCases) {
+    const log: string[] = []
+    const codec = config.make((entry) => log.push(entry))
+    config.configureBogus(codec)
+    codec.close()
+    Object.defineProperty(globalThis, 'DOMException', {
+      configurable: true,
+      get: () => {
+        log.push('DOMException read')
+        return descriptor.value
+      },
+    })
+    try {
+      await delay(200)
+    } finally {
+      Object.defineProperty(globalThis, 'DOMException', descriptor)
+    }
+    t.deepEqual(log, [], config.name)
   }
 })
 
