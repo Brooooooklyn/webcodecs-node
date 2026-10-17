@@ -236,6 +236,17 @@ impl CodecEpoch {
     Ok(())
   }
 
+  /// JS thread: whether `admit_error` drops an error queued under
+  /// `generation`, without its side effects. Once true it stays true: the
+  /// generation only advances, and `closed` and `error_delivered` are never
+  /// cleared.
+  fn drops_error(&self, generation: u32, origin: ErrorOrigin) -> bool {
+    match origin {
+      ErrorOrigin::Work => !self.is_current(generation),
+      ErrorOrigin::Configure => self.0.closed.load(Ordering::SeqCst) || self.error_delivered(),
+    }
+  }
+
   /// JS thread: whether an error queued under `generation` reaches the error
   /// callback. `configure_error` is the error's name when configure() found
   /// it (ErrorOrigin::Configure). Marks the error delivered when it does.
@@ -404,18 +415,28 @@ pub(crate) fn gated_error(
   .build_threadsafe_function::<(u32, ErrorOrigin, Error)>()
   .callee_handled::<false>()
   .weak::<true>()
-  .build_callback(|ctx: ThreadsafeCallContext<(u32, ErrorOrigin, Error)>| {
-    let (generation, origin, error) = ctx.value;
-    let configure_error = (origin == ErrorOrigin::Configure).then(|| {
-      DOMExceptionName::from_error_message(&error.reason)
-        .as_str()
-        .to_owned()
-    });
-    Ok(FnArgs::from((
-      generation,
-      configure_error,
-      error_as_dom_exception(&ctx.env, error)?,
-    )))
+  .build_callback({
+    let epoch = epoch.clone();
+    move |ctx: ThreadsafeCallContext<(u32, ErrorOrigin, Error)>| {
+      let (generation, origin, error) = ctx.value;
+      let configure_error = (origin == ErrorOrigin::Configure).then(|| {
+        DOMExceptionName::from_error_message(&error.reason)
+          .as_str()
+          .to_owned()
+      });
+      // Building the DOMException reads the global `DOMException`, which page
+      // code can replace. For an error close() or reset() dropped, pass
+      // undefined instead: the gate drops it, and no page code runs, as in
+      // Chrome.
+      let error = if epoch.drops_error(generation, origin) {
+        let mut undefined = ptr::null_mut();
+        check_status!(unsafe { sys::napi_get_undefined(ctx.env.raw(), &mut undefined) })?;
+        unsafe { Unknown::from_raw_unchecked(ctx.env.raw(), undefined) }
+      } else {
+        error_as_dom_exception(&ctx.env, error)?
+      };
+      Ok(FnArgs::from((generation, configure_error, error)))
+    }
   })
 }
 
