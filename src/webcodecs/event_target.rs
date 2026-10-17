@@ -122,11 +122,6 @@ impl Drop for WeakCodecRef {
   }
 }
 
-/// A codec's WebCodecsErrorCallback, called from any thread. The JS-side
-/// callback turns the Error payload into a native DOMException.
-pub type CodecErrorCallback =
-  ThreadsafeFunction<Error, UnknownReturnValue, Unknown<'static>, Status, false, true>;
-
 // The payload must be FnArgs — a plain tuple goes through the ToNapiValue
 // blanket impl and arrives as a single Array argument, not three args.
 type DispatcherTsf =
@@ -368,8 +363,9 @@ impl CodecEventState {
   }
 
   /// JS thread: queued work was discarded without dequeue dispatches
-  /// (reset/close/reconfigure). `cleared` is the number of dropped items;
-  /// items already fired but undelivered stay outstanding until delivered.
+  /// (configure(), or close()/reset() with no dispatcher; see
+  /// [`Self::clear_queue`]). `cleared` is the number of dropped items; items
+  /// already fired but undelivered stay outstanding until delivered.
   pub fn note_queue_cleared(&mut self, env: &Env, cleared: usize) {
     self.outstanding = self.outstanding.saturating_sub(cleared);
     if self.outstanding == 0 {
@@ -571,6 +567,28 @@ impl CodecEventState {
     Self::fire_n(shared, dropped);
   }
 
+  /// JS thread: close()/reset() dropped `cleared` queued items. Chrome keeps
+  /// one dequeue event pending at a time and does not cancel it: a dequeue
+  /// event that is scheduled and has not started still runs after close() or
+  /// reset(), and the dropped items join it. Otherwise one dequeue event
+  /// follows when anything was dropped.
+  pub fn clear_queue(shared: &Arc<RwLock<CodecEventState>>, env: &Env, cleared: usize) {
+    if cleared == 0 {
+      return;
+    }
+    {
+      let Ok(mut state) = shared.write() else {
+        return;
+      };
+      if state.dispatcher.is_none() {
+        // No dispatcher, so no listener to tell: only unpin the codec.
+        state.note_queue_cleared(env, cleared);
+        return;
+      }
+    }
+    Self::fire_n(shared, cleared);
+  }
+
   /// Schedule the dequeue event for `items` dequeued items (any thread,
   /// non-blocking). WebCodecs "schedule dequeue event": while a dispatch is
   /// queued and has not started, the items join it and no new event is
@@ -640,8 +658,9 @@ impl CodecEventState {
     }
   }
 
-  /// Any thread: send a codec's error to its error callback. Every codec
-  /// error closes the codec.
+  /// Any thread: send a codec's error to its error callback, a thread-safe
+  /// function whose JS side turns `error` into a native DOMException. Every
+  /// codec error closes the codec.
   ///
   /// Chrome runs the error callback first, and the dequeue event for the
   /// work the error dropped after it: closing the codec queues that event and
@@ -649,10 +668,10 @@ impl CodecEventState {
   /// through two thread-safe functions, whose order is not defined, so a
   /// dequeue event that comes due before the error callback has run waits,
   /// and runs right after the callback, from the same call.
-  pub fn report_error(
+  pub fn report_error<T: 'static, Args: 'static + JsValuesTupleIntoVec>(
     shared: &Arc<RwLock<CodecEventState>>,
-    callback: &CodecErrorCallback,
-    error: Error,
+    callback: &ThreadsafeFunction<T, UnknownReturnValue, Args, Status, false, true>,
+    error: T,
   ) {
     if let Ok(mut state) = shared.write() {
       state.errors_pending += 1;

@@ -58,6 +58,24 @@ impl DOMExceptionName {
       DOMExceptionName::ConstraintError => "ConstraintError",
     }
   }
+
+  /// The name a codec error callback reports for `message`: the
+  /// `"NameError: detail"` prefix when present, else EncodingError (the same
+  /// rule as `error_as_dom_exception`).
+  pub fn from_error_message(message: &str) -> Self {
+    let prefix = message
+      .split_once(':')
+      .map_or(message, |(prefix, _)| prefix);
+    match prefix.trim() {
+      "OperationError" => DOMExceptionName::OperationError,
+      "NotSupportedError" => DOMExceptionName::NotSupportedError,
+      "InvalidStateError" => DOMExceptionName::InvalidStateError,
+      "DataError" => DOMExceptionName::DataError,
+      "AbortError" => DOMExceptionName::AbortError,
+      "ConstraintError" => DOMExceptionName::ConstraintError,
+      _ => DOMExceptionName::EncodingError,
+    }
+  }
 }
 
 /// Create a spec-compliant error with DOMException-style naming
