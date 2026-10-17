@@ -1,0 +1,710 @@
+//! BMP decoder with Chrome 155's pixels.
+//!
+//! Chrome decodes BMP with the `image` crate 0.25.10 in lenient mode, patched by
+//! Chromium (third_party/rust/chromium_crates_io/patches/image 0001 to 0003), through
+//! skia's SkBmpRustCodec. This file follows the same rules:
+//!
+//! - headers of 12, 40, 52, 56, 108 and 124 bytes, and OS/2 headers of 16 to 64 bytes
+//! - 1, 2, 4 and 8-bit palettes (an index past the palette is black), RLE4, RLE8,
+//!   OS/2 RLE24 (skipped pixels are black), 16 and 32-bit bitfields, 24-bit and 32-bit
+//! - a channel of n bits is scaled to 8 bits with round(v * 255 / (2^n - 1)); masks
+//!   wider than 8 bits keep their top 8 bits
+//! - alpha comes from an alpha mask: bitfields with a V3 to V5 header or
+//!   BI_ALPHABITFIELDS, or 32-bit BI_RGB with a V4 or V5 header
+//! - errors in the headers, masks, palette or ICC profile range are an image Chrome
+//!   fails to open; short or bad pixel data fails the decode
+//!
+//! Output is unpremultiplied BGRA. `has_alpha` says whether Chrome labels the image
+//! BGRA (true) or BGRX (false, the X bytes are 255).
+
+use std::{fmt, iter};
+
+use pixel_simd::{Bitfield, Opaque, Palette};
+
+/// A malformed or unsupported BMP
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BmpError(&'static str);
+
+impl fmt::Display for BmpError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "BMP: {}", self.0)
+  }
+}
+
+impl std::error::Error for BmpError {}
+
+/// The data ends early. While more data can come, a stream is not failed by it.
+pub const TRUNCATED: BmpError = BmpError("truncated data");
+
+const BI_RGB: u32 = 0;
+const BI_RLE8: u32 = 1;
+const BI_RLE4: u32 = 2;
+const BI_BITFIELDS: u32 = 3;
+const BI_JPEG: u32 = 4;
+const BI_ALPHABITFIELDS: u32 = 6;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rle {
+  Rle4,
+  Rle8,
+  Rle24,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Kind {
+  /// 1, 2, 4 or 8 bits per palette index
+  Palette(u32),
+  /// 2, 3 or 4 bytes per pixel. Masks are red, green, blue, alpha.
+  Packed {
+    bytes: usize,
+    masks: [Bitfield; 4],
+  },
+  Rle(Rle),
+}
+
+const fn field(shift: u32, len: u32) -> Bitfield {
+  Bitfield { shift, len }
+}
+const RGB555: [Bitfield; 4] = [field(10, 5), field(5, 5), field(0, 5), field(0, 0)];
+const RGB888: [Bitfield; 4] = [field(16, 8), field(8, 8), field(0, 8), field(0, 0)];
+const ARGB8888: [Bitfield; 4] = [field(16, 8), field(8, 8), field(0, 8), field(24, 8)];
+/// R, G and B in the high 3 bytes, no alpha
+const XBGR8888: [Bitfield; 4] = [field(24, 8), field(16, 8), field(8, 8), field(0, 0)];
+
+/// A BMP's size and pixel format, read the way the patched `image` crate reads them
+pub struct BmpDecoder<'a> {
+  data: &'a [u8],
+  width: u32,
+  height: u32,
+  top_down: bool,
+  data_offset: u64,
+  kind: Kind,
+  palette: Palette,
+}
+
+fn bytes(data: &[u8], at: u64, len: usize) -> Result<&[u8], BmpError> {
+  let at = usize::try_from(at).map_err(|_| TRUNCATED)?;
+  data.get(at..at.saturating_add(len)).ok_or(TRUNCATED)
+}
+
+fn u32_at(data: &[u8], at: u64) -> Result<u32, BmpError> {
+  let b = bytes(data, at, 4)?;
+  Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+impl<'a> BmpDecoder<'a> {
+  /// Reads the headers, masks and palette. An error here is an image Chrome fails to
+  /// open (ImageDecoder's `tracks.ready` rejects).
+  pub fn new(data: &'a [u8]) -> Result<Self, BmpError> {
+    let file_header = bytes(data, 0, 14)?;
+    if &file_header[..2] != b"BM" {
+      return Err(BmpError("bad signature"));
+    }
+    let data_offset = u64::from(u32_at(data, 10)?);
+    let header_size = u32_at(data, 14)?;
+    let header_end = 14 + u64::from(header_size);
+    let core = header_size == 12;
+    let os2 = match header_size {
+      12 | 40 | 52 | 56 | 108 | 124 => false,
+      16..=64 if header_size % 4 == 0 || header_size == 42 || header_size == 46 => true,
+      _ => return Err(BmpError("unknown header size")),
+    };
+
+    let (width, height, top_down, bit_count, compression, colors_used);
+    if core {
+      let h = bytes(data, 18, 8)?;
+      width = i64::from(u16::from_le_bytes([h[0], h[1]]));
+      height = i64::from(u16::from_le_bytes([h[2], h[3]]));
+      top_down = false;
+      bit_count = u16::from_le_bytes([h[6], h[7]]);
+      if !matches!(bit_count, 1 | 4 | 8 | 24) {
+        return Err(BmpError("unsupported bit count"));
+      }
+      compression = BI_RGB;
+      colors_used = 0;
+    } else {
+      // An OS/2 header shorter than 40 bytes reads as zeros past its end. A longer
+      // OS/2 header is read whole; a Windows header only up to its first 40 bytes.
+      let read = (header_size as usize - 4).min(36);
+      let mut h = [0; 36];
+      h[..read].copy_from_slice(bytes(data, 18, read)?);
+      if os2 {
+        bytes(data, 18, header_size as usize - 4)?;
+      }
+      let w = i32::from_le_bytes([h[0], h[1], h[2], h[3]]);
+      let mut hh = i32::from_le_bytes([h[4], h[5], h[6], h[7]]);
+      if !(0..=0xFFFF).contains(&w) || hh > 0xFFFF || hh == i32::MIN {
+        return Err(BmpError("bad dimensions"));
+      }
+      top_down = hh < 0;
+      hh = hh.abs();
+      width = i64::from(w);
+      height = i64::from(hh);
+      bit_count = u16::from_le_bytes([h[10], h[11]]);
+      compression = u32::from_le_bytes([h[12], h[13], h[14], h[15]]);
+      colors_used = u32::from_le_bytes([h[28], h[29], h[30], h[31]]);
+    }
+    if width == 0 || height == 0 {
+      return Err(BmpError("empty image"));
+    }
+
+    let packed = |bytes, masks| Kind::Packed { bytes, masks };
+    let mut kind = match (compression, bit_count) {
+      (BI_RGB, 1 | 2 | 4 | 8) => Kind::Palette(u32::from(bit_count)),
+      (BI_RGB, 16) => packed(2, RGB555),
+      (BI_RGB, 24) => packed(3, RGB888),
+      (BI_RGB, 32) => packed(4, RGB888),
+      (BI_RLE8, 8) => Kind::Rle(Rle::Rle8),
+      (BI_RLE4, 4) => Kind::Rle(Rle::Rle4),
+      (BI_BITFIELDS | BI_ALPHABITFIELDS, 16 | 32) => {
+        // Masks follow the 40-byte part of the header (inside V2 to V5 headers) or
+        // the whole OS/2 header. The alpha mask is read with a V3 to V5 header, or
+        // with BI_ALPHABITFIELDS in a Windows header.
+        let at = if os2 { header_end } else { 54 };
+        let alpha = !os2 && (header_size >= 56 || compression == BI_ALPHABITFIELDS);
+        let raw = bytes(data, at, if alpha { 16 } else { 12 })?;
+        let mut masks = [Bitfield::default(); 4];
+        for (mask, &le) in masks.iter_mut().zip(raw.as_chunks().0) {
+          *mask = Bitfield::from_mask(u32::from_le_bytes(le), u32::from(bit_count))
+            .ok_or(BmpError("bad bitfield mask"))?;
+        }
+        packed(usize::from(bit_count / 8), masks)
+      }
+      (BI_JPEG, 24) if os2 => Kind::Rle(Rle::Rle24),
+      _ => return Err(BmpError("unsupported compression or bit count")),
+    };
+    // 32-bit BI_RGB with a V4 or V5 header has alpha when the alpha mask is set
+    if compression == BI_RGB && bit_count == 32 && header_size >= 108 && u32_at(data, 66)? != 0 {
+      kind = packed(4, ARGB8888);
+    }
+    // A V5 header with an embedded ICC profile must hold the profile in the file
+    if header_size == 124 {
+      bytes(data, 18, 120)?;
+      let (offset, size) = (u32_at(data, 126)?, u32_at(data, 130)?);
+      if u32_at(data, 70)? == 0x4D42_4544 && offset != 0 && size != 0 {
+        bytes(data, 14 + u64::from(offset), size as usize)?;
+      }
+    }
+
+    // B, G, R and, past a core header, an unused byte; padded with black
+    let entry = if core { 3 } else { 4 };
+    let table = if matches!(kind, Kind::Palette(_) | Kind::Rle(Rle::Rle4 | Rle::Rle8)) {
+      let count = match colors_used {
+        0 => 1 << bit_count,
+        n => (n as usize).min(1 << bit_count),
+      };
+      bytes(data, header_end, count * entry)?
+    } else {
+      &[]
+    };
+    let palette = Palette::new(table.chunks_exact(entry).map(|c| [c[0], c[1], c[2]]));
+
+    // Blink ImageDecoder::SetSize
+    if width > 1_000_000 || height > 1_000_000 || width * height * 4 > i64::from(i32::MAX) {
+      return Err(BmpError("image too large"));
+    }
+    Ok(BmpDecoder {
+      data,
+      width: width as u32,
+      height: height as u32,
+      top_down,
+      data_offset,
+      kind,
+      palette,
+    })
+  }
+
+  pub fn width(&self) -> u32 {
+    self.width
+  }
+
+  pub fn height(&self) -> u32 {
+    self.height
+  }
+
+  /// Chrome labels the image BGRA when true, BGRX when false
+  pub fn has_alpha(&self) -> bool {
+    matches!(self.kind, Kind::Packed { masks, .. } if masks[3].len != 0)
+  }
+
+  /// Decodes the pixels as unpremultiplied BGRA, top row first. An error is a decode
+  /// Chrome fails (ImageDecoder's `decode()` rejects).
+  pub fn decode(&self) -> Result<Vec<u8>, BmpError> {
+    // B, G, R bytes and alpha 255
+    let opaque = |bits, layout| {
+      self.decode_rows(bits, |src, dst| {
+        pixel_simd::opaque_to_bgra(src, dst, layout)
+      })
+    };
+    match self.kind {
+      Kind::Palette(1) => self.decode_palette::<1>(),
+      Kind::Palette(2) => self.decode_palette::<2>(),
+      Kind::Palette(4) => self.decode_palette::<4>(),
+      Kind::Palette(_) => self.decode_palette::<8>(),
+      // 24-bit BI_RGB
+      Kind::Packed { bytes: 3, .. } => opaque(24, Opaque::Bgr),
+      Kind::Packed {
+        bytes: 4,
+        masks: RGB888,
+      } => opaque(32, Opaque::Bgrx),
+      Kind::Packed {
+        bytes: 4,
+        masks: XBGR8888,
+      } => opaque(32, Opaque::Xbgr),
+      Kind::Packed {
+        bytes: 4,
+        masks: ARGB8888,
+      } => self.decode_rows(32, |src, dst| dst.copy_from_slice(&src[..dst.len()])),
+      // bitfield rows under 32 pixels: packed_row, inlined in the row loop, is faster than a
+      // pixel-simd call per row
+      Kind::Packed { bytes: 2, masks } if self.width < 32 => {
+        self.decode_rows(16, |src, dst| packed_row::<2>(src, dst, masks))
+      }
+      Kind::Packed { masks, .. } if self.width < 32 => {
+        self.decode_rows(32, |src, dst| packed_row::<4>(src, dst, masks))
+      }
+      // without an alpha field, alpha is 255
+      Kind::Packed { bytes: 2, masks } => self.decode_rows(16, |src, dst| {
+        pixel_simd::bitfields16_to_bgra(src, dst, masks, masks[3].len != 0)
+      }),
+      Kind::Packed { masks, .. } => self.decode_rows(32, |src, dst| {
+        pixel_simd::bitfields32_to_bgra(src, dst, masks, masks[3].len != 0)
+      }),
+      Kind::Rle(rle) => self.decode_rle(rle),
+    }
+  }
+
+  /// Checks the pixel data without decoding it: Ok, or the error `decode` finds before it
+  /// allocates the output. It allocates no output.
+  pub fn check(&self) -> Result<(), BmpError> {
+    match self.kind {
+      Kind::Palette(bits) => self.rows(bits as usize).map(drop),
+      Kind::Packed { bytes, .. } => self.rows(bytes * 8).map(drop),
+      Kind::Rle(rle) => self
+        .read_rle(rle, RleRows::new(self.width as usize, Vec::new()))
+        .map(drop),
+    }
+  }
+
+  /// The uncompressed rows of `bits` per pixel, each padded to 4 bytes, and their stride. Every
+  /// row must be in the file.
+  fn rows(&self, bits: usize) -> Result<(&'a [u8], usize), BmpError> {
+    let stride = (bits * self.width as usize).div_ceil(32) * 4;
+    let rows = bytes(self.data, self.data_offset, stride * self.height as usize)?;
+    Ok((rows, stride))
+  }
+
+  /// Whether rows of `bits`-bit palette indexes are too narrow for pixel-simd: fewer than 64
+  /// pixels, or than one 16-byte vector of them. On such rows its call and SIMD setup cost more
+  /// than its vectors save, and `palette_row`, inlined in the row loop, is faster.
+  fn narrow(&self, bits: usize) -> bool {
+    (self.width as usize) < 64.max(128 / bits)
+  }
+
+  /// Rows of `BITS`-bit palette indexes: through pixel-simd when it has a SIMD path for them
+  fn decode_palette<const BITS: u32>(&self) -> Result<Vec<u8>, BmpError> {
+    if self.narrow(BITS as usize) || !self.palette.simd(BITS) {
+      return self.decode_rows(BITS as usize, |src, dst| {
+        palette_row::<BITS>(src, dst, &self.palette)
+      });
+    }
+    self.decode_rows(BITS as usize, |src, dst| {
+      pixel_simd::palette_to_bgra(src, dst, BITS, &self.palette)
+    })
+  }
+
+  /// Uncompressed rows of `bits` per pixel, each padded to 4 bytes. `row` converts one.
+  fn decode_rows(&self, bits: usize, row: impl Fn(&[u8], &mut [u8])) -> Result<Vec<u8>, BmpError> {
+    let (width, height) = (self.width as usize, self.height as usize);
+    let (rows, stride) = self.rows(bits)?;
+    let mut out = room_for(width * height * 4)?;
+    // zeroed in one go: a memset call per row costs more than a narrow row, and the row
+    // loop has to reload its constants after each call
+    out.resize(width * height * 4, 0);
+    // output rows top first (the header check keeps width above 0)
+    for (y, dst) in out.chunks_exact_mut(width * 4).enumerate() {
+      let i = if self.top_down { y } else { height - 1 - y };
+      row(&rows[i * stride..][..stride], dst);
+    }
+    Ok(out)
+  }
+
+  /// RLE4, RLE8 and RLE24 (image crate BmpDecoder::read_rle_data)
+  fn decode_rle(&self, rle: Rle) -> Result<Vec<u8>, BmpError> {
+    let (width, height) = (self.width as usize, self.height as usize);
+    // A dry run without pixels first: data that ends early or is corrupt fails before the
+    // canvas is allocated. Without it, a header of 1 KB declaring 65535 x 8191 pixels made
+    // 2 GiB of zeros before its missing pixel data failed the decode.
+    self.read_rle(rle, RleRows::new(width, Vec::new()))?;
+    let mut pixels = room_for(width * height * 4)?;
+    pixels.resize(width * height * 4, 0);
+    self.read_rle(rle, RleRows::new(width, pixels))
+  }
+
+  /// Reads the RLE data into `out` and returns its pixels. With no pixels, only checks the data.
+  fn read_rle(&self, rle: Rle, mut out: RleRows) -> Result<Vec<u8>, BmpError> {
+    let height = self.height as usize;
+    // output rows in file order
+    let mut rows = (0..height).map(|i| if self.top_down { i } else { height - 1 - i });
+    let mut src = Source {
+      data: self.data,
+      pos: self.data_offset,
+    };
+    let color = |index: u8| self.palette.color(index);
+    let nibble = |pair: u8, i: usize| {
+      if i.is_multiple_of(2) {
+        pair >> 4
+      } else {
+        pair & 15
+      }
+    };
+    while let Some(row) = rows.next() {
+      out.start(row);
+      // pixels counted in this row, which can pass the row end
+      let mut count = 0;
+      loop {
+        match src.byte()? {
+          0 => match src.byte()? {
+            // end of row
+            0 => {
+              out.fill();
+              break;
+            }
+            // end of image
+            1 => {
+              out.fill();
+              for row in rows {
+                out.start(row);
+                out.fill();
+              }
+              return Ok(out.pixels);
+            }
+            // move right and down; skipped pixels are black
+            2 => {
+              let (dx, dy) = (usize::from(src.byte()?), src.byte()?);
+              if dy > 0 {
+                out.fill();
+                for _ in 1..dy {
+                  out.start(rows.next().ok_or(CORRUPT)?);
+                  out.fill();
+                }
+                out.start(rows.next().ok_or(CORRUPT)?);
+                out.black(count)?;
+              }
+              out.black(dx)?;
+              count += dx;
+            }
+            // absolute run, padded to 2 bytes
+            n => {
+              let n = usize::from(n);
+              match rle {
+                Rle::Rle8 => {
+                  let run = src.take(n + n % 2)?;
+                  out.run(n, run.iter().map(|&index| color(index)))?;
+                }
+                Rle::Rle4 => {
+                  let len = n.div_ceil(2);
+                  let run = src.take(len + len % 2)?;
+                  out.run(n, (0..n).map(|i| color(nibble(run[i / 2], i))))?;
+                }
+                Rle::Rle24 => {
+                  let run = src.take(n * 3 + n % 2)?.as_chunks().0;
+                  out.run(
+                    n.min(out.left()),
+                    run.iter().map(|&[b, g, r]| [b, g, r, 255]),
+                  )?;
+                }
+              }
+              count += n;
+            }
+          },
+          // encoded run; RLE8 and RLE24 runs stop at the row end
+          n => {
+            let n = usize::from(n);
+            match rle {
+              Rle::Rle8 => {
+                let c = color(src.byte()?);
+                out.run(n.min(out.left()), iter::repeat(c))?;
+              }
+              Rle::Rle4 => {
+                let pair = src.byte()?;
+                out.run(n, (0..n).map(|i| color(nibble(pair, i))))?;
+              }
+              Rle::Rle24 => {
+                let bgr = src.take(3)?;
+                out.run(
+                  n.min(out.left()),
+                  iter::repeat([bgr[0], bgr[1], bgr[2], 255]),
+                )?;
+              }
+            }
+            count += n;
+          }
+        }
+      }
+    }
+    Ok(out.pixels)
+  }
+}
+
+/// An empty buffer with room for `size` bytes, or an error when the memory is not there (Blink
+/// fails the decode when it cannot allocate the frame)
+fn room_for(size: usize) -> Result<Vec<u8>, BmpError> {
+  let mut buffer = Vec::new();
+  buffer
+    .try_reserve_exact(size)
+    .map_err(|_| BmpError("out of memory"))?;
+  Ok(buffer)
+}
+
+/// One row of `BITS`-bit palette indexes (1, 2, 4 or 8), the first pixel in the high bits, for
+/// the rows pixel-simd is not faster on
+fn palette_row<const BITS: u32>(src: &[u8], dst: &mut [u8], palette: &Palette) {
+  let dst = dst.as_chunks_mut::<4>().0;
+  for (pixels, &byte) in dst.chunks_mut((8 / BITS) as usize).zip(src) {
+    for (k, px) in pixels.iter_mut().enumerate() {
+      *px = palette.color((byte << (BITS * k as u32)) >> (8 - BITS));
+    }
+  }
+}
+
+/// One narrow row of little-endian `N`-byte pixels, each channel read through its bitfield.
+/// Without an alpha bitfield the alpha is 255.
+fn packed_row<const N: usize>(src: &[u8], dst: &mut [u8], [r, g, b, a]: [Bitfield; 4]) {
+  let alpha = a.len != 0;
+  for (px, pixel) in dst
+    .as_chunks_mut::<4>()
+    .0
+    .iter_mut()
+    .zip(src.as_chunks::<N>().0)
+  {
+    let mut le = [0; 4];
+    le[..N].copy_from_slice(pixel);
+    let v = u32::from_le_bytes(le);
+    *px = [
+      b.read(v),
+      g.read(v),
+      r.read(v),
+      if alpha { a.read(v) } else { 255 },
+    ];
+  }
+}
+
+const CORRUPT: BmpError = BmpError("corrupt RLE data");
+
+struct Source<'a> {
+  data: &'a [u8],
+  pos: u64,
+}
+
+impl<'a> Source<'a> {
+  fn take(&mut self, n: usize) -> Result<&'a [u8], BmpError> {
+    let b = bytes(self.data, self.pos, n)?;
+    self.pos += n as u64;
+    Ok(b)
+  }
+
+  fn byte(&mut self) -> Result<u8, BmpError> {
+    Ok(self.take(1)?[0])
+  }
+}
+
+/// RLE output: the row being written and the next pixel in it. With no pixels (a dry run), it
+/// only follows the position.
+struct RleRows {
+  pixels: Vec<u8>,
+  width: usize,
+  row: usize,
+  x: usize,
+}
+
+impl RleRows {
+  fn new(width: usize, pixels: Vec<u8>) -> Self {
+    RleRows {
+      pixels,
+      width,
+      row: 0,
+      x: 0,
+    }
+  }
+
+  fn start(&mut self, row: usize) {
+    self.row = row;
+    self.x = 0;
+  }
+
+  fn left(&self) -> usize {
+    self.width - self.x
+  }
+
+  /// Writes `n` pixels of `colors`; past the row end is corrupt data. A dry run only moves the
+  /// position, so it does not cost a step per pixel.
+  fn run(&mut self, n: usize, colors: impl Iterator<Item = [u8; 4]>) -> Result<(), BmpError> {
+    let fits = n.min(self.left());
+    let at = (self.row * self.width + self.x) * 4;
+    if let Some(pixels) = self.pixels.get_mut(at..at + fits * 4) {
+      for (pixel, color) in pixels.as_chunks_mut::<4>().0.iter_mut().zip(colors) {
+        *pixel = color;
+      }
+    }
+    self.x += fits;
+    if fits < n { Err(CORRUPT) } else { Ok(()) }
+  }
+
+  fn black(&mut self, n: usize) -> Result<(), BmpError> {
+    self.run(n, iter::repeat([0, 0, 0, 255]))
+  }
+
+  /// Black up to the row end
+  fn fill(&mut self) {
+    let _ = self.black(self.left());
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::webcodecs::chrome_cases::{self, Expected, fnv1a};
+
+  #[test]
+  fn pixels_match_chrome() {
+    for case in chrome_cases::cases("bmp/") {
+      let name = &case.name;
+      let bmp = match (BmpDecoder::new(&case.data), &case.frames[..]) {
+        (Err(_), [Expected::OpenError]) => continue,
+        (Ok(_), [Expected::OpenError]) => panic!("{name}: Chrome fails to open it"),
+        (Err(e), _) => panic!("{name}: {e}"),
+        (Ok(bmp), _) => bmp,
+      };
+      match (bmp.decode(), &case.frames[..]) {
+        (Err(_), [Expected::Error]) => {}
+        (
+          Ok(pixels),
+          &[
+            Expected::Frame {
+              alpha,
+              width,
+              height,
+              hash,
+            },
+          ],
+        ) => {
+          assert_eq!(bmp.has_alpha(), alpha, "{name}");
+          assert_eq!((bmp.width(), bmp.height()), (width, height), "{name}");
+          assert_eq!(fnv1a(&pixels), hash, "{name} pixels");
+        }
+        (pixels, expected) => panic!("{name}: {:?} vs {expected:?}", pixels.err()),
+      }
+    }
+  }
+
+  #[test]
+  fn broken_files_do_not_panic() {
+    for case in chrome_cases::cases("bmp/") {
+      for data in chrome_cases::broken_copies(&case.data) {
+        let Ok(bmp) = BmpDecoder::new(&data) else {
+          continue;
+        };
+        // keep the test small; the size limit itself is Blink's (4 * w * h < 2^31)
+        if bmp.width() * bmp.height() > 1 << 20 {
+          continue;
+        }
+        if let Ok(pixels) = bmp.decode() {
+          assert_eq!(pixels.len(), (bmp.width() * bmp.height() * 4) as usize);
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn check_finds_the_errors_of_decode() {
+    for case in chrome_cases::cases("bmp/") {
+      for data in iter::once(case.data.clone()).chain(chrome_cases::broken_copies(&case.data)) {
+        let Ok(bmp) = BmpDecoder::new(&data) else {
+          continue;
+        };
+        if bmp.width() * bmp.height() > 1 << 20 {
+          continue;
+        }
+        assert_eq!(bmp.check(), bmp.decode().map(drop), "{}", case.name);
+      }
+    }
+  }
+
+  #[test]
+  fn missing_rows_fail_before_allocating() {
+    // 65535 x 8192 passes Blink's size limit; the 2 GiB output is never allocated
+    let mut data = b"BM".to_vec();
+    data.extend([0; 8]);
+    data.extend(54u32.to_le_bytes());
+    data.extend(40u32.to_le_bytes());
+    data.extend(65535i32.to_le_bytes());
+    data.extend(8192i32.to_le_bytes());
+    data.extend([1, 0, 24, 0]);
+    data.extend([0; 24]);
+    let bmp = BmpDecoder::new(&data).unwrap();
+    assert_eq!(bmp.decode(), Err(TRUNCATED));
+  }
+
+  #[test]
+  fn row_loops_match_pixel_simd() {
+    // palette_row and packed_row give the bytes of pixel-simd's rows, at widths on both sides
+    // of the narrow-row bounds (32 pixels for bitfields, `narrow` for palettes)
+    let mut seed = 7u32;
+    let mut byte = move || {
+      seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+      (seed >> 24) as u8
+    };
+    let widths = [1, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 300];
+    fn same_rows<const BITS: u32>(src: &[u8], width: usize, palette: &Palette) {
+      let (mut ours, mut simd) = (vec![0; 4 * width], vec![1; 4 * width]);
+      palette_row::<BITS>(src, &mut ours, palette);
+      pixel_simd::palette_to_bgra(src, &mut simd, BITS, palette);
+      assert_eq!(ours, simd, "{BITS}-bit, {width} px");
+    }
+    for colors in [2, 16, 17, 64, 65, 129, 256] {
+      let palette = Palette::new((0..colors).map(|_| [byte(), byte(), byte()]));
+      for width in widths {
+        let src: Vec<u8> = (0..width + 3).map(|_| byte()).collect();
+        same_rows::<1>(&src, width, &palette);
+        same_rows::<2>(&src, width, &palette);
+        same_rows::<4>(&src, width, &palette);
+        same_rows::<8>(&src, width, &palette);
+      }
+    }
+    // 565, 565 with R and B swapped, 1555 and 4444 with alpha; 2-10-10-10 and 10-10-10-2
+    // with and without alpha
+    let masks16 = [
+      [0xF800, 0x7E0, 0x1F, 0],
+      [0x1F, 0x7E0, 0xF800, 0],
+      [0x7C00, 0x3E0, 0x1F, 0x8000],
+      [0xF00, 0xF0, 0xF, 0xF000],
+    ];
+    let masks32 = [
+      [0x3FF0_0000, 0xF_FC00, 0x3FF, 0xC000_0000],
+      [0x3FF0_0000, 0xF_FC00, 0x3FF, 0],
+      [0xFFC0_0000, 0x3F_F000, 0xFFC, 0x3],
+      [0xFFC0_0000, 0x3F_F000, 0xFFC, 0],
+    ];
+    for width in widths {
+      let src: Vec<u8> = (0..4 * width).map(|_| byte()).collect();
+      for (bits, masks) in masks16
+        .iter()
+        .map(|m| (16, m))
+        .chain(masks32.iter().map(|m| (32, m)))
+      {
+        let fields = masks.map(|m| Bitfield::from_mask(m, bits).unwrap());
+        let alpha = fields[3].len != 0;
+        let (mut ours, mut simd) = (vec![0; 4 * width], vec![1; 4 * width]);
+        if bits == 16 {
+          packed_row::<2>(&src, &mut ours, fields);
+          pixel_simd::bitfields16_to_bgra(&src, &mut simd, fields, alpha);
+        } else {
+          packed_row::<4>(&src, &mut ours, fields);
+          pixel_simd::bitfields32_to_bgra(&src, &mut simd, fields, alpha);
+        }
+        assert_eq!(ours, simd, "{masks:x?}, {width} px");
+      }
+    }
+  }
+}

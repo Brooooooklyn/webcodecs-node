@@ -4,7 +4,7 @@
 use core::arch::aarch64::*;
 
 use crate::simd::zip_chunks;
-use crate::{Alpha, Be16, Bitfield};
+use crate::{Alpha, Be16, Bitfield, Opaque, Palette};
 
 /// The first 16 bytes of `src`.
 #[inline]
@@ -207,4 +207,168 @@ pub(crate) fn bitfields32_to_bgra(
     };
     store(d, vreinterpretq_u8_u32(bgra));
   })
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn opaque_to_bgra(src: &[u8], dst: &mut [u8], layout: Opaque) -> usize {
+  match layout {
+    Opaque::Bgr => {
+      // 16 pixels from 3 vectors, through tables over 1 or 2 of them: pixels 0 to 3 in the 1st,
+      // 4 to 7 in the 1st and 2nd, 8 to 11 in the 2nd and 3rd, 12 to 15 in the 3rd. vqtbl gives
+      // 0 for index 255, which `opaque` then sets to 255.
+      let order = [
+        [0, 1, 2, 255, 3, 4, 5, 255, 6, 7, 8, 255, 9, 10, 11, 255],
+        [
+          12, 13, 14, 255, 15, 16, 17, 255, 18, 19, 20, 255, 21, 22, 23, 255,
+        ],
+        [
+          8, 9, 10, 255, 11, 12, 13, 255, 14, 15, 16, 255, 17, 18, 19, 255,
+        ],
+        [4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255, 13, 14, 15, 255],
+      ]
+      .map(|order| load(&order));
+      16 * zip_chunks::<48, 64>(src, dst, |s, d| {
+        let (q0, q1, q2) = (load(s), load(&s[16..]), load(&s[32..]));
+        store(d, opaque(vqtbl1q_u8(q0, order[0])));
+        store(
+          &mut d[16..],
+          opaque(vqtbl2q_u8(uint8x16x2_t(q0, q1), order[1])),
+        );
+        store(
+          &mut d[32..],
+          opaque(vqtbl2q_u8(uint8x16x2_t(q1, q2), order[2])),
+        );
+        store(&mut d[48..], opaque(vqtbl1q_u8(q2, order[3])));
+      })
+    }
+    Opaque::Bgrx => 4 * zip_chunks::<16, 16>(src, dst, |s, d| store(d, opaque(load(s)))),
+    Opaque::Xbgr => {
+      4 * zip_chunks::<16, 16>(src, dst, |s, d| {
+        let bgr = vshrq_n_u32::<8>(vreinterpretq_u32_u8(load(s)));
+        store(d, opaque(vreinterpretq_u8_u32(bgr)));
+      })
+    }
+  }
+}
+
+/// The B, G and R planes of a palette's first 16 * `T` colors (`T`: 1 to 4, or 8).
+struct Planes<const T: usize>([[uint8x16_t; T]; 3]);
+
+impl<const T: usize> Planes<T> {
+  #[inline]
+  #[target_feature(enable = "neon")]
+  fn new(palette: &Palette) -> Planes<T> {
+    Planes(
+      palette
+        .planes
+        .each_ref()
+        .map(|plane| core::array::from_fn(|i| load(&plane[16 * i..]))),
+    )
+  }
+
+  /// Plane `c` at 16 indexes; 0 past the plane.
+  #[inline]
+  #[target_feature(enable = "neon")]
+  fn get(&self, c: usize, index: uint8x16_t) -> uint8x16_t {
+    let t = &self.0[c];
+    match T {
+      1 => vqtbl1q_u8(t[0], index),
+      2 => vqtbl2q_u8(uint8x16x2_t(t[0], t[1]), index),
+      3 => vqtbl3q_u8(uint8x16x3_t(t[0], t[1], t[2]), index),
+      4 => vqtbl4q_u8(uint8x16x4_t(t[0], t[1], t[2], t[3]), index),
+      // then colors 64 to 127, where the index minus 64 is under 64
+      _ => vqtbx4q_u8(
+        vqtbl4q_u8(uint8x16x4_t(t[0], t[1], t[2], t[3]), index),
+        uint8x16x4_t(t[4], t[5], t[6], t[7]),
+        vsubq_u8(index, vdupq_n_u8(64)),
+      ),
+    }
+  }
+
+  /// The colors of 16 indexes, as BGRA pixels at the start of `dst`.
+  #[inline]
+  #[target_feature(enable = "neon")]
+  fn store(&self, dst: &mut [u8], index: uint8x16_t) {
+    let [b, g, r] = [0, 1, 2].map(|c| self.get(c, index));
+    let a = vdupq_n_u8(255);
+    let bg = [vzip1q_u8(b, g), vzip2q_u8(b, g)].map(|v| vreinterpretq_u16_u8(v));
+    let ra = [vzip1q_u8(r, a), vzip2q_u8(r, a)].map(|v| vreinterpretq_u16_u8(v));
+    for (i, (bg, ra)) in bg.into_iter().zip(ra).enumerate() {
+      store(&mut dst[32 * i..], vreinterpretq_u8_u16(vzip1q_u16(bg, ra)));
+      store(
+        &mut dst[32 * i + 16..],
+        vreinterpretq_u8_u16(vzip2q_u16(bg, ra)),
+      );
+    }
+  }
+}
+
+/// The largest palette of 8-bit indexes that the lookups below take.
+pub(crate) const PALETTE_COLORS: usize = 128;
+
+#[target_feature(enable = "neon")]
+pub(crate) fn palette_to_bgra(src: &[u8], dst: &mut [u8], bits: u32, palette: &Palette) -> usize {
+  // 1, 2 and 4-bit indexes are under 16: one register per plane
+  match bits {
+    1 => {
+      let p = Planes::<1>::new(palette);
+      let bit = load(&[128, 64, 32, 16, 8, 4, 2, 1, 128, 64, 32, 16, 8, 4, 2, 1]);
+      128
+        * zip_chunks::<16, 512>(src, dst, |s, d| {
+          let x = load(s);
+          for i in 0..8 {
+            // bytes 2i and 2i + 1, 8 times each, to 16 indexes of 0 or 1
+            let pair = vqtbl1q_u8(x, vcombine_u8(vdup_n_u8(2 * i), vdup_n_u8(2 * i + 1)));
+            let index = vandq_u8(vtstq_u8(pair, bit), vdupq_n_u8(1));
+            p.store(&mut d[64 * usize::from(i)..], index);
+          }
+        })
+    }
+    2 => {
+      let p = Planes::<1>::new(palette);
+      64 * zip_chunks::<16, 256>(src, dst, |s, d| {
+        let (x, three) = (load(s), vdupq_n_u8(3));
+        let a = vshrq_n_u8::<6>(x);
+        let b = vandq_u8(vshrq_n_u8::<4>(x), three);
+        let c = vandq_u8(vshrq_n_u8::<2>(x), three);
+        let e = vandq_u8(x, three);
+        // a, b, c, e of each byte in turn
+        let ab = [vzip1q_u8(a, b), vzip2q_u8(a, b)].map(|v| vreinterpretq_u16_u8(v));
+        let ce = [vzip1q_u8(c, e), vzip2q_u8(c, e)].map(|v| vreinterpretq_u16_u8(v));
+        for (i, (ab, ce)) in ab.into_iter().zip(ce).enumerate() {
+          p.store(&mut d[128 * i..], vreinterpretq_u8_u16(vzip1q_u16(ab, ce)));
+          p.store(
+            &mut d[128 * i + 64..],
+            vreinterpretq_u8_u16(vzip2q_u16(ab, ce)),
+          );
+        }
+      })
+    }
+    4 => {
+      let p = Planes::<1>::new(palette);
+      32 * zip_chunks::<16, 128>(src, dst, |s, d| {
+        let x = load(s);
+        let (high, low) = (vshrq_n_u8::<4>(x), vandq_u8(x, vdupq_n_u8(15)));
+        p.store(d, vzip1q_u8(high, low));
+        p.store(&mut d[64..], vzip2q_u8(high, low));
+      })
+    }
+    // A larger table is slower to look up: past 128 colors the scalar code is faster.
+    _ => match palette.len {
+      0..=16 => indexes::<1>(src, dst, palette),
+      17..=32 => indexes::<2>(src, dst, palette),
+      33..=48 => indexes::<3>(src, dst, palette),
+      49..=64 => indexes::<4>(src, dst, palette),
+      65..=PALETTE_COLORS => indexes::<8>(src, dst, palette),
+      _ => 0,
+    },
+  }
+}
+
+/// 8-bit indexes, with a palette of at most 16 * `T` colors.
+#[inline]
+#[target_feature(enable = "neon")]
+fn indexes<const T: usize>(src: &[u8], dst: &mut [u8], palette: &Palette) -> usize {
+  let p = Planes::<T>::new(palette);
+  16 * zip_chunks::<16, 64>(src, dst, |s, d| p.store(d, load(s)))
 }

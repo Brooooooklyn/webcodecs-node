@@ -1,7 +1,7 @@
 //! The scalar code: the reference of every SIMD path, and what each runs past its last whole
 //! vector.
 
-use crate::{Alpha, Be16, Bitfield};
+use crate::{Alpha, Be16, Bitfield, Opaque, Palette};
 
 pub(crate) fn edit_bgra(pixels: &mut [u8], swap: bool, alpha: Alpha) {
   for px in pixels.as_chunks_mut::<4>().0 {
@@ -26,18 +26,60 @@ pub(crate) fn be16_to_bgra(src: &[u8], dst: &mut [u8], layout: Be16, alpha: bool
   }
 }
 
-/// `size`-byte little-endian words, each field read like the image crate does.
+/// `size`-byte little-endian words (2 or 4), each field read like the image crate does.
 pub(crate) fn bitfields_to_bgra(
   src: &[u8],
   dst: &mut [u8],
   size: usize,
+  fields: [Bitfield; 4],
+  alpha: bool,
+) {
+  // a loop for each size, with a constant word load
+  match size {
+    2 => words_to_bgra::<2>(src, dst, fields, alpha),
+    _ => words_to_bgra::<4>(src, dst, fields, alpha),
+  }
+}
+
+fn words_to_bgra<const N: usize>(
+  src: &[u8],
+  dst: &mut [u8],
   [r, g, b, a]: [Bitfield; 4],
   alpha: bool,
 ) {
-  unpack(src, dst, size, alpha, |p| {
-    let word = p.iter().rev().fold(0, |word, &v| word << 8 | u32::from(v));
+  unpack(src, dst, N, alpha, |p| {
+    let mut le = [0; 4];
+    le[..N].copy_from_slice(p);
+    let word = u32::from_le_bytes(le);
     [b.read(word), g.read(word), r.read(word), a.read(word)]
   })
+}
+
+pub(crate) fn opaque_to_bgra(src: &[u8], dst: &mut [u8], layout: Opaque) {
+  match layout {
+    Opaque::Bgr => unpack(src, dst, 3, false, |p| [p[0], p[1], p[2], 255]),
+    Opaque::Bgrx => unpack(src, dst, 4, false, |p| [p[0], p[1], p[2], 255]),
+    Opaque::Xbgr => unpack(src, dst, 4, false, |p| [p[1], p[2], p[3], 255]),
+  }
+}
+
+pub(crate) fn palette_to_bgra(src: &[u8], dst: &mut [u8], bits: u32, palette: &Palette) {
+  // a loop for each size, with constant shifts
+  match bits {
+    1 => indexes_to_bgra::<1>(src, dst, palette),
+    2 => indexes_to_bgra::<2>(src, dst, palette),
+    4 => indexes_to_bgra::<4>(src, dst, palette),
+    _ => indexes_to_bgra::<8>(src, dst, palette),
+  }
+}
+
+fn indexes_to_bgra<const BITS: u32>(src: &[u8], dst: &mut [u8], palette: &Palette) {
+  let pixels = dst.as_chunks_mut::<4>().0.chunks_mut((8 / BITS) as usize);
+  for (pixels, &byte) in pixels.zip(src) {
+    for (k, px) in pixels.iter_mut().enumerate() {
+      *px = palette.color((byte << (BITS * k as u32)) >> (8 - BITS));
+    }
+  }
 }
 
 /// BGRA pixels from the packed `size`-byte pixels of `src`: `read` gives the B, G, R and A of

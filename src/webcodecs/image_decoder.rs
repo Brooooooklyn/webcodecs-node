@@ -1,21 +1,26 @@
 //! ImageDecoder - WebCodecs API implementation
 //!
-//! Provides image decoding functionality using FFmpeg.
+//! Provides image decoding functionality: GIF and BMP with the decoders that follow Chrome
+//! (gif_decoder, bmp_decoder), the other formats with FFmpeg.
 //! See: <https://developer.mozilla.org/en-US/docs/Web/API/ImageDecoder>
 
 use crate::codec::demuxer::{DemuxerContext, MediaType};
 use crate::codec::jpeg::{JpegDecode, decode_jpeg, jpeg_info};
 use crate::codec::{CodecContext, CodecError, DecoderConfig, Frame, Packet};
-use crate::ffi::avutil::{av_opt_set_int, av_rescale_q, opt_flag};
-use crate::ffi::{AV_NOPTS_VALUE, AVCodecID, AVPixelFormat, AVRational, check_error};
+use crate::ffi::avutil::{av_image_check_size, av_rescale_q};
+use crate::ffi::{
+  AV_NOPTS_VALUE, AVCodecID, AVColorRange, AVColorSpace, AVPixelFormat, AVRational,
+};
 use crate::webcodecs::avif::{self, Avif, AvifImage, AvifSamples};
+use crate::webcodecs::bmp_decoder::{self, BmpDecoder};
 use crate::webcodecs::buffer_source::{self, Uint8ArrayCopy};
 use crate::webcodecs::decoded_frame::{DecodedSource, avif_frame, decoded_frame_format};
 use crate::webcodecs::error::{
   DOMExceptionName, abort_error, invalid_state_error, native_dom_exception_error,
   native_range_error, throw_invalid_state_error,
 };
-use crate::webcodecs::image_hints::{PixelHint, bmp_header, gif_frame_alpha, png_header};
+use crate::webcodecs::gif_decoder::{self, GifDecoder};
+use crate::webcodecs::image_hints::{PixelHint, png_header};
 use crate::webcodecs::{VideoFrame, VideoPixelFormat};
 use futures::stream::StreamExt;
 use napi::bindgen_prelude::*;
@@ -25,6 +30,7 @@ use napi::tokio::sync::mpsc::{
 };
 use napi_derive::napi;
 use parking_lot::RwLock as ParkingLotRwLock;
+use std::collections::HashSet;
 use std::sync::{
   Arc, Mutex, Weak,
   atomic::{AtomicBool, AtomicU8, Ordering},
@@ -218,6 +224,26 @@ struct ImageTrackData {
   frame_count: u32,
   /// Number of times the animation repeats (Infinity for infinite)
   repetition_count: f64,
+}
+
+impl ImageTrackData {
+  /// The track before its metadata is known
+  fn initial(codec_id: Option<AVCodecID>) -> Self {
+    // Determine if this is an animated format
+    let animated = matches!(
+      codec_id,
+      Some(AVCodecID::Gif)
+        | Some(AVCodecID::Webp)
+        | Some(AVCodecID::Jpegxl)
+        | Some(AVCodecID::JpegxlAnim)
+    );
+    ImageTrackData {
+      animated,
+      // For static images, there's one frame; for animated, we'll detect later
+      frame_count: if animated { 0 } else { 1 },
+      repetition_count: if animated { f64::INFINITY } else { 0.0 },
+    }
+  }
 }
 
 /// Internal state for ImageTrackList (shared with ImageTrack instances)
@@ -435,9 +461,6 @@ impl ImageTrackList {
   }
 }
 
-/// A decoded frame, shared, with the WebCodecs format that describes it and its duration
-type CachedFrame = (Arc<ParkingLotRwLock<Frame>>, VideoPixelFormat, Option<i64>);
-
 /// Internal decoder state
 struct ImageDecoderInner {
   /// Original encoded data
@@ -502,8 +525,22 @@ struct ImageDecoderInner {
   tracks: ImageTrackList,
   /// Whether decoder is closed
   closed: bool,
-  /// Cached decoded frames (for animated images, populated on first decode)
+  /// Cached frames (for animated images, populated on first decode)
   cached_frames: Option<Vec<CachedFrame>>,
+  /// The frames Chrome tried and failed to decode. When they are all the frames, Chrome fails
+  /// the decoder. A reset() keeps them, like Chrome's.
+  failed_frames: HashSet<usize>,
+  /// Whether every frame failed to decode: the decoder then closed, and the decode() calls still
+  /// pending reject with EncodingError (see `closed_error`). As for `frame_failed`, a failure
+  /// found by a decode() that a reset() made stale leaves the decoder open, and the next decode()
+  /// closes it on the JS thread (`apply_frame_failure`). A close() that comes first clears it.
+  frames_failed: bool,
+  /// The ticket of the next decode() call. Like Chrome, the calls are handled one at a time, in
+  /// call order: each one waits until `decode_turn` is its ticket, also one made on a closed
+  /// decoder, so the promises settle in call order.
+  next_decode: u64,
+  /// The ticket of the decode() call being handled
+  decode_turn: u64,
   /// Incremented when reset/close invalidates in-flight decode work.
   cache_epoch: u64,
   /// Encoded byte length represented by the current cache. Prevents an older
@@ -534,7 +571,7 @@ impl ImageDecoderInner {
   }
 
   /// What reset() does to an open decoder. Like Chrome, whose decoder stays failed after a
-  /// reset(), it keeps `frame_failed`.
+  /// reset(), it keeps `frame_failed` and `frames_failed`.
   fn reset(&mut self) {
     self.context = None;
     self.cached_frames = None;
@@ -562,7 +599,8 @@ impl ImageDecoderInner {
     }
   }
 
-  /// Whether the metadata was rejected or a frame failed (see `closed_error`)
+  /// Whether the metadata was rejected or a JPEG frame failed (`frame_failed`). Every frame of a
+  /// GIF or BMP failing (`frames_failed`) does not count here, only in `closed_error`.
   fn failed(&self) -> bool {
     self.tracks.failed.load(Ordering::Acquire) || self.frame_failed.is_some()
   }
@@ -575,6 +613,23 @@ impl ImageDecoderInner {
       .and_then(WeakUnboundedSender::upgrade)
       .is_some_and(|items| items.send(item).is_ok())
   }
+}
+
+/// A frame of the cache
+#[derive(Clone)]
+enum CachedFrame {
+  /// Shared through an Arc, with the WebCodecs format that describes it and its duration
+  Decoded {
+    frame: Arc<ParkingLotRwLock<Frame>>,
+    format: VideoPixelFormat,
+    duration: Option<i64>,
+  },
+  /// Chrome fails to decode it. `required`: the frame it is drawn on, when that one fails too.
+  /// Chrome then tries both, and fails both.
+  Failed { required: Option<usize> },
+  /// Its header has arrived, and not yet all its data. Chrome counts it, and a decode() of it
+  /// waits for the data.
+  Pending,
 }
 
 /// ImageDecoder - WebCodecs-compliant image decoder
@@ -606,29 +661,13 @@ impl ImageDecoder {
     // Parse MIME type to codec ID - accept invalid types (will fail at decode time per W3C spec)
     let codec_id = parse_mime_type(&init.mime_type).ok();
 
-    // Determine if this is an animated format
-    let animated = matches!(
-      codec_id,
-      Some(AVCodecID::Gif)
-        | Some(AVCodecID::Webp)
-        | Some(AVCodecID::Jpegxl)
-        | Some(AVCodecID::JpegxlAnim)
-    );
-
-    // For static images, there's one frame; for animated, we'll detect later
-    let frame_count = if animated { 0 } else { 1 };
-
     // Create async signaling primitives
     let complete = Arc::new(AtomicBool::new(false));
     let ready = Arc::new(AtomicBool::new(false));
     let ready_notify = Arc::new(Notify::new());
 
     let track_list_inner = Arc::new(Mutex::new(ImageTrackListInner {
-      tracks: vec![ImageTrackData {
-        animated,
-        frame_count,
-        repetition_count: if animated { f64::INFINITY } else { 0.0 },
-      }],
+      tracks: vec![ImageTrackData::initial(codec_id)],
       selected_index: Some(0),
     }));
 
@@ -662,6 +701,10 @@ impl ImageDecoder {
       tracks: tracks.clone(),
       closed: false,
       cached_frames: None,
+      failed_frames: HashSet::new(),
+      frames_failed: false,
+      next_decode: 0,
+      decode_turn: 0,
       cache_epoch: 0,
       cached_data_len: 0,
       color_space_conversion: init.color_space_conversion,
@@ -700,9 +743,10 @@ impl ImageDecoder {
       let ready_inner = inner.clone();
       let ready_promise = env.spawn_future_with_callback(
         async move {
-          let _ =
-            spawn_blocking(move || cache_decoded_frames(&parse_inner, FrameCall::Probe, false))
-              .await;
+          let _ = spawn_blocking(move || {
+            cache_decoded_frames(&parse_inner, FrameCall::Probe, true, false)
+          })
+          .await;
           Ok(())
         },
         move |_, ()| {
@@ -769,7 +813,7 @@ impl ImageDecoder {
               if jpeg_try_wanted(&inner_clone, epoch) {
                 let decode_inner = inner_clone.clone();
                 let tried = spawn_blocking(move || {
-                  cache_decoded_frames(&decode_inner, FrameCall::Arrival(epoch), false)
+                  cache_decoded_frames(&decode_inner, FrameCall::Arrival(epoch), false, false)
                 })
                 .await;
                 // A rejected metadata closes the decoder here, as for a probe.
@@ -802,20 +846,36 @@ impl ImageDecoder {
               if close_if_metadata_failed(&inner_clone) || closed_on_failure(&inner_clone) {
                 return Ok(StreamEnd::Aborted(!data_complete.load(Ordering::Acquire)));
               }
-              // A stream error is terminal. Mark the input complete before
-              // waking decode waiters so they reject instead of waiting for an
-              // update that can never arrive. A JPEG frame failure that a decode() has not
-              // applied yet comes first: the JS thread decides (`end_with_frame_failure`).
+              // A stream error is terminal. Like Chrome, decode the data that came, as at EOF,
+              // and mark the input complete before waking decode waiters so they reject instead
+              // of waiting for an update that can never arrive. A JPEG frame failure found
+              // before the error that a decode() has not applied yet comes first: the JS thread
+              // decides (`end_with_frame_failure`).
               let pending = inner_clone.lock().is_ok_and(|mut inner_guard| {
                 inner_guard.all_data = true;
-                let pending = frame_failure_pending(&inner_guard);
+                frame_failure_pending(&inner_guard)
+              });
+              let final_inner = inner_clone.clone();
+              let _ = spawn_blocking(move || {
+                cache_decoded_frames(&final_inner, FrameCall::Probe, true, true)
+              })
+              .await;
+              // A metadata that this refresh rejects closes the decoder, and `completed` rejects
+              // with the error. So does a close on a failure that a decode() made meanwhile,
+              // unless the failure was pending: the JS thread decides. A frame failure that the
+              // refresh finds is only recorded (see `ImageDecoderInner::frame_failed`).
+              if close_if_metadata_failed(&inner_clone)
+                || (!pending && closed_on_failure(&inner_clone))
+              {
+                return Err(error);
+              }
+              if let Ok(mut inner_guard) = inner_clone.lock() {
                 if pending {
                   inner_guard.end_deferred = true;
                 } else {
                   inner_guard.complete.store(true, Ordering::Release);
                 }
-                pending
-              });
+              }
               signal_tracks_ready(&inner_clone);
               if pending {
                 return Ok(StreamEnd::FrameFailure(Some(error)));
@@ -844,7 +904,7 @@ impl ImageDecoder {
             let call = arrival.map_or(FrameCall::Probe, FrameCall::Arrival);
             let probe_inner = inner_clone.clone();
             let tried =
-              spawn_blocking(move || cache_decoded_frames(&probe_inner, call, false)).await;
+              spawn_blocking(move || cache_decoded_frames(&probe_inner, call, false, false)).await;
             // A rejected metadata closes the decoder at once. A frame failure does not (see
             // `StreamItem::Decode`): a decode() that waits wakes and applies it.
             if close_if_metadata_failed(&inner_clone) {
@@ -871,7 +931,8 @@ impl ImageDecoder {
         });
         let final_inner = inner_clone.clone();
         let _ =
-          spawn_blocking(move || cache_decoded_frames(&final_inner, FrameCall::Probe, true)).await;
+          spawn_blocking(move || cache_decoded_frames(&final_inner, FrameCall::Probe, true, true))
+            .await;
         if close_if_metadata_failed(&inner_clone) || closed_on_failure(&inner_clone) {
           return Ok(StreamEnd::Aborted(!data_complete.load(Ordering::Acquire)));
         }
@@ -954,20 +1015,9 @@ impl ImageDecoder {
   /// Promise that resolves when data is fully loaded (per WebCodecs spec)
   /// Returns a new promise chained from the stored promise (allows multiple accesses)
   #[napi(getter)]
-  pub fn completed(&self, env: Env, this: This) -> Result<PromiseRaw<'_, ()>> {
-    // Check if closed
-    {
-      let inner = self
-        .inner
-        .lock()
-        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-      if inner.closed {
-        return throw_invalid_state_error(&env, "ImageDecoder is closed");
-      }
-    }
-
-    // Get stored promise from this and chain a new promise for this access. Like Chrome,
-    // never report its rejection as unhandled.
+  pub fn completed(&self, this: This) -> Result<PromiseRaw<'_, ()>> {
+    // Get stored promise from this and chain a new promise for this access. Like Chrome, also
+    // once the decoder is closed, and never report its rejection as unhandled.
     let promise: PromiseRaw<()> = this.get_named_property(COMPLETED_PROMISE)?;
     let completed = promise.then(|_| Ok(()))?;
     completed.catch(|_: CallbackContext<Unknown>| Ok(()))?;
@@ -1011,9 +1061,10 @@ impl ImageDecoder {
     let inner = self.inner.clone();
     let frame_index = options.as_ref().and_then(|o| o.frame_index).unwrap_or(0) as usize;
     // Read now: a decode() made before the decoder fails rejects differently from one made
-    // after (see `closed_error`), and one made before a reset() no longer decodes part of the
-    // data (see `FrameCall::Decode`).
-    let (closed, epoch, jpeg_request, post) = {
+    // after (see `closed_error`), and one made before a reset() rejects (see `abort_if_reset`).
+    // Like Chrome, the calls are handled in call order: what one finds can depend on the frames
+    // that the ones before it failed.
+    let (ticket, closed, epoch, jpeg_request, post) = {
       let mut guard = inner
         .lock()
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
@@ -1029,7 +1080,11 @@ impl ImageDecoder {
       if post {
         guard.jpeg_unposted += 1;
       }
+      // Every call takes a ticket, also one made on a closed decoder (see `DecodeTurn`)
+      let ticket = guard.next_decode;
+      guard.next_decode += 1;
       (
+        ticket,
         guard.closed,
         guard.cache_epoch,
         jpeg_request,
@@ -1050,8 +1105,13 @@ impl ImageDecoder {
 
     // Keep the Rust error as the resolved future value so the completion
     // callback can construct the precise native JavaScript exception class.
+    let turn_inner = inner.clone();
     let decode = async move {
+      // Like Chrome, a call made on a closed decoder rejects with InvalidStateError. Chrome's
+      // close() rejects the calls made before it at once; here they reject on their turns, so it
+      // waits for them, and the promises settle in call order.
       if closed {
+        wait_for_turn(&inner, ticket).await?;
         return Err(invalid_state_error("ImageDecoder is closed"));
       }
 
@@ -1076,21 +1136,29 @@ impl ImageDecoder {
         // before the blocking cache check so notify_waiters() reaches every
         // concurrent decode, rather than relying on a single stored permit.
         notified.as_mut().enable();
-        abort_if_reset(&inner, epoch)?;
-        let decode_inner = inner.clone();
-        let result = spawn_blocking(move || decode_cached_frame(&decode_inner, frame_index, epoch))
-          .await
-          .map_err(|join_error| {
-            Error::new(
-              Status::GenericFailure,
-              format!("Decode task failed: {}", join_error),
-            )
-          })?;
-        // A reset() that came while it ran: what it found is dropped.
-        abort_if_reset(&inner, epoch)?;
+        let turn = inner
+          .lock()
+          .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?
+          .decode_turn;
+        if turn == ticket {
+          // Only on its turn: every result, this error too, gives the turn to the next call.
+          abort_if_reset(&inner, epoch)?;
+          let decode_inner = inner.clone();
+          let result =
+            spawn_blocking(move || decode_cached_frame(&decode_inner, frame_index, epoch))
+              .await
+              .map_err(|join_error| {
+                Error::new(
+                  Status::GenericFailure,
+                  format!("Decode task failed: {}", join_error),
+                )
+              })?;
+          // A reset() that came while it ran: what it found is dropped.
+          abort_if_reset(&inner, epoch)?;
 
-        if let Some(result) = result? {
-          return Ok(result);
+          if let Some(result) = result? {
+            return Ok(result);
+          }
         }
 
         notified.await;
@@ -1108,16 +1176,18 @@ impl ImageDecoder {
       result
     };
 
-    env.spawn_future_with_callback(
-      async move { Ok(decode.await) },
-      move |env, result| match result {
+    let turn = DecodeTurn(turn_inner);
+    env.spawn_future_with_callback(async move { Ok(decode.await) }, move |env, result| {
+      // A frame failure counts first (`apply_frame_failure`), then the next decode() call's
+      // turn (see `DecodeTurn`)
+      let result =
+        result.map_err(|error| apply_frame_failure(&settle_inner, epoch, frame_index, error));
+      drop(turn);
+      match result {
         Ok(result) => Ok(result),
-        Err(error) => Err(native_image_decode_error(
-          env,
-          apply_frame_failure(&settle_inner, epoch, frame_index, error),
-        )?),
-      },
-    )
+        Err(error) => Err(native_image_decode_error(env, error)?),
+      }
+    })
   }
 
   /// Reset the decoder
@@ -1146,11 +1216,24 @@ impl ImageDecoder {
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
     // A metadata failure counts once `close_if_metadata_failed` has closed the decoder. A close()
     // that comes first wins, also when a worker thread already found the failure
-    // (`reject_metadata`).
+    // (`reject_metadata`). A GIF track goes back to how it was built the same way: until
+    // `tracks.ready` is signalled, what a worker thread may have filled in
+    // (`cache_decoded_frames`) does not count. Only GIF: gif_decoder often finishes before the JS
+    // task that made the decoder reaches close(), so without this the track after an early
+    // close() changes from run to run. The other formats keep what the worker found, as before.
     if !inner.closed {
-      // The same for a frame failure (`jpeg_frame`), also one that a reset() kept
+      // The same for a frame failure (`jpeg_frame`, every frame of a GIF or BMP), also one that a
+      // reset() kept
       inner.frame_failed = None;
+      inner.frames_failed = false;
       inner.tracks.failed.store(false, Ordering::Release);
+      if inner.codec_id == Some(AVCodecID::Gif)
+        && !inner.tracks.ready.load(Ordering::Acquire)
+        && let Ok(mut tracks) = inner.tracks.inner.lock()
+        && let Some(track) = tracks.tracks.get_mut(0)
+      {
+        *track = ImageTrackData::initial(inner.codec_id);
+      }
     }
     inner.close();
     Ok(())
@@ -1204,13 +1287,16 @@ fn decode_cached_frame(
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
     // A frame failure that left the decoder open: one that the collector found for this
-    // decode(), or one that a reset() kept (`frame_failed`). Like Chrome's decoder, which stays
-    // failed, the decode() fails, whatever the frame index. It closes the decoder on the JS
-    // thread, where a reset() made first still keeps the failure (`apply_frame_failure`). Once
-    // the JS thread has read the end of the stream, it waits for the end's result (`complete`),
-    // as Chrome answers in the order it was asked, unless the collector left that to the JS
-    // thread (`end_deferred`).
-    if !guard.closed && guard.frame_failed.is_some() && guard.cache_epoch == epoch {
+    // decode(), or one that a reset() kept (`frame_failed`, and the frames that all failed
+    // below). Like Chrome's decoder, which stays failed, the decode() fails, whatever the frame
+    // index. It closes the decoder on the JS thread, where a reset() made first still keeps the
+    // failure (`apply_frame_failure`). Once the JS thread has read the end of a JPEG stream, it
+    // waits for the end's result (`complete`), as Chrome answers in the order it was asked,
+    // unless the collector left that to the JS thread (`end_deferred`).
+    if !guard.closed
+      && (guard.frame_failed.is_some() || guard.frames_failed)
+      && guard.cache_epoch == epoch
+    {
       if guard.stream_ended && !guard.complete.load(Ordering::Acquire) && !guard.end_deferred {
         return Ok(None);
       }
@@ -1241,11 +1327,11 @@ fn decode_cached_frame(
   // far is tried by the collector, in the stream's order (`FrameCall::Arrival`); here only once
   // the data is complete (`FrameCall::Decode`).
   if needs_cache && (data_complete || jpeg) {
-    cache_decoded_frames(inner, FrameCall::Decode(epoch), false)
+    cache_decoded_frames(inner, FrameCall::Decode(epoch), data_complete, false)
       .map_err(|error| decode_failure(inner, epoch, frame_index, error))?;
   }
 
-  let guard = inner
+  let mut guard = inner
     .lock()
     .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
   if guard.closed {
@@ -1277,7 +1363,55 @@ fn decode_cached_frame(
   }
 
   // Clone the Arc to share the frame data (no pixel copy needed).
-  let (frame_arc, format, duration) = frames[frame_index].clone();
+  let (frame_arc, format, duration) = match &frames[frame_index] {
+    CachedFrame::Decoded {
+      frame,
+      format,
+      duration,
+    } => (frame.clone(), *format, *duration),
+    CachedFrame::Pending if !data_complete => return Ok(None),
+    CachedFrame::Pending => {
+      return Err(Error::new(
+        Status::GenericFailure,
+        format!(
+          "RangeError: Unexpected end of image. Request for frame index {frame_index} can't be satisfied."
+        ),
+      ));
+    }
+    CachedFrame::Failed { .. } => {
+      // Chrome tries the frame, and the failed frames it is drawn on, and remembers them
+      let mut failed = vec![frame_index];
+      while let CachedFrame::Failed { required: Some(i) } = frames[failed[failed.len() - 1]] {
+        failed.push(i);
+      }
+      let count = frames.len();
+      guard.failed_frames.extend(failed);
+      // Once every frame failed, Chrome fails the decoder and closes it. While more data can
+      // come, it waits for the data before it rejects.
+      if guard.failed_frames.len() == count {
+        guard.frames_failed = true;
+        // Not for a decode() that a reset() made stale (it built these frames after the reset()):
+        // like Chrome, whose reset() drops the result of a decode in flight, it rejects with
+        // AbortError (`abort_if_reset`), and the decoder stays failed: the next decode() closes it.
+        if guard.cache_epoch == epoch {
+          guard.close();
+        }
+        return Err(Error::new(
+          Status::GenericFailure,
+          format!("Failed to decode frame at index {frame_index}"),
+        ));
+      }
+      if !data_complete {
+        return Ok(None);
+      }
+      return Err(Error::new(
+        Status::GenericFailure,
+        format!(
+          "RangeError: Unexpected end of image. Request for frame index {frame_index} can't be satisfied."
+        ),
+      ));
+    }
+  };
   let pts = frame_arc.read().pts();
 
   // Per Chromium behavior: "default" extracts color space, "none" ignores it.
@@ -1296,14 +1430,56 @@ fn decode_cached_frame(
   }))
 }
 
-/// Like Chrome, a reset() made after a decode() call rejects it with AbortError. Only a JPEG for
-/// now, whose decode() waits for the data (`FrameCall::Decode`). A close() also moves
-/// `cache_epoch`; the call then gets the error of a closed decoder (`closed_error`).
+/// The turn of a decode() call: dropping it gives the turn to the next call. decode() drops it on
+/// the JS thread, in the callback that settles the call's promise, so the next call starts only
+/// once this one settles, and the promises settle in call order, like Chrome's. Given away on the
+/// worker thread instead, the next call could finish and settle first while that thread waits to
+/// settle this one. It also drops when the callback never runs (the environment goes away), so
+/// the calls after it do not wait forever.
+struct DecodeTurn(Arc<Mutex<ImageDecoderInner>>);
+
+impl Drop for DecodeTurn {
+  fn drop(&mut self) {
+    if let Ok(mut guard) = self.0.lock() {
+      guard.decode_turn += 1;
+      guard.tracks.ready_notify.notify_waiters();
+    }
+  }
+}
+
+/// Wait for the turn of the decode() call with this ticket (see `DecodeTurn`)
+async fn wait_for_turn(inner: &Arc<Mutex<ImageDecoderInner>>, ticket: u64) -> Result<()> {
+  let notify = inner
+    .lock()
+    .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?
+    .tracks
+    .ready_notify
+    .clone();
+  loop {
+    // Registered before the check, so a turn given in between still wakes it
+    let mut notified = std::pin::pin!(notify.notified());
+    notified.as_mut().enable();
+    let turn = inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?
+      .decode_turn;
+    if turn == ticket {
+      return Ok(());
+    }
+    notified.await;
+  }
+}
+
+/// Like Chrome, a reset() made after a decode() call rejects it with AbortError, in every format.
+/// decode() checks it on the call's turn, so the calls made before the reset() reject in call
+/// order, and each one gives the turn to the next: the calls made after it do not wait for them.
+/// A close() also moves `cache_epoch`; the call then gets the error of a closed decoder
+/// (`closed_error`).
 fn abort_if_reset(inner: &Arc<Mutex<ImageDecoderInner>>, epoch: u64) -> Result<()> {
   let guard = inner
     .lock()
     .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-  if !guard.closed && guard.cache_epoch != epoch && guard.codec_id == Some(AVCodecID::Mjpeg) {
+  if !guard.closed && guard.cache_epoch != epoch {
     return Err(abort_error("Aborted by reset."));
   }
   Ok(())
@@ -1318,10 +1494,10 @@ fn frame_index_error(frame_index: usize, frame_count: usize) -> Error {
 }
 
 /// The error of a decode() that finds the decoder closed. When the decoder closed because its
-/// metadata was rejected or a frame failed, Chrome rejects the decodes still pending with
-/// EncodingError.
+/// metadata was rejected, a frame failed (JPEG) or every frame failed (GIF, BMP), Chrome rejects
+/// the decodes still pending with EncodingError.
 fn closed_error(inner: &ImageDecoderInner, frame_index: usize) -> Error {
-  if inner.failed() {
+  if inner.failed() || inner.frames_failed {
     return frame_failure(frame_index);
   }
   invalid_state_error("ImageDecoder is closed")
@@ -1365,11 +1541,12 @@ fn frame_failure(frame_index: usize) -> Error {
 }
 
 /// On the JS thread, as a decode() made when `cache_epoch` was `epoch` rejects with `error`: a
-/// JPEG frame failure that left the decoder open (`decode_cached_frame`) closes it now. Chrome
-/// applies a failed decode the same way, on the main thread in a task of its own
-/// (ImageDecoderExternal::OnDecodeReady, SetFailed), so a reset() made in the meantime, even in the
-/// same task as the decode(), drops it: the call rejects with AbortError and the decoder stays
-/// failed for the next decode(). A close() made first wins (`closed_error`).
+/// frame failure that left the decoder open (`decode_cached_frame`: a JPEG frame, or every frame
+/// of a GIF or BMP) closes it now. Chrome applies a failed decode the same way, on the main
+/// thread in a task of its own (ImageDecoderExternal::OnDecodeReady, SetFailed), so a reset()
+/// made in the meantime, even in the same task as the decode(), drops it: the call rejects with
+/// AbortError and the decoder stays failed for the next decode(). A close() made first wins
+/// (`closed_error`).
 fn apply_frame_failure(
   inner: &Arc<Mutex<ImageDecoderInner>>,
   epoch: u64,
@@ -1386,7 +1563,7 @@ fn apply_frame_failure(
     if guard.cache_epoch != epoch {
       return abort_error("Aborted by reset.");
     }
-    if guard.frame_failed.is_none() {
+    if guard.frame_failed.is_none() && !guard.frames_failed {
       return error;
     }
     // A failure kept from before a reset(), while the JS thread has yet to settle the end of the
@@ -2015,15 +2192,16 @@ struct JpegState {
   cache_epoch: u64,
 }
 
-/// Attempt to cache every frame currently present in the buffered bytes.
-/// Failures do not resolve `tracks.ready`, which lets streamed images retry as
-/// more bytes arrive. A rejected metadata is left to `close_if_metadata_failed`, a failed frame
+/// Attempt to cache every frame currently present in the buffered bytes (`data_complete`: all
+/// the bytes are there). Failures do not resolve `tracks.ready`, which lets streamed images retry
+/// as more bytes arrive. A rejected metadata is left to `close_if_metadata_failed`, a failed frame
 /// to the JS thread (see `ImageDecoderInner::frame_failed`).
 /// `stream_ended`: the stream has ended, and this is its last refresh (an AVIF that still
 /// lacks a box then fails, see `Avif::Incomplete`).
 fn cache_decoded_frames(
   inner: &Arc<Mutex<ImageDecoderInner>>,
   call: FrameCall,
+  data_complete: bool,
   stream_ended: bool,
 ) -> Result<()> {
   // Snapshot everything needed for FFmpeg work under the mutex, then release
@@ -2038,7 +2216,7 @@ fn cache_decoded_frames(
     desired_height,
     jpeg_state,
     cache_epoch,
-    data_complete,
+    complete,
   ) = {
     let guard = inner
       .lock()
@@ -2088,7 +2266,11 @@ fn cache_decoded_frames(
         inner,
         cache_epoch,
         &data_bytes,
-        vec![(frame, format, None)],
+        vec![CachedFrame::Decoded {
+          frame: frame.into_shared(),
+          format,
+          duration: None,
+        }],
         1,
         None,
         None,
@@ -2096,6 +2278,30 @@ fn cache_decoded_frames(
       // the metadata, but no frame yet
       None => Ok(()),
     };
+  }
+
+  // Chrome decodes GIF with Wuffs and BMP with the image crate: gif_decoder and bmp_decoder
+  // follow them. FFmpeg decodes the other formats.
+  let gif_or_bmp = match codec_id {
+    AVCodecID::Gif => {
+      let (frames, repetition_count) =
+        gif_frames(inner, &data_bytes, data_complete, prefer_animation)?;
+      Some((frames, Some(repetition_count)))
+    }
+    AVCodecID::Bmp => Some((bmp_frames(inner, &data_bytes, data_complete)?, None)),
+    _ => None,
+  };
+  if let Some((frames, repetition_count)) = gif_or_bmp {
+    let frame_count = frames.len();
+    return store_frames(
+      inner,
+      cache_epoch,
+      &data_bytes,
+      frames,
+      frame_count,
+      None,
+      repetition_count,
+    );
   }
 
   // Chrome reads an AVIF with CrabbyAvif, and so does `avif`. FFmpeg's mov demuxer decodes
@@ -2109,7 +2315,7 @@ fn cache_decoded_frames(
   let (context, frames, frame_count) = match avif {
     Avif::Image(image) => {
       let len = data_bytes.len();
-      let size_hint = if data_complete {
+      let size_hint = if complete {
         len as u64
       } else {
         avif::STREAM_SIZE_HINT
@@ -2118,7 +2324,7 @@ fn cache_decoded_frames(
         .chain(&image.alpha)
         .any(|samples| samples.past_size_hint(size_hint))
       {
-        return Err(reject_metadata(inner));
+        return Err(reject_metadata(inner, false));
       }
       let (context, frames) = decode_avif(&data_bytes, &image).inspect_err(|_| {
         // The samples that have arrived do not decode: the frames cached from fewer bytes
@@ -2131,7 +2337,7 @@ fn cache_decoded_frames(
         }
       })?;
       // an item that ends past the data (see `AvifSamples::past_size_hint`)
-      if data_complete && frames.len() < image.color.len() {
+      if complete && frames.len() < image.color.len() {
         return Err(Error::new(
           Status::GenericFailure,
           "Failed to decode frame at index 0",
@@ -2142,11 +2348,8 @@ fn cache_decoded_frames(
     // Chrome waits for the boxes the brands need, and fails the metadata when the data ends
     // before them. At the end of a stream it marks the data complete first: `completed`
     // resolves.
-    Avif::Incomplete if data_complete || stream_ended => {
-      if let Ok(guard) = inner.lock() {
-        guard.complete.store(true, Ordering::Release);
-      }
-      return Err(reject_metadata(inner));
+    Avif::Incomplete if complete || stream_ended => {
+      return Err(reject_metadata(inner, true));
     }
     Avif::Incomplete => {
       return Err(Error::new(
@@ -2155,24 +2358,23 @@ fn cache_decoded_frames(
       ));
     }
     _ => {
-      let (context, frames) = decode_frames(inner, codec_id, &data_bytes, prefer_animation)?;
+      let (context, frames) = decode_frames(codec_id, &data_bytes, prefer_animation)?;
       let frame_count = frames.len();
       (context, frames, frame_count)
     }
   };
 
-  let repetition_count = if codec_id == AVCodecID::Gif {
-    gif_repetition_count(&data_bytes)
-  } else {
-    None
-  };
   // Chrome gives every frame of an animation its duration. FFmpeg's 0 is no duration; a
   // track's 0 is one.
   let frames = frames
     .into_iter()
     .map(|(f, format)| {
       let duration = (frame_count > 1 && (f.duration() > 0 || track_timing)).then(|| f.duration());
-      (f, format, duration)
+      CachedFrame::Decoded {
+        frame: f.into_shared(),
+        format,
+        duration,
+      }
     })
     .collect();
   store_frames(
@@ -2182,18 +2384,18 @@ fn cache_decoded_frames(
     frames,
     frame_count,
     Some(context),
-    repetition_count,
+    None,
   )
 }
 
-/// Cache the frames decoded from `data`, each with its format and duration, unless
-/// reset()/close() or a newer probe came first. `frame_count` is the track's frame count: an
-/// AVIF track also counts the frames whose samples have not arrived yet.
+/// Cache the frames of `data` (see `CachedFrame`), unless reset()/close() or a newer probe came
+/// first. `frame_count` is the track's frame count: an AVIF track also counts the frames whose
+/// samples have not arrived yet.
 fn store_frames(
   inner: &Arc<Mutex<ImageDecoderInner>>,
   cache_epoch: u64,
   data: &[u8],
-  frames: Vec<(Frame, VideoPixelFormat, Option<i64>)>,
+  frames: Vec<CachedFrame>,
   frame_count: usize,
   context: Option<CodecContext>,
   repetition_count: Option<f64>,
@@ -2225,12 +2427,7 @@ fn store_frames(
     }
   }
 
-  // Wrap frames in Arc for efficient sharing from cache
-  let shared_frames = frames
-    .into_iter()
-    .map(|(f, format, duration)| (f.into_shared(), format, duration))
-    .collect();
-  guard.cached_frames = Some(shared_frames);
+  guard.cached_frames = Some(frames);
   guard.context = context;
   guard.cached_data_len = data.len();
 
@@ -2240,29 +2437,13 @@ fn store_frames(
 /// Decode an image with FFmpeg and give every frame a WebCodecs format, from what the file
 /// header says.
 fn decode_frames(
-  inner: &Arc<Mutex<ImageDecoderInner>>,
   codec_id: AVCodecID,
   data_bytes: &[u8],
   prefer_animation: Option<bool>,
 ) -> Result<(CodecContext, Vec<(Frame, VideoPixelFormat)>)> {
-  // Chrome fails the metadata of a BMP whose bitfield masks the image crate rejects.
-  let bmp = match codec_id {
-    AVCodecID::Bmp => bmp_header(data_bytes).map_err(|()| reject_metadata(inner))?,
-    _ => None,
-  };
-
   // Demux and decode all frames.
   let (context, mut frames) = decode_image_data(codec_id, data_bytes)?;
   let still = frames.len() == 1;
-
-  // Chrome labels each GIF frame by the frames it is drawn over. FFmpeg's frames are the first
-  // ones of the file, but can be fewer (one for a GIF without graphic control extensions). A
-  // frame list shorter than FFmpeg's (damaged data) makes every frame BGRA.
-  let gif_alpha = (codec_id == AVCodecID::Gif).then(|| {
-    gif_frame_alpha(data_bytes)
-      .filter(|alpha| alpha.len() >= frames.len())
-      .unwrap_or_else(|| vec![true; frames.len()])
-  });
 
   // Apply preferAnimation: if false and format supports animation, only keep first frame
   if prefer_animation == Some(false) && !frames.is_empty() {
@@ -2273,7 +2454,6 @@ fn decode_frames(
   // FFmpeg formats WebCodecs has no name for (rgb24, pal8, gray, argb, ...).
   let header = match codec_id {
     AVCodecID::Png => png_header(data_bytes),
-    AVCodecID::Bmp => bmp,
     _ => None,
   };
   let alpha = match codec_id {
@@ -2286,19 +2466,15 @@ fn decode_frames(
     AVCodecID::Webp => Some(webp_is_simple_lossy(data_bytes)),
     _ => None,
   };
-  let pixels = header.map_or(PixelHint::None, |header| header.pixels);
+  let source = DecodedSource::Image {
+    codec: codec_id,
+    alpha,
+    yuv,
+    pixels: header.map_or(PixelHint::None, |header| header.pixels),
+  };
   let frames = frames
     .into_iter()
-    .enumerate()
-    .map(|(i, frame)| {
-      let source = DecodedSource::Image {
-        codec: codec_id,
-        alpha: gif_alpha.as_ref().map_or(alpha, |gif| Some(gif[i])),
-        yuv,
-        pixels,
-      };
-      decoded_frame_format(frame, source)
-    })
+    .map(|frame| decoded_frame_format(frame, source))
     .collect::<std::result::Result<Vec<_>, _>>()
     .map_err(|e| {
       Error::new(
@@ -2307,6 +2483,134 @@ fn decode_frames(
       )
     })?;
   Ok((context, frames))
+}
+
+/// The frames of a GIF, drawn like Chrome draws them, and its repetition count. While more data
+/// can come, the frames from the first one whose data ends early are pending. Like Chrome, each
+/// frame lasts its Graphic Control delay, and starts when the frames before it end.
+fn gif_frames(
+  inner: &Arc<Mutex<ImageDecoderInner>>,
+  data: &[u8],
+  data_complete: bool,
+  prefer_animation: Option<bool>,
+) -> Result<(Vec<CachedFrame>, f64)> {
+  let gif = match GifDecoder::new(data) {
+    Ok(gif) => gif,
+    Err(gif_decoder::TRUNCATED) if !data_complete => return Err(incomplete_data()),
+    Err(error) => return Err(reject_metadata(inner, error == gif_decoder::TRUNCATED)),
+  };
+  // preferAnimation false keeps the first frame only
+  let count = if prefer_animation == Some(false) {
+    1
+  } else {
+    gif.frames().len()
+  };
+  // a canvas too large for a frame only has its data checked (see `frame_fits`)
+  let fits = frame_fits(gif.width(), gif.height());
+  let decoded = if fits { gif.decode() } else { gif.check() };
+  let mut frames = Vec::new();
+  let mut timestamp = 0;
+  for (info, pixels) in gif.frames().iter().zip(decoded).take(count) {
+    let format = if info.has_alpha {
+      VideoPixelFormat::BGRA
+    } else {
+      VideoPixelFormat::BGRX
+    };
+    let frame = match pixels {
+      Err(gif_decoder::TRUNCATED) if !data_complete => {
+        frames.resize(count, CachedFrame::Pending);
+        break;
+      }
+      Ok(pixels) if fits => bgra_frame(gif.width(), gif.height(), &pixels, timestamp),
+      _ => None,
+    };
+    let duration = i64::from(info.delay) * 10_000;
+    frames.push(match frame {
+      Some(frame) => CachedFrame::Decoded {
+        frame: frame.into_shared(),
+        format,
+        duration: Some(duration),
+      },
+      None => CachedFrame::Failed {
+        required: info
+          .required
+          .filter(|&i| matches!(frames[i], CachedFrame::Failed { .. })),
+      },
+    });
+    timestamp += duration;
+  }
+  if frames.is_empty() && !data_complete {
+    return Err(incomplete_data());
+  }
+  Ok((frames, gif.repetition_count()))
+}
+
+/// The frame of a BMP, decoded like Chrome decodes it. While more data can come, it is pending
+/// while its data ends early.
+fn bmp_frames(
+  inner: &Arc<Mutex<ImageDecoderInner>>,
+  data: &[u8],
+  data_complete: bool,
+) -> Result<Vec<CachedFrame>> {
+  let bmp = match BmpDecoder::new(data) {
+    Ok(bmp) => bmp,
+    Err(bmp_decoder::TRUNCATED) if !data_complete => return Err(incomplete_data()),
+    Err(error) => return Err(reject_metadata(inner, error == bmp_decoder::TRUNCATED)),
+  };
+  let format = if bmp.has_alpha() {
+    VideoPixelFormat::BGRA
+  } else {
+    VideoPixelFormat::BGRX
+  };
+  // an image too large for a frame only has its data checked (see `frame_fits`)
+  let fits = frame_fits(bmp.width(), bmp.height());
+  let pixels = if fits {
+    bmp.decode()
+  } else {
+    bmp.check().map(|()| Vec::new())
+  };
+  let frame = match pixels {
+    Err(bmp_decoder::TRUNCATED) if !data_complete => return Ok(vec![CachedFrame::Pending]),
+    Ok(pixels) if fits => bgra_frame(bmp.width(), bmp.height(), &pixels, 0),
+    _ => None,
+  };
+  Ok(vec![match frame {
+    Some(frame) => CachedFrame::Decoded {
+      frame: frame.into_shared(),
+      format,
+      duration: None,
+    },
+    None => CachedFrame::Failed { required: None },
+  }])
+}
+
+fn incomplete_data() -> Error {
+  Error::new(Status::GenericFailure, "Incomplete image data")
+}
+
+/// Whether `bgra_frame` can make a frame of this size. av_frame_get_buffer fails a frame that
+/// av_image_check_size rejects ((8 * width + 1024) * (height + 128) must stay under 2^31 - 1), so
+/// the decode of a larger GIF or BMP fails whatever its data holds. Their decoders then only
+/// check the data, for the same outcome: decoding it first made up to 2 GiB of canvas from a file
+/// of a few bytes.
+fn frame_fits(width: u32, height: u32) -> bool {
+  // SAFETY: av_image_check_size reads only its arguments; a null log context is allowed.
+  unsafe { av_image_check_size(width, height, 0, std::ptr::null_mut()) >= 0 }
+}
+
+/// A BGRA frame with the rows of `pixels`, tagged RGB matrix and full range like the images
+/// FFmpeg decodes to RGB. None without memory for it.
+fn bgra_frame(width: u32, height: u32, pixels: &[u8], pts: i64) -> Option<Frame> {
+  let mut frame = Frame::new_video(width, height, AVPixelFormat::Bgra).ok()?;
+  let (row, stride) = (width as usize * 4, frame.linesize(0) as usize);
+  let rows = frame.plane_data_mut(0)?.chunks_mut(stride);
+  for (to, from) in rows.zip(pixels.chunks_exact(row)) {
+    to[..row].copy_from_slice(from);
+  }
+  frame.set_pts(pts);
+  frame.set_colorspace(AVColorSpace::Rgb);
+  frame.set_color_range(AVColorRange::Jpeg);
+  Some(frame)
 }
 
 /// Decode an AVIF like Chrome (see `avif`): the colour samples with one AV1 decoder and the alpha
@@ -2407,20 +2711,15 @@ fn jpeg_frame(
       ));
     }
     // A header cut short by the end of the data fails only once the data is complete.
-    Ok(None) => {
-      if let Ok(guard) = inner.lock() {
-        guard.complete.store(true, Ordering::Release);
-      }
-      return Err(reject_metadata(inner));
-    }
-    Err(_) => return Err(reject_metadata(inner)),
+    Ok(None) => return Err(reject_metadata(inner, true)),
+    Err(_) => return Err(reject_metadata(inner, false)),
   };
   let scale = desired.map_or(8, |desired| {
     jpeg_scale_numerator(info.width, info.height, desired)
   });
   // Chrome rejects the metadata and closes the decoder.
   if scale == 0 {
-    return Err(reject_metadata(inner));
+    return Err(reject_metadata(inner, false));
   }
   let decode = match call {
     FrameCall::Probe => state.rgb_decode,
@@ -2488,11 +2787,16 @@ fn jpeg_frame(
 }
 
 /// Reject the metadata. The caller then closes the decoder with `close_if_metadata_failed`.
-fn reject_metadata(inner: &Arc<Mutex<ImageDecoderInner>>) -> Error {
+/// `at_end`: the data ends before the header does. Chrome finds that only once all the data is
+/// in, so the data is complete and `completed` resolves.
+fn reject_metadata(inner: &Arc<Mutex<ImageDecoderInner>>, at_end: bool) -> Error {
   if let Ok(guard) = inner.lock()
     && !guard.closed
   {
     guard.tracks.failed.store(true, Ordering::Release);
+    if at_end {
+      guard.complete.store(true, Ordering::Release);
+    }
   }
   invalid_state_error("Failed to retrieve track metadata.")
 }
@@ -2571,36 +2875,6 @@ fn webp_is_simple_lossy(data: &[u8]) -> bool {
   data.len() >= 20 && data.starts_with(b"RIFF") && &data[8..16] == b"WEBPVP8 "
 }
 
-/// Parse the GIF application extension used for animation loop control.
-/// NETSCAPE/ANIMEXTS stores a little-endian repeat count; zero means infinite.
-fn gif_repetition_count(data: &[u8]) -> Option<f64> {
-  const NETSCAPE: &[u8; 11] = b"NETSCAPE2.0";
-  const ANIMEXTS: &[u8; 11] = b"ANIMEXTS1.0";
-
-  for window in data.windows(18) {
-    if window[0] != 0x21 || window[1] != 0xff || window[2] != 0x0b {
-      continue;
-    }
-    let application = &window[3..14];
-    if application != NETSCAPE && application != ANIMEXTS {
-      continue;
-    }
-    if window[14] != 0x03 || window[15] != 0x01 {
-      continue;
-    }
-
-    let count = u16::from_le_bytes([window[16], window[17]]);
-    return Some(if count == 0 {
-      f64::INFINITY
-    } else {
-      count as f64
-    });
-  }
-
-  // No loop extension means the animation plays once and repeats zero times.
-  Some(0.0)
-}
-
 /// Parse MIME type to FFmpeg codec ID
 fn parse_mime_type(mime_type: &str) -> Result<AVCodecID> {
   let mime_lower = mime_type.to_lowercase();
@@ -2657,23 +2931,6 @@ fn create_image_decoder(codec_id: AVCodecID, extradata: Option<Vec<u8>>) -> Resu
         format!("Failed to configure decoder: {}", e),
       )
     })?;
-  if codec_id == AVCodecID::Gif {
-    // Chrome's transparent GIF pixels are 0, 0, 0, 0; FFmpeg's default is transparent white.
-    check_error(unsafe {
-      av_opt_set_int(
-        context.as_mut_ptr().cast(),
-        c"trans_color".as_ptr(),
-        0,
-        opt_flag::SEARCH_CHILDREN,
-      )
-    })
-    .map_err(|e| {
-      Error::new(
-        Status::GenericFailure,
-        format!("Failed to configure decoder: {}", e),
-      )
-    })?;
-  }
   context.open().map_err(|e| {
     Error::new(
       Status::GenericFailure,
@@ -2804,8 +3061,7 @@ fn normalize_frame_timing(frames: &mut [Frame], time_base: (i32, i32)) {
 #[cfg(test)]
 mod tests {
   use super::{
-    gif_repetition_count, jpeg_scale_numerator, normalize_frame_timing, webp_alpha_hint,
-    webp_is_simple_lossy,
+    jpeg_scale_numerator, normalize_frame_timing, webp_alpha_hint, webp_is_simple_lossy,
   };
   use crate::codec::Frame;
   use crate::ffi::types::AV_NOPTS_VALUE;
@@ -2818,25 +3074,12 @@ mod tests {
   };
   use napi::tokio::sync::Notify;
   use std::cell::{Cell, RefCell};
+  use std::collections::HashSet;
   use std::rc::Rc;
   use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
   };
-
-  #[test]
-  fn parses_finite_and_infinite_gif_repetition_counts() {
-    let mut extension = b"\x21\xff\x0bNETSCAPE2.0\x03\x01\x05\x00\x00".to_vec();
-    assert_eq!(gif_repetition_count(&extension), Some(5.0));
-
-    extension[16] = 0;
-    assert_eq!(gif_repetition_count(&extension), Some(f64::INFINITY));
-
-    // The 18-byte application block is sufficient to read the loop count;
-    // the trailing block terminator is not part of the fields inspected here.
-    extension.pop();
-    assert_eq!(gif_repetition_count(&extension), Some(f64::INFINITY));
-  }
 
   #[test]
   fn reads_webp_alpha_hints() {
@@ -2910,11 +3153,6 @@ mod tests {
   }
 
   #[test]
-  fn gif_without_loop_extension_does_not_repeat() {
-    assert_eq!(gif_repetition_count(b"GIF89a"), Some(0.0));
-  }
-
-  #[test]
   fn container_frame_without_pts_is_normalized_to_zero() {
     let mut frame = Frame::new().expect("allocate frame");
     frame.set_pts(AV_NOPTS_VALUE);
@@ -2947,6 +3185,11 @@ mod tests {
 
   /// The state of an ImageDecoder made from a BufferSource with `data`, once its tracks are ready
   fn jpeg_decoder(data: &[u8]) -> Arc<Mutex<ImageDecoderInner>> {
+    decoder(data, AVCodecID::Mjpeg, "image/jpeg")
+  }
+
+  /// `jpeg_decoder` for another format
+  fn decoder(data: &[u8], codec_id: AVCodecID, mime_type: &str) -> Arc<Mutex<ImageDecoderInner>> {
     let tracks = ImageTrackList {
       inner: Arc::new(Mutex::new(ImageTrackListInner {
         tracks: vec![ImageTrackData {
@@ -2962,8 +3205,8 @@ mod tests {
     };
     Arc::new(Mutex::new(ImageDecoderInner {
       data: ImageDecoderData::Vec(data.to_vec()),
-      mime_type: "image/jpeg".to_string(),
-      codec_id: Some(AVCodecID::Mjpeg),
+      mime_type: mime_type.to_string(),
+      codec_id: Some(codec_id),
       context: None,
       complete: Arc::new(AtomicBool::new(true)),
       all_data: true,
@@ -2982,6 +3225,10 @@ mod tests {
       tracks,
       closed: false,
       cached_frames: None,
+      failed_frames: HashSet::new(),
+      frames_failed: false,
+      next_decode: 0,
+      decode_turn: 0,
       cache_epoch: 0,
       cached_data_len: 0,
       color_space_conversion: ColorSpaceConversion::Default,
@@ -3148,7 +3395,12 @@ mod tests {
       guard.jpeg_requests = 1;
     }
     assert_eq!(
-      reason(cache_decoded_frames(&inner, FrameCall::Arrival(0), false)),
+      reason(cache_decoded_frames(
+        &inner,
+        FrameCall::Arrival(0),
+        false,
+        false
+      )),
       "Failed to decode frame at index 0"
     );
     inner
@@ -3334,5 +3586,70 @@ mod tests {
     let guard = inner.lock().unwrap();
     assert_eq!(guard.frame_failed, Some(1));
     assert!(super::frame_failure_pending(&guard));
+  }
+
+  /// gif(4, 2, PALETTE, [fullFrame({ codes: BAD_CODES })]) of image-decoder.spec.ts: its one frame
+  /// fails, so every frame does
+  const BAD_GIF: &[u8] = &[
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x04, 0x00, 0x02, 0x00, 0xf1, 0x00, 0x00, 0xff, 0x00, 0x00,
+    0x00, 0xff, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00,
+    0x02, 0x00, 0x00, 0x02, 0x01, 0x3c, 0x00, 0x3b,
+  ];
+
+  #[test]
+  fn a_gif_whose_frames_all_fail_closes_the_decoder() {
+    let inner = decoder(BAD_GIF, AVCodecID::Gif, "image/gif");
+    assert_eq!(
+      reason(decode_cached_frame(&inner, 0, 0)),
+      "Failed to decode frame at index 0"
+    );
+    let guard = inner.lock().unwrap();
+    assert!(guard.closed);
+    assert!(guard.frames_failed);
+  }
+
+  #[test]
+  fn a_gif_decode_made_before_a_reset_keeps_the_failure_for_the_next_decode() {
+    let inner = decoder(BAD_GIF, AVCodecID::Gif, "image/gif");
+    // The reset() lands once the call's turn has come (`abort_if_reset`), before its work: the
+    // call builds the frames again, for the new cache_epoch, and they all fail
+    reset(&inner);
+    assert_eq!(
+      reason(decode_cached_frame(&inner, 0, 0)),
+      "Failed to decode frame at index 0"
+    );
+    {
+      let guard = inner.lock().unwrap();
+      // Like Chrome, the reset() dropped what the call found: the decoder is still open
+      assert!(!guard.closed);
+      // and it stays failed, like Chrome's decoder
+      assert!(guard.frames_failed);
+    }
+    assert_eq!(
+      reason(abort_if_reset(&inner, 0)),
+      "AbortError: Aborted by reset."
+    );
+    // Like Chrome, the next decode() fails, whatever the frame index (the GIF has no frame 1),
+    // and closes the decoder on the JS thread
+    let error = decode_cached_frame(&inner, 1, 1).err().unwrap();
+    assert_eq!(error.reason, "Failed to decode frame at index 1");
+    assert!(!inner.lock().unwrap().closed);
+    assert_eq!(
+      apply_frame_failure(&inner, 1, 1, error).reason,
+      "Failed to decode frame at index 1"
+    );
+    assert!(inner.lock().unwrap().closed);
+  }
+
+  #[test]
+  fn a_close_after_a_kept_gif_failure_wins() {
+    let inner = decoder(BAD_GIF, AVCodecID::Gif, "image/gif");
+    reset(&inner);
+    let _ = decode_cached_frame(&inner, 0, 0);
+    close(&inner);
+    assert_eq!(
+      reason(decode_cached_frame(&inner, 0, 1)),
+      "InvalidStateError: ImageDecoder is closed"
+    );
   }
 }
