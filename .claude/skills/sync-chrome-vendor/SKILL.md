@@ -146,11 +146,12 @@ table below follows one Chrome stable version: the `chrome:` line of
   again on each chunk and answers as soon as the frame is whole. A JPEG does the same here: a
   decode() that waits tries the data read so far when it is made, when a chunk comes to an idle
   stream and when the stream goes idle (`post_jpeg_decode`).
-- reset() while a decode() waits: Chrome rejects that decode() with an AbortError ("Aborted by
-  reset."). Here only a JPEG decode() does, before and after each try; for the other formats it
-  still resolves or fails later. Like Chrome, a JPEG failure found by work that started before
-  the reset() does not close the decoder: it is kept, and the next decode() fails and closes
-  it. Chrome can also close on a kept failure when the next chunk comes (`completed` rejects)
+- reset() while a decode() waits: like Chrome, the decode() rejects with an AbortError ("Aborted
+  by reset."), in every format, before and after each try (`abort_if_reset`). But a decode()
+  that still waits for `tracks.ready` rejects only once the tracks are ready; Chrome rejects it
+  at once. Like Chrome, a JPEG, GIF or BMP failure found by work that started before the
+  reset() does not close the decoder: it is kept, and the next decode() fails and closes it.
+  Chrome can also close on a kept JPEG failure when the next chunk comes (`completed` rejects)
   or the stream ends (`completed` resolves), but only when its decode ran before the reset(): it
   reads the metadata again then, and its decoder is still failed (OnMetadata). With reset() 3
   microtasks after decode(), that was 9 of 30 runs at the chunk and 4 of 30 at the end. Here
