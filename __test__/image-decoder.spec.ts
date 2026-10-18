@@ -423,12 +423,10 @@ test('ImageDecoder pending streamed decode rejects after a stream error', async 
 
   controller.error(new Error('intentional stream failure'))
 
-  const decodeOutcome = await Promise.race([
-    decodeOutcomePromise,
-    new Promise<{ status: 'timeout' }>((resolve) =>
-      setTimeout(() => resolve({ status: 'timeout' }), 500),
-    ),
-  ])
+  // decode() must not remain pending after a stream error. Await it with no timer: a decode() that never settles
+  // fails the test through ava's timeout. A 500 ms timer here lost the race when the event loop was blocked for
+  // longer than that, though the decode() did reject.
+  const decodeOutcome = await decodeOutcomePromise
   const completed = await completedOutcome
 
   t.true(decoder.complete)
@@ -436,7 +434,7 @@ test('ImageDecoder pending streamed decode rejects after a stream error', async 
   if (completed.status === 'rejected') {
     t.is((completed.error as Error).message, 'intentional stream failure')
   }
-  t.is(decodeOutcome.status, 'rejected', 'decode must not remain pending after a stream error')
+  t.is(decodeOutcome.status, 'rejected', 'decode must reject after a stream error')
   if (decodeOutcome.status === 'rejected') {
     t.true(decodeOutcome.error instanceof RangeError)
   }
@@ -747,16 +745,11 @@ test('ImageDecoder: reset() rejects a waiting GIF decode() with AbortError, and 
   next.catch(() => {})
   // more data, but frame 2 is still not whole
   controller.enqueue(data.slice(902, 1810))
-  // fails at once if a call stays pending (the stream stays open)
-  const within = <T>(promise: Promise<T>) => {
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const late = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error('still pending after 5 s')), 5000)
-    })
-    return Promise.race([promise, late]).finally(() => clearTimeout(timer))
-  }
-  await t.throwsAsync(within(waiting), { instanceOf: DOMException, name: 'AbortError', message: 'Aborted by reset.' })
-  const { image } = await within(next)
+  // Await each call with no timer: a call that stays pending (the stream stays open) fails the test through ava's
+  // timeout. A 5 s timer could fail a call that settles: if its result misses the next poll and the event loop is
+  // then blocked for longer than 5 s, the overdue timer runs first.
+  await t.throwsAsync(waiting, { instanceOf: DOMException, name: 'AbortError', message: 'Aborted by reset.' })
+  const { image } = await next
   t.is(image.timestamp, 0)
   t.is(image.duration, 1_000_000)
   t.deepEqual(settled, [2, 0])
