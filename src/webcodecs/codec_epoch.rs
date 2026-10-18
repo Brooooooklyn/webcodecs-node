@@ -15,22 +15,30 @@
 //! drops it.
 //!
 //! Outputs produced before an error reach JS before the error callback, and
-//! none reaches JS after it, as in Chrome.
+//! none reaches JS after it, as in Chrome. Outputs wait in the epoch's own
+//! queue, not in the output ThreadsafeFunction's: the output and error
+//! ThreadsafeFunctions are separate libuv handles, and Node runs at most 999
+//! calls of one before it moves on to the next, so an error queued behind
+//! more outputs than that would otherwise overtake them. The error callback
+//! hands the outputs still queued to JS first.
 
+use std::collections::VecDeque;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{ThreadsafeCallContext, ThreadsafeFunction, UnknownReturnValue};
+use napi::threadsafe_function::{
+  ThreadsafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
+};
 use napi::{check_status, sys};
 
 use super::error::{DOMExceptionName, error_as_dom_exception};
 use super::event_target::{CodecEventState, report_exception};
 
-/// Worker → JS output callback. The first argument is the codec generation.
-pub(crate) type GatedOutput<Args> =
-  ThreadsafeFunction<Args, UnknownReturnValue, Args, Status, false, true>;
+/// Worker → JS: one output waits in the epoch's queue (see
+/// `CodecEpoch::send_output`). Carries the generation it was queued under.
+pub(crate) type GatedOutput = ThreadsafeFunction<u32, UnknownReturnValue, u32, Status, false, true>;
 
 /// Worker → JS error callback, carrying the codec generation, where the
 /// error came from, and the error. The error is converted to a native
@@ -71,8 +79,8 @@ impl ErrorOrigin {
 /// reset(). Gets the error's name.
 type CloseOnError = Box<dyn Fn(&Env, DOMExceptionName) + Send + Sync>;
 
-/// An output a codec buffered for a pending flush. Turned into the output
-/// callback's arguments on the JS thread.
+/// An output on its way to JS, or one a codec buffered for a pending flush.
+/// Turned into the output callback's arguments on the JS thread.
 pub(crate) type BufferedOutput =
   Box<dyn FnOnce(sys::napi_env) -> Result<Vec<sys::napi_value>> + Send>;
 
@@ -97,6 +105,9 @@ struct EpochState {
   close_on_error: OnceLock<CloseOnError>,
   /// Set once by the codec's constructor.
   take_buffered: OnceLock<TakeBuffered>,
+  /// Outputs on their way to the output callback, oldest first, each with
+  /// the generation it was queued under.
+  outputs: Mutex<VecDeque<(u32, BufferedOutput)>>,
 }
 
 /// Generation counter shared by one codec, its workers and its callbacks.
@@ -128,6 +139,42 @@ impl CodecEpoch {
       epoch: self.clone(),
       generation: self.current(),
     }
+  }
+
+  /// Worker: queue an output of `generation` and wake the output callback
+  /// for it. Outputs reach JS in the order they were queued; an error
+  /// callback hands the ones still queued to JS before the error.
+  pub(crate) fn send_output(
+    &self,
+    callback: &GatedOutput,
+    generation: u32,
+    output: BufferedOutput,
+  ) {
+    let Ok(mut outputs) = self.0.outputs.lock() else {
+      return;
+    };
+    outputs.push_back((generation, output));
+    drop(outputs);
+    callback.call(generation, ThreadsafeFunctionCallMode::NonBlocking);
+  }
+
+  /// JS thread: the oldest queued output, unless an error callback took it.
+  fn next_output(&self) -> Option<(u32, BufferedOutput)> {
+    self.0.outputs.lock().ok()?.pop_front()
+  }
+
+  /// JS thread: take every queued output; those of `generation` are
+  /// returned oldest first, older ones are dropped. A worker stops after it
+  /// reports an error, so all of them were produced before that error.
+  fn take_outputs(&self, generation: u32) -> Vec<BufferedOutput> {
+    let Ok(mut outputs) = self.0.outputs.lock() else {
+      return Vec::new();
+    };
+    outputs
+      .drain(..)
+      .filter(|(queued, _)| *queued == generation)
+      .map(|(_, output)| output)
+      .collect()
   }
 
   /// Whether the error callback has run. Until then a codec that a worker
@@ -185,18 +232,20 @@ impl CodecEpoch {
   }
 
   /// JS thread: an error queued under `generation` is about to reach JS.
-  /// Outputs a pending flush buffered were produced before the error; that
-  /// flush would deliver them after the error closed the codec. Hand them to
-  /// `output` now, so they arrive before the error callback as in Chrome.
-  /// Stops when an output callback calls close() or reset().
+  /// The outputs still queued for the output callback, then those a pending
+  /// flush buffered, were produced before the error; the gate would drop
+  /// them once the error closed the codec, and that flush would deliver them
+  /// after it. Hand them to `output` now, so they arrive before the error
+  /// callback as in Chrome. Stops when an output callback calls close() or
+  /// reset().
   fn deliver_buffered(&self, env: &Env, generation: u32, output: &OutputRef) -> Result<()> {
     if !self.is_current(generation) || self.error_delivered() {
       return Ok(());
     }
-    let Some(take) = self.0.take_buffered.get() else {
-      return Ok(());
-    };
-    let outputs = take();
+    let mut outputs = self.take_outputs(generation);
+    if let Some(take) = self.0.take_buffered.get() {
+      outputs.extend(take());
+    }
     if outputs.is_empty() {
       return Ok(());
     }
@@ -303,13 +352,15 @@ enum CallbackKind {
 type OutputRef = FunctionRef<Unknown<'static>, UnknownReturnValue>;
 
 /// Wrap a user callback in a native function whose first argument is the
-/// generation the call was queued under. Calls from an older generation are
-/// dropped; the others call `callback` with the remaining arguments and an
-/// undefined `this`. For the error callback, the second argument is the
-/// error's name when configure() found it, or null (see `admit_error`). A
-/// worker ThreadsafeFunction targets the returned function. Before the error
-/// callback runs, the outputs a pending flush buffered go to `output` (see
-/// `deliver_buffered`).
+/// generation the call was queued under. A worker ThreadsafeFunction targets
+/// the returned function. For the output callback, each call takes the
+/// oldest output from the epoch's queue (the error callback may have taken
+/// it already). Calls and outputs from an older generation are dropped; the
+/// others call `callback` with the output, or with the remaining arguments,
+/// and an undefined `this`. For the error callback, the second argument is
+/// the error's name when configure() found it, or null (see `admit_error`).
+/// Before the error callback runs, the outputs still queued and those a
+/// pending flush buffered go to `output` (see `deliver_buffered`).
 ///
 /// An exception thrown by the callback stays pending, so it surfaces exactly
 /// as it did when the ThreadsafeFunction called the callback directly.
@@ -335,14 +386,17 @@ fn gated_callback<'env, Args: JsValuesTupleIntoVec>(
   };
   let gated = env.create_function_from_closure::<Args, (), _>("codecCallback", move |ctx| {
     let generation = ctx.get::<u32>(0)?;
-    let first_arg = match kind {
+    let args = match kind {
       CallbackKind::Output => {
+        let Some((generation, queued)) = epoch.next_output() else {
+          return Ok(());
+        };
         // Once the error callback ran, the codec is closed: Chrome drops the
         // outputs still on their way.
         if !epoch.is_current(generation) || epoch.error_delivered() {
           return Ok(());
         }
-        1
+        queued(ctx.env.raw())?
       }
       CallbackKind::Error => {
         let configure_error = ctx.get::<Option<String>>(1)?;
@@ -352,13 +406,13 @@ fn gated_callback<'env, Args: JsValuesTupleIntoVec>(
         if !epoch.admit_error(ctx.env, generation, configure_error.as_deref()) {
           return Ok(());
         }
-        2
+        let mut args = Vec::with_capacity(ctx.length().saturating_sub(2));
+        for index in 2..ctx.length() {
+          args.push(ctx.get::<Unknown>(index)?.raw());
+        }
+        args
       }
     };
-    let mut args = Vec::with_capacity(ctx.length().saturating_sub(first_arg));
-    for index in first_arg..ctx.length() {
-      args.push(ctx.get::<Unknown>(index)?.raw());
-    }
     let function = callback.borrow_back(ctx.env)?;
     let mut this = ptr::null_mut();
     check_status!(unsafe { sys::napi_get_undefined(ctx.env.raw(), &mut this) })?;
@@ -381,14 +435,15 @@ fn gated_callback<'env, Args: JsValuesTupleIntoVec>(
   unsafe { Function::from_napi_value(env.raw(), gated.raw()) }
 }
 
-/// Weak ThreadsafeFunction that calls the output callback `callback` with
-/// `Args` minus its leading generation, unless the generation is stale.
-pub(crate) fn gated_output<Args: 'static + JsValuesTupleIntoVec>(
+/// Weak ThreadsafeFunction that calls the output callback `callback` with the
+/// oldest output queued by `CodecEpoch::send_output`, unless its generation
+/// is stale.
+pub(crate) fn gated_output(
   env: &Env,
   callback: sys::napi_value,
   epoch: &CodecEpoch,
-) -> Result<GatedOutput<Args>> {
-  gated_callback::<Args>(env, callback, None, epoch.clone(), CallbackKind::Output)?
+) -> Result<GatedOutput> {
+  gated_callback::<u32>(env, callback, None, epoch.clone(), CallbackKind::Output)?
     .build_threadsafe_function()
     .callee_handled::<false>()
     .weak::<true>()

@@ -19,7 +19,7 @@ use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_w
 use crate::webcodecs::{AudioData, AudioDecoderConfig, AudioDecoderSupport, EncodedAudioChunk};
 use crossbeam::channel::{self, Receiver, Sender};
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{ThreadsafeFunctionCallMode, UnknownReturnValue};
+use napi::threadsafe_function::UnknownReturnValue;
 use napi_derive::napi;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, RwLock};
@@ -28,9 +28,9 @@ use std::thread::JoinHandle;
 use super::event_target::CodecEventState;
 use super::video_encoder::CodecState;
 
-/// Type alias for output callback (takes the codec generation and AudioData)
-/// Using CalleeHandled: false for direct callbacks without error-first convention
-type OutputCallback = GatedOutput<FnArgs<(u32, AudioData)>>;
+/// Output callback: wakes the gate for one output queued with
+/// `CodecEpoch::send_output` (see codec_epoch.rs).
+type OutputCallback = GatedOutput;
 
 /// Type alias for error callback (takes the codec generation and an Error)
 /// Using CalleeHandled: false because WebCodecs error callback receives the
@@ -562,9 +562,10 @@ impl AudioDecoder {
       if guard.flushes.should_buffer_outputs() {
         guard.pending_data.push(audio_data);
       } else if !guard.is_stale() {
-        guard.output_callback.call(
-          FnArgs::from((guard.generation, audio_data)),
-          ThreadsafeFunctionCallMode::NonBlocking,
+        guard.epoch.send_output(
+          &guard.output_callback,
+          guard.generation,
+          buffered_output(audio_data),
         );
       }
     }
