@@ -297,6 +297,20 @@ pub fn dom_exception_for_rejection(env: &Env, error: Error) -> Result<Unknown<'_
   error_with_name(env, name, message)
 }
 
+/// `dom_exception_for_rejection` as the `Err` a promise callback returns (the codec flush
+/// resolvers): the promise rejects with that value as it is.
+//
+// `Error::from_unknown_without_coercion` keeps the value itself for the rejection and reads its
+// `message` and `cause` only as data properties, following at most eight `cause` links.
+// `Error::from` calls the value's `toString` and converts its `cause` the same way with no limit,
+// so a value whose `cause` is itself (thrown by a replaced global DOMException, or returned by a
+// replaced constructor) overflowed the stack and aborted the process.
+pub fn dom_exception_rejection_error(env: &Env, error: Error) -> Result<Error> {
+  Ok(Error::from_unknown_without_coercion(
+    dom_exception_for_rejection(env, error)?,
+  ))
+}
+
 /// A plain JS Error with an own `name`. Runs no page code: the Error comes from the engine and
 /// `name` is defined, not assigned.
 fn error_with_name<'env>(env: &'env Env, name: &str, message: &str) -> Result<Unknown<'env>> {

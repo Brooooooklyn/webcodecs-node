@@ -12,7 +12,7 @@ use crate::webcodecs::codec_epoch::{
 use crate::webcodecs::decoded_frame::{DecodedSource, decoded_frame_format};
 use crate::webcodecs::encoded_video_chunk::InternalSlice;
 use crate::webcodecs::error::{
-  DOMExceptionName, error_as_dom_exception, native_dom_exception_error, throw_data_error,
+  DOMExceptionName, dom_exception_rejection_error, native_dom_exception_error, throw_data_error,
   throw_invalid_state_error, throw_type_error_unit,
 };
 use crate::webcodecs::event_target::CodecEventState;
@@ -1980,7 +1980,7 @@ impl VideoDecoder {
         // Worker errors carry their DOMException name as a message prefix
         match result {
           Ok(()) => Ok(()),
-          Err(error) => Err(Error::from(error_as_dom_exception(env, error)?)),
+          Err(error) => Err(dom_exception_rejection_error(env, error)?),
         }
       },
     )
