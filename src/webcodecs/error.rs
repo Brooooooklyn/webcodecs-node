@@ -311,6 +311,31 @@ pub fn dom_exception_rejection_error(env: &Env, error: Error) -> Result<Error> {
   ))
 }
 
+/// `native_dom_exception_error` as the `Err` a promise callback returns (the codec flush
+/// resolvers, for a flush that close(), reset() or an error that closed the codec aborted). The
+/// same DOMException; when page code replaced the global `DOMException`, the same fallbacks and
+/// the same conversion as `dom_exception_rejection_error`, so the flush still settles.
+pub fn native_dom_exception_rejection_error(
+  env: &Env,
+  name: DOMExceptionName,
+  message: &str,
+) -> Result<Error> {
+  let exception = env
+    .get_global()
+    .and_then(|global| {
+      global.get_named_property_unchecked::<Function<FnArgs<(&str, &str)>>>("DOMException")
+    })
+    .and_then(|constructor| constructor.new_instance((message, name.as_str()).into()));
+  let exception = match exception {
+    Ok(exception) => exception,
+    Err(_) => match take_pending_exception(env)? {
+      Some(exception) => exception,
+      None => error_with_name(env, name.as_str(), message)?,
+    },
+  };
+  Ok(Error::from_unknown_without_coercion(exception))
+}
+
 /// A plain JS Error with an own `name`. Runs no page code: the Error comes from the engine and
 /// `name` is defined, not assigned.
 fn error_with_name<'env>(env: &'env Env, name: &str, message: &str) -> Result<Unknown<'env>> {

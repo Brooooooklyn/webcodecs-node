@@ -12,8 +12,8 @@ use crate::webcodecs::codec_epoch::{
 use crate::webcodecs::decoded_frame::{DecodedSource, decoded_frame_format};
 use crate::webcodecs::encoded_video_chunk::InternalSlice;
 use crate::webcodecs::error::{
-  DOMExceptionName, dom_exception_rejection_error, native_dom_exception_error, throw_data_error,
-  throw_invalid_state_error, throw_type_error_unit,
+  DOMExceptionName, dom_exception_rejection_error, native_dom_exception_rejection_error,
+  throw_data_error, throw_invalid_state_error, throw_type_error_unit,
 };
 use crate::webcodecs::event_target::CodecEventState;
 use crate::webcodecs::flush_tracker::{FlushAbort, FlushTracker};
@@ -1974,7 +1974,7 @@ impl VideoDecoder {
         // close()/reset() abort the flush; an error that closed the codec fails it
         if abort.is_aborted() {
           let (name, message) = abort.rejection();
-          return Err(native_dom_exception_error(env, name, message)?);
+          return Err(native_dom_exception_rejection_error(env, name, message)?);
         }
 
         // Worker errors carry their DOMException name as a message prefix

@@ -940,6 +940,68 @@ test.serial('close() drops the configure() NotSupportedError without reading the
   }
 })
 
+// The same as "a pending flush still settles when page code replaced DOMException in
+// the error callback", for a flush that is aborted: by reset() or close(), or by the
+// NotSupportedError a configure() before reset() reports, which closes the codec
+// configured since. That rejection was built through napi-rs's Error::from too, so
+// the flush stayed pending or the process crashed. (Chrome rejects with a native
+// AbortError, or with the NotSupportedError before the error callback runs.)
+const abortTriggers = ['reset()', 'close()', 'configure() error after reset()'] as const
+
+// Serial: the global stays replaced across an await.
+test.serial('an aborted flush still settles when page code replaced DOMException', async (t) => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'DOMException')!
+  for (const trigger of abortTriggers) {
+    for (const replacement of domExceptionReplacements) {
+      for (const config of unsupportedConfigCases) {
+        const log: string[] = []
+        let expected: unknown = Symbol('not replaced')
+        // Cleared before the global is restored, so an error callback that comes
+        // later cannot replace it again.
+        let armed = trigger === 'configure() error after reset()'
+        try {
+          const codec = config.make((entry) => {
+            log.push(entry)
+            if (armed && entry.startsWith('error:')) {
+              expected = replacement.install()
+            }
+          })
+          if (trigger === 'configure() error after reset()') {
+            config.configureBogus(codec)
+            codec.reset()
+          }
+          config.configureGood(codec)
+          config.queue(codec)
+          const flush = codec.flush().then(
+            () => 'flush:resolved',
+            (error: unknown) =>
+              error === expected ? 'flush:rejected with that value' : `flush:rejected:${String(error)}`,
+          )
+          if (trigger === 'reset()') {
+            expected = replacement.install()
+            codec.reset()
+          } else if (trigger === 'close()') {
+            expected = replacement.install()
+            codec.close()
+          }
+          // Awaited with no timer, for the reason given in that test.
+          log.push(await flush)
+        } finally {
+          armed = false
+          Object.defineProperty(globalThis, 'DOMException', descriptor)
+        }
+        t.deepEqual(
+          log,
+          trigger === 'configure() error after reset()'
+            ? ['error:NotSupportedError:closed', 'flush:rejected with that value']
+            : ['flush:rejected with that value'],
+          `${trigger}: ${replacement.name}: ${config.name}`,
+        )
+      }
+    }
+  }
+})
+
 // FLAC needs a description. A configured decoder checks that in configure() like
 // an unconfigured one, so the error does not depend on the decoder's state.
 test('AudioDecoder: reset() keeps the NotSupportedError for FLAC without a description, also when reconfiguring', async (t) => {
