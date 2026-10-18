@@ -11,8 +11,8 @@ use crate::webcodecs::codec_epoch::{
 };
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunkInner;
 use crate::webcodecs::error::{
-  DOMExceptionName, dom_exception_rejection_error, native_dom_exception_error, throw_data_error,
-  throw_invalid_state_error, throw_type_error_unit,
+  DOMExceptionName, dom_exception_rejection_error, native_dom_exception_rejection_error,
+  throw_data_error, throw_invalid_state_error, throw_type_error_unit,
 };
 use crate::webcodecs::flush_tracker::{FlushAbort, FlushTracker};
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
@@ -1255,7 +1255,7 @@ impl AudioDecoder {
         // close()/reset() abort the flush; an error that closed the codec fails it
         if abort.is_aborted() {
           let (name, message) = abort.rejection();
-          return Err(native_dom_exception_error(env, name, message)?);
+          return Err(native_dom_exception_rejection_error(env, name, message)?);
         }
 
         // Worker errors carry their DOMException name as a message prefix
