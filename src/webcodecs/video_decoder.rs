@@ -702,7 +702,7 @@ impl VideoDecoder {
       );
 
       if let Err(e) = Self::apply_display_aspect(&guard, &video_frame) {
-        Self::report_error(&mut guard, &format!("EncodingError: {}", e));
+        Self::close_with_error(&mut guard, event_state, &format!("EncodingError: {}", e));
         return;
       }
 
@@ -874,7 +874,8 @@ impl VideoDecoder {
         );
 
         if let Err(e) = Self::apply_display_aspect(&guard, &video_frame) {
-          Self::report_error(&mut guard, &format!("EncodingError: {}", e));
+          let event_state = guard.event_state.clone();
+          Self::close_with_error(&mut guard, &event_state, &format!("EncodingError: {}", e));
           return;
         }
         if guard.flushes.should_buffer_outputs() {

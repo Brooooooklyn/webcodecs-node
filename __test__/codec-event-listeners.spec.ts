@@ -741,6 +741,40 @@ test('dequeue: an error after a decoded chunk leaves the VideoDecoder queue empt
   t.deepEqual(fromError(result.log), ['error', 'dequeue:0'], 'one dequeue event follows the error')
 })
 
+test('dequeue: a display aspect error on an output frame leaves the VideoDecoder queue empty', (t) => {
+  // 1093:1 on 100x30 passes configure() but the output frame would be 32790 wide.
+  // Chrome 155 (100 of 100 runs, 64 key chunks): dequeue:63, the error
+  // (EncodingError) with a queue of 0 and state closed, then dequeue:0. 64 chunks
+  // so that a decoder with frame threads still fails while chunks are queued.
+  const result = runChild<Teardown>(`
+    ${PRELUDE}
+    const m = require('./index.js');
+    ${TEARDOWN}
+    (async () => {
+      const COUNT = 64;
+      const chunks = [];
+      const encoder = new m.VideoEncoder({ output: (chunk) => chunks.push(chunk), error: fail });
+      encoder.configure({ codec: 'vp8', width: 100, height: 30, bitrate: 300000 });
+      for (let i = 0; i < COUNT; i++) {
+        const frame = new m.VideoFrame(new Uint8Array(100 * 30 * 4).fill(i), { format: 'RGBA', codedWidth: 100, codedHeight: 30, timestamp: i * 33333 });
+        encoder.encode(frame, { keyFrame: true });
+        frame.close();
+      }
+      await encoder.flush();
+      encoder.close();
+      done(await teardown(m.VideoDecoder, (decoder) => {
+        decoder.configure({ codec: 'vp8', codedWidth: 100, codedHeight: 30, displayAspectWidth: 1093, displayAspectHeight: 1 });
+        for (const chunk of chunks) decoder.decode(chunk);
+      }));
+    })().catch(fail);
+  `)
+  t.is(result.queued, 64, 'all chunks were queued')
+  t.is(result.state, 'closed', 'the error closed the decoder')
+  t.deepEqual(result.errors, ['EncodingError:0:closed'], 'one error, seeing an empty queue')
+  t.is(result.dequeues.at(-1), 'dequeue:0', 'the last dequeue event sees an empty queue')
+  t.deepEqual(fromError(result.log), ['error', 'dequeue:0'], 'one dequeue event follows the error')
+})
+
 test('dequeue: the error callback runs before the dequeue event for the work it dropped, under load', (t) => {
   // Chrome 155 (10 of 10 runs each, same triggers): AudioDecoder, AudioEncoder and
   // VideoEncoder log the error, then dequeue:0; VideoDecoder logs dequeue:6, the
