@@ -321,19 +321,21 @@ test('ImageDecoder: a JPEG stream that trickles in is not decoded again for each
 })
 
 // reset() aborts a waiting decode() in Chrome, before it decodes, but keeps the choice of RGB that a
-// decode of part of the data made. The test gives the rest (30 ms after the data) and the close (30
-// ms after that) itself, after the reset(): a stream timer made before the test's own wait could
-// fire first on a slow runner.
+// decode of part of the data made. The first half of the data is there at the decode(). The test
+// gives the rest (30 ms after the reset()) and the close (30 ms after that) itself, after the
+// reset(): a stream timer made before the test's own wait could fire first on a slow runner.
 test("ImageDecoder: reset() keeps a JPEG's choice of RGB or YUV, like Chrome", async (t) => {
-  for (const [name, resetAt, format] of [
+  for (const [name, ready, resetAt, format] of [
     // reset() in the task of the decode(): nothing was decoded
-    ['444-progressive-33x17.jpg', 0, 'I444'],
-    ['420-37x9.jpg', 0, 'I420'],
-    // reset() at 20 ms, before the rest comes at 30 ms: half of the data was decoded, with rows
-    // of the progressive JPEG (its first scan) and none of the 4:2:0 one (its header ends after
-    // the half)
-    ['444-progressive-33x17.jpg', 20, 'BGRX'],
-    ['420-37x9.jpg', 20, 'I420'],
+    ['444-progressive-33x17.jpg', false, 0, 'I444'],
+    ['420-37x9.jpg', false, 0, 'I420'],
+    // reset() 300 ms after tracks.ready: the header is in the first half, and the decode() tries
+    // that half right after the header is read. The try decodes rows (the first scan). JS cannot
+    // see the try itself; the 300 ms leave room for a slow, loaded runner.
+    ['444-progressive-33x17.jpg', true, 300, 'BGRX'],
+    // reset() 300 ms after the decode(): the header ends after the half (tracks.ready waits for
+    // the rest), so nothing was decoded
+    ['420-37x9.jpg', false, 300, 'I420'],
   ] as const) {
     const data = fixture(name)
     const source = cutStream(data, data.length >> 1)
@@ -342,15 +344,16 @@ test("ImageDecoder: reset() keeps a JPEG's choice of RGB or YUV, like Chrome", a
       ({ image }) => image.close(),
       () => {},
     )
+    if (ready) await decoder.tracks.ready
     if (resetAt) await sleep(resetAt)
     decoder.reset()
-    await sleep(30 - resetAt)
+    await sleep(30)
     source.rest()
     await sleep(30)
     source.close()
     await decoder.completed
     const { image } = await decoder.decode()
-    t.is(image.format, format, `${name} reset at ${resetAt} ms`)
+    t.is(image.format, format, `${name} reset at ${resetAt} ms${ready ? ' after tracks.ready' : ''}`)
     image.close()
     await pending
     decoder.close()
