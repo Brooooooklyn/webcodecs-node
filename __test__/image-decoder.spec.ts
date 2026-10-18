@@ -557,6 +557,50 @@ test('ImageDecoder: a GIF frame with broken data, and the frames drawn on it, re
   decoder.close()
 })
 
+// Chrome 155 waits for the end here too: on an open stream, a decode() of a frame with bad data
+// stays pending while another frame decodes, also when the stream is idle or a valid frame comes
+// after it (5 s idle probe), and rejects with RangeError at the end. The decoder stays open.
+test('ImageDecoder: on an open GIF stream, decode() of a broken frame waits for the end while another frame decodes, like Chrome', async (t) => {
+  // frames 0 and 1, without the trailer
+  const data = gif(4, 2, PALETTE, [fullFrame({ delay: 10 }), fullFrame({ delay: 10, codes: BAD_CODES })])
+  let controller!: ReadableStreamDefaultController<Uint8Array>
+  const stream = new ReadableStream<Uint8Array>({
+    start(streamController) {
+      controller = streamController
+      controller.enqueue(data.subarray(0, -1))
+    },
+  })
+  const decoder = new ImageDecoder({ data: stream, type: 'image/gif' })
+  // the open stream would keep the worker alive
+  t.teardown(() => {
+    try {
+      controller.close()
+    } catch {}
+  })
+  await decoder.tracks.ready
+  t.is(decoder.tracks.selectedTrack!.frameCount, 2)
+  const first = await decoder.decode({ frameIndex: 0 })
+  first.image.close()
+
+  const settled: number[] = []
+  const decodes = [1, 0].map((frameIndex) => decoder.decode({ frameIndex }).finally(() => settled.push(frameIndex)))
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  // frame 1 failed, but the stream is open: its decode() waits, and frame 0's waits behind it
+  t.deepEqual(settled, [])
+  t.false(decoder.closed)
+
+  controller.enqueue(data.subarray(-1))
+  controller.close()
+  await t.throwsAsync(decodes[0], unexpectedEnd(1))
+  const { image } = await decodes[1]
+  t.is(image.timestamp, 0)
+  image.close()
+  t.deepEqual(settled, [1, 0])
+  t.false(decoder.closed)
+  await t.notThrowsAsync(decoder.completed)
+  decoder.close()
+})
+
 test('ImageDecoder: once every GIF frame failed, decode() rejects with EncodingError and the decoder closes, like Chrome', async (t) => {
   const data = gif(4, 2, PALETTE, [fullFrame({ delay: 10, codes: BAD_CODES }), partFrame({ delay: 10 })])
   const decoder = new ImageDecoder({ data, type: 'image/gif' })
