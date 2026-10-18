@@ -746,13 +746,20 @@ impl ImageDecoder {
       let data_complete = complete.clone();
       let collect = async move {
         let mut next_probe_size = 1usize;
+        let jpeg = matches!(reader, ChunkReader::Jpeg(_));
+        let mut retries = JpegRetries::default();
 
         while let Some(item) = reader.next().await {
           let (chunk, arrival) = match item {
-            Ok(StreamItem::Chunk(chunk, arrival)) => (
-              chunk,
-              arrival.filter(|&epoch| jpeg_try_wanted(&inner_clone, epoch)),
-            ),
+            Ok(StreamItem::Chunk(chunk, arrival)) => {
+              if jpeg {
+                retries.chunk(&chunk);
+              }
+              let arrival = arrival.filter(|&epoch| {
+                jpeg_try_wanted(&inner_clone, epoch) && retries.run(&inner_clone, epoch)
+              });
+              (chunk, arrival)
+            }
             // A JPEG decode() that waits tries the data so far, here, in the order of the
             // stream's results, as Chrome's decoder thread does (`FrameCall::Arrival`).
             Ok(StreamItem::Decode(epoch)) => {
@@ -763,7 +770,7 @@ impl ImageDecoder {
                 signal_tracks_ready(&inner_clone);
                 continue;
               }
-              if jpeg_try_wanted(&inner_clone, epoch) {
+              if jpeg_try_wanted(&inner_clone, epoch) && retries.run(&inner_clone, epoch) {
                 let decode_inner = inner_clone.clone();
                 let tried = spawn_blocking(move || {
                   cache_decoded_frames(&decode_inner, FrameCall::Arrival(epoch))
@@ -835,7 +842,8 @@ impl ImageDecoder {
           };
 
           // A chunk that came to an idle JPEG stream while a decode() waits is decoded now,
-          // before the reader sees what came with it (the close, say), as Chrome does.
+          // before the reader sees what came with it (the close, say), as Chrome does, unless
+          // the try can only give what the last one gave (`JpegRetries`).
           let probe = buffered_len >= next_probe_size;
           if probe || arrival.is_some() {
             let call = arrival.map_or(FrameCall::Probe, FrameCall::Arrival);
@@ -1620,6 +1628,191 @@ fn jpeg_try_wanted(inner: &Arc<Mutex<ImageDecoderInner>>, epoch: u64) -> bool {
   inner.lock().is_ok_and(|guard| {
     guard.cache_epoch == epoch && guard.jpeg_requests > 0 && !guard.closed && !guard.all_data
   })
+}
+
+/// Which wanted tries of a JPEG stream's data so far run (`StreamItem::Decode`,
+/// `FrameCall::Arrival`). decode_jpeg() reads the data from its first byte each time, so a try for
+/// every chunk of a stream that trickles in, while a decode() waits, decodes ever longer prefixes:
+/// the work grows with the square of the chunk count (Chrome keeps one Blink JPEGImageDecoder,
+/// which reads each byte once). A try that can only give what the last one gave (no frame, no
+/// failure) is skipped. One runs when it is the first of its epoch (a reset() dropped what the
+/// last one found), when a frame failure is recorded (those paths stay as they are), or when
+/// bytes that can change what libjpeg reports came since the last one (`JpegScan`).
+#[derive(Default)]
+struct JpegRetries {
+  scan: JpegScan,
+  /// The epoch of the last try that ran
+  last: Option<u64>,
+  /// Whether bytes that can change a try's result came since then
+  changed: bool,
+}
+
+impl JpegRetries {
+  /// A chunk of the stream, before the collector appends it
+  fn chunk(&mut self, chunk: &[u8]) {
+    self.changed |= self.scan.feed(chunk);
+  }
+
+  /// Whether a wanted try (`jpeg_try_wanted`) made when `cache_epoch` was `epoch` runs
+  fn run(&mut self, inner: &Arc<Mutex<ImageDecoderInner>>, epoch: u64) -> bool {
+    let failed = !inner.lock().is_ok_and(|guard| guard.frame_failed.is_none());
+    if !self.changed && self.last == Some(epoch) && !failed {
+      return false;
+    }
+    self.last = Some(epoch);
+    self.changed = false;
+    true
+  }
+}
+
+/// Reads the markers of a JPEG stream as its chunks come, to tell which bytes can change what a
+/// try of the data so far reports (`jpeg_frame`: a frame, rows started, a failure):
+/// - The frame is complete only at the EOI marker, and Blink reads nothing after it.
+/// - Blink gets to output rows only at the start of a scan (a multi-scan sequential file: at the
+///   EOI marker).
+/// - libjpeg fails on markers, at the start of a scan (jdmarker.c, jdinput.c, the start_pass of
+///   jdhuff.c and jdphuff.c) and on the 100th scan (`progress_monitor` in jpeg_blink.c). In the
+///   entropy-coded data of a scan, with its restart markers and stuffed bytes, it only warns (a
+///   progressive decode then stops reading, `num_corrupt_warnings` in jpeg_blink.c), with one
+///   exception: a DC value that overflows in a progressive DC first scan (jdphuff.c
+///   decode_mcu_DC_first, JERR_BAD_DCT_COEF). That takes more than 65536 DC differences of 15
+///   bits, 16 bits each with their code, so at least 128 KiB of the scan.
+///
+/// So the bytes of a scan's data (only the first 128 KiB of a progressive DC first scan) and the
+/// bytes after the EOI marker change nothing; every other byte, garbage too, does.
+#[derive(Default)]
+struct JpegScan {
+  state: ScanState,
+  /// A progressive frame (SOF2, or SOF6, SOF10, SOF14, which libjpeg fails)
+  progressive: bool,
+  /// The SOS segment read so far
+  sos: Vec<u8>,
+  /// How many more bytes of the current scan's data change nothing
+  quiet: usize,
+}
+
+#[derive(Default, Clone, Copy)]
+enum ScanState {
+  /// Between marker segments, or after 0xFF there
+  #[default]
+  Between,
+  Ff,
+  /// The two length bytes of a marker's segment (with the first once read)
+  Length(u8, Option<u8>),
+  /// In a marker's segment, with the bytes left
+  Segment(u8, usize),
+  /// In the entropy-coded data of a scan, or after 0xFF there
+  Scan,
+  ScanFf,
+  /// After the EOI marker
+  Done,
+}
+
+/// How many bytes of a progressive DC first scan's data cannot fail (see `JpegScan`)
+const DC_FIRST_QUIET: usize = 1 << 17;
+
+impl JpegScan {
+  /// The next bytes of the stream. Returns whether any of them can change a try's result.
+  fn feed(&mut self, bytes: &[u8]) -> bool {
+    let mut changed = false;
+    for &byte in bytes {
+      let quiet = match self.state {
+        ScanState::Done => true,
+        ScanState::Scan => {
+          if byte == 0xFF {
+            self.state = ScanState::ScanFf;
+          }
+          self.scan_byte()
+        }
+        // A stuffed 0xFF, a restart marker, a fill byte, or the marker that ends the scan
+        ScanState::ScanFf => match byte {
+          0x00 | 0xD0..=0xD7 => {
+            self.state = ScanState::Scan;
+            self.scan_byte()
+          }
+          0xFF => self.scan_byte(),
+          code => {
+            self.marker(code);
+            false
+          }
+        },
+        ScanState::Between => {
+          if byte == 0xFF {
+            self.state = ScanState::Ff;
+          }
+          false
+        }
+        ScanState::Ff => {
+          match byte {
+            0xFF => {}
+            0x00 => self.state = ScanState::Between,
+            code => self.marker(code),
+          }
+          false
+        }
+        ScanState::Length(code, None) => {
+          self.state = ScanState::Length(code, Some(byte));
+          false
+        }
+        ScanState::Length(code, Some(high)) => {
+          let length = usize::from(high) << 8 | usize::from(byte);
+          self.segment(code, length.saturating_sub(2));
+          false
+        }
+        ScanState::Segment(code, left) => {
+          if code == 0xDA {
+            self.sos.push(byte);
+          }
+          self.segment(code, left - 1);
+          false
+        }
+      };
+      changed |= !quiet;
+    }
+    changed
+  }
+
+  fn marker(&mut self, code: u8) {
+    self.state = match code {
+      // EOI
+      0xD9 => ScanState::Done,
+      // SOI, TEM, RSTn: no segment
+      0xD8 | 0x01 | 0xD0..=0xD7 => ScanState::Between,
+      _ => {
+        if matches!(code, 0xC2 | 0xC6 | 0xCA | 0xCE) {
+          self.progressive = true;
+        }
+        self.sos.clear();
+        ScanState::Length(code, None)
+      }
+    };
+  }
+
+  fn segment(&mut self, code: u8, left: usize) {
+    self.state = if left > 0 {
+      ScanState::Segment(code, left)
+    } else if code == 0xDA {
+      // SOS: Ns, two bytes per component, Ss, Se, Ah and Al
+      let components = usize::from(self.sos.first().copied().unwrap_or(0));
+      let ss = self.sos.get(1 + 2 * components);
+      let ah_al = self.sos.get(3 + 2 * components);
+      self.quiet = match (ss, ah_al) {
+        (Some(0), Some(ah_al)) if self.progressive && ah_al >> 4 == 0 => DC_FIRST_QUIET,
+        (Some(_), Some(_)) => usize::MAX,
+        _ => 0,
+      };
+      ScanState::Scan
+    } else {
+      ScanState::Between
+    };
+  }
+
+  /// A byte of a scan's data: whether it changes nothing
+  fn scan_byte(&mut self) -> bool {
+    let quiet = self.quiet > 0;
+    self.quiet = self.quiet.saturating_sub(1);
+    quiet
+  }
 }
 
 /// What the collector reads of a stream
@@ -3186,5 +3379,127 @@ mod tests {
     let guard = inner.lock().unwrap();
     assert_eq!(guard.frame_failed, Some(1));
     assert!(super::frame_failure_pending(&guard));
+  }
+
+  /// What a try of the data so far reports (`jpeg_frame` on a stream that has not ended): a
+  /// frame and its bytes, the data ends before the image does (with or without rows), or a
+  /// failure
+  fn jpeg_try(data: &[u8]) -> String {
+    use crate::codec::jpeg::{JpegDecode, decode_jpeg};
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    match decode_jpeg(data, 8, false) {
+      Ok(JpegDecode::Frame(frame)) => {
+        let mut bytes = vec![0u8; frame.width() as usize * frame.height() as usize * 4];
+        let size = frame.copy_to_buffer(&mut bytes).unwrap();
+        let mut hasher = DefaultHasher::new();
+        bytes[..size].hash(&mut hasher);
+        format!("frame {:016x}", hasher.finish())
+      }
+      Ok(JpegDecode::Incomplete { rows_started }) => format!("incomplete, rows {rows_started}"),
+      Err(error) => format!("failed: {error:?}"),
+    }
+  }
+
+  /// The JPEG fixtures, read at run time so that new ones are checked too
+  fn jpeg_fixtures() -> Vec<(String, Vec<u8>)> {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/__test__/fixtures/jpeg");
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+      .unwrap()
+      .map(|entry| {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        (name, std::fs::read(&path).unwrap())
+      })
+      .collect();
+    files.sort();
+    assert!(files.len() >= 17);
+    files
+  }
+
+  // `JpegRetries` skips a try whose new bytes `JpegScan` calls quiet. Such a try must report what
+  // the try before it reported: for every fixture (good, cut, failing, progressive, 99 and 100
+  // scans, two images) and chunk size, the bytes it calls quiet never change what libjpeg reports.
+  #[test]
+  fn a_jpeg_try_on_quiet_bytes_reports_what_the_last_try_reported() {
+    for (name, data) in jpeg_fixtures() {
+      for chunk in [1, 13, 64] {
+        let mut scan = super::JpegScan::default();
+        let mut last: Option<String> = None;
+        let mut quiet = 0;
+        let mut start = 0;
+        while start < data.len() {
+          let end = (start + chunk).min(data.len());
+          let changed = scan.feed(&data[start..end]);
+          let report = jpeg_try(&data[..end]);
+          if !changed {
+            quiet += end - start;
+            assert_eq!(
+              Some(&report),
+              last.as_ref(),
+              "{name}, chunks of {chunk}, at {end}"
+            );
+          }
+          last = Some(report);
+          start = end;
+        }
+        // The data of a scan is quiet: most of the bytes of these files
+        if name == "cmyk-33x17.jpg" {
+          assert!(
+            quiet > 1400,
+            "{name}, chunks of {chunk}: {quiet} quiet bytes"
+          );
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn jpeg_scan_counts_markers_segments_and_the_dc_first_limit() {
+    let mut scan = super::JpegScan::default();
+    // SOI, a COM segment whose payload looks like markers, then SOF2 and a DC first SOS
+    assert!(scan.feed(&[0xFF, 0xD8, 0xFF, 0xFE, 0x00, 0x06, 0xFF, 0xD9, 0xFF, 0xDA]));
+    assert!(scan.feed(&[0xFF, 0xC2, 0x00, 0x02]));
+    assert!(scan.feed(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01]));
+    // Its data, stuffed bytes, fill bytes and restart markers: quiet up to 128 KiB
+    assert!(!scan.feed(&[0x12, 0xFF, 0x00, 0x34, 0xFF, 0xFF, 0xD3, 0x56]));
+    assert!(!scan.feed(&vec![0x55; super::DC_FIRST_QUIET - 8]));
+    assert!(scan.feed(&[0x55]));
+    // A marker that ends the scan, then an AC scan (Ss 1): quiet however long
+    assert!(scan.feed(&[0xFF, 0xC4, 0x00, 0x02]));
+    assert!(scan.feed(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x01, 0x3F, 0x01]));
+    assert!(!scan.feed(&vec![0x55; super::DC_FIRST_QUIET * 2]));
+    // A marker split across chunks counts in the chunk that ends it
+    assert!(!scan.feed(&[0x55, 0xFF]));
+    assert!(scan.feed(&[0xD9]));
+    // Nothing after EOI is read
+    assert!(!scan.feed(&[0xFF, 0xD8, 0xFF, 0xDA, 0x00]));
+  }
+
+  #[test]
+  fn jpeg_retries_run_once_per_epoch_and_change() {
+    let inner = jpeg_decoder(include_bytes!("../../__test__/fixtures/jpeg/420-37x9.jpg"));
+    let mut retries = super::JpegRetries::default();
+    // SOI and a baseline SOS (Ns 1, Ss 0, Se 63)
+    retries.chunk(&[
+      0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00,
+    ]);
+    assert!(retries.run(&inner, 0));
+    assert!(!retries.run(&inner, 0));
+    // Scan data changes nothing
+    retries.chunk(&[0x11; 100]);
+    assert!(!retries.run(&inner, 0));
+    // A new epoch (a reset()) runs again
+    assert!(retries.run(&inner, 1));
+    assert!(!retries.run(&inner, 1));
+    // So does a marker, also one split across chunks
+    retries.chunk(&[0xFF]);
+    assert!(!retries.run(&inner, 1));
+    retries.chunk(&[0xD9]);
+    assert!(retries.run(&inner, 1));
+    assert!(!retries.run(&inner, 1));
+    // And any try while a frame failure is recorded
+    inner.lock().unwrap().frame_failed = Some(1);
+    assert!(retries.run(&inner, 1));
+    assert!(retries.run(&inner, 1));
   }
 }

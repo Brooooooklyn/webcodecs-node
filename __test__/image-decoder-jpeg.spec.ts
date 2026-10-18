@@ -5,6 +5,7 @@
  */
 
 import test from 'ava'
+import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -270,6 +271,53 @@ test('ImageDecoder: a JPEG decode() made just before the stream closes is BGRX, 
     image.close()
     decoder.close()
   }
+})
+
+// A stream that trickles in while a decode() waits, each chunk to an idle stream. Chrome's decoder
+// reads each byte once. Here a try decodes the data from its first byte, so a try for each chunk
+// would make the work grow with the square of the chunk count: only a try whose new bytes can
+// change its result runs (markers, not the data of a scan). Two junk bytes before the SOS marker
+// make libjpeg warn once in each header read that gets that far (the ffmpeg log), which counts
+// them: 3 per try, 1 per wake of the decode(). In a child process, which owns its log.
+test('ImageDecoder: a JPEG stream that trickles in is not decoded again for each chunk', (t) => {
+  const data = fixture('cmyk-33x17.jpg')
+  const sos = data.findIndex((byte, i) => byte === 0xff && data[i + 1] === 0xda)
+  const junk = new Uint8Array(data.length + 2)
+  junk.set(data.subarray(0, sos))
+  junk.set(data.subarray(sos), sos + 2)
+  const script = `
+    const fs = require('node:fs');
+    const { ImageDecoder } = require('./index.js');
+    const data = Buffer.from('${Buffer.from(junk).toString('base64')}', 'base64');
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const stream = new ReadableStream({
+      start(controller) {
+        (async () => {
+          for (let i = 0; i < data.length; i += 8) {
+            controller.enqueue(new Uint8Array(data.subarray(i, i + 8)));
+            await sleep(1);
+          }
+          controller.close();
+        })();
+      },
+    });
+    const decoder = new ImageDecoder({ data: stream, type: 'image/jpeg' });
+    decoder.decode().then(
+      ({ image }) => fs.writeSync(1, 'MARKER:' + image.format + '\\n'),
+      (error) => fs.writeSync(1, 'MARKER:' + error.name + '\\n'),
+    ).then(() => process.exit(0));
+  `
+  const output = execFileSync(process.execPath, ['-e', script], {
+    cwd: process.cwd(),
+    env: { ...process.env, WEBCODECS_LOG: 'ffmpeg=warn' },
+    timeout: 30_000,
+    encoding: 'utf8',
+  })
+  const [log, marker = ''] = output.split('MARKER:')
+  const reads = log.split('extraneous bytes before marker').length - 1
+  t.is(marker.trim(), 'BGRX')
+  // 229 chunks, 186 of them in the scan: 934 reads with a try for each one
+  t.true(reads > 0 && reads < 60, `${reads} header reads`)
 })
 
 // reset() aborts a waiting decode() in Chrome, before it decodes, but keeps the choice of RGB that a
