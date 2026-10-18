@@ -13,8 +13,8 @@ use crate::webcodecs::codec_epoch::{
   gated_output,
 };
 use crate::webcodecs::error::{
-  DOMExceptionName, error_as_dom_exception, native_dom_exception_error, throw_invalid_state_error,
-  throw_type_error_unit,
+  DOMExceptionName, dom_exception_rejection_error, native_dom_exception_error,
+  throw_invalid_state_error, throw_type_error_unit,
 };
 use crate::webcodecs::event_target::CodecEventState;
 use crate::webcodecs::flush_tracker::{FlushAbort, FlushTracker};
@@ -1772,7 +1772,7 @@ impl AudioEncoder {
         // Worker errors carry their DOMException name as a message prefix
         match result {
           Ok(()) => Ok(()),
-          Err(error) => Err(Error::from(error_as_dom_exception(env, error)?)),
+          Err(error) => Err(dom_exception_rejection_error(env, error)?),
         }
       },
     )

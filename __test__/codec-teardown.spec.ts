@@ -563,6 +563,104 @@ test('outputs of work before a failure reach JS before the error callback, and t
   }
 })
 
+// The flush rejection is built from the global DOMException, which page code can
+// replace. When the replacement throws, napi-rs cannot reject the promise while
+// that exception is pending, so the flush stayed pending forever. Now it rejects
+// with what was thrown, or with what a replaced constructor returned, as it is.
+// A value whose cause is itself crashed the process: napi-rs's Error::from
+// follows `cause` with no limit. (Chrome builds a native DOMException.)
+interface DOMExceptionReplacement {
+  name: string
+  // Replaces the global DOMException and returns the value the flush must reject with.
+  install(): unknown
+}
+
+function errorCausedBySelf(message: string): Error {
+  const error = new Error(message)
+  error.cause = error
+  return error
+}
+
+function replaceDOMExceptionWithThrowingGetter(thrown: unknown): unknown {
+  Object.defineProperty(globalThis, 'DOMException', {
+    configurable: true,
+    get: () => {
+      throw thrown
+    },
+  })
+  return thrown
+}
+
+const domExceptionReplacements: DOMExceptionReplacement[] = [
+  {
+    name: 'getter throws an Error',
+    install: () => replaceDOMExceptionWithThrowingGetter(new Error('replaced DOMException')),
+  },
+  {
+    name: 'getter throws an Error whose cause is itself',
+    install: () => replaceDOMExceptionWithThrowingGetter(errorCausedBySelf('replaced DOMException')),
+  },
+  {
+    name: 'constructor returns an Error whose cause is itself',
+    install: () => {
+      const returned = errorCausedBySelf('replaced DOMException')
+      Object.defineProperty(globalThis, 'DOMException', {
+        configurable: true,
+        writable: true,
+        value: function ReplacedDOMException() {
+          return returned
+        },
+      })
+      return returned
+    },
+  },
+  {
+    name: 'getter throws a string',
+    install: () => replaceDOMExceptionWithThrowingGetter('replaced DOMException'),
+  },
+]
+
+// Serial: the global stays replaced across an await.
+test.serial('a pending flush still settles when page code replaced DOMException in the error callback', async (t) => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'DOMException')!
+  for (const replacement of domExceptionReplacements) {
+    for (const failCase of await failAfterOutputCases()) {
+      const log: string[] = []
+      let expected: unknown = Symbol('not replaced')
+      // Cleared before the global is restored, so an error callback that comes
+      // later cannot replace it again.
+      let armed = true
+      try {
+        const codec = failCase.run((entry) => {
+          log.push(entry)
+          if (armed && entry.startsWith('error:')) {
+            expected = replacement.install()
+          }
+        }, 2)
+        const flush = codec.flush().then(
+          () => 'flush:resolved',
+          (error: unknown) => (error === expected ? 'flush:rejected with that value' : `flush:rejected:${String(error)}`),
+        )
+        // Await the flush with no timer. A flush that never settles (the bug)
+        // fails the test: ava reports "Promise returned by test never
+        // resolved" when the event loop runs empty, or the test fails at ava's
+        // timeout. A timer could fail a flush that settles: if the JS thread is
+        // blocked for longer than the timer before the flush's result reaches
+        // JS, the overdue timer runs first.
+        log.push(await flush)
+      } finally {
+        armed = false
+        Object.defineProperty(globalThis, 'DOMException', descriptor)
+      }
+      t.deepEqual(
+        log,
+        ['output', 'output', `error:${failCase.error}`, 'flush:rejected with that value'],
+        `${replacement.name}: ${failCase.name}`,
+      )
+    }
+  }
+})
+
 // No flush pending: the outputs travel to JS on their own, the error on another
 // ThreadsafeFunction. Node runs at most 999 calls of one ThreadsafeFunction before
 // it moves on to the next, so with more outputs queued the error callback ran
