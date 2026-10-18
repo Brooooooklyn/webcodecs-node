@@ -915,7 +915,11 @@ rssTest('VideoEncoder: an encoder an error closed frees its codec while it is st
   const result = JSON.parse(
     execFileSync(process.execPath, ['--expose-gc', '-e', script], {
       cwd: process.cwd(),
-      env: childEnv(),
+      // x64 Node under Rosetta (as in CI) puts blocks of 32 KB to 8 MB in libmalloc's
+      // medium zone. It keeps the ones the encoders free resident and does not reuse
+      // them all, so RSS grew 12 to 28 MB per encoder with nothing leaked. With that
+      // zone off they are freed as in arm64 Node, which has none.
+      env: { ...childEnv(), MallocMediumZone: '0' },
       timeout: 120_000,
       encoding: 'utf8',
     }),
