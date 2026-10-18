@@ -481,6 +481,11 @@ struct ImageDecoderInner {
   /// (`jpeg_unposted`), a chunk that comes to an idle stream is decoded at once (see
   /// `FrameCall::Arrival`).
   jpeg_requests: u32,
+  /// The `cache_epoch` of the JPEG frame decode that a decode() runs with all the data
+  /// (`FrameCall::Decode`, see `JpegFill`). Another decode() made in that epoch that finds no frame
+  /// waits for it and takes its result, like Chrome's decoder thread, which decodes the frame once
+  /// and answers the calls after that from it (ImageDecoderCore::Decode).
+  jpeg_fill: Option<u64>,
   /// Whether a frame failed to decode where Chrome's decoder fails (JPEG), with the
   /// `cache_epoch` that the work which found it first was made for (see `jpeg_frame`). Only the
   /// JS thread closes the decoder on it, like Chrome, which applies a failed decode in a
@@ -655,6 +660,7 @@ impl ImageDecoder {
       jpeg_drains: Vec::new(),
       jpeg_items: None,
       jpeg_requests: 0,
+      jpeg_fill: None,
       frame_failed: None,
       end_deferred: false,
       tracks: tracks.clone(),
@@ -1238,6 +1244,25 @@ fn decode_cached_frame(
     };
   }
 
+  // One decode() at a time decodes a JPEG frame with all the data: another one made in the same
+  // epoch waits for it, and takes its frame or its failure (see `JpegFill`).
+  let (needs_cache, _fill) = if jpeg && needs_cache && data_complete {
+    let mut guard = inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    if guard.jpeg_fill == Some(epoch) {
+      return Ok(None);
+    }
+    let needs_cache = guard.cached_frames.is_none();
+    let fill = (needs_cache && guard.cache_epoch == epoch).then(|| {
+      guard.jpeg_fill = Some(epoch);
+      JpegFill { inner, epoch }
+    });
+    (needs_cache, fill)
+  } else {
+    (needs_cache, None)
+  };
+
   // A reset can clear the cache. For fully buffered input, reconstruct it now;
   // for a live stream, wait for the collector's next successful probe. A JPEG stream's data so
   // far is tried by the collector, in the stream's order (`FrameCall::Arrival`); here only once
@@ -1428,6 +1453,25 @@ fn take_frame_failure(inner: &Arc<Mutex<ImageDecoderInner>>, epoch: u64) -> bool
 /// came since the work that found it (see `ImageDecoderInner::frame_failed`).
 fn frame_failure_pending(inner: &ImageDecoderInner) -> bool {
   !inner.closed && inner.frame_failed == Some(inner.cache_epoch)
+}
+
+/// The JPEG frame decode that a decode() runs (see `ImageDecoderInner::jpeg_fill`). It ends when
+/// that decode() has its result, also on an error or a panic, and wakes the calls that wait for
+/// it. A reset() moves `cache_epoch`: the calls made after it do not wait for this one.
+struct JpegFill<'a> {
+  inner: &'a Arc<Mutex<ImageDecoderInner>>,
+  epoch: u64,
+}
+
+impl Drop for JpegFill<'_> {
+  fn drop(&mut self) {
+    if let Ok(mut guard) = self.inner.lock() {
+      if guard.jpeg_fill == Some(self.epoch) {
+        guard.jpeg_fill = None;
+      }
+      guard.tracks.ready_notify.notify_waiters();
+    }
+  }
 }
 
 /// Whether the decoder closed on a failure, not on a close()
@@ -3022,6 +3066,7 @@ mod tests {
       jpeg_drains: Vec::new(),
       jpeg_items: None,
       jpeg_requests: 0,
+      jpeg_fill: None,
       frame_failed: None,
       end_deferred: false,
       tracks,
@@ -3177,6 +3222,82 @@ mod tests {
     let (error, ran) = decode_with_hook(&inner, 0, 1, || {});
     assert!(!ran);
     assert_eq!(error, "InvalidStateError: ImageDecoder is closed");
+  }
+
+  /// A JPEG that decodes
+  const JPEG_420: &[u8] = include_bytes!("../../__test__/fixtures/jpeg/420-37x9.jpg");
+
+  /// `decode_cached_frame` of frame 0 for a decode() made at `epoch`, on another thread (no hook
+  /// there): "pending", "frame" or the error reason
+  fn decode_elsewhere(inner: &Arc<Mutex<ImageDecoderInner>>, epoch: u64) -> String {
+    let inner = inner.clone();
+    std::thread::spawn(move || match decode_cached_frame(&inner, 0, epoch) {
+      Ok(None) => "pending".to_string(),
+      Ok(Some(_)) => "frame".to_string(),
+      Err(error) => error.reason,
+    })
+    .join()
+    .unwrap()
+  }
+
+  /// A decode() of a buffered JPEG made while another one's libjpeg decode runs, and what the
+  /// first one returns. Checks that the second one waits and is woken when the first one ends.
+  fn decode_during_another(data: &[u8]) -> (Arc<Mutex<ImageDecoderInner>>, String) {
+    let inner = jpeg_decoder(data);
+    let notify = inner.lock().unwrap().tracks.ready_notify.clone();
+    let mut notified = std::pin::pin!(notify.notified());
+    notified.as_mut().enable();
+    let second = Rc::new(RefCell::new(String::new()));
+    let (hook_inner, hook_second) = (inner.clone(), second.clone());
+    let (first, ran) = decode_with_hook(&inner, 0, 0, move || {
+      *hook_second.borrow_mut() = decode_elsewhere(&hook_inner, 0);
+    });
+    assert!(ran);
+    // Like Chrome's decoder thread, which decodes the frame once: the second call runs no libjpeg
+    assert_eq!(*second.borrow(), "pending");
+    // The end of the first call's decode wakes it
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(notified.as_mut().poll(&mut cx).is_ready());
+    assert_eq!(inner.lock().unwrap().jpeg_fill, None);
+    (inner, first)
+  }
+
+  #[test]
+  fn a_jpeg_decode_made_while_another_decodes_takes_its_frame() {
+    let (inner, first) = decode_during_another(JPEG_420);
+    assert_eq!(first, "ok");
+    let (second, ran) = decode_with_hook(&inner, 0, 0, || {});
+    assert!(!ran);
+    assert_eq!(second, "ok");
+  }
+
+  #[test]
+  fn a_jpeg_decode_made_while_another_decodes_takes_its_frame_failure() {
+    let (inner, first) = decode_during_another(TRUNCATED_JPEG);
+    assert_eq!(first, "Failed to decode frame at index 0");
+    let (second, ran) = decode_with_hook(&inner, 0, 0, || {});
+    assert!(!ran);
+    assert_eq!(second, "Failed to decode frame at index 0");
+    // Still only recorded: a decode() closes the decoder on the JS thread
+    assert!(!inner.lock().unwrap().closed);
+  }
+
+  #[test]
+  fn a_jpeg_decode_made_after_a_reset_does_not_wait_for_the_decode_before_it() {
+    let inner = jpeg_decoder(JPEG_420);
+    let second = Rc::new(RefCell::new(String::new()));
+    let (hook_inner, hook_second) = (inner.clone(), second.clone());
+    let (_, ran) = decode_with_hook(&inner, 0, 0, move || {
+      reset(&hook_inner);
+      *hook_second.borrow_mut() = decode_elsewhere(&hook_inner, 1);
+    });
+    assert!(ran);
+    assert_eq!(*second.borrow(), "frame");
+    assert_eq!(
+      reason(abort_if_reset(&inner, 0)),
+      "AbortError: Aborted by reset."
+    );
+    assert_eq!(inner.lock().unwrap().jpeg_fill, None);
   }
 
   /// A 12-bit JPEG: Chrome fails its frame as soon as it decodes it, also with part of the data
