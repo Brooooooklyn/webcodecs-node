@@ -536,6 +536,97 @@ test('dequeue: items dequeued before the dequeue event runs share one event, for
   t.deepEqual(result, { VideoEncoder: [0], VideoDecoder: [0], AudioEncoder: [0], AudioDecoder: [0] })
 })
 
+test('dequeue: an item dequeued while the first listener is being added still fires its event', (t) => {
+  // Adding the first listener makes the codec's thread-safe function with the
+  // event state unlocked (its async_hooks init hooks may call back in). The init
+  // hook below holds the JS thread there until the worker has dequeued the one
+  // queued item. Chrome 155 fires that event: the queue size dropped and its
+  // dequeue task has not run before the listener is added.
+  const result = runChild<Record<string, string>>(`
+    ${PRELUDE}
+    const asyncHooks = require('node:async_hooks');
+    const m = require('./index.js');
+    let armed = false;
+    asyncHooks.createHook({
+      init() {
+        if (!armed) return;
+        armed = false;
+        const start = Date.now();
+        while (Date.now() - start < 200) {}
+      },
+    }).enable();
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const frame = () =>
+      new m.VideoFrame(new Uint8Array(64 * 64 * 4).fill(80), { format: 'RGBA', codedWidth: 64, codedHeight: 64, timestamp: 0 });
+    const audio = () =>
+      new m.AudioData({ format: 'f32-planar', sampleRate: 48000, numberOfFrames: 960, numberOfChannels: 2, timestamp: 0, data: new Float32Array(1920).fill(0.1) });
+    const VIDEO = { codec: 'vp8', width: 64, height: 64, bitrate: 200000 };
+    const AUDIO = { codec: 'opus', sampleRate: 48000, numberOfChannels: 2 };
+    async function firstChunk(Codec, config, make) {
+      const chunks = [];
+      const encoder = new Codec({ output: (chunk) => chunks.push(chunk), error: fail });
+      encoder.configure(config);
+      const input = make();
+      encoder.encode(input);
+      input.close();
+      await encoder.flush();
+      encoder.close();
+      return chunks[0];
+    }
+    (async () => {
+      const videoChunk = await firstChunk(m.VideoEncoder, VIDEO, frame);
+      const audioChunk = await firstChunk(m.AudioEncoder, AUDIO, audio);
+      const SUBMIT = {
+        VideoEncoder: (codec) => { codec.configure(VIDEO); const input = frame(); codec.encode(input); input.close(); },
+        VideoDecoder: (codec) => { codec.configure({ codec: 'vp8', codedWidth: 64, codedHeight: 64 }); codec.decode(videoChunk); },
+        AudioEncoder: (codec) => { codec.configure(AUDIO); const input = audio(); codec.encode(input); input.close(); },
+        AudioDecoder: (codec) => { codec.configure(AUDIO); codec.decode(audioChunk); },
+      };
+      const out = {};
+      async function run(kind, how) {
+        let events = 0;
+        let weak;
+        await (async () => {
+          const codec = new m[kind]({ output: (output) => output.close?.(), error: fail });
+          weak = new WeakRef(codec);
+          SUBMIT[kind](codec);
+          // The codec hands the item to its worker from a microtask.
+          await Promise.resolve();
+          const listener = () => { events++; };
+          armed = true;
+          if (how === 'addEventListener') codec.addEventListener('dequeue', listener);
+          else codec.ondequeue = listener;
+          armed = false;
+          await codec.flush();
+          await sleep(50);
+          codec.close();
+        })();
+        await fullGc();
+        return events + (weak.deref() === undefined ? ' collected' : ' kept');
+      }
+      for (const kind of CODECS) {
+        for (const how of ['addEventListener', 'ondequeue']) {
+          // '0 collected' (rare): the worker dequeued the item before the
+          // listener was being added at all. That older gap fires no event on
+          // main either and is not the one under test, so run the case again.
+          // The gap under test gives '0 kept' and is never run again.
+          let result = await run(kind, how);
+          for (let attempt = 1; attempt < 5 && result === '0 collected'; attempt++) {
+            result = await run(kind, how);
+          }
+          out[kind + ':' + how] = result;
+        }
+      }
+      done(out);
+    })().catch(fail);
+  `)
+  const expected: Record<string, string> = {}
+  for (const kind of ['VideoEncoder', 'VideoDecoder', 'AudioEncoder', 'AudioDecoder']) {
+    for (const how of ['addEventListener', 'ondequeue']) expected[`${kind}:${how}`] = '1 collected'
+  }
+  t.deepEqual(result, expected)
+})
+
 // Child-side runner for error teardown: records the error (with the queue size and
 // state it sees), every dequeue event, and the order of both in log.
 const TEARDOWN = `

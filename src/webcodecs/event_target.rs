@@ -177,6 +177,10 @@ pub struct CodecEventState {
   /// Single dispatcher invoked from the worker thread; runs the whole
   /// dispatch on the JS thread in one call.
   dispatcher: Option<Arc<DispatcherTsf>>,
+  /// Registrations making the first dispatcher with the lock released (see
+  /// [`Self::lock_for_registration`]). While >0, a dequeue with no dispatcher
+  /// is scheduled and waits for it instead of being dropped.
+  making_dispatcher: usize,
 }
 
 impl CodecEventState {
@@ -272,15 +276,24 @@ impl CodecEventState {
   /// `WeakMap.prototype.set` captured at load, which is user JS if `WeakMap`
   /// was replaced before the module loaded). A call that runs in between
   /// finds the holder already recorded and uses it without linking again.
+  ///
+  /// A dequeue on a worker while the dispatcher is being made waits for it
+  /// (see [`Self::fire_n`]), and its event is queued once it is installed: the
+  /// queue size already dropped, and the listener being added must see that.
   fn lock_for_registration<'a>(
-    shared: &'a RwLock<Self>,
+    shared: &'a Arc<RwLock<Self>>,
     env: &Env,
     this: Object,
   ) -> Result<(RwLockWriteGuard<'a, Self>, Option<sys::napi_value>)> {
     let (need_dispatcher, anchor) = {
       let mut state = write_state(shared)?;
       state.capture_codec(env, this)?;
-      (state.dispatcher.is_none(), state.holder.prepare(env)?)
+      let anchor = state.holder.prepare(env)?;
+      let need_dispatcher = state.dispatcher.is_none();
+      if need_dispatcher {
+        state.making_dispatcher += 1;
+      }
+      (need_dispatcher, anchor)
     };
     let linked = (|| {
       let dispatcher = if need_dispatcher {
@@ -296,18 +309,46 @@ impl CodecEventState {
     let dispatcher = match linked {
       Ok(dispatcher) => dispatcher,
       Err(error) => {
-        // A holder that is not linked from the codec would not keep callbacks
-        // alive: forget it, so the next registration makes a new one.
-        if anchor.as_ref().is_some_and(|anchor| anchor.link.is_some())
-          && let Ok(mut state) = shared.write()
-        {
-          state.holder.clear(env.raw());
+        if let Ok(mut state) = shared.write() {
+          // A holder that is not linked from the codec would not keep
+          // callbacks alive: forget it, so the next registration makes a new
+          // one.
+          if anchor.as_ref().is_some_and(|anchor| anchor.link.is_some()) {
+            state.holder.clear(env.raw());
+          }
+          if need_dispatcher {
+            state.making_dispatcher = state.making_dispatcher.saturating_sub(1);
+            if state.making_dispatcher == 0
+              && state.dispatcher.is_none()
+              && state.dequeue_scheduled
+              && state.errors_pending == 0
+            {
+              // No dispatcher after all: drop the dequeues that waited for it,
+              // as fire_n does with no dispatcher.
+              let waited = state.take_scheduled();
+              state.note_queue_cleared(env, waited);
+            }
+          }
         }
         return Err(error);
       }
     };
     if let Some(dispatcher) = dispatcher {
-      let unused = write_state(shared)?.install_dispatcher(dispatcher);
+      let unused = {
+        let mut state = write_state(shared)?;
+        state.making_dispatcher = state.making_dispatcher.saturating_sub(1);
+        let unused = state.install_dispatcher(dispatcher);
+        // Queue the event of dequeues that waited for this dispatcher. One that
+        // waits for an error callback runs right after it (see report_error).
+        if unused.is_none()
+          && state.dequeue_scheduled
+          && state.errors_pending == 0
+          && let Some(installed) = state.dispatcher.clone()
+        {
+          state.queue_dispatch(shared, &installed);
+        }
+        unused
+      };
       drop(unused);
     }
     Ok((write_state(shared)?, anchor.map(|anchor| anchor.holder)))
@@ -315,7 +356,7 @@ impl CodecEventState {
 
   /// DOM addEventListener on a codec (JS thread).
   pub fn add_event_listener(
-    shared: &RwLock<Self>,
+    shared: &Arc<RwLock<Self>>,
     env: &Env,
     this: Object,
     event_type: &str,
@@ -343,7 +384,7 @@ impl CodecEventState {
 
   /// The codec's `ondequeue` setter (JS thread).
   pub fn set_ondequeue_handler(
-    shared: &RwLock<Self>,
+    shared: &Arc<RwLock<Self>>,
     env: &Env,
     this: Object,
     handler: Option<FunctionRef<Unknown<'static>, UnknownReturnValue>>,
@@ -585,6 +626,14 @@ impl CodecEventState {
       return;
     };
     let Some(dispatcher) = state.dispatcher.clone() else {
+      if state.making_dispatcher > 0 {
+        // A listener is being added and its dispatcher is being made, with the
+        // lock released (see lock_for_registration). Schedule the items: the
+        // event is queued once that dispatcher is installed.
+        state.dequeue_scheduled = true;
+        state.scheduled_items += items;
+        return;
+      }
       // No dispatcher: the items completed without a dispatch. Drain them so
       // a listener registered later doesn't see a stale outstanding count —
       // with no dispatcher there is no codec ref to unpin anyway.
