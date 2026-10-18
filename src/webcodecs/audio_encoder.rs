@@ -24,7 +24,7 @@ use crate::webcodecs::{
 };
 use crossbeam::channel::{self, Receiver, Sender};
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{ThreadsafeFunctionCallMode, UnknownReturnValue};
+use napi::threadsafe_function::UnknownReturnValue;
 use napi_derive::napi;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, RwLock};
@@ -32,11 +32,9 @@ use std::thread::JoinHandle;
 
 use super::video_encoder::CodecState;
 
-/// Type alias for output callback (takes chunk and metadata as separate args)
-/// Using FnArgs to spread tuple as separate callback arguments per WebCodecs spec
-/// Using CalleeHandled: false for direct callbacks without error-first convention
-/// The leading u32 is the codec generation; a gated wrapper drops stale calls.
-type OutputCallback = GatedOutput<FnArgs<(u32, EncodedAudioChunk, EncodedAudioChunkMetadata)>>;
+/// Output callback: wakes the gate for one output queued with
+/// `CodecEpoch::send_output` (see codec_epoch.rs).
+type OutputCallback = GatedOutput;
 
 /// Type alias for error callback (takes the codec generation and an Error)
 /// Using CalleeHandled: false because WebCodecs error callback receives the
@@ -724,9 +722,10 @@ impl AudioEncoder {
         if guard.flushes.should_buffer_outputs() {
           guard.pending_chunks.push((chunk, metadata));
         } else if !guard.is_stale() {
-          guard.output_callback.call(
-            FnArgs::from((guard.generation, chunk, metadata)),
-            ThreadsafeFunctionCallMode::NonBlocking,
+          guard.epoch.send_output(
+            &guard.output_callback,
+            guard.generation,
+            buffered_output(FnArgs::from((chunk, metadata))),
           );
         }
       }

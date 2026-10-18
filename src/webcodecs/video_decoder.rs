@@ -26,7 +26,7 @@ use crate::webcodecs::{
 };
 use crossbeam::channel::{self, Receiver, Sender};
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{ThreadsafeFunctionCallMode, UnknownReturnValue};
+use napi::threadsafe_function::UnknownReturnValue;
 use napi_derive::napi;
 use std::borrow::Cow;
 use std::rc::Rc;
@@ -42,9 +42,9 @@ fn video_source(hardware: bool) -> DecodedSource {
   }
 }
 
-/// Type alias for output callback (takes the codec generation and a VideoFrame)
-/// Using CalleeHandled: false for direct callbacks without error-first convention
-type OutputCallback = GatedOutput<FnArgs<(u32, VideoFrame)>>;
+/// Output callback: wakes the gate for one output queued with
+/// `CodecEpoch::send_output` (see codec_epoch.rs).
+type OutputCallback = GatedOutput;
 
 /// Type alias for error callback (takes the codec generation and an Error)
 /// Using CalleeHandled: false because WebCodecs error callback receives the
@@ -328,9 +328,10 @@ impl VideoDecoderInner {
     if self.is_stale() {
       return;
     }
-    self.output_callback.call(
-      FnArgs::from((self.generation, frame)),
-      ThreadsafeFunctionCallMode::NonBlocking,
+    self.epoch.send_output(
+      &self.output_callback,
+      self.generation,
+      buffered_output(frame),
     );
   }
 }

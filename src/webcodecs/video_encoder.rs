@@ -36,7 +36,7 @@ use crate::webcodecs::{
 };
 use crossbeam::channel::{self, Receiver, Sender};
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{ThreadsafeFunctionCallMode, UnknownReturnValue};
+use napi::threadsafe_function::UnknownReturnValue;
 use napi_derive::napi;
 use parking_lot::RwLock as ParkingLotRwLock;
 use std::collections::{BTreeMap, VecDeque};
@@ -164,11 +164,9 @@ pub struct VideoEncoderSupport {
   pub config: VideoEncoderConfig,
 }
 
-/// Output callback type - uses FnArgs to spread tuple members as separate callback arguments
-/// This matches the WebCodecs spec: output(chunk, metadata) instead of output([chunk, metadata])
-/// The leading u32 is the codec generation; a gated wrapper drops stale calls
-/// and passes the rest to the user's callback.
-type OutputCallback = GatedOutput<FnArgs<(u32, EncodedVideoChunk, EncodedVideoChunkMetadata)>>;
+/// Output callback: wakes the gate for one output queued with
+/// `CodecEpoch::send_output` (see codec_epoch.rs).
+type OutputCallback = GatedOutput;
 
 /// Type alias for error callback (takes the codec generation and an Error)
 /// Using CalleeHandled: false because WebCodecs error callback receives the
@@ -512,9 +510,10 @@ impl VideoEncoderInner {
     if self.is_stale() {
       return;
     }
-    self.output_callback.call(
-      FnArgs::from((self.generation, chunk, metadata)),
-      ThreadsafeFunctionCallMode::NonBlocking,
+    self.epoch.send_output(
+      &self.output_callback,
+      self.generation,
+      buffered_output(FnArgs::from((chunk, metadata))),
     );
   }
 

@@ -74,7 +74,7 @@ function audioData(index: number) {
   })
 }
 
-async function encodeVp8Chunks(count: number) {
+async function encodeVp8Chunks(count: number, width = 320, height = 240) {
   const chunks: EncodedVideoChunk[] = []
   let config: VideoDecoderConfig | undefined
   const encoder = new VideoEncoder({
@@ -86,9 +86,9 @@ async function encodeVp8Chunks(count: number) {
       throw error
     },
   })
-  encoder.configure({ codec: 'vp8', width: 320, height: 240, hardwareAcceleration: 'prefer-software' })
+  encoder.configure({ codec: 'vp8', width, height, hardwareAcceleration: 'prefer-software' })
   for (let i = 0; i < count; i++) {
-    const frame = i420Frame(320, 240, i)
+    const frame = i420Frame(width, height, i)
     encoder.encode(frame, { keyFrame: true })
     frame.close()
   }
@@ -462,9 +462,9 @@ interface FailAfterOutputCase {
   error: string
 }
 
-async function failAfterOutputCases(): Promise<FailAfterOutputCase[]> {
-  const video = await encodeVp8Chunks(3)
-  const audio = await encodeOpusChunks(3)
+async function failAfterOutputCases(maxGood = 3, videoSize = 320): Promise<FailAfterOutputCase[]> {
+  const video = await encodeVp8Chunks(maxGood, videoSize, (videoSize * 3) / 4)
+  const audio = await encodeOpusChunks(maxGood)
   return [
     {
       name: 'VideoEncoder: opaque frame',
@@ -554,6 +554,34 @@ test('outputs of work before a failure reach JS before the error callback, and t
     t.deepEqual(
       log,
       ['output', 'output', `error:${failCase.error}`, `flush:${failCase.error}`],
+      failCase.name,
+    )
+    t.is(codec.state, 'closed', failCase.name)
+  }
+})
+
+// No flush pending: the outputs travel to JS on their own, the error on another
+// ThreadsafeFunction. Node runs at most 999 calls of one ThreadsafeFunction before
+// it moves on to the next, so with more outputs queued the error callback ran
+// first and closed the codec, and the gate dropped the rest. Chrome: all outputs,
+// then the error.
+test('outputs queued behind more than 999 others still reach JS before the error callback', async (t) => {
+  const good = 1100
+  for (const failCase of await failAfterOutputCases(good, 64)) {
+    const log: string[] = []
+    const codec = failCase.run((entry) => log.push(entry), good)
+    await sendQueued()
+    // Keep the JS thread busy until the worker is done: every output and the
+    // error are queued before any callback runs.
+    const deadline = Date.now() + 20_000
+    while (queueSize(codec) > 0 && Date.now() < deadline) blockJsThread(1)
+    blockJsThread(200)
+    await waitFor(() => log.some((entry) => entry.startsWith('error:')), `${failCase.name} error callback`)
+    await delay(100)
+    const errorAt = log.findIndex((entry) => entry.startsWith('error:'))
+    t.deepEqual(
+      { before: errorAt, error: log[errorAt], after: log.length - errorAt - 1 },
+      { before: good, error: `error:${failCase.error}`, after: 0 },
       failCase.name,
     )
     t.is(codec.state, 'closed', failCase.name)
