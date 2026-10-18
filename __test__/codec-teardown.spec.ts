@@ -280,7 +280,10 @@ for (const teardown of ['close', 'reset'] as const) {
     }
   })
 
-  test(`${teardown}() after the worker emptied the queue still fires the dequeue event JS has not seen`, async (t) => {
+  // Serial, because ava runs a file's serial tests before the others: the spin
+  // below runs no timers, and in x64 Node under Rosetta at background priority it
+  // took about 11 s, longer than the waitFor() of the tests that ran with it.
+  test.serial(`${teardown}() after the worker emptied the queue still fires the dequeue event JS has not seen`, async (t) => {
     for (const codecCase of await codecCases()) {
       const log = phasedLog()
       const codec = codecCase.make(log.record)
