@@ -50,30 +50,6 @@ function twoPartStream(data: Uint8Array) {
   })
 }
 
-// All of `data` at once, the close 60 ms later
-function openStream(data: Uint8Array) {
-  return new ReadableStream<Uint8Array>({
-    start(controller) {
-      controller.enqueue(data)
-      setTimeout(() => controller.close(), 60)
-    },
-  })
-}
-
-// The first half at once, the rest and the close together 30 ms later
-function lastChunkClosesStream(data: Uint8Array) {
-  const half = data.length >> 1
-  return new ReadableStream<Uint8Array>({
-    start(controller) {
-      controller.enqueue(data.slice(0, half))
-      setTimeout(() => {
-        controller.enqueue(data.slice(half))
-        controller.close()
-      }, 30)
-    },
-  })
-}
-
 // All of `data` and the close in start(), or in pull()
 const closedStreams = {
   start: (data: Uint8Array) =>
@@ -235,19 +211,36 @@ const OPEN_STREAM_BGRX = [
 ] as const
 
 test('ImageDecoder: a JPEG decode() made while the stream is open is BGRX, like Chrome', async (t) => {
+  const rest = (source: Source) => source.rest()
+  const close = (source: Source) => source.close()
+  const restAndClose = (source: Source) => {
+    source.rest()
+    source.close()
+  }
   for (const [name, hash] of OPEN_STREAM_BGRX) {
-    // With half the data (decode() at once), with all of it and the close 60 ms later (decode()
-    // at once, or at 30 ms), or with the rest and the close in one task: Chrome decodes the rest
-    // before it reads the close.
-    for (const [stream, wait] of [
-      [twoPartStream, 0],
-      [openStream, 0],
-      [openStream, 30],
-      [lastChunkClosesStream, 0],
+    const data = fixture(name)
+    const half = data.length >> 1
+    // With half the data (decode() at once, the rest 30 ms later, the close 30 ms after that), with
+    // all of it and the close 60 ms after the data (decode() at once, or at 30 ms), or with half
+    // and the rest and the close in one task 30 ms later: Chrome decodes the rest before it reads
+    // the close. The test gives each part itself, after the decode(): a stream timer made before
+    // the test's own wait could fire first on a slow runner. The waits stay: with the rest and the
+    // close about 1 ms after the decode(), Chrome decodes the 4:2:0 and 4:2:2 JPEGs to YUV.
+    for (const [cut, wait, parts] of [
+      [half, 0, [[30, rest], [30, close]]],
+      [data.length, 0, [[60, close]]],
+      [data.length, 30, [[30, close]]],
+      [half, 0, [[30, restAndClose]]],
     ] as const) {
-      const decoder = new ImageDecoder({ data: stream(fixture(name)), type: 'image/jpeg' })
+      const source = cutStream(data, cut)
+      const decoder = new ImageDecoder({ data: source.stream, type: 'image/jpeg' })
       await sleep(wait)
-      const { image } = await decoder.decode()
+      const pending = decoder.decode()
+      for (const [ms, part] of parts) {
+        await sleep(ms)
+        part(source)
+      }
+      const { image } = await pending
       t.is(image.format, 'BGRX', name)
       t.is((await digests(image)).all, hash, name)
       image.close()
@@ -280,7 +273,9 @@ test('ImageDecoder: a JPEG decode() made just before the stream closes is BGRX, 
 })
 
 // reset() aborts a waiting decode() in Chrome, before it decodes, but keeps the choice of RGB that a
-// decode of part of the data made.
+// decode of part of the data made. The test gives the rest (30 ms after the data) and the close (30
+// ms after that) itself, after the reset(): a stream timer made before the test's own wait could
+// fire first on a slow runner.
 test("ImageDecoder: reset() keeps a JPEG's choice of RGB or YUV, like Chrome", async (t) => {
   for (const [name, resetAt, format] of [
     // reset() in the task of the decode(): nothing was decoded
@@ -292,13 +287,19 @@ test("ImageDecoder: reset() keeps a JPEG's choice of RGB or YUV, like Chrome", a
     ['444-progressive-33x17.jpg', 20, 'BGRX'],
     ['420-37x9.jpg', 20, 'I420'],
   ] as const) {
-    const decoder = new ImageDecoder({ data: twoPartStream(fixture(name)), type: 'image/jpeg' })
+    const data = fixture(name)
+    const source = cutStream(data, data.length >> 1)
+    const decoder = new ImageDecoder({ data: source.stream, type: 'image/jpeg' })
     const pending = decoder.decode().then(
       ({ image }) => image.close(),
       () => {},
     )
     if (resetAt) await sleep(resetAt)
     decoder.reset()
+    await sleep(30 - resetAt)
+    source.rest()
+    await sleep(30)
+    source.close()
     await decoder.completed
     const { image } = await decoder.decode()
     t.is(image.format, format, `${name} reset at ${resetAt} ms`)
@@ -328,6 +329,7 @@ function cutStream(data: Uint8Array, cut: number) {
     close: () => controller.close(),
   }
 }
+type Source = ReturnType<typeof cutStream>
 
 // Whether a promise is still pending after `ms`
 async function pendingAfter(promise: Promise<unknown>, ms: number) {
