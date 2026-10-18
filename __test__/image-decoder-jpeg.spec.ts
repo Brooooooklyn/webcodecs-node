@@ -278,7 +278,11 @@ test('ImageDecoder: a JPEG decode() made just before the stream closes is BGRX, 
 // would make the work grow with the square of the chunk count: only a try whose new bytes can
 // change its result runs (markers, not the data of a scan). Two junk bytes before the SOS marker
 // make libjpeg warn once in each header read that gets that far (the ffmpeg log), which counts
-// them: 3 per try, 1 per wake of the decode(). In a child process, which owns its log.
+// them: 3 per try, 1 per wake of the decode(). In a child process, which owns its log. The try at
+// the last chunk makes the frame and wakes the decode(). The close, a moment later, makes the
+// decoder decode all the data once more (3 more reads), on another thread: those lines can come
+// before the marker, after it (before the exit), or not at all. So the format comes from the
+// marker's line alone, and the reads count in the whole output.
 test('ImageDecoder: a JPEG stream that trickles in is not decoded again for each chunk', (t) => {
   const data = fixture('cmyk-33x17.jpg')
   const sos = data.findIndex((byte, i) => byte === 0xff && data[i + 1] === 0xda)
@@ -313,9 +317,9 @@ test('ImageDecoder: a JPEG stream that trickles in is not decoded again for each
     timeout: 30_000,
     encoding: 'utf8',
   })
-  const [log, marker = ''] = output.split('MARKER:')
-  const reads = log.split('extraneous bytes before marker').length - 1
-  t.is(marker.trim(), 'BGRX')
+  const format = /MARKER:(\w+)/.exec(output)?.[1]
+  const reads = output.split('extraneous bytes before marker').length - 1
+  t.is(format, 'BGRX')
   // 229 chunks, 186 of them in the scan: 934 reads with a try for each one
   t.true(reads > 0 && reads < 60, `${reads} header reads`)
 })
