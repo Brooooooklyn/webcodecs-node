@@ -1295,6 +1295,19 @@ const avifStream = (data: Uint8Array) => {
   })
 }
 
+// avifStream, but the stream errors where it would end
+const avifErrorStream = (data: Uint8Array) => {
+  let offset = 0
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      if (offset >= data.length) return controller.error(new Error('stream broke'))
+      controller.enqueue(data.slice(offset, offset + 256))
+      offset += 256
+    },
+  })
+}
+
 test('ImageDecoder: a streamed AVIF with an alpha track is BGRA from its first frame, like Chrome', async (t) => {
   const decoder = new ImageDecoder({ data: avifStream(avifFixture('panim8_420a.avif')), type: 'image/avif' })
   const { image } = await decoder.decode({ frameIndex: 0 })
@@ -1441,7 +1454,25 @@ test('ImageDecoder: a complete AVIF that ends before a box its brands need fails
     await t.notThrowsAsync(completed)
     t.true(decoder.complete)
     t.true(decoder.closed)
+    // Chrome ends the data on a stream error as at its end. (Chrome then resolves `completed`;
+    // here it rejects with the stream's error, for every format.)
+    const failing = new ImageDecoder({ data: avifErrorStream(data), type: 'image/avif' })
+    const failed = failing.completed
+    await t.throwsAsync(failing.tracks.ready, metadataError, `${label}, stream error`)
+    await t.throwsAsync(failed, { message: 'stream broke' })
+    t.true(failing.complete)
+    t.true(failing.closed)
   }
+})
+
+test('ImageDecoder: a streamed AVIF track whose samples never came before a stream error fails decode(), like Chrome', async (t) => {
+  // anim8_420: moov ends at byte 993, sample 0 starts at byte 1001
+  const decoder = new ImageDecoder({ data: avifErrorStream(avifFixture('anim8_420.avif').slice(0, 1001)), type: 'image/avif' })
+  const pending = decoder.decode()
+  await decoder.tracks.ready
+  t.is(decoder.tracks.selectedTrack?.frameCount, 3)
+  await t.throwsAsync(pending, { name: 'EncodingError', message: 'Failed to decode frame at index 0' })
+  t.true(decoder.closed)
 })
 
 test("ImageDecoder: a streamed AVIF whose samples pass Chrome's 256 MB size hint fails the metadata while it streams", async (t) => {

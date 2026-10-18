@@ -830,16 +830,38 @@ impl ImageDecoder {
               // waking decode waiters so they reject instead of waiting for an
               // update that can never arrive. A JPEG frame failure that a decode() has not
               // applied yet comes first: the JS thread decides (`end_with_frame_failure`).
-              let pending = inner_clone.lock().is_ok_and(|mut inner_guard| {
-                inner_guard.all_data = true;
-                let pending = frame_failure_pending(&inner_guard);
+              let (pending, avif) = inner_clone
+                .lock()
+                .map_or((false, false), |mut inner_guard| {
+                  inner_guard.all_data = true;
+                  (
+                    frame_failure_pending(&inner_guard),
+                    inner_guard.codec_id == Some(AVCodecID::Av1),
+                  )
+                });
+              // Chrome ends the data on a stream error as at EOF: an AVIF gets the last refresh
+              // of the end of a stream. A box still missing rejects the metadata (the decoder
+              // closes, and `completed` rejects with the error), and a track counts the frames
+              // whose samples never came.
+              if avif {
+                let final_inner = inner_clone.clone();
+                let _ = spawn_blocking(move || {
+                  cache_decoded_frames(&final_inner, FrameCall::Probe, true)
+                })
+                .await;
+                if close_if_metadata_failed(&inner_clone)
+                  || (!pending && closed_on_failure(&inner_clone))
+                {
+                  return Err(error);
+                }
+              }
+              if let Ok(mut inner_guard) = inner_clone.lock() {
                 if pending {
                   inner_guard.end_deferred = true;
                 } else {
                   inner_guard.complete.store(true, Ordering::Release);
                 }
-                pending
-              });
+              }
               signal_tracks_ready(&inner_clone);
               if pending {
                 return Ok(StreamEnd::FrameFailure(Some(error)));
