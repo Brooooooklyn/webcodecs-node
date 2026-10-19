@@ -704,11 +704,19 @@ test('ImageDecoder: a decode() made after close() settles after the calls made b
       decodes.push(decoder.decode({ frameIndex }).finally(() => settled.push(3)))
       const results = await Promise.allSettled(decodes)
       t.deepEqual(settled, [0, 1, 2, 3], type)
-      t.true(
-        results.every((result) => result.status === 'rejected'),
+      t.deepEqual(
+        results.map((result) => {
+          const reason = (result as PromiseRejectedResult).reason as DOMException | undefined
+          return `${reason?.name}: ${reason?.message}`
+        }),
+        [
+          'AbortError: Aborted by failure.',
+          'AbortError: Aborted by failure.',
+          'AbortError: Aborted by failure.',
+          'InvalidStateError: ImageDecoder is closed',
+        ],
         type,
       )
-      t.is(((results[3] as PromiseRejectedResult).reason as DOMException).name, 'InvalidStateError', type)
     }
   }
 })
@@ -755,6 +763,333 @@ test('ImageDecoder: reset() rejects a waiting GIF decode() with AbortError, and 
   t.deepEqual(settled, [2, 0])
   t.false(decoder.closed)
   image.close()
+})
+
+// Chrome's reset() and close() reject every pending decode() inside their own call
+// (ImageDecoderExternal::reset, close), whatever the call waits for. The tests below check a call
+// after one `await Promise.resolve()`, with no timer: the reaction of a promise settled by reset()
+// or close() runs before that await resumes. A close() rejects with "Aborted by failure.", Chrome's message
+// for a close() (its two labels look swapped).
+const fourColors = (ext: string) => new Uint8Array(readFileSync(join(__dirname, `fixtures/wpt/four-colors.${ext}`)))
+// With the first bytes of the file before the header ends: 8, and 12 for the WebP, as here
+// tracks.ready resolves for 1 to 11 bytes of a WebP, which Chrome does not (not a reset() matter)
+const EVERY_FORMAT: [Uint8Array, string, number][] = [
+  [fourColors('png'), 'image/png', 8],
+  [fourColors('jpg'), 'image/jpeg', 8],
+  [fourColors('webp'), 'image/webp', 12],
+  [fourColors('gif'), 'image/gif', 8],
+  [fourColors('avif'), 'image/avif', 8],
+  [BMP_3x2, 'image/bmp', 8],
+]
+const ABORTED_BY_RESET = 'DOMException AbortError: Aborted by reset.'
+const ABORTED_BY_CLOSE = 'DOMException AbortError: Aborted by failure.'
+const CLOSED = 'DOMException InvalidStateError: ImageDecoder is closed'
+
+// The first `cut` bytes at once; the stream stays open until `close()`
+function openStream(data: Uint8Array, cut: number) {
+  let controller!: ReadableStreamDefaultController<Uint8Array>
+  const stream = new ReadableStream<Uint8Array>({
+    start(c) {
+      controller = c
+      c.enqueue(data.slice(0, cut))
+    },
+  })
+  return {
+    stream,
+    rest: () => controller.enqueue(data.slice(cut)),
+    close: () => {
+      try {
+        controller.close()
+      } catch {}
+    },
+  }
+}
+
+// What a promise has given so far: "pending", "resolved", "frame" or the rejection
+function state(promise: Promise<unknown>) {
+  const seen = { value: 'pending', reason: undefined as unknown }
+  promise.then(
+    (result) => {
+      seen.value = (result as { image?: unknown } | undefined)?.image ? 'frame' : 'resolved'
+    },
+    (error: Error) => {
+      seen.reason = error
+      seen.value = `${error.constructor.name} ${error.name}: ${error.message}`
+    },
+  )
+  return seen
+}
+
+// Whether a promise is still pending after `ms`
+async function pendingAfter(promise: Promise<unknown>, ms: number) {
+  const seen = state(promise)
+  await new Promise((resolve) => setTimeout(resolve, ms))
+  return seen.value === 'pending'
+}
+
+const busy = (ms: number) => {
+  const end = performance.now() + ms
+  while (performance.now() < end);
+}
+
+test('ImageDecoder: reset() rejects a decode() that waits for the tracks at once and leaves tracks.ready pending, in every format, like Chrome', async (t) => {
+  for (const [data, type, cut] of EVERY_FORMAT) {
+    const source = openStream(data, cut)
+    const decoder = new ImageDecoder({ data: source.stream, type })
+    // also when a check fails: the open stream would keep the worker alive
+    t.teardown(() => {
+      decoder.close()
+      source.close()
+    })
+    const ready = state(decoder.tracks.ready)
+    const waiting = state(decoder.decode())
+    decoder.reset()
+    await Promise.resolve()
+    t.is(waiting.value, ABORTED_BY_RESET, type)
+    t.is(ready.value, 'pending', type)
+    // nothing the rejected call does afterwards (it gives its turn) resolves it either
+    t.true(await pendingAfter(decoder.tracks.ready, 50), type)
+
+    // the call made after the reset() decodes once the data comes
+    const next = decoder.decode()
+    source.rest()
+    source.close()
+    const { image, complete } = await next
+    const whole = new ImageDecoder({ data, type })
+    const { image: expected } = await whole.decode()
+    t.true(complete, type)
+    t.deepEqual([image.codedWidth, image.codedHeight], [expected.codedWidth, expected.codedHeight], type)
+    t.is(ready.value, 'resolved', type)
+    t.is(waiting.value, ABORTED_BY_RESET, type)
+    image.close()
+    expected.close()
+    whole.close()
+  }
+})
+
+test('ImageDecoder: a close() after reset() leaves the decode() that reset() rejected as it was, like Chrome', async (t) => {
+  for (const sameTask of [true, false]) {
+    for (const [data, type, cut] of EVERY_FORMAT) {
+      const label = `${type}, close() ${sameTask ? 'in the task of the reset()' : 'after it'}`
+      const source = openStream(data, cut)
+      const decoder = new ImageDecoder({ data: source.stream, type })
+      t.teardown(source.close)
+      const pending = decoder.decode()
+      const waiting = state(pending)
+      decoder.reset()
+      if (!sameTask) await Promise.resolve()
+      decoder.close()
+      await Promise.resolve()
+      t.is(waiting.value, ABORTED_BY_RESET, label)
+      await t.throwsAsync(pending, { instanceOf: DOMException, name: 'AbortError', message: 'Aborted by reset.' }, label)
+    }
+  }
+})
+
+// When reset() or close() comes: in the task that made the decoder (the tracks are not ready);
+// in the decode()'s task once the tracks are ready; and once the frame is decoded but not given to
+// the decode() yet (two microtasks start the work, and 50 ms of sync work let it end). The result
+// is the same whichever stage the call is at: the stages only change what it waits for.
+const STAGES: [string, (decoder: ImageDecoder) => Promise<void>, (decoder: ImageDecoder) => Promise<void>][] = [
+  ['the task that made the decoder', async () => {}, async () => {}],
+  ['the task of the decode()', async (decoder) => decoder.tracks.ready, async () => {}],
+  [
+    'a frame that waits to be given',
+    async (decoder) => decoder.tracks.ready,
+    async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+      busy(50)
+    },
+  ],
+]
+const BUFFERED: [Uint8Array, string][] = [
+  [fourColors('png'), 'image/png'],
+  [fourColors('gif'), 'image/gif'],
+]
+
+test('ImageDecoder: reset() rejects a pending decode() at once at every stage, and the next decode() goes on, like Chrome', async (t) => {
+  for (const [stage, before, after] of STAGES) {
+    for (const [data, type] of BUFFERED) {
+      const label = `${type}, reset() in ${stage}`
+      const decoder = new ImageDecoder({ data, type })
+      await before(decoder)
+      const ready = state(decoder.tracks.ready)
+      const waiting = state(decoder.decode())
+      await after(decoder)
+      const readyBefore = ready.value
+      decoder.reset()
+      await Promise.resolve()
+      t.is(waiting.value, ABORTED_BY_RESET, label)
+      t.is(ready.value, readyBefore, label)
+      await t.notThrowsAsync(decoder.tracks.ready, label)
+      const { image } = await decoder.decode()
+      t.deepEqual([image.codedWidth, image.codedHeight], [320, 240], label)
+      image.close()
+      // never the frame
+      t.is(waiting.value, ABORTED_BY_RESET, label)
+      decoder.close()
+    }
+  }
+})
+
+test('ImageDecoder: close() rejects a pending decode() at once at every stage, and a decode() after it right after it, like Chrome', async (t) => {
+  const check = async (label: string, decoder: ImageDecoder, stage: () => Promise<void>) => {
+    const settled: number[] = []
+    const first = decoder.decode()
+    first.finally(() => settled.push(0)).catch(() => {})
+    const waiting = state(first)
+    await stage()
+    decoder.close()
+    const second = decoder.decode()
+    second.finally(() => settled.push(1)).catch(() => {})
+    const after = state(second)
+    await Promise.resolve()
+    t.is(waiting.value, ABORTED_BY_CLOSE, label)
+    t.is(after.value, CLOSED, label)
+    t.deepEqual(settled, [0, 1], label)
+  }
+  for (const [stage, before, after] of STAGES) {
+    for (const [data, type] of BUFFERED) {
+      const decoder = new ImageDecoder({ data, type })
+      await before(decoder)
+      await check(`${type}, close() in ${stage}`, decoder, () => after(decoder))
+    }
+  }
+  // a stream whose tracks have not come
+  for (const [data, type, cut] of EVERY_FORMAT) {
+    const source = openStream(data, cut)
+    t.teardown(source.close)
+    await check(`${type}, stream of ${cut} bytes`, new ImageDecoder({ data: source.stream, type }), async () => {})
+  }
+})
+
+test('ImageDecoder: reset() rejects every pending decode() at once, in call order, with one error, like Chrome', async (t) => {
+  // the fixture's frames are bytes 0..901, 902..1765 and 1766..2629
+  const data = new Uint8Array(readFileSync(join(__dirname, 'fixtures/animated.gif')))
+  const source = openStream(data, 902)
+  const decoder = new ImageDecoder({ data: source.stream, type: 'image/gif' })
+  t.teardown(() => {
+    decoder.close()
+    source.close()
+  })
+  await decoder.tracks.ready
+  const settled: number[] = []
+  const calls = [2, 1, 2].map((frameIndex, call) => {
+    const promise = decoder.decode({ frameIndex })
+    promise.finally(() => settled.push(call)).catch(() => {})
+    return state(promise)
+  })
+  decoder.reset()
+  const next = decoder.decode({ frameIndex: 0 })
+  next.finally(() => settled.push(3)).catch(() => {})
+  await Promise.resolve()
+  t.deepEqual(
+    calls.map(({ value }) => value),
+    [ABORTED_BY_RESET, ABORTED_BY_RESET, ABORTED_BY_RESET],
+  )
+  t.deepEqual(settled, [0, 1, 2])
+  t.is(calls[0].reason, calls[1].reason)
+  t.is(calls[1].reason, calls[2].reason)
+
+  source.rest()
+  source.close()
+  const { image } = await next
+  t.is(image.timestamp, 0)
+  t.deepEqual(settled, [0, 1, 2, 3])
+  image.close()
+})
+
+// reset() and close() make their AbortError before they take the calls: page code can run there (a
+// replaced global DOMException; Chrome runs none) and make a decode() and a reset() or close().
+// The calls still settle in call order: a close() made there rejects the calls made before it,
+// the one made there too, and leaves none to the outer call. The global is put back before any
+// await.
+test('ImageDecoder: a decode() and a close() or reset() made while reset() or close() makes its error settle after the calls made before', async (t) => {
+  for (const [outer, inner, expected] of [
+    ['reset', 'close', ['first AbortError: Aborted by failure.', 'second AbortError: Aborted by failure.']],
+    ['close', 'reset', ['first AbortError: Aborted by failure.', 'second InvalidStateError: ImageDecoder is closed']],
+  ] as const) {
+    const label = `${inner}() in ${outer}()`
+    const source = openStream(fourColors('png'), 8)
+    t.teardown(source.close)
+    const decoder = new ImageDecoder({ data: source.stream, type: 'image/png' })
+    const order: string[] = []
+    const watch = (name: string, promise: Promise<unknown>) =>
+      promise.then(
+        () => order.push(`${name} resolved`),
+        (error: Error) => order.push(`${name} ${error.name}: ${error.message}`),
+      )
+    const first = watch('first', decoder.decode())
+    let second: Promise<unknown> | undefined
+    const thrown: string[] = []
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'DOMException')!
+    const Native = descriptor.value as typeof DOMException
+    let runs = 0
+    function Replaced(message?: string, name?: string) {
+      if (runs++ === 0) {
+        second = watch('second', decoder.decode())
+        try {
+          decoder[inner]()
+        } catch (error) {
+          thrown.push(`${(error as Error).name}: ${(error as Error).message}`)
+        }
+      }
+      return new Native(message, name)
+    }
+    Replaced.prototype = Native.prototype
+    Object.defineProperty(globalThis, 'DOMException', { ...descriptor, value: Replaced })
+    try {
+      decoder[outer]()
+    } finally {
+      Object.defineProperty(globalThis, 'DOMException', descriptor)
+    }
+    await first
+    await second
+    t.true(runs > 0, label)
+    t.deepEqual(order, expected, label)
+    t.deepEqual(thrown, inner === 'reset' ? ['InvalidStateError: ImageDecoder is closed'] : [], label)
+  }
+})
+
+// The work's callback makes a failed decode()'s error through the global DOMException, which page
+// code can replace, and that code can call the decoder. A decode() made there, on the decoder the
+// failure closed, waits for the failed call (still pending) and rejects after it. Serial: the
+// global stays replaced until the first call settles, and is put back in `finally`.
+test.serial('ImageDecoder: a decode() made while a failed decode() makes its error settles after it', async (t) => {
+  for (const [label, data, init] of [
+    ['JPEG with a desired size below 1/64', fourColors('jpg'), { type: 'image/jpeg', desiredWidth: 39, desiredHeight: 30 }],
+  ] as const) {
+    const decoder = new ImageDecoder({ data, ...init })
+    const order: string[] = []
+    const watch = (name: string, promise: Promise<unknown>) =>
+      promise.then(
+        () => order.push(`${name} resolved`),
+        (error: Error) => order.push(`${name} ${error.name}: ${error.message}`),
+      )
+    let second: Promise<unknown> | undefined
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'DOMException')!
+    const Native = descriptor.value as typeof DOMException
+    function Replaced(message?: string, name?: string) {
+      if (name === 'EncodingError' && !second) {
+        second = watch('second', decoder.decode())
+      }
+      return new Native(message, name)
+    }
+    Replaced.prototype = Native.prototype
+    Object.defineProperty(globalThis, 'DOMException', { ...descriptor, value: Replaced })
+    try {
+      await watch('first', decoder.decode())
+    } finally {
+      Object.defineProperty(globalThis, 'DOMException', descriptor)
+    }
+    await second
+    t.deepEqual(
+      order,
+      ['first EncodingError: Failed to decode frame at index 0', 'second InvalidStateError: ImageDecoder is closed'],
+      label,
+    )
+  }
 })
 
 test('ImageDecoder: a stream error ends the GIF or BMP data, like Chrome', async (t) => {
@@ -1069,8 +1404,9 @@ test('ImageDecoder: a streamed JPEG with a desired size below 1/64 of its area r
 
 test('ImageDecoder: a close() in the decode() task or a microtask wins over a failed metadata, every time', async (t) => {
   // The worker thread can find the failed metadata before the JS task reaches close(). The close()
-  // still wins, as on main: decode() rejects with "ImageDecoder is closed", ready and completed
-  // resolve. (Chrome 155 rejects decode() with AbortError "Aborted by failure." here.)
+  // still wins, as on main: like Chrome 155, decode() rejects with AbortError "Aborted by
+  // failure.", Chrome's message for a close(); ready and completed resolve (Chrome rejects them
+  // with that error too).
   const badJpeg = new Uint8Array(readFileSync(join(__dirname, 'fixtures/wpt/four-colors.jpg')))
   const sof = badJpeg.findIndex((byte, i) => byte === 0xff && badJpeg[i + 1] === 0xc2)
   badJpeg.fill(0, sof + 7, sof + 9)
@@ -1176,7 +1512,7 @@ test('ImageDecoder: a close() in the decode() task or a microtask wins over a fa
       }
       t.deepEqual(
         seen,
-        { 'decode() DOMException InvalidStateError: ImageDecoder is closed | ready resolves | completed resolves': 50 },
+        { 'decode() DOMException AbortError: Aborted by failure. | ready resolves | completed resolves': 50 },
         `${name}, close() in ${when}`,
       )
     }
@@ -1245,7 +1581,7 @@ test('ImageDecoder: a close() in the decode() task or a microtask leaves the GIF
       }
       seen[`${name}, close() in ${when}`] = counts
       expected[`${name}, close() in ${when}`] = {
-        [`decode() InvalidStateError: ImageDecoder is closed | ready resolves | ${built}`]: 50,
+        [`decode() AbortError: Aborted by failure. | ready resolves | ${built}`]: 50,
       }
     }
   }
