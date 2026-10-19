@@ -17,12 +17,14 @@ use crate::webcodecs::bmp_decoder::{self, BmpDecoder};
 use crate::webcodecs::buffer_source::{self, Uint8ArrayCopy};
 use crate::webcodecs::decoded_frame::{DecodedSource, avif_frame, decoded_frame_format};
 use crate::webcodecs::error::{
-  DOMExceptionName, abort_error, invalid_state_error, native_dom_exception_error,
-  native_range_error, throw_invalid_state_error,
+  DOMExceptionName, abort_error, dom_exception_for_rejection, invalid_state_error,
+  native_dom_exception_error, native_range_error, take_pending_exception,
+  throw_invalid_state_error,
 };
 use crate::webcodecs::gif_decoder::{self, GifDecoder};
 use crate::webcodecs::image_hints::{PixelHint, png_header};
 use crate::webcodecs::{VideoFrame, VideoPixelFormat};
+use futures::future::{Either, select};
 use futures::stream::StreamExt;
 use napi::bindgen_prelude::*;
 use napi::tokio::sync::Notify;
@@ -31,10 +33,11 @@ use napi::tokio::sync::mpsc::{
 };
 use napi_derive::napi;
 use parking_lot::RwLock as ParkingLotRwLock;
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
   Arc, Mutex, Weak,
-  atomic::{AtomicBool, AtomicU8, Ordering},
+  atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 
 const COMPLETED_PROMISE: &str = "[[completed]]";
@@ -412,20 +415,7 @@ impl ImageTrackList {
   pub fn ready<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
     let tracks = self.clone();
     let wait = async move {
-      // Fast path: already ready
-      if !tracks.ready.load(Ordering::Acquire) {
-        // IMPORTANT: Create the listener FIRST, before checking the flag again.
-        // This prevents a race condition where notify_waiters() is called
-        // after our initial check but before we register as a waiter.
-        let notified = tracks.ready_notify.notified();
-
-        // Check again - if became ready while creating listener, do not wait.
-        // Otherwise the listener is registered, so any subsequent
-        // notify_waiters() call will wake us up
-        if !tracks.ready.load(Ordering::Acquire) {
-          notified.await;
-        }
-      }
+      wait_for_flag(&tracks.ready, &tracks.ready_notify).await;
       Ok(tracks.failed.load(Ordering::Acquire))
     };
     let ready = env.spawn_future_with_callback(wait, |env, failed| {
@@ -536,6 +526,11 @@ struct ImageDecoderInner {
   missing_samples: Option<usize>,
   /// Track list
   tracks: ImageTrackList,
+  /// Wakes the decode() calls that wait: for their turn (`DecodeTurn`), for data or a frame
+  /// (`signal_tracks_ready`, `JpegFill`), or because a reset() or a close() rejected them
+  /// (`reset_or_closed`). `tracks.ready_notify` is only for the waits for the tracks, so none of
+  /// these can resolve `tracks.ready`.
+  decode_notify: Arc<Notify>,
   /// Whether decoder is closed
   closed: bool,
   /// Cached frames (for animated images, populated on first decode)
@@ -581,6 +576,7 @@ impl ImageDecoderInner {
     self.tracks.ready.store(true, Ordering::Release);
     self.tracks.ready_notify.notify_waiters();
     self.tracks.ready_notify.notify_one();
+    self.decode_notify.notify_waiters();
   }
 
   /// What reset() does to an open decoder. Like Chrome, whose decoder stays failed after a
@@ -590,18 +586,15 @@ impl ImageDecoderInner {
     self.cached_frames = None;
     self.cache_epoch = self.cache_epoch.wrapping_add(1);
     self.cached_data_len = 0;
-    // Like Chrome, the decode() calls that wait reject (`abort_if_reset`). A JPEG keeps its
-    // choice of RGB (`rgb_decode`).
+    // Like Chrome, the decode() calls that wait reject, at once (`ImageDecoder::reset`). A JPEG
+    // keeps its choice of RGB (`rgb_decode`).
     self.jpeg_requests = 0;
     self.jpeg_unposted = 0;
     self.jpeg_drains.clear();
     self.decode_posted_bytes = 0;
-    // Wake them. Only once the tracks are ready: before that, `ready_notify` would also resolve
-    // `tracks.ready`, and the calls still wait for the tracks; they reject when the tracks are
-    // ready.
-    if self.tracks.ready.load(Ordering::Acquire) {
-      self.tracks.ready_notify.notify_waiters();
-    }
+    // Wake their work, also the work that waits for the tracks (`reset_or_closed`): it goes on
+    // to its turn and ends there (`abort_if_reset`). `tracks.ready` stays as it is, like Chrome's.
+    self.decode_notify.notify_waiters();
 
     // Reset frame_count for animated formats (will be re-detected on next decode)
     if let Ok(mut track_inner) = self.tracks.inner.lock()
@@ -662,7 +655,12 @@ enum CachedFrame {
 #[napi]
 pub struct ImageDecoder {
   inner: Arc<Mutex<ImageDecoderInner>>,
+  /// Where the promises of its decode() calls wait (`DECODE_CALLS`)
+  id: u64,
 }
+
+/// The `id` of the next ImageDecoder
+static NEXT_DECODER_ID: AtomicU64 = AtomicU64::new(0);
 
 #[napi]
 impl ImageDecoder {
@@ -715,6 +713,7 @@ impl ImageDecoder {
       terminal_stream: false,
       missing_samples: None,
       tracks: tracks.clone(),
+      decode_notify: Arc::new(Notify::new()),
       closed: false,
       cached_frames: None,
       failed_frames: HashSet::new(),
@@ -1002,14 +1001,7 @@ impl ImageDecoder {
       let ready_flag = ready.clone();
       let ready_notifier = ready_notify.clone();
       let ready_promise = env.spawn_future(async move {
-        if ready_flag.load(Ordering::Acquire) {
-          return Ok(());
-        }
-        let notified = ready_notifier.notified();
-        if ready_flag.load(Ordering::Acquire) {
-          return Ok(());
-        }
-        notified.await;
+        wait_for_flag(&ready_flag, &ready_notifier).await;
         Ok(())
       })?;
 
@@ -1028,7 +1020,10 @@ impl ImageDecoder {
       return Err(Error::new(Status::InvalidArg, "Invalid data type"));
     }
 
-    Ok(Self { inner })
+    Ok(Self {
+      inner,
+      id: NEXT_DECODER_ID.fetch_add(1, Ordering::Relaxed),
+    })
   }
 
   /// Whether the data is fully buffered
@@ -1086,17 +1081,27 @@ impl ImageDecoder {
       let promise_raw: PromiseRaw<()> = this.get_named_property(READY_PROMISE)?;
       promise_raw.into_sendable_promise()?
     };
+    // The call's promise. Like Chrome's, it is settled on the JS thread: by the work's callback
+    // below, or at once by a reset() or a close() (see `DecodeCall`).
+    let (deferred, promise) = create_call_promise(env)?;
+    let promise = PromiseRaw::new(env.raw(), promise);
 
+    let id = self.id;
     let inner = self.inner.clone();
     let frame_index = options.as_ref().and_then(|o| o.frame_index).unwrap_or(0) as usize;
     // Read now: a decode() made before the decoder fails rejects differently from one made
     // after (see `closed_error`), and one made before a reset() rejects (see `abort_if_reset`).
     // Like Chrome, the calls are handled in call order: what one finds can depend on the frames
     // that the ones before it failed.
-    let (ticket, closed, epoch, jpeg_request, post) = {
-      let mut guard = inner
-        .lock()
-        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    let call = inner.lock().map_err(|_| ()).map(|mut guard| {
+      // Like Chrome, a call made on a closed decoder rejects at once, after the calls that close()
+      // rejected (see `ImageDecoder::close`). Not while calls made before it wait: this one then
+      // waits for its turn. Those are calls made before a failure closed the decoder, which reject
+      // on their turns (`closed_error`), and a call whose rejection is being made (page code can
+      // run there, see the work's callback below).
+      if guard.closed && !has_calls(id) {
+        return None;
+      }
       let jpeg_request =
         frame_index == 0 && !guard.closed && guard.codec_id == Some(AVCodecID::Mjpeg);
       // Like Chrome, a decode() made while the stream is open tries the data read so far: after
@@ -1112,14 +1117,25 @@ impl ImageDecoder {
       // Every call takes a ticket, also one made on a closed decoder (see `DecodeTurn`)
       let ticket = guard.next_decode;
       guard.next_decode += 1;
-      (
+      Some((
         ticket,
         guard.closed,
         guard.cache_epoch,
         jpeg_request,
         post.then_some(guard.stream_reads),
-      )
+      ))
+    });
+    let Ok(call) = call else {
+      let error = Error::new(Status::GenericFailure, "Lock poisoned");
+      settle_call(env, deferred, Err(error_value(env, error)));
+      return Ok(promise);
     };
+    let Some((ticket, closed, epoch, jpeg_request, post)) = call else {
+      let error = decode_rejection(env, invalid_state_error("ImageDecoder is closed"));
+      settle_call(env, deferred, Err(error));
+      return Ok(promise);
+    };
+    push_call(id, ticket, deferred);
     if let Some(reads) = post {
       let post = JpegPost {
         epoch,
@@ -1136,22 +1152,30 @@ impl ImageDecoder {
     // callback can construct the precise native JavaScript exception class.
     let turn_inner = inner.clone();
     let decode = async move {
-      // Like Chrome, a call made on a closed decoder rejects with InvalidStateError. Chrome's
-      // close() rejects the calls made before it at once; here they reject on their turns, so it
-      // waits for them, and the promises settle in call order.
+      // Made on a decoder that a failure closed while calls made before it were pending: like
+      // Chrome, it rejects with InvalidStateError, after those calls, which reject on their turns.
       if closed {
         wait_for_turn(&inner, ticket).await?;
         return Err(invalid_state_error("ImageDecoder is closed"));
       }
 
-      // Wait for ready promise (ensures initial pre-parsing is complete)
-      ready_promise.await?;
+      // Wait for ready promise (ensures initial pre-parsing is complete). A reset() or a close()
+      // rejects the call at once and stops this wait (`reset_or_closed`): the work goes on to
+      // its turn, and ends there.
+      if let Either::Left((ready, _)) = select(
+        ready_promise,
+        std::pin::pin!(reset_or_closed(&inner, epoch)),
+      )
+      .await
+      {
+        ready?;
+      }
 
       let update_notify = {
         let guard = inner
           .lock()
           .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-        guard.tracks.ready_notify.clone()
+        guard.decode_notify.clone()
       };
 
       // A streamed animated image can establish its tracks before the requested
@@ -1206,65 +1230,95 @@ impl ImageDecoder {
     };
 
     let turn = DecodeTurn(turn_inner);
-    env.spawn_future_with_callback(async move { Ok(decode.await) }, move |env, result| {
-      // A frame failure counts first (`apply_frame_failure`), then the next decode() call's
-      // turn (see `DecodeTurn`)
-      let result =
-        result.map_err(|error| apply_frame_failure(&settle_inner, epoch, frame_index, error));
-      drop(turn);
-      match result {
-        Ok(result) => Ok(result),
-        Err(error) => Err(native_image_decode_error(env, error)?),
+    let work =
+      env.spawn_future_with_callback(async move { Ok(decode.await) }, move |env, result| {
+        // A frame failure counts first (`apply_frame_failure`), then the next decode() call's
+        // turn (see `DecodeTurn`)
+        let result =
+          result.map_err(|error| apply_frame_failure(&settle_inner, epoch, frame_index, error));
+        drop(turn);
+        // The call's promise, unless a reset() or a close() rejected it first: like Chrome, which
+        // drops the result of a decode in flight, the result is dropped here, with its frame
+        // (never given to JS)
+        if !has_call(id, ticket) {
+          return Ok(());
+        }
+        let value = match result {
+          // SAFETY: on the JS thread, with its env
+          Ok(result) => unsafe { ImageDecodeResult::to_napi_value(env.raw(), result) }
+            .map_err(|error| decode_rejection(env, error)),
+          Err(error) => Err(decode_rejection(env, error)),
+        };
+        settle_listed_call(env, id, ticket, value);
+        Ok(())
+      });
+    let work = match work {
+      Ok(work) => work,
+      // No work: the callback is dropped, and with it the turn
+      Err(error) => {
+        let value = Err(decode_rejection(env, error));
+        settle_listed_call(env, id, ticket, value);
+        return Ok(promise);
       }
-    })
+    };
+    // The work's own promise rejects only when its callback never ran (a panic in the work): the
+    // call then rejects with that reason, as before this promise was the call's. Never reported
+    // as unhandled.
+    let caught = work.catch(move |ctx: CallbackContext<Unknown>| {
+      if let Some(deferred) = take_call(id, ticket) {
+        settle_call(&ctx.env, deferred, Err(ctx.value.raw()));
+      }
+      Ok(())
+    });
+    if caught.is_err() {
+      clear_pending_exception(env);
+    }
+    Ok(promise)
   }
 
   /// Reset the decoder
   /// Clears cached frames - next decode() will re-decode from stored data
   #[napi]
   pub fn reset(&self, env: Env) -> Result<()> {
-    let mut inner = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    if inner.closed {
+    let (closed, made) = {
+      let mut inner = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+      if !inner.closed {
+        inner.reset();
+      }
+      (inner.closed, inner.next_decode)
+    };
+    // JS errors only once the lock is let go: page code can run there (a replaced global
+    // DOMException) and call the decoder
+    if closed {
       return throw_invalid_state_error(&env, "ImageDecoder is closed");
     }
-
-    inner.reset();
+    // Like Chrome (ImageDecoderExternal::reset), every decode() call not settled yet rejects
+    // now, in call order: one that waits for the tracks (they stay pending), for data, for its
+    // frame work, or whose frame waits to be delivered. Its work ends on its turn
+    // (`abort_if_reset`).
+    reject_calls(&env, self.id, made, "Aborted by reset.");
     Ok(())
   }
 
   /// Close the decoder
   #[napi]
-  pub fn close(&self) -> Result<()> {
-    let mut inner = self
-      .inner
-      .lock()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-    // A metadata failure counts once `close_if_metadata_failed` has closed the decoder. A close()
-    // that comes first wins, also when a worker thread already found the failure
-    // (`reject_metadata`). A GIF track goes back to how it was built the same way: until
-    // `tracks.ready` is signalled, what a worker thread may have filled in
-    // (`cache_decoded_frames`) does not count. Only GIF: gif_decoder often finishes before the JS
-    // task that made the decoder reaches close(), so without this the track after an early
-    // close() changes from run to run. The other formats keep what the worker found, as before.
-    if !inner.closed {
-      // The same for a frame failure (`jpeg_frame`, every frame of a GIF or BMP), also one that a
-      // reset() kept
-      inner.frame_failed = None;
-      inner.frames_failed = false;
-      inner.tracks.failed.store(false, Ordering::Release);
-      if inner.codec_id == Some(AVCodecID::Gif)
-        && !inner.tracks.ready.load(Ordering::Acquire)
-        && let Ok(mut tracks) = inner.tracks.inner.lock()
-        && let Some(track) = tracks.tracks.get_mut(0)
-      {
-        *track = ImageTrackData::initial(inner.codec_id);
-      }
+  pub fn close(&self, env: Env) -> Result<()> {
+    // Like Chrome (ImageDecoderExternal::close), every decode() call not settled yet rejects
+    // now, in call order, with Chrome's message for a close(): "Aborted by failure." (its two
+    // labels look swapped; a failure closes with "Aborted by close.", see `StreamEnd`). Not when
+    // a failure closed the decoder first: those calls reject with EncodingError on their turns
+    // (`closed_error`).
+    if close_decoder(&self.inner)? {
+      let made = self
+        .inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?
+        .next_decode;
+      reject_calls(&env, self.id, made, "Aborted by failure.");
     }
-    inner.close();
     Ok(())
   }
 
@@ -1300,6 +1354,255 @@ fn native_image_decode_error(env: &Env, error: Error) -> Result<Error> {
   }
 
   native_dom_exception_error(env, DOMExceptionName::EncodingError, &error.reason)
+}
+
+/// What close() does to the decoder's state. Returns whether it was open.
+fn close_decoder(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<bool> {
+  let mut inner = inner
+    .lock()
+    .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+  // A metadata failure counts once `close_if_metadata_failed` has closed the decoder. A close()
+  // that comes first wins, also when a worker thread already found the failure
+  // (`reject_metadata`). A GIF track goes back to how it was built the same way: until
+  // `tracks.ready` is signalled, what a worker thread may have filled in
+  // (`cache_decoded_frames`) does not count. Only GIF: gif_decoder often finishes before the JS
+  // task that made the decoder reaches close(), so without this the track after an early
+  // close() changes from run to run. The other formats keep what the worker found, as before.
+  let open = !inner.closed;
+  if open {
+    // The same for a frame failure (`jpeg_frame`, every frame of a GIF or BMP), also one that a
+    // reset() kept
+    inner.frame_failed = None;
+    inner.frames_failed = false;
+    inner.tracks.failed.store(false, Ordering::Release);
+    if inner.codec_id == Some(AVCodecID::Gif)
+      && !inner.tracks.ready.load(Ordering::Acquire)
+      && let Ok(mut tracks) = inner.tracks.inner.lock()
+      && let Some(track) = tracks.tracks.get_mut(0)
+    {
+      *track = ImageTrackData::initial(inner.codec_id);
+    }
+  }
+  inner.close();
+  Ok(open)
+}
+
+thread_local! {
+  /// The decode() calls whose promise is not settled yet, by decoder (`ImageDecoder::id`), in
+  /// call order, like Chrome's `pending_decodes_`. A decoder has an entry only while it has such
+  /// calls.
+  static DECODE_CALLS: RefCell<HashMap<u64, Vec<DecodeCall>>> = RefCell::new(HashMap::new());
+}
+
+/// A decode() call whose promise is not settled yet: its ticket (see `DecodeTurn`) and the
+/// promise's napi_deferred. Like Chrome, which settles these on the main thread, also inside
+/// reset() and close() (ImageDecoderExternal::reset), so a call they reject is rejected before
+/// they return; napi-rs settles its own deferreds only in a later callback.
+///
+/// Safety rule for `deferred`: decode() makes it with `create_call_promise`, on the JS thread,
+/// and keeps it only in that thread's `DECODE_CALLS`. Whoever takes it out of the map settles it
+/// at once with `settle_call`, on the same thread and with the decoder's env: decode()'s work
+/// callback or its catch reaction (`take_call`), reset() or close() (`take_calls`). So it is
+/// settled once, and never used after. The decode work and its callback capture only the
+/// decoder's id and the ticket: the callback may be dropped on another thread (when the work
+/// panics, or at env teardown) and owns nothing of JS. A raw pointer is neither Send nor Sync,
+/// so the compiler keeps a DecodeCall on its thread. A call left in the map at env teardown is
+/// never settled; dropping it makes no napi call.
+struct DecodeCall {
+  ticket: u64,
+  deferred: napi::sys::napi_deferred,
+}
+
+/// On the JS thread: a decode() call's promise and its napi_deferred (see `DecodeCall`)
+fn create_call_promise(env: &Env) -> Result<(napi::sys::napi_deferred, napi::sys::napi_value)> {
+  let mut deferred = std::ptr::null_mut();
+  let mut promise = std::ptr::null_mut();
+  // SAFETY: on the JS thread, with its env; both out pointers are valid
+  napi::check_status!(
+    unsafe { napi::sys::napi_create_promise(env.raw(), &mut deferred, &mut promise) },
+    "Failed to create the promise of decode()"
+  )?;
+  Ok((deferred, promise))
+}
+
+fn push_call(id: u64, ticket: u64, deferred: napi::sys::napi_deferred) {
+  let _ = DECODE_CALLS.try_with(|calls| {
+    calls
+      .borrow_mut()
+      .entry(id)
+      .or_default()
+      .push(DecodeCall { ticket, deferred })
+  });
+}
+
+/// Take the promise of a decoder's decode() call out of `DECODE_CALLS`, to settle it now. None
+/// when a reset() or a close() took it first.
+fn take_call(id: u64, ticket: u64) -> Option<napi::sys::napi_deferred> {
+  DECODE_CALLS
+    .try_with(|calls| {
+      let mut calls = calls.borrow_mut();
+      let pending = calls.get_mut(&id)?;
+      let call = pending.remove(pending.iter().position(|call| call.ticket == ticket)?);
+      if pending.is_empty() {
+        calls.remove(&id);
+      }
+      Some(call.deferred)
+    })
+    .ok()
+    .flatten()
+}
+
+/// Take the promises of a decoder's decode() calls whose ticket is below `made` out of
+/// `DECODE_CALLS`, in call order, to settle them now
+fn take_calls(id: u64, made: u64) -> Vec<DecodeCall> {
+  DECODE_CALLS
+    .try_with(|calls| {
+      let mut calls = calls.borrow_mut();
+      let Some(pending) = calls.get_mut(&id) else {
+        return Vec::new();
+      };
+      // in call order: the calls made before are first
+      let before = pending.iter().take_while(|call| call.ticket < made).count();
+      let taken = pending.drain(..before).collect();
+      if pending.is_empty() {
+        calls.remove(&id);
+      }
+      taken
+    })
+    .unwrap_or_default()
+}
+
+/// Whether a decoder's decode() call is still in `DECODE_CALLS`
+fn has_call(id: u64, ticket: u64) -> bool {
+  DECODE_CALLS
+    .try_with(|calls| {
+      calls
+        .borrow()
+        .get(&id)
+        .is_some_and(|pending| pending.iter().any(|call| call.ticket == ticket))
+    })
+    .unwrap_or(false)
+}
+
+/// On the JS thread: settle a decode() call with `value`, made while the call was still in
+/// `DECODE_CALLS`, unless page code that ran while `value` was made settled it first. A rejection
+/// is made through the global DOMException, which page code can replace: a decode() made there
+/// finds this call still pending, and waits for its turn rather than reject before it, and a
+/// reset() or close() made there takes this call and rejects it first.
+fn settle_listed_call(
+  env: &Env,
+  id: u64,
+  ticket: u64,
+  value: std::result::Result<napi::sys::napi_value, napi::sys::napi_value>,
+) {
+  if let Some(deferred) = take_call(id, ticket) {
+    settle_call(env, deferred, value);
+  }
+}
+
+/// Whether a decoder has decode() calls whose promise is not settled yet
+fn has_calls(id: u64) -> bool {
+  DECODE_CALLS
+    .try_with(|calls| calls.borrow().contains_key(&id))
+    .unwrap_or(false)
+}
+
+/// On the JS thread: settle a decode() call's promise, taken out of `DECODE_CALLS` (or never put
+/// there) just before. Ok resolves with the value, Err rejects with it.
+fn settle_call(
+  env: &Env,
+  deferred: napi::sys::napi_deferred,
+  value: std::result::Result<napi::sys::napi_value, napi::sys::napi_value>,
+) {
+  // SAFETY: see `DecodeCall`: `deferred` was made with this env, on this thread, and is not
+  // settled yet. Settling it frees it, and nothing holds it any more.
+  let status = unsafe {
+    match value {
+      Ok(value) => napi::sys::napi_resolve_deferred(env.raw(), deferred, value),
+      Err(value) => napi::sys::napi_reject_deferred(env.raw(), deferred, value),
+    }
+  };
+  // napi settles nothing while an exception is pending: reject with it rather than leave the
+  // promise pending for ever
+  if status == napi::sys::Status::napi_pending_exception
+    && let Ok(Some(exception)) = take_pending_exception(env)
+  {
+    // SAFETY: as above; the deferred was not settled
+    unsafe { napi::sys::napi_reject_deferred(env.raw(), deferred, exception.raw()) };
+  }
+}
+
+/// `error` as a JS value: the JS value it holds, as it is (a DOMException is no native Error,
+/// which `JsError::into_value` would replace with a new Error), else a new Error with its message
+fn error_value(env: &Env, error: Error) -> napi::sys::napi_value {
+  // SAFETY: on the JS thread, with its env
+  unsafe { ToNapiValue::to_napi_value(env.raw(), error) }
+    .unwrap_or_else(|error| unsafe { napi::JsError::from(error).into_value(env.raw()) })
+}
+
+/// What a decode() call rejects with for `error`: the JS error it names
+/// (`native_image_decode_error`), or, when page code broke that (a replaced global DOMException),
+/// the exception it left pending
+fn decode_rejection(env: &Env, error: Error) -> napi::sys::napi_value {
+  match native_image_decode_error(env, error) {
+    Ok(error) => error_value(env, error),
+    Err(error) => match take_pending_exception(env) {
+      Ok(Some(exception)) => exception.raw(),
+      _ => error_value(env, error),
+    },
+  }
+}
+
+/// On the JS thread, in reset() or close(): reject the decoder's decode() calls made before it
+/// (whose ticket is below `made`, `ImageDecoderInner::next_decode` then) and not settled yet, in
+/// call order, with one AbortError, like Chrome. Made once the decoder's lock is let go: page code
+/// can run while the error is made (a replaced global DOMException) and call the decoder. So the
+/// calls are taken only after the error is made: a close() made there rejects them first, with
+/// the calls made there, in call order, and leaves none here. A decode() made there that no
+/// close() rejects is a call made after this one, and stays.
+fn reject_calls(env: &Env, id: u64, made: u64, message: &str) {
+  if !has_calls(id) {
+    return;
+  }
+  let error = dom_exception_for_rejection(env, abort_error(message))
+    .map(|error| error.raw())
+    .unwrap_or_else(|_| error_value(env, abort_error(message)));
+  for call in take_calls(id, made) {
+    settle_call(env, call.deferred, Err(error));
+  }
+}
+
+/// Ends once a reset() or a close() came after the decode() call made when `cache_epoch` was
+/// `epoch`. A reset() or a close() rejects the call at once; a close on a failure leaves it to
+/// its turn (`closed_error`). Either way its work stops waiting for the tracks.
+async fn reset_or_closed(inner: &Arc<Mutex<ImageDecoderInner>>, epoch: u64) {
+  let Ok(notify) = inner.lock().map(|guard| guard.decode_notify.clone()) else {
+    return;
+  };
+  loop {
+    // Registered before the check, so a reset() in between still wakes it
+    let mut notified = std::pin::pin!(notify.notified());
+    notified.as_mut().enable();
+    match inner.lock() {
+      Ok(guard) if !guard.closed && guard.cache_epoch == epoch => {}
+      _ => return,
+    }
+    notified.await;
+  }
+}
+
+/// Wait until `flag` (`tracks.ready`) is set. `notify` is woken once it is set
+/// (`signal_tracks_ready`, `ImageDecoderInner::close`); the flag is read again after each wake.
+async fn wait_for_flag(flag: &AtomicBool, notify: &Notify) {
+  loop {
+    // Registered before the check, so a notify_waiters() in between still wakes it
+    let mut notified = std::pin::pin!(notify.notified());
+    notified.as_mut().enable();
+    if flag.load(Ordering::Acquire) {
+      return;
+    }
+    notified.await;
+  }
 }
 
 /// Return a requested cached frame, or None while a streamed image may still
@@ -1487,18 +1790,18 @@ fn decode_cached_frame(
 }
 
 /// The turn of a decode() call: dropping it gives the turn to the next call. decode() drops it on
-/// the JS thread, in the callback that settles the call's promise, so the next call starts only
-/// once this one settles, and the promises settle in call order, like Chrome's. Given away on the
-/// worker thread instead, the next call could finish and settle first while that thread waits to
-/// settle this one. It also drops when the callback never runs (the environment goes away), so
-/// the calls after it do not wait forever.
+/// the JS thread, in the callback that settles the call's promise (unless a reset() or a close()
+/// did), so the next call starts only once this one settles, and the promises settle in call
+/// order, like Chrome's. Given away on the worker thread instead, the next call could finish and
+/// settle first while that thread waits to settle this one. It also drops when the callback never
+/// runs (the environment goes away), so the calls after it do not wait forever.
 struct DecodeTurn(Arc<Mutex<ImageDecoderInner>>);
 
 impl Drop for DecodeTurn {
   fn drop(&mut self) {
     if let Ok(mut guard) = self.0.lock() {
       guard.decode_turn += 1;
-      guard.tracks.ready_notify.notify_waiters();
+      guard.decode_notify.notify_waiters();
     }
   }
 }
@@ -1508,8 +1811,7 @@ async fn wait_for_turn(inner: &Arc<Mutex<ImageDecoderInner>>, ticket: u64) -> Re
   let notify = inner
     .lock()
     .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?
-    .tracks
-    .ready_notify
+    .decode_notify
     .clone();
   loop {
     // Registered before the check, so a turn given in between still wakes it
@@ -1527,10 +1829,10 @@ async fn wait_for_turn(inner: &Arc<Mutex<ImageDecoderInner>>, ticket: u64) -> Re
 }
 
 /// Like Chrome, a reset() made after a decode() call rejects it with AbortError, in every format.
-/// decode() checks it on the call's turn, so the calls made before the reset() reject in call
-/// order, and each one gives the turn to the next: the calls made after it do not wait for them.
-/// A close() also moves `cache_epoch`; the call then gets the error of a closed decoder
-/// (`closed_error`).
+/// The reset() rejects it at once (`ImageDecoder::reset`); its work ends here, on the call's turn,
+/// with what it found dropped, and gives the turn to the next call, so the calls made after the
+/// reset() do not wait for its result. A close() also moves `cache_epoch`; the work then gets the
+/// error of a closed decoder (`closed_error`).
 fn abort_if_reset(inner: &Arc<Mutex<ImageDecoderInner>>, epoch: u64) -> Result<()> {
   let guard = inner
     .lock()
@@ -1681,7 +1983,7 @@ impl Drop for JpegFill<'_> {
       if guard.jpeg_fill == Some(self.epoch) {
         guard.jpeg_fill = None;
       }
-      guard.tracks.ready_notify.notify_waiters();
+      guard.decode_notify.notify_waiters();
     }
   }
 }
@@ -1736,6 +2038,8 @@ fn signal_tracks_ready(inner: &Arc<Mutex<ImageDecoderInner>>) {
     // recheck and the first poll of a Notified future.
     inner_guard.tracks.ready_notify.notify_waiters();
     inner_guard.tracks.ready_notify.notify_one();
+    // The decode() calls that wait for data or a frame look again
+    inner_guard.decode_notify.notify_waiters();
   }
 }
 
@@ -3606,10 +3910,11 @@ mod tests {
   use crate::ffi::types::AV_NOPTS_VALUE;
 
   use super::{
-    AVCodecID, ColorSpaceConversion, FrameCall, ImageDecoder, ImageDecoderData, ImageDecoderInner,
+    AVCodecID, ColorSpaceConversion, DecodeTurn, FrameCall, ImageDecoderData, ImageDecoderInner,
     ImageTrackData, ImageTrackList, ImageTrackListInner, JpegPost, abort_if_reset,
-    apply_frame_failure, begin_terminal_refresh, cache_decoded_frames, decode_cached_frame,
-    end_with_frame_failure, finish_jpeg_post, frame_failure, post_before_end, take_frame_failure,
+    apply_frame_failure, begin_terminal_refresh, cache_decoded_frames, close_decoder,
+    decode_cached_frame, end_with_frame_failure, finish_jpeg_post, frame_failure, post_before_end,
+    reset_or_closed, take_frame_failure,
   };
   use napi::tokio::sync::Notify;
   use std::cell::{Cell, RefCell};
@@ -3768,6 +4073,7 @@ mod tests {
       terminal_stream: false,
       missing_samples: None,
       tracks,
+      decode_notify: Arc::new(Notify::new()),
       closed: false,
       cached_frames: None,
       failed_frames: HashSet::new(),
@@ -3819,12 +4125,9 @@ mod tests {
     guard.reset();
   }
 
+  /// What `ImageDecoder::close` does to the decoder (the method needs an Env)
   fn close(inner: &Arc<Mutex<ImageDecoderInner>>) {
-    ImageDecoder {
-      inner: inner.clone(),
-    }
-    .close()
-    .unwrap();
+    close_decoder(inner).unwrap();
   }
 
   #[test]
@@ -3946,7 +4249,7 @@ mod tests {
   /// first one returns. Checks that the second one waits and is woken when the first one ends.
   fn decode_during_another(data: &[u8]) -> (Arc<Mutex<ImageDecoderInner>>, String) {
     let inner = jpeg_decoder(data);
-    let notify = inner.lock().unwrap().tracks.ready_notify.clone();
+    let notify = inner.lock().unwrap().decode_notify.clone();
     let mut notified = std::pin::pin!(notify.notified());
     notified.as_mut().enable();
     let second = Rc::new(RefCell::new(String::new()));
@@ -4476,5 +4779,77 @@ mod tests {
       reason(decode_cached_frame(&inner, 0, 1)),
       "InvalidStateError: ImageDecoder is closed"
     );
+  }
+
+  /// `jpeg_decoder` before its tracks are ready, with a waiter enabled on `tracks.ready_notify`
+  /// (what `tracks.ready` waits on) and one on `decode_notify` (what decode() calls wait on)
+  fn waiters_before_the_tracks() -> (Arc<Mutex<ImageDecoderInner>>, Arc<Notify>, Arc<Notify>) {
+    let inner = jpeg_decoder(JPEG_420);
+    let (ready_notify, decode_notify) = {
+      let guard = inner.lock().unwrap();
+      guard.tracks.ready.store(false, Ordering::Release);
+      (
+        guard.tracks.ready_notify.clone(),
+        guard.decode_notify.clone(),
+      )
+    };
+    (inner, ready_notify, decode_notify)
+  }
+
+  #[test]
+  fn a_turn_given_before_the_tracks_are_ready_does_not_wake_tracks_ready() {
+    let (inner, ready_notify, decode_notify) = waiters_before_the_tracks();
+    let mut ready = std::pin::pin!(ready_notify.notified());
+    ready.as_mut().enable();
+    let mut decode = std::pin::pin!(decode_notify.notified());
+    decode.as_mut().enable();
+    // A decode() call gives its turn (a call that a reset() rejected while the tracks are not
+    // ready, say)
+    drop(DecodeTurn(inner.clone()));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert_eq!(inner.lock().unwrap().decode_turn, 1);
+    assert!(decode.as_mut().poll(&mut cx).is_ready());
+    // tracks.ready still waits, like Chrome's
+    assert!(ready.as_mut().poll(&mut cx).is_pending());
+  }
+
+  #[test]
+  fn a_reset_before_the_tracks_are_ready_wakes_the_decode_calls_not_tracks_ready() {
+    let (inner, ready_notify, decode_notify) = waiters_before_the_tracks();
+    let mut ready = std::pin::pin!(ready_notify.notified());
+    ready.as_mut().enable();
+    let mut decode = std::pin::pin!(decode_notify.notified());
+    decode.as_mut().enable();
+    reset(&inner);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    // The work of the calls that the reset() rejected goes on to its turn
+    assert!(decode.as_mut().poll(&mut cx).is_ready());
+    assert!(ready.as_mut().poll(&mut cx).is_pending());
+    assert!(!inner.lock().unwrap().tracks.ready.load(Ordering::Acquire));
+  }
+
+  #[test]
+  fn the_wait_for_the_tracks_ends_at_a_reset_or_a_close() {
+    for close_it in [false, true] {
+      let (inner, _, _) = waiters_before_the_tracks();
+      let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+      let mut wait = std::pin::pin!(reset_or_closed(&inner, 0));
+      assert!(wait.as_mut().poll(&mut cx).is_pending());
+      // A turn given, or data that came, does not end it
+      drop(DecodeTurn(inner.clone()));
+      super::signal_tracks_ready(&inner);
+      assert!(wait.as_mut().poll(&mut cx).is_pending());
+      if close_it {
+        close(&inner);
+      } else {
+        reset(&inner);
+      }
+      assert!(wait.as_mut().poll(&mut cx).is_ready(), "close: {close_it}");
+      // A call made after the reset() waits on
+      if !close_it {
+        let mut later = std::pin::pin!(reset_or_closed(&inner, 1));
+        assert!(later.as_mut().poll(&mut cx).is_pending());
+      }
+    }
   }
 }
