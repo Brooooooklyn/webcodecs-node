@@ -1036,23 +1036,25 @@ function childEnv(): NodeJS.ProcessEnv {
   return env
 }
 
-// RSS only drops when the allocator hands freed blocks back to the OS. macOS does
-// that for blocks this large; other allocators may keep them, so the check runs on
-// macOS only.
+// The peak RSS stays flat only when the allocator reuses, or hands back to the OS, the
+// blocks that the closed encoders freed. libmalloc does for blocks this large (with its
+// medium zone off under Rosetta, see below); other allocators are not checked, so the
+// check runs on macOS only.
 const rssTest = process.platform === 'darwin' ? test : test.skip
 
 rssTest('VideoEncoder: an encoder an error closed frees its codec while it is still referenced', (t) => {
   // Each encoder fills an x264 1080p context, then a failing configure() closes it.
-  // The encoders stay referenced, so whatever they still hold adds up in RSS.
+  // The encoders stay referenced, so whatever they still hold adds up in the peak RSS.
   const script = `
     const fs = require('node:fs');
     const { VideoEncoder, VideoFrame } = require('./index.js');
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-    const rss = () => process.memoryUsage().rss / 1048576;
+    // the peak RSS so far, in MB (maxRSS is in KB)
+    const peak = () => process.resourceUsage().maxRSS / 1024;
     const settle = async () => { for (let i = 0; i < 5; i++) { global.gc(); await sleep(50); } };
     (async () => {
       const kept = [];
-      const samples = [];
+      const peaks = [];
       for (let k = 0; k < 3; k++) {
         const errors = [];
         const encoder = new VideoEncoder({ output: () => {}, error: (e) => errors.push(e.name) });
@@ -1069,9 +1071,9 @@ rssTest('VideoEncoder: an encoder an error closed frees its codec while it is st
         encoder.configure({ codec: 'bogus', width: 1920, height: 1080 });
         while (errors.length === 0) await sleep(10);
         await settle();
-        samples.push(rss());
+        peaks.push(peak());
       }
-      fs.writeSync(1, JSON.stringify({ samples, states: kept.map((e) => e.state) }));
+      fs.writeSync(1, JSON.stringify({ peaks, states: kept.map((e) => e.state) }));
       process.exit(0);
     })();
   `
@@ -1086,9 +1088,12 @@ rssTest('VideoEncoder: an encoder an error closed frees its codec while it is st
       timeout: 120_000,
       encoding: 'utf8',
     }),
-  ) as { samples: number[]; states: string[] }
+  ) as { peaks: number[]; states: string[] }
   t.deepEqual(result.states, ['closed', 'closed', 'closed'])
-  // A 1080p x264 context is about 40 MB; a released one is reused by the next encoder.
-  const growth = (result.samples[2] - result.samples[0]) / 2
-  t.true(growth < 20, `RSS grows ${growth.toFixed(1)} MB per closed encoder (samples ${result.samples.join(', ')})`)
+  // A 1080p x264 context is about 40 MB: one that a closed encoder keeps raises the peak by
+  // that much for each next encoder, while a released one is reused or faulted in again. An
+  // RSS sample would also depend on when the OS takes freed pages back: under load it took
+  // them back early for the first encoder only, and RSS seemed to grow 22 MB per encoder.
+  const growth = (result.peaks[2] - result.peaks[0]) / 2
+  t.true(growth < 20, `peak RSS grows ${growth.toFixed(1)} MB per closed encoder (peaks ${result.peaks.join(', ')})`)
 })
