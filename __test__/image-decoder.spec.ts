@@ -771,12 +771,11 @@ test('ImageDecoder: reset() rejects a waiting GIF decode() with AbortError, and 
 // or close() runs before that await resumes. A close() rejects with "Aborted by failure.", Chrome's message
 // for a close() (its two labels look swapped).
 const fourColors = (ext: string) => new Uint8Array(readFileSync(join(__dirname, `fixtures/wpt/four-colors.${ext}`)))
-// With the first bytes of the file before the header ends: 8, and 12 for the WebP, as here
-// tracks.ready resolves for 1 to 11 bytes of a WebP, which Chrome does not (not a reset() matter)
+// With the first 8 bytes of the file: the header is not whole yet in any format
 const EVERY_FORMAT: [Uint8Array, string, number][] = [
   [fourColors('png'), 'image/png', 8],
   [fourColors('jpg'), 'image/jpeg', 8],
-  [fourColors('webp'), 'image/webp', 12],
+  [fourColors('webp'), 'image/webp', 8],
   [fourColors('gif'), 'image/gif', 8],
   [fourColors('avif'), 'image/avif', 8],
   [BMP_3x2, 'image/bmp', 8],
@@ -1059,6 +1058,8 @@ test('ImageDecoder: a decode() and a close() or reset() made while reset() or cl
 test.serial('ImageDecoder: a decode() made while a failed decode() makes its error settles after it', async (t) => {
   for (const [label, data, init] of [
     ['JPEG with a desired size below 1/64', fourColors('jpg'), { type: 'image/jpeg', desiredWidth: 39, desiredHeight: 30 }],
+    // the only call: its frame's image data does not inflate
+    ['PNG with bad image data', readFileSync(join(__dirname, 'fixtures/png-webp/png-bad-body.png')), { type: 'image/png' }],
   ] as const) {
     const decoder = new ImageDecoder({ data, ...init })
     const order: string[] = []

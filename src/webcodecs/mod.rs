@@ -4,6 +4,7 @@
 //! See: https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API
 
 pub(crate) mod after_task;
+mod apng;
 mod audio_data;
 mod audio_decoder;
 mod audio_encoder;
@@ -38,6 +39,7 @@ mod video_encoder;
 mod video_frame;
 mod webm_demuxer;
 mod webm_muxer;
+mod webp;
 
 pub use audio_data::{AudioData, AudioDataCopyToOptions, AudioDataInit, AudioSampleFormat};
 pub use audio_decoder::AudioDecoder;

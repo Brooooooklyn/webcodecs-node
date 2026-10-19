@@ -1,0 +1,2499 @@
+{
+ "about": "What Chrome for Testing 155.0.8059.79 ImageDecoder gives for the files in png-webp/ (and test.png, wpt/four-colors.*): frames as \"<format> <width>x<height> <timestamp> <duration> <first 16 hex digits of the SHA-256 of the copyTo() bytes>\" (\"ok <format>\" where only the format was kept), errors as \"<name>: <message>\" (only the name where our message is worded differently). whole: BufferSource, decode() of every frame and one past the end. sweeps: a stream left open with the first N bytes, for every N: [first N, tracks.ready, the track [animated, frameCount, repetitionCount]] each time either changes. edges: a stream left open: the first N where decode({frameIndex}) settles, and with what (null: never). ends: the first N bytes, then the end of the stream: tracks.ready, completed, the track, then [frameIndex, result] of each decode() in order. afterReady: a decode() made right after tracks.ready resolves, then a decode() of each next frame once the last settled: buffer from a BufferSource (and one past the end), stream from one chunk with every byte on a stream left open (no decode() past the last frame there: Chrome waits for more data).",
+ "files": {
+  "anim-alpha-lossless.webp": {
+   "path": "png-webp/anim-alpha-lossless.webp",
+   "type": "image/webp",
+   "note": "img2webp -loop 0 -lossless -d 80 of six RGBA 32x24 frames (half with alpha)",
+   "sha256": "fd8b5841f8e0155eed2dffe171df08e263d2a50405b27bf9fcf56a627d0b8731"
+  },
+  "anim-alpha-lossy.webp": {
+   "path": "png-webp/anim-alpha-lossy.webp",
+   "type": "image/webp",
+   "note": "img2webp -loop 2 -lossy -q 60 -d 50 of the same frames",
+   "sha256": "025b33b627a5a2bc2bc2eb26548fb1f1a542d354ce86697445a11c6c0a4fefa7"
+  },
+  "anim-loop3.webp": {
+   "path": "png-webp/anim-loop3.webp",
+   "type": "image/webp",
+   "note": "webpmux -set loop 3 anim_lossy_opaque.webp",
+   "sha256": "2da5069f06f5199d1162e43d555599f081d50da4cd0177be066d98140e43fecd"
+  },
+  "anim-mixed.webp": {
+   "path": "png-webp/anim-mixed.webp",
+   "type": "image/webp",
+   "note": "img2webp -loop 0 -mixed, delays 40, 90, then 10 ms, of the same frames",
+   "sha256": "4072b6b0d717699f8b0b323e537c56725ceb37ac5e4c48fa618793453e9289af"
+  },
+  "anim-mux-bad1.webp": {
+   "path": "png-webp/anim-mux-bad1.webp",
+   "type": "image/webp",
+   "note": "anim-mux.webp with the VP8L signature of frame 1 broken",
+   "sha256": "3232b34901f2a33ef68e7805e32aa101082df34e18b9c10ba21ac7026e23264c"
+  },
+  "anim-mux-bad2.webp": {
+   "path": "png-webp/anim-mux-bad2.webp",
+   "type": "image/webp",
+   "note": "anim-mux.webp with the VP8 start code of frame 2 broken",
+   "sha256": "ad964c642b85ac9d8ca72b30430d658cce8ba3e1b47200e9511b2a12f3ecc8df"
+  },
+  "anim-mux-bad4body.webp": {
+   "path": "png-webp/anim-mux-bad4body.webp",
+   "type": "image/webp",
+   "note": "anim-mux.webp with the VP8L data of frame 4 (after its header) set to 0xff",
+   "sha256": "467c378607b9b7999d89ab9d9eb92c745927abd9c07d6ed37b90bf0271205905"
+  },
+  "anim-mux-noalphaflag.webp": {
+   "path": "png-webp/anim-mux-noalphaflag.webp",
+   "type": "image/webp",
+   "note": "anim-mux.webp with the VP8X alpha flag cleared",
+   "sha256": "a0317c9a970272ecbf4a7749f69ec59c445700fc95baf99899b481701b214ec0"
+  },
+  "anim-mux.webp": {
+   "path": "png-webp/anim-mux.webp",
+   "type": "image/webp",
+   "note": "webpmux of 5 cwebp frames (lossless and lossy, cropped): offsets, blend and no blend, dispose none and background, loop 3",
+   "sha256": "84c482932819443fa5fca754566329263cd4695f6505b5a1d2d5b704ff4bf6cd"
+  },
+  "anim-vp8l-loop0.webp": {
+   "path": "png-webp/anim-vp8l-loop0.webp",
+   "type": "image/webp",
+   "note": "VP8X(anim)+ANIM(loop 0)+3 ANMF wrapping the VP8L chunk of four-colors.webp",
+   "sha256": "2040ce2eff204b3950bdbb9a0b7254da9d6226ade581b50abed45d8f15aa9bae"
+  },
+  "anim-vp8l-loop1.webp": {
+   "path": "png-webp/anim-vp8l-loop1.webp",
+   "type": "image/webp",
+   "note": "as anim-vp8l-loop0 with loop count 1",
+   "sha256": "cd2a2a0f4a8461e8048d5e59e236f28ec68e53cc3046e8bd18dda2646935cbd8"
+  },
+  "anim_lossy_opaque.webp": {
+   "path": "png-webp/anim_lossy_opaque.webp",
+   "type": "image/webp",
+   "note": "lossy animation 40x30, no alpha: VP8X+ANIM(loop 0)+ANMF frames, 40x30",
+   "sha256": "d8333f1e59408dc644be00de81be27a2a0b855d4acd191448a340b58797fab7a"
+  },
+  "apng-1f.png": {
+   "path": "png-webp/apng-1f.png",
+   "type": "image/png",
+   "note": "acTL(1 frame), fcTL before IDAT",
+   "sha256": "3c515f70892f40e27a19a0eed5c9fc031d208a63f1bda9e15f83e5892e0d4ab8"
+  },
+  "apng-3f-inf.png": {
+   "path": "png-webp/apng-3f-inf.png",
+   "type": "image/png",
+   "note": "acTL(3 frames, plays 0), fcTL before IDAT, 2 fdAT frames",
+   "sha256": "feea5cd552d68450cdef67e487aeaf9c64d5d0c4d38fc2f7f743e65fe1ce3579"
+  },
+  "apng-3f-plays3.png": {
+   "path": "png-webp/apng-3f-plays3.png",
+   "type": "image/png",
+   "note": "as apng-3f-inf with num_plays 3",
+   "sha256": "58e900adfc64c33125bc06f1ca799a120180712ed74a738c5a3b94aafaa98f67"
+  },
+  "apng-40f-512.png": {
+   "path": "png-webp/apng-40f-512.png",
+   "type": "image/png",
+   "note": "40 frames of 512x512 RGB, each one solid color over the whole canvas, 1/30 s, plays for ever: big frames, so a decode() made right after tracks.ready on a stream can find them still being drawn",
+   "sha256": "1f1f77454926f35d21db9a6053689aad2f3b1de1c17d1c92cf937173c60c24b1"
+  },
+  "apng-blend-badfctlcrc3.png": {
+   "path": "png-webp/apng-blend-badfctlcrc3.png",
+   "type": "image/png",
+   "note": "apng-blend.png with a wrong CRC on the fcTL of frame 3",
+   "sha256": "0f933596f0d968e6b9d75d5938fce79de49a81b002396273ec1d043c90ff5b6c"
+  },
+  "apng-blend-corrupt0.png": {
+   "path": "png-webp/apng-blend-corrupt0.png",
+   "type": "image/png",
+   "note": "apng-blend.png with frame 0 (the IDAT) deflate block type 3",
+   "sha256": "76c39e14d4db89f8a1f332e3fd34332b7d6102be51afd8b1a59219c7a9bb97e4"
+  },
+  "apng-blend-corrupt1.png": {
+   "path": "png-webp/apng-blend-corrupt1.png",
+   "type": "image/png",
+   "note": "apng-blend.png with frame 1 deflate block type 3",
+   "sha256": "26614f578c10d302246f67d1a5a32e81eb2f46254390613978db427405d6aa1d"
+  },
+  "apng-blend-more.png": {
+   "path": "png-webp/apng-blend-more.png",
+   "type": "image/png",
+   "note": "apng-blend.png with acTL num_frames 4 (6 frames present)",
+   "sha256": "b78945afa13101cb234b903ffcb041fc0cda6ccf9efd0d490747135f39b2d8a5"
+  },
+  "apng-blend-short.png": {
+   "path": "png-webp/apng-blend-short.png",
+   "type": "image/png",
+   "note": "apng-blend.png with acTL num_frames 8 (6 frames present)",
+   "sha256": "987351f24a5d1335d4a30b6115acbf4974a2f1542577bd0e99fc0afe5516d686"
+  },
+  "apng-blend.png": {
+   "path": "png-webp/apng-blend.png",
+   "type": "image/png",
+   "note": "RGBA 24x24, 6 frames: offsets, dispose none/background/previous, blend source/over, semi-transparent pixels, delays 1/10 3/100 0/0 7/1000 1/3 5/10",
+   "sha256": "b58da92b5956bd7e9832c74b2d5e8e7be6eb321ce38f7c09b62fc2175bcd2e1e"
+  },
+  "apng-hidden-default.png": {
+   "path": "png-webp/apng-hidden-default.png",
+   "type": "image/png",
+   "note": "acTL(2 frames), IDAT without fcTL (not part of the animation), 2 fcTL+fdAT frames",
+   "sha256": "a03b5c1d13c13834cbc7a55633024789ea397b38abb8a77aedef257e8ba6700c"
+  },
+  "apng-hidden-offset.png": {
+   "path": "png-webp/apng-hidden-offset.png",
+   "type": "image/png",
+   "note": "RGBA 16x16, IDAT not part of the animation, 2 offset frames with alpha",
+   "sha256": "d9661a7c875399d7d388c7814813b3e103ff365fb670faa341655858be536ab6"
+  },
+  "apng-interlaced.png": {
+   "path": "png-webp/apng-interlaced.png",
+   "type": "image/png",
+   "note": "RGBA 13x11 Adam7, 2 frames, frame 1 offset with blend over",
+   "sha256": "3f7d56bad6d790454d29ef57459069488249dc48a545708e3e692f1526c453cb"
+  },
+  "apng-palette.png": {
+   "path": "png-webp/apng-palette.png",
+   "type": "image/png",
+   "note": "palette 16x16 with tRNS, 3 frames, blend over",
+   "sha256": "49b8e20555dce0e0b9edb2f08c6c4508698956ced17d483b4c290516313b861c"
+  },
+  "apng-rgb-offset.png": {
+   "path": "png-webp/apng-rgb-offset.png",
+   "type": "image/png",
+   "note": "RGB 20x12, 4 opaque frames, offsets, dispose background/previous",
+   "sha256": "f951166dda0e612b733f9b439f2d683284df388dc65e24aed051e8a776fd5aa8"
+  },
+  "apng-rgba16.png": {
+   "path": "png-webp/apng-rgba16.png",
+   "type": "image/png",
+   "note": "RGBA 16-bit 8x8, 2 frames, frame 1 blend over",
+   "sha256": "1912a9370719e9ce9e07c5d83506358645638c61f9789f6057acc5e6947cef51"
+  },
+  "craft_vp8x_opaque_33x17.webp": {
+   "path": "png-webp/craft_vp8x_opaque_33x17.webp",
+   "type": "image/webp",
+   "note": "VP8X (no flags) + VP8 at 30",
+   "sha256": "4aaa95f845c8e0a0c3a805c17647aea7b3455b3ed47ff94886d50c8d2db311e6"
+  },
+  "four-colors.png": {
+   "path": "wpt/four-colors.png",
+   "type": "image/png",
+   "note": "already in __test__/fixtures"
+  },
+  "four-colors.webp": {
+   "path": "wpt/four-colors.webp",
+   "type": "image/webp",
+   "note": "already in __test__/fixtures"
+  },
+  "lossy_alpha_33x17.webp": {
+   "path": "png-webp/lossy_alpha_33x17.webp",
+   "type": "image/webp",
+   "note": "VP8X(alpha) + ALPH at 30 + VP8",
+   "sha256": "e746f3251f3c47d0c8dd81f4b93b295892a0d12ee6e955cd9844d3f284a9607a"
+  },
+  "png-bad-body.png": {
+   "path": "png-webp/png-bad-body.png",
+   "type": "image/png",
+   "note": "four-colors.png, first deflate block type 3 (reserved), IDAT CRC recomputed",
+   "sha256": "6b302a4712d3dc50e91517d295600a7c583c607d83ea1c7d4de62d0c87b2904e"
+  },
+  "png-bad-idat-crc.png": {
+   "path": "png-webp/png-bad-idat-crc.png",
+   "type": "image/png",
+   "note": "four-colors.png, IDAT CRC wrong",
+   "sha256": "cb10068c0088f55ea6369a5ae127b7263ba7ed792763355075f0e1268f736b7b"
+  },
+  "png-bad-ihdr-crc.png": {
+   "path": "png-webp/png-bad-ihdr-crc.png",
+   "type": "image/png",
+   "note": "four-colors.png, IHDR CRC wrong",
+   "sha256": "93fa1953efb564cc8fd8d9f846ff2e864699553c8f17a85d0405a58ee00b928d"
+  },
+  "png-bad-phys-crc.png": {
+   "path": "png-webp/png-bad-phys-crc.png",
+   "type": "image/png",
+   "note": "test.png + pHYs with a wrong CRC before IDAT (IDAT chunk at 54)",
+   "sha256": "a29d86a3cff8d219d16ec86857f2b1bbd187dadfab7d6fd3e39d0de559b28c74"
+  },
+  "png-trns-257.png": {
+   "path": "png-webp/png-trns-257.png",
+   "type": "image/png",
+   "note": "test.png + a 257-byte tRNS before IDAT (IDAT chunk at 302)",
+   "sha256": "3f45865f24d8230c4b2baed907c3ec3f2da19b4d252c77205562dfc4a351700f"
+  },
+  "test.png": {
+   "path": "test.png",
+   "type": "image/png",
+   "note": "already in __test__/fixtures"
+  },
+  "vp8x-vp8l.webp": {
+   "path": "png-webp/vp8x-vp8l.webp",
+   "type": "image/webp",
+   "note": "VP8X (no flags) + the VP8L chunk of four-colors.webp at 30",
+   "sha256": "57489605bc5e1f693c56f1e417d6ef5085cafe6236166252c7c8f7736eabc014"
+  },
+  "webp-bad-part0-ff.webp": {
+   "path": "png-webp/webp-bad-part0-ff.webp",
+   "type": "image/webp",
+   "note": "webp-valid.webp, first partition after 4 bytes all 0xff (libwebp NOT_ENOUGH_DATA, FFmpeg Invalid partitions)",
+   "sha256": "4146cddc9f3aa3576fb3755b5325571c9d384effe1c72182fc4eccf9882ae6ca"
+  },
+  "webp-valid.webp": {
+   "path": "png-webp/webp-valid.webp",
+   "type": "image/webp",
+   "note": "simple lossy (VP8 at 12), 64x48",
+   "sha256": "11e95882971a2e3dea8524fb2b1b3ee572dc4711e418318ce491c0d125b4a97a"
+  }
+ },
+ "whole": {
+  "apng-blend.png": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    true,
+    6,
+    "Infinity"
+   ],
+   "frames": [
+    "BGRA 24x24 0 100000 ccd45e427457bfa3",
+    "BGRA 24x24 100000 30000 1a0b6d2cd53dc766",
+    "BGRA 24x24 130000 0 3c5d202a2b30ccaf",
+    "BGRA 24x24 130000 7000 62b0bdada6533837",
+    "BGRA 24x24 137000 333000 fbc0ecdbf31ca16d",
+    "BGRA 24x24 470000 500000 d1ee79ab14d07b68",
+    "RangeError"
+   ]
+  },
+  "apng-blend-more.png": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    true,
+    4,
+    "Infinity"
+   ],
+   "frames": [
+    "BGRA 24x24 0 100000 ccd45e427457bfa3",
+    "BGRA 24x24 100000 30000 1a0b6d2cd53dc766",
+    "BGRA 24x24 130000 0 3c5d202a2b30ccaf",
+    "BGRA 24x24 130000 7000 62b0bdada6533837",
+    "RangeError"
+   ]
+  },
+  "apng-blend-short.png": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    true,
+    6,
+    "Infinity"
+   ],
+   "frames": [
+    "BGRA 24x24 0 100000 ccd45e427457bfa3",
+    "BGRA 24x24 100000 30000 1a0b6d2cd53dc766",
+    "BGRA 24x24 130000 0 3c5d202a2b30ccaf",
+    "BGRA 24x24 130000 7000 62b0bdada6533837",
+    "BGRA 24x24 137000 333000 fbc0ecdbf31ca16d",
+    "BGRA 24x24 470000 500000 d1ee79ab14d07b68",
+    "RangeError"
+   ]
+  },
+  "apng-rgb-offset.png": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    true,
+    4,
+    "Infinity"
+   ],
+   "frames": [
+    "BGRX 20x12 0 200000 4e1a32a831b2a0d1",
+    "BGRX 20x12 200000 200000 6cac74642d5f3150",
+    "BGRA 20x12 400000 200000 e076ea863dfedcb6",
+    "BGRA 20x12 600000 200000 6943cdf61ac0152e",
+    "RangeError"
+   ]
+  },
+  "apng-palette.png": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    true,
+    3,
+    "Infinity"
+   ],
+   "frames": [
+    "BGRA 16x16 0 50000 c8a7de748dec15fe",
+    "BGRA 16x16 50000 50000 c2bfa9f8c15843a9",
+    "BGRA 16x16 100000 50000 4dc8b6bc4e820e1d",
+    "RangeError"
+   ]
+  },
+  "apng-interlaced.png": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    true,
+    2,
+    "Infinity"
+   ],
+   "frames": [
+    "BGRA 13x11 0 100000 166d2c8bbb7f9906",
+    "BGRA 13x11 100000 100000 9020bc4f46dd6028",
+    "RangeError"
+   ]
+  },
+  "apng-hidden-offset.png": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    true,
+    2,
+    "Infinity"
+   ],
+   "frames": [
+    "BGRA 16x16 0 100000 5075864012fca781",
+    "BGRA 16x16 100000 100000 70a74e1b8f1eafd7",
+    "RangeError"
+   ]
+  },
+  "apng-rgba16.png": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    true,
+    2,
+    "Infinity"
+   ],
+   "frames": [
+    "BGRA 8x8 0 100000 0c07cb70da5fffa8",
+    "BGRA 8x8 100000 100000 6b854567faec4a26",
+    "RangeError"
+   ]
+  },
+  "apng-3f-plays3.png": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    true,
+    3,
+    "2"
+   ],
+   "frames": [
+    "BGRX 16x16 0 100000 3fb5701c6e0bed57",
+    "BGRX 16x16 100000 100000 0b3b4eba5c7d53be",
+    "BGRX 16x16 200000 100000 71205eb7a329a3ea",
+    "RangeError"
+   ]
+  },
+  "apng-hidden-default.png": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    true,
+    2,
+    "Infinity"
+   ],
+   "frames": [
+    "BGRX 16x16 0 100000 3fb5701c6e0bed57",
+    "BGRX 16x16 100000 100000 0b3b4eba5c7d53be",
+    "RangeError"
+   ]
+  },
+  "apng-1f.png": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    false,
+    1,
+    "0"
+   ],
+   "frames": [
+    "BGRX 16x16 0 null 3fb5701c6e0bed57",
+    "RangeError"
+   ]
+  },
+  "apng-blend-corrupt0.png": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    true,
+    6,
+    "Infinity"
+   ],
+   "frames": [
+    "RangeError: Unexpected end of image. Request for frame index 0 can't be satisfied.",
+    "RangeError: Unexpected end of image. Request for frame index 1 can't be satisfied.",
+    "RangeError: Unexpected end of image. Request for frame index 2 can't be satisfied.",
+    "RangeError: Unexpected end of image. Request for frame index 3 can't be satisfied.",
+    "RangeError: Unexpected end of image. Request for frame index 4 can't be satisfied.",
+    "EncodingError: Failed to decode frame at index 5",
+    "InvalidStateError"
+   ]
+  },
+  "apng-blend-corrupt1.png": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    true,
+    6,
+    "Infinity"
+   ],
+   "frames": [
+    "BGRA 24x24 0 100000 ccd45e427457bfa3",
+    "RangeError: Unexpected end of image. Request for frame index 1 can't be satisfied.",
+    "RangeError: Unexpected end of image. Request for frame index 2 can't be satisfied.",
+    "RangeError: Unexpected end of image. Request for frame index 3 can't be satisfied.",
+    "RangeError: Unexpected end of image. Request for frame index 4 can't be satisfied.",
+    "RangeError: Unexpected end of image. Request for frame index 5 can't be satisfied.",
+    "RangeError"
+   ]
+  },
+  "png-bad-body.png": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    false,
+    1,
+    "0"
+   ],
+   "frames": [
+    "EncodingError: Failed to decode frame at index 0",
+    "InvalidStateError"
+   ]
+  },
+  "png-bad-idat-crc.png": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    false,
+    1,
+    "0"
+   ],
+   "frames": [
+    "EncodingError: Failed to decode frame at index 0",
+    "InvalidStateError"
+   ]
+  },
+  "png-bad-ihdr-crc.png": {
+   "ready": "InvalidStateError: Failed to retrieve track metadata.",
+   "completed": "fulfilled",
+   "track": null,
+   "frames": [
+    "InvalidStateError",
+    "InvalidStateError"
+   ]
+  },
+  "png-bad-phys-crc.png": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    false,
+    1,
+    "0"
+   ],
+   "frames": [
+    "BGRX 8x8 0 null c262b5c549abc0f3",
+    "RangeError"
+   ]
+  },
+  "png-trns-257.png": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    false,
+    1,
+    "0"
+   ],
+   "frames": [
+    "BGRX 8x8 0 null c262b5c549abc0f3",
+    "RangeError"
+   ]
+  },
+  "anim-alpha-lossless.webp": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    true,
+    6,
+    "Infinity"
+   ],
+   "frames": [
+    "BGRA 32x24 0 80000 fdb457655969e86f",
+    "BGRA 32x24 80000 80000 3f1fb816c6e4d20d",
+    "BGRA 32x24 160000 80000 a5e8b196869df737",
+    "BGRA 32x24 240000 80000 27c28a80a1b48c08",
+    "BGRA 32x24 320000 80000 7b98b56b9f4b60d8",
+    "BGRA 32x24 400000 80000 0b598f60970818c6",
+    "RangeError"
+   ]
+  },
+  "anim-alpha-lossy.webp": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    true,
+    6,
+    "1"
+   ],
+   "frames": [
+    "BGRA 32x24 0 50000 1d0aa3ced690f60a",
+    "BGRA 32x24 50000 50000 8ef7f51daac88bc1",
+    "BGRA 32x24 100000 50000 3c9e5ffb1dce73f0",
+    "BGRA 32x24 150000 50000 6ff866a515921b4a",
+    "BGRA 32x24 200000 50000 42a74bb21e59e2c1",
+    "BGRA 32x24 250000 50000 f5133ad34b90fea9",
+    "RangeError"
+   ]
+  },
+  "anim-mixed.webp": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    true,
+    6,
+    "Infinity"
+   ],
+   "frames": [
+    "BGRA 32x24 0 40000 fdb457655969e86f",
+    "BGRA 32x24 40000 90000 3f1fb816c6e4d20d",
+    "BGRA 32x24 130000 10000 a5e8b196869df737",
+    "BGRA 32x24 140000 10000 27c28a80a1b48c08",
+    "BGRA 32x24 150000 10000 7b98b56b9f4b60d8",
+    "BGRA 32x24 160000 10000 0b598f60970818c6",
+    "RangeError"
+   ]
+  },
+  "anim-mux.webp": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    true,
+    5,
+    "2"
+   ],
+   "frames": [
+    "BGRA 32x24 0 100000 fdb457655969e86f",
+    "BGRA 32x24 100000 60000 5ee7b15c86539a09",
+    "BGRA 32x24 160000 40000 61b11c1fc5a0818d",
+    "BGRA 32x24 200000 70000 9bb108392d2002ee",
+    "BGRA 32x24 270000 30000 42c33bc409939408",
+    "RangeError"
+   ]
+  },
+  "anim-mux-noalphaflag.webp": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    true,
+    5,
+    "2"
+   ],
+   "frames": [
+    "BGRX 32x24 0 100000 fdb457655969e86f",
+    "BGRX 32x24 100000 60000 5ee7b15c86539a09",
+    "BGRA 32x24 160000 40000 61b11c1fc5a0818d",
+    "BGRA 32x24 200000 70000 9bb108392d2002ee",
+    "BGRA 32x24 270000 30000 42c33bc409939408",
+    "RangeError"
+   ]
+  },
+  "anim-mux-bad1.webp": {
+   "ready": "InvalidStateError: Failed to retrieve track metadata.",
+   "completed": "fulfilled",
+   "track": null,
+   "frames": [
+    "InvalidStateError",
+    "InvalidStateError"
+   ]
+  },
+  "anim-vp8l-loop1.webp": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    true,
+    3,
+    "0"
+   ],
+   "frames": [
+    "BGRX 320x240 0 100000 da76d824e943b611",
+    "BGRX 320x240 100000 100000 da76d824e943b611",
+    "BGRX 320x240 200000 100000 da76d824e943b611",
+    "RangeError"
+   ]
+  },
+  "webp-valid.webp": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    false,
+    1,
+    "0"
+   ],
+   "frames": [
+    "I420 64x48 0 null 9ba01407cd2c9c19",
+    "RangeError"
+   ]
+  },
+  "craft_vp8x_opaque_33x17.webp": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    false,
+    1,
+    "0"
+   ],
+   "frames": [
+    "BGRX 33x17 0 null 85d7c51efa963c20",
+    "RangeError"
+   ]
+  },
+  "lossy_alpha_33x17.webp": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    false,
+    1,
+    "0"
+   ],
+   "frames": [
+    "BGRA 33x17 0 null c107f3facba67155",
+    "RangeError"
+   ]
+  },
+  "vp8x-vp8l.webp": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    false,
+    1,
+    "0"
+   ],
+   "frames": [
+    "BGRX 320x240 0 null da76d824e943b611",
+    "RangeError"
+   ]
+  },
+  "webp-bad-part0-ff.webp": {
+   "ready": "fulfilled",
+   "completed": "fulfilled",
+   "track": [
+    false,
+    1,
+    "0"
+   ],
+   "frames": [
+    "EncodingError: Failed to decode frame at index 0",
+    "InvalidStateError"
+   ]
+  }
+ },
+ "sweeps": {
+  "test.png": [
+   [
+    0,
+    "pending",
+    null
+   ],
+   [
+    41,
+    "fulfilled",
+    [
+     false,
+     1,
+     "0"
+    ]
+   ]
+  ],
+  "four-colors.png": [
+   [
+    0,
+    "pending",
+    null
+   ],
+   [
+    91,
+    "fulfilled",
+    [
+     false,
+     1,
+     "0"
+    ]
+   ]
+  ],
+  "apng-3f-inf.png": [
+   [
+    0,
+    "pending",
+    null
+   ],
+   [
+    99,
+    "fulfilled",
+    [
+     true,
+     1,
+     "Infinity"
+    ]
+   ],
+   [
+    171,
+    "fulfilled",
+    [
+     true,
+     2,
+     "Infinity"
+    ]
+   ],
+   [
+    246,
+    "fulfilled",
+    [
+     true,
+     3,
+     "Infinity"
+    ]
+   ]
+  ],
+  "apng-3f-plays3.png": [
+   [
+    0,
+    "pending",
+    null
+   ],
+   [
+    99,
+    "fulfilled",
+    [
+     true,
+     1,
+     "2"
+    ]
+   ],
+   [
+    171,
+    "fulfilled",
+    [
+     true,
+     2,
+     "2"
+    ]
+   ],
+   [
+    246,
+    "fulfilled",
+    [
+     true,
+     3,
+     "2"
+    ]
+   ]
+  ],
+  "apng-hidden-default.png": [
+   [
+    0,
+    "pending",
+    null
+   ],
+   [
+    61,
+    "fulfilled",
+    [
+     true,
+     0,
+     "Infinity"
+    ]
+   ],
+   [
+    131,
+    "fulfilled",
+    [
+     true,
+     1,
+     "Infinity"
+    ]
+   ],
+   [
+    207,
+    "fulfilled",
+    [
+     true,
+     2,
+     "Infinity"
+    ]
+   ]
+  ],
+  "apng-1f.png": [
+   [
+    0,
+    "pending",
+    null
+   ],
+   [
+    99,
+    "fulfilled",
+    [
+     false,
+     1,
+     "0"
+    ]
+   ]
+  ],
+  "png-bad-body.png": [
+   [
+    0,
+    "pending",
+    null
+   ],
+   [
+    91,
+    "fulfilled",
+    [
+     false,
+     1,
+     "0"
+    ]
+   ]
+  ],
+  "png-bad-ihdr-crc.png": [
+   [
+    0,
+    "pending",
+    null
+   ],
+   [
+    33,
+    "InvalidStateError: Failed to retrieve track metadata.",
+    null
+   ]
+  ],
+  "png-bad-phys-crc.png": [
+   [
+    0,
+    "pending",
+    null
+   ],
+   [
+    62,
+    "fulfilled",
+    [
+     false,
+     1,
+     "0"
+    ]
+   ]
+  ],
+  "png-trns-257.png": [
+   [
+    0,
+    "pending",
+    null
+   ],
+   [
+    310,
+    "fulfilled",
+    [
+     false,
+     1,
+     "0"
+    ]
+   ]
+  ],
+  "four-colors.webp": [
+   [
+    0,
+    "pending",
+    null
+   ],
+   [
+    25,
+    "fulfilled",
+    [
+     false,
+     1,
+     "0"
+    ]
+   ]
+  ],
+  "webp-valid.webp": [
+   [
+    0,
+    "pending",
+    null
+   ],
+   [
+    30,
+    "fulfilled",
+    [
+     false,
+     1,
+     "0"
+    ]
+   ]
+  ],
+  "anim_lossy_opaque.webp": [
+   [
+    0,
+    "pending",
+    null
+   ],
+   [
+    560,
+    "fulfilled",
+    [
+     true,
+     1,
+     "Infinity"
+    ]
+   ],
+   [
+    1146,
+    "fulfilled",
+    [
+     true,
+     2,
+     "Infinity"
+    ]
+   ],
+   [
+    1726,
+    "fulfilled",
+    [
+     true,
+     3,
+     "Infinity"
+    ]
+   ]
+  ],
+  "anim-loop3.webp": [
+   [
+    0,
+    "pending",
+    null
+   ],
+   [
+    560,
+    "fulfilled",
+    [
+     true,
+     1,
+     "2"
+    ]
+   ],
+   [
+    1146,
+    "fulfilled",
+    [
+     true,
+     2,
+     "2"
+    ]
+   ],
+   [
+    1726,
+    "fulfilled",
+    [
+     true,
+     3,
+     "2"
+    ]
+   ]
+  ],
+  "craft_vp8x_opaque_33x17.webp": [
+   [
+    0,
+    "pending",
+    null
+   ],
+   [
+    38,
+    "fulfilled",
+    [
+     false,
+     1,
+     "0"
+    ]
+   ]
+  ],
+  "lossy_alpha_33x17.webp": [
+   [
+    0,
+    "pending",
+    null
+   ],
+   [
+    38,
+    "fulfilled",
+    [
+     false,
+     1,
+     "0"
+    ]
+   ]
+  ],
+  "vp8x-vp8l.webp": [
+   [
+    0,
+    "pending",
+    null
+   ],
+   [
+    38,
+    "fulfilled",
+    [
+     false,
+     1,
+     "0"
+    ]
+   ]
+  ],
+  "anim-vp8l-loop0.webp": [
+   [
+    0,
+    "pending",
+    null
+   ],
+   [
+    134,
+    "fulfilled",
+    [
+     true,
+     1,
+     "Infinity"
+    ]
+   ],
+   [
+    224,
+    "fulfilled",
+    [
+     true,
+     2,
+     "Infinity"
+    ]
+   ],
+   [
+    314,
+    "fulfilled",
+    [
+     true,
+     3,
+     "Infinity"
+    ]
+   ]
+  ],
+  "anim-vp8l-loop1.webp": [
+   [
+    0,
+    "pending",
+    null
+   ],
+   [
+    134,
+    "fulfilled",
+    [
+     true,
+     1,
+     "0"
+    ]
+   ],
+   [
+    224,
+    "fulfilled",
+    [
+     true,
+     2,
+     "0"
+    ]
+   ],
+   [
+    314,
+    "fulfilled",
+    [
+     true,
+     3,
+     "0"
+    ]
+   ]
+  ]
+ },
+ "edges": [
+  [
+   "apng-3f-inf.png",
+   0,
+   133,
+   "BGRX 3fb5701c6e0bed57"
+  ],
+  [
+   "apng-3f-inf.png",
+   1,
+   208,
+   "BGRX 0b3b4eba5c7d53be"
+  ],
+  [
+   "apng-3f-inf.png",
+   2,
+   283,
+   "BGRX 71205eb7a329a3ea"
+  ],
+  [
+   "apng-blend.png",
+   0,
+   2087,
+   "BGRA ccd45e427457bfa3"
+  ],
+  [
+   "apng-blend.png",
+   1,
+   2175,
+   "BGRA 1a0b6d2cd53dc766"
+  ],
+  [
+   "apng-blend.png",
+   2,
+   2260,
+   "BGRA 3c5d202a2b30ccaf"
+  ],
+  [
+   "apng-blend.png",
+   3,
+   2346,
+   "BGRA 62b0bdada6533837"
+  ],
+  [
+   "apng-blend.png",
+   4,
+   2451,
+   "BGRA fbc0ecdbf31ca16d"
+  ],
+  [
+   "apng-blend.png",
+   5,
+   3089,
+   "BGRA d1ee79ab14d07b68"
+  ],
+  [
+   "apng-hidden-offset.png",
+   0,
+   186,
+   "BGRA 5075864012fca781"
+  ],
+  [
+   "apng-hidden-offset.png",
+   1,
+   272,
+   "BGRA 70a74e1b8f1eafd7"
+  ],
+  [
+   "apng-interlaced.png",
+   0,
+   599,
+   "BGRA 166d2c8bbb7f9906"
+  ],
+  [
+   "apng-interlaced.png",
+   1,
+   705,
+   "BGRA 9020bc4f46dd6028"
+  ],
+  [
+   "apng-hidden-default.png",
+   0,
+   169,
+   "BGRX 3fb5701c6e0bed57"
+  ],
+  [
+   "apng-hidden-default.png",
+   1,
+   244,
+   "BGRX 0b3b4eba5c7d53be"
+  ],
+  [
+   "apng-1f.png",
+   0,
+   133,
+   "BGRX 3fb5701c6e0bed57"
+  ],
+  [
+   "test.png",
+   0,
+   71,
+   "BGRX c262b5c549abc0f3"
+  ],
+  [
+   "four-colors.png",
+   0,
+   1438,
+   "BGRX da76d824e943b611"
+  ],
+  [
+   "png-bad-idat-crc.png",
+   0,
+   1430,
+   "EncodingError: Failed to decode frame at index 0"
+  ],
+  [
+   "apng-blend-corrupt1.png",
+   0,
+   2087,
+   "BGRA ccd45e427457bfa3"
+  ],
+  [
+   "apng-blend-corrupt1.png",
+   1,
+   null,
+   null
+  ],
+  [
+   "apng-blend-corrupt1.png",
+   2,
+   null,
+   null
+  ],
+  [
+   "apng-blend-corrupt0.png",
+   0,
+   null,
+   null
+  ],
+  [
+   "apng-blend-corrupt0.png",
+   5,
+   null,
+   null
+  ],
+  [
+   "anim-mux.webp",
+   0,
+   128,
+   "BGRA fdb457655969e86f"
+  ],
+  [
+   "anim-mux.webp",
+   1,
+   220,
+   "BGRA 5ee7b15c86539a09"
+  ],
+  [
+   "anim-mux.webp",
+   2,
+   382,
+   "BGRA 61b11c1fc5a0818d"
+  ],
+  [
+   "anim-mux.webp",
+   3,
+   650,
+   "BGRA 9bb108392d2002ee"
+  ],
+  [
+   "anim-mux.webp",
+   4,
+   778,
+   "BGRA 42c33bc409939408"
+  ],
+  [
+   "anim_lossy_opaque.webp",
+   0,
+   560,
+   "BGRX 874c2c08d02f2254"
+  ],
+  [
+   "anim_lossy_opaque.webp",
+   1,
+   1146,
+   "BGRX 85123bd38153b7be"
+  ],
+  [
+   "anim_lossy_opaque.webp",
+   2,
+   1726,
+   "BGRX fb490744d42240f6"
+  ],
+  [
+   "anim-alpha-lossy.webp",
+   0,
+   294,
+   "BGRA 1d0aa3ced690f60a"
+  ],
+  [
+   "anim-alpha-lossy.webp",
+   5,
+   1138,
+   "BGRA f5133ad34b90fea9"
+  ],
+  [
+   "four-colors.webp",
+   0,
+   77,
+   "BGRX da76d824e943b611"
+  ],
+  [
+   "vp8x-vp8l.webp",
+   0,
+   95,
+   "BGRX da76d824e943b611"
+  ],
+  [
+   "anim-mux-bad2.webp",
+   0,
+   null,
+   null
+  ],
+  [
+   "anim-mux-bad2.webp",
+   2,
+   null,
+   null
+  ],
+  [
+   "anim-mux-bad1.webp",
+   0,
+   null,
+   null
+  ],
+  [
+   "anim-mux-bad1.webp",
+   1,
+   null,
+   null
+  ]
+ ],
+ "ends": [
+  [
+   "apng-3f-inf.png",
+   125,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    1,
+    "Infinity"
+   ],
+   [
+    [
+     0,
+     "EncodingError: Failed to decode frame at index 0"
+    ],
+    [
+     1,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "apng-3f-inf.png",
+   133,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    1,
+    "Infinity"
+   ],
+   [
+    [
+     0,
+     "BGRX 16x16 0 100000 3fb5701c6e0bed57"
+    ],
+    [
+     1,
+     "RangeError"
+    ]
+   ]
+  ],
+  [
+   "apng-3f-inf.png",
+   163,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    1,
+    "Infinity"
+   ],
+   [
+    [
+     0,
+     "BGRX 16x16 0 100000 3fb5701c6e0bed57"
+    ],
+    [
+     1,
+     "RangeError"
+    ]
+   ]
+  ],
+  [
+   "apng-3f-inf.png",
+   171,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    2,
+    "Infinity"
+   ],
+   [
+    [
+     0,
+     "BGRX 16x16 0 100000 3fb5701c6e0bed57"
+    ],
+    [
+     1,
+     "RangeError: Unexpected end of image. Request for frame index 1 can't be satisfied."
+    ],
+    [
+     2,
+     "RangeError"
+    ]
+   ]
+  ],
+  [
+   "apng-3f-inf.png",
+   200,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    2,
+    "Infinity"
+   ],
+   [
+    [
+     0,
+     "BGRX 16x16 0 100000 3fb5701c6e0bed57"
+    ],
+    [
+     1,
+     "RangeError: Unexpected end of image. Request for frame index 1 can't be satisfied."
+    ],
+    [
+     2,
+     "RangeError"
+    ]
+   ]
+  ],
+  [
+   "apng-3f-inf.png",
+   208,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    2,
+    "Infinity"
+   ],
+   [
+    [
+     0,
+     "BGRX 16x16 0 100000 3fb5701c6e0bed57"
+    ],
+    [
+     1,
+     "BGRX 16x16 100000 100000 0b3b4eba5c7d53be"
+    ],
+    [
+     2,
+     "RangeError"
+    ]
+   ]
+  ],
+  [
+   "apng-3f-inf.png",
+   238,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    2,
+    "Infinity"
+   ],
+   [
+    [
+     0,
+     "BGRX 16x16 0 100000 3fb5701c6e0bed57"
+    ],
+    [
+     1,
+     "BGRX 16x16 100000 100000 0b3b4eba5c7d53be"
+    ],
+    [
+     2,
+     "RangeError"
+    ]
+   ]
+  ],
+  [
+   "apng-3f-inf.png",
+   246,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    3,
+    "Infinity"
+   ],
+   [
+    [
+     0,
+     "BGRX 16x16 0 100000 3fb5701c6e0bed57"
+    ],
+    [
+     1,
+     "BGRX 16x16 100000 100000 0b3b4eba5c7d53be"
+    ],
+    [
+     2,
+     "RangeError: Unexpected end of image. Request for frame index 2 can't be satisfied."
+    ],
+    [
+     3,
+     "RangeError"
+    ]
+   ]
+  ],
+  [
+   "apng-3f-inf.png",
+   275,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    3,
+    "Infinity"
+   ],
+   [
+    [
+     0,
+     "BGRX 16x16 0 100000 3fb5701c6e0bed57"
+    ],
+    [
+     1,
+     "BGRX 16x16 100000 100000 0b3b4eba5c7d53be"
+    ],
+    [
+     2,
+     "RangeError: Unexpected end of image. Request for frame index 2 can't be satisfied."
+    ],
+    [
+     3,
+     "RangeError"
+    ]
+   ]
+  ],
+  [
+   "apng-3f-inf.png",
+   283,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    3,
+    "Infinity"
+   ],
+   [
+    [
+     0,
+     "BGRX 16x16 0 100000 3fb5701c6e0bed57"
+    ],
+    [
+     1,
+     "BGRX 16x16 100000 100000 0b3b4eba5c7d53be"
+    ],
+    [
+     2,
+     "BGRX 16x16 200000 100000 71205eb7a329a3ea"
+    ],
+    [
+     3,
+     "RangeError"
+    ]
+   ]
+  ],
+  [
+   "apng-blend.png",
+   2100,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    1,
+    "Infinity"
+   ],
+   [
+    [
+     0,
+     "BGRA 24x24 0 100000 ccd45e427457bfa3"
+    ],
+    [
+     1,
+     "RangeError"
+    ]
+   ]
+  ],
+  [
+   "apng-blend.png",
+   2200,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    2,
+    "Infinity"
+   ],
+   [
+    [
+     0,
+     "BGRA 24x24 0 100000 ccd45e427457bfa3"
+    ],
+    [
+     1,
+     "BGRA 24x24 100000 30000 1a0b6d2cd53dc766"
+    ],
+    [
+     2,
+     "RangeError"
+    ]
+   ]
+  ],
+  [
+   "apng-blend.png",
+   2440,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    5,
+    "Infinity"
+   ],
+   [
+    [
+     0,
+     "BGRA 24x24 0 100000 ccd45e427457bfa3"
+    ],
+    [
+     1,
+     "BGRA 24x24 100000 30000 1a0b6d2cd53dc766"
+    ],
+    [
+     2,
+     "BGRA 24x24 130000 0 3c5d202a2b30ccaf"
+    ],
+    [
+     3,
+     "BGRA 24x24 130000 7000 62b0bdada6533837"
+    ],
+    [
+     4,
+     "RangeError: Unexpected end of image. Request for frame index 4 can't be satisfied."
+    ],
+    [
+     5,
+     "RangeError"
+    ]
+   ]
+  ],
+  [
+   "apng-blend.png",
+   3081,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    6,
+    "Infinity"
+   ],
+   [
+    [
+     0,
+     "BGRA 24x24 0 100000 ccd45e427457bfa3"
+    ],
+    [
+     1,
+     "BGRA 24x24 100000 30000 1a0b6d2cd53dc766"
+    ],
+    [
+     2,
+     "BGRA 24x24 130000 0 3c5d202a2b30ccaf"
+    ],
+    [
+     3,
+     "BGRA 24x24 130000 7000 62b0bdada6533837"
+    ],
+    [
+     4,
+     "BGRA 24x24 137000 333000 fbc0ecdbf31ca16d"
+    ],
+    [
+     5,
+     "RangeError: Unexpected end of image. Request for frame index 5 can't be satisfied."
+    ],
+    [
+     6,
+     "RangeError"
+    ]
+   ]
+  ],
+  [
+   "apng-blend.png",
+   3089,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    6,
+    "Infinity"
+   ],
+   [
+    [
+     0,
+     "BGRA 24x24 0 100000 ccd45e427457bfa3"
+    ],
+    [
+     1,
+     "BGRA 24x24 100000 30000 1a0b6d2cd53dc766"
+    ],
+    [
+     2,
+     "BGRA 24x24 130000 0 3c5d202a2b30ccaf"
+    ],
+    [
+     3,
+     "BGRA 24x24 130000 7000 62b0bdada6533837"
+    ],
+    [
+     4,
+     "BGRA 24x24 137000 333000 fbc0ecdbf31ca16d"
+    ],
+    [
+     5,
+     "BGRA 24x24 470000 500000 d1ee79ab14d07b68"
+    ],
+    [
+     6,
+     "RangeError"
+    ]
+   ]
+  ],
+  [
+   "anim-mux.webp",
+   128,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    1,
+    "2"
+   ],
+   [
+    [
+     0,
+     "EncodingError: Failed to decode frame at index 0"
+    ],
+    [
+     1,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "anim-mux.webp",
+   200,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    1,
+    "2"
+   ],
+   [
+    [
+     0,
+     "EncodingError: Failed to decode frame at index 0"
+    ],
+    [
+     1,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "anim-mux.webp",
+   650,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    4,
+    "2"
+   ],
+   [
+    [
+     0,
+     "BGRA 32x24 0 100000 fdb457655969e86f"
+    ],
+    [
+     1,
+     "BGRA 32x24 100000 60000 5ee7b15c86539a09"
+    ],
+    [
+     2,
+     "BGRA 32x24 160000 40000 61b11c1fc5a0818d"
+    ],
+    [
+     3,
+     "EncodingError: Failed to decode frame at index 3"
+    ],
+    [
+     4,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "anim-mux.webp",
+   700,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    4,
+    "2"
+   ],
+   [
+    [
+     0,
+     "BGRA 32x24 0 100000 fdb457655969e86f"
+    ],
+    [
+     1,
+     "BGRA 32x24 100000 60000 5ee7b15c86539a09"
+    ],
+    [
+     2,
+     "BGRA 32x24 160000 40000 61b11c1fc5a0818d"
+    ],
+    [
+     3,
+     "EncodingError: Failed to decode frame at index 3"
+    ],
+    [
+     4,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "anim-mux.webp",
+   777,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    4,
+    "2"
+   ],
+   [
+    [
+     0,
+     "BGRA 32x24 0 100000 fdb457655969e86f"
+    ],
+    [
+     1,
+     "BGRA 32x24 100000 60000 5ee7b15c86539a09"
+    ],
+    [
+     2,
+     "BGRA 32x24 160000 40000 61b11c1fc5a0818d"
+    ],
+    [
+     3,
+     "EncodingError: Failed to decode frame at index 3"
+    ],
+    [
+     4,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "anim_lossy_opaque.webp",
+   1000,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    1,
+    "Infinity"
+   ],
+   [
+    [
+     0,
+     "EncodingError: Failed to decode frame at index 0"
+    ],
+    [
+     1,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "four-colors.webp",
+   76,
+   "fulfilled",
+   "fulfilled",
+   [
+    false,
+    1,
+    "0"
+   ],
+   [
+    [
+     0,
+     "EncodingError: Failed to decode frame at index 0"
+    ],
+    [
+     1,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "four-colors.webp",
+   77,
+   "fulfilled",
+   "fulfilled",
+   [
+    false,
+    1,
+    "0"
+   ],
+   [
+    [
+     0,
+     "EncodingError: Failed to decode frame at index 0"
+    ],
+    [
+     1,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "webp-valid.webp",
+   1134,
+   "fulfilled",
+   "fulfilled",
+   [
+    false,
+    1,
+    "0"
+   ],
+   [
+    [
+     0,
+     "EncodingError: Failed to decode frame at index 0"
+    ],
+    [
+     1,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "four-colors.png",
+   1430,
+   "fulfilled",
+   "fulfilled",
+   [
+    false,
+    1,
+    "0"
+   ],
+   [
+    [
+     0,
+     "EncodingError: Failed to decode frame at index 0"
+    ],
+    [
+     1,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "four-colors.png",
+   1437,
+   "fulfilled",
+   "fulfilled",
+   [
+    false,
+    1,
+    "0"
+   ],
+   [
+    [
+     0,
+     "EncodingError: Failed to decode frame at index 0"
+    ],
+    [
+     1,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "four-colors.png",
+   1438,
+   "fulfilled",
+   "fulfilled",
+   [
+    false,
+    1,
+    "0"
+   ],
+   [
+    [
+     0,
+     "BGRX 320x240 0 null da76d824e943b611"
+    ],
+    [
+     1,
+     "RangeError"
+    ]
+   ]
+  ],
+  [
+   "four-colors.png",
+   1441,
+   "fulfilled",
+   "fulfilled",
+   [
+    false,
+    1,
+    "0"
+   ],
+   [
+    [
+     0,
+     "BGRX 320x240 0 null da76d824e943b611"
+    ],
+    [
+     1,
+     "RangeError"
+    ]
+   ]
+  ],
+  [
+   "webp-valid.webp",
+   600,
+   "fulfilled",
+   "fulfilled",
+   [
+    false,
+    1,
+    "0"
+   ],
+   [
+    [
+     0,
+     "EncodingError: Failed to decode frame at index 0"
+    ],
+    [
+     0,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "anim_lossy_opaque.webp",
+   1000,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    1,
+    "Infinity"
+   ],
+   [
+    [
+     0,
+     "EncodingError: Failed to decode frame at index 0"
+    ],
+    [
+     0,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "four-colors.png",
+   500,
+   "fulfilled",
+   "fulfilled",
+   [
+    false,
+    1,
+    "0"
+   ],
+   [
+    [
+     0,
+     "EncodingError: Failed to decode frame at index 0"
+    ],
+    [
+     0,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "apng-3f-inf.png",
+   150,
+   "fulfilled",
+   "fulfilled",
+   [
+    true,
+    1,
+    "Infinity"
+   ],
+   [
+    [
+     0,
+     "ok BGRX"
+    ],
+    [
+     0,
+     "ok BGRX"
+    ]
+   ]
+  ],
+  [
+   "four-colors.png",
+   90,
+   "InvalidStateError: Failed to retrieve track metadata.",
+   "fulfilled",
+   null,
+   [
+    [
+     0,
+     "InvalidStateError"
+    ],
+    [
+     0,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "four-colors.webp",
+   8,
+   "InvalidStateError: Failed to retrieve track metadata.",
+   "fulfilled",
+   null,
+   [
+    [
+     0,
+     "InvalidStateError"
+    ],
+    [
+     0,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "four-colors.webp",
+   24,
+   "InvalidStateError: Failed to retrieve track metadata.",
+   "fulfilled",
+   null,
+   [
+    [
+     0,
+     "InvalidStateError"
+    ],
+    [
+     0,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "test.png",
+   7,
+   "InvalidStateError: Failed to retrieve track metadata.",
+   "fulfilled",
+   null,
+   [
+    [
+     0,
+     "InvalidStateError"
+    ],
+    [
+     0,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "png-bad-body.png",
+   1442,
+   "fulfilled",
+   "fulfilled",
+   [
+    false,
+    1,
+    "0"
+   ],
+   [
+    [
+     0,
+     "EncodingError: Failed to decode frame at index 0"
+    ],
+    [
+     0,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "webp-bad-part0-ff.webp",
+   1136,
+   "fulfilled",
+   "fulfilled",
+   [
+    false,
+    1,
+    "0"
+   ],
+   [
+    [
+     0,
+     "EncodingError: Failed to decode frame at index 0"
+    ],
+    [
+     0,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "png-bad-idat-crc.png",
+   1442,
+   "fulfilled",
+   "fulfilled",
+   [
+    false,
+    1,
+    "0"
+   ],
+   [
+    [
+     0,
+     "EncodingError: Failed to decode frame at index 0"
+    ],
+    [
+     0,
+     "InvalidStateError"
+    ]
+   ]
+  ],
+  [
+   "png-bad-ihdr-crc.png",
+   1442,
+   "InvalidStateError: Failed to retrieve track metadata.",
+   "AbortError: Aborted by close.",
+   null,
+   [
+    [
+     0,
+     "InvalidStateError"
+    ],
+    [
+     0,
+     "InvalidStateError"
+    ]
+   ]
+  ]
+ ],
+ "afterReady": {
+  "anim-alpha-lossless.webp": {
+   "buffer": [
+    "BGRA 32x24 0 80000 fdb457655969e86f",
+    "BGRA 32x24 80000 80000 3f1fb816c6e4d20d",
+    "BGRA 32x24 160000 80000 a5e8b196869df737",
+    "BGRA 32x24 240000 80000 27c28a80a1b48c08",
+    "BGRA 32x24 320000 80000 7b98b56b9f4b60d8",
+    "BGRA 32x24 400000 80000 0b598f60970818c6",
+    "RangeError"
+   ],
+   "stream": [
+    "BGRA 32x24 0 80000 fdb457655969e86f",
+    "BGRA 32x24 80000 80000 3f1fb816c6e4d20d",
+    "BGRA 32x24 160000 80000 a5e8b196869df737",
+    "BGRA 32x24 240000 80000 27c28a80a1b48c08",
+    "BGRA 32x24 320000 80000 7b98b56b9f4b60d8",
+    "BGRA 32x24 400000 80000 0b598f60970818c6"
+   ]
+  },
+  "anim_lossy_opaque.webp": {
+   "buffer": [
+    "BGRX 40x30 0 100000 874c2c08d02f2254",
+    "BGRX 40x30 100000 100000 85123bd38153b7be",
+    "BGRX 40x30 200000 100000 fb490744d42240f6",
+    "RangeError"
+   ],
+   "stream": [
+    "BGRX 40x30 0 100000 874c2c08d02f2254",
+    "BGRX 40x30 100000 100000 85123bd38153b7be",
+    "BGRX 40x30 200000 100000 fb490744d42240f6"
+   ]
+  },
+  "apng-3f-inf.png": {
+   "buffer": [
+    "BGRX 16x16 0 100000 3fb5701c6e0bed57",
+    "BGRX 16x16 100000 100000 0b3b4eba5c7d53be",
+    "BGRX 16x16 200000 100000 71205eb7a329a3ea",
+    "RangeError"
+   ],
+   "stream": [
+    "BGRX 16x16 0 100000 3fb5701c6e0bed57",
+    "BGRX 16x16 100000 100000 0b3b4eba5c7d53be",
+    "BGRX 16x16 200000 100000 71205eb7a329a3ea"
+   ]
+  },
+  "apng-40f-512.png": {
+   "buffer": [
+    "BGRX 512x512 0 33000 3b688f39b2b40aa8",
+    "BGRX 512x512 33000 33000 2005e97d1256d421",
+    "BGRX 512x512 66000 33000 24e71d08f457f69d",
+    "BGRX 512x512 99000 33000 f5c61b7b74cfda2e",
+    "BGRX 512x512 132000 33000 9c5f20628fea6c15",
+    "BGRX 512x512 165000 33000 2d666e20f2ee17b1",
+    "BGRX 512x512 198000 33000 dd1e39c2d0575204",
+    "BGRX 512x512 231000 33000 929a69462fd53895",
+    "BGRX 512x512 264000 33000 679e5f91617c887f",
+    "BGRX 512x512 297000 33000 9b2b2fe4e5a23b80",
+    "BGRX 512x512 330000 33000 470741a94184040a",
+    "BGRX 512x512 363000 33000 071966bf291d9a1a",
+    "BGRX 512x512 396000 33000 25194fc831ecc8bd",
+    "BGRX 512x512 429000 33000 fa6f50701568a2f5",
+    "BGRX 512x512 462000 33000 e1b81d8d9ddf1716",
+    "BGRX 512x512 495000 33000 1a018c253fabb042",
+    "BGRX 512x512 528000 33000 2cfa64dd15f46330",
+    "BGRX 512x512 561000 33000 eac698e108525f5e",
+    "BGRX 512x512 594000 33000 f50a19ff9a22bf8a",
+    "BGRX 512x512 627000 33000 8f03266be123e1fc",
+    "BGRX 512x512 660000 33000 b5dec4ff50ec565a",
+    "BGRX 512x512 693000 33000 13bb43a8ff48f246",
+    "BGRX 512x512 726000 33000 eeb2ed6f307b6866",
+    "BGRX 512x512 759000 33000 f27f5a6b93879398",
+    "BGRX 512x512 792000 33000 d57857c4287cf2e6",
+    "BGRX 512x512 825000 33000 4e5e67ae1db32f01",
+    "BGRX 512x512 858000 33000 b33b2c26a9b5d721",
+    "BGRX 512x512 891000 33000 9711b98986fced55",
+    "BGRX 512x512 924000 33000 6e27eba2e950004e",
+    "BGRX 512x512 957000 33000 0684309c5b6a7505",
+    "BGRX 512x512 990000 33000 97b5f1e1b4204cee",
+    "BGRX 512x512 1023000 33000 df68999d71c58a43",
+    "BGRX 512x512 1056000 33000 b4f2e6caaf50a3bd",
+    "BGRX 512x512 1089000 33000 a17422b863695923",
+    "BGRX 512x512 1122000 33000 2df8b89df8f36401",
+    "BGRX 512x512 1155000 33000 7ec3588662252bc0",
+    "BGRX 512x512 1188000 33000 97b57699fe89f2bf",
+    "BGRX 512x512 1221000 33000 04752c7fc4fba8e9",
+    "BGRX 512x512 1254000 33000 2add0b9f949f45a2",
+    "BGRX 512x512 1287000 33000 2d2495a7319047f9",
+    "RangeError"
+   ],
+   "stream": [
+    "BGRX 512x512 0 33000 3b688f39b2b40aa8",
+    "BGRX 512x512 33000 33000 2005e97d1256d421",
+    "BGRX 512x512 66000 33000 24e71d08f457f69d",
+    "BGRX 512x512 99000 33000 f5c61b7b74cfda2e",
+    "BGRX 512x512 132000 33000 9c5f20628fea6c15",
+    "BGRX 512x512 165000 33000 2d666e20f2ee17b1",
+    "BGRX 512x512 198000 33000 dd1e39c2d0575204",
+    "BGRX 512x512 231000 33000 929a69462fd53895",
+    "BGRX 512x512 264000 33000 679e5f91617c887f",
+    "BGRX 512x512 297000 33000 9b2b2fe4e5a23b80",
+    "BGRX 512x512 330000 33000 470741a94184040a",
+    "BGRX 512x512 363000 33000 071966bf291d9a1a",
+    "BGRX 512x512 396000 33000 25194fc831ecc8bd",
+    "BGRX 512x512 429000 33000 fa6f50701568a2f5",
+    "BGRX 512x512 462000 33000 e1b81d8d9ddf1716",
+    "BGRX 512x512 495000 33000 1a018c253fabb042",
+    "BGRX 512x512 528000 33000 2cfa64dd15f46330",
+    "BGRX 512x512 561000 33000 eac698e108525f5e",
+    "BGRX 512x512 594000 33000 f50a19ff9a22bf8a",
+    "BGRX 512x512 627000 33000 8f03266be123e1fc",
+    "BGRX 512x512 660000 33000 b5dec4ff50ec565a",
+    "BGRX 512x512 693000 33000 13bb43a8ff48f246",
+    "BGRX 512x512 726000 33000 eeb2ed6f307b6866",
+    "BGRX 512x512 759000 33000 f27f5a6b93879398",
+    "BGRX 512x512 792000 33000 d57857c4287cf2e6",
+    "BGRX 512x512 825000 33000 4e5e67ae1db32f01",
+    "BGRX 512x512 858000 33000 b33b2c26a9b5d721",
+    "BGRX 512x512 891000 33000 9711b98986fced55",
+    "BGRX 512x512 924000 33000 6e27eba2e950004e",
+    "BGRX 512x512 957000 33000 0684309c5b6a7505",
+    "BGRX 512x512 990000 33000 97b5f1e1b4204cee",
+    "BGRX 512x512 1023000 33000 df68999d71c58a43",
+    "BGRX 512x512 1056000 33000 b4f2e6caaf50a3bd",
+    "BGRX 512x512 1089000 33000 a17422b863695923",
+    "BGRX 512x512 1122000 33000 2df8b89df8f36401",
+    "BGRX 512x512 1155000 33000 7ec3588662252bc0",
+    "BGRX 512x512 1188000 33000 97b57699fe89f2bf",
+    "BGRX 512x512 1221000 33000 04752c7fc4fba8e9",
+    "BGRX 512x512 1254000 33000 2add0b9f949f45a2",
+    "BGRX 512x512 1287000 33000 2d2495a7319047f9"
+   ]
+  },
+  "apng-blend.png": {
+   "buffer": [
+    "BGRA 24x24 0 100000 ccd45e427457bfa3",
+    "BGRA 24x24 100000 30000 1a0b6d2cd53dc766",
+    "BGRA 24x24 130000 0 3c5d202a2b30ccaf",
+    "BGRA 24x24 130000 7000 62b0bdada6533837",
+    "BGRA 24x24 137000 333000 fbc0ecdbf31ca16d",
+    "BGRA 24x24 470000 500000 d1ee79ab14d07b68",
+    "RangeError"
+   ],
+   "stream": [
+    "BGRA 24x24 0 100000 ccd45e427457bfa3",
+    "BGRA 24x24 100000 30000 1a0b6d2cd53dc766",
+    "BGRA 24x24 130000 0 3c5d202a2b30ccaf",
+    "BGRA 24x24 130000 7000 62b0bdada6533837",
+    "BGRA 24x24 137000 333000 fbc0ecdbf31ca16d",
+    "BGRA 24x24 470000 500000 d1ee79ab14d07b68"
+   ]
+  },
+  "four-colors.png": {
+   "buffer": [
+    "BGRX 320x240 0 null da76d824e943b611",
+    "RangeError"
+   ],
+   "stream": [
+    "BGRX 320x240 0 null da76d824e943b611"
+   ]
+  },
+  "four-colors.webp": {
+   "buffer": [
+    "BGRX 320x240 0 null da76d824e943b611",
+    "RangeError"
+   ],
+   "stream": [
+    "BGRX 320x240 0 null da76d824e943b611"
+   ]
+  },
+  "webp-valid.webp": {
+   "buffer": [
+    "I420 64x48 0 null 9ba01407cd2c9c19",
+    "RangeError"
+   ],
+   "stream": [
+    "BGRX 64x48 0 null 747f27e26639aadf"
+   ]
+  }
+ }
+}
