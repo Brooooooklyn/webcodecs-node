@@ -742,6 +742,11 @@ impl ImageDecoder {
       } else {
         ChunkReader::Any(stream.read()?)
       };
+      // For the collector's callback (see `JpegRefs`)
+      let jpeg_refs = match &reader {
+        ChunkReader::Jpeg(reader) => Some(Arc::downgrade(&reader.refs)),
+        ChunkReader::Any(_) => None,
+      };
       let inner_clone = inner.clone();
       if let Ok(mut inner_guard) = inner_clone.lock() {
         inner_guard.data = ImageDecoderData::Vec(Vec::new());
@@ -898,6 +903,12 @@ impl ImageDecoder {
       };
       let end_inner = inner.clone();
       let collection_promise = env.spawn_future_with_callback(collect, move |env, end| {
+        // The collector is done: let go of its JPEG stream's read() and reactions here, on the JS
+        // thread. A stream error ends the collector without this callback: the JS thread let go
+        // of them as it read the error.
+        if let Some(refs) = jpeg_refs.as_ref().and_then(Weak::upgrade) {
+          release_jpeg_refs(&refs);
+        }
         let aborted = match end {
           StreamEnd::Aborted(aborted) => aborted,
           StreamEnd::FrameFailure(error) => match (end_with_frame_failure(&end_inner), error) {
@@ -1910,21 +1921,149 @@ enum JpegItem {
   Error(Error),
 }
 
-/// The collector's end of a JPEG stream's reader (see `JpegStream`). Dropping it lets go of
-/// the stream's reader.
+/// The collector's end of a JPEG stream's reader (see `JpegStream`). Dropping it ends the
+/// reading: the JS thread finds no collector at its next result and reads no more. The JS
+/// references are let go on the JS thread (see `JpegRefs`).
 struct JpegChunkReader {
   items: UnboundedReceiver<JpegItem>,
-  read: Arc<Mutex<Option<JpegReadFn>>>,
+  refs: Arc<Mutex<JpegRefs>>,
 }
 
 type JpegReadFn = FunctionRef<(), PromiseRaw<'static, Object<'static>>>;
 
+/// A JPEG stream's `onRead` and `onReadError`
+type JpegReactions = (FunctionRef<(), ()>, FunctionRef<(), ()>);
+
+/// The same, to hand to then()
+type JpegReactionFns<'env> = (Function<'env, (), ()>, Function<'env, (), ()>);
+
+/// The JS references of a JPEG stream's reader, under one lock. The JS thread makes the reactions
+/// only while `read` is there (`JpegStream::reactions`), and only the JS thread lets go of them
+/// (`release_jpeg_refs`): at the end or an error of the stream, in the collector's callback once
+/// the collector is done, or at the env's teardown (`release_jpeg_streams`).
+///
+/// Never on the collector's thread: napi lets go of a reference dropped there through a
+/// thread-safe function of the env, and while the env is torn down, once Node has started to
+/// close that function, napi 3.12.4 takes every such drop after the first one as an error
+/// (`napi_invalid_arg`) and panics; the second panic in one drop aborts the process. A collector
+/// can drop then in two ways: the async runtime is shut down at the teardown of the last env that
+/// loaded the addon (a worker, when only workers load it), which drops the collector on its
+/// thread; or the collector ends by itself then (a JPEG whose header fails, say).
+struct JpegRefs {
+  /// The reader's read(); None once the JS thread let go of it
+  read: Option<JpegReadFn>,
+  /// The reactions to every read of the stream, made at its first read. They hold the stream
+  /// (`JpegStream`), which holds them, until the JS thread lets go of them with `read`, which
+  /// ends that cycle. So while `read` is there, the JS thread keeps the stream, and with it these
+  /// references, alive: the collector never holds the last of them.
+  reactions: Option<JpegReactions>,
+  /// The JS thread
+  thread: std::thread::ThreadId,
+}
+
+impl Drop for JpegRefs {
+  fn drop(&mut self) {
+    // Only the JS thread holds the last of these with references in it (see above). Should it
+    // ever be another thread, they leak rather than call napi there: the env frees them.
+    if std::thread::current().id() != self.thread {
+      std::mem::forget(self.read.take());
+      std::mem::forget(self.reactions.take());
+    }
+  }
+}
+
 impl Drop for JpegChunkReader {
   fn drop(&mut self) {
-    // The collector is done: the JS thread reads no more (a FunctionRef may drop off-thread)
-    if let Ok(mut read) = self.read.lock() {
-      read.take();
+    // The collector is done. On the JS thread (the collector was never started), let go of the
+    // references now; else the collector's callback does, on the JS thread.
+    if self
+      .refs
+      .lock()
+      .is_ok_and(|refs| refs.thread == std::thread::current().id())
+    {
+      release_jpeg_refs(&self.refs);
     }
+  }
+}
+
+/// On the JS thread: let go of a JPEG stream's read() and reactions (see `JpegRefs`). They are
+/// taken out under the lock and dropped after it.
+fn release_jpeg_refs(refs: &Mutex<JpegRefs>) {
+  let taken = refs
+    .lock()
+    .ok()
+    .map(|mut refs| (refs.read.take(), refs.reactions.take()));
+  drop(taken);
+}
+
+thread_local! {
+  /// The JPEG streams of this thread's env, for its teardown (`release_jpeg_streams`). None until
+  /// the first stream adds that hook, and again once it ran.
+  static JPEG_STREAMS: std::cell::RefCell<Option<Vec<Weak<Mutex<JpegRefs>>>>> =
+    const { std::cell::RefCell::new(None) };
+}
+
+/// On the JS thread, at a JPEG stream's start: let the env's teardown see its references. The
+/// first stream of the env adds the teardown hook (`release_jpeg_streams`).
+fn watch_jpeg_refs(env: &Env, refs: &Arc<Mutex<JpegRefs>>) {
+  let _ = JPEG_STREAMS.try_with(|streams| {
+    let mut streams = streams.borrow_mut();
+    if streams.is_none() {
+      // SAFETY: on the env's JS thread; the hook takes no data
+      let status = unsafe {
+        napi::sys::napi_add_env_cleanup_hook(
+          env.raw(),
+          Some(release_jpeg_streams),
+          std::ptr::null_mut(),
+        )
+      };
+      if status != napi::sys::Status::napi_ok {
+        return;
+      }
+      *streams = Some(Vec::new());
+    }
+    if let Some(streams) = streams.as_mut() {
+      streams.retain(|stream| stream.strong_count() > 0);
+      streams.push(Arc::downgrade(refs));
+    }
+  });
+}
+
+/// The env's teardown, on its JS thread: let go of the references of every JPEG stream still
+/// open (see `JpegRefs`). Node runs the cleanup hooks from the one added last, so this runs before
+/// the hooks napi added when the addon was registered: the one that shuts the async runtime down
+/// (and with it the collectors) and the one that closes napi's thread-safe function. The env is
+/// whole here: each reference is deleted at once. A collector dropped later finds nothing to let
+/// go of.
+///
+/// The list is per thread, and so is this hook: it also takes the streams of a second
+/// registration of the addon in the same env (the addon loaded again). napi deletes a reference
+/// at once when it was made under the registration made last on this thread; else the drop goes
+/// through the thread-safe function of the registration it was made under, still open here when
+/// that registration came before this hook was added. Each reference drops on its own, and a
+/// panic there (possible with a third registration) is caught: an unwind must not leave this
+/// extern "C" function.
+unsafe extern "C" fn release_jpeg_streams(_: *mut std::ffi::c_void) {
+  let streams = JPEG_STREAMS
+    .try_with(|streams| streams.borrow_mut().take())
+    .ok()
+    .flatten();
+  for refs in streams
+    .into_iter()
+    .flatten()
+    .filter_map(|refs| refs.upgrade())
+  {
+    let Some((read, reactions)) = refs
+      .lock()
+      .ok()
+      .map(|mut refs| (refs.read.take(), refs.reactions.take()))
+    else {
+      continue;
+    };
+    let (on_value, on_error) = reactions.unzip();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(read)));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(on_value)));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(on_error)));
   }
 }
 
@@ -1940,31 +2079,40 @@ impl JpegChunkReader {
     watch_stream_close(env, reader, inner);
     let read: Function<(), PromiseRaw<Object>> = reader.get_named_property("read")?;
     let read: JpegReadFn = read.bind(reader)?.create_ref()?;
-    let read = Arc::new(Mutex::new(Some(read)));
+    let refs = Arc::new(Mutex::new(JpegRefs {
+      read: Some(read),
+      reactions: None,
+      thread: std::thread::current().id(),
+    }));
+    watch_jpeg_refs(env, &refs);
     let (sender, items) = unbounded_channel();
     if let Ok(mut guard) = inner.lock() {
       guard.jpeg_items = Some(sender.downgrade());
     }
     let js = Arc::new(JpegStream {
-      read: read.clone(),
+      refs: refs.clone(),
       items: sender,
       inner: Arc::downgrade(inner),
       idle_check: Mutex::new(None),
+      waiting: Mutex::new(None),
     });
     js.read_next(env);
-    Ok(Self { items, read })
+    Ok(Self { items, refs })
   }
 }
 
 /// The JS thread's end of a JPEG stream's reader
 struct JpegStream {
-  /// The reader's read(); None once the collector is done
-  read: Arc<Mutex<Option<JpegReadFn>>>,
+  /// The reader's read() and the reactions (see `JpegRefs`)
+  refs: Arc<Mutex<JpegRefs>>,
   /// The only strong sender (see `ImageDecoderInner::jpeg_items`)
   items: UnboundedSender<JpegItem>,
   inner: Weak<Mutex<ImageDecoderInner>>,
   /// The last read, while an idle check is scheduled (see `start_jpeg_read`)
   idle_check: Mutex<Option<Arc<JpegRead>>>,
+  /// The read that waits, for the reactions. One at a time: each read starts in the reaction to
+  /// the last one.
+  waiting: Mutex<Option<Arc<JpegRead>>>,
 }
 
 const READ_WAITING: u8 = 0;
@@ -1980,12 +2128,12 @@ impl JpegStream {
   fn read_next(self: &Arc<Self>, env: &Env) {
     // Not under the lock: read() runs the stream's pull()
     let read = {
-      let Ok(read) = self.read.lock() else {
+      let Ok(refs) = self.refs.lock() else {
         return;
       };
-      match read.as_ref() {
+      match refs.read.as_ref() {
         Some(read) => read.borrow_back(env),
-        // the collector is done
+        // nothing reads on (see `JpegRefs`)
         None => return,
       }
     };
@@ -2054,55 +2202,108 @@ impl JpegStream {
     // A collector that is gone drops the chunk here, on the JS thread, and nothing reads on.
     self.items.send(item).is_ok() && more
   }
+
+  /// On the JS thread: the reactions to the read that waits (`waiting`), the same two functions
+  /// for every read of the stream, made at its first read. None once the JS thread let go of
+  /// `read` (see `JpegRefs`): then no reaction is made, as nothing would let it go. The collector
+  /// can stop on another thread between `read_next` and this call (read() runs the stream's
+  /// pull(), which can close the decoder); it leaves the references to its callback, which runs on
+  /// the JS thread after this call and lets go of a pair made here.
+  fn reactions<'env>(self: &Arc<Self>, env: &'env Env) -> Result<Option<JpegReactionFns<'env>>> {
+    let mut refs = self
+      .refs
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    if refs.read.is_none() {
+      return Ok(None);
+    }
+    if refs.reactions.is_none() {
+      let js = self.clone();
+      let on_value = env.create_function_from_closure::<(), (), _>("onRead", move |ctx| {
+        let Some(read) = js.take_waiting() else {
+          return Ok(());
+        };
+        let chunk = ctx.first_arg::<Object>().and_then(|result| {
+          if result.get_named_property::<bool>("done")? {
+            Ok(None)
+          } else {
+            // Copied here, on the JS thread, like the chunks of other formats.
+            result
+              .get_named_property::<Uint8ArrayCopy>("value")
+              .map(Some)
+          }
+        });
+        if chunk.is_err() {
+          clear_pending_exception(ctx.env);
+        }
+        if js.settle(
+          &read,
+          chunk.map_err(|error| Error::new(Status::GenericFailure, error.reason.clone())),
+        ) {
+          js.read_next(ctx.env);
+        } else {
+          js.drop_reactions();
+        }
+        Ok(())
+      })?;
+      let js = self.clone();
+      let on_error = env.create_function_from_closure::<(), (), _>("onReadError", move |ctx| {
+        let Some(read) = js.take_waiting() else {
+          return Ok(());
+        };
+        let message = ctx.first_arg::<Unknown>().map_or_else(
+          |_| "ReadableStream read error".to_owned(),
+          rejection_message,
+        );
+        js.settle(&read, Err(Error::new(Status::GenericFailure, message)));
+        js.drop_reactions();
+        Ok(())
+      })?;
+      refs.reactions = Some((on_value.create_ref()?, on_error.create_ref()?));
+    }
+    match refs.reactions.as_ref() {
+      Some((on_value, on_error)) => Ok(Some((
+        on_value.borrow_back(env)?,
+        on_error.borrow_back(env)?,
+      ))),
+      None => Ok(None),
+    }
+  }
+
+  /// The read that waits, for its reaction
+  fn take_waiting(&self) -> Option<Arc<JpegRead>> {
+    self.waiting.lock().ok().and_then(|mut read| read.take())
+  }
+
+  /// On the JS thread, when nothing reads on: let go of read() and the reactions, which hold this
+  /// stream (see `JpegRefs`)
+  fn drop_reactions(&self) {
+    release_jpeg_refs(&self.refs);
+  }
 }
 
 /// On the JS thread, with the promise of a read(): wait for its result (then read on at once),
 /// and check once this task (with its microtasks) has ended whether the read still waits. Errors
 /// are owned (no JS reference), as the collector may drop them on another thread. One then() with
 /// both reactions: a rejected read is handled one microtask after it settles, like a chunk (see
-/// `queue_jpeg_post`).
+/// `queue_jpeg_post`). The reactions are the stream's (`JpegStream::reactions`): a read makes no
+/// new function, so a source that gives many chunks at once leaves no function per read behind.
 fn start_jpeg_read(
   promise: Result<PromiseRaw<Object>>,
   env: &Env,
   js: Arc<JpegStream>,
   read: Arc<JpegRead>,
 ) {
-  let on_value = (js.clone(), read.clone());
-  let on_error = (js.clone(), read.clone());
-  let handlers = promise.and_then(|promise| {
-    let on_value = env.create_function_from_closure::<(), (), _>("onRead", move |ctx| {
-      let chunk = ctx.first_arg::<Object>().and_then(|result| {
-        if result.get_named_property::<bool>("done")? {
-          Ok(None)
-        } else {
-          // Copied here, on the JS thread, like the chunks of other formats.
-          result
-            .get_named_property::<Uint8ArrayCopy>("value")
-            .map(Some)
-        }
-      });
-      if chunk.is_err() {
-        clear_pending_exception(ctx.env);
-      }
-      let (js, read) = &on_value;
-      if js.settle(
-        read,
-        chunk.map_err(|error| Error::new(Status::GenericFailure, error.reason.clone())),
-      ) {
-        js.read_next(ctx.env);
-      }
-      Ok(())
-    })?;
-    let on_error = env.create_function_from_closure::<(), (), _>("onReadError", move |ctx| {
-      let message = ctx.first_arg::<Unknown>().map_or_else(
-        |_| "ReadableStream read error".to_owned(),
-        rejection_message,
-      );
-      let (js, read) = &on_error;
-      js.settle(read, Err(Error::new(Status::GenericFailure, message)));
-      Ok(())
-    })?;
-    then_both(promise, on_value, on_error)
+  if let Ok(mut waiting) = js.waiting.lock() {
+    *waiting = Some(read.clone());
+  }
+  let handlers = promise.and_then(|promise| match js.reactions(env)? {
+    Some((on_value, on_error)) => then_both(promise, on_value, on_error),
+    // The collector is done: nothing takes the result, but a rejection is still handled.
+    None => {
+      let ignore = env.create_function_from_closure::<(), (), _>("ignoreRead", |_| Ok(()))?;
+      then_both(promise, ignore, ignore)
+    }
   });
   if let Err(error) = handlers {
     clear_pending_exception(env);
@@ -2111,7 +2312,9 @@ fn start_jpeg_read(
     } else {
       error.reason.clone()
     };
+    js.take_waiting();
     js.settle(&read, Err(Error::new(Status::GenericFailure, reason)));
+    js.drop_reactions();
     return;
   }
   // setImmediate runs after this task and its microtasks: a chunk or the end already queued in

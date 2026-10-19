@@ -324,6 +324,198 @@ test('ImageDecoder: a JPEG stream that trickles in is not decoded again for each
   t.true(reads > 0 && reads < 60, `${reads} header reads`)
 })
 
+// The decoder reads a JPEG stream on the JS thread, and looks `then` up on the promise of each
+// read() of its reader. An own `then` on each promise sees the reactions it is handed.
+function watchReads(stream: ReadableStream<Uint8Array>, seen: (onValue: unknown, onError: unknown) => void) {
+  const getReader = stream.getReader.bind(stream)
+  Object.defineProperty(stream, 'getReader', {
+    value: () => {
+      const reader = getReader()
+      const read = reader.read.bind(reader)
+      Object.defineProperty(reader, 'read', {
+        value: () => {
+          const promise = read()
+          const then = promise.then.bind(promise)
+          // oxlint-disable-next-line unicorn/no-thenable -- the promise is a thenable already
+          void Object.defineProperty(promise, 'then', {
+            value: (onValue: () => void, onError: () => void) => {
+              seen(onValue, onError)
+              return then(onValue, onError)
+            },
+          })
+          return promise
+        },
+      })
+      return reader
+    },
+  })
+  return stream
+}
+
+// A source that gives its chunks at once is read in one task, one read per chunk. Each read gets
+// the same two reactions, so the reads leave no functions behind (before, each read made two new
+// ones, which the GC freed only after that task).
+test('ImageDecoder: the reads of a JPEG stream share one pair of reactions', async (t) => {
+  const data = fixture('420-37x9.jpg')
+  const reactions = new Set<unknown>()
+  let reads = 0
+  let sent = 0
+  const stream = new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        if (sent < data.length) {
+          controller.enqueue(data.slice(sent, ++sent))
+        } else {
+          controller.close()
+        }
+      },
+    },
+    { highWaterMark: 0 },
+  )
+  watchReads(stream, (onValue, onError) => {
+    reads++
+    reactions.add(onValue)
+    reactions.add(onError)
+  })
+  const decoder = new ImageDecoder({ data: stream, type: 'image/jpeg' })
+  await decoder.completed
+  const { image } = await decoder.decode()
+  t.is(image.format, 'I420')
+  t.deepEqual([image.codedWidth, image.codedHeight], [37, 9])
+  image.close()
+  decoder.close()
+  // one read for each byte, and one for the end
+  t.is(reads, data.length + 1)
+  t.is(reactions.size, 2)
+})
+
+// The two reactions hold the stream, and the decoder holds them while it reads: it lets go of them
+// when nothing reads on. In a child process with --expose-gc, which drops the decoder and the
+// stream and then checks with WeakRefs that the reactions of every read are collected: after the
+// end, after an error, and after a header that fails, which stops the reading while the stream
+// stays open (the last read waits forever). The last case also stops the reading while the JS
+// thread is between a read() and its then(): the first pull() runs inside that read() and waits
+// until the decoder has closed (the reading stops right after that). Reactions made after that
+// stop would hold the stream forever.
+test('ImageDecoder: a JPEG stream lets go of its reactions when nothing reads on', (t) => {
+  const script = `
+    const fs = require('node:fs');
+    const { ImageDecoder } = require('./index.js');
+    const data = Buffer.from('${Buffer.from(fixture('420-37x9.jpg')).toString('base64')}', 'base64');
+    function watchReads(stream, seen) {
+      const getReader = stream.getReader.bind(stream);
+      Object.defineProperty(stream, 'getReader', {
+        value: () => {
+          const reader = getReader();
+          const read = reader.read.bind(reader);
+          Object.defineProperty(reader, 'read', {
+            value: () => {
+              const promise = read();
+              const then = promise.then;
+              Object.defineProperty(promise, 'then', {
+                value(onValue, onError) {
+                  seen(onValue, onError);
+                  return then.call(this, onValue, onError);
+                },
+              });
+              return promise;
+            },
+          });
+          return reader;
+        },
+      });
+      return stream;
+    }
+    const turn = () => new Promise((resolve) => setImmediate(resolve));
+    async function collected(refs) {
+      for (let i = 0; i < 50; i++) {
+        gc();
+        await turn();
+        if (refs.every((ref) => ref.deref() === undefined)) return true;
+      }
+      return false;
+    }
+    function watched(stream, refs) {
+      return watchReads(stream, (onValue, onError) => refs.push(new WeakRef(onValue), new WeakRef(onError)));
+    }
+    async function oneCase(kind) {
+      const refs = [];
+      let controller;
+      let stream = watched(new ReadableStream({ start: (c) => void (controller = c) }), refs);
+      let decoder = new ImageDecoder({ data: stream, type: 'image/jpeg' });
+      const completed = decoder.completed.catch(() => {});
+      decoder.tracks.ready.catch(() => {});
+      if (kind === 'header fails') {
+        controller.enqueue(new Uint8Array([0, ...data]));
+      } else {
+        controller.enqueue(data.slice(0, 623));
+        await decoder.tracks.ready;
+        if (kind === 'end') {
+          controller.enqueue(data.slice(623));
+          controller.close();
+        } else {
+          controller.error(new Error('stream error'));
+        }
+      }
+      await completed;
+      stream = decoder = controller = null;
+      return collected(refs);
+    }
+    async function stopInRead() {
+      // 1 MiB: the reading stops a moment after the chunk is read
+      const junk = new Uint8Array(1 << 20);
+      junk.set(data, 1);
+      const refs = [];
+      let controller;
+      let decoder;
+      let open = false;
+      let stream = watched(new ReadableStream({
+        start: (c) => void (controller = c),
+        pull() {
+          // The first pull() runs in the read made in the reaction to the chunk (start() had not
+          // finished at the first read, made in the constructor).
+          if (!decoder || open) return;
+          open = !decoder.closed;
+          const limit = performance.now() + 10000;
+          while (!decoder.closed && performance.now() < limit) {}
+          const end = performance.now() + 50;
+          while (performance.now() < end) {}
+        },
+      }, { highWaterMark: 0 }), refs);
+      decoder = new ImageDecoder({ data: stream, type: 'image/jpeg' });
+      const completed = decoder.completed.catch(() => {});
+      decoder.tracks.ready.catch(() => {});
+      controller.enqueue(junk);
+      await completed;
+      const reached = open && refs.length === 4;
+      stream = decoder = controller = null;
+      return { reached, collected: await collected(refs) };
+    }
+    (async () => {
+      const cases = {};
+      for (const kind of ['end', 'error', 'header fails']) cases[kind] = await oneCase(kind);
+      const race = { reached: 0, leaked: 0 };
+      for (let i = 0; i < 20 && race.reached < 3; i++) {
+        const { reached, collected } = await stopInRead();
+        if (reached) race.reached++;
+        if (!collected) race.leaked++;
+      }
+      fs.writeSync(1, 'RESULT:' + JSON.stringify({ cases, race }) + '\\n');
+      process.exit(0);
+    })();
+  `
+  const output = execFileSync(process.execPath, ['--expose-gc', '-e', script], {
+    cwd: process.cwd(),
+    timeout: 60_000,
+    encoding: 'utf8',
+  })
+  const result = JSON.parse(/RESULT:(.*)/.exec(output)?.[1] ?? 'null')
+  t.deepEqual(result?.cases, { end: true, error: true, 'header fails': true })
+  // The window was hit: the reading stopped while the read() of the first pull() ran
+  t.true(result?.race.reached > 0, JSON.stringify(result?.race))
+  t.is(result?.race.leaked, 0)
+})
+
 // reset() aborts a waiting decode() in Chrome, before it decodes, but keeps the choice of RGB that a
 // decode of part of the data made. The first half of the data is there at the decode(). The test
 // gives the rest (30 ms after the reset()) and the close (30 ms after that) itself, after the
