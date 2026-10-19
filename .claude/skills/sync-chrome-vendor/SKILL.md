@@ -163,11 +163,22 @@ table below follows one Chrome stable version: the `chrome:` line of
   data is tried as soon as it is read, before the close is read: BGRX. Both depend on timing;
   with 30 ms between the decode() and the close, Chrome is BGRX too.
 - Stream results and a JPEG decode() in one task: Chrome reads a chunk, the close or an error
-  inside enqueue(), close() or error(), so its decode() sees what came before it in the task and
-  nothing after. Here reads settle in microtasks (`queue_jpeg_post`). That gives the same order,
-  except after two or more chunks in one task: a decode() made between them, or before the close
-  that follows them, sees all of them, and the close. It then decodes YUV planes where Chrome
-  gives BGRX (a frame that fails: `completed` resolves where Chrome's rejects).
+  inside enqueue(), close() or error(), and starts its next read there too, so its decode() sees
+  what came before it in the task and nothing after. Here the JS thread keeps one read waiting
+  and starts the next read() only in the reaction to the last one (`onRead` calls
+  `JpegStream::read_next`): after the first chunk of a task, the other chunks and the close of
+  that task wait in the stream's queue until those reactions run, and the decode() can only wait
+  for them (`queue_jpeg_post`). That gives the same order, except after two or more chunks in one
+  task: a decode() made between them, or before the close that follows them, sees all of them,
+  and the close. It then decodes YUV planes where Chrome gives BGRX (a frame that fails:
+  `completed` resolves where Chrome's rejects).
+- Two more results of the same cause, in every format (the other formats read through napi's
+  `Reader`, which also has one read waiting and copies a chunk in the reaction), and on main too:
+  a chunk whose buffer is detached right after enqueue() is read empty here, so the decode fails
+  (or a JPEG gets other pixels), where Chrome copied it inside enqueue() and decodes it; and
+  `desiredSize` after a second enqueue() in one task is -1 here and 0 in Chrome, whose pull() runs
+  inside the first enqueue(). A decode() that takes a frame made from the first chunk alone does
+  not show the first one: a GIF here, and a JPEG or a GIF on main.
 - Size limits: Chrome fails a frame wider or taller than `kMaxDimension` (32767); here FFmpeg
   allocates the frame, and fails it when (width + 128) × (height + 128) ≥ 2^28. Both fail the
   metadata above 2^29 - 1 pixels.
