@@ -54,6 +54,21 @@ table below follows one Chrome stable version: the `chrome:` line of
      `close_if_metadata_failed` and `closed_error`
    - `media/base/limits.h` `kMaxDimension`: Chrome rejects a decoded frame wider or taller
      than this
+   - PNG and APNG: Skia's `src/codec/SkPngRustCodec.cpp` and `src/codec/SkCodec.cpp` (at the
+     Skia revision in DEPS) and the png crate in
+     `third_party/rust/chromium_crates_io/vendor/png-v0_18` (`src/decoder/stream.rs`,
+     `src/decoder/read_decoder.rs`): when the header is ready, which chunks and CRCs fail the
+     image or a frame, how frames are counted, the repetition count and how frames are drawn,
+     all in `src/webcodecs/apng.rs`
+   - WebP: libwebp's `src/demux/demux.c`, `src/dec/webp_dec.c`, `src/dec/vp8_dec.c` and
+     `src/dec/vp8l_dec.c` (at the libwebp revision in DEPS), ported in
+     `src/webcodecs/webp.rs`, and `third_party/blink/renderer/platform/image-decoders/webp/webp_image_decoder.cc`
+     (`UpdateDemuxer`: when the header is ready, truncated files, a parse error after the header;
+     frame blending), followed by `read_webp` in `src/webcodecs/image_decoder.rs` and `draw`
+     in `webp.rs`
+   - `third_party/blink/renderer/platform/image-decoders/skia/skia_image_decoder_base.cc`:
+     which frame failures fail the decoder (`SetFailedFrameIndex`), followed by `read_png` and
+     `layered_frames` in `src/webcodecs/image_decoder.rs`
    - the libjpeg-turbo `BUILD.gn` (in the vendored revision): the `defines` of `libjpeg`,
      `libjpeg12`, `libjpeg16`, `simd` and `libjpeg_simd_config`, and the `simd_asm` flags.
      `build.rs` copies them by hand: `NO_GETENV` and `NO_PUTENV` on the decoder files,
@@ -142,10 +157,78 @@ table below follows one Chrome stable version: the `chrome:` line of
 `src/webcodecs/image_decoder.rs` has these, outside the JPEG decoder:
 
 - A stream that stays open after its last byte: a waiting decode() resolves (or fails) at the
-  close, or at the next probe when the data has doubled (all formats but JPEG). Chrome decodes
-  again on each chunk and answers as soon as the frame is whole. A JPEG does the same here: a
-  decode() that waits tries the data read so far when it is made, when a chunk comes to an idle
-  stream and when the stream goes idle (`post_jpeg_decode`).
+  close, or at the next probe when the data has doubled (all formats but JPEG, PNG and WebP).
+  Chrome decodes again on each chunk and answers as soon as the frame is whole. A JPEG does the
+  same here: a decode() that waits tries the data read so far when it is made, when a chunk comes
+  to an idle stream and when the stream goes idle (`post_jpeg_decode`). A PNG or WebP reads its
+  layout again on each chunk (`apng`, `webp`) and decodes a frame once all of its data is here
+  (a bare bitstream: see below). A decode() of it that waits is answered once a read has drawn
+  its frame.
+- tracks.ready of a PNG or WebP given much data at once: Chrome's decoder stops at the header.
+  Here, from a buffer, the read that finds the header resolves it once it has parsed all the data
+  (for a PNG, with every chunk's CRC checked) and copied the data of each whole frame, but before
+  any frame is drawn. On a stream, a chunk that holds the header and whole frames resolves it only
+  once the read of that chunk has drawn them (or a reset() stopped the draw: the read still stores
+  the track); a chunk with the header and no whole frame resolves it at once.
+- PNG and WebP data that is whole but bad, with the stream open: Chrome finds the error while it
+  inflates or decodes the first bytes (a PNG whose first deflate block is bad fails at 95 of
+  1442 bytes); here the frame fails once all of its data is here. A lossy (VP8) WebP frame that
+  libwebp can not finish waits for more data in Chrome and fails at the stream's end; here it
+  fails at once.
+- Lossy (VP8) WebP frames that libwebp and FFmpeg read differently: libwebp rejects a frame whose
+  first partition is too short for its macroblock modes, FFmpeg decodes it (here the frame
+  decodes); and libwebp can finish a frame without the last byte of its data, so Chrome answers
+  one byte sooner on an open stream, and decodes a file cut by that byte where it fails here.
+  Matching them needs libwebp's VP8 decoder.
+- APNG frame count while a frame is partly decoded: Skia counts no new frame while it has a
+  frame partly decoded (`SkPngRustCodec::onGetFrameCount`), nor after a decode error. Here frames
+  count as their headers come: a decode() that waits for a frame whose data does not inflate
+  leaves Chrome at the frames counted then (2 of 6 in `apng-blend-corrupt1.png`), and 6 here.
+- PNG and WebP chunks enqueued in the task of a decode(), or while a decode() waits: Chrome reads
+  a chunk into its decoder when it is enqueued, so a decode() uses the chunks enqueued before it
+  when no other decode() is still decoding ahead of it (with one still decoding, a later decode()
+  also uses a chunk enqueued after it in its task). Here the collector reads the stream through
+  napi's stream reader, which asks the JS thread for one chunk at a time, and a decode() looks at
+  the frames that the reads done by then have drawn (a decode() made before tracks.ready waits for
+  it, and so for the read of the chunk that holds the header). So its result depends on which
+  thread gets there first. Posting a PNG or WebP decode() among the chunks in their order, as
+  `queue_jpeg_post` does for a JPEG, would match Chrome in more of the cases below. Measured in
+  fresh processes, 20 runs per case unless a count says otherwise, each case with one result in
+  Chrome:
+  - `anim-mux-bad1.webp` (frame 1 broken; frame 0 whole in the first 128 bytes) given as those
+    bytes and the rest in one task, with a decode() of frame 0 between the two: Chrome gives frame
+    0, here it fails (EncodingError), also when the close comes 300 ms later. With tracks.ready
+    awaited after the first bytes and the rest enqueued just before the decode(): Chrome fails it,
+    here it gives frame 0. A second decode() made in a later task, after the rest: Chrome gives
+    frame 0 to the first and fails the second at the close; here both give frame 0, or both fail,
+    or (in some runs, for some files) Chrome's result comes: how often each comes depends on the
+    file, on the time between the two calls and on the load. The same with three 1920x1080 WebPs
+    whose frame 1 is broken. With `apng-blend-corrupt1.png` (frame 1 does not inflate) the orders
+    with one decode() give frame 0 in both.
+  - `anim-lossy-bad.webp` and `anim-lossless-bad.webp` (frame 1 broken) given as a first part that
+    holds frame 0 and the rest in one task, with a decode() between the two: Chrome gives frame 0,
+    here it fails (it gave frame 0 in 2 and 1 of 160 runs). `anim-lossy.webp` and
+    `anim-lossless.webp` given as a first part that holds frame 0 and ends inside frame 1, then a
+    decode() and the close in one task: Chrome gives frame 0; here the decode() is answered after
+    the close, where the cut frame 1 fails the decoder, so it fails.
+  - `craft_vp8x_opaque_33x17.webp` and `vp8x-vp8l.webp` (VP8X still images) given as the bytes up
+    to the image chunk header and the rest in one task: with a decode() between the two, Chrome
+    fails it and here it gives the frame. With tracks.ready awaited after the first bytes, then the
+    rest and the close enqueued before the decode(), Chrome gives the frame and here it usually
+    fails (it gave the frame in 1 and 5 of 40 runs); with the decode() before the rest there, both
+    fail (here it gave the frame in 7 and 4 of 160 runs).
+  - A simple lossy WebP, YUV planes in Chrome and BGRX here: a decode() made in the tracks.ready
+    reaction with the first 30 bytes and the rest enqueued in one task, or one made before the data
+    or after the data and the close, with the data in two chunks and the close in one task (made
+    between the two chunks, or between the data and the close, it is BGRX in both). The other way
+    round, BGRX in Chrome and YUV here: a 4000x3000 one, with the decode() in the tracks.ready
+    reaction, the whole file in one chunk and the close 50 ms later.
+- A WebP that is a bare VP8 or VP8L bitstream (no RIFF header, no chunk header) on an open
+  stream: it has no size, so a read decodes its frame from the bytes so far, and that frame or
+  failure is kept (`webp::image_complete`). Chrome waits for the rest. The VP8 bitstream of
+  `webp-valid.webp` cut at 500 of 1116 bytes, then the rest: Chrome gives the whole image, here
+  only its first 7 of 48 rows are right. The VP8L bitstream of `wpt/four-colors.webp` cut at 20
+  of 57 bytes: Chrome gives the frame (a decode() made at the cut fails it), here it fails.
 - reset() or close() while decode() calls wait: like Chrome, each one rejects all of them in its
   own call, in call order, with one AbortError ("Aborted by reset.", and for close() Chrome's
   "Aborted by failure.": its two labels look swapped), in every format, whatever a call waits
@@ -201,8 +284,9 @@ table below follows one Chrome stable version: the `chrome:` line of
 Chrome 155.0.8059.79.
 `src/ffi/jpeg_blink.c` is derived from Blink's `jpeg_image_decoder.cc` and keeps that file's
 licence notice (LGPL 2.1 or later, MPL 1.1 or GPL 2.0): keep it when you port changes.
-The files in `crates/pixel-simd/src/webp` port libwebp and keep its notice (BSD-3-Clause,
-`licenses/libwebp-COPYING.txt` and `licenses/libwebp-PATENTS.txt`): keep it too.
+The files in `crates/pixel-simd/src/webp` and `src/webcodecs/webp.rs` port libwebp and keep its
+notice (BSD-3-Clause, `licenses/libwebp-COPYING.txt` and `licenses/libwebp-PATENTS.txt`): keep it
+too.
 
 | What                                   | Chromium file and revision                                                                                                                              | Where here                                                                                                                                                                     |
 | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -218,3 +302,8 @@ The files in `crates/pixel-simd/src/webp` port libwebp and keep its notice (BSD-
 | Skia SkFrameHolder alpha rule (GIF)    | `src/third_party/skia` @ `29ed1e87a0a5`: `src/codec/SkCodec.cpp` `setAlphaAndRequiredFrame`                                                             | `frame_alpha` in `src/webcodecs/image_hints.rs`                                                                                                                                |
 | image-rs BMP alpha rule                | `third_party/rust/chromium_crates_io/vendor/image-v0_25` (0.25.10) @ 155.0.8059.79: `src/codecs/bmp/decoder.rs`                                         | `bmp_header` in `src/webcodecs/image_hints.rs`                                                                                                                                 |
 | image crate BMP bitfield scaling       | `third_party/rust/chromium_crates_io/vendor/image-v0_25` (0.25.10) @ 155.0.8059.79: `src/codecs/bmp/decoder.rs` `Bitfield::from_mask`, `Bitfield::read` | `Bitfield` in `crates/pixel-simd/src/lib.rs`                                                                                                                                   |
+| png crate chunk and CRC rules          | `third_party/rust/chromium_crates_io/vendor/png-v0_18` (0.18.1) @ 155.0.8059.79: `src/decoder/stream.rs`, `src/decoder/read_decoder.rs`                 | `parse_with` in `src/webcodecs/apng.rs`                                                                                                                                        |
+| Skia APNG frames                       | `src/third_party/skia` @ `29ed1e87a0a5`: `src/codec/SkPngRustCodec.cpp` (frame count, repetition count, `blendRow`), `src/codec/SkCodec.cpp`            | `make_layout`, `alpha_and_required_frame`, `blend_over` in `src/webcodecs/apng.rs`                                                                                             |
+| libwebp demuxer and header parse       | `src/third_party/libwebp/src` @ `b43b2caa710c`: `src/demux/demux.c`, `src/dec/webp_dec.c`, `src/dec/vp8_dec.c`, `src/dec/vp8l_dec.c`                    | `demux`, `features`, `raw_still` in `src/webcodecs/webp.rs`                                                                                                                    |
+| Blink WebP decoder                     | `third_party/blink/renderer/platform/image-decoders/webp/webp_image_decoder.cc` @ 155.0.8059.79, `image_decoder.cc` (`FindRequiredPreviousFrame`)       | `read_webp` in `src/webcodecs/image_decoder.rs`; `anim_frames`, `draw`, `blend_non_premultiplied` in `src/webcodecs/webp.rs`                                                   |
+| Blink frame failures (PNG, WebP)       | `third_party/blink/renderer/platform/image-decoders/skia/skia_image_decoder_base.cc` @ 155.0.8059.79                                                    | `read_png`, `layered_frames` in `src/webcodecs/image_decoder.rs`                                                                                                               |

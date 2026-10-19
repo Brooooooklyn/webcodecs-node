@@ -1,17 +1,19 @@
 //! ImageDecoder - WebCodecs API implementation
 //!
 //! Provides image decoding functionality: GIF and BMP with the decoders that follow Chrome
-//! (gif_decoder, bmp_decoder), the other formats with FFmpeg.
+//! (gif_decoder, bmp_decoder); PNG and WebP read and drawn like Chrome (apng, webp), each frame
+//! decoded with FFmpeg; the other formats with FFmpeg.
 //! See: <https://developer.mozilla.org/en-US/docs/Web/API/ImageDecoder>
 
 use crate::codec::demuxer::{DemuxerContext, MediaType};
 use crate::codec::jpeg::{JpegDecode, decode_jpeg, jpeg_info};
 use crate::codec::{CodecContext, CodecError, DecoderConfig, Frame, Packet};
-use crate::ffi::avutil::{av_image_check_size, av_rescale_q};
+use crate::ffi::avutil::{av_frame_copy_props, av_image_check_size, av_opt_set_int, av_rescale_q};
 use crate::ffi::{
   AV_NOPTS_VALUE, AVCodecID, AVColorRange, AVColorSpace, AVPixelFormat, AVRational,
 };
 use crate::webcodecs::after_task::after_task;
+use crate::webcodecs::apng::{self, CrcMemo, PngParse};
 use crate::webcodecs::avif::{self, Avif, AvifImage, AvifSamples};
 use crate::webcodecs::bmp_decoder::{self, BmpDecoder};
 use crate::webcodecs::buffer_source::{self, Uint8ArrayCopy};
@@ -22,7 +24,8 @@ use crate::webcodecs::error::{
   throw_invalid_state_error,
 };
 use crate::webcodecs::gif_decoder::{self, GifDecoder};
-use crate::webcodecs::image_hints::{PixelHint, png_header};
+use crate::webcodecs::image_hints::PixelHint;
+use crate::webcodecs::webp::{self, DemuxState};
 use crate::webcodecs::{VideoFrame, VideoPixelFormat};
 use futures::future::{Either, select};
 use futures::stream::StreamExt;
@@ -537,6 +540,8 @@ struct ImageDecoderInner {
   corrupt_sample: Option<usize>,
   /// How a terminal stream's missing AVIF still item fails decode()
   missing_item: Option<MissingAvifItem>,
+  /// What a PNG or a WebP keeps between two reads of its data (see `layered_frames`)
+  layered: LayeredState,
   /// Track list
   tracks: ImageTrackList,
   /// Wakes the decode() calls that wait: for their turn (`DecodeTurn`), for data or a frame
@@ -609,8 +614,10 @@ impl ImageDecoderInner {
     // to its turn and ends there (`abort_if_reset`). `tracks.ready` stays as it is, like Chrome's.
     self.decode_notify.notify_waiters();
 
-    // Reset frame_count for animated formats (will be re-detected on next decode)
-    if let Ok(mut track_inner) = self.tracks.inner.lock()
+    // Reset frame_count for animated formats (will be re-detected on next decode). Not for PNG
+    // and WebP: like Chrome, whose reset() leaves the decoder as it is, their track stays.
+    if !layered_codec(self.codec_id)
+      && let Ok(mut track_inner) = self.tracks.inner.lock()
       && let Some(track) = track_inner.tracks.get_mut(0)
       && track.animated
     {
@@ -727,6 +734,7 @@ impl ImageDecoder {
       missing_samples: None,
       corrupt_sample: None,
       missing_item: None,
+      layered: LayeredState::default(),
       tracks: tracks.clone(),
       decode_notify: Arc::new(Notify::new()),
       closed: false,
@@ -768,7 +776,9 @@ impl ImageDecoder {
 
       // Spawn pre-parse task for ready promise. Always signal ready, even on error (per W3C
       // spec behavior). Like Chrome, a rejected metadata closes the decoder in a JS task of its
-      // own, so a decode() made before that task is still pending.
+      // own, so a decode() made before that task is still pending. A PNG or a WebP sets
+      // `tracks.ready` sooner, at its header, before its frames are drawn (`layered_frames`);
+      // decode() still waits for this task, and so for the frames.
       let parse_inner = inner.clone();
       let ready_inner = inner.clone();
       let ready_promise = env.spawn_future_with_callback(
@@ -830,8 +840,33 @@ impl ImageDecoder {
         let mut next_probe_size = 1usize;
         let jpeg = matches!(reader, ChunkReader::Jpeg(_));
         let mut retries = JpegRetries::default();
+        // A PNG or a WebP is read again for every chunk: like Chrome, which reads each chunk, its
+        // header and each frame count once the read of the chunk that brings their bytes is done
+        // (see `layered_frames`).
+        let layered = layered_codec(codec_id);
 
-        while let Some(item) = reader.next().await {
+        loop {
+          // Like Chrome's close, a PNG or WebP decoder that a failure closed (a decode() of a
+          // frame that fails it) stops reading at once, and `completed` rejects while the data
+          // is not complete.
+          let item = if layered {
+            match select(
+              std::pin::pin!(reader.next()),
+              std::pin::pin!(failure_closed(&inner_clone)),
+            )
+            .await
+            {
+              Either::Left((item, _)) => item,
+              Either::Right(((), _)) => {
+                return Ok(StreamEnd::Aborted(!data_complete.load(Ordering::Acquire)));
+              }
+            }
+          } else {
+            reader.next().await
+          };
+          let Some(item) = item else {
+            break;
+          };
           let (chunk, arrival) = match item {
             Ok(StreamItem::Chunk(chunk, arrival)) => {
               if jpeg {
@@ -885,7 +920,10 @@ impl ImageDecoder {
               // The decoder closed on a failure before the error (a rejected metadata, or a
               // frame failure that a decode() applied): like Chrome, that close rejects
               // `completed`, and the stream is no longer read.
-              if close_if_metadata_failed(&inner_clone) || closed_on_failure(&inner_clone) {
+              if close_if_metadata_failed(&inner_clone)
+                || closed_on_failure(&inner_clone)
+                || (layered && closed_on_frame_failure(&inner_clone))
+              {
                 return Ok(StreamEnd::Aborted(!data_complete.load(Ordering::Acquire)));
               }
               // A stream error is terminal. Like Chrome, decode the data that came, as at EOF,
@@ -905,6 +943,7 @@ impl ImageDecoder {
               // refresh finds is only recorded (see `ImageDecoderInner::frame_failed`).
               if close_if_metadata_failed(&inner_clone)
                 || (!pending && closed_on_failure(&inner_clone))
+                || (layered && closed_on_frame_failure(&inner_clone))
               {
                 return Err(error);
               }
@@ -939,15 +978,18 @@ impl ImageDecoder {
           // A chunk that came to an idle JPEG stream while a decode() waits is decoded now,
           // before the reader sees what came with it (the close, say), as Chrome does, unless
           // the try can only give what the last one gave (`JpegRetries`).
-          let probe = buffered_len >= next_probe_size;
+          let probe = buffered_len >= next_probe_size || layered;
           if probe || arrival.is_some() {
             let call = arrival.map_or(FrameCall::Probe, FrameCall::Arrival);
             let probe_inner = inner_clone.clone();
             let tried =
               spawn_blocking(move || cache_decoded_frames(&probe_inner, call, false, false)).await;
             // A rejected metadata closes the decoder at once. A frame failure does not (see
-            // `StreamItem::Decode`): a decode() that waits wakes and applies it.
-            if close_if_metadata_failed(&inner_clone) {
+            // `StreamItem::Decode`): a decode() that waits wakes and applies it. A PNG or a WebP
+            // has drawn the whole frames of the chunk by now, and stored them with the track.
+            if close_if_metadata_failed(&inner_clone)
+              || (layered && closed_on_frame_failure(&inner_clone))
+            {
               return Ok(StreamEnd::Aborted(!data_complete.load(Ordering::Acquire)));
             }
             if matches!(tried, Ok(Ok(()))) || frame_failed(&inner_clone) {
@@ -970,7 +1012,10 @@ impl ImageDecoder {
         let _ =
           spawn_blocking(move || cache_decoded_frames(&final_inner, FrameCall::Probe, true, true))
             .await;
-        if close_if_metadata_failed(&inner_clone) || closed_on_failure(&inner_clone) {
+        if close_if_metadata_failed(&inner_clone)
+          || closed_on_failure(&inner_clone)
+          || (layered && closed_on_frame_failure(&inner_clone))
+        {
           return Ok(StreamEnd::Aborted(!data_complete.load(Ordering::Acquire)));
         }
         if let Ok(mut inner_guard) = inner_clone.lock() {
@@ -1174,9 +1219,10 @@ impl ImageDecoder {
         return Err(invalid_state_error("ImageDecoder is closed"));
       }
 
-      // Wait for ready promise (ensures initial pre-parsing is complete). A reset() or a close()
-      // rejects the call at once and stops this wait (`reset_or_closed`): the work goes on to
-      // its turn, and ends there.
+      // Wait for ready promise (ensures initial pre-parsing is complete: for a buffer, its whole
+      // probe, also the frames of a PNG or a WebP drawn after `tracks.ready`). A reset() or a
+      // close() rejects the call at once and stops this wait (`reset_or_closed`): the work goes
+      // on to its turn, and ends there.
       if let Either::Left((ready, _)) = select(
         ready_promise,
         std::pin::pin!(reset_or_closed(&inner, epoch)),
@@ -1652,12 +1698,28 @@ fn decode_cached_frame(
     if guard.closed {
       return Err(closed_error(&guard, frame_index));
     }
+    // A WebP whose data had an error after its header: like Chrome, whose demuxer is gone until
+    // the end of the data, every decode() waits (see `WebpState::lost`).
+    if guard.layered.webp.lost
+      && guard.layered.webp.header.is_some()
+      && !guard.complete.load(Ordering::Acquire)
+    {
+      return Ok(None);
+    }
+    // A read of a PNG or a WebP draws the frames of this epoch now (`LayeredState::drawing`): like
+    // Chrome's decoder, which decodes a frame once, wait for them rather than draw them again
+    if drawing_for(&guard, epoch) {
+      return Ok(None);
+    }
     (
       guard.cached_frames.is_none(),
       guard.complete.load(Ordering::Acquire),
       guard.codec_id == Some(AVCodecID::Mjpeg),
     )
   };
+  let layered = inner
+    .lock()
+    .is_ok_and(|guard| layered_codec(guard.codec_id));
 
   // Like Chrome, a JPEG has one frame: another index fails once the data is complete, before
   // any decode.
@@ -1691,8 +1753,10 @@ fn decode_cached_frame(
   // A reset can clear the cache. For fully buffered input, reconstruct it now;
   // for a live stream, wait for the collector's next successful probe. A JPEG stream's data so
   // far is tried by the collector, in the stream's order (`FrameCall::Arrival`); here only once
-  // the data is complete (`FrameCall::Decode`).
-  if needs_cache && (data_complete || jpeg) {
+  // the data is complete (`FrameCall::Decode`). A PNG or a WebP is read again now, like Chrome,
+  // whose decoder has the data so far after a reset().
+  if needs_cache && (data_complete || jpeg || layered) {
+    before_decode_read();
     cache_decoded_frames(inner, FrameCall::Decode(epoch), data_complete, false)
       .map_err(|error| decode_failure(inner, epoch, frame_index, error))?;
   }
@@ -1702,6 +1766,11 @@ fn decode_cached_frame(
     .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
   if guard.closed {
     return Err(closed_error(&guard, frame_index));
+  }
+  // A read that started drawing the frames after the check above: the read made here left them
+  // to it (`layered_frames`), and this waits for them
+  if drawing_for(&guard, epoch) {
+    return Ok(None);
   }
 
   // A JPEG that was not decoded above because the data was not complete then waits for the
@@ -1718,6 +1787,27 @@ fn decode_cached_frame(
   {
     guard.frame_failed = Some(epoch);
     return Err(frame_failure(frame_index));
+  }
+
+  // A simple lossy WebP whose frame a decode() tries while its data is not all here: like
+  // Chrome, the frame is RGB from then on, also after a reset() (image_decoder_core.cc
+  // have_completed_rgb_decode_). Else it is YUV planes, decoded once all the data is here.
+  let webp = guard.codec_id == Some(AVCodecID::Webp);
+  let webp_yuv = webp
+    && guard
+      .layered
+      .webp
+      .header
+      .is_some_and(|header| header.simple_lossy);
+  if webp_yuv
+    && frame_index == 0
+    && !guard.all_data
+    && guard
+      .cached_frames
+      .as_ref()
+      .is_some_and(|frames| !frames.is_empty())
+  {
+    guard.rgb_decode = true;
   }
 
   let Some(frames) = guard.cached_frames.as_ref() else {
@@ -1767,6 +1857,11 @@ fn decode_cached_frame(
       format,
       duration,
     } => (frame.clone(), *format, *duration),
+    // A still WebP whose frame has only its image chunk header (`WebpState::unnumbered`): like
+    // Chrome, a decode() made now fails the decoder (see below)
+    CachedFrame::Pending if webp && guard.layered.webp.unnumbered => {
+      return Err(fail_webp_decoder(&mut guard, epoch, frame_index));
+    }
     CachedFrame::Pending if !data_complete => return Ok(None),
     CachedFrame::Pending => {
       return Err(Error::new(
@@ -1775,6 +1870,10 @@ fn decode_cached_frame(
           "RangeError: Unexpected end of image. Request for frame index {frame_index} can't be satisfied."
         ),
       ));
+    }
+    // Like Chrome, a WebP frame that fails fails the decoder at once (`fail_webp_decoder`)
+    CachedFrame::Failed { .. } if webp => {
+      return Err(fail_webp_decoder(&mut guard, epoch, frame_index));
     }
     CachedFrame::Failed { .. } => {
       // Chrome tries the frame, and the failed frames it is drawn on, and remembers them
@@ -1810,6 +1909,41 @@ fn decode_cached_frame(
       ));
     }
   };
+  // The YUV frame of a simple lossy WebP that Chrome now decodes to RGB (see `webp_yuv`)
+  let (frame_arc, format) =
+    if webp_yuv && frame_index == 0 && format == VideoPixelFormat::I420 && guard.rgb_decode {
+      let source = DecodedSource::Image {
+        codec: AVCodecID::Webp,
+        alpha: Some(false),
+        yuv: Some(false),
+        pixels: PixelHint::None,
+      };
+      let converted = frame_arc
+        .read()
+        .shallow_clone()
+        .and_then(|frame| decoded_frame_format(frame, source))
+        .map_err(|e| {
+          Error::new(
+            Status::GenericFailure,
+            format!("Failed to convert decoded image: {e}"),
+          )
+        })?;
+      let frame = converted.0.into_shared();
+      if let Some(slot) = guard
+        .cached_frames
+        .as_mut()
+        .and_then(|frames| frames.get_mut(0))
+      {
+        *slot = CachedFrame::Decoded {
+          frame: frame.clone(),
+          format: converted.1,
+          duration,
+        };
+      }
+      (frame, converted.1)
+    } else {
+      (frame_arc, format)
+    };
   let pts = frame_arc.read().pts();
 
   // Per Chromium behavior: "default" extracts color space, "none" ignores it.
@@ -1927,6 +2061,20 @@ fn decode_failure(
   } else {
     error
   }
+}
+
+/// Like Chrome, a WebP frame that fails fails the decoder at once (WEBPImageDecoder::Decode,
+/// SetFailed), while more data can come too: the decode() of `frame_index`, made when
+/// `cache_epoch` was `epoch`, rejects, the decoder closes, and the decode() calls still pending
+/// reject with EncodingError (`closed_error`). Not for a decode() that a reset() made stale: like
+/// Chrome, whose reset() drops the result of a decode in flight, it rejects with AbortError
+/// (`abort_if_reset`), and the decoder stays failed: the next decode() closes it.
+fn fail_webp_decoder(guard: &mut ImageDecoderInner, epoch: u64, frame_index: usize) -> Error {
+  guard.frames_failed = true;
+  if guard.cache_epoch == epoch {
+    guard.close();
+  }
+  frame_failure(frame_index)
 }
 
 /// The EncodingError of a decode() whose frame failed
@@ -2071,15 +2219,20 @@ fn end_with_frame_failure(inner: &Arc<Mutex<ImageDecoderInner>>) -> bool {
 
 fn signal_tracks_ready(inner: &Arc<Mutex<ImageDecoderInner>>) {
   if let Ok(inner_guard) = inner.lock() {
-    inner_guard.tracks.ready.store(true, Ordering::Release);
-    // notify_waiters wakes listeners that are already registered, while
-    // notify_one stores a permit for the narrow interval between the atomic
-    // recheck and the first poll of a Notified future.
-    inner_guard.tracks.ready_notify.notify_waiters();
-    inner_guard.tracks.ready_notify.notify_one();
+    set_tracks_ready(&inner_guard);
     // The decode() calls that wait for data or a frame look again
     inner_guard.decode_notify.notify_waiters();
   }
+}
+
+/// Set `tracks.ready`, under the decoder's lock, and wake what waits for it
+fn set_tracks_ready(inner: &ImageDecoderInner) {
+  inner.tracks.ready.store(true, Ordering::Release);
+  // notify_waiters wakes listeners that are already registered, while
+  // notify_one stores a permit for the narrow interval between the atomic
+  // recheck and the first poll of a Notified future.
+  inner.tracks.ready_notify.notify_waiters();
+  inner.tracks.ready_notify.notify_one();
 }
 
 /// A JPEG decode() that waits tries the data so far (`StreamItem::Decode`), unless the stream
@@ -3053,6 +3206,13 @@ fn cache_decoded_frames(
   data_complete: bool,
   stream_ended: bool,
 ) -> Result<()> {
+  // A PNG or a WebP reads only what it needs of the data (see `layered_frames`)
+  if inner
+    .lock()
+    .is_ok_and(|guard| layered_codec(guard.codec_id))
+  {
+    return layered_frames(inner, call, data_complete, stream_ended);
+  }
   // Snapshot everything needed for FFmpeg work under the mutex, then release
   // it. Large animated images can take a long time to decode; close() and
   // reset() must remain responsive while that work is in flight.
@@ -3353,26 +3513,18 @@ fn decode_frames(
   }
 
   // Give every frame a WebCodecs format that describes its bytes, converting the
-  // FFmpeg formats WebCodecs has no name for (rgb24, pal8, gray, argb, ...).
-  let header = match codec_id {
-    AVCodecID::Png => png_header(data_bytes),
-    _ => None,
-  };
-  let alpha = match codec_id {
-    AVCodecID::Webp => webp_alpha_hint(data_bytes),
-    _ => header.map(|header| header.alpha),
-  };
+  // FFmpeg formats WebCodecs has no name for (rgb24, pal8, gray, argb, ...). PNG and WebP do
+  // not come here (see `layered_frames`).
   let yuv = match codec_id {
     // an AVIF that `avif::parse` declines: a single frame is a still image
     AVCodecID::Av1 => Some(still),
-    AVCodecID::Webp => Some(webp_is_simple_lossy(data_bytes)),
     _ => None,
   };
   let source = DecodedSource::Image {
     codec: codec_id,
-    alpha,
+    alpha: None,
     yuv,
-    pixels: header.map_or(PixelHint::None, |header| header.pixels),
+    pixels: PixelHint::None,
   };
   let frames = frames
     .into_iter()
@@ -3488,6 +3640,757 @@ fn bmp_frames(
 
 fn incomplete_data() -> Error {
   Error::new(Status::GenericFailure, "Incomplete image data")
+}
+
+/// Whether this format is read and drawn like Chrome, frame by frame, with FFmpeg decoding each
+/// frame on its own (see `layered_frames`): PNG (`apng`) and WebP (`webp`)
+fn layered_codec(codec_id: Option<AVCodecID>) -> bool {
+  matches!(codec_id, Some(AVCodecID::Png | AVCodecID::Webp))
+}
+
+/// What a PNG or a WebP keeps between two reads of its data. A reset() keeps it: Chrome's reset()
+/// leaves its decoder as it is.
+#[derive(Debug, Default)]
+struct LayeredState {
+  /// PNG: the CRC checks made so far
+  crc: CrcMemo,
+  /// WebP: what Blink's decoder keeps
+  webp: WebpState,
+  /// The read whose frames are being drawn, as (`cache_epoch`, its number from `draws`). From a
+  /// buffer, its track is stored, and `tracks.ready` set, before the draw (see `layered_frames`).
+  /// A decode() that finds no frames in that epoch waits for them (`decode_cached_frame`), rather
+  /// than read the data and draw the same frames again.
+  drawing: Option<(u64, u64)>,
+  /// How many reads have drawn frames
+  draws: u64,
+  /// The data length of the read whose track is stored: the track of a read of less data (one
+  /// that a reset() made stale, say) does not replace it (`store_track`)
+  track_len: usize,
+}
+
+/// A read of a PNG or a WebP that draws its frames (see `LayeredState::drawing`). Dropped once
+/// they are stored or dropped, also on a panic: it then wakes the decode() calls that wait.
+struct LayeredDrawing<'a> {
+  inner: &'a Arc<Mutex<ImageDecoderInner>>,
+  id: u64,
+}
+
+impl Drop for LayeredDrawing<'_> {
+  fn drop(&mut self) {
+    if let Ok(mut guard) = self.inner.lock() {
+      if guard.layered.drawing.is_some_and(|(_, id)| id == self.id) {
+        guard.layered.drawing = None;
+      }
+      guard.decode_notify.notify_waiters();
+    }
+  }
+}
+
+/// What Blink's WEBPImageDecoder keeps between two reads of the data (UpdateDemuxer)
+#[derive(Debug, Default)]
+struct WebpState {
+  /// Read once the demuxer has a frame (IsDecodedSizeAvailable): then fixed
+  header: Option<WebpHeader>,
+  /// The last read found no demuxer (an error). Blink then reads the data again at its end
+  /// (`consolidated_data_` is reset), and fails if it still finds none. Until then its frame
+  /// count is 0 for a decode(): after the header, every decode() waits.
+  lost: bool,
+  /// The data length of the last read. A read of the same data only reads it again when the
+  /// last one was lost: Blink fails a file cut short only on a read of new data with all the
+  /// data (`truncated_file`).
+  parsed_len: usize,
+  /// The last read found the frame of a still image with only its image chunk header, not the
+  /// start of its data: libwebp's demuxer has it with frame number 0, so Blink finds no frame 1
+  /// (WebPDemuxGetFrame) and fails a decode() made now. The frame itself stays pending: once
+  /// more data comes, it decodes.
+  unnumbered: bool,
+}
+
+/// A WebP header as Blink reads it, once
+#[derive(Clone, Copy, Debug)]
+struct WebpHeader {
+  /// The demuxer's format flags (WEBP_FF_FORMAT_FLAGS)
+  flags: u32,
+  /// The track's repetition count (Infinity, n, or 0 for kAnimationLoopOnce and
+  /// kAnimationNone), or None for a still image
+  repetition: Option<f64>,
+  /// A simple lossy file (first chunk VP8): Chrome decodes it to YUV planes once all the data is
+  /// here (IsSimpleLossyWebPImage)
+  simple_lossy: bool,
+}
+
+/// Whether a read of a PNG or a WebP draws the frames of `epoch` now, with none stored yet
+/// (`LayeredState::drawing`)
+fn drawing_for(guard: &ImageDecoderInner, epoch: u64) -> bool {
+  guard.cached_frames.is_none()
+    && guard.cache_epoch == epoch
+    && guard
+      .layered
+      .drawing
+      .is_some_and(|(drawing, _)| drawing == epoch)
+}
+
+/// Ends once the decoder closed on a failure (see `closed_on_frame_failure`)
+async fn failure_closed(inner: &Arc<Mutex<ImageDecoderInner>>) {
+  let Ok(notify) = inner.lock().map(|guard| guard.decode_notify.clone()) else {
+    return;
+  };
+  loop {
+    // Registered before the check: `ImageDecoderInner::close` notifies the waiters
+    let mut notified = std::pin::pin!(notify.notified());
+    notified.as_mut().enable();
+    if closed_on_frame_failure(inner) {
+      return;
+    }
+    notified.await;
+  }
+}
+
+/// Whether the decoder closed on a failure: the metadata, a frame that fails a WebP, or every
+/// frame of a PNG
+fn closed_on_frame_failure(inner: &Arc<Mutex<ImageDecoderInner>>) -> bool {
+  inner
+    .lock()
+    .is_ok_and(|guard| guard.closed && (guard.failed() || guard.frames_failed))
+}
+
+/// What the read of a PNG or a WebP found
+enum LayeredRead {
+  /// The header has not arrived: Chrome waits
+  Wait,
+  /// Chrome fails the metadata (`at_end`: the data is complete, see `reject_metadata`)
+  RejectMetadata { at_end: bool },
+  /// Chrome fails the decoder after its header, once the data is complete: `completed` resolves,
+  /// the decoder closes, and the decode() calls still pending reject with EncodingError
+  FailDecoder,
+  /// The header is here, nothing changed: the track and the frames stay as they are
+  Keep,
+  /// The track and the frames to decode
+  Frames(LayeredPlan),
+}
+
+/// A frame of a `LayeredPlan`
+enum PlannedFrame {
+  /// As it is
+  Ready(CachedFrame),
+  /// Decode this still image (a PNG, or a WebP) and draw it
+  Decode(Vec<u8>),
+}
+
+/// The track, and what each frame needs, read under the decoder's lock
+struct LayeredPlan {
+  epoch: u64,
+  data_len: usize,
+  track: ImageTrackData,
+  frames: Vec<PlannedFrame>,
+  draw: LayeredDraw,
+}
+
+/// How the frames of a `LayeredPlan` are drawn
+enum LayeredDraw {
+  Png(apng::PngLayout),
+  /// A still WebP: its alpha flag, and whether Chrome decodes it to YUV planes
+  WebpStill {
+    alpha: bool,
+    yuv: bool,
+  },
+  /// An animated WebP
+  WebpAnim {
+    width: u32,
+    height: u32,
+    frames: Vec<webp::AnimFrame>,
+    alpha: Vec<bool>,
+  },
+}
+
+/// The frames of a PNG or a WebP, read and drawn like Chrome (see `apng` and `webp`), and its
+/// track. The header is the metadata, and Chrome decodes a frame only for a decode(). Here the
+/// read first parses all the data so far (for a PNG, checking every chunk's CRC) and copies the
+/// data of each whole frame not decoded yet. With all the data from the start (a buffer), it then
+/// stores the track and sets `tracks.ready`, under the same lock, before any frame is drawn; so
+/// much data at once sets it later than in Chrome, whose decoder stops at the header. On a
+/// stream, the track is stored once the frames are drawn, with them, and the collector sets
+/// `tracks.ready` after that read (`signal_tracks_ready`): a chunk with no whole frame (the header
+/// alone) sets it at once, a chunk with the header and whole frames only once those are drawn. A
+/// close() or a reset() stops the draw before its next frame, and its frames are dropped; after a
+/// reset(), a stream's read still stores the track. Every frame is decoded once its data is
+/// complete, with FFmpeg, on its own; a read of more data decodes only the frames that became
+/// complete. While more data can come, a frame whose data is not complete is pending; once the
+/// data is complete, it fails. A bare VP8 or VP8L bitstream (a WebP with no chunk header) has no
+/// size: on an open stream its frame is decoded from the bytes read so far, and kept
+/// (`webp::image_complete`).
+fn layered_frames(
+  inner: &Arc<Mutex<ImageDecoderInner>>,
+  call: FrameCall,
+  data_complete: bool,
+  stream_ended: bool,
+) -> Result<()> {
+  // Whether the track is stored and `tracks.ready` set before the draw: a read with all the data
+  // that is not the last read of a stream (see above)
+  let early = data_complete && !stream_ended;
+  let (read, drawing) = {
+    let mut guard = inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+    if guard.closed {
+      return Err(invalid_state_error("ImageDecoder is closed"));
+    }
+    // A decode() whose read finds a read of its epoch drawing the frames (one that started after
+    // the decode() looked, `decode_cached_frame`) does not read: it waits for those frames
+    if let FrameCall::Decode(epoch) = call
+      && drawing_for(&guard, epoch)
+    {
+      return Ok(());
+    }
+    let read = if guard.codec_id == Some(AVCodecID::Png) {
+      read_png(&mut guard, data_complete, stream_ended)
+    } else {
+      read_webp(&mut guard, data_complete)
+    };
+    let drawing = match &read {
+      LayeredRead::Frames(plan) => {
+        // All the data from the start (a buffer; a decode() made after a reset() once a stream
+        // ended): the data does not change, so no other read stores another track
+        if early {
+          store_track(&mut guard, plan.data_len, &plan.track);
+          set_tracks_ready(&guard);
+        }
+        guard.layered.draws += 1;
+        let id = guard.layered.draws;
+        guard.layered.drawing = Some((plan.epoch, id));
+        Some(LayeredDrawing { inner, id })
+      }
+      _ => None,
+    };
+    (read, drawing)
+  };
+  let plan = match read {
+    LayeredRead::Wait => return Err(incomplete_data()),
+    LayeredRead::RejectMetadata { at_end } => return Err(reject_metadata(inner, at_end)),
+    LayeredRead::FailDecoder => {
+      if let Ok(mut guard) = inner.lock()
+        && !guard.closed
+      {
+        // Chrome resolves `completed` first (OnMetadata), then fails
+        guard.complete.store(true, Ordering::Release);
+        guard.frames_failed = true;
+        guard.close();
+      }
+      return Err(frame_failure(0));
+    }
+    LayeredRead::Keep => return Ok(()),
+    LayeredRead::Frames(plan) => plan,
+  };
+  before_layered_draw();
+  // A close() or a reset() stops the draw before its next frame
+  let frames = draw_frames(plan.frames, &plan.draw, || {
+    inner.lock().map_or(true, |guard| {
+      guard.closed || guard.cache_epoch != plan.epoch
+    })
+  });
+  // Stored or dropped with the lock below held; `drawing` drops after it, and wakes the decode()
+  // calls that wait for these frames
+  let _drawing = drawing;
+  let mut guard = inner
+    .lock()
+    .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+  if guard.closed {
+    return Err(invalid_state_error("ImageDecoder is closed"));
+  }
+  // A stream's read: the track of the data it read, also when a reset() came and its frames are
+  // dropped. The track comes from the layout, and Chrome's reset() keeps it; the collector then
+  // sets `tracks.ready` as after any read.
+  if !early {
+    store_track(&mut guard, plan.data_len, &plan.track);
+  }
+  // reset() came, or a read of more data stored its frames first
+  let Some(frames) = frames else {
+    return Ok(());
+  };
+  if guard.cache_epoch != plan.epoch || plan.data_len < guard.cached_data_len {
+    return Ok(());
+  }
+  guard.cached_frames = Some(frames);
+  guard.context = None;
+  guard.cached_data_len = plan.data_len;
+  guard.missing_samples = None;
+  Ok(())
+}
+
+/// Store the track of a PNG or a WebP read from `data_len` bytes, under the decoder's lock, unless
+/// the stored one is from more data (`LayeredState::track_len`)
+fn store_track(guard: &mut ImageDecoderInner, data_len: usize, track: &ImageTrackData) {
+  if data_len < guard.layered.track_len {
+    return;
+  }
+  guard.layered.track_len = data_len;
+  if let Ok(mut tracks) = guard.tracks.inner.lock()
+    && let Some(stored) = tracks.tracks.get_mut(0)
+  {
+    *stored = track.clone();
+  }
+}
+
+/// What Chrome reports for a track: animated when it has more than one frame or a repetition
+/// (ImageTrack), and its repetition count
+fn layered_track(frame_count: usize, repetition: Option<f64>) -> ImageTrackData {
+  ImageTrackData {
+    animated: frame_count > 1 || repetition.is_some(),
+    frame_count: frame_count as u32,
+    repetition_count: repetition.unwrap_or(0.0),
+  }
+}
+
+/// The frame cached for `i` that a read of more data keeps: a decoded frame, or a failure
+fn kept_frame(cached: Option<&Vec<CachedFrame>>, i: usize) -> Option<CachedFrame> {
+  cached
+    .and_then(|frames| frames.get(i))
+    .filter(|frame| !matches!(frame, CachedFrame::Pending))
+    .cloned()
+}
+
+/// Read a PNG like Chrome (see `apng`), under the decoder's lock
+fn read_png(guard: &mut ImageDecoderInner, data_complete: bool, stream_ended: bool) -> LayeredRead {
+  let ImageDecoderInner {
+    data,
+    layered,
+    cached_frames,
+    cache_epoch,
+    ..
+  } = guard;
+  let ImageDecoderData::Vec(data) = data else {
+    return LayeredRead::Wait;
+  };
+  let mut layout = match apng::parse_with(data, &mut layered.crc) {
+    // Chrome fails a header that the data ends before
+    PngParse::Incomplete if data_complete => return LayeredRead::RejectMetadata { at_end: true },
+    PngParse::Incomplete => return LayeredRead::Wait,
+    PngParse::Bad => {
+      return LayeredRead::RejectMetadata {
+        at_end: stream_ended,
+      };
+    }
+    PngParse::Ready(layout) => layout,
+  };
+  layout.resolve();
+  let repetition = match layout.repetition {
+    apng::Repetition::None => None,
+    apng::Repetition::Once => Some(0.0),
+    apng::Repetition::Infinite => Some(f64::INFINITY),
+    apng::Repetition::Count(n) => Some(f64::from(n)),
+  };
+  let mut frames: Vec<PlannedFrame> = Vec::with_capacity(layout.frames.len());
+  let failed = |frames: &[PlannedFrame], r: Option<usize>| {
+    r.filter(|&r| matches!(frames[r], PlannedFrame::Ready(CachedFrame::Failed { .. })))
+  };
+  for (i, frame) in layout.frames.iter().enumerate() {
+    let required = failed(&frames, frame.required);
+    let planned = match frame.state {
+      apng::DataState::Failed => CachedFrame::Failed { required },
+      apng::DataState::Incomplete if data_complete => CachedFrame::Failed { required },
+      apng::DataState::Incomplete => CachedFrame::Pending,
+      apng::DataState::Complete => match kept_frame(cached_frames.as_ref(), i) {
+        Some(kept) => kept,
+        // drawn on a frame that fails: it fails too
+        None if required.is_some() => CachedFrame::Failed { required },
+        None => {
+          frames.push(PlannedFrame::Decode(layout.still_png(data, i)));
+          continue;
+        }
+      },
+    };
+    frames.push(PlannedFrame::Ready(planned));
+  }
+  LayeredRead::Frames(LayeredPlan {
+    epoch: *cache_epoch,
+    data_len: data.len(),
+    track: layered_track(layout.frames.len(), repetition),
+    frames,
+    draw: LayeredDraw::Png(layout),
+  })
+}
+
+/// Read a WebP like Chrome (Blink's WEBPImageDecoder::UpdateDemuxer over `webp::demux`), under
+/// the decoder's lock
+fn read_webp(guard: &mut ImageDecoderInner, data_complete: bool) -> LayeredRead {
+  let rgb_decode = guard.rgb_decode;
+  let ImageDecoderInner {
+    data,
+    layered,
+    cached_frames,
+    cache_epoch,
+    ..
+  } = guard;
+  let ImageDecoderData::Vec(data) = data else {
+    return LayeredRead::Wait;
+  };
+  let state = &mut layered.webp;
+  let fail = |state: &WebpState| match state.header {
+    None => LayeredRead::RejectMetadata { at_end: true },
+    Some(_) => LayeredRead::FailDecoder,
+  };
+  // RIFF header and chunk header
+  if data.len() < 20 {
+    return if data_complete {
+      fail(state)
+    } else {
+      LayeredRead::Wait
+    };
+  }
+  let fresh = data.len() != state.parsed_len || state.lost;
+  let (demux, demux_state) = webp::demux(data);
+  state.parsed_len = data.len();
+  let truncated = data_complete && fresh && demux_state != DemuxState::Done;
+  let demux = match demux {
+    Some(demux) if demux_state >= DemuxState::ParsedHeader && !truncated => demux,
+    demux => {
+      state.lost = demux.is_none();
+      if truncated {
+        return fail(state);
+      }
+      // ImageDecoderCore: no header once all the data is here fails the metadata
+      if state.header.is_none() && data_complete {
+        return LayeredRead::RejectMetadata { at_end: true };
+      }
+      return if state.header.is_some() {
+        LayeredRead::Keep
+      } else {
+        LayeredRead::Wait
+      };
+    }
+  };
+  state.lost = false;
+  state.unnumbered = false;
+  if demux.frames.is_empty() {
+    // the frame data has not arrived
+    if state.header.is_none() && data_complete {
+      return LayeredRead::RejectMetadata { at_end: true };
+    }
+    return LayeredRead::Wait;
+  }
+  let (width, height) = (demux.canvas_width as u32, demux.canvas_height as u32);
+  let header = match state.header {
+    Some(header) => header,
+    None => {
+      // ImageDecoder::SetSize: 4 bytes a pixel must fit an int32
+      if u64::from(width) * u64::from(height) * 4 > i32::MAX as u64 {
+        return LayeredRead::RejectMetadata {
+          at_end: data_complete,
+        };
+      }
+      let flags = demux.flags;
+      let repetition = (flags & webp::ANIMATION_FLAG != 0).then(|| match demux.loop_count {
+        0 => f64::INFINITY,
+        n => f64::from(n - 1),
+      });
+      // a still image without alpha: the features of the data so far must read
+      if flags & (webp::ANIMATION_FLAG | webp::ALPHA_FLAG) == 0 && webp::features(data).is_err() {
+        return LayeredRead::RejectMetadata {
+          at_end: data_complete,
+        };
+      }
+      let header = WebpHeader {
+        flags,
+        repetition,
+        simple_lossy: webp_is_simple_lossy(data),
+      };
+      state.header = Some(header);
+      header
+    }
+  };
+  let count = demux.frames.len();
+  let track = layered_track(count, header.repetition);
+  let epoch = *cache_epoch;
+  let data_len = data.len();
+  // Blink fails the decode of the last frame once all the data is here and the file is cut short
+  // (WEBPImageDecoder::Decode), but not on its YUV path
+  let truncated_last = data_complete && demux_state != DemuxState::Done;
+  if header.flags & webp::ANIMATION_FLAG == 0 {
+    let yuv = header.simple_lossy && !rgb_decode;
+    let frame = &demux.frames[0];
+    let planned = if frame.frame_num == 0 && !data_complete {
+      // The image chunk header only: Blink finds no frame 1 in the demuxer (WebPDemuxGetFrame),
+      // and fails a decode() made now (`WebpState::unnumbered`). The frame waits for more data.
+      state.unnumbered = true;
+      PlannedFrame::Ready(CachedFrame::Pending)
+    } else if frame.frame_num == 0 || (truncated_last && !yuv) {
+      PlannedFrame::Ready(CachedFrame::Failed { required: None })
+    } else if webp::image_complete(data, &demux) {
+      match kept_frame(cached_frames.as_ref(), 0) {
+        Some(kept) => PlannedFrame::Ready(kept),
+        None => PlannedFrame::Decode(webp::image_still(data, &demux)),
+      }
+    } else if data_complete {
+      PlannedFrame::Ready(CachedFrame::Failed { required: None })
+    } else {
+      PlannedFrame::Ready(CachedFrame::Pending)
+    };
+    return LayeredRead::Frames(LayeredPlan {
+      epoch,
+      data_len,
+      track,
+      frames: vec![planned],
+      draw: LayeredDraw::WebpStill {
+        alpha: header.flags & webp::ALPHA_FLAG != 0,
+        yuv,
+      },
+    });
+  }
+  let anim = webp::anim_frames(&demux);
+  let alpha = webp::frame_alpha(&anim, header.flags, width, height);
+  let mut frames: Vec<PlannedFrame> = Vec::with_capacity(count);
+  for (i, frame) in demux.frames.iter().enumerate() {
+    let required = anim[i]
+      .required
+      .filter(|&r| matches!(frames[r], PlannedFrame::Ready(CachedFrame::Failed { .. })));
+    let planned = if (truncated_last && i + 1 == count) || !frame.complete {
+      // Blink fails a counted frame whose data is not complete (WebPIUpdate)
+      CachedFrame::Failed { required }
+    } else if let Some(kept) = kept_frame(cached_frames.as_ref(), i) {
+      kept
+    } else if required.is_some() {
+      CachedFrame::Failed { required }
+    } else {
+      frames.push(PlannedFrame::Decode(webp::frame_still(data, frame)));
+      continue;
+    };
+    frames.push(PlannedFrame::Ready(planned));
+  }
+  LayeredRead::Frames(LayeredPlan {
+    epoch,
+    data_len,
+    track,
+    frames,
+    draw: LayeredDraw::WebpAnim {
+      width,
+      height,
+      frames: anim,
+      alpha,
+    },
+  })
+}
+
+/// Decode the frames a `LayeredPlan` asks for and draw them on their canvas, in order: a frame
+/// drawn on another one needs that one's canvas. Before it decodes a frame it asks `stopped`
+/// (a close() or a reset() came): then it stops, and returns None, dropping what it drew.
+fn draw_frames(
+  planned: Vec<PlannedFrame>,
+  draw: &LayeredDraw,
+  stopped: impl Fn() -> bool,
+) -> Option<Vec<CachedFrame>> {
+  let mut frames: Vec<CachedFrame> = Vec::with_capacity(planned.len());
+  let mut timestamp = 0i64;
+  for (i, planned) in planned.into_iter().enumerate() {
+    // Chrome gives every frame of an animation its duration, and starts it when the frames
+    // before it end
+    let duration = match draw {
+      LayeredDraw::Png(layout) => (layout.repetition != apng::Repetition::None)
+        .then(|| i64::from(layout.frames[i].duration_ms) * 1000),
+      LayeredDraw::WebpStill { .. } => None,
+      LayeredDraw::WebpAnim { frames, .. } => Some(i64::from(frames[i].duration_ms) * 1000),
+    };
+    let frame = match planned {
+      PlannedFrame::Ready(frame) => frame,
+      PlannedFrame::Decode(input) => {
+        before_layered_frame();
+        if stopped() {
+          return None;
+        }
+        draw_frame(&frames, i, &input, draw, timestamp, duration).unwrap_or_else(|failed| failed)
+      }
+    };
+    frames.push(frame);
+    timestamp += duration.unwrap_or(0);
+  }
+  Some(frames)
+}
+
+/// Decode frame `i` and draw it (see `draw_frames`). Err: the failure to cache.
+fn draw_frame(
+  frames: &[CachedFrame],
+  i: usize,
+  input: &[u8],
+  draw: &LayeredDraw,
+  pts: i64,
+  duration: Option<i64>,
+) -> std::result::Result<CachedFrame, CachedFrame> {
+  let fail = || CachedFrame::Failed { required: None };
+  // The canvas of the frame drawn on, read from its cached frame
+  let base = |required: Option<usize>| match required {
+    None => Ok(None),
+    Some(r) => match &frames[r] {
+      CachedFrame::Decoded { frame, .. } => Ok(Some(canvas_bytes(&frame.read()))),
+      _ => Err(CachedFrame::Failed {
+        required: Some(r).filter(|&r| matches!(frames[r], CachedFrame::Failed { .. })),
+      }),
+    },
+  };
+  let decoded = |codec, source| {
+    decode_still(codec, input)
+      .ok()
+      .and_then(|frame| decoded_frame_format(frame, source).ok())
+  };
+  let (frame, format) = match draw {
+    LayeredDraw::Png(layout) => {
+      let info = &layout.frames[i];
+      let base = base(info.required)?;
+      let source = DecodedSource::Image {
+        codec: AVCodecID::Png,
+        alpha: Some(layout.header.alpha),
+        yuv: None,
+        pixels: layout.header.pixels,
+      };
+      let (sub, _) = decoded(AVCodecID::Png, source).ok_or_else(fail)?;
+      let rect = info.rect;
+      if (sub.width(), sub.height()) != (rect.x1 - rect.x0, rect.y1 - rect.y0) {
+        return Err(fail());
+      }
+      let mut canvas = layout.start(i, info.required.zip(base.as_deref()));
+      let pixels = sub.plane_data(0).ok_or_else(fail)?;
+      layout.draw(i, &mut canvas, pixels, sub.linesize(0) as usize);
+      let format = if info.has_alpha {
+        VideoPixelFormat::BGRA
+      } else {
+        VideoPixelFormat::BGRX
+      };
+      let frame = canvas_frame(layout.width, layout.height, &canvas, &sub, pts).ok_or_else(fail)?;
+      (frame, format)
+    }
+    LayeredDraw::WebpStill { alpha, yuv } => {
+      let source = DecodedSource::Image {
+        codec: AVCodecID::Webp,
+        alpha: Some(*alpha),
+        yuv: Some(*yuv),
+        pixels: PixelHint::None,
+      };
+      let (mut frame, format) = decoded(AVCodecID::Webp, source).ok_or_else(fail)?;
+      frame.set_pts(0);
+      (frame, format)
+    }
+    LayeredDraw::WebpAnim {
+      width,
+      height,
+      frames: anim,
+      alpha,
+    } => {
+      let info = &anim[i];
+      let base = base(info.required)?;
+      // every frame's own alpha (an ALPH chunk, or VP8L's), blended by Blink
+      let source = DecodedSource::Image {
+        codec: AVCodecID::Webp,
+        alpha: Some(true),
+        yuv: Some(false),
+        pixels: PixelHint::None,
+      };
+      let (sub, _) = decoded(AVCodecID::Webp, source).ok_or_else(fail)?;
+      let rect = info.rect;
+      if (sub.width(), sub.height()) != (rect.x1 - rect.x0, rect.y1 - rect.y0) {
+        return Err(fail());
+      }
+      let mut canvas = webp::start_canvas(anim, i, *width, *height, base.as_deref());
+      let pixels = sub.plane_data(0).ok_or_else(fail)?;
+      webp::draw(
+        anim,
+        i,
+        *width,
+        &mut canvas,
+        pixels,
+        sub.linesize(0) as usize,
+        base.as_deref(),
+      );
+      let format = if alpha[i] {
+        VideoPixelFormat::BGRA
+      } else {
+        VideoPixelFormat::BGRX
+      };
+      let frame = canvas_frame(*width, *height, &canvas, &sub, pts).ok_or_else(fail)?;
+      (frame, format)
+    }
+  };
+  Ok(CachedFrame::Decoded {
+    frame: frame.into_shared(),
+    format,
+    duration,
+  })
+}
+
+/// Decode a still image (a PNG or a WebP of one frame) with FFmpeg, on this thread. Any error,
+/// or anything but one frame, fails. A PNG whose image data ends early fails too, like the png
+/// crate (FFmpeg keeps an image with up to 95% of its rows missing by default).
+fn decode_still(codec_id: AVCodecID, data: &[u8]) -> Result<Frame> {
+  let failed = |e: CodecError| Error::new(Status::GenericFailure, format!("Decode failed: {e}"));
+  let mut context = CodecContext::new_decoder(codec_id).map_err(failed)?;
+  context
+    .configure_decoder(&DecoderConfig {
+      codec_id,
+      thread_count: 1,
+      extradata: None,
+      low_latency: false,
+      width: None,
+      height: None,
+    })
+    .map_err(failed)?;
+  if codec_id == AVCodecID::Png {
+    // SAFETY: the context is a valid AVCodecContext that is not opened yet
+    let set = unsafe {
+      av_opt_set_int(
+        context.as_mut_ptr().cast(),
+        c"discard_damaged_percentage".as_ptr(),
+        0,
+        0,
+      )
+    };
+    if set < 0 {
+      return Err(Error::new(
+        Status::GenericFailure,
+        "Failed to configure the PNG decoder",
+      ));
+    }
+  }
+  context.open().map_err(failed)?;
+  let mut packet = Packet::new().map_err(failed)?;
+  packet.copy_data_from(data).map_err(failed)?;
+  let mut frames = context.decode(Some(&packet)).map_err(failed)?;
+  frames.extend(context.flush_decoder().map_err(failed)?);
+  match <[Frame; 1]>::try_from(frames) {
+    Ok([frame]) => Ok(frame),
+    Err(_) => Err(Error::new(
+      Status::GenericFailure,
+      "Decode failed: not one frame",
+    )),
+  }
+}
+
+/// The rows of a BGRA frame, packed
+fn canvas_bytes(frame: &Frame) -> Vec<u8> {
+  let (row, stride) = (frame.width() as usize * 4, frame.linesize(0) as usize);
+  let mut out = Vec::with_capacity(row * frame.height() as usize);
+  if let Some(data) = frame.plane_data(0) {
+    for line in data.chunks(stride).take(frame.height() as usize) {
+      out.extend_from_slice(&line[..row]);
+    }
+  }
+  out
+}
+
+/// A BGRA frame of `width` x `height` with the packed rows of `canvas`, the properties of the
+/// decoded frame `props` (colour tags, side data), and `pts`. None without memory for it.
+fn canvas_frame(width: u32, height: u32, canvas: &[u8], props: &Frame, pts: i64) -> Option<Frame> {
+  let mut frame = Frame::new_video(width, height, AVPixelFormat::Bgra).ok()?;
+  // SAFETY: both frames are valid
+  if unsafe { av_frame_copy_props(frame.as_mut_ptr(), props.as_ptr()) } < 0 {
+    return None;
+  }
+  let (row, stride) = (width as usize * 4, frame.linesize(0) as usize);
+  let rows = frame.plane_data_mut(0)?.chunks_mut(stride);
+  for (to, from) in rows.zip(canvas.chunks_exact(row)) {
+    to[..row].copy_from_slice(from);
+  }
+  frame.set_pts(pts);
+  frame.set_duration(0);
+  frame.set_colorspace(AVColorSpace::Rgb);
+  frame.set_color_range(AVColorRange::Jpeg);
+  Some(frame)
 }
 
 /// Whether `bgra_frame` can make a frame of this size. av_frame_get_buffer fails a frame that
@@ -3792,8 +4695,48 @@ fn before_store_frames() {
   });
 }
 
+/// Runs just before a read of a PNG or a WebP draws its frames (from a buffer, once it has stored
+/// the track): the tests look at the decoder there, and make a decode() land there.
+#[cfg(test)]
+fn before_layered_draw() {
+  tests::BEFORE_LAYERED_DRAW.with(|hook| {
+    if let Some(hook) = hook.borrow_mut().as_mut() {
+      hook();
+    }
+  });
+}
+
 #[cfg(not(test))]
 fn before_store_frames() {}
+fn before_layered_draw() {}
+
+/// Runs in `draw_frames` before each frame it decodes, before it looks for a close() or a
+/// reset(): the tests make one land there, while the frames are drawn.
+#[cfg(test)]
+fn before_layered_frame() {
+  tests::BEFORE_LAYERED_FRAME.with(|hook| {
+    if let Some(hook) = hook.borrow_mut().as_mut() {
+      hook();
+    }
+  });
+}
+
+#[cfg(not(test))]
+fn before_layered_frame() {}
+
+/// Runs in `decode_cached_frame` after its first look, just before a decode() reads the data
+/// itself: the tests make a read start its draw there.
+#[cfg(test)]
+fn before_decode_read() {
+  tests::BEFORE_DECODE_READ.with(|hook| {
+    if let Some(hook) = hook.borrow_mut().as_mut() {
+      hook();
+    }
+  });
+}
+
+#[cfg(not(test))]
+fn before_decode_read() {}
 
 /// Chrome's scale numerator M: libjpeg decodes a JPEG at M/8 of its size so that its 4-byte
 /// pixels fit the budget that desiredWidth/desiredHeight give
@@ -3814,20 +4757,6 @@ fn jpeg_scale_numerator(width: u32, height: u32, desired: (u32, u32)) -> u32 {
     return 8;
   }
   ((f64::from(max_bytes) / f64::from(original_bytes)).sqrt() * 8.0).floor() as u32
-}
-
-/// The alpha hint in a WebP header: the VP8X alpha flag, or the alpha_is_used bit of
-/// a simple lossless (VP8L) file. Chrome labels the decoded image BGRA or BGRX by it.
-fn webp_alpha_hint(data: &[u8]) -> Option<bool> {
-  if data.len() < 25 || &data[0..4] != b"RIFF" || &data[8..12] != b"WEBP" {
-    return None;
-  }
-  match &data[12..16] {
-    b"VP8X" => Some(data[20] & 0x10 != 0),
-    // 0x2f signature, then 14 bits width - 1, 14 bits height - 1, 1 bit alpha_is_used
-    b"VP8L" if data[20] == 0x2f => Some(data[24] & 0x10 != 0),
-    _ => None,
-  }
 }
 
 /// Whether a WebP is simple lossy: its first chunk is VP8, so it has no VP8X header (Blink's
@@ -4021,9 +4950,7 @@ fn normalize_frame_timing(frames: &mut [Frame], time_base: (i32, i32)) {
 
 #[cfg(test)]
 mod tests {
-  use super::{
-    jpeg_scale_numerator, normalize_frame_timing, webp_alpha_hint, webp_is_simple_lossy,
-  };
+  use super::{jpeg_scale_numerator, normalize_frame_timing, webp_is_simple_lossy};
   use crate::codec::Frame;
   use crate::ffi::types::AV_NOPTS_VALUE;
 
@@ -4042,26 +4969,6 @@ mod tests {
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
   };
-
-  #[test]
-  fn reads_webp_alpha_hints() {
-    let lossless = |alpha: u8| {
-      let mut b = b"RIFF\0\0\0\0WEBPVP8L\0\0\0\0\x2f\x05\xc0\x00\x00".to_vec();
-      b[24] = alpha;
-      b
-    };
-    assert_eq!(webp_alpha_hint(&lossless(0x10)), Some(true));
-    assert_eq!(webp_alpha_hint(&lossless(0x00)), Some(false));
-    let mut extended = b"RIFF\0\0\0\0WEBPVP8X\x0a\0\0\0\x10\0\0\0\0".to_vec();
-    assert_eq!(webp_alpha_hint(&extended), Some(true));
-    extended[20] = 0x02; // animation flag only
-    assert_eq!(webp_alpha_hint(&extended), Some(false));
-    assert_eq!(
-      webp_alpha_hint(b"RIFF\0\0\0\0WEBPVP8 \0\0\0\0\0\0\0\0\0"),
-      None
-    );
-    assert_eq!(webp_alpha_hint(b"GIF89a"), None);
-  }
 
   #[test]
   fn finds_simple_lossy_webps_like_blink() {
@@ -4143,6 +5050,15 @@ mod tests {
     /// See `before_store_frames`
     pub(super) static BEFORE_STORE_FRAMES: RefCell<Option<Box<dyn FnMut()>>> =
       const { RefCell::new(None) };
+    /// See `before_decode_read`
+    pub(super) static BEFORE_DECODE_READ: RefCell<Option<Box<dyn FnMut()>>> =
+      const { RefCell::new(None) };
+    /// See `before_layered_draw`
+    pub(super) static BEFORE_LAYERED_DRAW: RefCell<Option<Box<dyn FnMut()>>> =
+      const { RefCell::new(None) };
+    /// See `before_layered_frame`
+    pub(super) static BEFORE_LAYERED_FRAME: RefCell<Option<Box<dyn FnMut()>>> =
+      const { RefCell::new(None) };
   }
 
   /// A JPEG whose data ends inside its scan: Chrome fails its frame at a decode()
@@ -4192,6 +5108,7 @@ mod tests {
       missing_samples: None,
       corrupt_sample: None,
       missing_item: None,
+      layered: super::LayeredState::default(),
       tracks,
       decode_notify: Arc::new(Notify::new()),
       closed: false,
@@ -4969,6 +5886,473 @@ mod tests {
       if !close_it {
         let mut later = std::pin::pin!(reset_or_closed(&inner, 1));
         assert!(later.as_mut().poll(&mut cx).is_pending());
+      }
+    }
+  }
+
+  /// A PNG or a WebP decoder before its tracks are ready: made from a buffer (`open` false), or
+  /// from a stream that is still open and has given all of `data`
+  fn layered_decoder(
+    data: &[u8],
+    codec_id: AVCodecID,
+    open: bool,
+  ) -> Arc<Mutex<ImageDecoderInner>> {
+    let mime_type = if codec_id == AVCodecID::Png {
+      "image/png"
+    } else {
+      "image/webp"
+    };
+    let inner = decoder(data, codec_id, mime_type);
+    {
+      let mut guard = inner.lock().unwrap();
+      guard.tracks.ready.store(false, Ordering::Release);
+      guard.tracks.inner.lock().unwrap().tracks[0] = ImageTrackData::initial(Some(codec_id));
+      if open {
+        guard.all_data = false;
+        guard.complete.store(false, Ordering::Release);
+      }
+    }
+    inner
+  }
+
+  /// The read that the collector or the buffer's probe makes (`FrameCall::Probe`), with `hook` run
+  /// where it is about to draw the frames (`before_layered_draw`; from a buffer, the track is
+  /// stored then). Returns the error reason, and whether the hook ran.
+  fn read_with_hook(
+    inner: &Arc<Mutex<ImageDecoderInner>>,
+    data_complete: bool,
+    mut hook: impl FnMut() + 'static,
+  ) -> (String, bool) {
+    let ran = Rc::new(Cell::new(false));
+    let hook_ran = ran.clone();
+    BEFORE_LAYERED_DRAW.with(|slot| {
+      *slot.borrow_mut() = Some(Box::new(move || {
+        hook_ran.set(true);
+        hook();
+      }))
+    });
+    let result = cache_decoded_frames(inner, FrameCall::Probe, data_complete, false);
+    BEFORE_LAYERED_DRAW.with(|slot| *slot.borrow_mut() = None);
+    (reason(result), ran.get())
+  }
+
+  /// A track as (animated, frameCount, repetitionCount)
+  type TrackOf = (bool, u32, f64);
+
+  /// The track of a decoder
+  fn track_of(inner: &Arc<Mutex<ImageDecoderInner>>) -> TrackOf {
+    let guard = inner.lock().unwrap();
+    let tracks = guard.tracks.inner.lock().unwrap();
+    let track = &tracks.tracks[0];
+    (track.animated, track.frame_count, track.repetition_count)
+  }
+
+  /// Whether every cached frame is decoded, and how many there are
+  fn decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Option<(bool, usize)> {
+    let guard = inner.lock().unwrap();
+    guard.cached_frames.as_ref().map(|frames| {
+      (
+        frames
+          .iter()
+          .all(|frame| matches!(frame, super::CachedFrame::Decoded { .. })),
+        frames.len(),
+      )
+    })
+  }
+
+  /// PNG and WebP files whose frames are all whole, with their codec and their track
+  const LAYERED_FILES: [(&str, &[u8], AVCodecID, TrackOf); 4] = [
+    (
+      "apng-3f-inf.png",
+      include_bytes!("../../__test__/fixtures/png-webp/apng-3f-inf.png"),
+      AVCodecID::Png,
+      (true, 3, f64::INFINITY),
+    ),
+    (
+      "four-colors.png",
+      include_bytes!("../../__test__/fixtures/wpt/four-colors.png"),
+      AVCodecID::Png,
+      (false, 1, 0.0),
+    ),
+    (
+      "anim_lossy_opaque.webp",
+      include_bytes!("../../__test__/fixtures/png-webp/anim_lossy_opaque.webp"),
+      AVCodecID::Webp,
+      (true, 3, f64::INFINITY),
+    ),
+    (
+      "webp-valid.webp",
+      include_bytes!("../../__test__/fixtures/png-webp/webp-valid.webp"),
+      AVCodecID::Webp,
+      (false, 1, 0.0),
+    ),
+  ];
+
+  /// From a buffer, the read stores the track and sets tracks.ready before it draws the frames. On
+  /// a stream, a chunk with the header and whole frames: the read stores the track with the
+  /// frames, once they are drawn, and leaves tracks.ready to the collector, which sets it after
+  /// the read (`signal_tracks_ready`)
+  #[test]
+  fn a_png_or_webp_track_and_tracks_ready_come_before_the_draw_from_a_buffer_and_after_it_on_a_stream()
+   {
+    for (name, data, codec_id, track) in LAYERED_FILES {
+      // a buffer, or one chunk with every byte on a stream left open
+      for open in [false, true] {
+        let inner = layered_decoder(data, codec_id, open);
+        let ready_notify = inner.lock().unwrap().tracks.ready_notify.clone();
+        let seen = Rc::new(RefCell::new(None));
+        let (hook_inner, hook_seen) = (inner.clone(), seen.clone());
+        let (result, ran) = read_with_hook(&inner, !open, move || {
+          let ready = hook_inner
+            .lock()
+            .unwrap()
+            .tracks
+            .ready
+            .load(Ordering::Acquire);
+          // set_tracks_ready leaves a permit: a waiter made now wakes at once
+          let mut woken = std::pin::pin!(ready_notify.notified());
+          let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+          let woken = woken.as_mut().poll(&mut cx).is_ready();
+          *hook_seen.borrow_mut() = Some((
+            ready,
+            woken,
+            track_of(&hook_inner),
+            decoded_frames(&hook_inner),
+          ));
+        });
+        let label = format!("{name} open {open}");
+        assert_eq!(result, "ok", "{label}");
+        assert!(ran, "{label}");
+        // At the hook, no frame drawn yet. A buffer: ready, its waiters woken, the track stored.
+        // A stream: not ready, the track as it was.
+        let initial = ImageTrackData::initial(Some(codec_id));
+        let at_hook = if open {
+          (
+            false,
+            false,
+            (
+              initial.animated,
+              initial.frame_count,
+              initial.repetition_count,
+            ),
+            None,
+          )
+        } else {
+          (true, true, track, None)
+        };
+        assert_eq!(seen.borrow_mut().take(), Some(at_hook), "{label}");
+        // Then the frames, every one decoded, with the track
+        assert_eq!(
+          decoded_frames(&inner),
+          Some((true, track.1 as usize)),
+          "{label}"
+        );
+        assert_eq!(track_of(&inner), track, "{label}");
+        assert_eq!(inner.lock().unwrap().layered.drawing, None, "{label}");
+        // A stream's read leaves tracks.ready to the collector
+        let ready = inner.lock().unwrap().tracks.ready.load(Ordering::Acquire);
+        assert_eq!(ready, !open, "{label}");
+      }
+    }
+  }
+
+  #[test]
+  fn a_png_or_webp_decode_made_while_the_frames_are_drawn_waits_for_them_and_draws_nothing() {
+    for (name, data, codec_id, track) in LAYERED_FILES {
+      for open in [false, true] {
+        let inner = layered_decoder(data, codec_id, open);
+        let notify = inner.lock().unwrap().decode_notify.clone();
+        let mut notified = std::pin::pin!(notify.notified());
+        notified.as_mut().enable();
+        let during = Rc::new(RefCell::new(String::new()));
+        let (hook_inner, hook_during) = (inner.clone(), during.clone());
+        let (result, ran) = read_with_hook(&inner, !open, move || {
+          // a decode() of frame 0 runs now, on another thread (from a buffer, tracks.ready is
+          // set; on a stream, a decode() made after a reset() finds no frames either)
+          *hook_during.borrow_mut() = decode_elsewhere(&hook_inner, 0);
+        });
+        let label = format!("{name} open {open}");
+        assert_eq!(result, "ok", "{label}");
+        assert!(ran, "{label}");
+        // It waited: no error, no frame of its own
+        assert_eq!(*during.borrow(), "pending", "{label}");
+        // The end of the draw wakes it, and it takes the frame drawn once
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(notified.as_mut().poll(&mut cx).is_ready(), "{label}");
+        assert_eq!(decode_elsewhere(&inner, 0), "frame", "{label}");
+        let last = track.1 as usize - 1;
+        let inner2 = inner.clone();
+        let last_frame =
+          std::thread::spawn(move || matches!(decode_cached_frame(&inner2, last, 0), Ok(Some(_))))
+            .join()
+            .unwrap();
+        assert!(last_frame, "{label}");
+        assert_eq!(inner.lock().unwrap().layered.draws, 1, "{label}");
+      }
+    }
+  }
+
+  /// A decode() that found no read drawing, and whose own read then finds that one started (the
+  /// collector's, on another thread, drawing under no lock), waits for that read's frames: the
+  /// frames are drawn once
+  #[test]
+  fn a_png_or_webp_decode_whose_read_finds_a_draw_started_after_its_look_waits_for_it() {
+    for (name, data, codec_id, track) in LAYERED_FILES {
+      for open in [false, true] {
+        let label = format!("{name} open {open}");
+        let inner = layered_decoder(data, codec_id, open);
+        let (at_draw, drawing) = std::sync::mpsc::channel::<()>();
+        let (go, wait_go) = std::sync::mpsc::channel::<()>();
+        let wait_go = Arc::new(Mutex::new(wait_go));
+        let reader = Rc::new(RefCell::new(None));
+        let (hook_inner, hook_reader) = (inner.clone(), reader.clone());
+        BEFORE_DECODE_READ.with(|slot| {
+          *slot.borrow_mut() = Some(Box::new(move || {
+            // the read of the collector starts now, and stops where it draws
+            let (inner, at_draw, wait_go) = (hook_inner.clone(), at_draw.clone(), wait_go.clone());
+            *hook_reader.borrow_mut() = Some(std::thread::spawn(move || {
+              BEFORE_LAYERED_DRAW.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                  at_draw.send(()).unwrap();
+                  wait_go.lock().unwrap().recv().unwrap();
+                }))
+              });
+              reason(cache_decoded_frames(&inner, FrameCall::Probe, !open, false))
+            }));
+            drawing.recv().unwrap();
+          }))
+        });
+        let during = match decode_cached_frame(&inner, 0, 0) {
+          Ok(None) => "pending".to_string(),
+          Ok(Some(_)) => "frame".to_string(),
+          Err(error) => error.reason,
+        };
+        BEFORE_DECODE_READ.with(|slot| *slot.borrow_mut() = None);
+        go.send(()).unwrap();
+        let reader = reader.borrow_mut().take().expect("the read started");
+        assert_eq!(reader.join().unwrap(), "ok", "{label}");
+        // It waited for the read's frames, and drew none of its own
+        assert_eq!(during, "pending", "{label}");
+        assert_eq!(inner.lock().unwrap().layered.draws, 1, "{label}");
+        assert_eq!(
+          decoded_frames(&inner),
+          Some((true, track.1 as usize)),
+          "{label}"
+        );
+        assert_eq!(decode_elsewhere(&inner, 0), "frame", "{label}");
+        assert_eq!(inner.lock().unwrap().layered.draws, 1, "{label}");
+      }
+    }
+  }
+
+  #[test]
+  fn a_png_or_webp_decode_made_after_a_reset_does_not_wait_for_the_draw_before_it() {
+    let (_, data, codec_id, _) = LAYERED_FILES[0];
+    let inner = layered_decoder(data, codec_id, true);
+    let during = Rc::new(RefCell::new(String::new()));
+    let (hook_inner, hook_during) = (inner.clone(), during.clone());
+    let (result, ran) = read_with_hook(&inner, false, move || {
+      reset(&hook_inner);
+      // the decode() made after the reset() reads the data itself
+      *hook_during.borrow_mut() = decode_elsewhere(&hook_inner, 1);
+    });
+    assert_eq!(result, "ok");
+    assert!(ran);
+    assert_eq!(*during.borrow(), "frame");
+    // the draw of the stale read is dropped, and the track stays (reset() keeps it)
+    assert_eq!(track_of(&inner), (true, 3, f64::INFINITY));
+    assert_eq!(inner.lock().unwrap().layered.drawing, None);
+  }
+
+  /// The read that the collector or the buffer's probe makes (`FrameCall::Probe`), with `hook` run
+  /// before each frame it decodes (`before_layered_frame`), given how many it ran before. Returns
+  /// the error reason, and how many times the hook ran.
+  fn read_with_frame_hook(
+    inner: &Arc<Mutex<ImageDecoderInner>>,
+    data_complete: bool,
+    mut hook: impl FnMut(usize) + 'static,
+  ) -> (String, usize) {
+    let ran = Rc::new(Cell::new(0));
+    let hook_ran = ran.clone();
+    BEFORE_LAYERED_FRAME.with(|slot| {
+      *slot.borrow_mut() = Some(Box::new(move || {
+        let n = hook_ran.get();
+        hook_ran.set(n + 1);
+        hook(n);
+      }))
+    });
+    let result = cache_decoded_frames(inner, FrameCall::Probe, data_complete, false);
+    BEFORE_LAYERED_FRAME.with(|slot| *slot.borrow_mut() = None);
+    (reason(result), ran.get())
+  }
+
+  /// On a stream, a reset() made while the read of a chunk with the header and whole frames draws
+  /// them (before the first frame, or before the second one of an animation): the read stores
+  /// the track it read, like Chrome, whose reset() keeps the track, drops the frames, and returns
+  /// Ok, so the collector sets tracks.ready after it as after any read (`signal_tracks_ready`)
+  #[test]
+  fn a_reset_while_a_png_or_webp_stream_draws_keeps_the_track_it_read() {
+    for (name, data, codec_id, track) in LAYERED_FILES {
+      let places: &[usize] = if track.1 > 1 { &[0, 1] } else { &[0] };
+      for &at in places {
+        let label = format!("{name} reset before frame {at}");
+        let inner = layered_decoder(data, codec_id, true);
+        let hook_inner = inner.clone();
+        let (result, frames) = read_with_frame_hook(&inner, false, move |n| {
+          if n == at {
+            reset(&hook_inner);
+          }
+        });
+        assert_eq!(result, "ok", "{label}");
+        assert_eq!(track_of(&inner), track, "{label}");
+        let guard = inner.lock().unwrap();
+        assert!(guard.cached_frames.is_none(), "{label}");
+        assert_eq!(guard.layered.drawing, None, "{label}");
+        // Left to the collector, which sets it after the read: never at the reset()
+        assert!(!guard.tracks.ready.load(Ordering::Acquire), "{label}");
+        // The draw stopped there: no frame was decoded after the reset()
+        assert_eq!(frames, at + 1, "{label}");
+      }
+    }
+  }
+
+  /// A close() or a reset() made while a read draws the frames of an animation, from a buffer or
+  /// on a stream, stops the draw before the next frame: nothing of it is stored, and the draw
+  /// guard is cleared. A decode() of frame 0 that waited for those frames wakes, and ends as after
+  /// any close() or reset(): with the closed decoder's error, or with AbortError on its turn
+  /// (`abort_if_reset`); a decode() made after the reset() reads the data itself.
+  #[test]
+  fn a_close_or_a_reset_stops_a_png_or_webp_draw_before_its_next_frame() {
+    for (name, data, codec_id, track) in LAYERED_FILES {
+      if track.1 < 3 {
+        continue;
+      }
+      for open in [false, true] {
+        for close_it in [false, true] {
+          let op = if close_it { "close" } else { "reset" };
+          let label = format!("{name} open {open} {op} before frame 1");
+          let inner = layered_decoder(data, codec_id, open);
+          let notify = inner.lock().unwrap().decode_notify.clone();
+          let mut notified = std::pin::pin!(notify.notified());
+          notified.as_mut().enable();
+          let waiting = Rc::new(RefCell::new(String::new()));
+          let (hook_inner, hook_waiting) = (inner.clone(), waiting.clone());
+          let (result, frames) = read_with_frame_hook(&inner, !open, move |n| match n {
+            // a decode() of frame 0 made now waits for these frames
+            0 => *hook_waiting.borrow_mut() = decode_elsewhere(&hook_inner, 0),
+            1 if close_it => close(&hook_inner),
+            1 => reset(&hook_inner),
+            _ => {}
+          });
+          assert_eq!(*waiting.borrow(), "pending", "{label}");
+          let expected = if close_it {
+            "InvalidStateError: ImageDecoder is closed"
+          } else {
+            "ok"
+          };
+          assert_eq!(result, expected, "{label}");
+          assert_eq!(frames, 2, "{label}");
+          {
+            let guard = inner.lock().unwrap();
+            assert!(guard.cached_frames.is_none(), "{label}");
+            assert_eq!(guard.layered.drawing, None, "{label}");
+            assert_eq!(guard.layered.draws, 1, "{label}");
+          }
+          let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+          assert!(notified.as_mut().poll(&mut cx).is_ready(), "{label}");
+          if close_it {
+            assert_eq!(
+              decode_elsewhere(&inner, 0),
+              "InvalidStateError: ImageDecoder is closed",
+              "{label}"
+            );
+          } else {
+            assert_eq!(
+              reason(abort_if_reset(&inner, 0)),
+              "AbortError: Aborted by reset.",
+              "{label}"
+            );
+            assert_eq!(track_of(&inner), track, "{label}");
+            assert_eq!(decode_elsewhere(&inner, 1), "frame", "{label}");
+          }
+        }
+      }
+    }
+  }
+
+  /// VP8X still WebPs and the bytes that end with their image chunk header or soon after it,
+  /// before the image chunk's first bytes can be read (Chrome 155: a decode() made then fails;
+  /// one made once the rest came decodes)
+  const UNNUMBERED_CUTS: [(&str, &[u8], &[usize]); 2] = [
+    (
+      "craft_vp8x_opaque_33x17.webp",
+      include_bytes!("../../__test__/fixtures/png-webp/craft_vp8x_opaque_33x17.webp"),
+      &[38, 39, 42, 47],
+    ),
+    (
+      "vp8x-vp8l.webp",
+      include_bytes!("../../__test__/fixtures/png-webp/vp8x-vp8l.webp"),
+      &[38, 39, 42],
+    ),
+  ];
+
+  /// A WebP decoder on an open stream that has given the first `cut` bytes of `data`, read
+  fn webp_stream_at(data: &[u8], cut: usize) -> Arc<Mutex<ImageDecoderInner>> {
+    let inner = layered_decoder(&data[..cut], AVCodecID::Webp, true);
+    assert_eq!(
+      reason(cache_decoded_frames(&inner, FrameCall::Probe, false, false)),
+      "ok"
+    );
+    inner
+  }
+
+  #[test]
+  fn a_vp8x_still_webp_split_at_its_image_chunk_header_decodes_once_the_rest_comes() {
+    for (name, data, cuts) in UNNUMBERED_CUTS {
+      for &cut in cuts {
+        let label = format!("{name} cut at {cut}");
+        let inner = webp_stream_at(data, cut);
+        assert_eq!(track_of(&inner), (false, 1, 0.0), "{label}");
+        // the rest, then the end of the stream
+        {
+          let mut guard = inner.lock().unwrap();
+          guard.data = ImageDecoderData::Vec(data.to_vec());
+          guard.all_data = true;
+        }
+        assert_eq!(
+          reason(cache_decoded_frames(&inner, FrameCall::Probe, false, false)),
+          "ok",
+          "{label}"
+        );
+        assert_eq!(
+          reason(cache_decoded_frames(&inner, FrameCall::Probe, true, true)),
+          "ok",
+          "{label}"
+        );
+        inner
+          .lock()
+          .unwrap()
+          .complete
+          .store(true, Ordering::Release);
+        assert_eq!(decode_elsewhere(&inner, 0), "frame", "{label}");
+        assert!(!inner.lock().unwrap().closed, "{label}");
+      }
+    }
+  }
+
+  #[test]
+  fn a_decode_made_while_a_vp8x_still_webp_has_only_its_image_chunk_header_fails_like_chrome() {
+    for (name, data, cuts) in UNNUMBERED_CUTS {
+      for &cut in cuts {
+        let label = format!("{name} cut at {cut}");
+        let inner = webp_stream_at(data, cut);
+        assert_eq!(
+          decode_elsewhere(&inner, 0),
+          "Failed to decode frame at index 0",
+          "{label}"
+        );
+        let guard = inner.lock().unwrap();
+        assert!(guard.closed && guard.frames_failed, "{label}");
       }
     }
   }
