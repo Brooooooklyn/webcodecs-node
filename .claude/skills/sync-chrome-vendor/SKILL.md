@@ -179,6 +179,13 @@ table below follows one Chrome stable version: the `chrome:` line of
   `desiredSize` after a second enqueue() in one task is -1 here and 0 in Chrome, whose pull() runs
   inside the first enqueue(). A decode() that takes a frame made from the first chunk alone does
   not show the first one: a GIF here, and a JPEG or a GIF on main.
+- Fake timers that replace `setImmediate` on the main context (`@sinonjs/fake-timers`,
+  Vitest's vi.useFakeTimers(), node:test's mock.timers; not Jest's, which live in its vm
+  context) on Bun, Deno or WASI, or where Node lives in a DLL on Windows: there a JPEG stream
+  checks whether it went idle from setImmediate (`after_task` finds no libuv check handle), so
+  with setImmediate faked, a decode() made before the rest of the data comes waits for the close.
+  Chrome uses no page global for this; in Node neither does this decoder (the try of a decode()
+  is a promise reaction, the idle check a libuv check handle).
 - Size limits: Chrome fails a frame wider or taller than `kMaxDimension` (32767); here FFmpeg
   allocates the frame, and fails it when (width + 128) × (height + 128) ≥ 2^28. Both fail the
   metadata above 2^29 - 1 pixels.

@@ -3,6 +3,7 @@
 //! Provides spec-compliant WebCodecs API surface for Node.js via NAPI-RS.
 //! See: https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API
 
+pub(crate) mod after_task;
 mod audio_data;
 mod audio_decoder;
 mod audio_encoder;

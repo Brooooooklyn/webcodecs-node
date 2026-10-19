@@ -273,6 +273,59 @@ test('ImageDecoder: a JPEG decode() made just before the stream closes is BGRX, 
   }
 })
 
+// Fake timers on the main context replace globals that the decoder used for its JPEG stream work:
+// @sinonjs/fake-timers queueMicrotask, setImmediate and setTimeout, Vitest's vi.useFakeTimers()
+// setImmediate and setTimeout, node:test's mock.timers setImmediate. (Jest's fake timers live in
+// the vm context of its tests, which the addon does not read.) The decoder does not schedule that
+// work with them, as Chrome's does not: a decode() on an open stream resolves while they never
+// run a callback. In a child process that stubs all three for its whole run. The stream gets `first` bytes in start(), the rest (if any) in
+// a later task, through the real setImmediate, as from I/O; it stays open. The child prints the
+// frame's format and the decoder's `complete` (false: the stream is still open), and does not
+// answer (the stream never closes) if the decode() waits for the stubs.
+function decodeWithStubbedTimers(data: Uint8Array, first: number) {
+  const script = `
+    const fs = require('node:fs');
+    const { ImageDecoder } = require('./index.js');
+    const data = Buffer.from('${Buffer.from(data).toString('base64')}', 'base64');
+    const later = setImmediate;
+    for (const name of ['queueMicrotask', 'setImmediate', 'setTimeout']) globalThis[name] = () => {};
+    let controller;
+    const stream = new ReadableStream({
+      start(c) {
+        controller = c;
+        c.enqueue(new Uint8Array(data.subarray(0, ${first})));
+      },
+    });
+    const decoder = new ImageDecoder({ data: stream, type: 'image/jpeg' });
+    decoder.decode().then(
+      ({ image }) => fs.writeSync(1, 'RESULT:' + image.format + ' ' + decoder.complete + '\\n'),
+      (error) => fs.writeSync(1, 'RESULT:' + error.name + '\\n'),
+    ).then(() => process.exit(0));
+    if (${first} < data.length) later(() => controller.enqueue(new Uint8Array(data.subarray(${first}))));
+  `
+  const output = execFileSync(process.execPath, ['-e', script], {
+    cwd: process.cwd(),
+    timeout: 30_000,
+    encoding: 'utf8',
+  })
+  return /RESULT:(.*)/.exec(output)?.[1]
+}
+
+// All the data is in the stream before the decode(): the try is posted from a promise reaction.
+test('ImageDecoder: a JPEG decode() on an open stream does not wait for page timers', (t) => {
+  const data = fixture('420-37x9.jpg')
+  t.is(decodeWithStubbedTimers(data, data.length), 'BGRX false')
+})
+
+// The data up to the SOS marker before the decode(), the rest in a later task: the reader marks
+// the stream idle in the event loop's check phase (a libuv check handle), so the rest is decoded
+// as it comes, like Chrome.
+test('ImageDecoder: a JPEG chunk that comes to an idle stream does not wait for page timers', (t) => {
+  const data = fixture('420-37x9.jpg')
+  const sos = data.findIndex((byte, i) => byte === 0xff && data[i + 1] === 0xda)
+  t.is(decodeWithStubbedTimers(data, sos), 'BGRX false')
+})
+
 // A stream that trickles in while a decode() waits, each chunk to an idle stream. Chrome's decoder
 // reads each byte once. Here a try decodes the data from its first byte, so a try for each chunk
 // would make the work grow with the square of the chunk count: only a try whose new bytes can

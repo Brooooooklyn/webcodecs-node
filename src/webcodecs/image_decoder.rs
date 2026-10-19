@@ -8,6 +8,7 @@ use crate::codec::jpeg::{JpegDecode, decode_jpeg, jpeg_info};
 use crate::codec::{CodecContext, DecoderConfig, Frame, Packet};
 use crate::ffi::avutil::{av_opt_set_int, av_rescale_q, opt_flag};
 use crate::ffi::{AV_NOPTS_VALUE, AVCodecID, AVPixelFormat, AVRational, check_error};
+use crate::webcodecs::after_task::after_task;
 use crate::webcodecs::buffer_source::{self, Uint8ArrayCopy};
 use crate::webcodecs::decoded_frame::{DecodedSource, decoded_frame_format};
 use crate::webcodecs::error::{
@@ -1587,18 +1588,22 @@ struct JpegPost {
 ///   first step would have seen it): the try is posted before the end (`post_before_end`).
 ///   Promises cannot tell a second chunk (or a close behind it) that came after the decode() from
 ///   one that came before: both are read before the try.
+///
+/// Each step is the reaction to a promise made here and resolved at once. Its job goes to the end
+/// of the microtask queue in the then() call, as a queueMicrotask() callback would, so the steps
+/// keep their place among the reactions of the reads. Fake timers cannot hold them back: they
+/// replace `queueMicrotask`, not promise jobs (Chrome's decoder does not use the page's globals).
+/// Page code that replaces `Promise.prototype.then` can.
 fn queue_jpeg_post(env: &Env, inner: &Arc<Mutex<ImageDecoderInner>>, post: JpegPost) {
   let step_inner = inner.clone();
-  let queued = env
-    .create_function_from_closure::<(), (), _>("postJpegDecode", move |ctx| {
-      jpeg_post_step(ctx.env, &step_inner, post);
-      Ok(())
-    })
-    .and_then(|step| {
-      let queue: Function<Function<(), ()>, Unknown> =
-        env.get_global()?.get_named_property("queueMicrotask")?;
-      queue.call(step).map(|_| ())
-    });
+  let queued = PromiseRaw::<()>::resolve(env, ()).and_then(|resolved| {
+    resolved
+      .then(move |ctx| {
+        jpeg_post_step(&ctx.env, &step_inner, post);
+        Ok(())
+      })
+      .map(|_| ())
+  });
   if queued.is_err() {
     // No microtask: post now
     clear_pending_exception(env);
@@ -2317,14 +2322,26 @@ fn start_jpeg_read(
     js.drop_reactions();
     return;
   }
-  // setImmediate runs after this task and its microtasks: a chunk or the end already queued in
-  // the stream has settled the read by then. One check at most is pending, for the last read:
-  // a source that enqueues at once settles many reads in one task.
+  // The check runs after this task and its microtasks: a chunk or the end already queued in the
+  // stream has settled the read by then. One check at most is pending, for the last read: a source
+  // that enqueues at once settles many reads in one task. It runs in the loop's check phase
+  // (`after_task`), out of reach of fake timers; where that is not there, from setImmediate.
   let pending = js
     .idle_check
     .lock()
     .is_ok_and(|mut last| last.replace(read).is_some());
   if pending {
+    return;
+  }
+  let stream = Arc::downgrade(&js);
+  if after_task(
+    env,
+    Box::new(move || {
+      if let Some(stream) = stream.upgrade() {
+        stream.check_idle();
+      }
+    }),
+  ) {
     return;
   }
   let check = js.clone();

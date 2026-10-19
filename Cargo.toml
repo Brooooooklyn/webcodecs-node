@@ -39,6 +39,10 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 # Pixel loops with SIMD paths
 pixel-simd = { path = "crates/pixel-simd" }
 
+# Host functions (libuv) looked up at run time, as napi-sys looks up Node-API
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+libloading = "0.9"
+
 [dev-dependencies]
 sha2 = "0.11.0"
 
