@@ -5,7 +5,7 @@
  */
 
 import test from 'ava'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -567,6 +567,72 @@ test('ImageDecoder: a JPEG stream lets go of its reactions when nothing reads on
   // The window was hit: the reading stopped while the read() of the first pull() ran
   t.true(result?.race.reached > 0, JSON.stringify(result?.race))
   t.is(result?.race.leaked, 0)
+})
+
+// Each load of the addon gets its own env, so one thread can hold several. The JPEG streams still
+// open when an env is torn down are let go by a cleanup hook of that env, which runs before napi's
+// own hooks of that env. In a child process, workers load the addon three times, open a JPEG stream
+// in the first two loads, and are terminated. With one hook for the whole thread (added at the
+// first load's stream), the second load's streams were let go after napi's hooks of that load had
+// run. napi lets go of a reference made under a load that is not the last one through the
+// thread-safe function of that load, which was closing then, so it panicked (twice in each worker;
+// the panics were caught).
+test('ImageDecoder: a worker ends cleanly with JPEG streams open in more than one load of the addon', (t) => {
+  const script = `
+    const { Worker } = require('node:worker_threads');
+    require('./index.js');
+    const file = Object.keys(require.cache).find((name) => name.endsWith('.node'));
+    const data = '${Buffer.from(fixture('420-37x9.jpg')).toString('base64')}';
+    const worker = \`
+      const { parentPort, workerData } = require('node:worker_threads');
+      const data = Buffer.from(workerData.data, 'base64');
+      const sos = data.findIndex((byte, i) => byte === 0xff && data[i + 1] === 0xda);
+      const loads = [];
+      const load = () => {
+        const m = { exports: {} };
+        process.dlopen(m, workerData.file);
+        loads.push(m.exports);
+      };
+      // the header only, and the stream left open: decode() waits
+      const open = (m) => {
+        const stream = new ReadableStream({ start: (c) => c.enqueue(data.subarray(0, sos)) });
+        const decoder = new m.ImageDecoder({ data: stream, type: 'image/jpeg' });
+        decoder.decode().catch(() => {});
+        return decoder;
+      };
+      load();
+      const first = open(loads[0]);
+      load();
+      const second = open(loads[1]);
+      load();
+      globalThis.keep = [first, second];
+      setTimeout(() => parentPort.postMessage(new Set(loads.map((m) => m.ImageDecoder)).size), 20);
+    \`;
+    (async () => {
+      const results = [];
+      for (let i = 0; i < 5; i++) {
+        const w = new Worker(worker, { eval: true, workerData: { file, data } });
+        w.on('message', () => w.terminate());
+        const loads = new Promise((resolve) => w.once('message', resolve));
+        const code = await new Promise((resolve) => w.once('exit', resolve));
+        results.push({ loads: await loads, code });
+      }
+      require('node:fs').writeSync(1, 'RESULT:' + JSON.stringify(results) + '\\n');
+      process.exit(0);
+    })();
+  `
+  const child = spawnSync(process.execPath, ['-e', script], {
+    cwd: process.cwd(),
+    timeout: 60_000,
+    encoding: 'utf8',
+  })
+  t.is(child.status, 0, child.stderr)
+  // three envs in each worker, each terminated (exit code 1)
+  t.deepEqual(
+    JSON.parse(/RESULT:(.*)/.exec(child.stdout)?.[1] ?? 'null'),
+    Array.from({ length: 5 }, () => ({ loads: 3, code: 1 })),
+  )
+  t.notRegex(child.stderr, /panicked/)
 })
 
 // reset() aborts a waiting decode() in Chrome, before it decodes, but keeps the choice of RGB that a

@@ -2001,56 +2001,64 @@ fn release_jpeg_refs(refs: &Mutex<JpegRefs>) {
   drop(taken);
 }
 
+/// The open JPEG streams of each env, by env pointer (see `JPEG_STREAMS`)
+type JpegStreamsByEnv = std::collections::HashMap<usize, Vec<Weak<Mutex<JpegRefs>>>>;
+
 thread_local! {
-  /// The JPEG streams of this thread's env, for its teardown (`release_jpeg_streams`). None until
-  /// the first stream adds that hook, and again once it ran.
-  static JPEG_STREAMS: std::cell::RefCell<Option<Vec<Weak<Mutex<JpegRefs>>>>> =
-    const { std::cell::RefCell::new(None) };
+  /// The JPEG streams of each env on this thread, for that env's teardown
+  /// (`release_jpeg_streams`). A thread can hold more than one env: Node makes one for each load
+  /// of the addon, and an embedder like Electron can run several Node environments on one thread
+  /// and tear one down while the others go on. An env's first stream adds its entry and its hook;
+  /// the hook removes the entry before the env goes away, so a later env at the same address never
+  /// finds it.
+  static JPEG_STREAMS: std::cell::RefCell<JpegStreamsByEnv> =
+    std::cell::RefCell::new(JpegStreamsByEnv::new());
 }
 
-/// On the JS thread, at a JPEG stream's start: let the env's teardown see its references. The
-/// first stream of the env adds the teardown hook (`release_jpeg_streams`).
+/// On the JS thread, at a JPEG stream's start: let the teardown of its env see its references.
+/// The first stream of the env adds the env's teardown hook (`release_jpeg_streams`).
 fn watch_jpeg_refs(env: &Env, refs: &Arc<Mutex<JpegRefs>>) {
+  let key = env.raw() as usize;
   let _ = JPEG_STREAMS.try_with(|streams| {
     let mut streams = streams.borrow_mut();
-    if streams.is_none() {
-      // SAFETY: on the env's JS thread; the hook takes no data
+    if !streams.contains_key(&key) {
+      // SAFETY: on the env's JS thread; the hook's data is the env pointer, used only as the key
       let status = unsafe {
         napi::sys::napi_add_env_cleanup_hook(
           env.raw(),
           Some(release_jpeg_streams),
-          std::ptr::null_mut(),
+          env.raw().cast(),
         )
       };
       if status != napi::sys::Status::napi_ok {
         return;
       }
-      *streams = Some(Vec::new());
     }
-    if let Some(streams) = streams.as_mut() {
-      streams.retain(|stream| stream.strong_count() > 0);
-      streams.push(Arc::downgrade(refs));
-    }
+    let list = streams.entry(key).or_default();
+    list.retain(|stream| stream.strong_count() > 0);
+    list.push(Arc::downgrade(refs));
   });
 }
 
-/// The env's teardown, on its JS thread: let go of the references of every JPEG stream still
-/// open (see `JpegRefs`). Node runs the cleanup hooks from the one added last, so this runs before
-/// the hooks napi added when the addon was registered: the one that shuts the async runtime down
-/// (and with it the collectors) and the one that closes napi's thread-safe function. The env is
-/// whole here: each reference is deleted at once. A collector dropped later finds nothing to let
-/// go of.
+/// The teardown of one env (the hook's data), on its JS thread: let go of the references of every
+/// JPEG stream of that env still open (see `JpegRefs`). Only that env's: another env on the
+/// thread keeps reading its streams, and its own hook lets go of them at its own teardown. Node
+/// runs the cleanup hooks from the one added last. This one is added at the env's first stream,
+/// after the hooks napi added when the addon was registered in the env: the one that shuts the
+/// async runtime down at the last env (and with it the collectors), and the one that closes napi's
+/// thread-safe function. So it runs before them, while the env is whole. A collector dropped
+/// later finds nothing to let go of.
 ///
-/// The list is per thread, and so is this hook: it also takes the streams of a second
-/// registration of the addon in the same env (the addon loaded again). napi deletes a reference
-/// at once when it was made under the registration made last on this thread; else the drop goes
-/// through the thread-safe function of the registration it was made under, still open here when
-/// that registration came before this hook was added. Each reference drops on its own, and a
-/// panic there (possible with a third registration) is caught: an unwind must not leave this
-/// extern "C" function.
-unsafe extern "C" fn release_jpeg_streams(_: *mut std::ffi::c_void) {
+/// napi ties each reference to the registration of the addon made last on this thread when the
+/// reference was made. Once that registration's env is gone, the drop leaks the reference. Else
+/// it deletes it at once while that registration is still the last one on this thread, or lets it
+/// go through that registration's thread-safe function. That function is closing here only when
+/// its registration came after this hook was added (a stream started in this env after the addon
+/// was loaded again) and is not the last one: then napi panics. Each reference drops on its own,
+/// and that panic is caught: an unwind must not leave this extern "C" function.
+unsafe extern "C" fn release_jpeg_streams(env: *mut std::ffi::c_void) {
   let streams = JPEG_STREAMS
-    .try_with(|streams| streams.borrow_mut().take())
+    .try_with(|streams| streams.borrow_mut().remove(&(env as usize)))
     .ok()
     .flatten();
   for refs in streams
