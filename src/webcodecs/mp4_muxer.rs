@@ -149,7 +149,7 @@ pub struct Mp4VideoTrackConfig {
   /// Frame rate (frames per second)
   pub framerate: Option<f64>,
   /// Codec-specific description data (avcC/hvcC/av1C from encoder metadata)
-  #[napi(ts_type = "BufferSource")]
+  #[napi(ts_type = "AllowSharedBufferSource")]
   pub description: Option<BufferSourceCopy>,
   /// HEVC sample-entry override. Default picks "hvc1" when the hvcC
   /// description is well-formed, single-layer, and complete; "hev1" permits
@@ -168,7 +168,7 @@ pub struct Mp4AudioTrackConfig {
   /// Number of audio channels
   pub number_of_channels: u32,
   /// Codec-specific description data (esds for AAC, etc.)
-  #[napi(ts_type = "BufferSource")]
+  #[napi(ts_type = "AllowSharedBufferSource")]
   pub description: Option<BufferSourceCopy>,
 }
 

@@ -113,7 +113,7 @@ pub struct WebMVideoTrackConfig {
   /// Frame rate (frames per second)
   pub framerate: Option<f64>,
   /// Codec-specific description data
-  #[napi(ts_type = "BufferSource")]
+  #[napi(ts_type = "AllowSharedBufferSource")]
   pub description: Option<BufferSourceCopy>,
   /// Whether the video has alpha channel (VP9 alpha support)
   pub alpha: Option<bool>,
@@ -129,7 +129,7 @@ pub struct WebMAudioTrackConfig {
   /// Number of audio channels
   pub number_of_channels: u32,
   /// Codec-specific description data
-  #[napi(ts_type = "BufferSource")]
+  #[napi(ts_type = "AllowSharedBufferSource")]
   pub description: Option<BufferSourceCopy>,
 }
 

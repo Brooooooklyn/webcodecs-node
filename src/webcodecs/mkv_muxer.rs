@@ -114,7 +114,7 @@ pub struct MkvVideoTrackConfig {
   /// Frame rate (frames per second)
   pub framerate: Option<f64>,
   /// Codec-specific description data
-  #[napi(ts_type = "BufferSource")]
+  #[napi(ts_type = "AllowSharedBufferSource")]
   pub description: Option<BufferSourceCopy>,
 }
 
@@ -128,7 +128,7 @@ pub struct MkvAudioTrackConfig {
   /// Number of audio channels
   pub number_of_channels: u32,
   /// Codec-specific description data
-  #[napi(ts_type = "BufferSource")]
+  #[napi(ts_type = "AllowSharedBufferSource")]
   pub description: Option<BufferSourceCopy>,
 }
 

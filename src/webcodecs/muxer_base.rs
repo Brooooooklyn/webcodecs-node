@@ -136,7 +136,7 @@ pub struct VideoDecoderConfigJs {
   /// Codec string
   pub codec: Option<String>,
   /// Codec-specific description
-  #[napi(ts_type = "BufferSource")]
+  #[napi(ts_type = "AllowSharedBufferSource")]
   pub description: Option<BufferSourceCopy>,
   /// Coded width
   pub coded_width: Option<u32>,
@@ -171,7 +171,7 @@ pub struct AudioDecoderConfigJs {
   /// Number of channels
   pub number_of_channels: Option<u32>,
   /// Codec-specific description
-  #[napi(ts_type = "BufferSource")]
+  #[napi(ts_type = "AllowSharedBufferSource")]
   pub description: Option<BufferSourceCopy>,
 }
 
