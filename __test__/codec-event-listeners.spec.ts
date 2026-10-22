@@ -453,6 +453,40 @@ test('module load: loading the module again leaves callbacks removable and colle
   })
 })
 
+test('module load: the first module keeps its iterable layout support after a second load', (t) => {
+  // allocationSize reaches ITERATOR_SYMBOL without the separate copyTo getter cache.
+  // The child exits normally so execFileSync also checks its env cleanup hooks.
+  const result = runChild<{ loadedAgain: boolean; firstSize: number; secondSize: number }>(`
+    const fs = require('node:fs');
+    const first = require('./index.js');
+    const file = Object.keys(require.cache).find((name) => name.endsWith('.node'));
+    const second = { exports: {} };
+    process.dlopen(second, file);
+    const layout = {
+      *[Symbol.iterator]() {
+        yield { offset: 0, stride: 4 };
+        yield { offset: 8, stride: 2 };
+        yield { offset: 10, stride: 2 };
+      },
+    };
+    const makeFrame = (m) => new m.VideoFrame(new Uint8Array(12), {
+      format: 'I420', codedWidth: 4, codedHeight: 2, timestamp: 0,
+    });
+    const firstFrame = makeFrame(first);
+    const secondFrame = makeFrame(second.exports);
+    const firstSize = firstFrame.allocationSize({ layout });
+    const secondSize = secondFrame.allocationSize({ layout });
+    firstFrame.close();
+    secondFrame.close();
+    fs.writeSync(1, JSON.stringify({
+      loadedAgain: first.VideoFrame !== second.exports.VideoFrame,
+      firstSize,
+      secondSize,
+    }) + '\\n');
+  `)
+  t.deepEqual(result, { loadedAgain: true, firstSize: 12, secondSize: 12 })
+})
+
 // ============================================================================
 // Dequeue event coalescing
 // ============================================================================
