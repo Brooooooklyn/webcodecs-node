@@ -488,6 +488,7 @@ jobs:
       id-token: write
     needs:
       - lint
+      - pixel-simd
       - test-macOS-windows-binding
       - test-linux-binding
     steps:
