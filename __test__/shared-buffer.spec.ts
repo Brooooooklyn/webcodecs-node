@@ -140,6 +140,36 @@ test.serial('a pre-import set wrapper cannot re-enter a locked audio copy', (t) 
   t.is(output, 'ok')
 })
 
+test.serial('a detached temporary shared-copy destination returns an error', (t) => {
+  const output = execFileSync(
+    process.execPath,
+    [
+      '-e',
+      `const fs = require('node:fs');
+       const original = Uint8Array.prototype.set;
+       Object.defineProperty(Uint8Array.prototype, 'set', {
+         configurable: true,
+         writable: true,
+         value: function (...args) {
+           const result = original.apply(this, args);
+           structuredClone(this.buffer, { transfer: [this.buffer] });
+           return result;
+         },
+       });
+       const { EncodedAudioChunk } = require('./index.js');
+       const shared = new SharedArrayBuffer(8);
+       try {
+         new EncodedAudioChunk({ type: 'key', timestamp: 0, data: shared });
+         fs.writeSync(1, 'no error');
+       } catch (error) {
+         fs.writeSync(1, error.message);
+       }`,
+    ],
+    { cwd: process.cwd(), encoding: 'utf8', timeout: 5000 },
+  )
+  t.is(output, 'Shared buffer copy destination was detached')
+})
+
 for (const kind of ['Int32Array', 'BigInt64Array'] as const) {
   test.serial(`shared input and output tolerate concurrent ${kind} worker reads and writes`, async (t) => {
     const source = bytes(4096)

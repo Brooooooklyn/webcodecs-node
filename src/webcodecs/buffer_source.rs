@@ -96,6 +96,12 @@ impl RawBufferSource {
     check_status!(unsafe {
       sys::napi_get_arraybuffer_info(self.env, native_buffer, &mut data, &mut len)
     })?;
+    if len != self.len || data.is_null() {
+      return Err(Error::new(
+        Status::InvalidArg,
+        "Shared buffer copy destination was detached",
+      ));
+    }
     let mut out = Vec::with_capacity(len);
     // SAFETY: this is the ordinary ArrayBuffer created above, `len` is its
     // engine-reported size, and no JS runs before the native copy finishes.

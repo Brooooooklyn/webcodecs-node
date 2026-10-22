@@ -741,12 +741,19 @@ pub fn load_buffer_from_js<'env, F: DemuxerFormat>(
   if !claim.try_claim() {
     return env.spawn_future(async move { Err::<(), _>(already_loaded_error()) });
   }
-  // No user JS runs during the copy. If the engine copy fails, this call has
-  // not started a load and must release the claim it acquired above.
+  // No demuxer mutex is held during the copy. A pre-import wrapper can close
+  // the demuxer reentrantly, so release a failed copy's claim only if the state
+  // is still unloaded. A successful copy is checked again by the blocking load.
   let bytes = match source.to_vec() {
     Ok(bytes) => bytes,
     Err(error) => {
-      claim.set(false);
+      if inner
+        .lock()
+        .map(|guard| guard.state == DemuxerState::Unloaded)
+        .unwrap_or(false)
+      {
+        claim.set(false);
+      }
       return Err(error);
     }
   };
