@@ -106,6 +106,9 @@ function openStream() {
     send: (bytes: Uint8Array) => {
       if (bytes.length) controller.enqueue(bytes.slice())
     },
+    error: (reason: unknown) => {
+      controller.error(reason)
+    },
     close: () => {
       try {
         controller.close()
@@ -628,6 +631,60 @@ test('ImageDecoder: a WebP with no RIFF header split inside its image chunk deco
         decoder.close()
       }
     }
+  }
+})
+
+// cwebp -lossless of a 1x1 red pixel: its 15-byte VP8L payload, without RIFF or a chunk header
+const bareVp8l = Uint8Array.of(0x2f, 0, 0, 0, 0, 0x07, 0x10, 0xfd, 0x8f, 0xfe, 0x07, 0x22, 0xa2, 0xff, 0x01)
+const bareVp8lFrame = 'BGRX 1x1 0 null b7d1b3a1104cc86b'
+
+test('ImageDecoder: a bare VP8L bitstream split before EOF does not keep a partial decode result', async (t) => {
+  const control = new ImageDecoder({ data: bareVp8l, type: 'image/webp' })
+  const expected = await result(control.decode())
+  control.close()
+  t.is(expected, bareVp8lFrame, 'complete buffer')
+
+  for (let cut = 1; cut < bareVp8l.length; cut++) {
+    const label = `cut at ${cut}`
+    const source = openStream()
+    source.send(bareVp8l.subarray(0, cut))
+    source.send(bareVp8l.subarray(cut))
+    source.close()
+    const decoder = new ImageDecoder({ data: source.stream, type: 'image/webp' })
+    t.is(await settled(decoder.completed), 'fulfilled', label)
+    t.is(await result(decoder.decode()), expected, label)
+    decoder.close()
+  }
+})
+
+test('ImageDecoder: an early decode of a bare VP8L bitstream waits for EOF or a terminal stream error', async (t) => {
+  for (const streamError of [false, true]) {
+    const label = streamError ? 'stream error' : 'EOF'
+    const source = openStream()
+    const decoder = new ImageDecoder({ data: source.stream, type: 'image/webp' })
+    t.teardown(() => {
+      decoder.close()
+      source.close()
+    })
+    // libwebp's raw demuxer recognizes this VP8L header at 12 bytes
+    source.send(bareVp8l.subarray(0, 12))
+    await decoder.tracks.ready
+    const call = decoder.decode()
+    const seen = watch(call)
+    t.true(await holds(() => seen.value === 'pending', 50), `${label}: pending at the cut`)
+
+    source.send(bareVp8l.subarray(12))
+    t.true(await holds(() => seen.value === 'pending', 50), `${label}: pending with every byte on an open stream`)
+    const completed = settled(decoder.completed)
+    if (streamError) {
+      source.error(new Error('stream broke'))
+    } else {
+      source.close()
+    }
+    t.is(await result(call), bareVp8lFrame, label)
+    t.is(await completed, streamError ? 'Error: stream broke' : 'fulfilled', label)
+    t.true(decoder.complete, label)
+    decoder.close()
   }
 })
 

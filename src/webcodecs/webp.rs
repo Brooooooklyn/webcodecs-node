@@ -360,8 +360,11 @@ pub(crate) fn demux(data: &[u8]) -> (Option<Demux>, DemuxState) {
     end: data.len(),
     riff_end: 0,
   };
-  // ReadHeader
-  let header = if data.len() < RIFF_HEADER_SIZE + CHUNK_HEADER_SIZE {
+  // ReadHeader: raw data can use features() once its 12-byte minimum is here; RIFF still needs
+  // its first chunk header too
+  let header = if data.len() < RIFF_HEADER_SIZE
+    || (data.len() < RIFF_HEADER_SIZE + CHUNK_HEADER_SIZE && &data[..4] == b"RIFF")
+  {
     Parse::NeedMore
   } else if &data[..4] != b"RIFF" || &data[8..12] != b"WEBP" {
     Parse::Error
@@ -1050,6 +1053,11 @@ fn raw_chunks(data: &[u8]) -> RawChunks {
   RawChunks { alpha, image }
 }
 
+/// Whether the raw data is a bare VP8 or VP8L bitstream, without any chunk header
+pub(crate) fn bare_bitstream(data: &[u8], demux: &Demux) -> bool {
+  demux.raw && raw_chunks(data).image.is_none()
+}
+
 /// The data that libwebp decodes without a RIFF header as a still WebP for FFmpeg (see
 /// `raw_chunks`): the last ALPH chunk and the VP8 or VP8L chunk, or a bare bitstream. A chunk
 /// keeps its own size, and its bytes that are here: a chunk cut short fails in FFmpeg, as in
@@ -1093,16 +1101,14 @@ fn push_chunk_here(out: &mut Vec<u8>, data: &[u8], at: usize) {
 
 /// Whether a still image's frame can be decoded with the data so far: its image chunk's payload
 /// is here (libwebp's incremental decoder may finish a VP8 frame a little earlier). Data with no
-/// RIFF header too, from the size in its image chunk header. A bare bitstream has no size, and
-/// counts as whole as soon as its header is here: on an open stream its frame is decoded from the
-/// bytes read so far, and that frame (or failure) is kept when more bytes come. Chrome waits for
-/// the rest (the skill text lists this).
-pub(crate) fn image_complete(data: &[u8], demux: &Demux) -> bool {
+/// RIFF header too, from the size in its image chunk header. A bare bitstream has no size, so an
+/// open stream waits for its end (`data_complete`, also set for the terminal error refresh).
+pub(crate) fn image_complete(data: &[u8], demux: &Demux, data_complete: bool) -> bool {
   let Some(frame) = demux.frames.first() else {
     return false;
   };
   if demux.raw {
-    return raw_chunks(data).image.is_none_or(|at| {
+    return raw_chunks(data).image.map_or(data_complete, |at| {
       (data.len() - at - CHUNK_HEADER_SIZE) as u64 >= u64::from(le32(&data[at + 4..]))
     });
   }
@@ -1226,10 +1232,10 @@ mod tests {
     assert_eq!((demux.canvas_width, demux.canvas_height), (7, 5));
     assert_eq!(demux.frames.len(), 1);
     assert!(!demux.frames[0].complete);
-    assert!(!image_complete(&data[..25], &demux));
+    assert!(!image_complete(&data[..25], &demux, true));
     let (demux, state) = super::demux(&data);
     assert_eq!(state, DemuxState::Done);
-    assert!(image_complete(&data, &demux.unwrap()));
+    assert!(image_complete(&data, &demux.unwrap(), true));
     // a lossy one needs the 10 bytes of the frame header
     let data = file(&[chunk(b"VP8 ", &vp8(9, 4, 30))]);
     assert!(
