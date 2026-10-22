@@ -515,7 +515,7 @@ impl ImageDecoder {
       // BufferSource: copy the bytes now. Every init getter has already run;
       // keeping a pointer into the caller's buffer would let JS detach, shrink
       // or rewrite it while decode work reads it on another thread.
-      let bytes = raw.to_vec();
+      let bytes = raw.to_vec()?;
       // Like Chrome, empty (or detached) data is a TypeError, except for an
       // unsupported type: decode() rejects with NotSupportedError instead.
       if codec_id.is_some() && bytes.is_empty() {

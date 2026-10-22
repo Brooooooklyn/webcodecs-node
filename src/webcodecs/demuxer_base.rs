@@ -741,8 +741,15 @@ pub fn load_buffer_from_js<'env, F: DemuxerFormat>(
   if !claim.try_claim() {
     return env.spawn_future(async move { Err::<(), _>(already_loaded_error()) });
   }
-  // No JS ran since `source` was located.
-  let bytes = source.to_vec();
+  // No user JS runs during the copy. If the engine copy fails, this call has
+  // not started a load and must release the claim it acquired above.
+  let bytes = match source.to_vec() {
+    Ok(bytes) => bytes,
+    Err(error) => {
+      claim.set(false);
+      return Err(error);
+    }
+  };
   spawn_load(env, inner, claim, move |demuxer| demuxer.load_buffer(bytes))
 }
 

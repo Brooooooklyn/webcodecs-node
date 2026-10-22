@@ -384,9 +384,8 @@ impl EncodedVideoChunk {
         )?;
         return Ok(());
       }
-      // SAFETY: no JS runs between locating the destination and this write.
-      let dest_slice = unsafe { destination.as_mut_slice() };
-      dest_slice[..inner.data.len()].copy_from_slice(inner.data.as_slice());
+      // No user JS runs between locating the destination and this write.
+      destination.write_from_slice(inner.data.as_slice())?;
       Ok(())
     })
   }

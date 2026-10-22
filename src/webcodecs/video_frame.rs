@@ -1938,6 +1938,7 @@ thread_local! {
 pub fn on_module_load(exports: Object, env: Env) -> Result<()> {
   // Codec event listeners and VideoFrame close observers. Cannot fail.
   super::event_target::install_callback_anchor_store(&env);
+  super::buffer_source::capture_typed_array_set(&env)?;
   capture_buffer_flag_getters(&env)?;
   capture_iterator_symbol(&env)?;
   try_install_dom_rect_read_only_shape(&env, &exports);

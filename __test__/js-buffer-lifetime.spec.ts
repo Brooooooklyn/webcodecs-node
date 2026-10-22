@@ -77,6 +77,12 @@ function own(bytes: Uint8Array): Uint8Array {
   return copy
 }
 
+function shared(bytes: Uint8Array): SharedArrayBuffer {
+  const copy = new SharedArrayBuffer(bytes.length)
+  new Uint8Array(copy).set(bytes)
+  return copy
+}
+
 function detach(buffer: ArrayBuffer): void {
   structuredClone(buffer, { transfer: [buffer] })
 }
@@ -493,6 +499,11 @@ test('ImageDecoder keeps its own copy of BufferSource data', async (t) => {
     await decodeSize(new ImageDecoder({ data: new DataView(own(PNG).buffer as ArrayBuffer), type: 'image/png' })),
     [320, 240],
   )
+  t.deepEqual(
+    await decodeSize(new ImageDecoder({ data: shared(PNG) as unknown as ArrayBuffer, type: 'image/png' })),
+    [320, 240],
+  )
+  t.deepEqual(await decodeSize(new ImageDecoder({ data: new DataView(shared(PNG)), type: 'image/png' })), [320, 240])
 
   const detachedBefore = own(PNG)
   detach(detachedBefore.buffer as ArrayBuffer)
@@ -623,7 +634,9 @@ test('muxers take a description from isConfigSupported (an ArrayBuffer) or any o
   // The description the muxer wrote is the one the demuxer reads back.
   const forms = {
     ArrayBuffer: support.config.description as ArrayBuffer,
+    SharedArrayBuffer: shared(description!) as unknown as ArrayBuffer,
     DataView: new DataView(own(description!).buffer),
+    SharedDataView: new DataView(shared(description!)),
     Uint16Array: new Uint16Array(own(description!).buffer, 0, description!.length / 2),
   }
   for (const [name, form] of Object.entries(forms)) {

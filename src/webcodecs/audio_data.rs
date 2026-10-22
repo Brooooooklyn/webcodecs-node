@@ -714,18 +714,15 @@ impl AudioData {
     // byteLength properties may lie, and reading them would run JS while the
     // locks above are held.
     let destination = buffer_source::copy_to_destination(env.raw(), &destination)?;
-    // SAFETY: no JS runs between locating the destination and the writes below.
-    let dest_slice = unsafe { destination.as_mut_slice() };
-
     // The destination must hold element_count samples in the destination
     // format — not the source format's byte size (RangeError per W3C spec)
     let copy_size = plan.element_count * dest_format.bytes_per_sample();
-    if dest_slice.len() < copy_size {
+    if destination.len() < copy_size {
       env.throw_range_error(
         &format!(
           "destination buffer too small: need {} bytes, got {}",
           copy_size,
-          dest_slice.len()
+          destination.len()
         ),
         None,
       )?;
@@ -735,99 +732,100 @@ impl AudioData {
       ));
     }
 
-    let src_format = inner.format;
-    if src_format.base() == dest_format.base() {
-      // Same base sample type (planarity may still differ) — verbatim byte
-      // copy; source indexing uses the source format's byte size
-      let bytes_per_sample = dest_format.bytes_per_sample();
-      if dest_format.is_planar() {
-        if src_format.is_planar() {
-          // Source is planar too
-          if let Some(src) = frame_guard.audio_channel_data(plane_index) {
-            let src_offset = frame_offset * bytes_per_sample;
-            dest_slice[..copy_size].copy_from_slice(&src[src_offset..src_offset + copy_size]);
-          }
-        } else {
-          // Source is interleaved, need to extract one channel
-          if let Some(src) = frame_guard.audio_channel_data(0) {
-            for i in 0..num_frames {
-              let src_offset = ((frame_offset + i) * channels + plane_index) * bytes_per_sample;
-              let dst_offset = i * bytes_per_sample;
-              dest_slice[dst_offset..dst_offset + bytes_per_sample]
-                .copy_from_slice(&src[src_offset..src_offset + bytes_per_sample]);
+    destination.write_with(copy_size, |dest_slice| {
+      let src_format = inner.format;
+      if src_format.base() == dest_format.base() {
+        // Same base sample type (planarity may still differ) — verbatim byte
+        // copy; source indexing uses the source format's byte size
+        let bytes_per_sample = dest_format.bytes_per_sample();
+        if dest_format.is_planar() {
+          if src_format.is_planar() {
+            // Source is planar too
+            if let Some(src) = frame_guard.audio_channel_data(plane_index) {
+              let src_offset = frame_offset * bytes_per_sample;
+              dest_slice[..copy_size].copy_from_slice(&src[src_offset..src_offset + copy_size]);
             }
-          }
-        }
-      } else {
-        // Interleaved output
-        if src_format.is_planar() {
-          // Source is planar, need to interleave
-          for i in 0..num_frames {
-            for ch in 0..channels {
-              if let Some(src) = frame_guard.audio_channel_data(ch) {
-                let src_offset = (frame_offset + i) * bytes_per_sample;
-                let dst_offset = (i * channels + ch) * bytes_per_sample;
+          } else {
+            // Source is interleaved, need to extract one channel
+            if let Some(src) = frame_guard.audio_channel_data(0) {
+              for i in 0..num_frames {
+                let src_offset = ((frame_offset + i) * channels + plane_index) * bytes_per_sample;
+                let dst_offset = i * bytes_per_sample;
                 dest_slice[dst_offset..dst_offset + bytes_per_sample]
                   .copy_from_slice(&src[src_offset..src_offset + bytes_per_sample]);
               }
             }
           }
         } else {
-          // Both interleaved
-          if let Some(src) = frame_guard.audio_channel_data(0) {
-            let src_offset = frame_offset * channels * bytes_per_sample;
-            dest_slice[..copy_size].copy_from_slice(&src[src_offset..src_offset + copy_size]);
+          // Interleaved output
+          if src_format.is_planar() {
+            // Source is planar, need to interleave
+            for i in 0..num_frames {
+              for ch in 0..channels {
+                if let Some(src) = frame_guard.audio_channel_data(ch) {
+                  let src_offset = (frame_offset + i) * bytes_per_sample;
+                  let dst_offset = (i * channels + ch) * bytes_per_sample;
+                  dest_slice[dst_offset..dst_offset + bytes_per_sample]
+                    .copy_from_slice(&src[src_offset..src_offset + bytes_per_sample]);
+                }
+              }
+            }
+          } else {
+            // Both interleaved
+            if let Some(src) = frame_guard.audio_channel_data(0) {
+              let src_offset = frame_offset * channels * bytes_per_sample;
+              dest_slice[..copy_size].copy_from_slice(&src[src_offset..src_offset + copy_size]);
+            }
           }
         }
-      }
-    } else {
-      // Base sample types differ — per-sample conversion through the
-      // normalized [-1, 1] domain per the spec's magnitude table
-      if dest_format.is_planar() {
-        let src = frame_guard
-          .audio_channel_data(if src_format.is_planar() {
-            plane_index
-          } else {
-            0
-          })
-          .ok_or_else(|| Error::new(Status::GenericFailure, "missing audio channel data"))?;
-        for i in 0..num_frames {
-          let src_index = if src_format.is_planar() {
-            frame_offset + i
-          } else {
-            (frame_offset + i) * channels + plane_index
-          };
-          write_sample(
-            dest_slice,
-            i,
-            dest_format,
-            read_sample(src, src_index, src_format),
-          );
-        }
       } else {
-        // Interleaved destination — all channels are written
-        for ch in 0..channels {
+        // Base sample types differ — per-sample conversion through the
+        // normalized [-1, 1] domain per the spec's magnitude table
+        if dest_format.is_planar() {
           let src = frame_guard
-            .audio_channel_data(if src_format.is_planar() { ch } else { 0 })
+            .audio_channel_data(if src_format.is_planar() {
+              plane_index
+            } else {
+              0
+            })
             .ok_or_else(|| Error::new(Status::GenericFailure, "missing audio channel data"))?;
           for i in 0..num_frames {
             let src_index = if src_format.is_planar() {
               frame_offset + i
             } else {
-              (frame_offset + i) * channels + ch
+              (frame_offset + i) * channels + plane_index
             };
             write_sample(
               dest_slice,
-              i * channels + ch,
+              i,
               dest_format,
               read_sample(src, src_index, src_format),
             );
           }
+        } else {
+          // Interleaved destination — all channels are written
+          for ch in 0..channels {
+            let src = frame_guard
+              .audio_channel_data(if src_format.is_planar() { ch } else { 0 })
+              .ok_or_else(|| Error::new(Status::GenericFailure, "missing audio channel data"))?;
+            for i in 0..num_frames {
+              let src_index = if src_format.is_planar() {
+                frame_offset + i
+              } else {
+                (frame_offset + i) * channels + ch
+              };
+              write_sample(
+                dest_slice,
+                i * channels + ch,
+                dest_format,
+                read_sample(src, src_index, src_format),
+              );
+            }
+          }
         }
       }
-    }
-
-    Ok(())
+      Ok(())
+    })
   }
 
   /// Create a copy of this AudioData

@@ -1,17 +1,22 @@
 //! Reading JavaScript `BufferSource` values (ArrayBuffer, SharedArrayBuffer,
 //! TypedArray, DataView) without trusting them or keeping them.
 //!
-//! Two rules keep native code memory safe here:
+//! Three rules keep native code memory safe here:
 //!
 //! - A view's bytes are located with engine calls (`napi_get_typedarray_info`,
 //!   `napi_get_dataview_info`, `napi_get_arraybuffer_info`), never with the
 //!   `buffer` / `byteOffset` / `byteLength` properties: JS can override those
 //!   (own properties, getters, proxies), and reading them runs JS.
-//! - A pointer into a JS buffer is only used until JS runs again. A later
-//!   getter, a callback, or returning to the event loop can detach, shrink or
-//!   rewrite the buffer, so inputs are copied into native memory right away
+//! - A pointer into a non-shared JS buffer is only used until JS runs again.
+//!   A later getter, callback, or return to the event loop can detach, shrink
+//!   or rewrite the buffer, so inputs are copied into native memory right away
 //!   and outputs are written before control goes back to JS.
+//! - Shared memory is copied with the captured intrinsic TypedArray.set on
+//!   fresh Uint8Array views. The engine handles mixed-width worker accesses;
+//!   Rust never dereferences a shared-memory pointer.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ptr;
 
 use napi::bindgen_prelude::*;
@@ -31,14 +36,17 @@ pub(crate) enum BufferSourceKind {
 
 /// The bytes of a `BufferSource` as the engine reports them.
 ///
-/// The pointer is only valid until JS runs again; copy or write through it
-/// before calling anything that can run JS.
+/// The pointer is for non-shared buffers and is only valid until JS runs again.
+/// Shared buffers use `buffer` and `byte_offset` for engine-mediated copies.
 pub(crate) struct RawBufferSource {
+  env: sys::napi_env,
   data: *mut u8,
   len: usize,
+  byte_offset: usize,
   /// The underlying ArrayBuffer (or SharedArrayBuffer).
   buffer: sys::napi_value,
   kind: BufferSourceKind,
+  shared: bool,
 }
 
 impl RawBufferSource {
@@ -51,33 +59,196 @@ impl RawBufferSource {
   }
 
   /// Copies the bytes into native memory.
-  pub(crate) fn to_vec(&self) -> Vec<u8> {
+  pub(crate) fn to_vec(&self) -> Result<Vec<u8>> {
     if self.len == 0 || self.data.is_null() {
-      return Vec::new();
+      return Ok(Vec::new());
+    }
+    if self.shared {
+      return self.shared_to_vec();
     }
     let mut out = Vec::with_capacity(self.len);
-    // SAFETY: the engine reported `len` readable bytes at `data`, and no JS has
-    // run since. A raw copy (rather than a `&[u8]`) keeps this sound even when
-    // another thread writes a SharedArrayBuffer concurrently.
+    // SAFETY: the engine reported `len` readable bytes at `data`, and no JS
+    // has run since. A non-shared buffer cannot be accessed by a worker.
     unsafe {
       ptr::copy_nonoverlapping(self.data, out.as_mut_ptr(), self.len);
       out.set_len(self.len);
     }
-    out
+    Ok(out)
   }
 
-  /// The bytes as a writable slice.
-  ///
-  /// # Safety
-  ///
-  /// The slice must not be used after JS runs again (no JS calls, callbacks,
-  /// getters, or returning to JS while it is alive).
-  pub(crate) unsafe fn as_mut_slice<'a>(&self) -> &'a mut [u8] {
-    if self.len == 0 || self.data.is_null() {
-      return &mut [];
+  fn shared_to_vec(&self) -> Result<Vec<u8>> {
+    let source = create_uint8_view(self.env, self.buffer, self.byte_offset, self.len)?;
+    let mut native_buffer = ptr::null_mut();
+    check_status!(unsafe {
+      sys::napi_create_arraybuffer(self.env, self.len, ptr::null_mut(), &mut native_buffer)
+    })?;
+    let target = create_uint8_view(self.env, native_buffer, 0, self.len)?;
+    typed_array_set(self.env, target, source)?;
+
+    // Locate the ordinary destination only after the engine copy. No worker
+    // can access it, and no pointer is live across the intrinsic call.
+    let mut data = ptr::null_mut();
+    let mut len = 0usize;
+    check_status!(unsafe {
+      sys::napi_get_arraybuffer_info(self.env, native_buffer, &mut data, &mut len)
+    })?;
+    let mut out = Vec::with_capacity(len);
+    // SAFETY: this is the ordinary ArrayBuffer created above, `len` is its
+    // engine-reported size, and no JS runs before the native copy finishes.
+    unsafe {
+      ptr::copy_nonoverlapping(data.cast::<u8>(), out.as_mut_ptr(), len);
+      out.set_len(len);
     }
-    unsafe { std::slice::from_raw_parts_mut(self.data, self.len) }
+    Ok(out)
   }
+
+  /// Copies native bytes into the destination without writing past them.
+  pub(crate) fn write_from_slice(&self, source: &[u8]) -> Result<()> {
+    assert!(source.len() <= self.len);
+    if source.is_empty() {
+      return Ok(());
+    }
+    if self.shared {
+      let mut native_buffer = ptr::null_mut();
+      let mut data = ptr::null_mut();
+      check_status!(unsafe {
+        sys::napi_create_arraybuffer(self.env, source.len(), &mut data, &mut native_buffer)
+      })?;
+      // SAFETY: the new ordinary ArrayBuffer has source.len() bytes, and no
+      // JS runs between obtaining its pointer and initializing them.
+      unsafe { ptr::copy_nonoverlapping(source.as_ptr(), data.cast::<u8>(), source.len()) };
+      let native_source = create_uint8_view(self.env, native_buffer, 0, source.len())?;
+      let target = create_uint8_view(self.env, self.buffer, self.byte_offset, source.len())?;
+      return typed_array_set(self.env, target, native_source);
+    }
+    // SAFETY: the destination is valid until JS runs again, and all callers
+    // provide native source storage that does not overlap the destination.
+    unsafe { ptr::copy_nonoverlapping(source.as_ptr(), self.data, source.len()) };
+    Ok(())
+  }
+
+  /// Writes through a native temporary for shared memory, then uses the
+  /// engine to copy it back. Ordinary buffers keep their direct slice path.
+  pub(crate) fn write_with(
+    &self,
+    len: usize,
+    write: impl FnOnce(&mut [u8]) -> Result<()>,
+  ) -> Result<()> {
+    assert!(len <= self.len);
+    if self.shared {
+      let mut native = vec![0; len];
+      let result = write(&mut native);
+      self.write_from_slice(&native)?;
+      return result;
+    }
+    if len == 0 || self.data.is_null() {
+      return write(&mut []);
+    }
+    // SAFETY: this buffer is not shared, and callers do not run JS until the
+    // closure returns. The slice covers only the established copy boundary.
+    let destination = unsafe { std::slice::from_raw_parts_mut(self.data, len) };
+    write(destination)
+  }
+}
+
+fn create_uint8_view(
+  env: sys::napi_env,
+  buffer: sys::napi_value,
+  byte_offset: usize,
+  len: usize,
+) -> Result<sys::napi_value> {
+  let mut view = ptr::null_mut();
+  check_status!(unsafe {
+    sys::napi_create_typedarray(
+      env,
+      sys::TypedarrayType::uint8_array,
+      len,
+      buffer,
+      byte_offset,
+      &mut view,
+    )
+  })?;
+  Ok(view)
+}
+
+thread_local! {
+  // The `TypedArray.set` refs of the envs on this thread, by env pointer. Each
+  // env's one cleanup hook removes its entry before the env goes away.
+  static TYPED_ARRAY_SET: RefCell<HashMap<usize, sys::napi_ref>> =
+    RefCell::new(HashMap::new());
+}
+
+/// Captures Uint8Array.prototype.set before page code can use the module.
+/// Replacing the prototype property later cannot change the stored reference.
+pub(crate) fn capture_typed_array_set(env: &Env) -> Result<()> {
+  let raw_env = env.raw();
+  let key = raw_env as usize;
+  if TYPED_ARRAY_SET.with(|intrinsics| intrinsics.borrow().contains_key(&key)) {
+    return Ok(());
+  }
+  let mut global = ptr::null_mut();
+  check_status!(unsafe { sys::napi_get_global(raw_env, &mut global) })?;
+  let mut constructor = ptr::null_mut();
+  check_status!(unsafe {
+    sys::napi_get_named_property(raw_env, global, c"Uint8Array".as_ptr(), &mut constructor)
+  })?;
+  let mut prototype = ptr::null_mut();
+  check_status!(unsafe {
+    sys::napi_get_named_property(raw_env, constructor, c"prototype".as_ptr(), &mut prototype)
+  })?;
+  let mut function = ptr::null_mut();
+  check_status!(unsafe {
+    sys::napi_get_named_property(raw_env, prototype, c"set".as_ptr(), &mut function)
+  })?;
+  let mut value_type = 0;
+  check_status!(unsafe { sys::napi_typeof(raw_env, function, &mut value_type) })?;
+  if value_type != sys::ValueType::napi_function {
+    return Err(Error::new(
+      Status::GenericFailure,
+      "Uint8Array.prototype.set is not a function",
+    ));
+  }
+  let mut reference = ptr::null_mut();
+  check_status!(unsafe { sys::napi_create_reference(raw_env, function, 1, &mut reference) })?;
+  unsafe extern "C" fn forget(env: *mut std::ffi::c_void) {
+    let _ = TYPED_ARRAY_SET.try_with(|intrinsics| {
+      intrinsics.borrow_mut().remove(&(env as usize));
+    });
+  }
+  if let Err(error) =
+    check_status!(unsafe { sys::napi_add_env_cleanup_hook(raw_env, Some(forget), raw_env.cast()) })
+  {
+    if !reference.is_null() {
+      unsafe { sys::napi_delete_reference(raw_env, reference) };
+    }
+    return Err(error);
+  }
+  TYPED_ARRAY_SET.with(|intrinsics| intrinsics.borrow_mut().insert(key, reference));
+  Ok(())
+}
+
+fn typed_array_set(
+  env: sys::napi_env,
+  target: sys::napi_value,
+  source: sys::napi_value,
+) -> Result<()> {
+  let function = TYPED_ARRAY_SET
+    .with(|intrinsics| intrinsics.borrow().get(&(env as usize)).copied())
+    .ok_or_else(|| {
+      Error::new(
+        Status::GenericFailure,
+        "TypedArray.set intrinsic is unavailable",
+      )
+    })?;
+  let mut function_value = ptr::null_mut();
+  check_status!(unsafe { sys::napi_get_reference_value(env, function, &mut function_value) })?;
+  let mut result = ptr::null_mut();
+  // Both arguments are fresh Uint8Arrays. The intrinsic's typed-array source
+  // path uses internal slots and does not read user properties or run user code.
+  check_status!(unsafe {
+    sys::napi_call_function(env, target, function_value, 1, &source, &mut result)
+  })?;
+  Ok(())
 }
 
 /// Bytes per element for a `napi_typedarray_type` (values fixed by the Node-API ABI).
@@ -153,14 +324,17 @@ pub(crate) unsafe fn inspect(
       .checked_mul(element_size)
       .ok_or_else(|| Error::new(Status::InvalidArg, "TypedArray is too large"))?;
     return Ok(Some(RawBufferSource {
+      env,
       data: data.cast(),
       len,
+      byte_offset,
       buffer,
       kind: if kind == sys::TypedarrayType::uint8_array {
         BufferSourceKind::Uint8Array
       } else {
         BufferSourceKind::OtherTypedArray
       },
+      shared: is_shared_buffer(env, buffer)?,
     }));
   }
 
@@ -182,10 +356,13 @@ pub(crate) unsafe fn inspect(
       )
     })?;
     return Ok(Some(RawBufferSource {
+      env,
       data: data.cast(),
       len,
+      byte_offset,
       buffer,
       kind: BufferSourceKind::DataView,
+      shared: is_shared_buffer(env, buffer)?,
     }));
   }
 
@@ -204,11 +381,21 @@ pub(crate) unsafe fn inspect(
     return Ok(None);
   }
   Ok(Some(RawBufferSource {
+    env,
     data: data.cast(),
     len,
+    byte_offset: 0,
     buffer: value,
     kind: BufferSourceKind::ArrayBuffer,
+    shared: is_shared_buffer(env, value)?,
   }))
+}
+
+/// Node-API distinguishes SharedArrayBuffer from ArrayBuffer without running JS.
+fn is_shared_buffer(env: sys::napi_env, buffer: sys::napi_value) -> Result<bool> {
+  let mut is_array = false;
+  check_status!(unsafe { sys::napi_is_arraybuffer(env, buffer, &mut is_array) })?;
+  Ok(!is_array)
 }
 
 /// Whether `value` is a detached ArrayBuffer. False for anything else,
@@ -238,7 +425,7 @@ pub(crate) fn copy_required_data(env: sys::napi_env, obj: &Object) -> Result<Vec
     return Err(throw_type_error(env, "data is required"));
   }
   match unsafe { inspect(env, data.raw())? } {
-    Some(raw) => Ok(raw.to_vec()),
+    Some(raw) => raw.to_vec(),
     None => Err(throw_type_error(env, "data must be a BufferSource")),
   }
 }
@@ -264,7 +451,7 @@ pub(crate) enum BufferSourceMember {
 /// Call it once every other member of the dictionary was read. Chrome reads
 /// all members first and copies the bytes when it uses the config, so a later
 /// getter that rewrites, resizes or detaches the buffer changes what it gets.
-/// Never runs JS, so no pointer into the buffer outlives this call.
+/// Never runs user JS, so no pointer into an ordinary buffer outlives this call.
 pub(crate) fn copy_member(env: sys::napi_env, value: &Unknown) -> Result<BufferSourceMember> {
   if value.get_type()? == ValueType::Undefined {
     return Ok(BufferSourceMember::Absent);
@@ -275,13 +462,13 @@ pub(crate) fn copy_member(env: sys::napi_env, value: &Unknown) -> Result<BufferS
   if is_detached_array_buffer(env, raw.buffer)? {
     return Ok(BufferSourceMember::Detached);
   }
-  Ok(BufferSourceMember::Copied(raw.to_vec()))
+  Ok(BufferSourceMember::Copied(raw.to_vec()?))
 }
 
 /// Locates the destination of a `copyTo()` call with engine calls.
 ///
-/// Throws a TypeError when it is not a BufferSource. The returned pointer is
-/// only valid until JS runs again, so write the bytes before returning.
+/// Throws a TypeError when it is not a BufferSource. The returned value must
+/// be consumed before control returns to JS.
 pub(crate) fn copy_to_destination(
   env: sys::napi_env,
   destination: &Unknown,
@@ -346,7 +533,7 @@ impl ValidateNapiValue for Uint8ArrayCopy {}
 
 impl FromNapiValue for Uint8ArrayCopy {
   unsafe fn from_napi_value(env: sys::napi_env, value: sys::napi_value) -> Result<Self> {
-    Ok(Self(unsafe { inspect_uint8_array(env, value)? }.to_vec()))
+    Ok(Self(unsafe { inspect_uint8_array(env, value)? }.to_vec()?))
   }
 }
 
@@ -388,7 +575,7 @@ impl ValidateNapiValue for BufferSourceCopy {}
 impl FromNapiValue for BufferSourceCopy {
   unsafe fn from_napi_value(env: sys::napi_env, value: sys::napi_value) -> Result<Self> {
     match unsafe { inspect(env, value)? } {
-      Some(raw) => Ok(Self(raw.to_vec())),
+      Some(raw) => Ok(Self(raw.to_vec()?)),
       None => Err(Error::new(
         Status::InvalidArg,
         "Expected an ArrayBuffer, SharedArrayBuffer, TypedArray or DataView",
