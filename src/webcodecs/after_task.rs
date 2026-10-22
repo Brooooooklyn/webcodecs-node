@@ -19,12 +19,14 @@
 //! much as napi-sys looks up Node-API. On Windows only the exe is searched (napi-sys also tries a
 //! node DLL): where Node lives in a DLL, nothing is found. Where they are missing (Deno has no
 //! uv_check_init), where the runtime is not Node (Bun exports these libuv names, but as stubs that
-//! abort with "unsupported uv function"), and on WASI, `after_task` returns false and the caller
-//! schedules the work itself.
+//! abort with "unsupported uv function"), and on WASI, a Node-API threadsafe function queues the
+//! work on the JS thread instead. Only where that is unavailable too does `after_task` return
+//! false and leave scheduling to the caller.
 //!
 //! Teardown: an async env cleanup hook closes both handles and frees them once libuv is done with
 //! them. Node runs the loop until the hook says it is done (napi_remove_async_cleanup_hook): a
-//! worker's loop must have no handle left when it closes.
+//! worker's loop must have no handle left when it closes. A fallback threadsafe function's
+//! finalizer frees queued work without running it once JS is unavailable.
 
 use napi::Env;
 
@@ -32,16 +34,15 @@ use napi::Env;
 pub(crate) type Work = Box<dyn FnOnce()>;
 
 /// Run `work` on the JS thread of `env` once the current task and its microtasks are over (see the
-/// module docs). Returns false, and drops `work`, where the host has no such loop check: the caller
+/// module docs). Returns false, and drops `work`, where the host has no such scheduler: the caller
 /// then schedules the work itself. `work` may be dropped at env teardown without running.
-#[cfg(target_family = "wasm")]
-pub(crate) fn after_task(_env: &Env, _work: Work) -> bool {
-  false
-}
-
-#[cfg(not(target_family = "wasm"))]
 pub(crate) fn after_task(env: &Env, work: Work) -> bool {
-  uv::after_task(env, work)
+  #[cfg(not(target_family = "wasm"))]
+  let work = match uv::after_task(env, work) {
+    Ok(()) => return true,
+    Err(work) => work,
+  };
+  tsfn::after_task(env, work)
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -190,16 +191,16 @@ mod uv {
     static CHECKS: RefCell<HashMap<usize, *mut Checks>> = RefCell::new(HashMap::new());
   }
 
-  pub(super) fn after_task(env: &Env, work: Work) -> bool {
+  pub(super) fn after_task(env: &Env, work: Work) -> std::result::Result<(), Work> {
     let key = env.raw() as usize;
     let Ok(found) = CHECKS.try_with(|checks| checks.borrow().get(&key).copied()) else {
-      return false;
+      return Err(work);
     };
     let checks = match found {
       Some(checks) => checks,
       None => {
         let Some(checks) = Checks::new(env) else {
-          return false;
+          return Err(work);
         };
         CHECKS.with(|all| all.borrow_mut().insert(key, checks));
         checks
@@ -219,7 +220,7 @@ mod uv {
         (checks.host.idle_start)(checks.idle, on_idle);
       }
     }
-    true
+    Ok(())
   }
 
   impl Checks {
@@ -357,6 +358,192 @@ mod uv {
       drop(unsafe { Box::from_raw(checks) });
       if !hook.is_null() {
         unsafe { (host.remove_cleanup_hook)(hook) };
+      }
+    }
+  }
+}
+
+/// The portable host queue used where the libuv check is unavailable. One threadsafe function per
+/// batch preserves call order and stays referenced until the batch is drained. The batch owns its
+/// non-Send closures; only a notification crosses the host queue.
+mod tsfn {
+  use std::cell::RefCell;
+  use std::collections::HashMap;
+  use std::ffi::c_void;
+  use std::panic::{AssertUnwindSafe, catch_unwind};
+  use std::ptr;
+
+  use napi::bindgen_prelude::*;
+  use napi::sys;
+
+  use super::Work;
+
+  /// One env's pending batch. Only its JS thread accesses this state. The threadsafe function's
+  /// finalizer frees it after the notification is drained.
+  struct Tasks {
+    env: usize,
+    work: RefCell<Vec<Work>>,
+  }
+
+  thread_local! {
+    static TASKS: RefCell<HashMap<usize, *mut Tasks>> = RefCell::new(HashMap::new());
+  }
+
+  pub(super) fn after_task(env: &Env, work: Work) -> bool {
+    let key = env.raw() as usize;
+    let Ok(found) = TASKS.try_with(|tasks| tasks.borrow().get(&key).copied()) else {
+      return false;
+    };
+    if let Some(tasks) = found {
+      // SAFETY: the map holds this batch until its callback, on this same JS thread
+      unsafe { &*tasks }.work.borrow_mut().push(work);
+      return true;
+    }
+    let Some((tasks, function)) = Tasks::new(env, work) else {
+      clear_exception(env.raw());
+      return false;
+    };
+    TASKS.with(|all| all.borrow_mut().insert(key, tasks));
+    let status = unsafe {
+      sys::napi_call_threadsafe_function(
+        function,
+        ptr::null_mut(),
+        sys::ThreadsafeFunctionCallMode::nonblocking,
+      )
+    };
+    if status == sys::Status::napi_closing {
+      // The finalizer owns and drops the batch now; the function must not be touched again.
+      return false;
+    }
+    if status != sys::Status::napi_ok {
+      forget(tasks);
+      unsafe {
+        sys::napi_release_threadsafe_function(function, sys::ThreadsafeFunctionReleaseMode::abort)
+      };
+      clear_exception(env.raw());
+      return false;
+    }
+    // Release the only acquisition. The referenced function keeps the loop alive until `on_call`
+    // has drained the batch and the host has finalized it. This must be its last use here.
+    unsafe {
+      sys::napi_release_threadsafe_function(function, sys::ThreadsafeFunctionReleaseMode::release)
+    };
+    true
+  }
+
+  impl Tasks {
+    fn new(env: &Env, work: Work) -> Option<(*mut Tasks, sys::napi_threadsafe_function)> {
+      // The custom call_js callback does not call this function; it is only the queue's target.
+      let callback = env
+        .create_function_from_closure::<(), (), _>("afterTask", |_| Ok(()))
+        .ok()?;
+      let name = env.create_string("webcodecs_after_task").ok()?;
+      let tasks = Box::into_raw(Box::new(Tasks {
+        env: env.raw() as usize,
+        work: RefCell::new(vec![work]),
+      }));
+      let mut function = ptr::null_mut();
+      // SAFETY: all values belong to this live env. On success the host calls `finalize` once for
+      // `tasks`; before success this function reclaims it below.
+      let status = unsafe {
+        sys::napi_create_threadsafe_function(
+          env.raw(),
+          callback.raw(),
+          ptr::null_mut(),
+          name.raw(),
+          0,
+          1,
+          tasks.cast(),
+          Some(finalize),
+          tasks.cast(),
+          Some(on_call),
+          &mut function,
+        )
+      };
+      if status != sys::Status::napi_ok {
+        // SAFETY: creation failed, so the host did not take ownership of `tasks`
+        drop(unsafe { Box::from_raw(tasks) });
+        return None;
+      }
+      Some((tasks, function))
+    }
+  }
+
+  unsafe extern "C" fn on_call(
+    env: sys::napi_env,
+    js_callback: sys::napi_value,
+    context: *mut c_void,
+    _data: *mut c_void,
+  ) {
+    // Aborting can finalize `context` before the host drains notifications with no JS callback.
+    // The finalizer owns any closures still in the queue, so there is nothing to do in that case.
+    if env.is_null() || js_callback.is_null() {
+      return;
+    }
+    // SAFETY: with JS still available, the context remains live until this notification is drained
+    let tasks = unsafe { &*context.cast::<Tasks>() };
+    loop {
+      let work = std::mem::take(&mut *tasks.work.borrow_mut());
+      if work.is_empty() {
+        break;
+      }
+      for item in work {
+        // A panic must not unwind into the host. Work queued by an item joins this batch because
+        // its map entry remains until the loop below has drained it.
+        let _ = catch_unwind(AssertUnwindSafe(item));
+      }
+    }
+    forget(context.cast());
+  }
+
+  fn forget(tasks: *mut Tasks) {
+    // An old env's finalizer must not remove a new env at the same address.
+    let _ = TASKS.try_with(|all| {
+      let mut all = all.borrow_mut();
+      // SAFETY: `tasks` is live in both callers
+      let env = unsafe { (*tasks).env };
+      if all.get(&env).is_some_and(|&current| current == tasks) {
+        all.remove(&env);
+      }
+    });
+  }
+
+  unsafe extern "C" fn finalize(_env: sys::napi_env, data: *mut c_void, _hint: *mut c_void) {
+    let tasks = data.cast::<Tasks>();
+    forget(tasks);
+    // SAFETY: Node-API calls this once after the queue and all acquisitions are gone. Dropping the
+    // box also drops any work left by a failed call or env shutdown.
+    drop(unsafe { Box::from_raw(tasks) });
+  }
+
+  fn clear_exception(env: sys::napi_env) {
+    let mut exception = ptr::null_mut();
+    unsafe { sys::napi_get_and_clear_last_exception(env, &mut exception) };
+  }
+
+  #[cfg(test)]
+  mod tests {
+    use super::on_call;
+    use std::ptr;
+
+    #[test]
+    fn shutdown_callbacks_return_before_touching_queue_state() {
+      let mut marker = 0;
+      let nonnull = &mut marker as *mut i32;
+      // Each null shutdown value is checked before the other one or the context is dereferenced.
+      unsafe {
+        on_call(
+          ptr::null_mut(),
+          nonnull.cast(),
+          ptr::null_mut(),
+          ptr::null_mut(),
+        );
+        on_call(
+          nonnull.cast(),
+          ptr::null_mut(),
+          ptr::null_mut(),
+          ptr::null_mut(),
+        );
       }
     }
   }

@@ -282,9 +282,10 @@ test('ImageDecoder: a JPEG decode() made just before the stream closes is BGRX, 
 // a later task, through the real setImmediate, as from I/O; it stays open. The child prints the
 // frame's format and the decoder's `complete` (false: the stream is still open), and does not
 // answer (the stream never closes) if the decode() waits for the stubs.
-function decodeWithStubbedTimers(data: Uint8Array, first: number) {
+function decodeWithStubbedTimers(data: Uint8Array, first: number, timerFirst = false, forceFallback = false) {
   const script = `
     const fs = require('node:fs');
+    if (${forceFallback}) process.isBun = true;
     const { ImageDecoder } = require('./index.js');
     const data = Buffer.from('${Buffer.from(data).toString('base64')}', 'base64');
     const later = setImmediate;
@@ -296,12 +297,13 @@ function decodeWithStubbedTimers(data: Uint8Array, first: number) {
         c.enqueue(new Uint8Array(data.subarray(0, ${first})));
       },
     });
+    if (${timerFirst} && ${first} < data.length) later(() => controller.enqueue(new Uint8Array(data.subarray(${first}))));
     const decoder = new ImageDecoder({ data: stream, type: 'image/jpeg' });
     decoder.decode().then(
       ({ image }) => fs.writeSync(1, 'RESULT:' + image.format + ' ' + decoder.complete + '\\n'),
       (error) => fs.writeSync(1, 'RESULT:' + error.name + '\\n'),
     ).then(() => process.exit(0));
-    if (${first} < data.length) later(() => controller.enqueue(new Uint8Array(data.subarray(${first}))));
+    if (!${timerFirst} && ${first} < data.length) later(() => controller.enqueue(new Uint8Array(data.subarray(${first}))));
   `
   const output = execFileSync(process.execPath, ['-e', script], {
     cwd: process.cwd(),
@@ -317,13 +319,23 @@ test('ImageDecoder: a JPEG decode() on an open stream does not wait for page tim
   t.is(decodeWithStubbedTimers(data, data.length), 'BGRX false')
 })
 
-// The data up to the SOS marker before the decode(), the rest in a later task: the reader marks
-// the stream idle in the event loop's check phase (a libuv check handle), so the rest is decoded
-// as it comes, like Chrome.
+// The data up to the SOS marker before the decode(), the rest in a later task: the host scheduler
+// marks the stream idle, so the rest is decoded as it comes, like Chrome. This remains true when
+// the real immediate was queued before the native scheduler.
 test('ImageDecoder: a JPEG chunk that comes to an idle stream does not wait for page timers', (t) => {
   const data = fixture('420-37x9.jpg')
   const sos = data.findIndex((byte, i) => byte === 0xff && data[i + 1] === 0xda)
   t.is(decodeWithStubbedTimers(data, sos), 'BGRX false')
+  t.is(decodeWithStubbedTimers(data, sos, true), 'BGRX false')
+})
+
+// Force the portable queue in a Node child too, so its shutdown and callback paths do not depend
+// on a Bun-only CI job.
+test('ImageDecoder: the fallback JPEG scheduler is host-driven and ordered before immediates', (t) => {
+  const data = fixture('420-37x9.jpg')
+  const sos = data.findIndex((byte, i) => byte === 0xff && data[i + 1] === 0xda)
+  t.is(decodeWithStubbedTimers(data, sos, false, true), 'BGRX false')
+  t.is(decodeWithStubbedTimers(data, sos, true, true), 'BGRX false')
 })
 
 // A stream that trickles in while a decode() waits, each chunk to an idle stream. Chrome's decoder
