@@ -1743,6 +1743,9 @@ impl JpegRetries {
 #[derive(Default)]
 struct JpegScan {
   state: ScanState,
+  /// Whether any input byte has been seen; the first byte must establish a
+  /// baseline libjpeg result before quiet segments can be skipped.
+  started: bool,
   /// A progressive frame (SOF2, or SOF6, SOF10, SOF14, which libjpeg fails)
   progressive: bool,
   /// The SOS segment read so far
@@ -1771,11 +1774,20 @@ enum ScanState {
 /// How many bytes of a progressive DC first scan's data cannot fail (see `JpegScan`)
 const DC_FIRST_QUIET: usize = 1 << 17;
 
+/// APP1, APP2 and APP11 are saved opaque metadata, not a reason to re-read the
+/// accumulated image for every arriving chunk. Their complete segments are
+/// quiet; structural markers and the final parse still retain their bytes.
+fn saved_app(code: u8) -> bool {
+  matches!(code, 0xE1 | 0xE2 | 0xEB)
+}
+
 impl JpegScan {
   /// The next bytes of the stream. Returns whether any of them can change a try's result.
   fn feed(&mut self, bytes: &[u8]) -> bool {
     let mut changed = false;
     for &byte in bytes {
+      let first = !self.started;
+      self.started = true;
       let quiet = match self.state {
         ScanState::Done => true,
         ScanState::Scan => {
@@ -1799,35 +1811,43 @@ impl JpegScan {
         ScanState::Between => {
           if byte == 0xFF {
             self.state = ScanState::Ff;
+            // Wait for the marker code: a saved APP segment is quiet, while a
+            // structural marker still makes the try significant.
+            true
+          } else {
+            false
           }
-          false
         }
-        ScanState::Ff => {
-          match byte {
-            0xFF => {}
-            0x00 => self.state = ScanState::Between,
-            code => self.marker(code),
+        ScanState::Ff => match byte {
+          0xFF => true,
+          0x00 => {
+            self.state = ScanState::Between;
+            false
           }
-          false
-        }
+          code => {
+            self.marker(code);
+            saved_app(code)
+          }
+        },
         ScanState::Length(code, None) => {
           self.state = ScanState::Length(code, Some(byte));
-          false
+          saved_app(code)
         }
         ScanState::Length(code, Some(high)) => {
           let length = usize::from(high) << 8 | usize::from(byte);
           self.segment(code, length.saturating_sub(2));
-          false
+          // A malformed segment length still needs libjpeg's error path.
+          saved_app(code) && length >= 2
         }
         ScanState::Segment(code, left) => {
           if code == 0xDA {
             self.sos.push(byte);
           }
           self.segment(code, left - 1);
-          false
+          saved_app(code)
         }
       };
-      changed |= !quiet;
+      changed |= first || !quiet;
     }
     changed
   }
@@ -3822,6 +3842,38 @@ mod tests {
     assert!(scan.feed(&[0xD9]));
     // Nothing after EOI is read
     assert!(!scan.feed(&[0xFF, 0xD8, 0xFF, 0xDA, 0x00]));
+  }
+
+  #[test]
+  fn jpeg_scan_quiets_complete_saved_app_segments() {
+    let inner = jpeg_decoder(include_bytes!("../../__test__/fixtures/jpeg/420-37x9.jpg"));
+    let mut retries = super::JpegRetries::default();
+    retries.chunk(&[0xFF, 0xD8]);
+    assert!(retries.run(&inner, 0));
+
+    // Split every byte, including the marker prefix, length, and payload. The
+    // payload deliberately contains bytes that look like structural markers.
+    for code in [0xE1, 0xE2, 0xEB] {
+      for byte in [0xFF, code, 0x00, 0x06, 0xFF, 0xD9, 0x00, 0x11] {
+        retries.chunk(&[byte]);
+        assert!(
+          !retries.run(&inner, 0),
+          "saved APP {code:02X} was not quiet"
+        );
+      }
+    }
+
+    // A malformed saved-APP length still reports libjpeg's failure.
+    retries.chunk(&[0xFF, 0xE2, 0x00, 0x01]);
+    assert!(retries.run(&inner, 0));
+
+    // An empty saved APP is quiet, but a following structural marker is not.
+    retries.chunk(&[0xFF, 0xE2, 0x00, 0x02]);
+    assert!(!retries.run(&inner, 0));
+    retries.chunk(&[0xFF]);
+    assert!(!retries.run(&inner, 0));
+    retries.chunk(&[0xD9]);
+    assert!(retries.run(&inner, 0));
   }
 
   #[test]
