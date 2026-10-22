@@ -3817,8 +3817,7 @@ enum LayeredDraw {
 /// complete, with FFmpeg, on its own; a read of more data decodes only the frames that became
 /// complete. While more data can come, a frame whose data is not complete is pending; once the
 /// data is complete, it fails. A bare VP8 or VP8L bitstream (a WebP with no chunk header) has no
-/// size: on an open stream its frame is decoded from the bytes read so far, and kept
-/// (`webp::image_complete`).
+/// size: its frame stays pending until the end of the stream (`webp::image_complete`).
 fn layered_frames(
   inner: &Arc<Mutex<ImageDecoderInner>>,
   call: FrameCall,
@@ -4029,8 +4028,14 @@ fn read_webp(guard: &mut ImageDecoderInner, data_complete: bool) -> LayeredRead 
     None => LayeredRead::RejectMetadata { at_end: true },
     Some(_) => LayeredRead::FailDecoder,
   };
-  // RIFF header and chunk header
-  if data.len() < 20 {
+  let (demux, demux_state) = webp::demux(data);
+  // A bare bitstream can be valid with fewer than 20 bytes; RIFF and raw chunks still wait for
+  // their header and chunk header.
+  if data.len() < 20
+    && !demux
+      .as_ref()
+      .is_some_and(|demux| webp::bare_bitstream(data, demux))
+  {
     return if data_complete {
       fail(state)
     } else {
@@ -4038,7 +4043,6 @@ fn read_webp(guard: &mut ImageDecoderInner, data_complete: bool) -> LayeredRead 
     };
   }
   let fresh = data.len() != state.parsed_len || state.lost;
-  let (demux, demux_state) = webp::demux(data);
   state.parsed_len = data.len();
   let truncated = data_complete && fresh && demux_state != DemuxState::Done;
   let demux = match demux {
@@ -4115,7 +4119,7 @@ fn read_webp(guard: &mut ImageDecoderInner, data_complete: bool) -> LayeredRead 
       PlannedFrame::Ready(CachedFrame::Pending)
     } else if frame.frame_num == 0 || (truncated_last && !yuv) {
       PlannedFrame::Ready(CachedFrame::Failed { required: None })
-    } else if webp::image_complete(data, &demux) {
+    } else if webp::image_complete(data, &demux, data_complete) {
       match kept_frame(cached_frames.as_ref(), 0) {
         Some(kept) => PlannedFrame::Ready(kept),
         None => PlannedFrame::Decode(webp::image_still(data, &demux)),
