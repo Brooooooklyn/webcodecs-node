@@ -1434,6 +1434,27 @@ test('ImageDecoder: a streamed AVIF track that ends before its last samples fail
   t.true(early.closed)
 })
 
+test('ImageDecoder: reset() keeps an AVIF track that ended before its last samples, like Chrome', async (t) => {
+  const data = avifFixture('anim8_420.avif')
+  const decoder = new ImageDecoder({ data: avifStream(data.slice(0, 2871)), type: 'image/avif' })
+  await decoder.completed
+  const before = await decoder.decode({ frameIndex: 0 })
+  t.is(before.image.timestamp, 0)
+  before.image.close()
+
+  decoder.reset()
+  const after = await decoder.decode({ frameIndex: 0 })
+  t.is(after.image.timestamp, 0)
+  after.image.close()
+  t.false(decoder.closed)
+
+  await t.throwsAsync(decoder.decode({ frameIndex: 2 }), {
+    name: 'EncodingError',
+    message: 'Failed to decode frame at index 2',
+  })
+  t.true(decoder.closed)
+})
+
 test('ImageDecoder: a complete AVIF that ends before a box its brands need fails the metadata, like Chrome', async (t) => {
   const metadataError = { name: 'InvalidStateError', message: 'Failed to retrieve track metadata.' }
   for (const [label, data] of [

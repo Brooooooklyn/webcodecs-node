@@ -2559,6 +2559,7 @@ fn cache_decoded_frames(
     jpeg_state,
     cache_epoch,
     data_complete,
+    eof_partial_track,
   ) = {
     let guard = inner
       .lock()
@@ -2589,6 +2590,7 @@ fn cache_decoded_frames(
       },
       guard.cache_epoch,
       guard.complete.load(Ordering::Acquire),
+      guard.missing_samples.is_some(),
     )
   };
 
@@ -2621,6 +2623,10 @@ fn cache_decoded_frames(
 
   // Chrome reads an AVIF with CrabbyAvif, and so does `avif`. FFmpeg's mov demuxer decodes
   // what it declines (a grid, ...) as before.
+  // A reset after EOF keeps missing_samples but clears the cache. Rebuild that accepted partial
+  // track with the EOF probe's size hint and missing-sample rules, not as a complete buffer.
+  let data_complete = data_complete && !eof_partial_track;
+  let stream_ended = stream_ended || eof_partial_track;
   let size_hint = if data_complete {
     data_bytes.len() as u64
   } else {
