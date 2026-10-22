@@ -41,12 +41,12 @@ use super::event_target::{CodecEventState, report_exception};
 pub(crate) type GatedOutput = ThreadsafeFunction<u32, UnknownReturnValue, u32, Status, false, true>;
 
 /// Worker → JS error callback, carrying the codec generation, where the
-/// error came from, and the error. The error is converted to a native
-/// DOMException on the JS thread.
+/// error came from, and the error. The gate converts its reason to a native
+/// DOMException after delivering older outputs.
 pub(crate) type GatedError = ThreadsafeFunction<
   (u32, ErrorOrigin, Error),
   UnknownReturnValue,
-  FnArgs<(u32, Option<String>, Unknown<'static>)>,
+  FnArgs<(u32, Option<String>, String)>,
   Status,
   false,
   true,
@@ -356,11 +356,11 @@ type OutputRef = FunctionRef<Unknown<'static>, UnknownReturnValue>;
 /// the returned function. For the output callback, each call takes the
 /// oldest output from the epoch's queue (the error callback may have taken
 /// it already). Calls and outputs from an older generation are dropped; the
-/// others call `callback` with the output, or with the remaining arguments,
-/// and an undefined `this`. For the error callback, the second argument is
-/// the error's name when configure() found it, or null (see `admit_error`).
-/// Before the error callback runs, the outputs still queued and those a
-/// pending flush buffered go to `output` (see `deliver_buffered`).
+/// others call `callback` with the output, or with the converted error, and an
+/// undefined `this`. For the error callback, the second argument is the error's
+/// name when configure() found it, or null (see `admit_error`), and the third
+/// is its reason. Before that reason is converted, the outputs still queued
+/// and those a pending flush buffered go to `output` (see `deliver_buffered`).
 ///
 /// An exception thrown by the callback stays pending, so it surfaces exactly
 /// as it did when the ThreadsafeFunction called the callback directly.
@@ -400,17 +400,25 @@ fn gated_callback<'env, Args: JsValuesTupleIntoVec>(
       }
       CallbackKind::Error => {
         let configure_error = ctx.get::<Option<String>>(1)?;
+        let error = ctx.get::<String>(2)?;
         if let Some(output) = output.as_ref() {
           epoch.deliver_buffered(ctx.env, generation, output)?;
         }
+        let origin = if configure_error.is_some() {
+          ErrorOrigin::Configure
+        } else {
+          ErrorOrigin::Work
+        };
+        // Output callbacks can cancel the error. Do not run page code to build
+        // a dropped error, and re-check admission after the constructor runs.
+        if epoch.drops_error(generation, origin) {
+          return Ok(());
+        }
+        let error = error_as_dom_exception(ctx.env, Error::new(Status::GenericFailure, error))?;
         if !epoch.admit_error(ctx.env, generation, configure_error.as_deref()) {
           return Ok(());
         }
-        let mut args = Vec::with_capacity(ctx.length().saturating_sub(2));
-        for index in 2..ctx.length() {
-          args.push(ctx.get::<Unknown>(index)?.raw());
-        }
-        args
+        vec![error.raw()]
       }
     };
     let function = callback.borrow_back(ctx.env)?;
@@ -460,7 +468,7 @@ pub(crate) fn gated_error(
   output: sys::napi_value,
   epoch: &CodecEpoch,
 ) -> Result<GatedError> {
-  gated_callback::<FnArgs<(u32, Option<String>, Unknown<'static>)>>(
+  gated_callback::<FnArgs<(u32, Option<String>, String)>>(
     env,
     callback,
     Some(output),
@@ -470,28 +478,14 @@ pub(crate) fn gated_error(
   .build_threadsafe_function::<(u32, ErrorOrigin, Error)>()
   .callee_handled::<false>()
   .weak::<true>()
-  .build_callback({
-    let epoch = epoch.clone();
-    move |ctx: ThreadsafeCallContext<(u32, ErrorOrigin, Error)>| {
-      let (generation, origin, error) = ctx.value;
-      let configure_error = (origin == ErrorOrigin::Configure).then(|| {
-        DOMExceptionName::from_error_message(&error.reason)
-          .as_str()
-          .to_owned()
-      });
-      // Building the DOMException reads the global `DOMException`, which page
-      // code can replace. For an error close() or reset() dropped, pass
-      // undefined instead: the gate drops it, and no page code runs, as in
-      // Chrome.
-      let error = if epoch.drops_error(generation, origin) {
-        let mut undefined = ptr::null_mut();
-        check_status!(unsafe { sys::napi_get_undefined(ctx.env.raw(), &mut undefined) })?;
-        unsafe { Unknown::from_raw_unchecked(ctx.env.raw(), undefined) }
-      } else {
-        error_as_dom_exception(&ctx.env, error)?
-      };
-      Ok(FnArgs::from((generation, configure_error, error)))
-    }
+  .build_callback(|ctx: ThreadsafeCallContext<(u32, ErrorOrigin, Error)>| {
+    let (generation, origin, error) = ctx.value;
+    let configure_error = (origin == ErrorOrigin::Configure).then(|| {
+      DOMExceptionName::from_error_message(&error.reason)
+        .as_str()
+        .to_owned()
+    });
+    Ok(FnArgs::from((generation, configure_error, error.reason)))
   })
 }
 
