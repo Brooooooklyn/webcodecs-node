@@ -504,6 +504,9 @@ struct ImageDecoderInner {
   /// decode() of the current epoch: the JS thread then decides how `completed` settles
   /// (`StreamEnd::FrameFailure`).
   end_deferred: bool,
+  /// Whether a stream reached EOF or an error. Set before its final refresh and kept across
+  /// reset(), so rebuilding its AVIF cache retains the terminal-stream parsing rules.
+  terminal_stream: bool,
   /// The frame count of an AVIF track whose stream ended before the samples of its last frames
   /// arrived (`cached_frames` holds the frames before them). Chrome counts those frames, and the
   /// decode() of one fails (see `decode_cached_frame`).
@@ -670,6 +673,7 @@ impl ImageDecoder {
       jpeg_fill: None,
       frame_failed: None,
       end_deferred: false,
+      terminal_stream: false,
       missing_samples: None,
       tracks: tracks.clone(),
       closed: false,
@@ -830,15 +834,10 @@ impl ImageDecoder {
               // waking decode waiters so they reject instead of waiting for an
               // update that can never arrive. A JPEG frame failure that a decode() has not
               // applied yet comes first: the JS thread decides (`end_with_frame_failure`).
-              let (pending, avif) = inner_clone
+              let pending = begin_terminal_refresh(&inner_clone);
+              let avif = inner_clone
                 .lock()
-                .map_or((false, false), |mut inner_guard| {
-                  inner_guard.all_data = true;
-                  (
-                    frame_failure_pending(&inner_guard),
-                    inner_guard.codec_id == Some(AVCodecID::Av1),
-                  )
-                });
+                .is_ok_and(|guard| guard.codec_id == Some(AVCodecID::Av1));
               // Chrome ends the data on a stream error as at EOF: an AVIF gets the last refresh
               // of the end of a stream. A box still missing rejects the metadata (the decoder
               // closes, and `completed` rejects with the error), and a track counts the frames
@@ -912,10 +911,7 @@ impl ImageDecoder {
         // (not for an AVIF that lacks a box, see `cache_decoded_frames`).
         // A JPEG frame failure found before the end that a decode() has not applied yet comes
         // first, as Chrome's failed decode does: the JS thread decides (`end_with_frame_failure`).
-        let pending = inner_clone.lock().is_ok_and(|mut inner_guard| {
-          inner_guard.all_data = true;
-          frame_failure_pending(&inner_guard)
-        });
+        let pending = begin_terminal_refresh(&inner_clone);
         let final_inner = inner_clone.clone();
         let _ =
           spawn_blocking(move || cache_decoded_frames(&final_inner, FrameCall::Probe, true)).await;
@@ -1502,6 +1498,16 @@ fn take_frame_failure(inner: &Arc<Mutex<ImageDecoderInner>>, epoch: u64) -> bool
 /// came since the work that found it (see `ImageDecoderInner::frame_failed`).
 fn frame_failure_pending(inner: &ImageDecoderInner) -> bool {
   !inner.closed && inner.frame_failed == Some(inner.cache_epoch)
+}
+
+/// Mark a stream EOF or error before starting its final refresh. The return value lets the
+/// collector defer its end to a pending JPEG frame failure.
+fn begin_terminal_refresh(inner: &Arc<Mutex<ImageDecoderInner>>) -> bool {
+  inner.lock().is_ok_and(|mut guard| {
+    guard.all_data = true;
+    guard.terminal_stream = true;
+    frame_failure_pending(&guard)
+  })
 }
 
 /// The JPEG frame decode that a decode() runs (see `ImageDecoderInner::jpeg_fill`). It ends when
@@ -2559,7 +2565,7 @@ fn cache_decoded_frames(
     jpeg_state,
     cache_epoch,
     data_complete,
-    eof_partial_track,
+    terminal_stream,
   ) = {
     let guard = inner
       .lock()
@@ -2590,7 +2596,7 @@ fn cache_decoded_frames(
       },
       guard.cache_epoch,
       guard.complete.load(Ordering::Acquire),
-      guard.missing_samples.is_some(),
+      guard.terminal_stream,
     )
   };
 
@@ -2623,10 +2629,10 @@ fn cache_decoded_frames(
 
   // Chrome reads an AVIF with CrabbyAvif, and so does `avif`. FFmpeg's mov demuxer decodes
   // what it declines (a grid, ...) as before.
-  // A reset after EOF keeps missing_samples but clears the cache. Rebuild that accepted partial
-  // track with the EOF probe's size hint and missing-sample rules, not as a complete buffer.
-  let data_complete = data_complete && !eof_partial_track;
-  let stream_ended = stream_ended || eof_partial_track;
+  // A reset clears the cache but not terminal-stream provenance. Rebuild with the final probe's
+  // size hint and missing-sample rules, even when that probe's commit became stale.
+  let data_complete = data_complete && !terminal_stream;
+  let stream_ended = stream_ended || terminal_stream;
   let size_hint = if data_complete {
     data_bytes.len() as u64
   } else {
@@ -2736,6 +2742,7 @@ fn store_frames(
   repetition_count: Option<f64>,
   missing_samples: Option<usize>,
 ) -> Result<()> {
+  before_store_frames();
   let mut guard = inner
     .lock()
     .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
@@ -3069,6 +3076,19 @@ fn after_jpeg_decode() {
 #[cfg(not(test))]
 fn after_jpeg_decode() {}
 
+/// Runs before a frame cache commit: the tests make a reset() land there so the commit is stale.
+#[cfg(test)]
+fn before_store_frames() {
+  tests::BEFORE_STORE_FRAMES.with(|hook| {
+    if let Some(hook) = hook.borrow_mut().as_mut() {
+      hook();
+    }
+  });
+}
+
+#[cfg(not(test))]
+fn before_store_frames() {}
+
 /// Chrome's scale numerator M: libjpeg decodes a JPEG at M/8 of its size so that its 4-byte
 /// pixels fit the budget that desiredWidth/desiredHeight give
 /// (JPEGImageDecoder::DesiredScaleNumerator, CalculateMaxDecodedBytes). 8 is full size; 0 means
@@ -3352,8 +3372,8 @@ mod tests {
   use super::{
     AVCodecID, ColorSpaceConversion, FrameCall, ImageDecoder, ImageDecoderData, ImageDecoderInner,
     ImageTrackData, ImageTrackList, ImageTrackListInner, JpegPost, abort_if_reset,
-    apply_frame_failure, cache_decoded_frames, decode_cached_frame, end_with_frame_failure,
-    finish_jpeg_post, frame_failure, post_before_end, take_frame_failure,
+    apply_frame_failure, begin_terminal_refresh, cache_decoded_frames, decode_cached_frame,
+    end_with_frame_failure, finish_jpeg_post, frame_failure, post_before_end, take_frame_failure,
   };
   use napi::tokio::sync::Notify;
   use std::cell::{Cell, RefCell};
@@ -3479,6 +3499,9 @@ mod tests {
     /// See `after_jpeg_decode`
     pub(super) static AFTER_JPEG_DECODE: RefCell<Option<Box<dyn FnMut()>>> =
       const { RefCell::new(None) };
+    /// See `before_store_frames`
+    pub(super) static BEFORE_STORE_FRAMES: RefCell<Option<Box<dyn FnMut()>>> =
+      const { RefCell::new(None) };
   }
 
   /// A JPEG whose data ends inside its scan: Chrome fails its frame at a decode()
@@ -3519,6 +3542,7 @@ mod tests {
       jpeg_fill: None,
       frame_failed: None,
       end_deferred: false,
+      terminal_stream: false,
       missing_samples: None,
       tracks,
       closed: false,
@@ -3530,6 +3554,16 @@ mod tests {
       desired_height: None,
       prefer_animation: None,
     }))
+  }
+
+  /// The state of an ImageDecoder with `data` and a chosen codec, once its tracks are ready.
+  fn decoder(data: &[u8], codec_id: AVCodecID, mime_type: &str) -> Arc<Mutex<ImageDecoderInner>> {
+    let inner = jpeg_decoder(data);
+    let mut guard = inner.lock().unwrap();
+    guard.codec_id = Some(codec_id);
+    guard.mime_type = mime_type.to_string();
+    drop(guard);
+    inner
   }
 
   /// The error reason of a result, or "ok"
@@ -4105,5 +4139,55 @@ mod tests {
     inner.lock().unwrap().frame_failed = Some(1);
     assert!(retries.run(&inner, 1));
     assert!(retries.run(&inner, 1));
+  }
+
+  #[test]
+  fn a_reset_during_the_final_avif_probe_preserves_terminal_stream_rules() {
+    let data = include_bytes!("../../__test__/fixtures/avif/anim8_420.avif");
+    let inner = decoder(&data[..2871], AVCodecID::Av1, "image/avif");
+    {
+      let mut guard = inner.lock().unwrap();
+      guard.all_data = false;
+      guard.complete.store(false, Ordering::Release);
+      assert_eq!(guard.missing_samples, None);
+    }
+    assert!(!begin_terminal_refresh(&inner));
+
+    // Reset after the final probe decoded its frames but before its cache commit. The stale
+    // commit must not be the only place that terminal-stream state survives.
+    let hook_inner = inner.clone();
+    BEFORE_STORE_FRAMES.with(|slot| {
+      *slot.borrow_mut() = Some(Box::new(move || reset(&hook_inner)));
+    });
+    let result = cache_decoded_frames(&inner, FrameCall::Probe, true);
+    BEFORE_STORE_FRAMES.with(|slot| *slot.borrow_mut() = None);
+    assert_eq!(reason(result), "ok");
+    {
+      let guard = inner.lock().unwrap();
+      assert!(guard.terminal_stream);
+      assert_eq!(guard.cache_epoch, 1);
+      assert!(guard.cached_frames.is_none());
+      assert_eq!(guard.missing_samples, None);
+    }
+
+    // The collector marks the data complete after the stale probe. A later decode must rebuild
+    // the two available frames with the stream size hint and retain the missing third sample.
+    inner
+      .lock()
+      .unwrap()
+      .complete
+      .store(true, Ordering::Release);
+    assert!(matches!(decode_cached_frame(&inner, 0, 1), Ok(Some(_))));
+    {
+      let guard = inner.lock().unwrap();
+      assert!(!guard.closed);
+      assert!(!guard.tracks.failed.load(Ordering::Acquire));
+      assert_eq!(guard.missing_samples, Some(3));
+      assert_eq!(guard.cached_frames.as_ref().map(Vec::len), Some(2));
+    }
+    assert_eq!(
+      reason(decode_cached_frame(&inner, 2, 1)),
+      "Failed to decode frame at index 2"
+    );
   }
 }

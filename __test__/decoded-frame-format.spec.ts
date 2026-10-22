@@ -1455,6 +1455,45 @@ test('ImageDecoder: reset() keeps an AVIF track that ended before its last sampl
   t.true(decoder.closed)
 })
 
+test('ImageDecoder: reset() keeps terminal-stream rules for a truncated AVIF item', async (t) => {
+  const cuts = [
+    ['missing item tail', avifFixture('s8_420.avif').slice(0, -100)],
+    // Fewer bytes than the colour item's 854: a complete buffer rejects this item's metadata,
+    // but a terminal stream uses the streaming size hint and has zero decodable frames.
+    ['item larger than the data', avifFixture('a8_420.avif').slice(0, 530)],
+  ] as const
+  for (const [cut, data] of cuts) {
+    for (const [end, stream] of [
+      ['EOF', avifStream],
+      ['stream error', avifErrorStream],
+    ] as const) {
+      const label = `${cut}, ${end}`
+      const decoder = new ImageDecoder({ data: stream(data), type: 'image/avif' })
+      const completed = decoder.completed
+      await decoder.tracks.ready
+      if (end === 'stream error') {
+        await t.throwsAsync(completed, { message: 'stream broke' }, label)
+      } else {
+        await completed
+      }
+
+      for (const afterReset of [false, true]) {
+        if (afterReset) decoder.reset()
+        await t.throwsAsync(
+          decoder.decode(),
+          {
+            instanceOf: RangeError,
+            message: 'Frame index 0 out of bounds (image has 0 frames)',
+          },
+          `${label}, afterReset ${afterReset}`,
+        )
+        t.false(decoder.closed, `${label}, afterReset ${afterReset}`)
+      }
+      decoder.close()
+    }
+  }
+})
+
 test('ImageDecoder: a complete AVIF that ends before a box its brands need fails the metadata, like Chrome', async (t) => {
   const metadataError = { name: 'InvalidStateError', message: 'Failed to retrieve track metadata.' }
   for (const [label, data] of [
