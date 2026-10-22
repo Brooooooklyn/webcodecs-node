@@ -1765,19 +1765,17 @@ fn capture_buffer_flag_getters(env: &Env) -> Result<()> {
 }
 
 thread_local! {
-  // The env's `Symbol.iterator` (null if it was not a symbol), read when the module loads, like
-  // `BUFFER_FLAG_GETTERS` and with the same limit. Its cleanup hook empties the slot.
-  static ITERATOR_SYMBOL: std::cell::Cell<Option<(napi::sys::napi_env, napi::sys::napi_ref)>> =
-    const { std::cell::Cell::new(None) };
+  // The `Symbol.iterator` refs of the envs on this thread, by env pointer. Each env's one cleanup
+  // hook removes its entry before the env goes away, so a reused pointer never finds a stale ref.
+  static ITERATOR_SYMBOLS: RefCell<HashMap<usize, napi::sys::napi_ref>> =
+    RefCell::new(HashMap::new());
 }
 
 /// Captures `Symbol.iterator` of `env`, once per env.
 fn capture_iterator_symbol(env: &Env) -> Result<()> {
   use napi::sys;
-  if ITERATOR_SYMBOL
-    .get()
-    .is_some_and(|(owner, _)| owner == env.raw())
-  {
+  let key = env.raw() as usize;
+  if ITERATOR_SYMBOLS.with(|symbols| symbols.borrow().contains_key(&key)) {
     return Ok(());
   }
   let env = env.raw();
@@ -1801,28 +1799,33 @@ fn capture_iterator_symbol(env: &Env) -> Result<()> {
     }
   }
   unsafe extern "C" fn forget(env: *mut std::ffi::c_void) {
-    let _ = ITERATOR_SYMBOL.try_with(|slot| {
-      if slot.get().is_some_and(|(owner, _)| owner.cast() == env) {
-        slot.set(None);
-      }
+    let _ = ITERATOR_SYMBOLS.try_with(|symbols| {
+      symbols.borrow_mut().remove(&(env as usize));
     });
   }
   // Node deletes the references of an env when it tears the env down.
-  napi::check_status!(unsafe { sys::napi_add_env_cleanup_hook(env, Some(forget), env.cast()) })?;
-  ITERATOR_SYMBOL.set(Some((env, reference)));
+  if let Err(error) =
+    napi::check_status!(unsafe { sys::napi_add_env_cleanup_hook(env, Some(forget), env.cast()) })
+  {
+    if !reference.is_null() {
+      unsafe { sys::napi_delete_reference(env, reference) };
+    }
+    return Err(error);
+  }
+  ITERATOR_SYMBOLS.with(|symbols| symbols.borrow_mut().insert(key, reference));
   Ok(())
 }
 
 /// The `Symbol.iterator` captured for `env`.
 fn iterator_symbol<'env>(env: napi::sys::napi_env) -> Result<Unknown<'env>> {
-  let reference = match ITERATOR_SYMBOL.get() {
-    Some((owner, reference)) if owner == env => reference,
+  let key = env as usize;
+  let reference = match ITERATOR_SYMBOLS.with(|symbols| symbols.borrow().get(&key).copied()) {
+    Some(reference) => reference,
     // The load hook runs for every env, so this is only a fallback.
-    _ => {
+    None => {
       capture_iterator_symbol(&Env::from_raw(env))?;
-      ITERATOR_SYMBOL
-        .get()
-        .map(|(_, reference)| reference)
+      ITERATOR_SYMBOLS
+        .with(|symbols| symbols.borrow().get(&key).copied())
         .ok_or_else(|| Error::new(Status::GenericFailure, "Symbol.iterator missing"))?
     }
   };
