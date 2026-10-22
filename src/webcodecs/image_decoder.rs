@@ -4712,6 +4712,7 @@ fn before_layered_draw() {
 
 #[cfg(not(test))]
 fn before_store_frames() {}
+#[cfg(not(test))]
 fn before_layered_draw() {}
 
 /// Runs in `draw_frames` before each frame it decodes, before it looks for a close() or a
