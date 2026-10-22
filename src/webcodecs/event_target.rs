@@ -1177,7 +1177,7 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
 }
 
 /// Report one listener exception as an uncaught error via the microtask queue.
-/// Falls back to throwing inline if scheduling fails — better than swallowing.
+/// Falls back to reporting inline without leaving a pending exception.
 pub(crate) fn report_exception(env: &Env, exc: sys::napi_value) {
   let mut exc_ref = ptr::null_mut();
   let env_raw = env.raw();
@@ -1203,7 +1203,7 @@ pub(crate) fn report_exception(env: &Env, exc: sys::napi_value) {
         })
         .is_ok();
   if !reported {
-    unsafe { sys::napi_throw(env_raw, exc) };
+    unsafe { sys::napi_fatal_exception(env_raw, exc) };
     if !exc_ref.is_null() {
       unsafe { sys::napi_delete_reference(env_raw, exc_ref) };
     }

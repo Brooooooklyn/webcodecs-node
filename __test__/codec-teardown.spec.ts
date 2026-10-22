@@ -563,6 +563,42 @@ test('outputs of work before a failure reach JS before the error callback, and t
   }
 })
 
+// Some Node-API versions cannot retain a primitive with napi_create_reference.
+// Reporting it must not leave a pending exception that stops the remaining
+// outputs and the codec's own error callback.
+test.serial('primitive output exceptions do not stop later outputs or the codec error callback', async (t) => {
+  for (const thrown of ['primitive-output-threw', 42] as const) {
+    for (const failCase of await failAfterOutputCases()) {
+      const log: string[] = []
+      process.setUncaughtExceptionCaptureCallback((error) => {
+        log.push(`uncaught:${String(error)}`)
+      })
+      try {
+        const codec = failCase.run((entry) => {
+          log.push(entry)
+          if (entry === 'output') throw thrown
+        }, 2)
+        await codec.flush().catch((error: unknown) => log.push(`flush:${(error as DOMException).name}`))
+        await delay(20)
+      } finally {
+        process.setUncaughtExceptionCaptureCallback(null)
+      }
+      t.deepEqual(
+        log,
+        [
+          'output',
+          `uncaught:${String(thrown)}`,
+          'output',
+          `uncaught:${String(thrown)}`,
+          `error:${failCase.error}`,
+          `flush:${failCase.error}`,
+        ],
+        `${String(thrown)}: ${failCase.name}`,
+      )
+    }
+  }
+})
+
 // The flush rejection is built from the global DOMException, which page code can
 // replace. When the replacement throws, napi-rs cannot reject the promise while
 // that exception is pending, so the flush stayed pending forever. Now it rejects
@@ -655,6 +691,68 @@ test.serial('a pending flush still settles when page code replaced DOMException 
       t.deepEqual(
         log,
         ['output', 'output', `error:${failCase.error}`, 'flush:rejected with that value'],
+        `${replacement.name}: ${failCase.name}`,
+      )
+    }
+  }
+})
+
+const throwingDOMExceptionReplacements = [
+  {
+    name: 'getter throws',
+    install(thrown: Error) {
+      replaceDOMExceptionWithThrowingGetter(thrown)
+    },
+  },
+  {
+    name: 'constructor throws',
+    install(thrown: Error) {
+      Object.defineProperty(globalThis, 'DOMException', {
+        configurable: true,
+        writable: true,
+        value: function ReplacedDOMException() {
+          throw thrown
+        },
+      })
+    },
+  },
+]
+
+// Building the callback's DOMException still reports a replacement's exception
+// as uncaught. That report must not overtake outputs produced before the error,
+// and the pending flush must still reject. The capture callback restores the
+// native global so the flush rejection does not depend on the replacement.
+test.serial('buffered outputs precede a throwing DOMException replacement and the flush still settles', async (t) => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'DOMException')!
+  for (const replacement of throwingDOMExceptionReplacements) {
+    for (const failCase of await failAfterOutputCases()) {
+      const log: string[] = []
+      const thrown = new Error('replacement-threw')
+      let resolveUncaught!: () => void
+      const uncaught = new Promise<void>((resolve) => {
+        resolveUncaught = resolve
+      })
+      process.setUncaughtExceptionCaptureCallback((error) => {
+        log.push(`uncaught:${error instanceof Error ? error.message : String(error)}`)
+        Object.defineProperty(globalThis, 'DOMException', descriptor)
+        resolveUncaught()
+      })
+      try {
+        replacement.install(thrown)
+        const codec = failCase.run((entry) => log.push(entry), 2)
+        const flush = codec.flush().then(
+          () => 'flush:resolved',
+          (error: unknown) => `flush:${error === thrown ? failCase.error : (error as DOMException).name}`,
+        )
+        const [flushResult] = await Promise.all([flush, uncaught])
+        log.push(flushResult)
+      } finally {
+        process.setUncaughtExceptionCaptureCallback(null)
+        Object.defineProperty(globalThis, 'DOMException', descriptor)
+      }
+      t.deepEqual(
+        log,
+        ['output', 'output', 'uncaught:replacement-threw', `flush:${failCase.error}`],
         `${replacement.name}: ${failCase.name}`,
       )
     }
