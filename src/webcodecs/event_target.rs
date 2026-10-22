@@ -172,7 +172,7 @@ pub struct CodecEventState {
   scheduled_items: usize,
   /// Errors sent to the codec's error callback that have not run yet (see
   /// [`Self::report_error`]). While >0 a scheduled dequeue event waits, and
-  /// runs right after the error callback.
+  /// is queued after the error callback returns.
   errors_pending: usize,
   /// Single dispatcher invoked from the worker thread; runs the whole
   /// dispatch on the JS thread in one call.
@@ -238,8 +238,8 @@ impl CodecEventState {
           CMD_DISPATCH => {
             let shared = unsafe { Arc::from_raw(ptr as usize as *const RwLock<CodecEventState>) };
             let covered = match shared.write() {
-              // Waits for an error callback, or already ran right after one
-              // (see report_error).
+              // Waits for an error callback, or its schedule already ran after
+              // one (see report_error).
               Ok(state) if state.errors_pending > 0 || !state.dequeue_scheduled => None,
               Ok(mut state) => Some(state.take_scheduled()),
               Err(_) => None,
@@ -339,7 +339,7 @@ impl CodecEventState {
         state.making_dispatcher = state.making_dispatcher.saturating_sub(1);
         let unused = state.install_dispatcher(dispatcher);
         // Queue the event of dequeues that waited for this dispatcher. One that
-        // waits for an error callback runs right after it (see report_error).
+        // waits for an error callback is queued after it (see report_error).
         if unused.is_none()
           && state.dequeue_scheduled
           && state.errors_pending == 0
@@ -696,8 +696,9 @@ impl CodecEventState {
   /// work the error dropped after it: closing the codec queues that event and
   /// then invokes the callback. Here the error and the dequeue event reach JS
   /// through two thread-safe functions, whose order is not defined, so a
-  /// dequeue event that comes due before the error callback has run waits,
-  /// and runs right after the callback, from the same call.
+  /// dequeue event that comes due before the error callback has run waits.
+  /// Once the callback returns it is queued through the dispatcher, after the
+  /// callback's microtasks.
   pub fn report_error(
     shared: &Arc<RwLock<CodecEventState>>,
     callback: &CodecErrorCallback,
@@ -720,7 +721,7 @@ impl CodecEventState {
             unsafe { sys::napi_fatal_exception(env.raw(), value) };
           }
         }
-        delivery.delivered(&env);
+        delivery.delivered();
         Ok(())
       },
     );
@@ -733,18 +734,23 @@ impl CodecEventState {
 struct ErrorDelivery(Option<Arc<RwLock<CodecEventState>>>);
 
 impl ErrorDelivery {
-  /// JS thread, right after the error callback: run a waiting dequeue event
-  /// when this was the last pending error.
-  fn delivered(mut self, env: &Env) {
+  /// JS thread, after the error callback: queue a waiting dequeue event when
+  /// this was the last pending error.
+  fn delivered(mut self) {
     let Some(shared) = self.0.take() else {
       return;
     };
-    let covered = shared.write().ok().and_then(|mut state| {
-      state.errors_pending = state.errors_pending.saturating_sub(1);
-      (state.errors_pending == 0 && state.dequeue_scheduled).then(|| state.take_scheduled())
-    });
-    if let Some(covered) = covered {
-      CodecEventState::deliver_dequeue(env, &shared, covered);
+    let Ok(mut state) = shared.write() else {
+      return;
+    };
+    state.errors_pending = state.errors_pending.saturating_sub(1);
+    if state.errors_pending == 0
+      && state.dequeue_scheduled
+      && let Some(dispatcher) = state.dispatcher.clone()
+    {
+      // Leave the schedule intact for the dispatcher, whether its original
+      // payload was consumed while waiting or is still queued.
+      state.queue_dispatch(&shared, &dispatcher);
     }
   }
 }

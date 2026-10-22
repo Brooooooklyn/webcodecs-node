@@ -632,7 +632,7 @@ test('dequeue: an item dequeued while the first listener is being added still fi
 const TEARDOWN = `
   const N = 6;
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  async function teardown(Codec, setup) {
+  async function teardown(Codec, setup, onError) {
     const errors = [];
     const dequeues = [];
     const log = [];
@@ -643,6 +643,7 @@ const TEARDOWN = `
       error: (error) => {
         errors.push(error.name + ':' + queueSize() + ':' + codec.state);
         log.push('error');
+        if (onError) onError(log);
       },
     });
     codec.addEventListener('dequeue', () => {
@@ -775,6 +776,69 @@ test('dequeue: a display aspect error on an output frame leaves the VideoDecoder
   t.deepEqual(fromError(result.log), ['error', 'dequeue:0'], 'one dequeue event follows the error')
 })
 
+test('dequeue: error callback microtasks precede one dequeue with the original payload still queued', (t) => {
+  // Without a competing output callback, the error callback runs first and leaves
+  // the original dispatcher payload queued. Both payloads must coalesce into one
+  // event after the callback's microtasks.
+  const result = runChild<Record<string, Teardown>>(`
+    ${PRELUDE}
+    const m = require('./index.js');
+    ${TEARDOWN}
+    const audioData = (i) =>
+      new m.AudioData({ format: 'f32-planar', sampleRate: 48000, numberOfFrames: 960, numberOfChannels: 2, timestamp: i * 20000, data: new Float32Array(1920) });
+    const SETUPS = {
+      AudioDecoder(codec) {
+        codec.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 });
+        for (let i = 0; i < N; i++) codec.decode(new m.EncodedAudioChunk({ type: 'key', timestamp: i, data: new Uint8Array(0) }));
+      },
+      VideoDecoder(codec, key) {
+        codec.configure({ codec: 'vp8', codedWidth: 64, codedHeight: 64 });
+        codec.decode(key);
+        for (let i = 1; i <= N; i++) codec.decode(new m.EncodedVideoChunk({ type: 'delta', timestamp: i * 33333, data: new Uint8Array(0) }));
+      },
+      AudioEncoder(codec) {
+        codec.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 });
+        codec.configure({ codec: 'opus', sampleRate: 44100, numberOfChannels: 2 });
+        for (let i = 0; i < N; i++) { const data = audioData(i); codec.encode(data); data.close(); }
+      },
+      VideoEncoder(codec) {
+        codec.configure({ codec: 'vp8', width: 16, height: 16, bitrate: 100000 });
+        for (let i = 0; i < 3; i++) {
+          const frame = m.createVideoFrameFromRGBA16Float(new Uint16Array(16 * 16 * 4).fill(0x3c00), { codedWidth: 16, codedHeight: 16, timestamp: i });
+          codec.encode(frame);
+          frame.close();
+        }
+      },
+    };
+    const queueMicrotasks = (log) => {
+      queueMicrotask(() => log.push('microtask'));
+      Promise.resolve().then(() => log.push('promise'));
+    };
+    (async () => {
+      let key;
+      const encoder = new m.VideoEncoder({ output: (chunk) => { key = chunk; }, error: fail });
+      encoder.configure({ codec: 'vp8', width: 64, height: 64, bitrate: 200000 });
+      const frame = new m.VideoFrame(new Uint8Array(64 * 64 * 4), { format: 'RGBA', codedWidth: 64, codedHeight: 64, timestamp: 0 });
+      encoder.encode(frame, { keyFrame: true });
+      frame.close();
+      await encoder.flush();
+      encoder.close();
+      const out = {};
+      for (const kind of CODECS) {
+        out[kind] = await teardown(m[kind], (codec) => SETUPS[kind](codec, key), queueMicrotasks);
+      }
+      done(out);
+    })().catch(fail);
+  `)
+  for (const kind of ['AudioDecoder', 'VideoDecoder', 'AudioEncoder', 'VideoEncoder']) {
+    t.deepEqual(
+      fromError(result[kind].log),
+      ['error', 'microtask', 'promise', 'dequeue:0'],
+      `${kind}: microtasks run between the error and its one dequeue event`,
+    )
+  }
+})
+
 test('dequeue: the error callback runs before the dequeue event for the work it dropped, under load', (t) => {
   // Chrome 155 (10 of 10 runs each, same triggers): AudioDecoder, AudioEncoder and
   // VideoEncoder log the error, then dequeue:0; VideoDecoder logs dequeue:6, the
@@ -783,8 +847,9 @@ test('dequeue: the error callback runs before the dequeue event for the work it 
   // The error and the dequeue event reach JS through two thread-safe functions.
   // Each failure here starts while the JS thread is busy with the output callbacks
   // of another encoder whose thread-safe function was created between the failing
-  // codec's error and dequeue ones, which used to deliver the dequeue event first
-  // every time. Only the order is checked; the deadline only bounds a failing run.
+  // codec's error and dequeue ones. The dispatcher consumes the original payload
+  // while the error is pending. Check microtask ordering and exactly one replacement
+  // event; the deadline only bounds a failing run.
   const result = runChild<Record<string, Record<string, number>>>(`
     ${PRELUDE}
     const m = require('./index.js');
@@ -836,7 +901,14 @@ test('dequeue: the error callback runs before the dequeue event for the work it 
         for (let i = 0; i < PER_KIND; i++) {
           for (const kind of Object.keys(SETUPS)) {
             const run = { kind, log: [] };
-            run.codec = new m[kind]({ output: (o) => o.close?.(), error: () => run.log.push('error') });
+            run.codec = new m[kind]({
+              output: (o) => o.close?.(),
+              error: () => {
+                run.log.push('error');
+                queueMicrotask(() => run.log.push('microtask'));
+                Promise.resolve().then(() => run.log.push('promise'));
+              },
+            });
             runs.push(run);
           }
         }
@@ -858,7 +930,10 @@ test('dequeue: the error callback runs before the dequeue event for the work it 
         // No flush: outputs during a flush are delivered by the flush, not by the
         // output callback's thread-safe function.
         for (let i = 0; i < runs.length * 3; i++) { const data = audioData(i); busy.encode(data); data.close(); }
-        const finished = (run) => run.log.includes('error') && run.log.at(-1) === 'dequeue:0';
+        const finished = (run) => {
+          const from = run.log.indexOf('error');
+          return from >= 0 && ['microtask', 'promise', 'dequeue:0'].every((entry) => run.log.slice(from).includes(entry));
+        };
         while (!runs.every(finished) && Date.now() < deadline) await sleep(10);
         // Room for any extra event to arrive.
         await sleep(100);
@@ -873,6 +948,10 @@ test('dequeue: the error callback runs before the dequeue event for the work it 
     })().catch(fail);
   `)
   for (const kind of ['AudioDecoder', 'VideoDecoder', 'AudioEncoder', 'VideoEncoder']) {
-    t.deepEqual(result[kind], { 'error,dequeue:0': 20 }, `${kind}: from the error on, every run logs error, dequeue:0`)
+    t.deepEqual(
+      result[kind],
+      { 'error,microtask,promise,dequeue:0': 20 },
+      `${kind}: the consumed payload is replaced once, after the error callback's microtasks`,
+    )
   }
 })
