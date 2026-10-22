@@ -4,8 +4,8 @@
 // (Chromium's changes to the IJG files), Chromium's LICENSE as CHROMIUM_LICENSE, and
 // CHROMIUM_PIN, which records the Chrome version, the DEPS revision, the selection rule
 // and the source lists for build.rs.
-// LICENSE.md and README.ijg are also copied to licenses/ and listed in
-// licenses/manifest.json for the npm packages.
+// LICENSE.md, README.ijg, CHROMIUM_LICENSE and simd/nasm/jsimdext.inc are also
+// copied to licenses/ and listed in licenses/manifest.json for the npm packages.
 //
 //   node tools/sync-libjpeg-turbo.mjs                    re-sync the pinned revision
 //   node tools/sync-libjpeg-turbo.mjs --chrome <version> sync the revision in that Chrome's DEPS
@@ -200,9 +200,31 @@ try {
 
   const manifest = JSON.parse(await readFile(join(licenses, 'manifest.json'), 'utf8'))
   const manifestText = JSON.stringify(manifest, null, 2) + '\n'
-  for (const upstreamPath of ['LICENSE.md', 'README.ijg']) {
-    const file = `libjpeg-turbo-${upstreamPath}.txt`
-    const data = wanted.get(upstreamPath)
+  const libjpegTurbo = {
+    project: 'libjpeg-turbo',
+    upstream: `${gitiles}/chromium/deps/libjpeg_turbo`,
+    revision,
+    ref: `Chrome ${chrome} DEPS`,
+  }
+  const noticeSources = [
+    { ...libjpegTurbo, file: 'libjpeg-turbo-LICENSE.md.txt', upstreamPath: 'LICENSE.md' },
+    { ...libjpegTurbo, file: 'libjpeg-turbo-README.ijg.txt', upstreamPath: 'README.ijg' },
+    {
+      file: 'libjpeg-turbo-CHROMIUM_LICENSE.txt',
+      project: 'Chromium',
+      upstream: `${gitiles}/chromium/src`,
+      ref: `Chrome ${chrome}`,
+      upstreamPath: 'LICENSE',
+      wantedPath: 'CHROMIUM_LICENSE',
+    },
+    {
+      ...libjpegTurbo,
+      file: 'libjpeg-turbo-jsimdext.inc.txt',
+      upstreamPath: 'simd/nasm/jsimdext.inc',
+    },
+  ]
+  for (const { file, wantedPath, ...metadata } of noticeSources) {
+    const data = wanted.get(wantedPath ?? metadata.upstreamPath)
     const old = await readFile(join(licenses, file)).catch(() => null)
     if (!old?.equals(data)) {
       await writeFile(join(licenses, file), data)
@@ -210,11 +232,7 @@ try {
     }
     const entry = {
       file,
-      project: 'libjpeg-turbo',
-      upstream: `${gitiles}/chromium/deps/libjpeg_turbo`,
-      revision,
-      ref: `Chrome ${chrome} DEPS`,
-      upstreamPath,
+      ...metadata,
       excerpt: false,
       sha256: createHash('sha256').update(data).digest('hex'),
     }

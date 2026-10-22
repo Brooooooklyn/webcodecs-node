@@ -39,7 +39,7 @@ its port patches and actual resolved build inputs must also be retained.
 | Brotli                     | `v1.1.0`                                                                                         | MIT; `brotli-LICENSE.txt`                                                                                              |
 | Little CMS 2               | Unix `lcms2.16`; Windows `lcms2.17`                                                              | MIT; `lcms2-LICENSE.txt`, `lcms2-windows-LICENSE.txt`                                                                  |
 | NVIDIA codec headers       | Linux recipe `n13.0.19.0`, except armv7                                                          | MIT; `nv-codec-headers-nvEncodeAPI.h.txt`                                                                              |
-| libjpeg-turbo              | `3.1.0` from Chrome `155.0.8059.79` DEPS, in `vendor/libjpeg-turbo`, all targets                 | IJG License and BSD-3-Clause; `libjpeg-turbo-LICENSE.md.txt`, `libjpeg-turbo-README.ijg.txt`                           |
+| libjpeg-turbo              | `3.1.0` from Chrome `155.0.8059.79` DEPS, in `vendor/libjpeg-turbo`, all targets                 | IJG License, BSD-3-Clause and zlib; `libjpeg-turbo-LICENSE.md.txt`, `libjpeg-turbo-README.ijg.txt`; see below          |
 | Blink JPEG decoder         | `jpeg_image_decoder.cc` from Chrome `155.0.8059.79`, rewritten as `src/ffi/jpeg_blink.c`         | LGPL-2.1-or-later, MPL-1.1 or GPL-2.0; notice in `src/ffi/jpeg_blink.c`; `ffmpeg-COPYING.LGPLv2.1.txt`                 |
 
 This software is based in part on the work of the Independent JPEG Group.
@@ -52,9 +52,11 @@ included from `jpeglib.h`, and the hand-edited `jconfig.h` and `jconfigint.h`)
 are listed in `vendor/libjpeg-turbo/README.chromium`; `CHROMIUM_LICENSE` and
 `simd/nasm/jsimdext.inc` there hold the notices that `jpeglibmangler.h`,
 `jsimd.h`, `jsimddct.h` and most SIMD files refer to (the Neon files hold their
-zlib notice themselves). The SIMD code bears the zlib License, which
-`LICENSE.md` says the IJG License subsumes in the built library. Other builds
-must document any changes to these files.
+zlib notice themselves). Byte-for-byte copies are packaged as
+`licenses/libjpeg-turbo-CHROMIUM_LICENSE.txt` and
+`licenses/libjpeg-turbo-jsimdext.inc.txt`. The SIMD code bears the zlib License,
+which `LICENSE.md` says the IJG License subsumes in the built library. Other
+builds must document any changes to these files.
 
 `src/ffi/jpeg_blink.c` is a C rewrite of Blink's `jpeg_image_decoder.cc`:
 Copyright (C) 2006 Apple Computer, Inc.; portions Copyright (C) 2001-6

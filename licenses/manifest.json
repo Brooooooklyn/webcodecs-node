@@ -319,6 +319,25 @@
       "upstreamPath": "README.ijg",
       "excerpt": false,
       "sha256": "75815e3bf6484201a3c3d17a1bbf10f2e8e3237f84df10a2357ea896db2a81d6"
+    },
+    {
+      "file": "libjpeg-turbo-CHROMIUM_LICENSE.txt",
+      "project": "Chromium",
+      "upstream": "https://chromium.googlesource.com/chromium/src",
+      "ref": "Chrome 155.0.8059.79",
+      "upstreamPath": "LICENSE",
+      "excerpt": false,
+      "sha256": "368cca1106be99d39ecd32a38d8305585d802a475effb66380b91ffc9bcf709b"
+    },
+    {
+      "file": "libjpeg-turbo-jsimdext.inc.txt",
+      "project": "libjpeg-turbo",
+      "upstream": "https://chromium.googlesource.com/chromium/deps/libjpeg_turbo",
+      "revision": "640f254ad0fa03f6b1f29f89b7dd9366f2f6e533",
+      "ref": "Chrome 155.0.8059.79 DEPS",
+      "upstreamPath": "simd/nasm/jsimdext.inc",
+      "excerpt": false,
+      "sha256": "000b2df5469d2f94ea20a1b3d638b94031dad296f006600e1dbff79eded5facb"
     }
   ]
 }
