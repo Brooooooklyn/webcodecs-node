@@ -71,7 +71,7 @@
     "@emnapi/core": "^2.0.0-alpha.5",
     "@emnapi/runtime": "^2.0.0-alpha.5",
     "@napi-rs/canvas": "^1.0.9",
-    "@napi-rs/cli": "^3.9.1",
+    "@napi-rs/cli": "^3.10.9",
     "@napi-rs/wasm-runtime": "^1.2.4",
     "@oxc-node/cli": "^0.1.2",
     "@oxc-node/core": "^0.1.2",

@@ -1949,7 +1949,7 @@ type JpegReactionFns<'env> = (Function<'env, (), ()>, Function<'env, (), ()>);
 ///
 /// Never on the collector's thread: napi lets go of a reference dropped there through a
 /// thread-safe function of the env, and while the env is torn down, once Node has started to
-/// close that function, napi 3.12.4 takes every such drop after the first one as an error
+/// close that function, napi before 3.15 takes every such drop after the first one as an error
 /// (`napi_invalid_arg`) and panics; the second panic in one drop aborts the process. A collector
 /// can drop then in two ways: the async runtime is shut down at the teardown of the last env that
 /// loaded the addon (a worker, when only workers load it), which drops the collector on its
@@ -2054,7 +2054,7 @@ fn watch_jpeg_refs(env: &Env, refs: &Arc<Mutex<JpegRefs>>) {
 /// it deletes it at once while that registration is still the last one on this thread, or lets it
 /// go through that registration's thread-safe function. That function is closing here only when
 /// its registration came after this hook was added (a stream started in this env after the addon
-/// was loaded again) and is not the last one: then napi panics. Each reference drops on its own,
+/// was loaded again) and is not the last one: older napi can panic. Each reference drops on its own,
 /// and that panic is caught: an unwind must not leave this extern "C" function.
 unsafe extern "C" fn release_jpeg_streams(env: *mut std::ffi::c_void) {
   let streams = JPEG_STREAMS
