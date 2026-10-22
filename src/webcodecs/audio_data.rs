@@ -686,12 +686,12 @@ impl AudioData {
     destination: Unknown,
     options: AudioDataCopyToOptions,
   ) -> Result<()> {
-    let inner = self
+    let inner_guard = self
       .inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    let inner = match inner.as_ref() {
+    let inner = match inner_guard.as_ref() {
       Some(i) => i,
       None => return throw_invalid_state_error(&env, "AudioData is closed"),
     };
@@ -732,7 +732,7 @@ impl AudioData {
       ));
     }
 
-    destination.write_with(copy_size, |dest_slice| {
+    let write_samples = |dest_slice: &mut [u8]| {
       let src_format = inner.format;
       if src_format.base() == dest_format.base() {
         // Same base sample type (planarity may still differ) — verbatim byte
@@ -825,7 +825,21 @@ impl AudioData {
         }
       }
       Ok(())
-    })
+    };
+    if destination.is_shared() {
+      let mut native = vec![0; copy_size];
+      let result = write_samples(&mut native);
+      // Shared writes can call a captured pre-import function. Never run it
+      // while the codec or frame guards are held.
+      drop(frame_guard);
+      drop(inner_guard);
+      if result.is_ok() {
+        destination.write_from_slice(&native)?;
+      }
+      result
+    } else {
+      destination.write_with(copy_size, write_samples)
+    }
   }
 
   /// Create a copy of this AudioData

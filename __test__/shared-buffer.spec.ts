@@ -104,6 +104,42 @@ test.serial('shared copies keep working after a second native load', (t) => {
   t.is(output, '7')
 })
 
+test.serial('a pre-import set wrapper cannot re-enter a locked audio copy', (t) => {
+  const output = execFileSync(
+    process.execPath,
+    [
+      '-e',
+      `const fs = require('node:fs');
+       const original = Uint8Array.prototype.set;
+       let target;
+       Object.defineProperty(Uint8Array.prototype, 'set', {
+         configurable: true,
+         writable: true,
+         value: function (...args) {
+           if (target) target.close();
+           return original.apply(this, args);
+         },
+       });
+       const { AudioData } = require('./index.js');
+       const shared = new SharedArrayBuffer(16);
+       const audio = new AudioData({
+         data: shared,
+         format: 'u8',
+         sampleRate: 48000,
+         numberOfFrames: 16,
+         numberOfChannels: 1,
+         timestamp: 0,
+       });
+       target = audio;
+       const output = new Uint8Array(new SharedArrayBuffer(16));
+       audio.copyTo(output, { planeIndex: 0, format: 'u8' });
+       fs.writeSync(1, 'ok');`,
+    ],
+    { cwd: process.cwd(), encoding: 'utf8', timeout: 5000 },
+  )
+  t.is(output, 'ok')
+})
+
 for (const kind of ['Int32Array', 'BigInt64Array'] as const) {
   test.serial(`shared input and output tolerate concurrent ${kind} worker reads and writes`, async (t) => {
     const source = bytes(4096)

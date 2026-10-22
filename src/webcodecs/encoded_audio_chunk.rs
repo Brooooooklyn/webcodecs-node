@@ -234,8 +234,8 @@ impl EncodedAudioChunk {
   /// W3C spec: throws TypeError if destination is too small
   #[napi(ts_args_type = "destination: BufferSource")]
   pub fn copy_to(&self, env: Env, destination: Unknown) -> Result<()> {
-    self.with_inner(|inner| {
-      let destination = buffer_source::copy_to_destination(env.raw(), &destination)?;
+    let destination = buffer_source::copy_to_destination(env.raw(), &destination)?;
+    let shared_data = self.with_inner(|inner| {
       if destination.len() < inner.data.len() {
         env.throw_type_error(
           &format!(
@@ -245,12 +245,18 @@ impl EncodedAudioChunk {
           ),
           None,
         )?;
-        return Ok(());
+        return Ok(None);
       }
-      // No user JS runs between locating the destination and this write.
+      if destination.is_shared() {
+        return Ok(Some(inner.data.as_slice().to_vec()));
+      }
       destination.write_from_slice(inner.data.as_slice())?;
-      Ok(())
-    })
+      Ok(None)
+    })?;
+    if let Some(data) = shared_data {
+      destination.write_from_slice(&data)?;
+    }
+    Ok(())
   }
 
   // ========================================================================

@@ -58,6 +58,10 @@ impl RawBufferSource {
     self.len
   }
 
+  pub(crate) fn is_shared(&self) -> bool {
+    self.shared
+  }
+
   /// Copies the bytes into native memory.
   pub(crate) fn to_vec(&self) -> Result<Vec<u8>> {
     if self.len == 0 || self.data.is_null() {
@@ -129,6 +133,8 @@ impl RawBufferSource {
 
   /// Writes through a native temporary for shared memory, then uses the
   /// engine to copy it back. Ordinary buffers keep their direct slice path.
+  /// Shared destinations must instead be completed with `write_from_slice`
+  /// after the caller has released its locks.
   pub(crate) fn write_with(
     &self,
     len: usize,
@@ -136,10 +142,10 @@ impl RawBufferSource {
   ) -> Result<()> {
     assert!(len <= self.len);
     if self.shared {
-      let mut native = vec![0; len];
-      let result = write(&mut native);
-      self.write_from_slice(&native)?;
-      return result;
+      return Err(Error::new(
+        Status::GenericFailure,
+        "shared destinations require a deferred write",
+      ));
     }
     if len == 0 || self.data.is_null() {
       return write(&mut []);
@@ -151,30 +157,45 @@ impl RawBufferSource {
   }
 }
 
+#[derive(Clone, Copy)]
+struct TypedArrayIntrinsics {
+  set: sys::napi_ref,
+  constructor: sys::napi_ref,
+}
+
 fn create_uint8_view(
   env: sys::napi_env,
   buffer: sys::napi_value,
   byte_offset: usize,
   len: usize,
 ) -> Result<sys::napi_value> {
+  let constructor_ref = TYPED_ARRAY_INTRINSICS
+    .with(|intrinsics| intrinsics.borrow().get(&(env as usize)).copied())
+    .map(|intrinsics| intrinsics.constructor)
+    .ok_or_else(|| {
+      Error::new(
+        Status::GenericFailure,
+        "Uint8Array constructor intrinsic is unavailable",
+      )
+    })?;
+  let mut constructor = ptr::null_mut();
+  check_status!(unsafe { sys::napi_get_reference_value(env, constructor_ref, &mut constructor) })?;
+  let mut offset = ptr::null_mut();
+  let mut length = ptr::null_mut();
+  check_status!(unsafe { sys::napi_create_double(env, byte_offset as f64, &mut offset) })?;
+  check_status!(unsafe { sys::napi_create_double(env, len as f64, &mut length) })?;
+  let args = [buffer, offset, length];
   let mut view = ptr::null_mut();
   check_status!(unsafe {
-    sys::napi_create_typedarray(
-      env,
-      sys::TypedarrayType::uint8_array,
-      len,
-      buffer,
-      byte_offset,
-      &mut view,
-    )
+    sys::napi_new_instance(env, constructor, args.len(), args.as_ptr(), &mut view)
   })?;
   Ok(view)
 }
 
 thread_local! {
-  // The `TypedArray.set` refs of the envs on this thread, by env pointer. Each
-  // env's one cleanup hook removes its entry before the env goes away.
-  static TYPED_ARRAY_SET: RefCell<HashMap<usize, sys::napi_ref>> =
+  // The `TypedArray.set` and constructor refs of the envs on this thread, by
+  // env pointer. Each env's one cleanup hook removes its entry before the env goes away.
+  static TYPED_ARRAY_INTRINSICS: RefCell<HashMap<usize, TypedArrayIntrinsics>> =
     RefCell::new(HashMap::new());
 }
 
@@ -183,7 +204,7 @@ thread_local! {
 pub(crate) fn capture_typed_array_set(env: &Env) -> Result<()> {
   let raw_env = env.raw();
   let key = raw_env as usize;
-  if TYPED_ARRAY_SET.with(|intrinsics| intrinsics.borrow().contains_key(&key)) {
+  if TYPED_ARRAY_INTRINSICS.with(|intrinsics| intrinsics.borrow().contains_key(&key)) {
     return Ok(());
   }
   let mut global = ptr::null_mut();
@@ -210,8 +231,12 @@ pub(crate) fn capture_typed_array_set(env: &Env) -> Result<()> {
   }
   let mut reference = ptr::null_mut();
   check_status!(unsafe { sys::napi_create_reference(raw_env, function, 1, &mut reference) })?;
+  let mut constructor_reference = ptr::null_mut();
+  check_status!(unsafe {
+    sys::napi_create_reference(raw_env, constructor, 1, &mut constructor_reference)
+  })?;
   unsafe extern "C" fn forget(env: *mut std::ffi::c_void) {
-    let _ = TYPED_ARRAY_SET.try_with(|intrinsics| {
+    let _ = TYPED_ARRAY_INTRINSICS.try_with(|intrinsics| {
       intrinsics.borrow_mut().remove(&(env as usize));
     });
   }
@@ -221,9 +246,20 @@ pub(crate) fn capture_typed_array_set(env: &Env) -> Result<()> {
     if !reference.is_null() {
       unsafe { sys::napi_delete_reference(raw_env, reference) };
     }
+    if !constructor_reference.is_null() {
+      unsafe { sys::napi_delete_reference(raw_env, constructor_reference) };
+    }
     return Err(error);
   }
-  TYPED_ARRAY_SET.with(|intrinsics| intrinsics.borrow_mut().insert(key, reference));
+  TYPED_ARRAY_INTRINSICS.with(|intrinsics| {
+    intrinsics.borrow_mut().insert(
+      key,
+      TypedArrayIntrinsics {
+        set: reference,
+        constructor: constructor_reference,
+      },
+    )
+  });
   Ok(())
 }
 
@@ -232,8 +268,9 @@ fn typed_array_set(
   target: sys::napi_value,
   source: sys::napi_value,
 ) -> Result<()> {
-  let function = TYPED_ARRAY_SET
+  let function = TYPED_ARRAY_INTRINSICS
     .with(|intrinsics| intrinsics.borrow().get(&(env as usize)).copied())
+    .map(|intrinsics| intrinsics.set)
     .ok_or_else(|| {
       Error::new(
         Status::GenericFailure,
