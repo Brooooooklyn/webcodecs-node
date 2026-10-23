@@ -708,55 +708,23 @@ impl CodecEventState {
     }
   }
 
-  /// Any thread: send a codec's error to its error callback, a thread-safe
-  /// function whose JS side turns `error` into a native DOMException. Every
-  /// codec error closes the codec.
-  ///
-  /// Chrome runs the error callback first, and the dequeue event for the
-  /// work the error dropped after it: closing the codec queues that event and
-  /// then invokes the callback. Here the error and the dequeue event reach JS
-  /// through two thread-safe functions, whose order is not defined, so a
-  /// dequeue event that comes due before the error callback has run waits.
-  /// Once the callback returns it is queued through the dispatcher, after the
-  /// callback's microtasks.
-  pub fn report_error<T: 'static, Args: 'static + JsValuesTupleIntoVec>(
-    shared: &Arc<RwLock<CodecEventState>>,
-    callback: &ThreadsafeFunction<T, UnknownReturnValue, Args, Status, false, true>,
-    error: T,
-  ) {
+  /// Hold dequeue events behind an error whose callback is deferred by the codec epoch.
+  pub(crate) fn track_error(shared: &Arc<RwLock<CodecEventState>>) -> ErrorDelivery {
     if let Ok(mut state) = shared.write() {
       state.errors_pending += 1;
     }
-    let delivery = ErrorDelivery(Some(Arc::clone(shared)));
-    // When the call is not queued (env teardown), the closure and its guard
-    // are dropped here.
-    callback.call_with_return_value(
-      error,
-      ThreadsafeFunctionCallMode::NonBlocking,
-      move |result, env| {
-        if let Err(thrown) = result {
-          // Report what the callback threw before the dequeue event runs, as
-          // the plain call this replaces did.
-          if let Ok(value) = unsafe { Error::to_napi_value(env.raw(), thrown) } {
-            unsafe { sys::napi_fatal_exception(env.raw(), value) };
-          }
-        }
-        delivery.delivered();
-        Ok(())
-      },
-    );
+    ErrorDelivery(Some(Arc::clone(shared)))
   }
 }
 
-/// Settles one pending error (see [`CodecEventState::report_error`]): on the
-/// JS thread after the error callback ran, or on drop when the callback will
-/// not run (napi-rs drops a queued call whose payload it could not convert).
-struct ErrorDelivery(Option<Arc<RwLock<CodecEventState>>>);
+/// Settles one pending error: on the JS thread after the error callback ran,
+/// or on drop when its queued error tail will not run.
+pub(crate) struct ErrorDelivery(Option<Arc<RwLock<CodecEventState>>>);
 
 impl ErrorDelivery {
   /// JS thread, after the error callback: queue a waiting dequeue event when
   /// this was the last pending error.
-  fn delivered(mut self) {
+  pub(crate) fn delivered(mut self) {
     let Some(shared) = self.0.take() else {
       return;
     };

@@ -15,42 +15,29 @@
 //! drops it.
 //!
 //! Outputs produced before an error reach JS before the error callback, and
-//! none reaches JS after it, as in Chrome. Outputs wait in the epoch's own
-//! queue, not in the output ThreadsafeFunction's: the output and error
-//! ThreadsafeFunctions are separate libuv handles, and Node runs at most 999
-//! calls of one before it moves on to the next, so an error queued behind
-//! more outputs than that would otherwise overtake them. The error callback
-//! hands the outputs still queued to JS first.
+//! none reaches JS after it, as in Chrome. Outputs, including those buffered
+//! by a pending flush, and the error share one ordered queue and one
+//! ThreadsafeFunction. Every callback therefore has a microtask checkpoint,
+//! and an error cannot overtake outputs when Node moves on after 999 calls.
 
 use std::collections::VecDeque;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
+use crossbeam::channel::Sender;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{
-  ThreadsafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
+  ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue,
 };
 use napi::{check_status, sys};
 
 use super::error::{DOMExceptionName, error_as_dom_exception};
-use super::event_target::{CodecEventState, report_exception};
+use super::event_target::{CodecEventState, ErrorDelivery, report_exception};
 
-/// Worker → JS: one output waits in the epoch's queue (see
-/// `CodecEpoch::send_output`). Carries the generation it was queued under.
+/// Worker → JS: one output or error waits in the epoch's queue. The payload
+/// carries the generation it was queued under.
 pub(crate) type GatedOutput = ThreadsafeFunction<u32, UnknownReturnValue, u32, Status, false, true>;
-
-/// Worker → JS error callback, carrying the codec generation, where the
-/// error came from, and the error. The gate converts its reason to a native
-/// DOMException after delivering older outputs.
-pub(crate) type GatedError = ThreadsafeFunction<
-  (u32, ErrorOrigin, Error),
-  UnknownReturnValue,
-  FnArgs<(u32, Option<String>, String)>,
-  Status,
-  false,
-  true,
->;
 
 /// Where a codec error came from, which decides what drops it.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -91,8 +78,67 @@ pub(crate) fn buffered_output<Args: JsValuesTupleIntoVec + Send + 'static>(
   Box::new(move |env| args.into_vec(env))
 }
 
-/// JS thread: takes the outputs the codec buffered for a pending flush.
-type TakeBuffered = Box<dyn Fn() -> Vec<BufferedOutput> + Send + Sync>;
+/// A flush response held until the error queued before it reaches JS.
+pub(crate) struct DeferredFlush {
+  sender: Sender<Result<()>>,
+  result: Result<()>,
+}
+
+impl DeferredFlush {
+  /// Never block a worker or the JS thread. reset()/close() may already have
+  /// filled the response channel with their AbortError.
+  pub(crate) fn send(self) {
+    let _ = self.sender.try_send(self.result);
+  }
+}
+
+struct PendingErrorState {
+  delivery: Option<ErrorDelivery>,
+  flushes: Vec<DeferredFlush>,
+  completed: bool,
+}
+
+struct PendingError {
+  generation: u32,
+  origin: ErrorOrigin,
+  reason: String,
+  state: Mutex<PendingErrorState>,
+}
+
+impl PendingError {
+  fn matches(&self, generation: u32) -> bool {
+    self.origin == ErrorOrigin::Configure || self.generation == generation
+  }
+
+  fn defer(&self, flush: DeferredFlush) -> std::result::Result<(), DeferredFlush> {
+    let Ok(mut state) = self.state.lock() else {
+      return Err(flush);
+    };
+    if state.completed {
+      return Err(flush);
+    }
+    state.flushes.push(flush);
+    Ok(())
+  }
+
+  fn complete(&self) -> (Option<ErrorDelivery>, Vec<DeferredFlush>) {
+    let Ok(mut state) = self.state.lock() else {
+      return (None, Vec::new());
+    };
+    if state.completed {
+      return (None, Vec::new());
+    }
+    state.completed = true;
+    (state.delivery.take(), std::mem::take(&mut state.flushes))
+  }
+}
+
+enum EpochItem {
+  Output(BufferedOutput),
+  /// Flush-buffered output keeps the existing exception backstop behavior.
+  FlushOutput(BufferedOutput),
+  Error(Arc<PendingError>),
+}
 
 #[derive(Default)]
 struct EpochState {
@@ -103,11 +149,12 @@ struct EpochState {
   closed: AtomicBool,
   /// Set once by the codec's constructor.
   close_on_error: OnceLock<CloseOnError>,
-  /// Set once by the codec's constructor.
-  take_buffered: OnceLock<TakeBuffered>,
-  /// Outputs on their way to the output callback, oldest first, each with
+  /// Outputs and errors on their way to JS, oldest first, each tagged with
   /// the generation it was queued under.
-  outputs: Mutex<VecDeque<(u32, BufferedOutput)>>,
+  outputs: Mutex<VecDeque<(u32, EpochItem)>>,
+  /// Errors still able to accept a flush response. This includes the error
+  /// currently executing, after its queue entry has been removed.
+  errors: Mutex<Vec<Arc<PendingError>>>,
 }
 
 /// Generation counter shared by one codec, its workers and its callbacks.
@@ -141,46 +188,106 @@ impl CodecEpoch {
     }
   }
 
-  /// Worker: queue an output of `generation` and wake the output callback
-  /// for it. Outputs reach JS in the order they were queued; an error
-  /// callback hands the ones still queued to JS before the error.
+  fn send_item(&self, callback: &GatedOutput, generation: u32, item: EpochItem) {
+    let Ok(mut outputs) = self.0.outputs.lock() else {
+      return;
+    };
+    outputs.push_back((generation, item));
+    drop(outputs);
+    callback.call(generation, ThreadsafeFunctionCallMode::NonBlocking);
+  }
+
+  /// Worker: queue an output and wake the shared callback for it.
   pub(crate) fn send_output(
     &self,
     callback: &GatedOutput,
     generation: u32,
     output: BufferedOutput,
   ) {
-    let Ok(mut outputs) = self.0.outputs.lock() else {
+    self.send_item(callback, generation, EpochItem::Output(output));
+  }
+
+  /// Move an output buffered for a pending flush into the same ordered queue
+  /// when an error is reported, ahead of that error.
+  pub(crate) fn send_flush_output(
+    &self,
+    callback: &GatedOutput,
+    generation: u32,
+    output: BufferedOutput,
+  ) {
+    self.send_item(callback, generation, EpochItem::FlushOutput(output));
+  }
+
+  /// Queue an error behind every output already produced. Its dequeue guard
+  /// starts now and finishes only when the error tail runs or is dropped.
+  pub(crate) fn send_error(
+    &self,
+    callback: &GatedOutput,
+    event_state: &Arc<RwLock<CodecEventState>>,
+    generation: u32,
+    origin: ErrorOrigin,
+    error: Error,
+  ) {
+    let pending = Arc::new(PendingError {
+      generation,
+      origin,
+      reason: error.reason,
+      state: Mutex::new(PendingErrorState {
+        delivery: Some(CodecEventState::track_error(event_state)),
+        flushes: Vec::new(),
+        completed: false,
+      }),
+    });
+    let Ok(mut errors) = self.0.errors.lock() else {
       return;
     };
-    outputs.push_back((generation, output));
+    errors.push(pending.clone());
+    drop(errors);
+    let Ok(mut outputs) = self.0.outputs.lock() else {
+      if let Ok(mut errors) = self.0.errors.lock() {
+        errors.retain(|error| !Arc::ptr_eq(error, &pending));
+      }
+      return;
+    };
+    outputs.push_back((generation, EpochItem::Error(pending)));
     drop(outputs);
     callback.call(generation, ThreadsafeFunctionCallMode::NonBlocking);
   }
 
-  /// JS thread: the oldest output queued for this wakeup's generation. A stale wakeup must not
-  /// consume an output queued after reset() or reconfigure(), and a newer wakeup must not wait
-  /// behind stale entries whose own callbacks already ran.
-  fn next_output(&self, generation: u32) -> Option<BufferedOutput> {
+  /// Hold a flush response behind a matching queued error. An unsupported
+  /// configure() error also accepts work queued after a reset, since it closes
+  /// that new configuration when it arrives.
+  pub(crate) fn defer_flush(
+    &self,
+    generation: u32,
+    sender: Sender<Result<()>>,
+    result: Result<()>,
+  ) -> std::result::Result<(), DeferredFlush> {
+    let mut flush = DeferredFlush { sender, result };
+    let candidates = match self.0.errors.lock() {
+      Ok(errors) => errors.clone(),
+      Err(_) => return Err(flush),
+    };
+    for pending in candidates {
+      if !pending.matches(generation) {
+        continue;
+      }
+      match pending.defer(flush) {
+        Ok(()) => return Ok(()),
+        Err(returned) => flush = returned,
+      }
+    }
+    Err(flush)
+  }
+
+  /// JS thread: the oldest item queued for this wakeup's generation. A stale
+  /// wakeup cannot consume an item queued after reset()/reconfigure().
+  fn next_item(&self, generation: u32) -> Option<EpochItem> {
     let mut outputs = self.0.outputs.lock().ok()?;
     let index = outputs
       .iter()
       .position(|(queued, _)| *queued == generation)?;
-    outputs.remove(index).map(|(_, output)| output)
-  }
-
-  /// JS thread: take every queued output; those of `generation` are
-  /// returned oldest first, older ones are dropped. A worker stops after it
-  /// reports an error, so all of them were produced before that error.
-  fn take_outputs(&self, generation: u32) -> Vec<BufferedOutput> {
-    let Ok(mut outputs) = self.0.outputs.lock() else {
-      return Vec::new();
-    };
-    outputs
-      .drain(..)
-      .filter(|(queued, _)| *queued == generation)
-      .map(|(_, output)| output)
-      .collect()
+    outputs.remove(index).map(|(_, item)| item)
   }
 
   /// Whether the error callback has run. Until then a codec that a worker
@@ -214,81 +321,6 @@ impl CodecEpoch {
       }
     });
     let _ = self.0.close_on_error.set(close);
-  }
-
-  /// Install how the error callback takes the outputs the codec buffered for
-  /// a pending flush, so they reach JS before the error. The codec's
-  /// constructor calls this once. The codec state is held weakly.
-  pub(crate) fn set_take_buffered<T: Send + 'static>(
-    &self,
-    inner: &Arc<Mutex<T>>,
-    take: fn(&mut T) -> Vec<BufferedOutput>,
-  ) {
-    let inner = Arc::downgrade(inner);
-    let take: TakeBuffered = Box::new(move || {
-      let Some(inner) = inner.upgrade() else {
-        return Vec::new();
-      };
-      let Ok(mut guard) = inner.lock() else {
-        return Vec::new();
-      };
-      take(&mut guard)
-    });
-    let _ = self.0.take_buffered.set(take);
-  }
-
-  /// JS thread: an error queued under `generation` is about to reach JS.
-  /// The outputs still queued for the output callback, then those a pending
-  /// flush buffered, were produced before the error; the gate would drop
-  /// them once the error closed the codec, and that flush would deliver them
-  /// after it. Hand them to `output` now, so they arrive before the error
-  /// callback as in Chrome. Stops when an output callback calls close() or
-  /// reset().
-  fn deliver_buffered(&self, env: &Env, generation: u32, output: &OutputRef) -> Result<()> {
-    if !self.is_current(generation) || self.error_delivered() {
-      return Ok(());
-    }
-    let mut outputs = self.take_outputs(generation);
-    if let Some(take) = self.0.take_buffered.get() {
-      outputs.extend(take());
-    }
-    if outputs.is_empty() {
-      return Ok(());
-    }
-    let function = output.borrow_back(env)?;
-    let mut this = ptr::null_mut();
-    check_status!(unsafe { sys::napi_get_undefined(env.raw(), &mut this) })?;
-    for buffered in outputs {
-      if !self.is_current(generation) {
-        break;
-      }
-      // A throwing output callback must not keep the error from JS: report
-      // the exception and go on.
-      if let Ok(args) = buffered(env.raw()) {
-        let mut result = ptr::null_mut();
-        unsafe {
-          sys::napi_call_function(
-            env.raw(),
-            this,
-            function.raw(),
-            args.len(),
-            args.as_ptr(),
-            &mut result,
-          )
-        };
-      }
-      let mut pending = false;
-      unsafe { sys::napi_is_exception_pending(env.raw(), &mut pending) };
-      if pending {
-        let mut exception = ptr::null_mut();
-        if unsafe { sys::napi_get_and_clear_last_exception(env.raw(), &mut exception) }
-          == sys::Status::napi_ok
-        {
-          report_exception(env, exception);
-        }
-      }
-    }
-    Ok(())
   }
 
   /// JS thread: whether `admit_error` drops an error queued under
@@ -332,6 +364,40 @@ impl CodecEpoch {
     self.0.error_delivered.store(true, Ordering::SeqCst);
     true
   }
+
+  fn deliver_error(&self, env: &Env, pending: &PendingError, callback: &OutputRef) -> Result<()> {
+    let configure_error = (pending.origin == ErrorOrigin::Configure).then(|| {
+      DOMExceptionName::from_error_message(&pending.reason)
+        .as_str()
+        .to_owned()
+    });
+    // Do not run page code to build a dropped error, and re-check admission
+    // after a replaced DOMException constructor runs.
+    if self.drops_error(pending.generation, pending.origin) {
+      return Ok(());
+    }
+    let error = error_as_dom_exception(env, Error::new(Status::GenericFailure, &pending.reason))?;
+    if !self.admit_error(env, pending.generation, configure_error.as_deref()) {
+      return Ok(());
+    }
+    call_js(env, callback, &[error.raw()])
+  }
+
+  fn finish_error(&self, env: &Env, pending: &Arc<PendingError>, callback: &OutputRef) {
+    if let Err(thrown) = self.deliver_error(env, pending, callback) {
+      report_callback_exception(env, thrown);
+    }
+    let (delivery, flushes) = pending.complete();
+    if let Ok(mut errors) = self.0.errors.lock() {
+      errors.retain(|error| !Arc::ptr_eq(error, pending));
+    }
+    if let Some(delivery) = delivery {
+      delivery.delivered();
+    }
+    for flush in flushes {
+      flush.send();
+    }
+  }
 }
 
 /// A worker's view of the epoch: cancelled once close() or reset() advanced it.
@@ -345,154 +411,125 @@ impl CancelToken {
   pub(crate) fn is_cancelled(&self) -> bool {
     !self.epoch.is_current(self.generation)
   }
+
+  pub(crate) fn defer_flush(
+    &self,
+    sender: Sender<Result<()>>,
+    result: Result<()>,
+  ) -> std::result::Result<(), DeferredFlush> {
+    self.epoch.defer_flush(self.generation, sender, result)
+  }
 }
 
-/// Which callback a gated function forwards to.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CallbackKind {
-  Output,
-  Error,
-}
-
-/// The user's output callback, as the error gate calls it.
 type OutputRef = FunctionRef<Unknown<'static>, UnknownReturnValue>;
 
-/// Wrap a user callback in a native function whose first argument is the
-/// generation the call was queued under. A worker ThreadsafeFunction targets
-/// the returned function. For the output callback, each call takes the
-/// oldest output from the epoch's queue (the error callback may have taken
-/// it already). Calls and outputs from an older generation are dropped; the
-/// others call `callback` with the output, or with the converted error, and an
-/// undefined `this`. For the error callback, the second argument is the error's
-/// name when configure() found it, or null (see `admit_error`), and the third
-/// is its reason. Before that reason is converted, the outputs still queued
-/// and those a pending flush buffered go to `output` (see `deliver_buffered`).
-///
-/// An exception thrown by the callback stays pending, so it surfaces exactly
-/// as it did when the ThreadsafeFunction called the callback directly.
-fn gated_callback<'env, Args: JsValuesTupleIntoVec>(
-  env: &'env Env,
+fn call_js(env: &Env, callback: &OutputRef, args: &[sys::napi_value]) -> Result<()> {
+  let function = callback.borrow_back(env)?;
+  let mut this = ptr::null_mut();
+  check_status!(unsafe { sys::napi_get_undefined(env.raw(), &mut this) })?;
+  let mut result = ptr::null_mut();
+  let status = unsafe {
+    sys::napi_call_function(
+      env.raw(),
+      this,
+      function.raw(),
+      args.len(),
+      args.as_ptr(),
+      &mut result,
+    )
+  };
+  if status == sys::Status::napi_pending_exception {
+    return Err(Error::new(Status::PendingException, "codec callback threw"));
+  }
+  check_status!(status)
+}
+
+/// Keep flush-buffered output exceptions on the existing reporting/backstop
+/// path without letting them suppress later outputs or the codec error.
+fn call_flush_output(env: &Env, callback: &OutputRef, buffered: BufferedOutput) -> Result<()> {
+  if let Ok(args) = buffered(env.raw()) {
+    let _ = call_js(env, callback, &args);
+  }
+  let mut pending = false;
+  unsafe { sys::napi_is_exception_pending(env.raw(), &mut pending) };
+  if pending {
+    let mut exception = ptr::null_mut();
+    if unsafe { sys::napi_get_and_clear_last_exception(env.raw(), &mut exception) }
+      == sys::Status::napi_ok
+    {
+      report_exception(env, exception);
+    }
+  }
+  Ok(())
+}
+
+/// Report the exact pending JS exception, if there is one. Converting the
+/// Rust error first would make N-API warn about the pending exception and can
+/// skip the page's uncaught-exception handler.
+fn report_callback_exception(env: &Env, thrown: Error) {
+  let mut value = ptr::null_mut();
+  let mut pending = false;
+  unsafe { sys::napi_is_exception_pending(env.raw(), &mut pending) };
+  if pending {
+    unsafe { sys::napi_get_and_clear_last_exception(env.raw(), &mut value) };
+  }
+  if value.is_null()
+    && let Ok(converted) = unsafe { Error::to_napi_value(env.raw(), thrown) }
+  {
+    value = converted;
+  }
+  if !value.is_null() {
+    unsafe { sys::napi_fatal_exception(env.raw(), value) };
+  }
+}
+
+/// Weak ThreadsafeFunction that delivers ordered outputs and error tails with
+/// their original generation, unless close()/reset() cancelled them.
+pub(crate) fn gated_output(
+  env: &Env,
   callback: sys::napi_value,
-  output: Option<sys::napi_value>,
-  epoch: CodecEpoch,
-  kind: CallbackKind,
-) -> Result<Function<'env, Args, UnknownReturnValue>> {
+  error_callback: sys::napi_value,
+  epoch: &CodecEpoch,
+) -> Result<GatedOutput> {
   let callback = unsafe {
     Function::<Unknown<'static>, UnknownReturnValue>::from_napi_value(env.raw(), callback)?
   }
   .create_ref()?;
-  let output = match output {
-    Some(output) => Some(
-      unsafe {
-        Function::<Unknown<'static>, UnknownReturnValue>::from_napi_value(env.raw(), output)?
-      }
-      .create_ref()?,
-    ),
-    None => None,
-  };
-  let gated = env.create_function_from_closure::<Args, (), _>("codecCallback", move |ctx| {
+  let error_callback = unsafe {
+    Function::<Unknown<'static>, UnknownReturnValue>::from_napi_value(env.raw(), error_callback)?
+  }
+  .create_ref()?;
+  let epoch = epoch.clone();
+  let gated = env.create_function_from_closure::<u32, (), _>("codecCallback", move |ctx| {
     let generation = ctx.get::<u32>(0)?;
-    let args = match kind {
-      CallbackKind::Output => {
-        let Some(queued) = epoch.next_output(generation) else {
-          return Ok(());
-        };
-        // Once the error callback ran, the codec is closed: Chrome drops the
-        // outputs still on their way.
+    let Some(item) = epoch.next_item(generation) else {
+      return Ok(());
+    };
+    match item {
+      EpochItem::Output(output) => {
         if !epoch.is_current(generation) || epoch.error_delivered() {
           return Ok(());
         }
-        queued(ctx.env.raw())?
+        let args = output(ctx.env.raw())?;
+        call_js(ctx.env, &callback, &args)
       }
-      CallbackKind::Error => {
-        let configure_error = ctx.get::<Option<String>>(1)?;
-        let error = ctx.get::<String>(2)?;
-        if let Some(output) = output.as_ref() {
-          epoch.deliver_buffered(ctx.env, generation, output)?;
-        }
-        let origin = if configure_error.is_some() {
-          ErrorOrigin::Configure
-        } else {
-          ErrorOrigin::Work
-        };
-        // Output callbacks can cancel the error. Do not run page code to build
-        // a dropped error, and re-check admission after the constructor runs.
-        if epoch.drops_error(generation, origin) {
+      EpochItem::FlushOutput(output) => {
+        if !epoch.is_current(generation) || epoch.error_delivered() {
           return Ok(());
         }
-        let error = error_as_dom_exception(ctx.env, Error::new(Status::GenericFailure, error))?;
-        if !epoch.admit_error(ctx.env, generation, configure_error.as_deref()) {
-          return Ok(());
-        }
-        vec![error.raw()]
+        call_flush_output(ctx.env, &callback, output)
       }
-    };
-    let function = callback.borrow_back(ctx.env)?;
-    let mut this = ptr::null_mut();
-    check_status!(unsafe { sys::napi_get_undefined(ctx.env.raw(), &mut this) })?;
-    let mut result = ptr::null_mut();
-    let status = unsafe {
-      sys::napi_call_function(
-        ctx.env.raw(),
-        this,
-        function.raw(),
-        args.len(),
-        args.as_ptr(),
-        &mut result,
-      )
-    };
-    if status == sys::Status::napi_pending_exception {
-      return Err(Error::new(Status::PendingException, "codec callback threw"));
+      EpochItem::Error(pending) => {
+        epoch.finish_error(ctx.env, &pending, &error_callback);
+        Ok(())
+      }
     }
-    check_status!(status)
   })?;
-  unsafe { Function::from_napi_value(env.raw(), gated.raw()) }
-}
-
-/// Weak ThreadsafeFunction that calls the output callback `callback` with the
-/// oldest output queued by `CodecEpoch::send_output`, unless its generation
-/// is stale.
-pub(crate) fn gated_output(
-  env: &Env,
-  callback: sys::napi_value,
-  epoch: &CodecEpoch,
-) -> Result<GatedOutput> {
-  gated_callback::<u32>(env, callback, None, epoch.clone(), CallbackKind::Output)?
+  unsafe { Function::from_napi_value(env.raw(), gated.raw()) }?
     .build_threadsafe_function()
     .callee_handled::<false>()
     .weak::<true>()
     .build()
-}
-
-/// Weak ThreadsafeFunction that hands the error callback `callback` a native
-/// DOMException (WebCodecsErrorCallback receives DOMException per spec),
-/// unless close() or reset() dropped the error. Outputs a pending flush
-/// buffered go to the output callback `output` first.
-pub(crate) fn gated_error(
-  env: &Env,
-  callback: sys::napi_value,
-  output: sys::napi_value,
-  epoch: &CodecEpoch,
-) -> Result<GatedError> {
-  gated_callback::<FnArgs<(u32, Option<String>, String)>>(
-    env,
-    callback,
-    Some(output),
-    epoch.clone(),
-    CallbackKind::Error,
-  )?
-  .build_threadsafe_function::<(u32, ErrorOrigin, Error)>()
-  .callee_handled::<false>()
-  .weak::<true>()
-  .build_callback(|ctx: ThreadsafeCallContext<(u32, ErrorOrigin, Error)>| {
-    let (generation, origin, error) = ctx.value;
-    let configure_error = (origin == ErrorOrigin::Configure).then(|| {
-      DOMExceptionName::from_error_message(&error.reason)
-        .as_str()
-        .to_owned()
-    });
-    Ok(FnArgs::from((generation, configure_error, error.reason)))
-  })
 }
 
 #[cfg(test)]
@@ -531,6 +568,14 @@ mod tests {
 
   #[test]
   fn output_wakeups_only_take_their_generation() {
+    fn next(epoch: &CodecEpoch, generation: u32) -> Option<BufferedOutput> {
+      match epoch.next_item(generation) {
+        Some(EpochItem::Output(output)) => Some(output),
+        Some(_) => panic!("expected an output"),
+        None => None,
+      }
+    }
+
     let epoch = CodecEpoch::default();
     let delivered = Arc::new(Mutex::new(Vec::new()));
     let output = |value| {
@@ -542,18 +587,18 @@ mod tests {
     };
     {
       let mut outputs = epoch.0.outputs.lock().unwrap();
-      outputs.push_back((0, output(0)));
-      outputs.push_back((1, output(1)));
-      outputs.push_back((0, output(2)));
+      outputs.push_back((0, EpochItem::Output(output(0))));
+      outputs.push_back((1, EpochItem::Output(output(1))));
+      outputs.push_back((0, EpochItem::Output(output(2))));
     }
 
     // The new wakeup runs before both old ones. It takes only its own output, even though two
     // older entries were queued around it, and leaves the old entries in their original order.
-    epoch.next_output(1).unwrap()(ptr::null_mut()).unwrap();
-    assert!(epoch.next_output(1).is_none());
-    epoch.next_output(0).unwrap()(ptr::null_mut()).unwrap();
-    epoch.next_output(0).unwrap()(ptr::null_mut()).unwrap();
-    assert!(epoch.next_output(0).is_none());
+    next(&epoch, 1).unwrap()(ptr::null_mut()).unwrap();
+    assert!(next(&epoch, 1).is_none());
+    next(&epoch, 0).unwrap()(ptr::null_mut()).unwrap();
+    next(&epoch, 0).unwrap()(ptr::null_mut()).unwrap();
+    assert!(next(&epoch, 0).is_none());
     assert_eq!(*delivered.lock().unwrap(), [1, 0, 2]);
   }
 }

@@ -9,8 +9,7 @@ use crate::codec::{
 };
 use crate::ffi::{AVCodecID, AVSampleFormat};
 use crate::webcodecs::codec_epoch::{
-  CancelToken, CodecEpoch, ErrorOrigin, GatedError, GatedOutput, buffered_output, gated_error,
-  gated_output,
+  CancelToken, CodecEpoch, ErrorOrigin, GatedOutput, buffered_output, gated_output,
 };
 use crate::webcodecs::error::{
   DOMExceptionName, dom_exception_rejection_error, native_dom_exception_rejection_error,
@@ -36,12 +35,6 @@ use super::video_encoder::CodecState;
 /// `CodecEpoch::send_output` (see codec_epoch.rs).
 type OutputCallback = GatedOutput;
 
-/// Type alias for error callback (takes the codec generation and an Error)
-/// Using CalleeHandled: false because WebCodecs error callback receives the
-/// error directly, not error-first (err, result) style. The Error payload is
-/// converted to a native DOMException in the JS-side callback.
-type ErrorCallback = GatedError;
-
 /// Options for addEventListener (W3C DOM spec)
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
@@ -65,8 +58,6 @@ pub struct AudioEncoderInit {
   /// Output callback reference - stored for synchronous calls from main thread
   pub output_ref:
     FunctionRef<FnArgs<(EncodedAudioChunk, EncodedAudioChunkMetadata)>, UnknownReturnValue>,
-  /// Error callback - called when an error occurs
-  pub error: ErrorCallback,
   /// Error callback reference - prevents GC from collecting the error callback
   pub error_ref: FunctionRef<Error, UnknownReturnValue>,
   /// Cancellation shared with the gated callbacks above
@@ -100,11 +91,6 @@ impl FromNapiValue for AudioEncoderInit {
     // Create FunctionRef for synchronous calls from main thread (in flush resolver)
     let output_ref = output_func.create_ref()?;
 
-    // Create ThreadsafeFunction for async calls from worker thread. It targets
-    // a gated wrapper so calls queued before close()/reset() are dropped.
-    let epoch = CodecEpoch::default();
-    let output: OutputCallback = gated_output(&env_wrapper, output_func.raw(), &epoch)?;
-
     // Get error callback as Function first, then create both FunctionRef and ThreadsafeFunction
     let error_func: Function<Error, UnknownReturnValue> = match obj.get_named_property("error") {
       Ok(cb) => cb,
@@ -117,16 +103,14 @@ impl FromNapiValue for AudioEncoderInit {
     // Create FunctionRef to prevent GC from collecting the error callback
     let error_ref = error_func.create_ref()?;
 
-    // Create ThreadsafeFunction for async calls from worker thread.
-    // The JS-side callback converts the Error payload into a native
-    // DOMException (WebCodecsErrorCallback receives DOMException per spec).
-    let error: ErrorCallback =
-      gated_error(&env_wrapper, error_func.raw(), output_func.raw(), &epoch)?;
+    // Outputs and errors share one ordered, generation-gated callback queue.
+    let epoch = CodecEpoch::default();
+    let output: OutputCallback =
+      gated_output(&env_wrapper, output_func.raw(), error_func.raw(), &epoch)?;
 
     Ok(AudioEncoderInit {
       output,
       output_ref,
-      error,
       error_ref,
       epoch,
     })
@@ -191,7 +175,6 @@ struct AudioEncoderInner {
   /// Output callback (required per spec)
   output_callback: OutputCallback,
   /// Error callback (required per spec)
-  error_callback: ErrorCallback,
   /// The codec's event state: report_error orders the error callback before
   /// the dequeue events that come due meanwhile.
   event_state: Arc<RwLock<CodecEventState>>,
@@ -379,7 +362,6 @@ impl AudioEncoder {
       target_format: AVSampleFormat::Fltp,
       encode_queue_size: 0,
       output_callback: init.output,
-      error_callback: init.error,
       event_state: event_state.clone(),
       flushes: FlushTracker::default(),
       timestamp_queue: std::collections::VecDeque::new(),
@@ -405,15 +387,6 @@ impl AudioEncoder {
       .set_close_on_error(&inner, &event_state, |inner, env, events, name| {
         inner.close_codec(env, events, Some(name));
       });
-
-    // Outputs a pending flush buffered reach JS before an error callback, as in
-    // Chrome, instead of after the error closed the encoder.
-    init.epoch.set_take_buffered(&inner, |inner| {
-      std::mem::take(&mut inner.pending_chunks)
-        .into_iter()
-        .map(|(chunk, metadata)| buffered_output(FnArgs::from((chunk, metadata))))
-        .collect()
-    });
 
     // Create channel for worker commands
     let (sender, receiver) = channel::unbounded();
@@ -470,7 +443,9 @@ impl AudioEncoder {
         }
         EncoderCommand::Flush(response_sender) => {
           let result = Self::process_flush(&inner, &event_state, &cancel);
-          let _ = response_sender.send(result);
+          if let Err(flush) = cancel.defer_flush(response_sender, result) {
+            flush.send();
+          }
         }
         EncoderCommand::Reconfigure(config) => {
           Self::process_reconfigure(&inner, &config, &cancel);
@@ -1170,10 +1145,19 @@ impl AudioEncoder {
 
     // Create an Error object that will be passed directly to the JS callback
     let error = Error::new(Status::GenericFailure, error_msg);
-    CodecEventState::report_error(
+    for (chunk, metadata) in std::mem::take(&mut inner.pending_chunks) {
+      inner.epoch.send_flush_output(
+        &inner.output_callback,
+        inner.generation,
+        buffered_output(FnArgs::from((chunk, metadata))),
+      );
+    }
+    inner.epoch.send_error(
+      &inner.output_callback,
       &inner.event_state,
-      &inner.error_callback,
-      (inner.generation, origin, error),
+      inner.generation,
+      origin,
+      error,
     );
     // A flush issued before the error callback runs fails with this same error.
     inner.failure_name = Some(DOMExceptionName::from_error_message(error_msg));
@@ -1644,6 +1628,7 @@ impl AudioEncoder {
 
     // W3C spec: Check state upfront and return rejected promise with appropriate error
     // (not throw synchronously - flush() should always return a promise)
+    let mut queue_flush = true;
     let flush_id = {
       let mut inner = self
         .inner
@@ -1651,58 +1636,77 @@ impl AudioEncoder {
         .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
       if inner.state == CodecState::Closed {
-        // Chrome closes the codec when its error callback runs. Before that,
-        // a flush is still accepted and fails with the codec's error; after
-        // it, the codec is closed and flush() fails with InvalidStateError.
         let (error_name, error_msg) = match inner.failure_name {
           Some(name) if !self.epoch.error_delivered() => (name, "Encode error occurred"),
-          _ => (
-            DOMExceptionName::InvalidStateError,
-            "Cannot flush a closed codec",
-          ),
+          _ => {
+            return reject_with_dom_exception_async(
+              env,
+              DOMExceptionName::InvalidStateError,
+              "Cannot flush a closed codec",
+            );
+          }
         };
-        // Return rejected promise with native DOMException (async to allow error callback to run)
-        return reject_with_dom_exception_async(env, error_name, error_msg);
-      }
-      if inner.state == CodecState::Unconfigured {
-        // Return rejected promise with native DOMException (async to allow error callback to run)
+        let flush_id = inner
+          .flushes
+          .register(response_sender.clone(), flush_abort.clone());
+        let result = Err(Error::new(
+          Status::GenericFailure,
+          format!("{}: {}", error_name.as_str(), error_msg),
+        ));
+        match inner
+          .epoch
+          .defer_flush(inner.generation, response_sender.clone(), result)
+        {
+          Ok(()) => {
+            queue_flush = false;
+            flush_id
+          }
+          Err(flush) => {
+            inner.flushes.finish(flush_id);
+            drop(flush);
+            return reject_with_dom_exception_async(env, error_name, error_msg);
+          }
+        }
+      } else if inner.state == CodecState::Unconfigured {
         return reject_with_dom_exception_async(
           env,
           DOMExceptionName::InvalidStateError,
           "Cannot flush an unconfigured codec",
         );
+      } else {
+        inner
+          .flushes
+          .register(response_sender.clone(), flush_abort.clone())
       }
-
-      inner
-        .flushes
-        .register(response_sender.clone(), flush_abort.clone())
     };
 
-    // Send flush command through the channel (deferred to microtask for W3C spec compliance)
-    // This ensures flush is processed after all pending encode microtasks complete (FIFO order)
-    // Use Weak reference to allow close() to immediately close channel without deadlock
-    if let Some(ref sender) = self.command_sender {
-      let weak_sender = Arc::downgrade(sender);
-      let cancel = self.cancel.clone();
-      PromiseRaw::resolve(env, ())?.then(move |_| {
-        // Skip if reset()/close() ran since, then check the channel is still open
-        // (flush Promise is already rejected with AbortError by reset())
-        if !cancel.is_cancelled()
-          && let Some(sender) = weak_sender.upgrade()
-        {
-          let _ = sender.send(EncoderCommand::Flush(response_sender));
+    if queue_flush {
+      // Send flush command through the channel (deferred to microtask for W3C spec compliance)
+      // This ensures flush is processed after all pending encode microtasks complete (FIFO order)
+      // Use Weak reference to allow close() to immediately close channel without deadlock
+      if let Some(ref sender) = self.command_sender {
+        let weak_sender = Arc::downgrade(sender);
+        let cancel = self.cancel.clone();
+        PromiseRaw::resolve(env, ())?.then(move |_| {
+          // Skip if reset()/close() ran since, then check the channel is still open
+          // (flush Promise is already rejected with AbortError by reset())
+          if !cancel.is_cancelled()
+            && let Some(sender) = weak_sender.upgrade()
+          {
+            let _ = sender.send(EncoderCommand::Flush(response_sender));
+          }
+          Ok(())
+        })?;
+      } else {
+        if let Ok(mut inner) = self.inner.lock() {
+          inner.flushes.finish(flush_id);
         }
-        Ok(())
-      })?;
-    } else {
-      if let Ok(mut inner) = self.inner.lock() {
-        inner.flushes.finish(flush_id);
+        return reject_with_dom_exception_async(
+          env,
+          DOMExceptionName::InvalidStateError,
+          "Cannot flush a closed codec",
+        );
       }
-      return reject_with_dom_exception_async(
-        env,
-        DOMExceptionName::InvalidStateError,
-        "Cannot flush a closed codec",
-      );
     }
 
     // Clone references for the callback closure
@@ -1736,7 +1740,11 @@ impl AudioEncoder {
             .lock()
             .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
           guard.flushes.begin_output_delivery(flush_id);
-          std::mem::take(&mut guard.pending_chunks)
+          if abort.is_aborted() {
+            Vec::new()
+          } else {
+            std::mem::take(&mut guard.pending_chunks)
+          }
         };
 
         // Call output callback for each chunk synchronously

@@ -54,13 +54,13 @@ function blockJsThread(ms: number) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
 }
 
-function i420Frame(width: number, height: number, index: number) {
+function i420Frame(width: number, height: number, index: number, timestamp = index * 33_333) {
   const data = new Uint8Array((width * height * 3) / 2)
   for (let i = 0; i < data.length; i++) data[i] = (i * 7 + index * 13) & 0xff
-  return new VideoFrame(data, { format: 'I420', codedWidth: width, codedHeight: height, timestamp: index * 33_333 })
+  return new VideoFrame(data, { format: 'I420', codedWidth: width, codedHeight: height, timestamp })
 }
 
-function audioData(index: number) {
+function audioData(index: number, timestamp = index * 20_000) {
   const frames = 960
   const data = new Float32Array(frames * 2)
   for (let i = 0; i < data.length; i++) data[i] = Math.sin((index * frames + i) * 0.01) * 0.5
@@ -69,7 +69,7 @@ function audioData(index: number) {
     sampleRate: 48_000,
     numberOfChannels: 2,
     numberOfFrames: frames,
-    timestamp: index * 20_000,
+    timestamp,
     data,
   })
 }
@@ -456,12 +456,16 @@ for (const [name, make, expected] of workerErrorCases) {
 // Work that succeeds, then work that fails, then flush(). The flush buffers the
 // outputs of the first work; they must reach JS before the error callback, never
 // after the error closed the codec. Chrome: outputs, error, flush rejection.
+const RESTART_TIMESTAMP = 100_000_000
+
 interface FailAfterOutputCase {
   name: string
   // Configures the codec, queues `good` successful work items and one failing
   // item, and returns the codec. Synchronous, so a flush() right after it is
   // pending before the worker starts.
-  run(record: Record, good: number): TeardownCodec
+  run(record: Record, good: number, onOutput?: (timestamp: number) => void): TeardownCodec
+  // Reconfigures after reset() and queues one successful work item.
+  restart(codec: TeardownCodec): void
   error: string
 }
 
@@ -472,8 +476,14 @@ async function failAfterOutputCases(maxGood = 3, videoSize = 320): Promise<FailA
     {
       name: 'VideoEncoder: opaque frame',
       error: 'OperationError',
-      run: (record, good) => {
-        const encoder = new VideoEncoder({ output: () => record('output'), error: (e) => record('error:' + e.name) })
+      run: (record, good, onOutput) => {
+        const encoder = new VideoEncoder({
+          output: (chunk) => {
+            onOutput?.(chunk.timestamp)
+            record('output')
+          },
+          error: (e) => record('error:' + e.name),
+        })
         encoder.configure({ codec: 'vp8', width: 16, height: 16, hardwareAcceleration: 'prefer-software' })
         for (let i = 0; i < good; i++) {
           const frame = i420Frame(16, 16, i)
@@ -489,13 +499,21 @@ async function failAfterOutputCases(maxGood = 3, videoSize = 320): Promise<FailA
         opaque.close()
         return encoder
       },
+      restart: (codec) => {
+        const encoder = codec as VideoEncoder
+        encoder.configure({ codec: 'vp8', width: 16, height: 16, hardwareAcceleration: 'prefer-software' })
+        const frame = i420Frame(16, 16, 0, RESTART_TIMESTAMP)
+        encoder.encode(frame, { keyFrame: true })
+        frame.close()
+      },
     },
     {
       name: 'VideoDecoder: corrupt chunk',
       error: 'EncodingError',
-      run: (record, good) => {
+      run: (record, good, onOutput) => {
         const decoder = new VideoDecoder({
           output: (frame) => {
+            onOutput?.(frame.timestamp)
             record('output')
             frame.close()
           },
@@ -507,14 +525,28 @@ async function failAfterOutputCases(maxGood = 3, videoSize = 320): Promise<FailA
         decoder.decode(new EncodedVideoChunk({ type: 'key', timestamp: good * 33_333, data: new Uint8Array([0]) }))
         return decoder
       },
+      restart: (codec) => {
+        const decoder = codec as VideoDecoder
+        decoder.configure({ ...video.config, optimizeForLatency: true, hardwareAcceleration: 'prefer-software' })
+        const source = video.chunks[0]
+        const data = new Uint8Array(source.byteLength)
+        source.copyTo(data)
+        decoder.decode(new EncodedVideoChunk({ type: source.type, timestamp: RESTART_TIMESTAMP, data }))
+      },
     },
     {
       // Chrome resamples Opus input to 48 kHz; this encoder (libopus) cannot open at
       // 44.1 kHz, so the queued reconfigure fails on the worker.
       name: 'AudioEncoder: reconfigure the encoder cannot open',
       error: 'EncodingError',
-      run: (record, good) => {
-        const encoder = new AudioEncoder({ output: () => record('output'), error: (e) => record('error:' + e.name) })
+      run: (record, good, onOutput) => {
+        const encoder = new AudioEncoder({
+          output: (chunk) => {
+            onOutput?.(chunk.timestamp)
+            record('output')
+          },
+          error: (e) => record('error:' + e.name),
+        })
         encoder.configure({ codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 })
         for (let i = 0; i < good; i++) {
           const data = audioData(i)
@@ -524,13 +556,21 @@ async function failAfterOutputCases(maxGood = 3, videoSize = 320): Promise<FailA
         encoder.configure({ codec: 'opus', sampleRate: 44_100, numberOfChannels: 2 })
         return encoder
       },
+      restart: (codec) => {
+        const encoder = codec as AudioEncoder
+        encoder.configure({ codec: 'opus', sampleRate: 48_000, numberOfChannels: 2 })
+        const data = audioData(0, RESTART_TIMESTAMP)
+        encoder.encode(data)
+        data.close()
+      },
     },
     {
       name: 'AudioDecoder: corrupt chunk',
       error: 'EncodingError',
-      run: (record, good) => {
+      run: (record, good, onOutput) => {
         const decoder = new AudioDecoder({
           output: (data) => {
+            onOutput?.(data.timestamp)
             record('output')
             data.close()
           },
@@ -543,6 +583,14 @@ async function failAfterOutputCases(maxGood = 3, videoSize = 320): Promise<FailA
           new EncodedAudioChunk({ type: 'key', timestamp: good * 20_000, data: new Uint8Array([0x03, 0x00]) }),
         )
         return decoder
+      },
+      restart: (codec) => {
+        const decoder = codec as AudioDecoder
+        decoder.configure(audio.config)
+        const source = audio.chunks[0]
+        const data = new Uint8Array(source.byteLength)
+        source.copyTo(data)
+        decoder.decode(new EncodedAudioChunk({ type: source.type, timestamp: RESTART_TIMESTAMP, data }))
       },
     },
   ]
@@ -682,6 +730,43 @@ test.serial('an unrun exception scheduler cannot suppress buffered output except
         label,
       )
     }
+  }
+})
+
+test.serial('an exception backstop runs while flush-buffered outputs wait for the error', async (t) => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'queueMicrotask')!
+  const good = 1100
+  for (const failCase of await failAfterOutputCases(good, 64)) {
+    const log: string[] = []
+    const uncaught: string[] = []
+    let outputs = 0
+    process.setUncaughtExceptionCaptureCallback((error) => {
+      uncaught.push(error instanceof Error ? error.message : String(error))
+    })
+    try {
+      Object.defineProperty(globalThis, 'queueMicrotask', {
+        configurable: true,
+        writable: true,
+        value: () => {},
+      })
+      const codec = failCase.run((entry) => {
+        if (entry === 'output') {
+          outputs += 1
+          if (outputs === 1000) throw new Error('output-threw')
+        } else {
+          log.push(entry)
+        }
+      }, good)
+      await codec.flush().catch((error: unknown) => log.push(`flush:${(error as DOMException).name}`))
+      await waitFor(() => uncaught.length > 0, `${failCase.name}: exception backstop`)
+      await delay(20)
+    } finally {
+      process.setUncaughtExceptionCaptureCallback(null)
+      Object.defineProperty(globalThis, 'queueMicrotask', descriptor)
+    }
+    t.is(outputs, good, failCase.name)
+    t.deepEqual(uncaught, ['output-threw'], failCase.name)
+    t.deepEqual(log, [`error:${failCase.error}`, `flush:${failCase.error}`], failCase.name)
   }
 })
 
@@ -970,6 +1055,221 @@ test('outputs queued behind more than 999 others still reach JS before the error
     )
     t.is(codec.state, 'closed', failCase.name)
   }
+})
+
+test('microtask checkpoints let reset() cancel old work, with or without a pending flush', async (t) => {
+  const good = 2100
+  const failCases = await failAfterOutputCases(good, 64)
+  const schedules: Array<[string, (callback: () => void) => void]> = [
+    ['queueMicrotask', (callback) => queueMicrotask(callback)],
+    ['Promise continuation', (callback) => void Promise.resolve().then(callback)],
+  ]
+  for (const flushFirst of [false, true]) {
+    for (const [scheduleName, schedule] of schedules) {
+      for (const failCase of failCases) {
+        const label = `${flushFirst ? 'pending flush' : 'no pending flush'}: ${scheduleName}: ${failCase.name}`
+        const errors: string[] = []
+        let codec: TeardownCodec | undefined
+        let oldOutputs = 0
+        let lateOldOutputs = 0
+        let newOutputs = 0
+        let restarted = false
+        let resetError: unknown
+        let flushResult: string | undefined
+        let oldFlushResult: string | undefined
+        codec = failCase.run((entry) => {
+          if (entry !== 'output') errors.push(entry)
+        }, good, (timestamp) => {
+          if (timestamp >= RESTART_TIMESTAMP) {
+            newOutputs += 1
+          } else if (restarted) {
+            lateOldOutputs += 1
+          } else {
+            oldOutputs += 1
+            if (oldOutputs === 1000) {
+              schedule(() => {
+                try {
+                  codec!.reset()
+                  restarted = true
+                  failCase.restart(codec!)
+                  void codec!.flush().then(
+                    () => {
+                      flushResult = 'ok'
+                    },
+                    (error: unknown) => {
+                      flushResult = (error as DOMException).name
+                    },
+                  )
+                } catch (error) {
+                  resetError = error
+                }
+              })
+            }
+          }
+        })
+        if (flushFirst) {
+          void codec.flush().then(
+            () => {
+              oldFlushResult = 'ok'
+            },
+            (error: unknown) => {
+              oldFlushResult = (error as DOMException).name
+            },
+          )
+        }
+        await sendQueued()
+        const deadline = Date.now() + 20_000
+        while (queueSize(codec) > 0 && Date.now() < deadline) blockJsThread(1)
+        blockJsThread(200)
+        await waitFor(() => resetError !== undefined || flushResult !== undefined, `${label}: reset or flush`)
+        await delay(100)
+
+        t.deepEqual(
+          {
+            resetError:
+              resetError === undefined ? undefined : `${(resetError as Error).name}: ${(resetError as Error).message}`,
+            oldOutputs,
+            lateOldOutputs,
+            newOutputDelivered: newOutputs > 0,
+            errors,
+            oldFlushResult,
+            flushResult,
+            state: codec.state,
+          },
+          {
+            resetError: undefined,
+            oldOutputs: 1000,
+            lateOldOutputs: 0,
+            newOutputDelivered: true,
+            errors: [],
+            oldFlushResult: flushFirst ? 'AbortError' : undefined,
+            flushResult: 'ok',
+            state: 'configured',
+          },
+          label,
+        )
+        if (codec.state !== 'closed') codec.close()
+      }
+    }
+  }
+})
+
+test('a failed-state flush from an output rejects after the outputs and error', async (t) => {
+  const good = 2100
+  for (const failCase of await failAfterOutputCases(good, 64)) {
+    const events: string[] = []
+    let outputs = 0
+    let flushResult: string | undefined
+    const codec = failCase.run((entry) => {
+      events.push(entry)
+      if (entry === 'output') {
+        outputs += 1
+        if (outputs === 1000) {
+          void codec.flush().then(
+            () => {
+              flushResult = 'ok'
+              events.push('flush:ok')
+            },
+            (error: unknown) => {
+              flushResult = (error as DOMException).name
+              events.push(`flush:${flushResult}`)
+            },
+          )
+        }
+      }
+    }, good)
+    codec.ondequeue = () => events.push('dequeue')
+    await sendQueued()
+    const deadline = Date.now() + 20_000
+    while (queueSize(codec) > 0 && Date.now() < deadline) blockJsThread(1)
+    blockJsThread(200)
+    await waitFor(
+      () => flushResult !== undefined && events.some((entry) => entry.startsWith('error:')),
+      `${failCase.name}: error and flush`,
+    )
+    await delay(100)
+
+    const errorAt = events.findIndex((entry) => entry.startsWith('error:'))
+    const flushAt = events.findIndex((entry) => entry.startsWith('flush:'))
+    t.deepEqual(
+      {
+        outputs,
+        outputsBeforeError: events.slice(0, errorAt).filter((entry) => entry === 'output').length,
+        outputsAfterError: events.slice(errorAt + 1).filter((entry) => entry === 'output').length,
+        error: events[errorAt],
+        flushResult,
+        flushAfterError: flushAt > errorAt,
+        dequeueAfterError: events.some((entry, index) => index > errorAt && entry === 'dequeue'),
+        state: codec.state,
+      },
+      {
+        outputs: good,
+        outputsBeforeError: good,
+        outputsAfterError: 0,
+        error: `error:${failCase.error}`,
+        flushResult: failCase.error,
+        flushAfterError: true,
+        dequeueAfterError: true,
+        state: 'closed',
+      },
+      failCase.name,
+    )
+  }
+})
+
+test('a raw fallback batch cannot trap an error continuation', (t) => {
+  const script = `
+    process.isBun = true;
+    const fs = require('node:fs');
+    const { ImageDecoder, VideoEncoder, VideoFrame, createVideoFrameFromRGBA16Float } = require('./index.js');
+    let imageDecoder;
+    let outputs = 0;
+    const encoder = new VideoEncoder({
+      output() {
+        outputs += 1;
+        if (outputs === 1) {
+          imageDecoder = new ImageDecoder({ data: new ReadableStream({ start() {} }), type: 'image/jpeg' });
+          fs.writeSync(1, 'RAW_SCHEDULED\\n');
+        }
+        if (outputs === 1000 || outputs === 2100) fs.writeSync(1, 'OUTPUT:' + outputs + '\\n');
+      },
+      error(error) {
+        fs.writeSync(1, 'ERROR:' + error.name + '\\n');
+        setTimeout(() => {
+          imageDecoder.close();
+          fs.writeSync(1, 'DONE\\n');
+          process.exit(0);
+        }, 100);
+      },
+    });
+    encoder.configure({ codec: 'vp8', width: 16, height: 16, hardwareAcceleration: 'prefer-software' });
+    for (let i = 0; i < 2100; i++) {
+      const frame = new VideoFrame(new Uint8Array(16 * 16 * 3 / 2).fill(i & 255), {
+        format: 'I420', codedWidth: 16, codedHeight: 16, timestamp: i * 33333,
+      });
+      encoder.encode(frame, { keyFrame: true });
+      frame.close();
+    }
+    const opaque = createVideoFrameFromRGBA16Float(new Uint16Array(16 * 16 * 4), {
+      codedWidth: 16, codedHeight: 16, timestamp: 2100 * 33333,
+    });
+    encoder.encode(opaque);
+    opaque.close();
+    Promise.resolve().then(() => Promise.resolve()).then(() => {
+      const deadline = Date.now() + 20000;
+      while (encoder.encodeQueueSize > 0 && Date.now() < deadline) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1);
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+    });
+  `
+  const output = execFileSync(process.execPath, ['-e', script], {
+    cwd: process.cwd(),
+    env: childEnv(),
+    timeout: 10_000,
+    encoding: 'utf8',
+  })
+  t.deepEqual(output.trim().split('\n'), ['RAW_SCHEDULED', 'OUTPUT:1000', 'OUTPUT:2100', 'ERROR:OperationError', 'DONE'])
 })
 
 test('close() in an output callback that runs before the error callback drops the error', async (t) => {
