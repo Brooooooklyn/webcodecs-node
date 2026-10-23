@@ -4517,17 +4517,73 @@ fn decode_av1_samples(
   samples: &AvifSamples,
   count: usize,
 ) -> Result<(CodecContext, Vec<Frame>, Option<usize>)> {
+  let (context, frames, bad) = decode_av1_samples_once(data, samples, count)?;
+  let required = bad.unwrap_or(count);
+  if frames.len() >= required {
+    return Ok((context, frames, bad));
+  }
+
+  // Delayed output and an earlier no-output failure can leave the prefix short even when a
+  // later packet has an explicit error. That error supplies the first known-deficient prefix.
+  let upper = bad.map_or(count, |index| index + 1);
+  let (bad, valid) = first_bad_prefix(upper, |prefix| {
+    let (context, frames, bad) = decode_av1_samples_once(data, samples, prefix)?;
+    Ok((bad.is_none() && frames.len() == prefix).then_some((context, frames)))
+  })?;
+  if let Some((valid_context, valid_frames)) = valid {
+    Ok((valid_context, valid_frames, Some(bad)))
+  } else {
+    Ok((context, frames, Some(bad)))
+  }
+}
+
+/// Find the first deficient sample and the result for the valid prefix before it. The full
+/// `count` prefix is already known deficient. Exponential and binary search use O(log count)
+/// probes, without recursion or a probe for every sample.
+fn first_bad_prefix<T>(
+  count: usize,
+  mut probe: impl FnMut(usize) -> Result<Option<T>>,
+) -> Result<(usize, Option<T>)> {
+  debug_assert!(count > 0);
+  let mut low = 0;
+  let mut high = count;
+  let mut valid = None;
+  let mut next = 1;
+  while next < high {
+    match probe(next)? {
+      Some(result) => {
+        low = next;
+        valid = Some(result);
+        next = next.saturating_mul(2);
+      }
+      None => {
+        high = next;
+        break;
+      }
+    }
+  }
+  while high - low > 1 {
+    let middle = low + (high - low) / 2;
+    match probe(middle)? {
+      Some(result) => {
+        low = middle;
+        valid = Some(result);
+      }
+      None => high = middle,
+    }
+  }
+  Ok((high - 1, valid))
+}
+
+/// Make one decode pass and tag an explicit error without recursively repairing its prefix.
+fn decode_av1_samples_once(
+  data: &[u8],
+  samples: &AvifSamples,
+  count: usize,
+) -> Result<(CodecContext, Vec<Frame>, Option<usize>)> {
   let failed = |e: CodecError| Error::new(Status::GenericFailure, format!("Decode failed: {e}"));
   let fail = |context: CodecContext, frames: Vec<Frame>, _error: CodecError, index: usize| {
-    if index == 0 {
-      return Ok((context, frames, Some(0)));
-    }
-    // Re-decode only the valid prefix. Its final flush preserves the frames that
-    // would otherwise be lost when a later sample fails.
-    match decode_av1_samples(data, samples, index) {
-      Ok((prefix_context, prefix_frames, _)) => Ok((prefix_context, prefix_frames, Some(index))),
-      Err(_) => Ok((context, frames, Some(index))),
-    }
+    Ok((context, frames, Some(index)))
   };
   let mut context = create_image_decoder(AVCodecID::Av1, Some(samples.config.clone()))?;
   let mut frames = Vec::new();
@@ -4980,8 +5036,8 @@ mod tests {
     AVCodecID, ColorSpaceConversion, DecodeTurn, FrameCall, ImageDecoderData, ImageDecoderInner,
     ImageTrackData, ImageTrackList, ImageTrackListInner, JpegPost, abort_if_reset,
     apply_frame_failure, begin_terminal_refresh, cache_decoded_frames, close_decoder,
-    decode_cached_frame, end_with_frame_failure, finish_jpeg_post, frame_failure, post_before_end,
-    reset_or_closed, take_frame_failure,
+    decode_cached_frame, end_with_frame_failure, finish_jpeg_post, first_bad_prefix, frame_failure,
+    post_before_end, reset_or_closed, take_frame_failure,
   };
   use napi::tokio::sync::Notify;
   use std::cell::{Cell, RefCell};
@@ -5723,6 +5779,48 @@ mod tests {
     inner.lock().unwrap().frame_failed = Some(1);
     assert!(retries.run(&inner, 1));
     assert!(retries.run(&inner, 1));
+  }
+
+  #[test]
+  fn avif_prefix_search_skips_valid_delayed_samples() {
+    // With libdav1d, all three packets can return no frame immediately. Their own flushes give
+    // one and two frames for the valid prefixes, but only two for all three samples.
+    let mut probes = Vec::new();
+    let (bad, valid) = first_bad_prefix(3, |prefix| {
+      probes.push(prefix);
+      let frames = if prefix < 3 { prefix } else { 2 };
+      Ok((frames == prefix).then_some(frames))
+    })
+    .unwrap();
+    assert_eq!(bad, 2);
+    assert_eq!(valid, Some(2));
+    assert_eq!(probes, [1, 2]);
+  }
+
+  #[test]
+  fn avif_prefix_search_finds_every_first_deficient_sample() {
+    for count in 1..=65 {
+      for expected in 0..count {
+        let (bad, valid) =
+          first_bad_prefix(count, |prefix| Ok((prefix <= expected).then_some(prefix))).unwrap();
+        assert_eq!(bad, expected, "count {count}");
+        assert_eq!(valid, (expected > 0).then_some(expected), "count {count}");
+      }
+    }
+  }
+
+  #[test]
+  fn avif_prefix_search_is_iterative_and_bounded() {
+    const COUNT: usize = 2_592_000;
+    let mut probes = 0;
+    let (bad, valid) = first_bad_prefix(COUNT, |prefix| {
+      probes += 1;
+      Ok((prefix < COUNT).then_some(prefix))
+    })
+    .unwrap();
+    assert_eq!(bad, COUNT - 1);
+    assert_eq!(valid, Some(COUNT - 1));
+    assert!(probes <= 2 * usize::BITS as usize, "{probes} probes");
   }
 
   #[test]

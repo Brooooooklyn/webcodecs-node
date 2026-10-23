@@ -1512,6 +1512,38 @@ test('ImageDecoder: keeps frames decoded before a corrupt AVIF sample and checks
   t.true(decoder.closed)
 })
 
+test('ImageDecoder: keeps the valid prefix when an AVIF sample gives no frame', async (t) => {
+  const data = avifFixture('anim8_420.avif')
+  // The third sample starts at 2771. Changing its frame OBU to reserved type 14 makes FFmpeg
+  // ignore it without an error. Libaom returns 1,1,0 immediately; libdav1d delays all three
+  // outputs and flushes the valid two.
+  data[2773] ^= 0x40
+
+  const decoder = new ImageDecoder({ data, type: 'image/avif' })
+  await decoder.tracks.ready
+  t.is(decoder.tracks.selectedTrack?.frameCount, 3)
+  await t.throwsAsync(decoder.decode({ frameIndex: 3 }), {
+    name: 'RangeError',
+    message: 'Frame index 3 out of bounds (image has 3 frames)',
+  })
+  t.false(decoder.closed)
+  for (const [frameIndex, timestamp] of [
+    [0, 0],
+    [1, 33333],
+  ]) {
+    const { image } = await decoder.decode({ frameIndex })
+    t.is(image.format, 'BGRX')
+    t.is(image.timestamp, timestamp)
+    image.close()
+    t.false(decoder.closed)
+  }
+  await t.throwsAsync(decoder.decode({ frameIndex: 2 }), {
+    name: 'EncodingError',
+    message: 'Failed to decode frame at index 2',
+  })
+  t.true(decoder.closed)
+})
+
 test('ImageDecoder: an out-of-range decode of a streamed corrupt AVIF waits for EOF', async (t) => {
   const data = avifFixture('anim8_420.avif')
   data.fill(0xff, 1941, 2771)
@@ -1590,6 +1622,48 @@ test('ImageDecoder: a corrupt AVIF sample rejects decode() and completed while t
   const { image } = await decoder.decode({ frameIndex: 0 })
   t.is(image.format, 'BGRX')
   image.close()
+  await t.throwsAsync(decoder.decode({ frameIndex: 1 }), {
+    name: 'EncodingError',
+    message: 'Failed to decode frame at index 1',
+  })
+  t.true(decoder.closed)
+  t.false(decoder.complete)
+  await t.throwsAsync(completed, {
+    instanceOf: DOMException,
+    name: 'AbortError',
+    message: 'Aborted by close.',
+  })
+})
+
+test('ImageDecoder: mixed AVIF failures reject the first bad sample on an open stream', async (t) => {
+  const data = avifFixture('anim8_420.avif')
+  // Sample 1 gives no frame without an error; sample 2 has an explicit decode error.
+  data[1943] ^= 0x40
+  data.fill(0xff, 2771)
+
+  const buffered = new ImageDecoder({ data: data.slice(), type: 'image/avif' })
+  await buffered.tracks.ready
+  t.is(buffered.tracks.selectedTrack?.frameCount, 3)
+  await t.throwsAsync(buffered.decode({ frameIndex: 3 }), {
+    name: 'RangeError',
+    message: 'Frame index 3 out of bounds (image has 3 frames)',
+  })
+  t.false(buffered.closed)
+  buffered.close()
+
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(data)
+    },
+  })
+  const decoder = new ImageDecoder({ data: stream, type: 'image/avif' })
+  const completed = decoder.completed
+  await decoder.tracks.ready
+  t.is(decoder.tracks.selectedTrack?.frameCount, 3)
+  const { image } = await decoder.decode({ frameIndex: 0 })
+  t.is(image.format, 'BGRX')
+  image.close()
+  t.false(decoder.closed)
   await t.throwsAsync(decoder.decode({ frameIndex: 1 }), {
     name: 'EncodingError',
     message: 'Failed to decode frame at index 1',
