@@ -168,8 +168,8 @@ jobs:
           cmake -B build-12bit -S source -G Ninja `
             -DCMAKE_C_COMPILER=clang-cl `
             -DCMAKE_CXX_COMPILER=clang-cl `
-            -DCMAKE_RC_COMPILER=llvm-rc `
-            -DCMAKE_AR=llvm-lib `
+            -DCMAKE_RC_COMPILER="C:/Program Files/LLVM/bin/llvm-rc.exe" `
+            -DCMAKE_AR="C:/Program Files/LLVM/bin/llvm-lib.exe" `
             -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY="$x265Dir/build-12bit/Release" `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
@@ -188,8 +188,8 @@ jobs:
           cmake -B build-10bit -S source -G Ninja `
             -DCMAKE_C_COMPILER=clang-cl `
             -DCMAKE_CXX_COMPILER=clang-cl `
-            -DCMAKE_RC_COMPILER=llvm-rc `
-            -DCMAKE_AR=llvm-lib `
+            -DCMAKE_RC_COMPILER="C:/Program Files/LLVM/bin/llvm-rc.exe" `
+            -DCMAKE_AR="C:/Program Files/LLVM/bin/llvm-lib.exe" `
             -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY="$x265Dir/build-10bit/Release" `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
@@ -211,8 +211,8 @@ jobs:
           cmake -B build-main -S source -G Ninja `
             -DCMAKE_C_COMPILER=clang-cl `
             -DCMAKE_CXX_COMPILER=clang-cl `
-            -DCMAKE_RC_COMPILER=llvm-rc `
-            -DCMAKE_AR=llvm-lib `
+            -DCMAKE_RC_COMPILER="C:/Program Files/LLVM/bin/llvm-rc.exe" `
+            -DCMAKE_AR="C:/Program Files/LLVM/bin/llvm-lib.exe" `
             -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY="$x265Dir/build-main/Release" `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
