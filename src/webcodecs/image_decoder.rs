@@ -3318,6 +3318,7 @@ fn cache_decoded_frames(
       repetition_count,
       None,
       None,
+      None,
     );
   }
 
@@ -3358,8 +3359,9 @@ fn cache_decoded_frames(
             guard.cached_frames = None;
           }
         })?;
-      // an item that ends past the data (see `AvifSamples::past_size_hint`)
-      if data_complete && corrupt_sample.is_none() && frames.len() < image.color.len() {
+      // A complete in-memory input whose samples do not decode fails here. A terminated stream
+      // instead preserves its valid prefix and records the missing samples or item below.
+      if complete && corrupt_sample.is_none() && frames.len() < image.color.len() {
         return Err(Error::new(
           Status::GenericFailure,
           "Failed to decode frame at index 0",
