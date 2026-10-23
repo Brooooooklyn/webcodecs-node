@@ -1942,7 +1942,7 @@ Cflags: -I${{includedir}}
     self.info("Building brotli...");
 
     let source = self.source_dir.join("brotli");
-    self.git_clone(BROTLI_REPO, Some(BROTLI_BRANCH), &source)?;
+    self.git_clone_at_revision(BROTLI_REPO, BROTLI_BRANCH, &source)?;
 
     let build_dir = source.join("_build");
     fs::create_dir_all(&build_dir)?;
@@ -2801,6 +2801,43 @@ mod tests {
       .git_clone_at_revision(&repository_url, "n9.0", &checkout)
       .unwrap_err();
     assert!(error.to_string().contains("not requested revision n9.0"));
+
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn rejects_stale_brotli_checkout() {
+    let root = temporary_directory("brotli-revision");
+    let checkout = root.join("source").join("brotli");
+    fs::create_dir_all(&checkout).unwrap();
+
+    run_git(&checkout, &["init", "--quiet"]);
+    run_git(&checkout, &["config", "user.name", "Test User"]);
+    run_git(&checkout, &["config", "user.email", "test@example.com"]);
+    run_git(&checkout, &["config", "commit.gpgSign", "false"]);
+    run_git(&checkout, &["config", "tag.gpgSign", "false"]);
+    fs::write(checkout.join("version"), "1.1.0\n").unwrap();
+    run_git(&checkout, &["add", "version"]);
+    run_git(&checkout, &["commit", "--quiet", "-m", "Brotli 1.1.0"]);
+    run_git(&checkout, &["tag", "--no-sign", "v1.1.0"]);
+    fs::write(checkout.join("version"), "1.1.1\n").unwrap();
+    run_git(&checkout, &["commit", "--quiet", "-am", "Brotli 1.1.1"]);
+    run_git(&checkout, &["tag", "--no-sign", BROTLI_BRANCH]);
+    run_git(&checkout, &["checkout", "--quiet", "v1.1.0"]);
+
+    let context = BuildContext::new(
+      root.join("output"),
+      root.join("source"),
+      None,
+      1,
+      false,
+      false,
+      true,
+    );
+    let error = context.build_brotli().unwrap_err();
+    let message = error.to_string();
+    let expected = format!("not requested revision {BROTLI_BRANCH}");
+    assert!(message.contains(expected.as_str()), "{message}");
 
     fs::remove_dir_all(root).unwrap();
   }
