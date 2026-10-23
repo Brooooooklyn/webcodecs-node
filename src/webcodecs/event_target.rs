@@ -21,6 +21,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
+use super::after_task::after_task_with_napi;
 use super::error::new_event;
 
 /// Dispatcher commands, sent as three u32 args (a pointer cannot cross the JS
@@ -1176,14 +1177,15 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
   }
 }
 
-/// Report one listener exception as an uncaught error via the microtask queue.
-/// Falls back to reporting inline without leaving a pending exception.
+/// Report one listener exception as an uncaught error via the microtask queue, with a native
+/// backstop when the page scheduler does not run it. Falls back to reporting inline without
+/// leaving a pending exception.
 pub(crate) fn report_exception(env: &Env, exc: sys::napi_value) {
   let mut exc_ref = ptr::null_mut();
   let env_raw = env.raw();
   // A page-provided queueMicrotask can invoke the reporter synchronously, retain it, or invoke it
-  // more than once. The first reporter invocation or fallback cleanup claims exc_ref; every later
-  // reporter call is a no-op, and fallback must not repeat a synchronous invocation's deletion.
+  // more than once. The first reporter invocation, native backstop or fallback cleanup claims
+  // exc_ref; later reporters and backstops are no-ops, and fallback must not repeat that deletion.
   let consumed = Arc::new(AtomicBool::new(false));
   let reporter_consumed = consumed.clone();
   let reported =
@@ -1210,7 +1212,28 @@ pub(crate) fn report_exception(env: &Env, exc: sys::napi_value) {
           qm.call(reporter).map(|_| ())
         })
         .is_ok();
-  if !reported {
+  let backstop_consumed = consumed.clone();
+  let backstop_scheduled = reported
+    && !exc_ref.is_null()
+    && after_task_with_napi(
+      env,
+      Box::new(move || {
+        // queueMicrotask returned normally but need not have queued its argument. Report from the
+        // native task queue unless the page's reporter claimed the exception in a microtask first.
+        if backstop_consumed.swap(true, Ordering::AcqRel) {
+          return;
+        }
+        unsafe {
+          let mut value = ptr::null_mut();
+          sys::napi_get_reference_value(env_raw, exc_ref, &mut value);
+          sys::napi_delete_reference(env_raw, exc_ref);
+          if !value.is_null() {
+            sys::napi_fatal_exception(env_raw, value);
+          }
+        }
+      }),
+    );
+  if !reported || !backstop_scheduled {
     // Claim and release the reference before reporting either exception: napi_fatal_exception can
     // synchronously run a page's uncaught-exception handler, which can invoke a retained reporter.
     if !consumed.swap(true, Ordering::AcqRel) && !exc_ref.is_null() {

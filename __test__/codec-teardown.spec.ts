@@ -635,6 +635,56 @@ test.serial('a failed exception scheduler does not stop codec error callbacks', 
   }
 })
 
+// A scheduler that returns without running its callback has not reported the exception. A native
+// backstop reports it after the current task, and a reporter retained by the scheduler is inert
+// after that backstop releases the native reference.
+test.serial('an unrun exception scheduler cannot suppress buffered output exceptions', async (t) => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'queueMicrotask')!
+  for (const retain of [false, true]) {
+    for (const failCase of await failAfterOutputCases()) {
+      const label = `${retain ? 'retained no-op' : 'no-op'} scheduler: ${failCase.name}`
+      const log: string[] = []
+      const retainedReporters: Array<() => void> = []
+      process.setUncaughtExceptionCaptureCallback((error) => {
+        log.push(`uncaught:${error instanceof Error ? error.message : String(error)}`)
+      })
+      try {
+        Object.defineProperty(globalThis, 'queueMicrotask', {
+          configurable: true,
+          writable: true,
+          value: (reporter: () => void) => {
+            if (retain) retainedReporters.push(reporter)
+          },
+        })
+        const codec = failCase.run((entry) => {
+          log.push(entry)
+          if (entry === 'output') throw new Error('output-threw')
+        }, 2)
+        await codec.flush().catch((error: unknown) => log.push(`flush:${(error as DOMException).name}`))
+        await waitFor(
+          () => log.filter((entry) => entry.startsWith('uncaught:')).length >= 2,
+          `${label}: output exceptions`,
+        )
+        for (const reporter of retainedReporters) reporter()
+        await delay(20)
+      } finally {
+        process.setUncaughtExceptionCaptureCallback(null)
+        Object.defineProperty(globalThis, 'queueMicrotask', descriptor)
+      }
+      t.deepEqual(
+        log.filter((entry) => !entry.startsWith('uncaught:')),
+        ['output', 'output', `error:${failCase.error}`, `flush:${failCase.error}`],
+        label,
+      )
+      t.deepEqual(
+        log.filter((entry) => entry.startsWith('uncaught:')),
+        ['uncaught:output-threw', 'uncaught:output-threw'],
+        label,
+      )
+    }
+  }
+})
+
 // A page-provided scheduler can invoke the native reporter synchronously, throw after it, or
 // invoke it again. Each output exception owns one native reference, however the scheduler behaves.
 test.serial('synchronous exception schedulers consume each output exception once', async (t) => {

@@ -11,9 +11,9 @@
 //! turn, also those queued before it. An empty idle handle runs along, as Node's does for
 //! setImmediate: while it is active the loop does not wait for I/O before the check phase.
 //!
-//! The work must not call JS or Node-API: it runs in a raw libuv callback, with no HandleScope and
-//! no microtask checkpoint, and it can run while Node tears the env down and JS is no longer
-//! allowed (the loop runs on until the cleanup hook below is done).
+//! Work passed to `after_task` must not call JS or Node-API: it runs in a raw libuv callback, with
+//! no HandleScope and no microtask checkpoint, and it can run while Node tears the env down and JS
+//! is no longer allowed (the loop runs on until the cleanup hook below is done).
 //!
 //! The libuv and Node-API functions are looked up in the process at run time with `libloading`,
 //! much as napi-sys looks up Node-API. On Windows only the exe is searched (napi-sys also tries a
@@ -43,6 +43,13 @@ pub(crate) fn after_task(env: &Env, work: Work) -> bool {
     Err(work) => work,
   };
   tsfn::after_task(env, work)
+}
+
+/// Run work that may call JS or Node-API after the current task and its microtasks. This always
+/// uses the threadsafe-function queue, whose callback has a live `Env`; the raw libuv callback used
+/// by `after_task` does not. The queue drops work without running it at env teardown.
+pub(crate) fn after_task_with_napi(env: &Env, work: Work) -> bool {
+  tsfn::after_task_with_napi(env, work)
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -383,6 +390,9 @@ mod tsfn {
   struct Tasks {
     env: usize,
     work: RefCell<Vec<Work>>,
+    /// N-API work can report an exception and reenter the scheduler. Detach these batches before
+    /// running them so nested work gets a later callback, with a microtask checkpoint in between.
+    detach_on_call: bool,
   }
 
   thread_local! {
@@ -390,6 +400,14 @@ mod tsfn {
   }
 
   pub(super) fn after_task(env: &Env, work: Work) -> bool {
+    schedule(env, work, false)
+  }
+
+  pub(super) fn after_task_with_napi(env: &Env, work: Work) -> bool {
+    schedule(env, work, true)
+  }
+
+  fn schedule(env: &Env, work: Work, detach_on_call: bool) -> bool {
     let key = env.raw() as usize;
     let Ok(found) = TASKS.try_with(|tasks| tasks.borrow().get(&key).copied()) else {
       return false;
@@ -399,7 +417,7 @@ mod tsfn {
       unsafe { &*tasks }.work.borrow_mut().push(work);
       return true;
     }
-    let Some((tasks, function)) = Tasks::new(env, work) else {
+    let Some((tasks, function)) = Tasks::new(env, work, detach_on_call) else {
       clear_exception(env.raw());
       return false;
     };
@@ -432,7 +450,11 @@ mod tsfn {
   }
 
   impl Tasks {
-    fn new(env: &Env, work: Work) -> Option<(*mut Tasks, sys::napi_threadsafe_function)> {
+    fn new(
+      env: &Env,
+      work: Work,
+      detach_on_call: bool,
+    ) -> Option<(*mut Tasks, sys::napi_threadsafe_function)> {
       // The custom call_js callback does not call this function; it is only the queue's target.
       let callback = env
         .create_function_from_closure::<(), (), _>("afterTask", |_| Ok(()))
@@ -441,6 +463,7 @@ mod tsfn {
       let tasks = Box::into_raw(Box::new(Tasks {
         env: env.raw() as usize,
         work: RefCell::new(vec![work]),
+        detach_on_call,
       }));
       let mut function = ptr::null_mut();
       // SAFETY: all values belong to this live env. On success the host calls `finalize` once for
@@ -482,14 +505,19 @@ mod tsfn {
     }
     // SAFETY: with JS still available, the context remains live until this notification is drained
     let tasks = unsafe { &*context.cast::<Tasks>() };
+    if tasks.detach_on_call {
+      // Reentrant N-API work must not run before the microtasks queued by this batch's callbacks.
+      // The context stays alive until the TSFN finalizer, even though its map entry is gone.
+      forget(context.cast());
+    }
     loop {
       let work = std::mem::take(&mut *tasks.work.borrow_mut());
       if work.is_empty() {
         break;
       }
       for item in work {
-        // A panic must not unwind into the host. Work queued by an item joins this batch because
-        // its map entry remains until the loop below has drained it.
+        // A panic must not unwind into the host. Ordinary work queued by an item joins this batch;
+        // reentrant N-API work gets a fresh callback because its batch was detached above.
         let _ = catch_unwind(AssertUnwindSafe(item));
       }
     }
@@ -497,7 +525,8 @@ mod tsfn {
   }
 
   fn forget(tasks: *mut Tasks) {
-    // An old env's finalizer must not remove a new env at the same address.
+    // A stale callback or finalizer must not remove a replacement batch, or a new env at the same
+    // address.
     let _ = TASKS.try_with(|all| {
       let mut all = all.borrow_mut();
       // SAFETY: `tasks` is live in both callers
