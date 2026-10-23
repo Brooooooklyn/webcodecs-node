@@ -532,10 +532,10 @@ struct ImageDecoderInner {
   /// Whether a stream reached EOF or an error. Set before its final refresh and kept across
   /// reset(), so rebuilding its AVIF cache retains the terminal-stream parsing rules.
   terminal_stream: bool,
-  /// The frame count of an AVIF track whose stream ended before the samples of its last frames
-  /// arrived (`cached_frames` holds the frames before them). Chrome counts those frames, and the
-  /// decode() of one fails (see `decode_cached_frame`).
-  missing_samples: Option<usize>,
+  /// The declared sample count of an AVIF whose cache holds only a valid prefix: its stream ended
+  /// before the remaining samples arrived, or a sample is corrupt. Bounds checks use this count,
+  /// not the cached prefix length (see `decode_cached_frame`).
+  declared_samples: Option<usize>,
   /// The first arrived sample that is corrupt, distinct from a sample that has not arrived yet.
   corrupt_sample: Option<usize>,
   /// How a terminal stream's missing AVIF still item fails decode()
@@ -731,7 +731,7 @@ impl ImageDecoder {
       frame_failed: None,
       end_deferred: false,
       terminal_stream: false,
-      missing_samples: None,
+      declared_samples: None,
       corrupt_sample: None,
       missing_item: None,
       layered: LayeredState::default(),
@@ -844,10 +844,14 @@ impl ImageDecoder {
         // header and each frame count once the read of the chunk that brings their bytes is done
         // (see `layered_frames`).
         let layered = layered_codec(codec_id);
-        let watch_failure = layered || matches!(codec_id, Some(AVCodecID::Gif | AVCodecID::Bmp));
+        let watch_failure = layered
+          || matches!(
+            codec_id,
+            Some(AVCodecID::Gif | AVCodecID::Bmp | AVCodecID::Av1)
+          );
 
         loop {
-          // Like Chrome's close, a GIF, BMP, PNG or WebP decoder that a failure closed (a
+          // Like Chrome's close, a GIF, BMP, PNG, WebP or AVIF decoder that a failure closed (a
           // decode() of a frame that fails it) stops reading at once, and `completed` rejects
           // while the data is not complete.
           let item = if watch_failure {
@@ -1781,6 +1785,16 @@ fn decode_cached_frame(
   } else {
     guard.complete.load(Ordering::Acquire)
   };
+  // The declared sample count, not the valid cached prefix, decides whether an index exists.
+  // On an open stream an out-of-range decode still waits for the end, as it does without corruption.
+  if let Some(frame_count) = guard.declared_samples
+    && frame_index >= frame_count
+  {
+    if !data_complete {
+      return Ok(None);
+    }
+    return Err(frame_index_error(frame_index, frame_count));
+  }
   // An arrived corrupt sample fails at its own index, even while the stream is open. Valid
   // earlier frames remain available; this is separate from ordinary truncated samples.
   if let Some(index) = guard.corrupt_sample
@@ -1843,7 +1857,7 @@ fn decode_cached_frame(
     // A frame of an AVIF track whose samples did not all arrive before the stream ended: like
     // Chrome, the decode() fails with EncodingError, and the decoder closes on the JS thread
     // (`apply_frame_failure`).
-    let frame_count = guard.missing_samples.unwrap_or(frames.len());
+    let frame_count = guard.declared_samples.unwrap_or(frames.len());
     if frame_index < frame_count {
       guard.frame_failed = Some(epoch);
       return Err(frame_failure(frame_index));
@@ -3339,7 +3353,7 @@ fn cache_decoded_frames(
   };
   // An AVIF's durations come from its track (see `decode_avif`)
   let track_timing = matches!(avif, Avif::Image(_));
-  let (context, frames, frame_count, missing_samples, missing_item, corrupt_sample) = match avif {
+  let (context, frames, frame_count, declared_samples, missing_item, corrupt_sample) = match avif {
     Avif::Image(image) => {
       let len = data_bytes.len();
       if std::iter::once(&image.color)
@@ -3386,14 +3400,14 @@ fn cache_decoded_frames(
         } else {
           None
         };
-      let missing_samples =
-        (corrupt_sample.is_none() && stream_ended && frames.len() < image.color.len())
-          .then_some(image.color.len());
+      let declared_samples = ((corrupt_sample.is_some() || stream_ended)
+        && frames.len() < image.color.len())
+      .then_some(image.color.len());
       (
         context,
         frames,
         image.color.len(),
-        missing_samples,
+        declared_samples,
         missing_item,
         corrupt_sample,
       )
@@ -3440,7 +3454,7 @@ fn cache_decoded_frames(
     frame_count,
     Some(context),
     None,
-    missing_samples,
+    declared_samples,
     missing_item,
     corrupt_sample,
   )
@@ -3448,7 +3462,7 @@ fn cache_decoded_frames(
 
 /// Cache the frames of `data` (see `CachedFrame`), unless reset()/close() or a newer probe came
 /// first. `frame_count` is the track's frame count: an AVIF track also counts the frames whose
-/// samples have not arrived yet. `missing_samples` and `missing_item`: see `ImageDecoderInner`.
+/// samples have not arrived yet. `declared_samples` and `missing_item`: see `ImageDecoderInner`.
 #[allow(clippy::too_many_arguments)]
 fn store_frames(
   inner: &Arc<Mutex<ImageDecoderInner>>,
@@ -3458,7 +3472,7 @@ fn store_frames(
   frame_count: usize,
   context: Option<CodecContext>,
   repetition_count: Option<f64>,
-  missing_samples: Option<usize>,
+  declared_samples: Option<usize>,
   missing_item: Option<MissingAvifItem>,
   corrupt_sample: Option<usize>,
 ) -> Result<()> {
@@ -3493,7 +3507,7 @@ fn store_frames(
   guard.cached_frames = Some(frames);
   guard.context = context;
   guard.cached_data_len = data.len();
-  guard.missing_samples = missing_samples;
+  guard.declared_samples = declared_samples;
   guard.missing_item = missing_item;
   guard.corrupt_sample = corrupt_sample;
 
@@ -3915,7 +3929,7 @@ fn layered_frames(
   guard.cached_frames = Some(frames);
   guard.context = None;
   guard.cached_data_len = plan.data_len;
-  guard.missing_samples = None;
+  guard.declared_samples = None;
   Ok(())
 }
 
@@ -5113,7 +5127,7 @@ mod tests {
       frame_failed: None,
       end_deferred: false,
       terminal_stream: false,
-      missing_samples: None,
+      declared_samples: None,
       corrupt_sample: None,
       missing_item: None,
       layered: super::LayeredState::default(),
@@ -5719,7 +5733,7 @@ mod tests {
       let mut guard = inner.lock().unwrap();
       guard.all_data = false;
       guard.complete.store(false, Ordering::Release);
-      assert_eq!(guard.missing_samples, None);
+      assert_eq!(guard.declared_samples, None);
     }
     assert!(!begin_terminal_refresh(&inner));
 
@@ -5737,7 +5751,7 @@ mod tests {
       assert!(guard.terminal_stream);
       assert_eq!(guard.cache_epoch, 1);
       assert!(guard.cached_frames.is_none());
-      assert_eq!(guard.missing_samples, None);
+      assert_eq!(guard.declared_samples, None);
     }
 
     // The collector marks the data complete after the stale probe. A later decode must rebuild
@@ -5752,7 +5766,7 @@ mod tests {
       let guard = inner.lock().unwrap();
       assert!(!guard.closed);
       assert!(!guard.tracks.failed.load(Ordering::Acquire));
-      assert_eq!(guard.missing_samples, Some(3));
+      assert_eq!(guard.declared_samples, Some(3));
       assert_eq!(guard.cached_frames.as_ref().map(Vec::len), Some(2));
     }
     assert_eq!(

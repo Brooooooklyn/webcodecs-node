@@ -1480,7 +1480,7 @@ test('ImageDecoder: reset() keeps an AVIF track that ended before its last sampl
   t.true(decoder.closed)
 })
 
-test('ImageDecoder: keeps frames decoded before a corrupt AVIF sample', async (t) => {
+test('ImageDecoder: keeps frames decoded before a corrupt AVIF sample and checks its declared bounds', async (t) => {
   const data = Buffer.from(avifFixture('anim8_420.avif'))
   const stco = data.indexOf('stco')
   const stsz = data.indexOf('stsz')
@@ -1495,6 +1495,50 @@ test('ImageDecoder: keeps frames decoded before a corrupt AVIF sample', async (t
   data.fill(0xff, secondStart, secondStart + sizes[1])
 
   const decoder = new ImageDecoder({ data, type: 'image/avif' })
+  await decoder.tracks.ready
+  t.is(decoder.tracks.selectedTrack?.frameCount, 3)
+  await t.throwsAsync(decoder.decode({ frameIndex: 3 }), {
+    name: 'RangeError',
+    message: 'Frame index 3 out of bounds (image has 3 frames)',
+  })
+  t.false(decoder.closed)
+  const { image } = await decoder.decode({ frameIndex: 0 })
+  t.is(image.format, 'BGRX')
+  image.close()
+  await t.throwsAsync(decoder.decode({ frameIndex: 1 }), {
+    name: 'EncodingError',
+    message: 'Failed to decode frame at index 1',
+  })
+  t.true(decoder.closed)
+})
+
+test('ImageDecoder: an out-of-range decode of a streamed corrupt AVIF waits for EOF', async (t) => {
+  const data = avifFixture('anim8_420.avif')
+  data.fill(0xff, 1941, 2771)
+  let endStream!: () => void
+  const stream = new ReadableStream({
+    start(controller) {
+      endStream = () => controller.close()
+      controller.enqueue(data)
+    },
+  })
+  const decoder = new ImageDecoder({ data: stream, type: 'image/avif' })
+  const completed = decoder.completed
+  await decoder.tracks.ready
+  const outOfRange = decoder.decode({ frameIndex: 3 })
+  const outcome = outOfRange.then(
+    () => 'resolved',
+    (error: Error) => error.name,
+  )
+  t.is(await Promise.race([outcome, new Promise((resolve) => setTimeout(resolve, 50, 'pending'))]), 'pending')
+  t.false(decoder.closed)
+  endStream()
+  await completed
+  await t.throwsAsync(outOfRange, {
+    name: 'RangeError',
+    message: 'Frame index 3 out of bounds (image has 3 frames)',
+  })
+  t.false(decoder.closed)
   const { image } = await decoder.decode({ frameIndex: 0 })
   t.is(image.format, 'BGRX')
   image.close()
@@ -1531,24 +1575,32 @@ test('ImageDecoder: preserves an earlier frame when a corrupt AVIF sample stream
   t.true(decoder.closed)
 })
 
-test('ImageDecoder: rejects a corrupt AVIF sample while the stream is open', async (t) => {
+test('ImageDecoder: a corrupt AVIF sample rejects decode() and completed while the stream is open', async (t) => {
   const data = avifFixture('anim8_420.avif')
   data.fill(0xff, 1941, 2771)
-  let endStream: (() => void) | undefined
   const stream = new ReadableStream({
     start(controller) {
-      endStream = () => controller.error(new Error('done'))
       controller.enqueue(data)
     },
   })
   const decoder = new ImageDecoder({ data: stream, type: 'image/avif' })
+  const completed = decoder.completed
   await decoder.tracks.ready
+  t.is(decoder.tracks.selectedTrack?.frameCount, 3)
+  const { image } = await decoder.decode({ frameIndex: 0 })
+  t.is(image.format, 'BGRX')
+  image.close()
   await t.throwsAsync(decoder.decode({ frameIndex: 1 }), {
     name: 'EncodingError',
     message: 'Failed to decode frame at index 1',
   })
   t.true(decoder.closed)
-  endStream?.()
+  t.false(decoder.complete)
+  await t.throwsAsync(completed, {
+    instanceOf: DOMException,
+    name: 'AbortError',
+    message: 'Aborted by close.',
+  })
 })
 
 test('ImageDecoder: reset() keeps terminal-stream rules for a truncated AVIF item, like Chrome', async (t) => {
