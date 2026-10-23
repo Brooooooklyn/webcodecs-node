@@ -1203,6 +1203,21 @@ pub(crate) fn report_exception(env: &Env, exc: sys::napi_value) {
         })
         .is_ok();
   if !reported {
+    // A failed queueMicrotask lookup or call can leave its own exception
+    // pending. Clear and report it before the callback exception so both are
+    // surfaced without poisoning the error gate.
+    let mut pending = false;
+    unsafe { sys::napi_is_exception_pending(env_raw, &mut pending) };
+    if pending {
+      let mut scheduling_exception = ptr::null_mut();
+      let retrieved =
+        unsafe { sys::napi_get_and_clear_last_exception(env_raw, &mut scheduling_exception) }
+          == sys::Status::napi_ok
+          && !scheduling_exception.is_null();
+      if retrieved && scheduling_exception != exc {
+        unsafe { sys::napi_fatal_exception(env_raw, scheduling_exception) };
+      }
+    }
     unsafe { sys::napi_fatal_exception(env_raw, exc) };
     if !exc_ref.is_null() {
       unsafe { sys::napi_delete_reference(env_raw, exc_ref) };
