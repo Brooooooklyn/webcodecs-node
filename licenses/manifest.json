@@ -165,8 +165,8 @@
       "file": "brotli-LICENSE.txt",
       "project": "brotli",
       "upstream": "https://github.com/google/brotli.git",
-      "revision": "ed738e842d2fbdf2d6459e39267a633c4a9b2f5d",
-      "ref": "v1.1.0",
+      "revision": "db0631dfea829194206d269bc7b25d0908cdb97d",
+      "ref": "v1.1.1",
       "upstreamPath": "LICENSE",
       "excerpt": false,
       "sha256": "3d180008e36922a4e8daec11c34c7af264fed5962d07924aea928c38e8663c94"
