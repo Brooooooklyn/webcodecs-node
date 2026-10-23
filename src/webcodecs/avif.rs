@@ -95,14 +95,18 @@ impl AvifSamples {
     self.progressive
   }
 
-  /// Whether the first read of sample `index` starts after the first `len` bytes. Chrome turns
-  /// that into an IO error, not a short read.
-  pub fn starts_after(&self, len: usize, index: usize) -> bool {
+  /// Whether a missing read is a hard decode error: merging several extents uses read_exact
+  /// and fails on truncation, while a single extent fails only when its first missing read
+  /// starts after the data.
+  pub fn decode_error_on_truncation(&self, len: usize, index: usize) -> bool {
     match &self.samples {
-      Samples::Item(extents) if index == 0 => extents
-        .iter()
-        .find(|e| e.end > len as u64)
-        .is_some_and(|e| e.start > len as u64),
+      Samples::Item(extents) if index == 0 => {
+        extents.len() > 1
+          || extents
+            .iter()
+            .find(|e| e.end > len as u64)
+            .is_some_and(|e| e.start > len as u64)
+      }
       _ => false,
     }
   }
@@ -1335,8 +1339,8 @@ mod tests {
     assert_eq!(color.config, [0x81, 0x00, 0x0c, 0x00]);
     assert_eq!(samples(&data, color), bytes(&data, &[(275, 854)]));
     assert!(!color.is_progressive());
-    assert!(color.starts_after(274, 0));
-    assert!(!color.starts_after(275, 0));
+    assert!(color.decode_error_on_truncation(274, 0));
+    assert!(!color.decode_error_on_truncation(275, 0));
     assert_eq!(color.duration(0), 0);
     assert!(color.sample(&data, 1).is_none());
     assert!(image.alpha.is_none() && !image.premultiplied);
@@ -1357,8 +1361,8 @@ mod tests {
     let image = parsed(&data, None);
     let alpha = image.alpha.as_ref().expect("alpha");
     assert_eq!(samples(&data, &image.color), bytes(&data, &[(852, 854)]));
-    assert!(image.color.starts_after(530, 0));
-    assert!(!image.color.starts_after(852, 0));
+    assert!(image.color.decode_error_on_truncation(530, 0));
+    assert!(!image.color.decode_error_on_truncation(852, 0));
     assert_eq!(samples(&data, alpha), bytes(&data, &[(430, 422)]));
     assert_eq!(alpha.config, [0x81, 0x00, 0x1c, 0x00]);
     assert!(!image.premultiplied);
@@ -1393,6 +1397,24 @@ mod tests {
       samples(&data, &image.color),
       [bytes(&data, &[(299, 104), (403, 987)]).concat()]
     );
+
+    // Merging multiple extents is a hard error when truncated, regardless of a1lx.
+    let multi = AvifSamples {
+      config: Vec::new(),
+      progressive: false,
+      samples: Samples::Item(vec![0..10, 20..30]),
+    };
+    assert!(multi.decode_error_on_truncation(5, 0));
+    assert!(multi.decode_error_on_truncation(15, 0));
+    assert!(multi.decode_error_on_truncation(25, 0));
+    let single = AvifSamples {
+      config: Vec::new(),
+      progressive: false,
+      samples: Samples::Item(std::iter::once(20..30).collect()),
+    };
+    assert!(!single.decode_error_on_truncation(25, 0));
+    assert!(single.decode_error_on_truncation(19, 0));
+    assert!(!single.decode_error_on_truncation(30, 0));
 
     // a8_420.avif with iloc v2 (and index fields): the colour item in 'idat' as two
     // extents in reverse order, the alpha item in mdat. Chrome: the same BGRA bytes.

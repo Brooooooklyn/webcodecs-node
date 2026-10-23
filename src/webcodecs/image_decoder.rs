@@ -2708,7 +2708,7 @@ fn cache_decoded_frames(
             .chain(&image.alpha)
             .find(|samples| !samples.arrived(len, 0))
             .map(|samples| {
-              if samples.is_progressive() || samples.starts_after(len, 0) {
+              if samples.is_progressive() || samples.decode_error_on_truncation(len, 0) {
                 MissingAvifItem::DecodeError
               } else {
                 MissingAvifItem::UnexpectedEnd
