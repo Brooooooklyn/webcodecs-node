@@ -439,6 +439,15 @@ impl ImageTrackList {
 /// A decoded frame, shared, with the WebCodecs format that describes it and its duration
 type CachedFrame = (Arc<ParkingLotRwLock<Frame>>, VideoPixelFormat, Option<i64>);
 
+/// How a terminal stream's missing AVIF still item fails decode(), following Chrome's first read
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MissingAvifItem {
+  /// The read starts after the data, or the item is progressive: fail and close the decoder
+  DecodeError,
+  /// A short read: report that no complete frame arrived, and leave the decoder open
+  UnexpectedEnd,
+}
+
 /// Internal decoder state
 struct ImageDecoderInner {
   /// Original encoded data
@@ -511,6 +520,8 @@ struct ImageDecoderInner {
   /// arrived (`cached_frames` holds the frames before them). Chrome counts those frames, and the
   /// decode() of one fails (see `decode_cached_frame`).
   missing_samples: Option<usize>,
+  /// How a terminal stream's missing AVIF still item fails decode()
+  missing_item: Option<MissingAvifItem>,
   /// Track list
   tracks: ImageTrackList,
   /// Whether decoder is closed
@@ -675,6 +686,7 @@ impl ImageDecoder {
       end_deferred: false,
       terminal_stream: false,
       missing_samples: None,
+      missing_item: None,
       tracks: tracks.clone(),
       closed: false,
       cached_frames: None,
@@ -1340,6 +1352,21 @@ fn decode_cached_frame(
   if frame_index >= frames.len() {
     if !data_complete {
       return Ok(None);
+    }
+    if frame_index == 0 {
+      match guard.missing_item {
+        Some(MissingAvifItem::UnexpectedEnd) => {
+          return Err(Error::new(
+            Status::InvalidArg,
+            "RangeError: Unexpected end of image. Request for frame index 0 can't be satisfied.",
+          ));
+        }
+        Some(MissingAvifItem::DecodeError) => {
+          guard.frame_failed = Some(epoch);
+          return Err(frame_failure(frame_index));
+        }
+        None => {}
+      }
     }
     // A frame of an AVIF track whose samples did not all arrive before the stream ended: like
     // Chrome, the decode() fails with EncodingError, and the decoder closes on the JS thread
@@ -2621,6 +2648,7 @@ fn cache_decoded_frames(
         None,
         None,
         None,
+        None,
       ),
       // the metadata, but no frame yet
       None => Ok(()),
@@ -2644,7 +2672,7 @@ fn cache_decoded_frames(
   };
   // An AVIF's durations come from its track (see `decode_avif`)
   let track_timing = matches!(avif, Avif::Image(_));
-  let (context, frames, frame_count, missing_samples) = match avif {
+  let (context, frames, frame_count, missing_samples, missing_item) = match avif {
     Avif::Image(image) => {
       let len = data_bytes.len();
       if std::iter::once(&image.color)
@@ -2671,11 +2699,33 @@ fn cache_decoded_frames(
         ));
       }
       // A stream that ended before the samples of a track's last frames: Chrome counts them, and
-      // the decode() of one fails (CrabbyAvif's data is cut short); the frames before them decode
+      // A stream that ended before the samples of a track's last frames or of a still item:
+      // Chrome counts those frames. A still item follows its first missing read: a read past the
+      // end or a progressive item fails the decode, while a short read only reports no frame.
+      let missing_item =
+        if stream_ended && !image.color.is_track() && frames.len() < image.color.len() {
+          std::iter::once(&image.color)
+            .chain(&image.alpha)
+            .find(|samples| !samples.arrived(len, 0))
+            .map(|samples| {
+              if samples.is_progressive() || samples.starts_after(len, 0) {
+                MissingAvifItem::DecodeError
+              } else {
+                MissingAvifItem::UnexpectedEnd
+              }
+            })
+        } else {
+          None
+        };
       let missing_samples =
-        (stream_ended && image.color.is_track() && frames.len() < image.color.len())
-          .then_some(image.color.len());
-      (context, frames, image.color.len(), missing_samples)
+        (stream_ended && frames.len() < image.color.len()).then_some(image.color.len());
+      (
+        context,
+        frames,
+        image.color.len(),
+        missing_samples,
+        missing_item,
+      )
     }
     // a track sample past the size hint (see `Avif::PastSizeHint`)
     Avif::PastSizeHint => return Err(reject_metadata(inner)),
@@ -2697,7 +2747,7 @@ fn cache_decoded_frames(
     _ => {
       let (context, frames) = decode_frames(inner, codec_id, &data_bytes, prefer_animation)?;
       let frame_count = frames.len();
-      (context, frames, frame_count, None)
+      (context, frames, frame_count, None, None)
     }
   };
 
@@ -2724,13 +2774,14 @@ fn cache_decoded_frames(
     Some(context),
     repetition_count,
     missing_samples,
+    missing_item,
   )
 }
 
 /// Cache the frames decoded from `data`, each with its format and duration, unless
 /// reset()/close() or a newer probe came first. `frame_count` is the track's frame count: an
-/// AVIF track also counts the frames whose samples have not arrived yet. `missing_samples`: see
-/// `ImageDecoderInner::missing_samples`.
+/// AVIF track also counts the frames whose samples have not arrived yet. `missing_samples` and
+/// `missing_item`: see `ImageDecoderInner`.
 #[allow(clippy::too_many_arguments)]
 fn store_frames(
   inner: &Arc<Mutex<ImageDecoderInner>>,
@@ -2741,6 +2792,7 @@ fn store_frames(
   context: Option<CodecContext>,
   repetition_count: Option<f64>,
   missing_samples: Option<usize>,
+  missing_item: Option<MissingAvifItem>,
 ) -> Result<()> {
   before_store_frames();
   let mut guard = inner
@@ -2779,6 +2831,7 @@ fn store_frames(
   guard.context = context;
   guard.cached_data_len = data.len();
   guard.missing_samples = missing_samples;
+  guard.missing_item = missing_item;
 
   Ok(())
 }
@@ -3544,6 +3597,7 @@ mod tests {
       end_deferred: false,
       terminal_stream: false,
       missing_samples: None,
+      missing_item: None,
       tracks,
       closed: false,
       cached_frames: None,

@@ -1455,41 +1455,58 @@ test('ImageDecoder: reset() keeps an AVIF track that ended before its last sampl
   t.true(decoder.closed)
 })
 
-test('ImageDecoder: reset() keeps terminal-stream rules for a truncated AVIF item', async (t) => {
+test('ImageDecoder: reset() keeps terminal-stream rules for a truncated AVIF item, like Chrome', async (t) => {
   const cuts = [
-    ['missing item tail', avifFixture('s8_420.avif').slice(0, -100)],
-    // Fewer bytes than the colour item's 854: a complete buffer rejects this item's metadata,
-    // but a terminal stream uses the streaming size hint and has zero decodable frames.
-    ['item larger than the data', avifFixture('a8_420.avif').slice(0, 530)],
+    [
+      'short read',
+      avifFixture('s8_420.avif').slice(0, -100),
+      'RangeError',
+      "Unexpected end of image. Request for frame index 0 can't be satisfied.",
+      false,
+    ],
+    [
+      'read at the end before the alpha item',
+      avifFixture('aopitem8_420.avif').slice(0, 450),
+      'RangeError',
+      "Unexpected end of image. Request for frame index 0 can't be satisfied.",
+      false,
+    ],
+    [
+      'read past the end',
+      avifFixture('a8_420.avif').slice(0, 530),
+      'EncodingError',
+      'Failed to decode frame at index 0',
+      true,
+    ],
+    [
+      'progressive item',
+      avifFixture('prog8_420.avif').slice(0, -100),
+      'EncodingError',
+      'Failed to decode frame at index 0',
+      true,
+    ],
   ] as const
-  for (const [cut, data] of cuts) {
+  for (const [cut, data, name, message, closes] of cuts) {
     for (const [end, stream] of [
       ['EOF', avifStream],
       ['stream error', avifErrorStream],
     ] as const) {
-      const label = `${cut}, ${end}`
-      const decoder = new ImageDecoder({ data: stream(data), type: 'image/avif' })
-      const completed = decoder.completed
-      await decoder.tracks.ready
-      if (end === 'stream error') {
-        await t.throwsAsync(completed, { message: 'stream broke' }, label)
-      } else {
-        await completed
-      }
-
       for (const afterReset of [false, true]) {
+        const label = `${cut}, ${end}, afterReset ${afterReset}`
+        const decoder = new ImageDecoder({ data: stream(data), type: 'image/avif' })
+        const completed = decoder.completed
+        await decoder.tracks.ready
+        if (end === 'stream error') {
+          await t.throwsAsync(completed, { message: 'stream broke' }, label)
+        } else {
+          await completed
+        }
+
         if (afterReset) decoder.reset()
-        await t.throwsAsync(
-          decoder.decode(),
-          {
-            instanceOf: RangeError,
-            message: 'Frame index 0 out of bounds (image has 0 frames)',
-          },
-          `${label}, afterReset ${afterReset}`,
-        )
-        t.false(decoder.closed, `${label}, afterReset ${afterReset}`)
+        await t.throwsAsync(decoder.decode(), { name, message }, label)
+        t.is(decoder.closed, closes, label)
+        if (!decoder.closed) decoder.close()
       }
-      decoder.close()
     }
   }
 })

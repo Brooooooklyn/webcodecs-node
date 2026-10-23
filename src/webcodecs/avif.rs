@@ -64,6 +64,8 @@ pub(crate) struct Nclx {
 pub(crate) struct AvifSamples {
   /// The AV1CodecConfigurationRecord ('av1C')
   pub config: Vec<u8>,
+  /// 'a1lx': a progressive item (a selected layer, 'lsel', is declined here)
+  progressive: bool,
   samples: Samples,
 }
 
@@ -85,6 +87,23 @@ impl AvifSamples {
     match &self.samples {
       Samples::Item(_) => 1,
       Samples::Track(samples) => samples.len(),
+    }
+  }
+
+  /// Whether this is a progressive item
+  pub fn is_progressive(&self) -> bool {
+    self.progressive
+  }
+
+  /// Whether the first read of sample `index` starts after the first `len` bytes. Chrome turns
+  /// that into an IO error, not a short read.
+  pub fn starts_after(&self, len: usize, index: usize) -> bool {
+    match &self.samples {
+      Samples::Item(extents) if index == 0 => extents
+        .iter()
+        .find(|e| e.end > len as u64)
+        .is_some_and(|e| e.start > len as u64),
+      _ => false,
     }
   }
 
@@ -281,6 +300,8 @@ enum Property<'a> {
   /// auxC (item) or auxi (track) type
   Aux(&'a [u8]),
   Nclx(Nclx),
+  /// 'a1lx': a progressive image when no layer is selected ('lsel' is declined here)
+  A1lx,
   /// An operating point or layer selection ('a1op', 'lsel'), not handled here
   Unsupported,
   /// Known to CrabbyAvif and not used here (ICC 'colr', 'clap', 'irot', ...)
@@ -349,7 +370,8 @@ fn parse_property<'a>(kind: [u8; 4], mut r: Reader<'a>, track: bool) -> Option<P
       _ => Property::Ignored,
     },
     b"a1op" | b"lsel" => Property::Unsupported,
-    b"alpi" | b"pasp" | b"clap" | b"irot" | b"imir" | b"a1lx" | b"clli" => Property::Ignored,
+    b"a1lx" => Property::A1lx,
+    b"alpi" | b"pasp" | b"clap" | b"irot" | b"imir" | b"clli" => Property::Ignored,
     _ => Property::Unknown,
   })
 }
@@ -694,6 +716,7 @@ impl<'a> Meta<'a> {
     if pixi.is_some_and(|pixi| pixi != depth) {
       return None;
     }
+    let progressive = properties.iter().any(|p| matches!(p, Property::A1lx));
     let location = self.locations.get(&item)?;
     let extents = match (&self.idat, location.in_idat) {
       (Some(idat), true) => location
@@ -709,6 +732,7 @@ impl<'a> Meta<'a> {
     };
     Some(AvifSamples {
       config: config.to_vec(),
+      progressive,
       samples: Samples::Item(extents),
     })
   }
@@ -1051,6 +1075,7 @@ impl<'a> Track<'a> {
     }
     Ok(AvifSamples {
       config: config.to_vec(),
+      progressive: false,
       samples: Samples::Track(samples),
     })
   }
@@ -1309,6 +1334,9 @@ mod tests {
     let color = &image.color;
     assert_eq!(color.config, [0x81, 0x00, 0x0c, 0x00]);
     assert_eq!(samples(&data, color), bytes(&data, &[(275, 854)]));
+    assert!(!color.is_progressive());
+    assert!(color.starts_after(274, 0));
+    assert!(!color.starts_after(275, 0));
     assert_eq!(color.duration(0), 0);
     assert!(color.sample(&data, 1).is_none());
     assert!(image.alpha.is_none() && !image.premultiplied);
@@ -1329,6 +1357,8 @@ mod tests {
     let image = parsed(&data, None);
     let alpha = image.alpha.as_ref().expect("alpha");
     assert_eq!(samples(&data, &image.color), bytes(&data, &[(852, 854)]));
+    assert!(image.color.starts_after(530, 0));
+    assert!(!image.color.starts_after(852, 0));
     assert_eq!(samples(&data, alpha), bytes(&data, &[(430, 422)]));
     assert_eq!(alpha.config, [0x81, 0x00, 0x1c, 0x00]);
     assert!(!image.premultiplied);
@@ -1358,6 +1388,7 @@ mod tests {
     // avifenc --progressive: two extents. Chrome: I420 from both.
     let data = fixture("prog8_420.avif");
     let image = parsed(&data, None);
+    assert!(image.color.is_progressive());
     assert_eq!(
       samples(&data, &image.color),
       [bytes(&data, &[(299, 104), (403, 987)]).concat()]
