@@ -1211,6 +1211,11 @@ pub(crate) fn report_exception(env: &Env, exc: sys::napi_value) {
         })
         .is_ok();
   if !reported {
+    // Claim and release the reference before reporting either exception: napi_fatal_exception can
+    // synchronously run a page's uncaught-exception handler, which can invoke a retained reporter.
+    if !consumed.swap(true, Ordering::AcqRel) && !exc_ref.is_null() {
+      unsafe { sys::napi_delete_reference(env_raw, exc_ref) };
+    }
     // A failed queueMicrotask lookup or call can leave its own exception
     // pending. Clear and report it before the callback exception so both are
     // surfaced without poisoning the error gate.
@@ -1227,9 +1232,6 @@ pub(crate) fn report_exception(env: &Env, exc: sys::napi_value) {
       }
     }
     unsafe { sys::napi_fatal_exception(env_raw, exc) };
-    if !consumed.swap(true, Ordering::AcqRel) && !exc_ref.is_null() {
-      unsafe { sys::napi_delete_reference(env_raw, exc_ref) };
-    }
   }
 }
 

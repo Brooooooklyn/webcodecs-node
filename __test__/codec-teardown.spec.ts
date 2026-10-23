@@ -640,9 +640,11 @@ test.serial('a failed exception scheduler does not stop codec error callbacks', 
 test.serial('synchronous exception schedulers consume each output exception once', async (t) => {
   const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'queueMicrotask')!
   let retainedReporter: (() => void) | undefined
+  let reentrantCalls = 0
   const schedulers: {
     name: string
     retain?: boolean
+    reenter?: boolean
     run(reporter: () => void): void
   }[] = [
     {
@@ -679,14 +681,28 @@ test.serial('synchronous exception schedulers consume each output exception once
         throw new Error('queue-microtask-call')
       },
     },
+    {
+      name: 'retained reporter re-entered by the exception handler',
+      retain: true,
+      reenter: true,
+      run: (reporter) => {
+        retainedReporter = reporter
+        throw new Error('queue-microtask-call')
+      },
+    },
   ]
   const failCases = await failAfterOutputCases()
   for (const scheduler of schedulers) {
     for (const failCase of failCases) {
       const label = `${scheduler.name}: ${failCase.name}`
       retainedReporter = undefined
+      reentrantCalls = 0
       const log: string[] = []
       process.setUncaughtExceptionCaptureCallback((error) => {
+        if (scheduler.reenter) {
+          reentrantCalls += 1
+          retainedReporter?.()
+        }
         log.push(`uncaught:${error instanceof Error ? error.message : String(error)}`)
       })
       try {
@@ -705,6 +721,7 @@ test.serial('synchronous exception schedulers consume each output exception once
           t.truthy(retainedReporter, label)
           retainedReporter!()
         }
+        if (scheduler.reenter) t.true(reentrantCalls > 0, label)
       } finally {
         process.setUncaughtExceptionCaptureCallback(null)
         Object.defineProperty(globalThis, 'queueMicrotask', descriptor)
