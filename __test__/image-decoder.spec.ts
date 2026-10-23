@@ -616,6 +616,27 @@ test('ImageDecoder: once every GIF frame failed, decode() rejects with EncodingE
   t.true(single.closed)
 })
 
+test('ImageDecoder: a GIF or BMP failure on an open stream rejects completed, like Chrome', async (t) => {
+  const cases: [Uint8Array, string][] = [
+    [gif(4, 2, PALETTE, [fullFrame({ codes: BAD_CODES })]), 'image/gif'],
+    // an absolute RLE8 run past the end of the row is corrupt even while more data can come
+    [bmp(3, 2, 8, [], { compression: 1, palette: PALETTE, raw: [0, 4, 0, 1, 2, 3] }), 'image/bmp'],
+  ]
+  for (const [data, type] of cases) {
+    const source = openStream(data, data.length)
+    const decoder = new ImageDecoder({ data: source.stream, type })
+    t.teardown(source.close)
+    const completed = decoder.completed
+    await t.throwsAsync(decoder.decode(), failedFrame(0), type)
+    t.true(decoder.closed, type)
+    await t.throwsAsync(
+      completed,
+      { instanceOf: DOMException, name: 'AbortError', message: 'Aborted by close.' },
+      type,
+    )
+  }
+})
+
 test('ImageDecoder: decode() calls are handled in call order, like Chrome', async (t) => {
   // every frame fails: what a call finds depends on the frames that the calls before it failed
   const data = gif(4, 2, PALETTE, [0, 1, 2].map(() => fullFrame({ delay: 10, codes: BAD_CODES })))

@@ -844,12 +844,13 @@ impl ImageDecoder {
         // header and each frame count once the read of the chunk that brings their bytes is done
         // (see `layered_frames`).
         let layered = layered_codec(codec_id);
+        let watch_failure = layered || matches!(codec_id, Some(AVCodecID::Gif | AVCodecID::Bmp));
 
         loop {
-          // Like Chrome's close, a PNG or WebP decoder that a failure closed (a decode() of a
-          // frame that fails it) stops reading at once, and `completed` rejects while the data
-          // is not complete.
-          let item = if layered {
+          // Like Chrome's close, a GIF, BMP, PNG or WebP decoder that a failure closed (a
+          // decode() of a frame that fails it) stops reading at once, and `completed` rejects
+          // while the data is not complete.
+          let item = if watch_failure {
             match select(
               std::pin::pin!(reader.next()),
               std::pin::pin!(failure_closed(&inner_clone)),
@@ -3316,6 +3317,7 @@ fn cache_decoded_frames(
       None,
       repetition_count,
       None,
+      None,
     );
   }
 
@@ -3746,8 +3748,7 @@ async fn failure_closed(inner: &Arc<Mutex<ImageDecoderInner>>) {
   }
 }
 
-/// Whether the decoder closed on a failure: the metadata, a frame that fails a WebP, or every
-/// frame of a PNG
+/// Whether the decoder closed on a metadata or frame failure
 fn closed_on_frame_failure(inner: &Arc<Mutex<ImageDecoderInner>>) -> bool {
   inner
     .lock()
