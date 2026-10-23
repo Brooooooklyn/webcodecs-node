@@ -635,6 +635,88 @@ test.serial('a failed exception scheduler does not stop codec error callbacks', 
   }
 })
 
+// A page-provided scheduler can invoke the native reporter synchronously, throw after it, or
+// invoke it again. Each output exception owns one native reference, however the scheduler behaves.
+test.serial('synchronous exception schedulers consume each output exception once', async (t) => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'queueMicrotask')!
+  let retainedReporter: (() => void) | undefined
+  const schedulers: {
+    name: string
+    retain?: boolean
+    run(reporter: () => void): void
+  }[] = [
+    {
+      name: 'synchronous reporter',
+      run: (reporter) => reporter(),
+    },
+    {
+      name: 'throw after synchronous reporter',
+      run: (reporter) => {
+        try {
+          reporter()
+        } catch {}
+        throw new Error('queue-microtask-call')
+      },
+    },
+    {
+      name: 'repeated synchronous reporter',
+      run: (reporter) => {
+        let outputError: unknown
+        try {
+          reporter()
+        } catch (error) {
+          outputError = error
+        }
+        reporter()
+        throw outputError
+      },
+    },
+    {
+      name: 'retained reporter after scheduler failure',
+      retain: true,
+      run: (reporter) => {
+        retainedReporter = reporter
+        throw new Error('queue-microtask-call')
+      },
+    },
+  ]
+  const failCases = await failAfterOutputCases()
+  for (const scheduler of schedulers) {
+    for (const failCase of failCases) {
+      const label = `${scheduler.name}: ${failCase.name}`
+      retainedReporter = undefined
+      const log: string[] = []
+      process.setUncaughtExceptionCaptureCallback((error) => {
+        log.push(`uncaught:${error instanceof Error ? error.message : String(error)}`)
+      })
+      try {
+        Object.defineProperty(globalThis, 'queueMicrotask', {
+          configurable: true,
+          writable: true,
+          value: (reporter: () => void) => scheduler.run(reporter),
+        })
+        const codec = failCase.run((entry) => {
+          log.push(entry)
+          if (entry === 'output') throw new Error('output-threw')
+        }, 2)
+        await codec.flush().catch((error: unknown) => log.push(`flush:${(error as DOMException).name}`))
+        await delay(20)
+        if (scheduler.retain) {
+          t.truthy(retainedReporter, label)
+          retainedReporter!()
+        }
+      } finally {
+        process.setUncaughtExceptionCaptureCallback(null)
+        Object.defineProperty(globalThis, 'queueMicrotask', descriptor)
+      }
+      t.deepEqual(log.filter((entry) => entry === 'output'), ['output', 'output'], label)
+      const expected = ['uncaught:output-threw', 'uncaught:output-threw']
+      t.deepEqual(log.filter((entry) => entry.startsWith('uncaught:')).sort(), expected.sort(), label)
+      t.deepEqual(log.slice(-2), [`error:${failCase.error}`, `flush:${failCase.error}`], label)
+    }
+  }
+})
+
 // The flush rejection is built from the global DOMException, which page code can
 // replace. When the replacement throws, napi-rs cannot reject the promise while
 // that exception is pending, so the flush stayed pending forever. Now it rejects

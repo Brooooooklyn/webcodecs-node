@@ -1181,10 +1181,18 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
 pub(crate) fn report_exception(env: &Env, exc: sys::napi_value) {
   let mut exc_ref = ptr::null_mut();
   let env_raw = env.raw();
+  // A page-provided queueMicrotask can invoke the reporter synchronously, retain it, or invoke it
+  // more than once. The first reporter invocation or fallback cleanup claims exc_ref; every later
+  // reporter call is a no-op, and fallback must not repeat a synchronous invocation's deletion.
+  let consumed = Arc::new(AtomicBool::new(false));
+  let reporter_consumed = consumed.clone();
   let reported =
     unsafe { sys::napi_create_reference(env_raw, exc, 1, &mut exc_ref) == sys::Status::napi_ok }
       && env
         .create_function_from_closure::<(), (), _>("reportListenerException", move |_| {
+          if reporter_consumed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+          }
           unsafe {
             let mut v = ptr::null_mut();
             sys::napi_get_reference_value(env_raw, exc_ref, &mut v);
@@ -1219,7 +1227,7 @@ pub(crate) fn report_exception(env: &Env, exc: sys::napi_value) {
       }
     }
     unsafe { sys::napi_fatal_exception(env_raw, exc) };
-    if !exc_ref.is_null() {
+    if !consumed.swap(true, Ordering::AcqRel) && !exc_ref.is_null() {
       unsafe { sys::napi_delete_reference(env_raw, exc_ref) };
     }
   }
