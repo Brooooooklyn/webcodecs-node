@@ -599,6 +599,42 @@ test.serial('primitive output exceptions do not stop later outputs or the codec 
   }
 })
 
+// A failed exception scheduler must not leave a second exception pending and
+// suppress the codec's own error callback. Report both exceptions.
+test.serial('a failed exception scheduler does not stop codec error callbacks', async (t) => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'queueMicrotask')!
+  for (const failCase of await failAfterOutputCases()) {
+    const log: string[] = []
+    process.setUncaughtExceptionCaptureCallback((error) => {
+      log.push(`uncaught:${error instanceof Error ? error.message : String(error)}`)
+    })
+    try {
+      Object.defineProperty(globalThis, 'queueMicrotask', {
+        configurable: true,
+        get() {
+          throw new Error('queue-microtask-getter')
+        },
+      })
+      const codec = failCase.run((entry) => {
+        log.push(entry)
+        if (entry === 'output') throw new Error('output-threw')
+      }, 2)
+      await codec.flush().catch((error: unknown) => log.push(`flush:${(error as DOMException).name}`))
+      await delay(20)
+    } finally {
+      process.setUncaughtExceptionCaptureCallback(null)
+      Object.defineProperty(globalThis, 'queueMicrotask', descriptor)
+    }
+    t.deepEqual(log.filter((entry) => entry === 'output'), ['output', 'output'], failCase.name)
+    t.deepEqual(
+      log.filter((entry) => entry.startsWith('uncaught:')).sort(),
+      ['uncaught:output-threw', 'uncaught:output-threw', 'uncaught:queue-microtask-getter', 'uncaught:queue-microtask-getter'].sort(),
+      failCase.name,
+    )
+    t.deepEqual(log.slice(-2), [`error:${failCase.error}`, `flush:${failCase.error}`], failCase.name)
+  }
+})
+
 // The flush rejection is built from the global DOMException, which page code can
 // replace. When the replacement throws, napi-rs cannot reject the promise while
 // that exception is pending, so the flush stayed pending forever. Now it rejects
