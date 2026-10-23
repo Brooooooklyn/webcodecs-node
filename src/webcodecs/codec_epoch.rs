@@ -158,9 +158,15 @@ impl CodecEpoch {
     callback.call(generation, ThreadsafeFunctionCallMode::NonBlocking);
   }
 
-  /// JS thread: the oldest queued output, unless an error callback took it.
-  fn next_output(&self) -> Option<(u32, BufferedOutput)> {
-    self.0.outputs.lock().ok()?.pop_front()
+  /// JS thread: the oldest output queued for this wakeup's generation. A stale wakeup must not
+  /// consume an output queued after reset() or reconfigure(), and a newer wakeup must not wait
+  /// behind stale entries whose own callbacks already ran.
+  fn next_output(&self, generation: u32) -> Option<BufferedOutput> {
+    let mut outputs = self.0.outputs.lock().ok()?;
+    let index = outputs
+      .iter()
+      .position(|(queued, _)| *queued == generation)?;
+    outputs.remove(index).map(|(_, output)| output)
   }
 
   /// JS thread: take every queued output; those of `generation` are
@@ -388,7 +394,7 @@ fn gated_callback<'env, Args: JsValuesTupleIntoVec>(
     let generation = ctx.get::<u32>(0)?;
     let args = match kind {
       CallbackKind::Output => {
-        let Some((generation, queued)) = epoch.next_output() else {
+        let Some(queued) = epoch.next_output(generation) else {
           return Ok(());
         };
         // Once the error callback ran, the codec is closed: Chrome drops the
@@ -521,5 +527,33 @@ mod tests {
     let token = epoch.token();
     assert_eq!(epoch.advance(), 0);
     assert!(token.is_cancelled());
+  }
+
+  #[test]
+  fn output_wakeups_only_take_their_generation() {
+    let epoch = CodecEpoch::default();
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let output = |value| {
+      let delivered = delivered.clone();
+      Box::new(move |_| {
+        delivered.lock().unwrap().push(value);
+        Ok(Vec::new())
+      }) as BufferedOutput
+    };
+    {
+      let mut outputs = epoch.0.outputs.lock().unwrap();
+      outputs.push_back((0, output(0)));
+      outputs.push_back((1, output(1)));
+      outputs.push_back((0, output(2)));
+    }
+
+    // The new wakeup runs before both old ones. It takes only its own output, even though two
+    // older entries were queued around it, and leaves the old entries in their original order.
+    epoch.next_output(1).unwrap()(ptr::null_mut()).unwrap();
+    assert!(epoch.next_output(1).is_none());
+    epoch.next_output(0).unwrap()(ptr::null_mut()).unwrap();
+    epoch.next_output(0).unwrap()(ptr::null_mut()).unwrap();
+    assert!(epoch.next_output(0).is_none());
+    assert_eq!(*delivered.lock().unwrap(), [1, 0, 2]);
   }
 }
