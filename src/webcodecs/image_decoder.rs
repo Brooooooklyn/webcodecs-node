@@ -520,6 +520,8 @@ struct ImageDecoderInner {
   /// arrived (`cached_frames` holds the frames before them). Chrome counts those frames, and the
   /// decode() of one fails (see `decode_cached_frame`).
   missing_samples: Option<usize>,
+  /// The first arrived sample that is corrupt, distinct from a sample that has not arrived yet.
+  corrupt_sample: Option<usize>,
   /// How a terminal stream's missing AVIF still item fails decode()
   missing_item: Option<MissingAvifItem>,
   /// Track list
@@ -686,6 +688,7 @@ impl ImageDecoder {
       end_deferred: false,
       terminal_stream: false,
       missing_samples: None,
+      corrupt_sample: None,
       missing_item: None,
       tracks: tracks.clone(),
       closed: false,
@@ -1339,6 +1342,15 @@ fn decode_cached_frame(
   } else {
     guard.complete.load(Ordering::Acquire)
   };
+  // An arrived corrupt sample fails at its own index, even while the stream is open. Valid
+  // earlier frames remain available; this is separate from ordinary truncated samples.
+  if let Some(index) = guard.corrupt_sample
+    && frame_index >= index
+  {
+    guard.frame_failed = Some(epoch);
+    return Err(frame_failure(frame_index));
+  }
+
   let Some(frames) = guard.cached_frames.as_ref() else {
     if !data_complete {
       return Ok(None);
@@ -2649,6 +2661,7 @@ fn cache_decoded_frames(
         None,
         None,
         None,
+        None,
       ),
       // the metadata, but no frame yet
       None => Ok(()),
@@ -2672,7 +2685,7 @@ fn cache_decoded_frames(
   };
   // An AVIF's durations come from its track (see `decode_avif`)
   let track_timing = matches!(avif, Avif::Image(_));
-  let (context, frames, frame_count, missing_samples, missing_item) = match avif {
+  let (context, frames, frame_count, missing_samples, missing_item, corrupt_sample) = match avif {
     Avif::Image(image) => {
       let len = data_bytes.len();
       if std::iter::once(&image.color)
@@ -2681,18 +2694,19 @@ fn cache_decoded_frames(
       {
         return Err(reject_metadata(inner));
       }
-      let (context, frames) = decode_avif(&data_bytes, &image).inspect_err(|_| {
-        // The samples that have arrived do not decode: the frames cached from fewer bytes
-        // are stale, and decode() then fails like Chrome's.
-        if let Ok(mut guard) = inner.lock()
-          && guard.cache_epoch == cache_epoch
-          && len >= guard.cached_data_len
-        {
-          guard.cached_frames = None;
-        }
-      })?;
+      let (context, frames, corrupt_sample) =
+        decode_avif(&data_bytes, &image).inspect_err(|_| {
+          // The samples that have arrived do not decode: the frames cached from fewer bytes
+          // are stale, and decode() then fails like Chrome's.
+          if let Ok(mut guard) = inner.lock()
+            && guard.cache_epoch == cache_epoch
+            && len >= guard.cached_data_len
+          {
+            guard.cached_frames = None;
+          }
+        })?;
       // an item that ends past the data (see `AvifSamples::past_size_hint`)
-      if data_complete && frames.len() < image.color.len() {
+      if data_complete && corrupt_sample.is_none() && frames.len() < image.color.len() {
         return Err(Error::new(
           Status::GenericFailure,
           "Failed to decode frame at index 0",
@@ -2718,13 +2732,15 @@ fn cache_decoded_frames(
           None
         };
       let missing_samples =
-        (stream_ended && frames.len() < image.color.len()).then_some(image.color.len());
+        (corrupt_sample.is_none() && stream_ended && frames.len() < image.color.len())
+          .then_some(image.color.len());
       (
         context,
         frames,
         image.color.len(),
         missing_samples,
         missing_item,
+        corrupt_sample,
       )
     }
     // a track sample past the size hint (see `Avif::PastSizeHint`)
@@ -2747,7 +2763,7 @@ fn cache_decoded_frames(
     _ => {
       let (context, frames) = decode_frames(inner, codec_id, &data_bytes, prefer_animation)?;
       let frame_count = frames.len();
-      (context, frames, frame_count, None, None)
+      (context, frames, frame_count, None, None, None)
     }
   };
 
@@ -2775,6 +2791,7 @@ fn cache_decoded_frames(
     repetition_count,
     missing_samples,
     missing_item,
+    corrupt_sample,
   )
 }
 
@@ -2793,6 +2810,7 @@ fn store_frames(
   repetition_count: Option<f64>,
   missing_samples: Option<usize>,
   missing_item: Option<MissingAvifItem>,
+  corrupt_sample: Option<usize>,
 ) -> Result<()> {
   before_store_frames();
   let mut guard = inner
@@ -2832,6 +2850,7 @@ fn store_frames(
   guard.cached_data_len = data.len();
   guard.missing_samples = missing_samples;
   guard.missing_item = missing_item;
+  guard.corrupt_sample = corrupt_sample;
 
   Ok(())
 }
@@ -2911,20 +2930,38 @@ fn decode_frames(
 /// Decode an AVIF like Chrome (see `avif`): the colour samples with one AV1 decoder and the alpha
 /// samples with another, colour frame i with alpha frame i. While the data streams in, only the
 /// frames whose samples have all arrived. Timestamps and durations come from the track.
-fn decode_avif(
-  data: &[u8],
-  image: &AvifImage,
-) -> Result<(CodecContext, Vec<(Frame, VideoPixelFormat)>)> {
+type AvifDecodeResult = (CodecContext, Vec<(Frame, VideoPixelFormat)>, Option<usize>);
+
+fn decode_avif(data: &[u8], image: &AvifImage) -> Result<AvifDecodeResult> {
   let arrived = |samples: &AvifSamples, i| samples.arrived(data.len(), i);
   let count = (0..image.color.len())
     .take_while(|&i| arrived(&image.color, i) && image.alpha.iter().all(|a| arrived(a, i)))
     .count();
-  let (context, mut frames) = decode_av1_samples(data, &image.color, count)?;
-  let alpha = match &image.alpha {
-    Some(alpha) => decode_av1_samples(data, alpha, count)?.1,
-    None => Vec::new(),
+  let (context, mut frames, color_bad) = decode_av1_samples(data, &image.color, count)?;
+  let (mut alpha, alpha_bad) = match &image.alpha {
+    Some(alpha) => {
+      let (_, frames, bad) = decode_av1_samples(data, alpha, color_bad.unwrap_or(count))?;
+      (frames, bad)
+    }
+    None => (Vec::new(), None),
   };
-  if frames.len() != count || (image.alpha.is_some() && alpha.len() != count) {
+  let bad_sample = match (color_bad, alpha_bad) {
+    (Some(color), Some(alpha)) => Some(color.min(alpha)),
+    (Some(index), None) | (None, Some(index)) => Some(index),
+    _ => None,
+  };
+  if let Some(index) = bad_sample {
+    frames.truncate(index);
+    alpha.truncate(index);
+  }
+  // A sample that produced no frame without an error still fails the decode.
+  if color_bad.is_none() && alpha_bad.is_none() && frames.len() != count {
+    return Err(Error::new(
+      Status::GenericFailure,
+      "Decode failed: an AV1 sample gave no frame",
+    ));
+  }
+  if color_bad.is_none() && alpha_bad.is_none() && image.alpha.is_some() && alpha.len() != count {
     return Err(Error::new(
       Status::GenericFailure,
       "Decode failed: an AV1 sample gave no frame",
@@ -2958,25 +2995,53 @@ fn decode_avif(
       })
     })
     .collect::<Result<_>>()?;
-  Ok((context, frames))
+  Ok((context, frames, bad_sample))
 }
 
-/// Decode the first `count` samples of an AVIF image with an AV1 decoder of their own
+/// Decode the first `count` samples of an AVIF image with an AV1 decoder of their own.
+/// The optional index is the first corrupt sample; valid frames before it are kept.
 fn decode_av1_samples(
   data: &[u8],
   samples: &AvifSamples,
   count: usize,
-) -> Result<(CodecContext, Vec<Frame>)> {
+) -> Result<(CodecContext, Vec<Frame>, Option<usize>)> {
   let failed = |e: CodecError| Error::new(Status::GenericFailure, format!("Decode failed: {e}"));
+  let fail = |context: CodecContext, frames: Vec<Frame>, _error: CodecError, index: usize| {
+    if index == 0 {
+      return Ok((context, frames, Some(0)));
+    }
+    // Re-decode only the valid prefix. Its final flush preserves the frames that
+    // would otherwise be lost when a later sample fails.
+    match decode_av1_samples(data, samples, index) {
+      Ok((prefix_context, prefix_frames, _)) => Ok((prefix_context, prefix_frames, Some(index))),
+      Err(_) => Ok((context, frames, Some(index))),
+    }
+  };
   let mut context = create_image_decoder(AVCodecID::Av1, Some(samples.config.clone()))?;
   let mut frames = Vec::new();
-  for parts in (0..count).filter_map(|i| samples.sample(data, i)) {
-    let mut packet = Packet::new().map_err(failed)?;
-    packet.copy_parts_from(&parts).map_err(failed)?;
-    frames.extend(context.decode(Some(&packet)).map_err(failed)?);
+  for (index, parts) in (0..count).filter_map(|i| samples.sample(data, i).map(|parts| (i, parts))) {
+    let mut packet = match Packet::new() {
+      Ok(packet) => packet,
+      Err(error) => return fail(context, frames, error, index),
+    };
+    if let Err(error) = packet.copy_parts_from(&parts) {
+      return fail(context, frames, error, index);
+    }
+    match context.decode(Some(&packet)) {
+      Ok(decoded) => frames.extend(decoded),
+      Err(error) => return fail(context, frames, error, index),
+    }
   }
-  frames.extend(context.flush_decoder().map_err(failed)?);
-  Ok((context, frames))
+  match context.flush_decoder() {
+    Ok(decoded) => frames.extend(decoded),
+    Err(error) => {
+      if count == 0 {
+        return Err(failed(error));
+      }
+      return Ok((context, frames, Some(count - 1)));
+    }
+  }
+  Ok((context, frames, None))
 }
 
 /// Chrome's frame for a JPEG: Blink's JPEGImageDecoder on the libjpeg-turbo Chrome ships (see
@@ -3597,6 +3662,7 @@ mod tests {
       end_deferred: false,
       terminal_stream: false,
       missing_samples: None,
+      corrupt_sample: None,
       missing_item: None,
       tracks,
       closed: false,

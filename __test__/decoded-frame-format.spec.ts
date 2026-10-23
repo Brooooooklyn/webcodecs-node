@@ -1455,6 +1455,77 @@ test('ImageDecoder: reset() keeps an AVIF track that ended before its last sampl
   t.true(decoder.closed)
 })
 
+test('ImageDecoder: keeps frames decoded before a corrupt AVIF sample', async (t) => {
+  const data = Buffer.from(avifFixture('anim8_420.avif'))
+  const stco = data.indexOf('stco')
+  const stsz = data.indexOf('stsz')
+  const chunkCount = data.readUInt32BE(stco + 8)
+  const sampleCount = data.readUInt32BE(stsz + 12)
+  const sampleSize = data.readUInt32BE(stsz + 8)
+  const offsets = Array.from({ length: chunkCount }, (_, i) => data.readUInt32BE(stco + 12 + i * 4))
+  const sizes = Array.from({ length: sampleCount }, (_, i) =>
+    sampleSize === 0 ? data.readUInt32BE(stsz + 16 + i * 4) : sampleSize,
+  )
+  const secondStart = offsets[0] + sizes[0]
+  data.fill(0xff, secondStart, secondStart + sizes[1])
+
+  const decoder = new ImageDecoder({ data, type: 'image/avif' })
+  const { image } = await decoder.decode({ frameIndex: 0 })
+  t.is(image.format, 'BGRX')
+  image.close()
+  await t.throwsAsync(decoder.decode({ frameIndex: 1 }), {
+    name: 'EncodingError',
+    message: 'Failed to decode frame at index 1',
+  })
+  t.true(decoder.closed)
+})
+
+test('ImageDecoder: preserves an earlier frame when a corrupt AVIF sample streams in', async (t) => {
+  const data = avifFixture('anim8_420.avif')
+  data.fill(0xff, 1941, 2771)
+  const stream = new ReadableStream({
+    async start(controller) {
+      controller.enqueue(data.slice(0, 1941))
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      controller.enqueue(data.slice(1941))
+      controller.close()
+    },
+  })
+  const decoder = new ImageDecoder({ data: stream, type: 'image/avif' })
+  await decoder.tracks.ready
+  const { image } = await decoder.decode({ frameIndex: 0 })
+  t.is(image.format, 'BGRX')
+  image.close()
+  await decoder.completed
+  const { image: again } = await decoder.decode({ frameIndex: 0 })
+  again.close()
+  await t.throwsAsync(decoder.decode({ frameIndex: 1 }), {
+    name: 'EncodingError',
+    message: 'Failed to decode frame at index 1',
+  })
+  t.true(decoder.closed)
+})
+
+test('ImageDecoder: rejects a corrupt AVIF sample while the stream is open', async (t) => {
+  const data = avifFixture('anim8_420.avif')
+  data.fill(0xff, 1941, 2771)
+  let endStream: (() => void) | undefined
+  const stream = new ReadableStream({
+    start(controller) {
+      endStream = () => controller.error(new Error('done'))
+      controller.enqueue(data)
+    },
+  })
+  const decoder = new ImageDecoder({ data: stream, type: 'image/avif' })
+  await decoder.tracks.ready
+  await t.throwsAsync(decoder.decode({ frameIndex: 1 }), {
+    name: 'EncodingError',
+    message: 'Failed to decode frame at index 1',
+  })
+  t.true(decoder.closed)
+  endStream?.()
+})
+
 test('ImageDecoder: reset() keeps terminal-stream rules for a truncated AVIF item, like Chrome', async (t) => {
   const cuts = [
     [
