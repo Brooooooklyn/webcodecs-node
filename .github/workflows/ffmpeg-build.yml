@@ -7,6 +7,10 @@ on:
         description: 'FFmpeg version tag (e.g., n9.0.2)'
         required: true
         default: 'n9.0.2'
+      release_tag:
+        description: 'Release tag for the generated static libraries'
+        required: true
+        default: 'ffmpeg-n9.0.2'
 
 env:
   FFMPEG_VERSION: ${{ github.event.inputs.ffmpeg_version || 'n9.0.2' }}
@@ -118,7 +122,7 @@ jobs:
 
       - name: Install codec dependencies (without FFmpeg, x265 built separately for alpha)
         run: |
-          vcpkg install `
+          vcpkg install --overlay-ports="${{ github.workspace }}/tools/vcpkg-overlays" `
             x264:arm64-windows-static `
             libvpx:arm64-windows-static `
             aom:arm64-windows-static `
@@ -555,7 +559,7 @@ jobs:
 
       - name: Install codec dependencies (without FFmpeg, x265 built separately for alpha)
         run: |
-          vcpkg install `
+          vcpkg install --overlay-ports="${{ github.workspace }}/tools/vcpkg-overlays" `
             x264:x64-windows-static `
             libvpx:x64-windows-static `
             dav1d:x64-windows-static `
@@ -1191,7 +1195,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ffmpeg-${{ env.FFMPEG_VERSION }}
+          tag_name: ${{ github.event.inputs.release_tag || 'ffmpeg-n9.0.2' }}
           target_commitish: ${{ github.sha }}
           name: FFmpeg ${{ env.FFMPEG_VERSION }} Static Builds
           body: |
