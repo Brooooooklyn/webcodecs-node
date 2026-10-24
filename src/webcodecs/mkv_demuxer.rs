@@ -6,9 +6,10 @@
 use crate::ffi::AVCodecID;
 use crate::webcodecs::demuxer_base::{
   AudioOutputCallback, DemuxerAudioDecoderConfig, DemuxerChunk, DemuxerFormat, DemuxerInner,
-  DemuxerTrackInfo, DemuxerVideoDecoderConfig, ErrorCallback, VideoOutputCallback,
-  demux_with_callbacks, parse_aac_codec_string, parse_h264_codec_string, parse_hevc_codec_string,
-  parse_vp9_codec_string, with_demuxer_inner, with_demuxer_inner_mut,
+  DemuxerTrackInfo, DemuxerVideoDecoderConfig, ErrorCallback, LoadClaim, VideoOutputCallback,
+  demux_with_callbacks, load_buffer_from_js, load_file_from_js, parse_aac_codec_string,
+  parse_h264_codec_string, parse_hevc_codec_string, parse_vp9_codec_string, with_demuxer_inner,
+  with_demuxer_inner_mut,
 };
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunk;
 use crate::webcodecs::encoded_video_chunk::EncodedVideoChunk;
@@ -133,6 +134,7 @@ impl FromNapiValue for MkvDemuxerInit {
 #[napi(async_iterator)]
 pub struct MkvDemuxer {
   inner: Arc<Mutex<DemuxerInner<MkvFormat>>>,
+  load_claim: LoadClaim,
 }
 
 impl AsyncGenerator for MkvDemuxer {
@@ -163,46 +165,25 @@ impl AsyncGenerator for MkvDemuxer {
 impl MkvDemuxer {
   #[napi(constructor)]
   pub fn new(init: MkvDemuxerInit) -> Result<Self> {
+    let inner = DemuxerInner::new(init.video_output, init.audio_output, init.error);
     Ok(Self {
-      inner: Arc::new(Mutex::new(DemuxerInner::new(
-        init.video_output,
-        init.audio_output,
-        init.error,
-      ))),
+      load_claim: inner.load_claim(),
+      inner: Arc::new(Mutex::new(inner)),
     })
   }
 
-  #[napi]
-  pub async fn load(&self, path: String) -> Result<()> {
-    let inner = self.inner.clone();
-
-    tokio::task::spawn_blocking(move || {
-      let mut guard = inner
-        .lock()
-        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-      guard.load_file(&path)
-    })
-    .await
-    .map_err(|e| Error::new(Status::GenericFailure, format!("Task error: {}", e)))?
+  #[napi(ts_return_type = "Promise<void>")]
+  pub fn load<'env>(&self, env: &'env Env, path: String) -> Result<PromiseRaw<'env, ()>> {
+    load_file_from_js(env, &self.inner, &self.load_claim, path)
   }
 
   /// Load an MKV from a buffer
   ///
-  /// This method uses zero-copy buffer loading - the Uint8Array data is passed
-  /// directly to the demuxer without an intermediate copy.
-  #[napi]
-  pub async fn load_buffer(&self, data: Uint8Array) -> Result<()> {
-    let inner = self.inner.clone();
-    // Zero-copy: pass Uint8Array directly (it implements BufferSource)
-
-    tokio::task::spawn_blocking(move || {
-      let mut guard = inner
-        .lock()
-        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-      guard.load_buffer(data)
-    })
-    .await
-    .map_err(|e| Error::new(Status::GenericFailure, format!("Task error: {}", e)))?
+  /// The bytes are copied when this is called, so the caller may reuse,
+  /// detach or resize the buffer afterwards.
+  #[napi(ts_args_type = "data: Uint8Array", ts_return_type = "Promise<void>")]
+  pub fn load_buffer<'env>(&self, env: &'env Env, data: Unknown) -> Result<PromiseRaw<'env, ()>> {
+    load_buffer_from_js(env, &self.inner, &self.load_claim, data)
   }
 
   #[napi(getter)]

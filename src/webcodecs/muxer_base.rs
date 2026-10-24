@@ -10,6 +10,7 @@ use crate::codec::muxer::{
   MuxerOutput, VideoStreamConfig,
 };
 use crate::ffi::{AVCodecID, AVPixelFormat, AVRational, AVSampleFormat};
+use crate::webcodecs::buffer_source::{BufferSourceCopy, Uint8ArrayCopy};
 use crate::webcodecs::encoded_audio_chunk::EncodedAudioChunk;
 use crate::webcodecs::encoded_video_chunk::{EncodedVideoChunk, EncodedVideoChunkType};
 use napi::bindgen_prelude::*;
@@ -124,7 +125,8 @@ pub struct EncodedVideoChunkMetadataJs {
   /// Alpha channel side data (for VP9 alpha support)
   /// This contains the encoded alpha channel data that should be written
   /// as BlockAdditions in WebM/MKV containers.
-  pub alpha_side_data: Option<Uint8Array>,
+  #[napi(ts_type = "Uint8Array")]
+  pub alpha_side_data: Option<Uint8ArrayCopy>,
 }
 
 /// JavaScript-facing decoder config type
@@ -134,7 +136,8 @@ pub struct VideoDecoderConfigJs {
   /// Codec string
   pub codec: Option<String>,
   /// Codec-specific description
-  pub description: Option<Uint8Array>,
+  #[napi(ts_type = "AllowSharedBufferSource")]
+  pub description: Option<BufferSourceCopy>,
   /// Coded width
   pub coded_width: Option<u32>,
   /// Coded height
@@ -168,7 +171,8 @@ pub struct AudioDecoderConfigJs {
   /// Number of channels
   pub number_of_channels: Option<u32>,
   /// Codec-specific description
-  pub description: Option<Uint8Array>,
+  #[napi(ts_type = "AllowSharedBufferSource")]
+  pub description: Option<BufferSourceCopy>,
 }
 
 // ============================================================================

@@ -6,6 +6,7 @@
 use crate::codec::demuxer::{DemuxerContext, MediaType, StreamInfo};
 use crate::codec::io_buffer::BufferSource;
 use crate::ffi::{AV_NOPTS_VALUE, AVCodecID};
+use crate::webcodecs::buffer_source;
 use crate::webcodecs::encoded_audio_chunk::{
   EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkType,
 };
@@ -19,22 +20,8 @@ use napi_derive::napi;
 use std::any::Any;
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-
-// ============================================================================
-// BufferSource implementation for Uint8Array (zero-copy support)
-// ============================================================================
-
-/// Implement BufferSource for Uint8Array to enable zero-copy buffer loading.
-///
-/// This allows passing Uint8Array directly from JavaScript to the demuxer
-/// without an intermediate copy to Vec<u8>.
-impl BufferSource for Uint8Array {
-  fn buffer_data(&self) -> (*const u8, usize) {
-    let slice: &[u8] = self.as_ref();
-    (slice.as_ptr(), slice.len())
-  }
-}
 
 // ============================================================================
 // Lock Helper Macros
@@ -129,6 +116,36 @@ impl DemuxerState {
       DemuxerState::Closed => "closed",
     }
   }
+}
+
+/// Whether a demuxer still takes a source, readable without its mutex.
+///
+/// The JS thread claims it when it accepts a `load()` or `loadBuffer()` call,
+/// so a call that cannot succeed (another load still running, a source already
+/// loaded, or the demuxer closed) is rejected at once, without waiting for the
+/// mutex and without copying its input. A load that fails while the demuxer is
+/// still unloaded gives the claim back; `close()` keeps it claimed.
+#[derive(Clone, Default)]
+pub struct LoadClaim(Arc<AtomicBool>);
+
+impl LoadClaim {
+  fn try_claim(&self) -> bool {
+    self
+      .0
+      .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+      .is_ok()
+  }
+
+  fn set(&self, claimed: bool) {
+    self.0.store(claimed, Ordering::Release);
+  }
+}
+
+fn already_loaded_error() -> Error {
+  Error::new(
+    Status::GenericFailure,
+    "Demuxer already loaded. Call close() first.",
+  )
 }
 
 // ============================================================================
@@ -276,6 +293,8 @@ pub struct DemuxerInner<F: DemuxerFormat> {
   /// explicit session guard, two callers can therefore enqueue adjacent
   /// packets in the opposite order.
   callback_demux_active: bool,
+  /// Set while a load runs, after a source is loaded, and after close().
+  load_claim: LoadClaim,
   /// Phantom data for format type
   _format: PhantomData<F>,
 }
@@ -297,6 +316,7 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
       audio_callback,
       error_callback: Some(error_callback),
       callback_demux_active: false,
+      load_claim: LoadClaim::default(),
       _format: PhantomData,
     }
   }
@@ -333,14 +353,22 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
     }
   }
 
+  /// The claim that `load()` and `loadBuffer()` take on the JS thread.
+  pub fn load_claim(&self) -> LoadClaim {
+    self.load_claim.clone()
+  }
+
+  /// Fails unless no source was loaded yet (and the demuxer is not closed).
+  fn check_unloaded(&self) -> Result<()> {
+    if self.state != DemuxerState::Unloaded {
+      return Err(already_loaded_error());
+    }
+    Ok(())
+  }
+
   /// Load from a file path
   pub fn load_file(&mut self, path: &str) -> Result<()> {
-    if self.state != DemuxerState::Unloaded {
-      return Err(Error::new(
-        Status::GenericFailure,
-        "Demuxer already loaded. Call close() first.",
-      ));
-    }
+    self.check_unloaded()?;
 
     let demuxer = DemuxerContext::open_file(path).map_err(|e| {
       Error::new(
@@ -355,15 +383,11 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
 
   /// Load from a buffer
   ///
-  /// This method accepts any type implementing `BufferSource`, enabling
-  /// zero-copy buffer loading from `Uint8Array` without intermediate copies.
+  /// The source must own its bytes (for example a `Vec<u8>`): the demuxer
+  /// reads them on worker threads for as long as it is open, so it must never
+  /// point into a JS buffer that JS can detach or resize.
   pub fn load_buffer(&mut self, source: impl BufferSource + 'static) -> Result<()> {
-    if self.state != DemuxerState::Unloaded {
-      return Err(Error::new(
-        Status::GenericFailure,
-        "Demuxer already loaded. Call close() first.",
-      ));
-    }
+    self.check_unloaded()?;
 
     let demuxer = DemuxerContext::open_buffer(source).map_err(|e| {
       Error::new(
@@ -671,6 +695,8 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
     self.selected_audio_track = None;
     self.callback_demux_active = false;
     self.state = DemuxerState::Closed;
+    // A closed demuxer never takes a source again.
+    self.load_claim.set(true);
   }
 
   /// Get current state as string
@@ -682,6 +708,83 @@ impl<F: DemuxerFormat> DemuxerInner<F> {
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/// `load(path)` for every demuxer.
+pub fn load_file_from_js<'env, F: DemuxerFormat>(
+  env: &'env Env,
+  inner: &Arc<Mutex<DemuxerInner<F>>>,
+  claim: &LoadClaim,
+  path: String,
+) -> Result<PromiseRaw<'env, ()>> {
+  if !claim.try_claim() {
+    return env.spawn_future(async move { Err::<(), _>(already_loaded_error()) });
+  }
+  spawn_load(env, inner, claim, move |demuxer| demuxer.load_file(&path))
+}
+
+/// `loadBuffer(data)` for every demuxer.
+///
+/// `data` must be a `Uint8Array`. Its bytes are copied on the JS thread,
+/// because JS can detach or resize the buffer while the demuxer still reads
+/// it. A call that will be rejected (another load still running, a source
+/// already loaded, or the demuxer closed) is rejected before that copy, so it
+/// does not first copy the whole input.
+pub fn load_buffer_from_js<'env, F: DemuxerFormat>(
+  env: &'env Env,
+  inner: &Arc<Mutex<DemuxerInner<F>>>,
+  claim: &LoadClaim,
+  data: Unknown,
+) -> Result<PromiseRaw<'env, ()>> {
+  // Throws for a value that is not a Uint8Array, as before.
+  // SAFETY: `data` is an argument of the current native call.
+  let source = unsafe { buffer_source::inspect_uint8_array(env.raw(), data.raw())? };
+  if !claim.try_claim() {
+    return env.spawn_future(async move { Err::<(), _>(already_loaded_error()) });
+  }
+  // No demuxer mutex is held during the copy. A pre-import wrapper can close
+  // the demuxer reentrantly, so release a failed copy's claim only if the state
+  // is still unloaded. A successful copy is checked again by the blocking load.
+  let bytes = match source.to_vec() {
+    Ok(bytes) => bytes,
+    Err(error) => {
+      if inner
+        .lock()
+        .map(|guard| guard.state == DemuxerState::Unloaded)
+        .unwrap_or(false)
+      {
+        claim.set(false);
+      }
+      return Err(error);
+    }
+  };
+  spawn_load(env, inner, claim, move |demuxer| demuxer.load_buffer(bytes))
+}
+
+/// Run a claimed load on a blocking thread. When it fails and the demuxer is
+/// still unloaded, give the claim back, so a later load may try again.
+fn spawn_load<'env, F: DemuxerFormat>(
+  env: &'env Env,
+  inner: &Arc<Mutex<DemuxerInner<F>>>,
+  claim: &LoadClaim,
+  load: impl FnOnce(&mut DemuxerInner<F>) -> Result<()> + Send + 'static,
+) -> Result<PromiseRaw<'env, ()>> {
+  let inner = inner.clone();
+  let claim = claim.clone();
+  env.spawn_future(async move {
+    tokio::task::spawn_blocking(move || {
+      let mut guard = inner
+        .lock()
+        .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+      let result = load(&mut guard);
+      if guard.state == DemuxerState::Unloaded {
+        claim.set(false);
+      }
+      result
+    })
+    .await
+    .map_err(|e| Error::new(Status::GenericFailure, format!("Task error: {}", e)))?
+  })
+}
 
 /// Read and dispatch packets without holding the demuxer mutex while a
 /// JavaScript callback is queued. Callback queues are bounded, so a slow

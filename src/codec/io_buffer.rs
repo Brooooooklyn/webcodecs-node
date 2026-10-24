@@ -7,13 +7,15 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Condvar, Mutex};
 
 // ============================================================================
-// Buffer Source Trait (for zero-copy demuxing)
+// Buffer Source Trait (owned bytes for demuxing)
 // ============================================================================
 
 /// Object-safe trait for read-only buffer access.
 ///
-/// This trait enables zero-copy buffer loading by allowing different buffer
-/// types (Vec<u8>, Uint8Array, etc.) to be used without copying data.
+/// Lets the demuxer read owned buffer types (`Vec<u8>`, `Box<[u8]>`) without
+/// another copy. Implementations must own their bytes: a pointer into a JS
+/// ArrayBuffer does not stay valid, because JS can detach or resize it while
+/// the demuxer still reads it on a worker thread.
 pub trait BufferSource: Send + Sync {
   /// Get pointer and length of the buffer data.
   ///
@@ -35,13 +37,12 @@ impl BufferSource for Box<[u8]> {
 }
 
 // ============================================================================
-// Read-Only Buffer (for demuxing with zero-copy support)
+// Read-Only Buffer (for demuxing)
 // ============================================================================
 
 /// Read-only buffer for demuxing operations.
 ///
-/// This buffer wraps any `BufferSource` implementation, enabling zero-copy
-/// buffer loading from JavaScript `Uint8Array` without intermediate copies.
+/// This buffer wraps any `BufferSource` implementation (owned bytes).
 pub struct ReadOnlyBuffer {
   source: Box<dyn BufferSource>,
   position: usize,

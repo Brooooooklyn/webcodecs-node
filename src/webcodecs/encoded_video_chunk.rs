@@ -5,6 +5,7 @@
 
 use crate::codec::Packet;
 use crate::ffi::{AVRational, avutil::av_rescale_q};
+use crate::webcodecs::buffer_source::{self, BufferSourceMember};
 use crate::webcodecs::error::{
   enforce_range_long_long, enforce_range_unsigned_long_long_optional,
   enforce_range_unsigned_long_value, get_number_member, to_unsigned_long,
@@ -137,51 +138,10 @@ impl FromNapiValue for EncodedVideoChunkInit {
       enforce_range_unsigned_long_long_optional(&env_wrapper, duration_f64, "duration")?
         .map(|v| v.min(i64::MAX as u64) as i64);
 
-    // Validate data - required field, accept BufferSource (ArrayBuffer, TypedArray, DataView)
-    // Try different buffer types in order of preference
-    // per W3C spec, chunk data should be independent of the original data, so data copy is not avoidable here
-    let data = if let Ok(Some(buffer)) = obj.get::<&[u8]>("data") {
-      buffer.to_vec()
-    } else if let Ok(Some(array_buffer)) = obj.get::<ArrayBuffer>("data") {
-      Uint8ArraySlice::from_arraybuffer(&array_buffer, 0, array_buffer.len())?.to_vec()
-    } else {
-      // Check if data property exists but is undefined/null
-      let has_data = obj.has_named_property("data")?;
-      if !has_data {
-        env_wrapper.throw_type_error("data is required", None)?;
-        return Err(Error::new(Status::InvalidArg, "data is required"));
-      }
-
-      // Try getting as object and check for buffer/byteLength properties (DataView, other TypedArrays)
-      if let Ok(Some(data_obj)) = obj.get::<Object>("data") {
-        let byte_length: Option<u32> = data_obj.get("byteLength").ok().flatten();
-        let byte_offset: u32 = data_obj.get("byteOffset").ok().flatten().unwrap_or(0);
-
-        if let (Some(len), Ok(Some(buffer))) = (byte_length, data_obj.get::<ArrayBuffer>("buffer"))
-        {
-          let offset = byte_offset as usize;
-          let length = len as usize;
-          if offset + length <= buffer.len() {
-            Uint8ArraySlice::from_arraybuffer(&buffer, offset, length)?.to_vec()
-          } else {
-            env_wrapper.throw_type_error("data must be a valid BufferSource", None)?;
-            return Err(Error::new(
-              Status::InvalidArg,
-              "data must be a valid BufferSource",
-            ));
-          }
-        } else {
-          env_wrapper.throw_type_error("data must be a BufferSource", None)?;
-          return Err(Error::new(
-            Status::InvalidArg,
-            "data must be a BufferSource",
-          ));
-        }
-      } else {
-        env_wrapper.throw_type_error("data is required", None)?;
-        return Err(Error::new(Status::InvalidArg, "data is required"));
-      }
-    };
+    // Validate data - required field, any BufferSource. Per W3C spec the chunk
+    // owns a copy of the bytes. The view is located with engine calls, not its
+    // (overridable) buffer/byteOffset/byteLength properties.
+    let data = buffer_source::copy_required_data(env, &obj)?;
 
     Ok(EncodedVideoChunkInit {
       chunk_type,
@@ -411,63 +371,29 @@ impl EncodedVideoChunk {
   /// W3C spec: throws TypeError if destination is too small
   #[napi(ts_args_type = "destination: BufferSource")]
   pub fn copy_to(&self, env: Env, destination: Unknown) -> Result<()> {
-    self.with_inner(|inner| {
-      // Try to get it as a TypedArray first (most common case)
-      if let Ok(typed_array) = destination.coerce_to_object() {
-        // Check if it has a buffer property (TypedArray/DataView)
-        if let Ok(true) = typed_array.has_named_property("buffer") {
-          // It's a TypedArray or DataView - get its underlying buffer info
-          let byte_length: u32 = typed_array.get("byteLength").ok().flatten().unwrap_or(0);
-          let byte_offset: u32 = typed_array.get("byteOffset").ok().flatten().unwrap_or(0);
-          let mut buffer: ArrayBuffer = typed_array
-            .get("buffer")?
-            .ok_or_else(|| Error::new(Status::InvalidArg, "Invalid BufferSource"))?;
-
-          if (byte_length as usize) < inner.data.len() {
-            env.throw_type_error(
-              &format!(
-                "destination is too small: need {} bytes, got {}",
-                inner.data.len(),
-                byte_length
-              ),
-              None,
-            )?;
-            return Ok(());
-          }
-
-          // Copy data to the view's portion of the buffer using slice-based access
-          let dest_slice = unsafe { buffer.as_mut() };
-          let offset = byte_offset as usize;
-          dest_slice[offset..offset + inner.data.len()].copy_from_slice(inner.data.as_slice());
-        } else {
-          // It's likely an ArrayBuffer directly
-          let byte_length: Option<u32> = typed_array.get("byteLength").ok().flatten();
-          if let Some(len) = byte_length {
-            if (len as usize) < inner.data.len() {
-              env.throw_type_error(
-                &format!(
-                  "destination is too small: need {} bytes, got {}",
-                  inner.data.len(),
-                  len
-                ),
-                None,
-              )?;
-              return Ok(());
-            }
-
-            // Get the ArrayBuffer and use slice-based access
-            let mut array_buffer = ArrayBuffer::from_unknown(destination)?;
-            let dest_slice = unsafe { array_buffer.as_mut() };
-            dest_slice[..inner.data.len()].copy_from_slice(inner.data.as_slice());
-          } else {
-            return Err(Error::new(Status::InvalidArg, "Invalid BufferSource"));
-          }
-        }
-      } else {
-        return Err(Error::new(Status::InvalidArg, "Invalid BufferSource"));
+    let destination = buffer_source::copy_to_destination(env.raw(), &destination)?;
+    let shared_data = self.with_inner(|inner| {
+      if destination.len() < inner.data.len() {
+        env.throw_type_error(
+          &format!(
+            "destination is too small: need {} bytes, got {}",
+            inner.data.len(),
+            destination.len()
+          ),
+          None,
+        )?;
+        return Ok(None);
       }
-      Ok(())
-    })
+      if destination.is_shared() {
+        return Ok(Some(inner.data.as_slice().to_vec()));
+      }
+      destination.write_from_slice(inner.data.as_slice())?;
+      Ok(None)
+    })?;
+    if let Some(data) = shared_data {
+      destination.write_from_slice(&data)?;
+    }
+    Ok(())
   }
 
   /// Check if this is a key frame
@@ -1839,8 +1765,13 @@ pub struct VideoDecoderConfig {
   pub hardware_acceleration: Option<HardwareAcceleration>,
   /// Optimize for latency (W3C spec)
   pub optimize_for_latency: Option<bool>,
-  /// Codec-specific description data (e.g., avcC for H.264) - BufferSource per spec
-  pub description: Option<Uint8Array>,
+  /// Codec-specific description data (e.g., avcC for H.264) - BufferSource per spec.
+  /// A copy taken when the config was read.
+  pub description: Option<Vec<u8>>,
+  /// The description's buffer was detached while the config was read
+  /// (W3C: such a config is invalid, so configure() and isConfigSupported()
+  /// throw a TypeError).
+  pub description_detached: bool,
   /// Rotation in degrees clockwise, converted like Chrome 155: its VideoDecoderConfig takes
   /// rotation as `unsigned long` (ToUint32), not the spec's `double`. So -90 is 4294967206,
   /// which the output frame rounds to 180, and NaN is 0.
@@ -1892,24 +1823,21 @@ impl FromNapiValue for VideoDecoderConfig {
     let hardware_acceleration: Option<HardwareAcceleration> = obj.get("hardwareAcceleration")?;
     let optimize_for_latency: Option<bool> = obj.get("optimizeForLatency")?;
 
-    // Handle description as BufferSource (ArrayBuffer, TypedArray, or DataView)
-    // Try to get as Uint8Array first, then try to handle DataView/ArrayBuffer
-    let description: Option<Uint8Array> = match obj.get::<Uint8Array>("description") {
-      Ok(Some(arr)) => Some(arr),
-      Ok(None) => None,
-      Err(_) => {
-        // Not a Uint8Array directly - might be DataView or ArrayBuffer
-        // For these cases, the NAPI binding doesn't support direct conversion,
-        // so we accept None. The test expects isConfigSupported to still work
-        // with unsupported description types (it just won't use the description).
-        None
-      }
-    };
+    // Description: any BufferSource. Read here, in the same getter order as
+    // before, but copied only after the getters below ran, like Chrome.
+    let description: Unknown = obj.get_named_property("description")?;
 
     // Rotation and flip for VideoFrame orientation (W3C WebCodecs spec)
     let rotation: Option<f64> = get_number_member(&obj, "rotation")?;
     let rotation = rotation.map(to_unsigned_long);
     let flip: Option<bool> = obj.get("flip")?;
+
+    // A value that is not a BufferSource (null included) is ignored, as before.
+    let (description, description_detached) = match buffer_source::copy_member(env, &description)? {
+      BufferSourceMember::Copied(bytes) => (Some(bytes), false),
+      BufferSourceMember::Detached => (None, true),
+      BufferSourceMember::Absent | BufferSourceMember::NotBufferSource => (None, false),
+    };
 
     Ok(VideoDecoderConfig {
       codec,
@@ -1922,6 +1850,7 @@ impl FromNapiValue for VideoDecoderConfig {
       hardware_acceleration,
       optimize_for_latency,
       description,
+      description_detached,
       rotation,
       flip,
     })
@@ -2013,7 +1942,11 @@ impl ToNapiValue for VideoDecoderConfig {
       obj.set("optimizeForLatency", optimize_for_latency)?;
     }
     if let Some(description) = val.description {
-      obj.set("description", description)?;
+      // A copy, as an ArrayBuffer (like Chrome), never the caller's buffer.
+      obj.set(
+        "description",
+        ArrayBuffer::from_data(&env_wrapper, description)?,
+      )?;
     }
     if let Some(rotation) = val.rotation {
       obj.set("rotation", rotation)?;

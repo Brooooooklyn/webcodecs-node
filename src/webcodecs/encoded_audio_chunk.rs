@@ -4,6 +4,7 @@
 //! See: https://developer.mozilla.org/en-US/docs/Web/API/EncodedAudioChunk
 
 use crate::codec::Packet;
+use crate::webcodecs::buffer_source::{self, BufferSourceMember};
 use crate::webcodecs::encoded_video_chunk::InternalSlice;
 use crate::webcodecs::error::{enforce_range_long_long, enforce_range_unsigned_long_long_optional};
 use napi::bindgen_prelude::*;
@@ -88,53 +89,10 @@ impl FromNapiValue for EncodedAudioChunkInit {
       enforce_range_unsigned_long_long_optional(&env_wrapper, duration_f64, "duration")?
         .map(|v| v.min(i64::MAX as u64) as i64);
 
-    // Validate data - required field, accept BufferSource (ArrayBuffer, TypedArray, DataView)
-    // Per W3C spec, chunk data must be independent of the original source, so a copy is required.
-    // We optimize by using slice access where possible to avoid double-copying.
-    let data = if let Ok(Some(buffer)) = obj.get::<&[u8]>("data") {
-      buffer.to_vec()
-    } else if let Ok(Some(array_buffer)) = obj.get::<ArrayBuffer>("data") {
-      Uint8ArraySlice::from_arraybuffer(&array_buffer, 0, array_buffer.len())?.to_vec()
-    } else {
-      // Check if data property exists but is undefined/null
-      let has_data = obj.has_named_property("data")?;
-      if !has_data {
-        env_wrapper.throw_type_error("data is required", None)?;
-        return Err(Error::new(Status::InvalidArg, "data is required"));
-      }
-
-      // Try getting as object and check for buffer/byteLength properties (DataView, other TypedArrays)
-      if let Ok(Some(data_obj)) = obj.get::<Object>("data") {
-        let byte_length: Option<u32> = data_obj.get("byteLength").ok().flatten();
-        let byte_offset: u32 = data_obj.get("byteOffset").ok().flatten().unwrap_or(0);
-
-        if let (Some(len), Ok(Some(buffer))) = (byte_length, data_obj.get::<ArrayBuffer>("buffer"))
-        {
-          let offset = byte_offset as usize;
-          let length = len as usize;
-          // Use Uint8ArraySlice to copy directly from the slice (single copy)
-          // instead of copying entire buffer then slicing (double copy)
-          if offset + length <= buffer.len() {
-            Uint8ArraySlice::from_arraybuffer(&buffer, offset, length)?.to_vec()
-          } else {
-            env_wrapper.throw_type_error("data must be a valid BufferSource", None)?;
-            return Err(Error::new(
-              Status::InvalidArg,
-              "data must be a valid BufferSource",
-            ));
-          }
-        } else {
-          env_wrapper.throw_type_error("data must be a BufferSource", None)?;
-          return Err(Error::new(
-            Status::InvalidArg,
-            "data must be a BufferSource",
-          ));
-        }
-      } else {
-        env_wrapper.throw_type_error("data is required", None)?;
-        return Err(Error::new(Status::InvalidArg, "data is required"));
-      }
-    };
+    // Validate data - required field, any BufferSource. Per W3C spec the chunk
+    // owns a copy of the bytes. The view is located with engine calls, not its
+    // (overridable) buffer/byteOffset/byteLength properties.
+    let data = buffer_source::copy_required_data(env, &obj)?;
 
     Ok(EncodedAudioChunkInit {
       chunk_type,
@@ -276,62 +234,29 @@ impl EncodedAudioChunk {
   /// W3C spec: throws TypeError if destination is too small
   #[napi(ts_args_type = "destination: BufferSource")]
   pub fn copy_to(&self, env: Env, destination: Unknown) -> Result<()> {
-    self.with_inner(|inner| {
-      // Try to get it as a TypedArray first (most common case)
-      if let Ok(typed_array) = destination.coerce_to_object() {
-        // Check if it has a buffer property (TypedArray/DataView)
-        if let Ok(true) = typed_array.has_named_property("buffer") {
-          // It's a TypedArray or DataView - get its underlying buffer info
-          let byte_length: u32 = typed_array.get("byteLength").ok().flatten().unwrap_or(0);
-          let byte_offset: u32 = typed_array.get("byteOffset").ok().flatten().unwrap_or(0);
-          let mut buffer: ArrayBuffer = typed_array
-            .get("buffer")?
-            .ok_or_else(|| Error::new(Status::InvalidArg, "Invalid BufferSource"))?;
-          if (byte_length as usize) < inner.data.len() {
-            env.throw_type_error(
-              &format!(
-                "destination is too small: need {} bytes, got {}",
-                inner.data.len(),
-                byte_length
-              ),
-              None,
-            )?;
-            return Ok(());
-          }
-
-          // Copy data to the view's portion of the buffer using slice-based access
-          let dest_slice = unsafe { buffer.as_mut() };
-          let offset = byte_offset as usize;
-          dest_slice[offset..offset + inner.data.len()].copy_from_slice(inner.data.as_slice());
-        } else {
-          // It's likely an ArrayBuffer directly
-          let byte_length: Option<u32> = typed_array.get("byteLength").ok().flatten();
-          if let Some(len) = byte_length {
-            if (len as usize) < inner.data.len() {
-              env.throw_type_error(
-                &format!(
-                  "destination is too small: need {} bytes, got {}",
-                  inner.data.len(),
-                  len
-                ),
-                None,
-              )?;
-              return Ok(());
-            }
-
-            // Get the ArrayBuffer and use slice-based access
-            let mut array_buffer = ArrayBuffer::from_unknown(destination)?;
-            let dest_slice = unsafe { array_buffer.as_mut() };
-            dest_slice[..inner.data.len()].copy_from_slice(inner.data.as_slice());
-          } else {
-            return Err(Error::new(Status::InvalidArg, "Invalid BufferSource"));
-          }
-        }
-      } else {
-        return Err(Error::new(Status::InvalidArg, "Invalid BufferSource"));
+    let destination = buffer_source::copy_to_destination(env.raw(), &destination)?;
+    let shared_data = self.with_inner(|inner| {
+      if destination.len() < inner.data.len() {
+        env.throw_type_error(
+          &format!(
+            "destination is too small: need {} bytes, got {}",
+            inner.data.len(),
+            destination.len()
+          ),
+          None,
+        )?;
+        return Ok(None);
       }
-      Ok(())
-    })
+      if destination.is_shared() {
+        return Ok(Some(inner.data.as_slice().to_vec()));
+      }
+      destination.write_from_slice(inner.data.as_slice())?;
+      Ok(None)
+    })?;
+    if let Some(data) = shared_data {
+      destination.write_from_slice(&data)?;
+    }
+    Ok(())
   }
 
   // ========================================================================
@@ -630,8 +555,13 @@ pub struct AudioDecoderConfig {
   /// Number of channels
   /// W3C spec: required, but stored as Option for proper error handling
   pub number_of_channels: Option<u32>,
-  /// Codec-specific description data (e.g., AudioSpecificConfig for AAC) - BufferSource per spec
-  pub description: Option<Uint8Array>,
+  /// Codec-specific description data (e.g., AudioSpecificConfig for AAC) - BufferSource per spec.
+  /// A copy taken when the config was read.
+  pub description: Option<Vec<u8>>,
+  /// The description's buffer was detached while the config was read
+  /// (W3C: such a config is invalid, so configure() and isConfigSupported()
+  /// throw a TypeError).
+  pub description_detached: bool,
 }
 
 impl FromNapiValue for AudioDecoderConfig {
@@ -645,13 +575,27 @@ impl FromNapiValue for AudioDecoderConfig {
     let codec: Option<String> = obj.get("codec")?;
     let sample_rate: Option<f64> = obj.get("sampleRate")?;
     let number_of_channels: Option<u32> = obj.get("numberOfChannels")?;
-    let description: Option<Uint8Array> = obj.get("description")?;
+    // Description: any BufferSource. It is read last, so the copy taken here
+    // already holds what earlier getters wrote (Chrome copies after reading
+    // every member).
+    let description: Unknown = obj.get_named_property("description")?;
+    let (description, description_detached) = match buffer_source::copy_member(env, &description)? {
+      BufferSourceMember::Copied(bytes) => (Some(bytes), false),
+      BufferSourceMember::Detached => (None, true),
+      BufferSourceMember::Absent => (None, false),
+      BufferSourceMember::NotBufferSource => {
+        let message = format!("description {}", buffer_source::NOT_A_BUFFER_SOURCE);
+        Env::from_raw(env).throw_type_error(&message, None)?;
+        return Err(Error::new(Status::InvalidArg, message));
+      }
+    };
 
     Ok(AudioDecoderConfig {
       codec,
       sample_rate,
       number_of_channels,
       description,
+      description_detached,
     })
   }
 }
@@ -705,7 +649,11 @@ impl ToNapiValue for AudioDecoderConfig {
       obj.set("numberOfChannels", number_of_channels)?;
     }
     if let Some(description) = val.description {
-      obj.set("description", description)?;
+      // A copy, as an ArrayBuffer (like Chrome), never the caller's buffer.
+      obj.set(
+        "description",
+        ArrayBuffer::from_data(&env_wrapper, description)?,
+      )?;
     }
 
     unsafe { Object::to_napi_value(env, obj) }

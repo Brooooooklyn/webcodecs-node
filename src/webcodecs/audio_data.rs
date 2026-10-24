@@ -5,6 +5,7 @@
 
 use crate::codec::Frame;
 use crate::ffi::AVSampleFormat;
+use crate::webcodecs::buffer_source;
 use crate::webcodecs::error::{
   enforce_range_long_long, invalid_state_error, native_range_error, throw_invalid_state_error,
 };
@@ -302,42 +303,10 @@ impl FromNapiValue for AudioDataInit {
       None => return Err(throw_type_error(env, "timestamp is required")),
     };
 
-    // Validate data - required field, accept BufferSource (ArrayBuffer, TypedArray, DataView)
-    let data: Vec<u8> = if let Ok(Some(buffer)) = obj.get::<Buffer>("data") {
-      buffer.to_vec()
-    } else if let Ok(Some(array)) = obj.get::<Uint8Array>("data") {
-      array.to_vec()
-    } else if let Ok(Some(array_buffer)) = obj.get::<ArrayBuffer>("data") {
-      array_buffer.to_vec()
-    } else {
-      // Check if data property exists but is undefined/null
-      let has_data = obj.has_named_property("data")?;
-      if !has_data {
-        return Err(throw_type_error(env, "data is required"));
-      }
-
-      // Try getting as object and check for buffer/byteLength properties (DataView, other TypedArrays)
-      if let Ok(Some(data_obj)) = obj.get::<Object>("data") {
-        let byte_length: Option<u32> = data_obj.get("byteLength").ok().flatten();
-        let byte_offset: u32 = data_obj.get("byteOffset").ok().flatten().unwrap_or(0);
-
-        if let (Some(len), Ok(Some(buffer))) = (byte_length, data_obj.get::<ArrayBuffer>("buffer"))
-        {
-          let full_data = buffer.to_vec();
-          let offset = byte_offset as usize;
-          let length = len as usize;
-          if offset + length <= full_data.len() {
-            full_data[offset..offset + length].to_vec()
-          } else {
-            return Err(throw_type_error(env, "data must be a valid BufferSource"));
-          }
-        } else {
-          return Err(throw_type_error(env, "data must be a BufferSource"));
-        }
-      } else {
-        return Err(throw_type_error(env, "data is required"));
-      }
-    };
+    // Validate data - required field, any BufferSource. The view is located
+    // with engine calls, not its (overridable) buffer/byteOffset/byteLength
+    // properties, and its bytes are copied before any other JS runs.
+    let data = buffer_source::copy_required_data(env, &obj)?;
 
     Ok(AudioDataInit {
       format,
@@ -717,12 +686,12 @@ impl AudioData {
     destination: Unknown,
     options: AudioDataCopyToOptions,
   ) -> Result<()> {
-    let inner = self
+    let inner_guard = self
       .inner
       .lock()
       .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
 
-    let inner = match inner.as_ref() {
+    let inner = match inner_guard.as_ref() {
       Some(i) => i,
       None => return throw_invalid_state_error(&env, "AudioData is closed"),
     };
@@ -741,48 +710,19 @@ impl AudioData {
     let num_frames = plan.copy_frames;
     let channels = frame_guard.channels() as usize;
 
-    // Extract the underlying buffer from AllowSharedBufferSource (TypedArray, DataView, or ArrayBuffer)
-    let typed_array = destination
-      .coerce_to_object()
-      .map_err(|_| Error::new(Status::InvalidArg, "Invalid AllowSharedBufferSource"))?;
-
-    // Get buffer info - handle both TypedArray/DataView and direct ArrayBuffer
-    let (mut buffer, byte_offset, byte_length): (ArrayBuffer, usize, usize) =
-      if let Ok(true) = typed_array.has_named_property("buffer") {
-        // It's a TypedArray or DataView - get its underlying buffer info
-        let byte_length: u32 = typed_array.get("byteLength").ok().flatten().unwrap_or(0);
-        let byte_offset: u32 = typed_array.get("byteOffset").ok().flatten().unwrap_or(0);
-        let buffer: ArrayBuffer = typed_array
-          .get("buffer")?
-          .ok_or_else(|| Error::new(Status::InvalidArg, "Invalid AllowSharedBufferSource"))?;
-        (buffer, byte_offset as usize, byte_length as usize)
-      } else {
-        // It's likely an ArrayBuffer directly
-        let byte_length: Option<u32> = typed_array.get("byteLength").ok().flatten();
-        if let Some(len) = byte_length {
-          let buffer = ArrayBuffer::from_unknown(destination)?;
-          (buffer, 0, len as usize)
-        } else {
-          return Err(Error::new(
-            Status::InvalidArg,
-            "Invalid AllowSharedBufferSource",
-          ));
-        }
-      };
-
-    // Get mutable access to the destination buffer at the correct offset
-    let full_buffer = unsafe { buffer.as_mut() };
-    let dest_slice = &mut full_buffer[byte_offset..byte_offset + byte_length];
-
+    // Locate the destination with engine calls: its own buffer/byteOffset/
+    // byteLength properties may lie, and reading them would run JS while the
+    // locks above are held.
+    let destination = buffer_source::copy_to_destination(env.raw(), &destination)?;
     // The destination must hold element_count samples in the destination
     // format — not the source format's byte size (RangeError per W3C spec)
     let copy_size = plan.element_count * dest_format.bytes_per_sample();
-    if dest_slice.len() < copy_size {
+    if destination.len() < copy_size {
       env.throw_range_error(
         &format!(
           "destination buffer too small: need {} bytes, got {}",
           copy_size,
-          dest_slice.len()
+          destination.len()
         ),
         None,
       )?;
@@ -792,99 +732,114 @@ impl AudioData {
       ));
     }
 
-    let src_format = inner.format;
-    if src_format.base() == dest_format.base() {
-      // Same base sample type (planarity may still differ) — verbatim byte
-      // copy; source indexing uses the source format's byte size
-      let bytes_per_sample = dest_format.bytes_per_sample();
-      if dest_format.is_planar() {
-        if src_format.is_planar() {
-          // Source is planar too
-          if let Some(src) = frame_guard.audio_channel_data(plane_index) {
-            let src_offset = frame_offset * bytes_per_sample;
-            dest_slice[..copy_size].copy_from_slice(&src[src_offset..src_offset + copy_size]);
-          }
-        } else {
-          // Source is interleaved, need to extract one channel
-          if let Some(src) = frame_guard.audio_channel_data(0) {
-            for i in 0..num_frames {
-              let src_offset = ((frame_offset + i) * channels + plane_index) * bytes_per_sample;
-              let dst_offset = i * bytes_per_sample;
-              dest_slice[dst_offset..dst_offset + bytes_per_sample]
-                .copy_from_slice(&src[src_offset..src_offset + bytes_per_sample]);
+    let write_samples = |dest_slice: &mut [u8]| {
+      let src_format = inner.format;
+      if src_format.base() == dest_format.base() {
+        // Same base sample type (planarity may still differ) — verbatim byte
+        // copy; source indexing uses the source format's byte size
+        let bytes_per_sample = dest_format.bytes_per_sample();
+        if dest_format.is_planar() {
+          if src_format.is_planar() {
+            // Source is planar too
+            if let Some(src) = frame_guard.audio_channel_data(plane_index) {
+              let src_offset = frame_offset * bytes_per_sample;
+              dest_slice[..copy_size].copy_from_slice(&src[src_offset..src_offset + copy_size]);
             }
-          }
-        }
-      } else {
-        // Interleaved output
-        if src_format.is_planar() {
-          // Source is planar, need to interleave
-          for i in 0..num_frames {
-            for ch in 0..channels {
-              if let Some(src) = frame_guard.audio_channel_data(ch) {
-                let src_offset = (frame_offset + i) * bytes_per_sample;
-                let dst_offset = (i * channels + ch) * bytes_per_sample;
+          } else {
+            // Source is interleaved, need to extract one channel
+            if let Some(src) = frame_guard.audio_channel_data(0) {
+              for i in 0..num_frames {
+                let src_offset = ((frame_offset + i) * channels + plane_index) * bytes_per_sample;
+                let dst_offset = i * bytes_per_sample;
                 dest_slice[dst_offset..dst_offset + bytes_per_sample]
                   .copy_from_slice(&src[src_offset..src_offset + bytes_per_sample]);
               }
             }
           }
         } else {
-          // Both interleaved
-          if let Some(src) = frame_guard.audio_channel_data(0) {
-            let src_offset = frame_offset * channels * bytes_per_sample;
-            dest_slice[..copy_size].copy_from_slice(&src[src_offset..src_offset + copy_size]);
+          // Interleaved output
+          if src_format.is_planar() {
+            // Source is planar, need to interleave
+            for i in 0..num_frames {
+              for ch in 0..channels {
+                if let Some(src) = frame_guard.audio_channel_data(ch) {
+                  let src_offset = (frame_offset + i) * bytes_per_sample;
+                  let dst_offset = (i * channels + ch) * bytes_per_sample;
+                  dest_slice[dst_offset..dst_offset + bytes_per_sample]
+                    .copy_from_slice(&src[src_offset..src_offset + bytes_per_sample]);
+                }
+              }
+            }
+          } else {
+            // Both interleaved
+            if let Some(src) = frame_guard.audio_channel_data(0) {
+              let src_offset = frame_offset * channels * bytes_per_sample;
+              dest_slice[..copy_size].copy_from_slice(&src[src_offset..src_offset + copy_size]);
+            }
           }
         }
-      }
-    } else {
-      // Base sample types differ — per-sample conversion through the
-      // normalized [-1, 1] domain per the spec's magnitude table
-      if dest_format.is_planar() {
-        let src = frame_guard
-          .audio_channel_data(if src_format.is_planar() {
-            plane_index
-          } else {
-            0
-          })
-          .ok_or_else(|| Error::new(Status::GenericFailure, "missing audio channel data"))?;
-        for i in 0..num_frames {
-          let src_index = if src_format.is_planar() {
-            frame_offset + i
-          } else {
-            (frame_offset + i) * channels + plane_index
-          };
-          write_sample(
-            dest_slice,
-            i,
-            dest_format,
-            read_sample(src, src_index, src_format),
-          );
-        }
       } else {
-        // Interleaved destination — all channels are written
-        for ch in 0..channels {
+        // Base sample types differ — per-sample conversion through the
+        // normalized [-1, 1] domain per the spec's magnitude table
+        if dest_format.is_planar() {
           let src = frame_guard
-            .audio_channel_data(if src_format.is_planar() { ch } else { 0 })
+            .audio_channel_data(if src_format.is_planar() {
+              plane_index
+            } else {
+              0
+            })
             .ok_or_else(|| Error::new(Status::GenericFailure, "missing audio channel data"))?;
           for i in 0..num_frames {
             let src_index = if src_format.is_planar() {
               frame_offset + i
             } else {
-              (frame_offset + i) * channels + ch
+              (frame_offset + i) * channels + plane_index
             };
             write_sample(
               dest_slice,
-              i * channels + ch,
+              i,
               dest_format,
               read_sample(src, src_index, src_format),
             );
           }
+        } else {
+          // Interleaved destination — all channels are written
+          for ch in 0..channels {
+            let src = frame_guard
+              .audio_channel_data(if src_format.is_planar() { ch } else { 0 })
+              .ok_or_else(|| Error::new(Status::GenericFailure, "missing audio channel data"))?;
+            for i in 0..num_frames {
+              let src_index = if src_format.is_planar() {
+                frame_offset + i
+              } else {
+                (frame_offset + i) * channels + ch
+              };
+              write_sample(
+                dest_slice,
+                i * channels + ch,
+                dest_format,
+                read_sample(src, src_index, src_format),
+              );
+            }
+          }
         }
       }
+      Ok(())
+    };
+    if destination.is_shared() {
+      let mut native = vec![0; copy_size];
+      let result = write_samples(&mut native);
+      // Shared writes can call a captured pre-import function. Never run it
+      // while the codec or frame guards are held.
+      drop(frame_guard);
+      drop(inner_guard);
+      if result.is_ok() {
+        destination.write_from_slice(&native)?;
+      }
+      result
+    } else {
+      destination.write_with(copy_size, write_samples)
     }
-
-    Ok(())
   }
 
   /// Create a copy of this AudioData

@@ -794,7 +794,7 @@ impl AudioDecoder {
 
   /// Configure the decoder
   #[napi]
-  pub fn configure(&mut self, env: Env, mut config: AudioDecoderConfig) -> Result<()> {
+  pub fn configure(&mut self, env: Env, config: AudioDecoderConfig) -> Result<()> {
     // W3C WebCodecs spec: Validate config synchronously, throw TypeError for invalid
     // https://w3c.github.io/webcodecs/#dom-audiodecoder-configure
 
@@ -817,6 +817,10 @@ impl AudioDecoder {
       Some(_) => return throw_type_error_unit(&env, "numberOfChannels must be greater than 0"),
       None => return throw_type_error_unit(&env, "numberOfChannels is required"),
     };
+
+    if config.description_detached {
+      return throw_type_error_unit(&env, "Invalid config; description is detached.");
+    }
 
     let mut inner = self
       .inner
@@ -847,13 +851,6 @@ impl AudioDecoder {
           return Ok(());
         }
       };
-
-      // Snapshot the description before queueing: it borrows the caller's
-      // ArrayBuffer and is only copied in process_reconfigure() on the worker
-      // thread, so a post-configure() write would race the applied extradata.
-      if let Some(desc) = config.description.as_mut() {
-        *desc = Uint8Array::new(desc.to_vec());
-      }
 
       // Queue reconfigure via microtask (runs AFTER pending decode microtasks)
       // Use Weak reference to allow close() to immediately close channel without deadlock
@@ -1359,6 +1356,10 @@ impl AudioDecoder {
       Some(_) => return reject_with_type_error(env, "numberOfChannels must be greater than 0"),
       None => return reject_with_type_error(env, "numberOfChannels is required"),
     };
+
+    if config.description_detached {
+      return reject_with_type_error(env, "Invalid config; description is detached.");
+    }
 
     env.spawn_future(async move {
       // Parse codec string

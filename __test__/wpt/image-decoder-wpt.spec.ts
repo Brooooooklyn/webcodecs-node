@@ -293,15 +293,17 @@ test('ImageDecoder: invalid type is accepted (error on decode)', async (t) => {
   decoder.close()
 })
 
-test('ImageDecoder: empty data', async (t) => {
-  const decoder = new ImageDecoder({
-    data: new Uint8Array(0),
-    type: 'image/png',
-  })
-
-  await t.throwsAsync(decoder.decode())
-
-  decoder.close()
+test('ImageDecoder: empty data', (t) => {
+  // Empty BufferSource data is not a valid ImageDecoderInit: the constructor
+  // throws a TypeError (Chrome 155: "No image data provided").
+  t.throws(
+    () =>
+      new ImageDecoder({
+        data: new Uint8Array(0),
+        type: 'image/png',
+      }),
+    { instanceOf: TypeError },
+  )
 })
 
 // ============================================================================

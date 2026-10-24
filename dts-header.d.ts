@@ -96,7 +96,7 @@ export interface MuxerVideoTrackConfig {
   /** Video height */
   height: number
   /** Codec description (e.g., avcC for H.264) */
-  description?: Uint8Array
+  description?: AllowSharedBufferSource
 }
 
 /** Audio track config for muxer */
@@ -108,7 +108,7 @@ export interface MuxerAudioTrackConfig {
   /** Number of channels */
   numberOfChannels: number
   /** Codec description */
-  description?: Uint8Array
+  description?: AllowSharedBufferSource
 }
 
 // ============================================================================
