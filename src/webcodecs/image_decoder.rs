@@ -4,15 +4,16 @@
 //! See: <https://developer.mozilla.org/en-US/docs/Web/API/ImageDecoder>
 
 use crate::codec::demuxer::{DemuxerContext, MediaType};
-use crate::codec::{CodecContext, DecoderConfig, Frame, Packet, ScaleAlgorithm, Scaler};
+use crate::codec::{CodecContext, DecoderConfig, Frame, Packet};
 use crate::ffi::avutil::av_rescale_q;
 use crate::ffi::{AV_NOPTS_VALUE, AVCodecID, AVRational};
-use crate::webcodecs::VideoFrame;
 use crate::webcodecs::buffer_source::{self, Uint8ArrayCopy};
+use crate::webcodecs::decoded_frame::{DecodedSource, decoded_frame_format};
 use crate::webcodecs::error::{
   DOMExceptionName, invalid_state_error, native_dom_exception_error, native_range_error,
   throw_invalid_state_error,
 };
+use crate::webcodecs::{VideoFrame, VideoPixelFormat};
 use futures::stream::StreamExt;
 use napi::bindgen_prelude::*;
 use napi::tokio::sync::Notify;
@@ -415,8 +416,9 @@ struct ImageDecoderInner {
   /// Whether decoder is closed
   closed: bool,
   /// Cached decoded frames (for animated images, populated on first decode)
-  /// Cached decoded frames wrapped in Arc for efficient sharing
-  cached_frames: Option<Vec<Arc<ParkingLotRwLock<Frame>>>>,
+  /// Cached decoded frames wrapped in Arc for efficient sharing, with the
+  /// WebCodecs format that describes each one
+  cached_frames: Option<Vec<(Arc<ParkingLotRwLock<Frame>>, VideoPixelFormat)>>,
   /// Incremented when reset/close invalidates in-flight decode work.
   cache_epoch: u64,
   /// Encoded byte length represented by the current cache. Prevents an older
@@ -928,7 +930,7 @@ fn decode_cached_frame(
   }
 
   // Clone the Arc to share the frame data (no pixel copy needed).
-  let frame_arc = frames[frame_index].clone();
+  let (frame_arc, format) = frames[frame_index].clone();
   let frame_guard = frame_arc.read();
   let pts = frame_guard.pts();
   let frame_duration = frame_guard.duration();
@@ -937,8 +939,13 @@ fn decode_cached_frame(
 
   // Per Chromium behavior: "default" extracts color space, "none" ignores it.
   let extract_color_space = guard.color_space_conversion == ColorSpaceConversion::Default;
-  let video_frame =
-    VideoFrame::from_internal_arc_with_color_space(frame_arc, pts, duration, extract_color_space);
+  let video_frame = VideoFrame::from_internal_arc_with_color_space(
+    frame_arc,
+    format,
+    pts,
+    duration,
+    extract_color_space,
+  );
 
   Ok(Some(ImageDecodeResult {
     image: video_frame,
@@ -1015,46 +1022,44 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
   })?;
 
   // Demux and decode all frames.
-  let (context, mut frames) = decode_image_data(codec_id, &data_bytes)?;
+  let (context, mut frames, video_streams) = decode_image_data(codec_id, &data_bytes)?;
+  // One video stream with one frame: no animation, alpha or other auxiliary image. An
+  // 'avis' AVIF is an animation even when only its first frame has arrived.
+  let still = video_streams == 1 && frames.len() == 1 && !avif_is_sequence(&data_bytes);
 
   // Apply preferAnimation: if false and format supports animation, only keep first frame
   if prefer_animation == Some(false) && !frames.is_empty() {
     frames.truncate(1);
   }
 
-  // Apply desiredWidth/desiredHeight scaling if both are specified
-  let frames = if let (Some(dw), Some(dh)) = (desired_width, desired_height) {
-    let mut scaled_frames = Vec::with_capacity(frames.len());
-    for frame in frames {
-      // Create scaler for this frame's dimensions and format
-      let scaler = Scaler::new(
-        frame.width(),
-        frame.height(),
-        frame.format(),
-        dw,
-        dh,
-        frame.format(),
-        ScaleAlgorithm::Lanczos, // High quality for images
-      )
-      .map_err(|e| {
-        Error::new(
-          Status::GenericFailure,
-          format!("Failed to create scaler: {}", e),
-        )
-      })?;
-
-      let scaled = scaler.scale_alloc(&frame).map_err(|e| {
-        Error::new(
-          Status::GenericFailure,
-          format!("Failed to scale frame: {}", e),
-        )
-      })?;
-      scaled_frames.push(scaled);
-    }
-    scaled_frames
-  } else {
-    frames
+  // Give every frame a WebCodecs format that describes its bytes, converting the
+  // FFmpeg formats WebCodecs has no name for (rgb24, pal8, gray, argb, ...), and
+  // apply desiredWidth/desiredHeight scaling if both are specified.
+  let source = DecodedSource::Image {
+    codec: codec_id,
+    alpha: match codec_id {
+      AVCodecID::Webp => webp_alpha_hint(&data_bytes),
+      AVCodecID::Png => png_alpha_hint(&data_bytes),
+      _ => None,
+    },
+    yuv: match codec_id {
+      AVCodecID::Mjpeg => jpeg_yuv_hint(&data_bytes),
+      // Chrome keeps a still AVIF without alpha as YUV planes
+      AVCodecID::Av1 => Some(still),
+      _ => None,
+    },
+    size: desired_width.zip(desired_height),
   };
+  let frames = frames
+    .into_iter()
+    .map(|frame| decoded_frame_format(frame, source))
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .map_err(|e| {
+      Error::new(
+        Status::GenericFailure,
+        format!("Failed to convert decoded image: {}", e),
+      )
+    })?;
 
   let repetition_count = if codec_id == AVCodecID::Gif {
     gif_repetition_count(&data_bytes)
@@ -1089,13 +1094,107 @@ fn cache_decoded_frames(inner: &Arc<Mutex<ImageDecoderInner>>) -> Result<()> {
   }
 
   // Wrap frames in Arc for efficient sharing from cache
-  let shared_frames: Vec<Arc<ParkingLotRwLock<Frame>>> =
-    frames.into_iter().map(|f| f.into_shared()).collect();
+  let shared_frames: Vec<(Arc<ParkingLotRwLock<Frame>>, VideoPixelFormat)> = frames
+    .into_iter()
+    .map(|(f, format)| (f.into_shared(), format))
+    .collect();
   guard.cached_frames = Some(shared_frames);
   guard.context = Some(context);
   guard.cached_data_len = data_bytes.len();
 
   Ok(())
+}
+
+/// Whether an AVIF's major brand is 'avis', an image sequence. Chrome then decodes its
+/// track, not the still image, and resolves no frame before the track header ('moov').
+/// The ftyp box comes first, so this is known before any frame. The frame count is
+/// not: a stream can stop after the first frame, or before a 'moov' that follows the
+/// image data, where FFmpeg sees one stream with one frame.
+fn avif_is_sequence(data: &[u8]) -> bool {
+  data.get(4..12) == Some(&b"ftypavis"[..])
+}
+
+/// The alpha hint in a WebP header: the VP8X alpha flag, or the alpha_is_used bit of
+/// a simple lossless (VP8L) file. Chrome labels the decoded image BGRA or BGRX by it.
+fn webp_alpha_hint(data: &[u8]) -> Option<bool> {
+  if data.len() < 25 || &data[0..4] != b"RIFF" || &data[8..12] != b"WEBP" {
+    return None;
+  }
+  match &data[12..16] {
+    b"VP8X" => Some(data[20] & 0x10 != 0),
+    // 0x2f signature, then 14 bits width - 1, 14 bits height - 1, 1 bit alpha_is_used
+    b"VP8L" if data[20] == 0x2f => Some(data[24] & 0x10 != 0),
+    _ => None,
+  }
+}
+
+/// The alpha a PNG header declares: color type 4 or 6, or a tRNS chunk (which comes
+/// before IDAT). Chrome labels the decoded image BGRA or BGRX by it, even when every
+/// tRNS entry is 255.
+fn png_alpha_hint(data: &[u8]) -> Option<bool> {
+  const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+  if data.len() < 33 || &data[..8] != SIGNATURE || &data[12..16] != b"IHDR" {
+    return None;
+  }
+  if data[25] & 4 != 0 {
+    return Some(true);
+  }
+  let mut pos = 8usize;
+  while let Some(header) = data.get(pos..pos.checked_add(8)?) {
+    match &header[4..8] {
+      b"tRNS" => return Some(true),
+      b"IDAT" | b"IEND" => return Some(false),
+      _ => {}
+    }
+    // length, type, data, CRC
+    let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    pos = pos.checked_add(12)?.checked_add(length)?;
+  }
+  None
+}
+
+/// Whether Chrome decodes a JPEG to YUV planes, from its SOF sampling factors: three
+/// components, both chroma components 1x1 and luma 1x1, 2x1 or 2x2 (4:4:4, 4:2:2,
+/// 4:2:0). Other factors decode to BGRX, also ones FFmpeg reads as the same chroma
+/// layout (FFmpeg writes 4:2:2 as 2x2/1x2/1x2 and 4:4:4 as 1x2/1x2/1x2).
+fn jpeg_yuv_hint(data: &[u8]) -> Option<bool> {
+  if data.get(..2)? != [0xFF, 0xD8] {
+    return None;
+  }
+  let mut pos = 2usize;
+  loop {
+    if *data.get(pos)? != 0xFF {
+      return None;
+    }
+    let marker = *data.get(pos + 1)?;
+    match marker {
+      // fill byte before a marker
+      0xFF => pos += 1,
+      // markers without a length: TEM, RSTn, SOI
+      0x01 | 0xD0..=0xD8 => pos += 2,
+      // scan data or end of image before any frame header
+      0xD9 | 0xDA => return None,
+      _ => {
+        let length = u16::from_be_bytes([*data.get(pos + 2)?, *data.get(pos + 3)?]) as usize;
+        // SOFn (C4 DHT, C8 JPG and CC DAC are not frame headers): precision, height,
+        // width, component count, then (id, HxV, table) for each component
+        if matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+          let header = data.get(pos + 4..pos + 2 + length)?;
+          let count = *header.get(5)? as usize;
+          let factors = (0..count)
+            .map(|i| header.get(7 + 3 * i).copied())
+            .collect::<Option<Vec<u8>>>()?;
+          return Some(
+            count == 3
+              && matches!(factors[0], 0x11 | 0x21 | 0x22)
+              && factors[1] == 0x11
+              && factors[2] == 0x11,
+          );
+        }
+        pos += 2 + length;
+      }
+    }
+  }
 }
 
 /// Parse the GIF application extension used for animation loop control.
@@ -1195,10 +1294,12 @@ fn create_image_decoder(codec_id: AVCodecID, extradata: Option<Vec<u8>>) -> Resu
 
 /// Decode image data using FFmpeg. Image formats are containers too: animated
 /// GIF/WebP files must be demuxed into per-frame packets before decoding.
+/// Also returns the number of video streams in the container (an AVIF alpha plane
+/// is a stream of its own); a raw bitstream counts as one.
 fn decode_image_data(
   codec_id: AVCodecID,
   data: &[u8],
-) -> Result<(CodecContext, Vec<crate::codec::Frame>)> {
+) -> Result<(CodecContext, Vec<crate::codec::Frame>, usize)> {
   if let Ok(mut demuxer) = DemuxerContext::open_buffer(data.to_vec())
     && let Some(stream) = demuxer.find_best_stream(MediaType::Video).cloned()
   {
@@ -1243,7 +1344,12 @@ fn decode_image_data(
 
     if !frames.is_empty() {
       normalize_frame_timing(&mut frames, stream.time_base);
-      return Ok((context, frames));
+      let video_streams = demuxer
+        .streams()
+        .iter()
+        .filter(|s| s.media_type == MediaType::Video)
+        .count();
+      return Ok((context, frames, video_streams));
     }
   }
 
@@ -1285,7 +1391,7 @@ fn decode_image_data(
     }
   }
 
-  Ok((context, all_frames))
+  Ok((context, all_frames, 1))
 }
 
 /// Convert container time-base ticks into the microseconds required by
@@ -1313,7 +1419,10 @@ fn normalize_frame_timing(frames: &mut [Frame], time_base: (i32, i32)) {
 
 #[cfg(test)]
 mod tests {
-  use super::{gif_repetition_count, normalize_frame_timing};
+  use super::{
+    avif_is_sequence, gif_repetition_count, jpeg_yuv_hint, normalize_frame_timing, png_alpha_hint,
+    webp_alpha_hint,
+  };
   use crate::codec::Frame;
   use crate::ffi::types::AV_NOPTS_VALUE;
 
@@ -1329,6 +1438,119 @@ mod tests {
     // the trailing block terminator is not part of the fields inspected here.
     extension.pop();
     assert_eq!(gif_repetition_count(&extension), Some(f64::INFINITY));
+  }
+
+  #[test]
+  fn reads_webp_alpha_hints() {
+    let lossless = |alpha: u8| {
+      let mut b = b"RIFF\0\0\0\0WEBPVP8L\0\0\0\0\x2f\x05\xc0\x00\x00".to_vec();
+      b[24] = alpha;
+      b
+    };
+    assert_eq!(webp_alpha_hint(&lossless(0x10)), Some(true));
+    assert_eq!(webp_alpha_hint(&lossless(0x00)), Some(false));
+    let mut extended = b"RIFF\0\0\0\0WEBPVP8X\x0a\0\0\0\x10\0\0\0\0".to_vec();
+    assert_eq!(webp_alpha_hint(&extended), Some(true));
+    extended[20] = 0x02; // animation flag only
+    assert_eq!(webp_alpha_hint(&extended), Some(false));
+    assert_eq!(
+      webp_alpha_hint(b"RIFF\0\0\0\0WEBPVP8 \0\0\0\0\0\0\0\0\0"),
+      None
+    );
+    assert_eq!(webp_alpha_hint(b"GIF89a"), None);
+  }
+
+  #[test]
+  fn reads_png_alpha_hints() {
+    let chunk = |kind: &[u8], data: &[u8]| {
+      let mut c = (data.len() as u32).to_be_bytes().to_vec();
+      c.extend_from_slice(kind);
+      c.extend_from_slice(data);
+      c.extend_from_slice(&[0; 4]); // CRC is not checked
+      c
+    };
+    let png = |color_type: u8, chunks: &[Vec<u8>]| {
+      let mut b = b"\x89PNG\r\n\x1a\n".to_vec();
+      b.extend(chunk(
+        b"IHDR",
+        &[0, 0, 0, 1, 0, 0, 0, 1, 8, color_type, 0, 0, 0],
+      ));
+      chunks.iter().for_each(|c| b.extend_from_slice(c));
+      b.extend(chunk(b"IDAT", &[]));
+      b
+    };
+    let plte = chunk(b"PLTE", &[0, 0, 0]);
+    let trns = chunk(b"tRNS", &[255]);
+    let text = chunk(b"tEXt", b"a\0b");
+    assert_eq!(
+      png_alpha_hint(&png(3, std::slice::from_ref(&plte))),
+      Some(false)
+    );
+    // tRNS declares alpha even when every entry is 255
+    assert_eq!(
+      png_alpha_hint(&png(3, &[plte, text.clone(), trns.clone()])),
+      Some(true)
+    );
+    assert_eq!(png_alpha_hint(&png(0, &[trns])), Some(true));
+    assert_eq!(png_alpha_hint(&png(2, &[text])), Some(false));
+    assert_eq!(png_alpha_hint(&png(4, &[])), Some(true));
+    assert_eq!(png_alpha_hint(&png(6, &[])), Some(true));
+    // no IDAT yet (truncated) or not a PNG
+    assert_eq!(png_alpha_hint(&png(3, &[])[..33]), None);
+    assert_eq!(png_alpha_hint(b"GIF89a"), None);
+  }
+
+  #[test]
+  fn reads_jpeg_yuv_hints() {
+    // SOI, APP0 (skipped), SOF with the given (HxV) factors per component, SOS
+    let jpeg = |sof: u8, factors: &[u8]| {
+      let mut b = vec![
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00, 0xFF, 0xFF, sof,
+      ];
+      b.extend_from_slice(&((8 + 3 * factors.len()) as u16).to_be_bytes());
+      b.extend_from_slice(&[8, 0, 16, 0, 16, factors.len() as u8]);
+      for (i, f) in factors.iter().enumerate() {
+        b.extend_from_slice(&[i as u8 + 1, *f, 0]);
+      }
+      b.extend_from_slice(&[0xFF, 0xDA]);
+      b
+    };
+    for (factors, yuv) in [
+      (&[0x22, 0x11, 0x11][..], true),
+      (&[0x21, 0x11, 0x11], true),
+      (&[0x11, 0x11, 0x11], true),
+      (&[0x12, 0x11, 0x11], false), // 4:4:0
+      (&[0x41, 0x11, 0x11], false), // 4:1:1
+      (&[0x22, 0x12, 0x12], false), // FFmpeg's 4:2:2
+      (&[0x12, 0x12, 0x12], false), // FFmpeg's 4:4:4
+      (&[0x21, 0x21, 0x21], false),
+      (&[0x11], false),                   // grayscale
+      (&[0x11, 0x11, 0x11, 0x11], false), // CMYK
+    ] {
+      assert_eq!(
+        jpeg_yuv_hint(&jpeg(0xC0, factors)),
+        Some(yuv),
+        "{factors:02x?}"
+      );
+    }
+    assert_eq!(jpeg_yuv_hint(&jpeg(0xC2, &[0x22, 0x11, 0x11])), Some(true)); // progressive
+    // a DHT segment is not a frame header
+    let mut dht_first = jpeg(0xC0, &[0x22, 0x12, 0x12]);
+    dht_first.splice(2..2, [0xFF, 0xC4, 0x00, 0x02]);
+    assert_eq!(jpeg_yuv_hint(&dht_first), Some(false));
+    // truncated, no frame header, not a JPEG
+    assert_eq!(jpeg_yuv_hint(&jpeg(0xC0, &[0x22, 0x11, 0x11])[..15]), None);
+    assert_eq!(jpeg_yuv_hint(&[0xFF, 0xD8, 0xFF, 0xDA]), None);
+    assert_eq!(jpeg_yuv_hint(b"GIF89a"), None);
+  }
+
+  #[test]
+  fn reads_the_avif_sequence_brand() {
+    // only the major brand counts: Chrome decodes the still image of an 'avif' file
+    // that also lists 'avis'
+    assert!(avif_is_sequence(b"\0\0\0\x1cftypavis\0\0\0\0avifavis"));
+    assert!(!avif_is_sequence(b"\0\0\0\x1cftypavif\0\0\0\0avifavis"));
+    assert!(!avif_is_sequence(b"\0\0\0\x1cftypav"));
   }
 
   #[test]

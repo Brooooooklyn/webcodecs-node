@@ -169,6 +169,12 @@ impl Frame {
     AVPixelFormat::from_raw(fmt)
   }
 
+  /// Get the raw FFmpeg pixel format value, including formats `AVPixelFormat` does not list
+  #[inline]
+  pub fn format_raw(&self) -> i32 {
+    unsafe { ffframe_get_format(self.as_ptr()) }
+  }
+
   /// Set pixel format
   pub fn set_format(&mut self, format: AVPixelFormat) {
     unsafe { ffframe_set_format(self.as_mut_ptr(), format.as_raw()) }

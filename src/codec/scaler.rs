@@ -110,6 +110,14 @@ impl Scaler {
     dst_format: AVPixelFormat,
     algorithm: ScaleAlgorithm,
   ) -> CodecResult<Self> {
+    // swscale asserts (aborting the process) on an invalid format; `None` is what
+    // `Frame::format()` returns for a format AVPixelFormat does not list.
+    if src_format == AVPixelFormat::None || dst_format == AVPixelFormat::None {
+      return Err(CodecError::InvalidConfig(format!(
+        "Cannot create scaler: unsupported pixel format ({:?} to {:?})",
+        src_format, dst_format
+      )));
+    }
     let ptr = unsafe {
       sws_getContext(
         src_width as i32,

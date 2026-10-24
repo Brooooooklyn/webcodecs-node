@@ -28,6 +28,19 @@ unsafe extern "C" {
     dst: *mut u8,
     dst_stride: isize,
   ) -> c_int;
+  /// Pixel format descriptor facts: out = [flags, nb_components, log2_chroma_w,
+  /// log2_chroma_h, depth of component 0]. Returns a negative AVERROR for an unknown format.
+  pub fn ffpixfmt_describe(fmt: c_int, out: *mut c_int) -> c_int;
+  /// 1 when a palette frame has an entry that is not fully opaque, else 0.
+  pub fn ffframe_palette_has_alpha(frame: *const AVFrame) -> c_int;
+  /// Convert all of `src` into `dst` (allocated, its own format) with swscale. A `dst` of
+  /// another size is resized in the same pass (Lanczos).
+  /// `unspecified_full`: treat a gray/YUV source without a range tag as full range.
+  pub fn ffframe_convert_decoded(
+    src: *const AVFrame,
+    dst: *mut AVFrame,
+    unspecified_full: c_int,
+  ) -> c_int;
   // ========================================================================
   // AVCodecContext Setters
   // ========================================================================

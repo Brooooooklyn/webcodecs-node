@@ -290,6 +290,14 @@ pub enum AVPixelFormat {
   Yuva420p10le = 87, // I420AP10
   Yuva422p10le = 89, // I422AP10
   Yuva444p10le = 91, // I444AP10
+  // Full-range ("JPEG") YUV: the same planes as Yuv420p/Yuv422p/Yuv444p
+  Yuvj420p = 12,
+  Yuvj422p = 13,
+  Yuvj444p = 14,
+  // Planar RGB (G, B, R planes), as decoded from RGB H.264 / HEVC / VP9 streams
+  Gbrp = 71,
+  Gbrp10le = 75,
+  Gbrp12le = 135,
   // Hardware formats - FFmpeg 9.x (libavutil 61) values
   // Verified against ffmpeg-src/FFmpeg/libavutil/pixfmt.h
   Videotoolbox = 157,
@@ -372,6 +380,8 @@ impl AVPixelFormat {
       Self::Yuv420p | Self::Yuv422p | Self::Yuv444p => 3,
       Self::Yuv420p10le | Self::Yuv422p10le | Self::Yuv444p10le => 3,
       Self::Yuv420p12le | Self::Yuv422p12le | Self::Yuv444p12le => 3,
+      Self::Yuvj420p | Self::Yuvj422p | Self::Yuvj444p => 3,
+      Self::Gbrp | Self::Gbrp10le | Self::Gbrp12le => 3,
       // 4-plane formats (Y, U, V, A)
       Self::Yuva420p | Self::Yuva422p | Self::Yuva444p => 4,
       Self::Yuva420p10le | Self::Yuva422p10le | Self::Yuva444p10le => 4,
@@ -423,6 +433,12 @@ impl AVPixelFormat {
       87 => Self::Yuva420p10le,
       89 => Self::Yuva422p10le,
       91 => Self::Yuva444p10le,
+      12 => Self::Yuvj420p,
+      13 => Self::Yuvj422p,
+      14 => Self::Yuvj444p,
+      71 => Self::Gbrp,
+      75 => Self::Gbrp10le,
+      135 => Self::Gbrp12le,
       // Hardware formats - FFmpeg 9.x (libavutil 61) values
       // Verified against ffmpeg-src/FFmpeg/libavutil/pixfmt.h
       157 => Self::Videotoolbox,
@@ -904,4 +920,58 @@ pub mod pkt_side_data_type {
   /// An AV_PKT_DATA_ALPHA_MODE side data contains the alpha mode value.
   /// This is used to signal alpha channel information in VP9 encoded videos.
   pub const AV_PKT_DATA_ALPHA_MODE: c_int = 22;
+}
+
+#[cfg(test)]
+mod tests {
+  use super::AVPixelFormat;
+
+  #[test]
+  fn pixel_format_values_match_the_linked_ffmpeg() {
+    use AVPixelFormat as F;
+    let formats = [
+      (F::Yuv420p, "yuv420p"),
+      (F::Yuv422p, "yuv422p"),
+      (F::Yuv444p, "yuv444p"),
+      (F::Yuva420p, "yuva420p"),
+      (F::Yuva422p, "yuva422p"),
+      (F::Yuva444p, "yuva444p"),
+      (F::Nv12, "nv12"),
+      (F::Nv21, "nv21"),
+      (F::Rgb24, "rgb24"),
+      (F::Bgr24, "bgr24"),
+      (F::Argb, "argb"),
+      (F::Rgba, "rgba"),
+      (F::Abgr, "abgr"),
+      (F::Bgra, "bgra"),
+      (F::Yuv420p10le, "yuv420p10le"),
+      (F::Yuv422p10le, "yuv422p10le"),
+      (F::Yuv444p10le, "yuv444p10le"),
+      (F::Yuv420p12le, "yuv420p12le"),
+      (F::Yuv422p12le, "yuv422p12le"),
+      (F::Yuv444p12le, "yuv444p12le"),
+      (F::Yuva420p10le, "yuva420p10le"),
+      (F::Yuva422p10le, "yuva422p10le"),
+      (F::Yuva444p10le, "yuva444p10le"),
+      (F::Yuvj420p, "yuvj420p"),
+      (F::Yuvj422p, "yuvj422p"),
+      (F::Yuvj444p, "yuvj444p"),
+      (F::Gbrp, "gbrp"),
+      (F::Gbrp10le, "gbrp10le"),
+      (F::Gbrp12le, "gbrp12le"),
+      (F::Videotoolbox, "videotoolbox_vld"),
+      (F::Cuda, "cuda"),
+      (F::Vaapi, "vaapi"),
+      (F::Qsv, "qsv"),
+      (F::D3d11, "d3d11"),
+      (F::Dxva2Vld, "dxva2_vld"),
+      (F::Vulkan, "vulkan"),
+    ];
+    for (format, name) in formats {
+      let c_name = std::ffi::CString::new(name).unwrap();
+      let raw = unsafe { crate::ffi::avutil::av_get_pix_fmt(c_name.as_ptr()) };
+      assert_eq!(raw, format.as_raw(), "{name}");
+      assert_eq!(AVPixelFormat::from_raw(raw), format, "{name}");
+    }
+  }
 }
