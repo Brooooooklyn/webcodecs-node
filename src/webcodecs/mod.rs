@@ -7,6 +7,8 @@ pub(crate) mod after_task;
 mod audio_data;
 mod audio_decoder;
 mod audio_encoder;
+mod avif;
+mod avif_rgb;
 pub(crate) mod buffer_source;
 pub(crate) mod codec_pressure;
 pub mod codec_string;

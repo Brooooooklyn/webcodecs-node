@@ -95,6 +95,17 @@ pub const AVERROR_ENOMEM: c_int = -12;
 /// Same across platforms (22)
 pub const AVERROR_EINVAL: c_int = -22;
 
+/// Function not implemented
+/// Linux: ENOSYS = 38, macOS: 78, Windows: 40
+#[cfg(target_os = "macos")]
+pub const AVERROR_ENOSYS: c_int = -78;
+
+#[cfg(target_os = "windows")]
+pub const AVERROR_ENOSYS: c_int = -40;
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub const AVERROR_ENOSYS: c_int = -38;
+
 // ============================================================================
 // Error Tag Helper
 // ============================================================================
