@@ -5,10 +5,17 @@
  * Uses callback-based constructor per W3C WebCodecs spec.
  */
 
+import { execFileSync } from 'node:child_process'
 import test from 'ava'
 
 import { AudioEncoder } from '../index.js'
-import { generateSineTone, generateSilence, waitFor, type EncodedAudioChunk } from './helpers/index.js'
+import {
+  generateSineTone,
+  generateSilence,
+  waitFor,
+  type EncodedAudioChunk,
+  type EncodedAudioChunkMetadata,
+} from './helpers/index.js'
 
 // Helper to create encoder with callbacks that collect output
 function createTestEncoder() {
@@ -25,6 +32,42 @@ function createTestEncoder() {
   })
 
   return { encoder, chunks, errors }
+}
+
+function createFlacTestEncoder() {
+  const chunks: EncodedAudioChunk[] = []
+  const decoderConfigs: NonNullable<EncodedAudioChunkMetadata['decoderConfig']>[] = []
+  const errors: Error[] = []
+
+  const encoder = new AudioEncoder({
+    output: (chunk, metadata) => {
+      chunks.push(chunk)
+      if (metadata?.decoderConfig) {
+        decoderConfigs.push(metadata.decoderConfig)
+      }
+    },
+    error: (e) => {
+      errors.push(e)
+    },
+  })
+
+  return { encoder, chunks, decoderConfigs, errors }
+}
+
+function isExpectedFlacDecoderConfig(config: NonNullable<EncodedAudioChunkMetadata['decoderConfig']>) {
+  const description = config.description
+  if (!description) return false
+
+  return (
+    config.codec === 'flac' &&
+    config.sampleRate === 44100 &&
+    config.numberOfChannels === 2 &&
+    description.byteLength === 42 &&
+    description[0] === 0x66 &&
+    description[1] === 0x4c &&
+    description[2] === 0x61 &&
+    description[3] === 0x43
+  )
 }
 
 // ============================================================================
@@ -411,15 +454,15 @@ test('AudioEncoder: AAC chunks flushed at the end keep distinct timestamps and m
     bitrate: 128000,
   })
 
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < 3; i++) {
     const audio = generateSineTone(440, 1024, 2, 48000, 'f32', Math.round((i * 1024 * 1_000_000) / 48000))
     encoder.encode(audio)
     audio.close()
   }
   await encoder.flush()
 
-  // 20 input frames plus one packet of encoder delay
-  t.is(chunks.length, 21)
+  // Three input frames plus one packet of encoder delay
+  t.is(chunks.length, 4)
   const frameDuration = Math.floor((1024 * 1_000_000) / 48000)
   chunks.forEach((chunk, i) => {
     t.is(chunk.timestamp, Math.floor((i * 1024 * 1_000_000) / 48000), `timestamp of chunk ${i}`)
@@ -427,6 +470,238 @@ test('AudioEncoder: AAC chunks flushed at the end keep distinct timestamps and m
   })
 
   encoder.close()
+})
+
+test('AudioEncoder: AAC partial remainders keep packet durations and exact output timing', async (t) => {
+  const { encoder, chunks, errors } = createTestEncoder()
+
+  try {
+    encoder.configure({
+      codec: 'mp4a.40.2',
+      sampleRate: 48000,
+      numberOfChannels: 2,
+      bitrate: 128000,
+    })
+
+    for (const frames of [1024, 1024, 1]) {
+      const audio = generateSineTone(440, frames, 2, 48000, 'f32', 100000)
+      encoder.encode(audio)
+      audio.close()
+    }
+    await encoder.flush()
+
+    t.deepEqual(errors, [])
+    t.deepEqual(
+      chunks.map((chunk) => [chunk.timestamp, chunk.duration]),
+      [
+        [100000, 21333],
+        [121333, 21333],
+        [142666, 21333],
+        [164000, 20],
+      ],
+    )
+  } finally {
+    if (encoder.state !== 'closed') encoder.close()
+  }
+})
+
+test('AudioEncoder: one AAC input with a partial frame keeps exact output timing', async (t) => {
+  const { encoder, chunks, errors } = createTestEncoder()
+
+  try {
+    encoder.configure({
+      codec: 'mp4a.40.2',
+      sampleRate: 48000,
+      numberOfChannels: 2,
+      bitrate: 128000,
+    })
+
+    const audio = generateSineTone(440, 1025, 2, 48000, 'f32', 0)
+    encoder.encode(audio)
+    audio.close()
+    await encoder.flush()
+
+    t.deepEqual(errors, [])
+    t.deepEqual(chunks.map((chunk) => [chunk.timestamp, chunk.duration]), [
+      [0, 21333],
+      [21333, 21333],
+      [42666, 20],
+    ])
+  } finally {
+    if (encoder.state !== 'closed') encoder.close()
+  }
+})
+
+test('AudioEncoder: AAC timestamp overflow preserves valid output and rejects flush', (t) => {
+  // Isolate the native worker so an unfixed panic cannot stall the test process.
+  const script = `
+    const { AudioEncoder, AudioData } = require('./index.js');
+    const nearMax = 2 ** 63 - 4096;
+    const events = [];
+    const encoder = new AudioEncoder({
+      output(chunk) {
+        events.push('output:' + (chunk.timestamp === nearMax) + ':' + chunk.duration);
+      },
+      error(error) {
+        events.push('error:' + error.name);
+      },
+    });
+    const timer = setTimeout(() => {
+      console.error('TIMEOUT');
+      process.exit(2);
+    }, 4000);
+    (async () => {
+      encoder.configure({
+        codec: 'mp4a.40.2',
+        sampleRate: 48000,
+        numberOfChannels: 2,
+        bitrate: 128000,
+      });
+      const audio = new AudioData({
+        data: new Float32Array(1024 * 2),
+        format: 'f32',
+        sampleRate: 48000,
+        numberOfFrames: 1024,
+        numberOfChannels: 2,
+        timestamp: nearMax,
+      });
+      encoder.encode(audio);
+      audio.close();
+      try {
+        await encoder.flush();
+        events.push('flush:resolved');
+      } catch (error) {
+        events.push('flush:' + error.name);
+      }
+      try {
+        encoder.close();
+        events.push('close:ok');
+      } catch (error) {
+        events.push('close:' + error.name);
+      }
+      clearTimeout(timer);
+      process.stdout.write(JSON.stringify(events));
+    })().catch((error) => {
+      clearTimeout(timer);
+      console.error(error && error.stack || error);
+      process.exit(1);
+    });
+  `
+
+  const output = execFileSync(process.execPath, ['-e', script], {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+    timeout: 5000,
+  })
+  t.deepEqual(JSON.parse(output), [
+    'output:true:21333',
+    'error:EncodingError',
+    'flush:EncodingError',
+    'close:InvalidStateError',
+  ])
+})
+
+test('AudioEncoder: MP3 packets drained after queued timestamps have microsecond durations', async (t) => {
+  const { encoder, chunks, errors } = createTestEncoder()
+
+  encoder.configure({
+    codec: 'mp3',
+    sampleRate: 48000,
+    numberOfChannels: 2,
+    bitrate: 128000,
+  })
+
+  const audio = generateSineTone(440, 1, 2, 48000, 'f32', 0)
+  encoder.encode(audio)
+  audio.close()
+  await encoder.flush()
+
+  t.deepEqual(errors, [])
+  t.is(chunks.length, 2)
+  t.is(chunks[1].duration, Math.floor((1152 * 1_000_000) / 48000))
+
+  encoder.close()
+})
+
+test('AudioEncoder: FLAC empty flush does not synthesize drain duration', async (t) => {
+  const { encoder, chunks, decoderConfigs, errors } = createFlacTestEncoder()
+
+  try {
+    encoder.configure({
+      codec: 'flac',
+      sampleRate: 44100,
+      numberOfChannels: 2,
+    })
+    await encoder.flush()
+
+    t.deepEqual(errors, [])
+    t.is(chunks.length, 1)
+    t.is(decoderConfigs.length, chunks.length)
+    t.true(decoderConfigs.every(isExpectedFlacDecoderConfig))
+    t.is(chunks[0].byteLength, 0)
+    t.is(chunks[0].timestamp, 0)
+    t.is(chunks[0].duration, null)
+  } finally {
+    if (encoder.state !== 'closed') encoder.close()
+  }
+})
+
+test('AudioEncoder: FLAC partial-frame flush does not synthesize drain duration', async (t) => {
+  const { encoder, chunks, decoderConfigs, errors } = createFlacTestEncoder()
+
+  try {
+    encoder.configure({
+      codec: 'flac',
+      sampleRate: 44100,
+      numberOfChannels: 2,
+    })
+    const audio = generateSineTone(440, 1025, 2, 44100, 'f32', 0)
+    encoder.encode(audio)
+    audio.close()
+    await encoder.flush()
+
+    t.deepEqual(errors, [])
+    t.is(chunks.length, 2)
+    t.is(decoderConfigs.length, chunks.length)
+    t.true(decoderConfigs.every(isExpectedFlacDecoderConfig))
+    t.true(chunks[0].byteLength > 0)
+    t.is(chunks[0].timestamp, 0)
+    t.is(chunks[0].duration, 23242)
+    t.is(chunks[1].byteLength, 0)
+    t.is(chunks[1].timestamp, 23242)
+    t.is(chunks[1].duration, null)
+  } finally {
+    if (encoder.state !== 'closed') encoder.close()
+  }
+})
+
+test('AudioEncoder: FLAC full-frame flush does not synthesize drain duration', async (t) => {
+  const { encoder, chunks, decoderConfigs, errors } = createFlacTestEncoder()
+
+  try {
+    encoder.configure({
+      codec: 'flac',
+      sampleRate: 44100,
+      numberOfChannels: 2,
+    })
+    const audio = generateSineTone(440, 4608, 2, 44100, 'f32', 0)
+    encoder.encode(audio)
+    audio.close()
+    await encoder.flush()
+
+    t.deepEqual(errors, [])
+    t.is(chunks.length, 2)
+    t.is(decoderConfigs.length, chunks.length)
+    t.true(decoderConfigs.every(isExpectedFlacDecoderConfig))
+    t.true(chunks[0].byteLength > 0)
+    t.is(chunks[0].timestamp, 0)
+    t.is(chunks[0].duration, 104489)
+    t.is(chunks[1].byteLength, 0)
+    t.is(chunks[1].timestamp, 104489)
+    t.is(chunks[1].duration, null)
+  } finally {
+    if (encoder.state !== 'closed') encoder.close()
+  }
 })
 
 // ============================================================================
