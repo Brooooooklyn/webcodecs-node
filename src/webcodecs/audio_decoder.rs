@@ -156,6 +156,9 @@ struct AudioDecoderInner {
   output_callback: OutputCallback,
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
+  /// The codec's event state: report_error orders the error callback before
+  /// the dequeue events that come due meanwhile.
+  event_state: Arc<RwLock<CodecEventState>>,
   /// Whether an error has occurred during decoding (for flush error propagation)
   had_error: bool,
   /// Whether a key chunk has been decoded since the last configure (spec: [[key chunk required]])
@@ -247,6 +250,7 @@ impl AudioDecoder {
     )]
     init: AudioDecoderInit,
   ) -> Result<Self> {
+    let event_state = Arc::new(RwLock::new(CodecEventState::default()));
     let inner = AudioDecoderInner {
       state: CodecState::Unconfigured,
       config: None,
@@ -256,6 +260,7 @@ impl AudioDecoder {
       decode_queue_size: 0,
       output_callback: init.output,
       error_callback: init.error,
+      event_state: event_state.clone(),
       had_error: false,
       keyframe_received: false,
       flushes: FlushTracker::default(),
@@ -264,7 +269,6 @@ impl AudioDecoder {
     };
 
     let inner = Arc::new(Mutex::new(inner));
-    let event_state = Arc::new(RwLock::new(CodecEventState::default()));
 
     // Create channel for worker commands
     let (sender, receiver) = channel::unbounded();
@@ -363,26 +367,23 @@ impl AudioDecoder {
 
     // Check if decoder is still configured
     if guard.state != CodecState::Configured {
-      let old_size = guard.decode_queue_size;
-      guard.decode_queue_size = old_size.saturating_sub(1);
-      if old_size > 0 {
-        let _ = Self::fire_dequeue_event(event_state);
-      }
       // Per W3C spec: "cease producing output" - silently discard pending work
       // State could be Unconfigured (reset called) or Closed (close called)
       // Don't call report_error() - that would set state to Closed and invoke error callback
+      // Every decode still queued is discarded the same way, so dequeue them all
+      // now: one dequeue event, as Chrome fires when it resets the queue.
+      CodecEventState::dequeue_all(event_state, &mut guard.decode_queue_size);
       return;
     }
 
     let inner_lock = match chunk.read() {
       Ok(lock) => lock,
       Err(_) => {
-        let old_size = guard.decode_queue_size;
-        guard.decode_queue_size = old_size.saturating_sub(1);
-        if old_size > 0 {
-          let _ = Self::fire_dequeue_event(event_state);
-        }
-        Self::report_error(&mut guard, "Failed to read chunk: lock poisoned");
+        Self::close_with_error(
+          &mut guard,
+          event_state,
+          "Failed to read chunk: lock poisoned",
+        );
         return;
       }
     };
@@ -390,12 +391,11 @@ impl AudioDecoder {
     let inner = match inner_lock.as_ref() {
       Some(inner) => inner,
       None => {
-        let old_size = guard.decode_queue_size;
-        guard.decode_queue_size = old_size.saturating_sub(1);
-        if old_size > 0 {
-          let _ = Self::fire_dequeue_event(event_state);
-        }
-        Self::report_error(&mut guard, "Failed to read chunk: chunk is closed");
+        Self::close_with_error(
+          &mut guard,
+          event_state,
+          "Failed to read chunk: chunk is closed",
+        );
         return;
       }
     };
@@ -407,13 +407,9 @@ impl AudioDecoder {
 
     // W3C spec: Empty data should trigger EncodingError
     if data.is_empty() {
-      let old_size = guard.decode_queue_size;
-      guard.decode_queue_size = old_size.saturating_sub(1);
-      if old_size > 0 {
-        let _ = Self::fire_dequeue_event(event_state);
-      }
-      Self::report_error(
+      Self::close_with_error(
         &mut guard,
+        event_state,
         "EncodingError: Cannot decode empty audio chunk data",
       );
       return;
@@ -429,12 +425,7 @@ impl AudioDecoder {
       None => {
         // Remove the timestamp we just pushed since we're not decoding
         guard.timestamp_queue.pop_back();
-        let old_size = guard.decode_queue_size;
-        guard.decode_queue_size = old_size.saturating_sub(1);
-        if old_size > 0 {
-          let _ = Self::fire_dequeue_event(event_state);
-        }
-        Self::report_error(&mut guard, "No decoder context");
+        Self::close_with_error(&mut guard, event_state, "No decoder context");
         return;
       }
     };
@@ -444,12 +435,7 @@ impl AudioDecoder {
       Ok(f) => f,
       Err(e) => {
         guard.timestamp_queue.pop_back();
-        let old_size = guard.decode_queue_size;
-        guard.decode_queue_size = old_size.saturating_sub(1);
-        if old_size > 0 {
-          let _ = Self::fire_dequeue_event(event_state);
-        }
-        Self::report_error(&mut guard, &format!("Decode failed: {}", e));
+        Self::close_with_error(&mut guard, event_state, &format!("Decode failed: {}", e));
         return;
       }
     };
@@ -725,11 +711,21 @@ impl AudioDecoder {
 
     // Create an Error object that will be passed directly to the JS callback
     let error = Error::new(Status::GenericFailure, error_msg);
-    inner
-      .error_callback
-      .call(error, ThreadsafeFunctionCallMode::NonBlocking);
+    CodecEventState::report_error(&inner.event_state, &inner.error_callback, error);
     inner.had_error = true;
     inner.state = CodecState::Closed;
+  }
+
+  /// Worker: an error closes the decoder and drops every queued decode. As in
+  /// Chrome, decodeQueueSize is already 0 when the error callback runs, and one
+  /// dequeue event follows for all the dropped decodes.
+  fn close_with_error(
+    inner: &mut AudioDecoderInner,
+    event_state: &Arc<RwLock<CodecEventState>>,
+    message: &str,
+  ) {
+    Self::report_error(inner, message);
+    CodecEventState::dequeue_all(event_state, &mut inner.decode_queue_size);
   }
 
   /// Fire dequeue event via the shared JS-side dispatcher
@@ -773,15 +769,7 @@ impl AudioDecoder {
     this: This,
     callback: Option<FunctionRef<Unknown<'static>, UnknownReturnValue>>,
   ) -> Result<()> {
-    let mut state = self
-      .event_state
-      .write()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-    if callback.is_some() {
-      state.ensure_dispatcher(env, this.object)?;
-    }
-    state.set_ondequeue(env, callback)?;
-    Ok(())
+    CodecEventState::set_ondequeue_handler(&self.event_state, env, this.object, callback)
   }
 
   /// Get the dequeue event handler (per WebCodecs spec)
@@ -1411,15 +1399,17 @@ impl AudioDecoder {
     callback: FunctionRef<Unknown<'static>, UnknownReturnValue>,
     options: Option<AudioDecoderAddEventListenerOptions>,
   ) -> Result<()> {
-    let mut state = self
-      .event_state
-      .write()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    state.ensure_dispatcher(&env, this.object)?;
     let once = options.as_ref().and_then(|o| o.once).unwrap_or(false);
     let capture = options.as_ref().and_then(|o| o.capture).unwrap_or(false);
-    state.add_listener(&env, &event_type, callback, once, capture)
+    CodecEventState::add_event_listener(
+      &self.event_state,
+      &env,
+      this.object,
+      &event_type,
+      callback,
+      once,
+      capture,
+    )
   }
 
   /// Remove an event listener for the specified event type
@@ -1433,14 +1423,8 @@ impl AudioDecoder {
     callback: FunctionRef<Unknown<'static>, UnknownReturnValue>,
     options: Option<AudioDecoderEventListenerOptions>,
   ) -> Result<()> {
-    let mut state = self
-      .event_state
-      .write()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
     let capture = options.as_ref().and_then(|o| o.capture).unwrap_or(false);
-    state.remove_listener(&env, &event_type, &callback, capture);
-    Ok(())
+    CodecEventState::remove_event_listener(&self.event_state, &env, &event_type, &callback, capture)
   }
 
   /// Dispatch an event to all registered listeners

@@ -528,7 +528,8 @@ function runChild(script: string, env: NodeJS.ProcessEnv = childEnv()): string {
   })
 }
 
-test('VideoEncoder: opaque float error comes first, then one dequeue per queued encode, and the encoder is collected', (t) => {
+test('VideoEncoder: opaque float error comes first, then one dequeue for all queued encodes, and the encoder is collected', (t) => {
+  // Chrome resets the encoder on error: one dequeue event covers every dropped encode.
   const script = `
     const fs = require('node:fs');
     const { VideoEncoder, createVideoFrameFromRGBA16Float } = require('./index.js');
@@ -537,8 +538,12 @@ test('VideoEncoder: opaque float error comes first, then one dequeue per queued 
     let weak;
     let settle;
     const settled = new Promise((resolve) => { settle = resolve; });
-    const record = (entry) => { log.push(entry); if (log.length === 4) settle(); };
-    // Only reports a failure: a correct run settles as soon as the four callbacks ran.
+    // Settles once the error and a dequeue ran, after room for any extra event to arrive.
+    const record = (entry) => {
+      log.push(entry);
+      if (log.some((e) => e.startsWith('error')) && log.includes('dequeue')) setTimeout(settle, 100);
+    };
+    // Only reports a failure: a correct run settles as soon as both callbacks ran.
     const guard = setTimeout(settle, 10000);
     (() => {
       const encoder = new VideoEncoder({
@@ -571,7 +576,7 @@ test('VideoEncoder: opaque float error comes first, then one dequeue per queued 
     });
   `
   const result = JSON.parse(runChild(script))
-  t.deepEqual(result.log, ['error:OperationError:0', 'dequeue', 'dequeue', 'dequeue'])
+  t.deepEqual(result.log, ['error:OperationError:0', 'dequeue'])
   t.true(result.collected, 'the closed encoder must be collectable')
 })
 
@@ -689,13 +694,19 @@ test('RGBA16Float exports: another class instance throws TypeError instead of cr
 })
 
 test('registerVideoFrameCloseObserver: JS that closes or registers frames during registration completes', (t) => {
-  // Registration stores the callback in a Map on the frame. Patching
-  // Map.prototype.set runs JS in the middle of that step.
+  // Registration stores the callback in a WeakMap that the module captures when it
+  // loads, so JS runs in the middle of that step only if WeakMap.prototype.set was
+  // replaced before then.
   const script = `
     const fs = require('node:fs');
+    const set = WeakMap.prototype.set;
+    let hook = null;
+    WeakMap.prototype.set = function (key, value) {
+      if (hook) hook(key);
+      return set.call(this, key, value);
+    };
     const m = require('./index.js');
     const make = () => m.createVideoFrameFromRGBA16Float(new Uint16Array(4), { codedWidth: 1, codedHeight: 1, timestamp: 0 });
-    const set = Map.prototype.set;
     const results = [];
     for (const mode of ['close-other', 'register-other', 'close-self']) {
       const other = make();
@@ -704,50 +715,45 @@ test('registerVideoFrameCloseObserver: JS that closes or registers frames during
       let targetFired = 0;
       let reentered = false;
       let outcome = 'returned';
-      Map.prototype.set = function (key, value) {
-        if (!reentered && typeof value === 'function') {
+      hook = (key) => {
+        if (!reentered && key === target) {
           reentered = true;
           if (mode === 'close-other') other.close();
           if (mode === 'register-other') m.registerVideoFrameCloseObserver(other, () => { otherFired++; });
           if (mode === 'close-self') target.close();
         }
-        return set.call(this, key, value);
       };
       try {
         m.registerVideoFrameCloseObserver(target, () => { targetFired++; });
       } catch (error) {
         outcome = error.name;
       } finally {
-        Map.prototype.set = set;
+        hook = null;
       }
       target.close();
       other.close();
-      results.push([mode, outcome, targetFired, otherFired].join(':'));
+      results.push([mode, reentered, outcome, targetFired, otherFired].join(':'));
     }
     fs.writeSync(1, JSON.stringify(results) + '\\n');
   `
   t.deepEqual(JSON.parse(runChild(script)), [
-    'close-other:returned:1:0',
-    'register-other:returned:1:1',
-    'close-self:InvalidStateError:0:0',
+    'close-other:true:returned:1:0',
+    'register-other:true:returned:1:1',
+    'close-self:true:InvalidStateError:0:0',
   ])
 })
 
-test('registerVideoFrameCloseObserver: a frozen frame throws TypeError and registers nothing', (t) => {
+test('registerVideoFrameCloseObserver: a frozen frame takes a callback that runs on close', (t) => {
+  // Nothing is added to the frame, so freezing it does not matter (Chrome also
+  // accepts listeners on a frozen VideoEncoder).
   const frame = createVideoFrameFromRGBA16Float(new Uint16Array(4), { codedWidth: 1, codedHeight: 1, timestamp: 0 })
   let fired = 0
-  try {
-    Object.freeze(frame)
-    t.throws(
-      () =>
-        registerVideoFrameCloseObserver(frame, () => {
-          fired++
-        }),
-      { instanceOf: TypeError },
-    )
-    frame.close()
-    t.is(fired, 0)
-  } finally {
-    frame.close()
-  }
+  Object.freeze(frame)
+  registerVideoFrameCloseObserver(frame, () => {
+    fired++
+  })
+  frame.close()
+  t.is(fired, 1)
+  frame.close()
+  t.is(fired, 1)
 })

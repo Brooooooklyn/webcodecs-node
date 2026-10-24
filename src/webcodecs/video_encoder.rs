@@ -349,6 +349,9 @@ struct VideoEncoderInner {
   output_callback: OutputCallback,
   /// Error callback (required per spec)
   error_callback: ErrorCallback,
+  /// The codec's event state: report_error orders the error callback before
+  /// the dequeue events that come due meanwhile.
+  event_state: Arc<RwLock<CodecEventState>>,
   /// Retains the native failure category for pending and later flush rejections.
   failure_name: Option<DOMExceptionName>,
   /// Pending flush operations, tracked independently for overlapping calls.
@@ -578,6 +581,7 @@ impl VideoEncoder {
     )]
     init: VideoEncoderInit,
   ) -> Result<Self> {
+    let event_state = Arc::new(RwLock::new(CodecEventState::default()));
     let inner = VideoEncoderInner {
       state: CodecState::Unconfigured,
       config: None,
@@ -588,6 +592,7 @@ impl VideoEncoder {
       encode_queue_size: 0,
       output_callback: init.output,
       error_callback: init.error,
+      event_state: event_state.clone(),
       failure_name: None,
       flushes: FlushTracker::default(),
       timestamp_map: BTreeMap::new(),
@@ -625,7 +630,6 @@ impl VideoEncoder {
     let inner = Arc::new(Mutex::new(inner));
 
     // Create separate lock for event listener state (avoids contention with encode operations)
-    let event_state = Arc::new(RwLock::new(CodecEventState::default()));
 
     // Create channel for worker commands
     let (sender, receiver) = channel::unbounded();
@@ -721,22 +725,18 @@ impl VideoEncoder {
 
     // Check if encoder is still configured
     if guard.state != CodecState::Configured {
-      let old_size = guard.encode_queue_size;
-      guard.encode_queue_size = old_size.saturating_sub(1);
-      if old_size > 0 {
-        let _ = Self::fire_dequeue_event(event_state);
-      }
       // Per W3C spec: "cease producing output" - silently discard pending work
       // State could be Unconfigured (reset called) or Closed (close called)
       // Don't call report_error() - that would set state to Closed and invoke error callback
+      // Every encode still queued is discarded the same way, so dequeue them all
+      // now: one dequeue event, as Chrome fires when it resets the queue.
+      CodecEventState::dequeue_all(event_state, &mut guard.encode_queue_size);
       return;
     }
 
     let frame_arc = match frame_arc {
       Ok(frame) => frame,
       Err(error) => {
-        let old_size = guard.encode_queue_size;
-        guard.encode_queue_size = 0;
         // Release the codec and its hardware slot now; close() and reset() reject
         // once the encoder is closed, so nothing else would free them before GC.
         guard.context = None;
@@ -756,15 +756,10 @@ impl VideoEncoder {
         } else {
           format!("Failed to access frame: {}", error)
         };
-        Self::report_error(&mut guard, &message);
-        // Closing drops every queued encode. Fire one dequeue per dropped item, after
-        // the error is queued, so the codec's outstanding count returns to zero and
-        // it can be collected. Chrome coalesces these into a single dequeue event;
-        // matching that needs a counted dispatch in the shared event_target.rs, so
-        // it is left for a separate change.
-        for _ in 0..old_size {
-          let _ = Self::fire_dequeue_event(event_state);
-        }
+        // Closing drops every queued encode: one dequeue event after the error
+        // covers them all, and the codec's outstanding count returns to zero so it
+        // can be collected.
+        Self::close_with_error(&mut guard, event_state, &message);
         return;
       }
     };
@@ -783,12 +778,7 @@ impl VideoEncoder {
         config.display_height,
       ),
       None => {
-        let old_size = guard.encode_queue_size;
-        guard.encode_queue_size = old_size.saturating_sub(1);
-        if old_size > 0 {
-          let _ = Self::fire_dequeue_event(event_state);
-        }
-        Self::report_error(&mut guard, "No encoder config");
+        Self::close_with_error(&mut guard, event_state, "No encoder config");
         return;
       }
     };
@@ -821,12 +811,11 @@ impl VideoEncoder {
           Ok(scaler) => guard.scaler = Some(scaler),
           Err(e) => {
             drop(frame_guard);
-            let old_size = guard.encode_queue_size;
-            guard.encode_queue_size = old_size.saturating_sub(1);
-            if old_size > 0 {
-              let _ = Self::fire_dequeue_event(event_state);
-            }
-            Self::report_error(&mut guard, &format!("Failed to create scaler: {}", e));
+            Self::close_with_error(
+              &mut guard,
+              event_state,
+              &format!("Failed to create scaler: {}", e),
+            );
             return;
           }
         }
@@ -837,12 +826,11 @@ impl VideoEncoder {
         Ok(scaled) => scaled,
         Err(e) => {
           drop(frame_guard);
-          let old_size = guard.encode_queue_size;
-          guard.encode_queue_size = old_size.saturating_sub(1);
-          if old_size > 0 {
-            let _ = Self::fire_dequeue_event(event_state);
-          }
-          Self::report_error(&mut guard, &format!("Failed to scale frame: {}", e));
+          Self::close_with_error(
+            &mut guard,
+            event_state,
+            &format!("Failed to scale frame: {}", e),
+          );
           return;
         }
       }
@@ -855,12 +843,11 @@ impl VideoEncoder {
         Ok(shallow) => shallow,
         Err(e) => {
           drop(frame_guard);
-          let old_size = guard.encode_queue_size;
-          guard.encode_queue_size = old_size.saturating_sub(1);
-          if old_size > 0 {
-            let _ = Self::fire_dequeue_event(event_state);
-          }
-          Self::report_error(&mut guard, &format!("Failed to reference frame: {}", e));
+          Self::close_with_error(
+            &mut guard,
+            event_state,
+            &format!("Failed to reference frame: {}", e),
+          );
           return;
         }
       }
@@ -961,12 +948,7 @@ impl VideoEncoder {
     let context = match guard.context.as_mut() {
       Some(ctx) => ctx,
       None => {
-        let old_size = guard.encode_queue_size;
-        guard.encode_queue_size = old_size.saturating_sub(1);
-        if old_size > 0 {
-          let _ = Self::fire_dequeue_event(event_state);
-        }
-        Self::report_error(&mut guard, "No encoder context");
+        Self::close_with_error(&mut guard, event_state, "No encoder context");
         return;
       }
     };
@@ -1151,11 +1133,8 @@ impl VideoEncoder {
             ),
           );
         }
-        let old_size = guard.encode_queue_size;
-        guard.encode_queue_size = old_size.saturating_sub(1);
-        if old_size > 0 {
-          let _ = Self::fire_dequeue_event(event_state);
-        }
+        // The error closed the encoder: dequeue every queued encode at once.
+        CodecEventState::dequeue_all(event_state, &mut guard.encode_queue_size);
         return;
       }
     };
@@ -1198,19 +1177,15 @@ impl VideoEncoder {
             // prefer-hardware: Report error, no fallback
             // Record failure for global tracking
             record_hw_encoding_failure();
-            let old_size = guard.encode_queue_size;
-            guard.encode_queue_size = old_size.saturating_sub(1);
-            if old_size > 0 {
-              let _ = Self::fire_dequeue_event(event_state);
-            }
             let codec = guard
               .config
               .as_ref()
               .and_then(|c| c.codec.clone())
               .unwrap_or_else(|| "unknown".to_string());
             let encoder_name = guard.encoder_name.clone();
-            Self::report_error(
+            Self::close_with_error(
               &mut guard,
+              event_state,
               &format!(
                 "OperationError: {} encoder ({}) failed to produce output (silent failure after {} frames)",
                 codec, encoder_name, SILENT_FAILURE_THRESHOLD
@@ -1354,19 +1329,15 @@ impl VideoEncoder {
               // Fallback failed, report error
               // Record failure for global tracking
               record_hw_encoding_failure();
-              let old_size = guard.encode_queue_size;
-              guard.encode_queue_size = old_size.saturating_sub(1);
-              if old_size > 0 {
-                let _ = Self::fire_dequeue_event(event_state);
-              }
               let codec = guard
                 .config
                 .as_ref()
                 .and_then(|c| c.codec.clone())
                 .unwrap_or_else(|| "unknown".to_string());
               let encoder_name = guard.encoder_name.clone();
-              Self::report_error(
+              Self::close_with_error(
                 &mut guard,
+                event_state,
                 &format!(
                   "OperationError: {} encoder ({}) failed (silent failure) and software fallback unavailable",
                   codec, encoder_name
@@ -2332,9 +2303,7 @@ impl VideoEncoder {
 
     // Create an Error object that will be passed directly to the JS callback
     let error = Error::new(Status::GenericFailure, error_msg);
-    inner
-      .error_callback
-      .call(error, ThreadsafeFunctionCallMode::NonBlocking);
+    CodecEventState::report_error(&inner.event_state, &inner.error_callback, error);
     inner.failure_name = Some(if error_msg.starts_with("OperationError:") {
       DOMExceptionName::OperationError
     } else {
@@ -2348,6 +2317,18 @@ impl VideoEncoder {
   fn fire_dequeue_event(event_state: &Arc<RwLock<CodecEventState>>) -> Result<()> {
     CodecEventState::fire(event_state);
     Ok(())
+  }
+
+  /// Worker: an error closes the encoder and drops every queued encode. As in
+  /// Chrome, encodeQueueSize is already 0 when the error callback runs, and one
+  /// dequeue event follows for all the dropped encodes.
+  fn close_with_error(
+    inner: &mut VideoEncoderInner,
+    event_state: &Arc<RwLock<CodecEventState>>,
+    message: &str,
+  ) {
+    Self::report_error(inner, message);
+    CodecEventState::dequeue_all(event_state, &mut inner.encode_queue_size);
   }
 
   /// Attempt to fall back to software encoder (for no-preference mode)
@@ -2636,15 +2617,7 @@ impl VideoEncoder {
     this: This,
     callback: Option<FunctionRef<Unknown<'static>, UnknownReturnValue>>,
   ) -> Result<()> {
-    let mut state = self
-      .event_state
-      .write()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-    if callback.is_some() {
-      state.ensure_dispatcher(env, this.object)?;
-    }
-    state.set_ondequeue(env, callback)?;
-    Ok(())
+    CodecEventState::set_ondequeue_handler(&self.event_state, env, this.object, callback)
   }
 
   /// Get the dequeue event handler (per WebCodecs spec)
@@ -3662,15 +3635,17 @@ impl VideoEncoder {
     callback: FunctionRef<Unknown<'static>, UnknownReturnValue>,
     options: Option<AddEventListenerOptions>,
   ) -> Result<()> {
-    let mut state = self
-      .event_state
-      .write()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
-    state.ensure_dispatcher(&env, this.object)?;
     let once = options.as_ref().and_then(|o| o.once).unwrap_or(false);
     let capture = options.as_ref().and_then(|o| o.capture).unwrap_or(false);
-    state.add_listener(&env, &event_type, callback, once, capture)
+    CodecEventState::add_event_listener(
+      &self.event_state,
+      &env,
+      this.object,
+      &event_type,
+      callback,
+      once,
+      capture,
+    )
   }
 
   /// Remove an event listener for the specified event type
@@ -3684,14 +3659,8 @@ impl VideoEncoder {
     callback: FunctionRef<Unknown<'static>, UnknownReturnValue>,
     options: Option<EventListenerOptions>,
   ) -> Result<()> {
-    let mut state = self
-      .event_state
-      .write()
-      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-
     let capture = options.as_ref().and_then(|o| o.capture).unwrap_or(false);
-    state.remove_listener(&env, &event_type, &callback, capture);
-    Ok(())
+    CodecEventState::remove_event_listener(&self.event_state, &env, &event_type, &callback, capture)
   }
 
   /// Dispatch an event to all registered listeners
