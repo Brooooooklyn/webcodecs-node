@@ -30,7 +30,7 @@ thiserror = "2"
 crossbeam = "0.8"
 
 # Better RwLock implementation (no poisoning, better perf)
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 # Logging
 tracing = "0.1"
