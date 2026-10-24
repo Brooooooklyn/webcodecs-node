@@ -1057,6 +1057,56 @@ test('VideoEncoder: every throwing listener exception is reported', (t) => {
   t.true(output.includes('REPORTED:boom-1,boom-2'), 'each listener exception must be reported')
 })
 
+test('VideoEncoder: nested exception backstops yield to recovery microtasks', (t) => {
+  const script = `
+    const { VideoEncoder } = require('./index.js');
+    const enc = new VideoEncoder({ output: () => {}, error: () => {} });
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'queueMicrotask');
+    const nativeQueueMicrotask = globalThis.queueMicrotask;
+    const log = [];
+    let nested = false;
+    let recovered = false;
+    let nestedReported = false;
+    const finish = () => {
+      if (recovered && nestedReported) {
+        console.log(log.join(','));
+        enc.close();
+      }
+    };
+    process.on('uncaughtException', (error) => {
+      log.push('report:' + error.message);
+      if (!nested) {
+        nested = true;
+        Object.defineProperty(globalThis, 'queueMicrotask', descriptor);
+        nativeQueueMicrotask(() => {
+          log.push('recovery');
+          recovered = true;
+          finish();
+        });
+        enc.dispatchEvent('dequeue');
+      } else {
+        nestedReported = true;
+        finish();
+      }
+    });
+    enc.addEventListener('dequeue', () => {
+      throw new Error(nested ? 'nested' : 'initial');
+    });
+    Object.defineProperty(globalThis, 'queueMicrotask', {
+      configurable: true,
+      writable: true,
+      value: () => {},
+    });
+    enc.dispatchEvent('dequeue');
+  `
+  const output = execFileSync(process.execPath, ['-e', script], {
+    cwd: process.cwd(),
+    timeout: 15_000,
+    encoding: 'utf8',
+  })
+  t.is(output.trim(), 'report:initial,recovery,report:nested')
+})
+
 test('VideoEncoder: queued dequeue event survives codec GC', (t) => {
   // The dispatch payload carries a strong state reference, so a dequeue event
   // queued by the worker is still delivered even if the codec wrapper is

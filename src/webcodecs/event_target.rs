@@ -21,6 +21,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
+use super::after_task::after_task_with_napi;
 use super::error::new_event;
 
 /// Dispatcher commands, sent as three u32 args (a pointer cannot cross the JS
@@ -121,11 +122,6 @@ impl Drop for WeakCodecRef {
     // does not keep the JS object alive.
   }
 }
-
-/// A codec's WebCodecsErrorCallback, called from any thread. The JS-side
-/// callback turns the Error payload into a native DOMException.
-pub type CodecErrorCallback =
-  ThreadsafeFunction<Error, UnknownReturnValue, Unknown<'static>, Status, false, true>;
 
 // The payload must be FnArgs — a plain tuple goes through the ToNapiValue
 // blanket impl and arrives as a single Array argument, not three args.
@@ -409,8 +405,9 @@ impl CodecEventState {
   }
 
   /// JS thread: queued work was discarded without dequeue dispatches
-  /// (reset/close/reconfigure). `cleared` is the number of dropped items;
-  /// items already fired but undelivered stay outstanding until delivered.
+  /// (configure(), or close()/reset() with no dispatcher; see
+  /// [`Self::clear_queue`]). `cleared` is the number of dropped items; items
+  /// already fired but undelivered stay outstanding until delivered.
   pub fn note_queue_cleared(&mut self, env: &Env, cleared: usize) {
     self.outstanding = self.outstanding.saturating_sub(cleared);
     if self.outstanding == 0 {
@@ -612,6 +609,28 @@ impl CodecEventState {
     Self::fire_n(shared, dropped);
   }
 
+  /// JS thread: close()/reset() dropped `cleared` queued items. Chrome keeps
+  /// one dequeue event pending at a time and does not cancel it: a dequeue
+  /// event that is scheduled and has not started still runs after close() or
+  /// reset(), and the dropped items join it. Otherwise one dequeue event
+  /// follows when anything was dropped.
+  pub fn clear_queue(shared: &Arc<RwLock<CodecEventState>>, env: &Env, cleared: usize) {
+    if cleared == 0 {
+      return;
+    }
+    {
+      let Ok(mut state) = shared.write() else {
+        return;
+      };
+      if state.dispatcher.is_none() {
+        // No dispatcher, so no listener to tell: only unpin the codec.
+        state.note_queue_cleared(env, cleared);
+        return;
+      }
+    }
+    Self::fire_n(shared, cleared);
+  }
+
   /// Schedule the dequeue event for `items` dequeued items (any thread,
   /// non-blocking). WebCodecs "schedule dequeue event": while a dispatch is
   /// queued and has not started, the items join it and no new event is
@@ -689,54 +708,23 @@ impl CodecEventState {
     }
   }
 
-  /// Any thread: send a codec's error to its error callback. Every codec
-  /// error closes the codec.
-  ///
-  /// Chrome runs the error callback first, and the dequeue event for the
-  /// work the error dropped after it: closing the codec queues that event and
-  /// then invokes the callback. Here the error and the dequeue event reach JS
-  /// through two thread-safe functions, whose order is not defined, so a
-  /// dequeue event that comes due before the error callback has run waits.
-  /// Once the callback returns it is queued through the dispatcher, after the
-  /// callback's microtasks.
-  pub fn report_error(
-    shared: &Arc<RwLock<CodecEventState>>,
-    callback: &CodecErrorCallback,
-    error: Error,
-  ) {
+  /// Hold dequeue events behind an error whose callback is deferred by the codec epoch.
+  pub(crate) fn track_error(shared: &Arc<RwLock<CodecEventState>>) -> ErrorDelivery {
     if let Ok(mut state) = shared.write() {
       state.errors_pending += 1;
     }
-    let delivery = ErrorDelivery(Some(Arc::clone(shared)));
-    // When the call is not queued (env teardown), the closure and its guard
-    // are dropped here.
-    callback.call_with_return_value(
-      error,
-      ThreadsafeFunctionCallMode::NonBlocking,
-      move |result, env| {
-        if let Err(thrown) = result {
-          // Report what the callback threw before the dequeue event runs, as
-          // the plain call this replaces did.
-          if let Ok(value) = unsafe { Error::to_napi_value(env.raw(), thrown) } {
-            unsafe { sys::napi_fatal_exception(env.raw(), value) };
-          }
-        }
-        delivery.delivered();
-        Ok(())
-      },
-    );
+    ErrorDelivery(Some(Arc::clone(shared)))
   }
 }
 
-/// Settles one pending error (see [`CodecEventState::report_error`]): on the
-/// JS thread after the error callback ran, or on drop when the callback will
-/// not run (napi-rs drops a queued call whose payload it could not convert).
-struct ErrorDelivery(Option<Arc<RwLock<CodecEventState>>>);
+/// Settles one pending error: on the JS thread after the error callback ran,
+/// or on drop when its queued error tail will not run.
+pub(crate) struct ErrorDelivery(Option<Arc<RwLock<CodecEventState>>>);
 
 impl ErrorDelivery {
   /// JS thread, after the error callback: queue a waiting dequeue event when
   /// this was the last pending error.
-  fn delivered(mut self) {
+  pub(crate) fn delivered(mut self) {
     let Some(shared) = self.0.take() else {
       return;
     };
@@ -1157,15 +1145,24 @@ pub fn dispatch(env: &Env, shared: &Arc<RwLock<CodecEventState>>, event_type: &s
   }
 }
 
-/// Report one listener exception as an uncaught error via the microtask queue.
-/// Falls back to throwing inline if scheduling fails — better than swallowing.
+/// Report one listener exception as an uncaught error via the microtask queue, with a native
+/// backstop when the page scheduler does not run it. Falls back to reporting inline without
+/// leaving a pending exception.
 pub(crate) fn report_exception(env: &Env, exc: sys::napi_value) {
   let mut exc_ref = ptr::null_mut();
   let env_raw = env.raw();
+  // A page-provided queueMicrotask can invoke the reporter synchronously, retain it, or invoke it
+  // more than once. The first reporter invocation, native backstop or fallback cleanup claims
+  // exc_ref; later reporters and backstops are no-ops, and fallback must not repeat that deletion.
+  let consumed = Arc::new(AtomicBool::new(false));
+  let reporter_consumed = consumed.clone();
   let reported =
     unsafe { sys::napi_create_reference(env_raw, exc, 1, &mut exc_ref) == sys::Status::napi_ok }
       && env
         .create_function_from_closure::<(), (), _>("reportListenerException", move |_| {
+          if reporter_consumed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+          }
           unsafe {
             let mut v = ptr::null_mut();
             sys::napi_get_reference_value(env_raw, exc_ref, &mut v);
@@ -1183,11 +1180,49 @@ pub(crate) fn report_exception(env: &Env, exc: sys::napi_value) {
           qm.call(reporter).map(|_| ())
         })
         .is_ok();
-  if !reported {
-    unsafe { sys::napi_throw(env_raw, exc) };
-    if !exc_ref.is_null() {
+  let backstop_consumed = consumed.clone();
+  let backstop_scheduled = reported
+    && !exc_ref.is_null()
+    && after_task_with_napi(
+      env,
+      Box::new(move || {
+        // queueMicrotask returned normally but need not have queued its argument. Report from the
+        // native task queue unless the page's reporter claimed the exception in a microtask first.
+        if backstop_consumed.swap(true, Ordering::AcqRel) {
+          return;
+        }
+        unsafe {
+          let mut value = ptr::null_mut();
+          sys::napi_get_reference_value(env_raw, exc_ref, &mut value);
+          sys::napi_delete_reference(env_raw, exc_ref);
+          if !value.is_null() {
+            sys::napi_fatal_exception(env_raw, value);
+          }
+        }
+      }),
+    );
+  if !reported || !backstop_scheduled {
+    // Claim and release the reference before reporting either exception: napi_fatal_exception can
+    // synchronously run a page's uncaught-exception handler, which can invoke a retained reporter.
+    if !consumed.swap(true, Ordering::AcqRel) && !exc_ref.is_null() {
       unsafe { sys::napi_delete_reference(env_raw, exc_ref) };
     }
+    // A failed queueMicrotask lookup or call can leave its own exception
+    // pending. Clear and report it before the callback exception so both are
+    // surfaced without poisoning the error gate.
+    let mut pending = false;
+    unsafe { sys::napi_is_exception_pending(env_raw, &mut pending) };
+    if pending {
+      let mut scheduling_exception = ptr::null_mut();
+      let retrieved =
+        unsafe { sys::napi_get_and_clear_last_exception(env_raw, &mut scheduling_exception) }
+          == sys::Status::napi_ok
+          && !scheduling_exception.is_null();
+      if retrieved && scheduling_exception != exc {
+        unsafe { sys::napi_fatal_exception(env_raw, scheduling_exception) };
+      }
+    }
+    unsafe { sys::napi_fatal_exception(env_raw, exc) };
   }
 }
 
