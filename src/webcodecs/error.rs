@@ -122,6 +122,75 @@ pub fn native_range_error(env: &Env, message: &str) -> Result<Error> {
   Ok(Error::from(error))
 }
 
+/// Take the pending JS exception, if there is one, so that a promise can reject with it.
+pub fn take_pending_exception(env: &Env) -> Result<Option<Unknown<'_>>> {
+  let mut pending = false;
+  napi::check_status!(unsafe { napi::sys::napi_is_exception_pending(env.raw(), &mut pending) })?;
+  if !pending {
+    return Ok(None);
+  }
+  let mut exception = std::ptr::null_mut();
+  napi::check_status!(unsafe {
+    napi::sys::napi_get_and_clear_last_exception(env.raw(), &mut exception)
+  })?;
+  Ok(Some(unsafe {
+    Unknown::from_raw_unchecked(env.raw(), exception)
+  }))
+}
+
+/// For a synchronous method: throw the native JS error that `error`'s "Name: message" prefix
+/// names (a TypeError for "TypeError", a DOMException for a DOMException name), so JS gets a real
+/// `TypeError` / `DOMException` instead of a plain `Error` with the name in its message.
+/// An error with a pending exception or without such a prefix is returned unchanged.
+pub fn throw_as_native_error(env: &Env, error: Error) -> Error {
+  let mut pending = false;
+  unsafe { napi::sys::napi_is_exception_pending(env.raw(), &mut pending) };
+  if pending || error.status == Status::PendingException {
+    return error;
+  }
+  let Some((name, message)) = error.reason.split_once(':') else {
+    return error;
+  };
+  let (name, message) = (name.trim(), message.trim_start());
+  let thrown = if name == "TypeError" {
+    throw_type_error_with_length(env, message)
+  } else if DOM_EXCEPTION_NAMES.contains(&name) {
+    env
+      .get_global()
+      .and_then(|global| {
+        global.get_named_property_unchecked::<Function<FnArgs<(&str, &str)>>>("DOMException")
+      })
+      .and_then(|constructor| constructor.new_instance((message, name).into()))
+      .and_then(|exception| env.throw(exception))
+  } else {
+    return error;
+  };
+  match thrown {
+    Ok(()) => Error::new(Status::PendingException, error.reason),
+    Err(_) => error,
+  }
+}
+
+/// Throw a native JS TypeError. Unlike `Env::throw_type_error`, which passes the message as a C
+/// string and fails on a NUL character, this passes it with its length, so a message that quotes
+/// a user string with a NUL (an invalid enum value) still becomes a TypeError.
+fn throw_type_error_with_length(env: &Env, message: &str) -> Result<()> {
+  let mut js_message = std::ptr::null_mut();
+  napi::check_status!(unsafe {
+    napi::sys::napi_create_string_utf8(
+      env.raw(),
+      message.as_ptr().cast(),
+      message.len() as isize,
+      &mut js_message,
+    )
+  })?;
+  let mut type_error = std::ptr::null_mut();
+  napi::check_status!(unsafe {
+    napi::sys::napi_create_type_error(env.raw(), std::ptr::null_mut(), js_message, &mut type_error)
+  })?;
+  napi::check_status!(unsafe { napi::sys::napi_throw(env.raw(), type_error) })
+}
+
 /// Standard DOMException names that may prefix codec error messages.
 const DOM_EXCEPTION_NAMES: &[&str] = &[
   "AbortError",
@@ -181,6 +250,74 @@ pub fn error_as_dom_exception(env: &Env, error: Error) -> Result<Unknown<'static
   let dom_exception_constructor =
     global.get_named_property_unchecked::<Function<FnArgs<(String, String)>>>("DOMException")?;
   dom_exception_constructor.new_instance((detail, name).into())
+}
+
+/// `error_as_dom_exception` for a promise rejection, where failing to build the value must not
+/// turn into a synchronous throw. Page code can replace the global `DOMException` (with undefined,
+/// a throwing getter, a non-constructor). Then this returns the exception left pending, or, when
+/// there is none, a plain Error with the same name and message.
+//
+// Chrome builds the DOMException from the engine's own constructor, so it always rejects with a
+// real DOMException. Doing that here means caching the constructor for every caller of
+// `error_as_dom_exception`.
+pub fn dom_exception_for_rejection(env: &Env, error: Error) -> Result<Unknown<'_>> {
+  let reason = error.reason.clone();
+  if let Ok(exception) = error_as_dom_exception(env, error) {
+    return Ok(exception);
+  }
+  if let Some(exception) = take_pending_exception(env)? {
+    return Ok(exception);
+  }
+  // The same name and message `error_as_dom_exception` takes from the reason.
+  let (name, message) = match reason.split_once(':') {
+    Some((prefix, rest)) if DOM_EXCEPTION_NAMES.contains(&prefix.trim()) => {
+      (prefix.trim(), rest.trim_start())
+    }
+    _ if DOM_EXCEPTION_NAMES.contains(&reason.trim()) => (reason.trim(), ""),
+    _ => ("EncodingError", reason.as_str()),
+  };
+  error_with_name(env, name, message)
+}
+
+/// A plain JS Error with an own `name`. Runs no page code: the Error comes from the engine and
+/// `name` is defined, not assigned.
+fn error_with_name<'env>(env: &'env Env, name: &str, message: &str) -> Result<Unknown<'env>> {
+  let string = |text: &str| -> Result<napi::sys::napi_value> {
+    let mut value = std::ptr::null_mut();
+    napi::check_status!(unsafe {
+      napi::sys::napi_create_string_utf8(
+        env.raw(),
+        text.as_ptr().cast(),
+        text.len() as isize,
+        &mut value,
+      )
+    })?;
+    Ok(value)
+  };
+  let mut error = std::ptr::null_mut();
+  napi::check_status!(unsafe {
+    napi::sys::napi_create_error(
+      env.raw(),
+      std::ptr::null_mut(),
+      string(message)?,
+      &mut error,
+    )
+  })?;
+  let name_property = napi::sys::napi_property_descriptor {
+    utf8name: c"name".as_ptr(),
+    name: std::ptr::null_mut(),
+    method: None,
+    getter: None,
+    setter: None,
+    value: string(name)?,
+    attributes: napi::sys::PropertyAttributes::writable
+      | napi::sys::PropertyAttributes::configurable,
+    data: std::ptr::null_mut(),
+  };
+  napi::check_status!(unsafe {
+    napi::sys::napi_define_properties(env.raw(), error, 1, &name_property)
+  })?;
+  Ok(unsafe { Unknown::from_raw_unchecked(env.raw(), error) })
 }
 
 /// Create a native JavaScript Event for EventTarget dispatch (dequeue, etc.).
