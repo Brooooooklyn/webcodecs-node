@@ -168,7 +168,7 @@ JPEG XL support requires libjxl v0.11.1 and its dependencies:
 | Library | Version | Purpose                          | Build System |
 | ------- | ------- | -------------------------------- | ------------ |
 | highway | 1.3.0   | SIMD library for vectorized ops  | CMake        |
-| brotli  | 1.1.0   | Compression (required by JXL)    | CMake        |
+| brotli  | 1.1.1   | Compression (required by JXL)    | CMake        |
 | lcms2   | 2.16    | Little CMS 2 color management    | autotools    |
 | libjxl  | 0.11.1  | JPEG XL reference implementation | CMake        |
 

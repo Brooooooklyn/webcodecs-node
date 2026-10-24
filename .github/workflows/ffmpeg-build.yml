@@ -7,6 +7,10 @@ on:
         description: 'FFmpeg version tag (e.g., n9.0.2)'
         required: true
         default: 'n9.0.2'
+      release_tag:
+        description: 'Release tag for the generated static libraries'
+        required: true
+        default: 'ffmpeg-n9.0.2'
 
 env:
   FFMPEG_VERSION: ${{ github.event.inputs.ffmpeg_version || 'n9.0.2' }}
@@ -118,7 +122,7 @@ jobs:
 
       - name: Install codec dependencies (without FFmpeg, x265 built separately for alpha)
         run: |
-          vcpkg install `
+          vcpkg install --overlay-ports="${{ github.workspace }}/tools/vcpkg-overlays" `
             x264:arm64-windows-static `
             libvpx:arm64-windows-static `
             aom:arm64-windows-static `
@@ -153,11 +157,21 @@ jobs:
           # Shallow clone doesn't have the tag in history, so we create one locally
           git tag 4.1
 
+          # windows-11-arm ships VS18, which this CMake version cannot generate
+          # project files for. Use Ninja with ClangCL instead.
+          $x265Dir = (Get-Location).Path -replace '\\','/'
+
           # Build 12-bit lib
           # Use ClangCL for ARM64 NEON assembly support
           # NOWINBASEINTERLOCK skips winbase.h interlocked wrappers that conflict with ClangCL intrinsics
           # STATIC_LINK_CRT=ON uses /MT static CRT (x265's own option, more reliable than CMAKE_MSVC_RUNTIME_LIBRARY)
-          cmake -B build-12bit -S source -G "Visual Studio 17 2022" -A ARM64 -T ClangCL `
+          cmake -B build-12bit -S source -G Ninja `
+            -DCMAKE_C_COMPILER=clang-cl `
+            -DCMAKE_CXX_COMPILER=clang-cl `
+            -DCMAKE_RC_COMPILER="C:/Program Files/LLVM/bin/llvm-rc.exe" `
+            -DCMAKE_AR="C:/Program Files/LLVM/bin/llvm-lib.exe" `
+            -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY="$x265Dir/build-12bit/Release" `
+            -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
             -DSTATIC_LINK_CRT=ON `
             -DCMAKE_C_FLAGS="-DNOWINBASEINTERLOCK" `
@@ -171,7 +185,13 @@ jobs:
           cmake --build build-12bit --config Release --parallel
 
           # Build 10-bit lib
-          cmake -B build-10bit -S source -G "Visual Studio 17 2022" -A ARM64 -T ClangCL `
+          cmake -B build-10bit -S source -G Ninja `
+            -DCMAKE_C_COMPILER=clang-cl `
+            -DCMAKE_CXX_COMPILER=clang-cl `
+            -DCMAKE_RC_COMPILER="C:/Program Files/LLVM/bin/llvm-rc.exe" `
+            -DCMAKE_AR="C:/Program Files/LLVM/bin/llvm-lib.exe" `
+            -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY="$x265Dir/build-10bit/Release" `
+            -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
             -DSTATIC_LINK_CRT=ON `
             -DCMAKE_C_FLAGS="-DNOWINBASEINTERLOCK" `
@@ -185,11 +205,16 @@ jobs:
 
           # Build 8-bit main lib with linked 10/12-bit
           # Use absolute paths for EXTRA_LIB since linker resolves paths from build directory
-          $x265Dir = (Get-Location).Path -replace '\\','/'
           $lib10bit = "$x265Dir/build-10bit/Release/x265-static.lib"
           $lib12bit = "$x265Dir/build-12bit/Release/x265-static.lib"
           Write-Host "EXTRA_LIB: $lib10bit;$lib12bit"
-          cmake -B build-main -S source -G "Visual Studio 17 2022" -A ARM64 -T ClangCL `
+          cmake -B build-main -S source -G Ninja `
+            -DCMAKE_C_COMPILER=clang-cl `
+            -DCMAKE_CXX_COMPILER=clang-cl `
+            -DCMAKE_RC_COMPILER="C:/Program Files/LLVM/bin/llvm-rc.exe" `
+            -DCMAKE_AR="C:/Program Files/LLVM/bin/llvm-lib.exe" `
+            -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY="$x265Dir/build-main/Release" `
+            -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_INSTALL_PREFIX="$VCPKG_INSTALLED" `
             -DSTATIC_LINK_CRT=ON `
             -DCMAKE_C_FLAGS="-DNOWINBASEINTERLOCK" `
@@ -555,7 +580,7 @@ jobs:
 
       - name: Install codec dependencies (without FFmpeg, x265 built separately for alpha)
         run: |
-          vcpkg install `
+          vcpkg install --overlay-ports="${{ github.workspace }}/tools/vcpkg-overlays" `
             x264:x64-windows-static `
             libvpx:x64-windows-static `
             dav1d:x64-windows-static `
@@ -1191,7 +1216,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ffmpeg-${{ env.FFMPEG_VERSION }}
+          tag_name: ${{ github.event.inputs.release_tag || 'ffmpeg-n9.0.2' }}
           target_commitish: ${{ github.sha }}
           name: FFmpeg ${{ env.FFMPEG_VERSION }} Static Builds
           body: |
