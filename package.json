@@ -73,7 +73,7 @@
     "@napi-rs/canvas": "^1.0.9",
     "@napi-rs/cli": "^3.10.9",
     "@napi-rs/wasm-runtime": "^1.2.4",
-    "@oxc-node/cli": "^0.1.2",
+    "@oxc-node/cli": "^1.0.0",
     "@oxc-node/core": "^0.1.2",
     "@taplo/cli": "^0.7.0",
     "@tybys/wasm-util": "^0.10.4",
