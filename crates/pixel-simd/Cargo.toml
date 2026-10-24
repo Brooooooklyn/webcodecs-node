@@ -1,0 +1,7 @@
+[package]
+name = "pixel-simd"
+version = "0.0.0"
+edition = "2024"
+description = "Pixel loops of the image decoders, with SIMD paths that give the bytes of the scalar code"
+license = "MIT"
+publish = false

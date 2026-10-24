@@ -1,5 +1,5 @@
 [workspace]
-members = ["tools/build-ffmpeg"]
+members = ["crates/pixel-simd", "tools/build-ffmpeg"]
 
 [package]
 name = "webcodecs-node"
@@ -35,6 +35,9 @@ parking_lot = "0.12"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "json"] }
+
+# Pixel loops with SIMD paths
+pixel-simd = { path = "crates/pixel-simd" }
 
 [build-dependencies]
 napi-build = "2"

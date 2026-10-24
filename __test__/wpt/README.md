@@ -62,10 +62,10 @@ This directory contains tests ported from the [W3C Web Platform Tests](https://g
 
 ### ImageDecoder Tests
 
-| File                        | Tests      | Status       | Notes                                                               |
-| --------------------------- | ---------- | ------------ | ------------------------------------------------------------------- |
-| `image-decoder-wpt.spec.ts` | 15 passing | **Complete** | PNG, JPEG, GIF, WebP, AVIF                                          |
-| `image-decoder.spec.ts`     | 21 passing | **Complete** | Options: desiredWidth/Height, preferAnimation, colorSpaceConversion |
+| File                        | Tests      | Status       | Notes                                                                                        |
+| --------------------------- | ---------- | ------------ | -------------------------------------------------------------------------------------------- |
+| `image-decoder-wpt.spec.ts` | 15 passing | **Complete** | PNG, JPEG, GIF, WebP, AVIF                                                                   |
+| `image-decoder.spec.ts`     | 31 passing | **Complete** | Options: desiredWidth/Height (JPEG only, like Chrome), preferAnimation, colorSpaceConversion |
 
 ### VideoEncoder Tests
 

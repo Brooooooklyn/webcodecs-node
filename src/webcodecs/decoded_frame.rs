@@ -9,17 +9,22 @@
 //!   with a full-range tag; gbrp from video or a still AVIF is I444 with G, B, R planes)
 //! - anything else: convert once, to the format real Chrome reports for the input
 //!   (images: BGRX, or BGRA when the image has alpha; video: the nearest YUV format)
+//! - PNG, GIF and BMP: always BGRA or BGRX, by the header, with Skia's bytes (see `skia_image`)
+//! - a lossy WebP that is not simple lossy: BGRA or BGRX, with libwebp's bytes (see `webp_rgb`)
 //!
 //! Hardware frames keep the label they had before (I420 for p010 and its siblings):
 //! how to expose them is a separate product decision. `copyTo()` refuses to read
 //! them as I420 because their memory does not match.
 
-use crate::codec::{CodecError, Frame, ScaleAlgorithm, Scaler};
+use crate::codec::{CodecError, Frame};
 use crate::ffi::accessors::{
   ffframe_convert_decoded, ffframe_palette_has_alpha, ffpixfmt_describe,
 };
-use crate::ffi::{AVCodecID, AVColorRange, AVPixelFormat, check_error};
+use crate::ffi::avutil::av_frame_copy_props;
+use crate::ffi::{AVCodecID, AVColorRange, AVColorSpace, AVPixelFormat, check_error};
 use crate::webcodecs::VideoPixelFormat;
+use crate::webcodecs::image_hints::PixelHint;
+use pixel_simd::{Alpha, Be16, Plane, Yuva420};
 
 // libavutil/pixdesc.h AV_PIX_FMT_FLAG_*
 const FLAG_PAL: i32 = 1 << 1;
@@ -33,19 +38,22 @@ const FLAG_XYZ: i32 = 1 << 10;
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum DecodedSource {
   /// ImageDecoder, with what the file header says, when it says it:
-  /// - `alpha`: the alpha it declares (WebP alpha flag, PNG color type or tRNS chunk).
-  ///   Chrome labels the image BGRA or BGRX by it.
+  /// - `alpha`: the alpha it declares (WebP alpha flag; PNG, GIF and BMP: see `image_hints`,
+  ///   for each frame of a GIF). Chrome labels the image BGRA or BGRX by it.
   /// - `yuv`: whether Chrome decodes the image to YUV planes (JPEG: the sampling
-  ///   factors; AVIF: one still image without alpha). An AVIF with YUV planes keeps
-  ///   them either way: WebCodecs has a format for them, its alpha plane is not
-  ///   decoded, and BGRX would lose precision. Only planar RGB (gbrp) follows Chrome.
-  /// - `size`: desiredWidth/desiredHeight. A converted frame is resized in the same
-  ///   swscale pass; a kept frame is resized in its own format.
+  ///   factors; AVIF: one still image without alpha; WebP: a simple lossy file, whose
+  ///   first chunk is VP8). An AVIF with YUV planes keeps them either way: WebCodecs has a
+  ///   format for them, its alpha plane is not decoded, and BGRX would lose precision.
+  ///   Only planar RGB (gbrp) follows Chrome.
+  /// - `size`: the size of a JPEG that Chrome scales for desiredWidth/desiredHeight (with
+  ///   `yuv: Some(false)`: such a JPEG is BGRX). It is resized in the conversion pass.
+  /// - `pixels`: what a PNG or BMP header says about pixels FFmpeg decodes differently.
   Image {
     codec: AVCodecID,
     alpha: Option<bool>,
     yuv: Option<bool>,
     size: Option<(u32, u32)>,
+    pixels: PixelHint,
   },
   /// VideoDecoder, software decoder
   Video,
@@ -83,6 +91,8 @@ enum Choice {
     desc: PixDesc,
     image: bool,
   },
+  /// Convert a lossy WebP's planes to BGRA or BGRX the way libwebp does (see `webp_rgb`).
+  WebpRgb(VideoPixelFormat),
 }
 
 /// Give a decoded frame the WebCodecs format that describes its bytes, converting
@@ -91,15 +101,21 @@ pub(crate) fn decoded_frame_format(
   mut frame: Frame,
   source: DecodedSource,
 ) -> Result<(Frame, VideoPixelFormat), CodecError> {
+  if let DecodedSource::Image {
+    codec: codec @ (AVCodecID::Png | AVCodecID::Gif | AVCodecID::Bmp),
+    alpha,
+    pixels,
+    ..
+  } = source
+  {
+    return skia_image(frame, codec, alpha, pixels);
+  }
   let size = match source {
     DecodedSource::Image { size, .. } => size,
     _ => None,
   };
   match choose(&mut frame, source)? {
-    Choice::Keep(format) => match size {
-      Some((width, height)) => Ok((resize(&frame, width, height)?, format)),
-      None => Ok((frame, format)),
-    },
+    Choice::Keep(format) => Ok((frame, format)),
     // One swscale pass to the final size: a full-size converted copy of a large
     // image is never made.
     Choice::Convert {
@@ -107,12 +123,32 @@ pub(crate) fn decoded_frame_format(
       desc,
       image,
     } => Ok((convert(&frame, format, &desc, image, size)?, format)),
+    Choice::WebpRgb(format) => Ok((webp_rgb(&frame, format == VideoPixelFormat::BGRA)?, format)),
   }
 }
 
 /// Pick the frame's format. A yuvj* frame is relabelled yuv* here.
 fn choose(frame: &mut Frame, source: DecodedSource) -> Result<Choice, CodecError> {
   let av = frame.format();
+  // Chrome keeps the YUV planes of a simple lossy WebP only. It decodes any other lossy WebP
+  // with libwebp, to BGRA when the VP8X header has the alpha flag and to BGRX otherwise (an
+  // ALPH chunk without the flag is not used; the flag without one gives alpha 255).
+  if let DecodedSource::Image {
+    codec: AVCodecID::Webp,
+    alpha,
+    yuv: Some(false),
+    ..
+  } = source
+    && matches!(av, AVPixelFormat::Yuv420p | AVPixelFormat::Yuva420p)
+  {
+    return Ok(Choice::WebpRgb(
+      if alpha.unwrap_or(av == AVPixelFormat::Yuva420p) {
+        VideoPixelFormat::BGRA
+      } else {
+        VideoPixelFormat::BGRX
+      },
+    ));
+  }
   // Chrome decodes a JPEG to BGRX unless its sampling factors are ones it reads as YUV,
   // even when FFmpeg's planes have a WebCodecs layout (FFmpeg reads 2x2/1x2/1x2 as yuvj422p).
   let rgb_only = matches!(
@@ -182,6 +218,144 @@ fn choose(frame: &mut Frame, source: DecodedSource) -> Result<Choice, CodecError
       })
     }
   }
+}
+
+/// A PNG, GIF or BMP frame as Chrome decodes it with Skia: BGRA, or BGRX (alpha 255) when the
+/// header declares no alpha, never premultiplied. FFmpeg's bytes already are Skia's for BGRA
+/// (also BMP's bgr0, which is BGRA whose alpha is all 0), for RGBA once R and B are swapped, and
+/// for the formats swscale converts exactly (palette, gray, 8-bit RGB). Skia keeps the high byte
+/// of a 16-bit PNG sample, where swscale rounds. It reads a BMP's bitfields with the header masks
+/// and the image crate's tables, where swscale replicates bits and FFmpeg takes a 32-bit pixel's
+/// alpha from the byte the color masks leave. The frame is tagged RGB matrix, full range, like a
+/// converted one.
+fn skia_image(
+  frame: Frame,
+  codec: AVCodecID,
+  alpha: Option<bool>,
+  pixels: PixelHint,
+) -> Result<(Frame, VideoPixelFormat), CodecError> {
+  let desc = describe(frame.format_raw())?;
+  let alpha = alpha.unwrap_or_else(|| image_has_alpha(&frame, &desc, codec, None));
+  let format = if alpha {
+    VideoPixelFormat::BGRA
+  } else {
+    VideoPixelFormat::BGRX
+  };
+  // big-endian samples: Skia keeps the high byte
+  let be16 = |layout: Be16| {
+    unpack(&frame, layout.size(), |s, d| {
+      pixel_simd::be16_to_bgra(s, d, layout, alpha)
+    })
+  };
+  let mut frame = match (frame.format(), pixels) {
+    // FFmpeg keeps the 16 or 32-bit words of the file, alpha bits included
+    (
+      AVPixelFormat::Rgb555le | AVPixelFormat::Rgb565le | AVPixelFormat::Rgb444le,
+      PixelHint::Bitfields(fields),
+    ) => unpack(&frame, 2, |s, d| {
+      pixel_simd::bitfields16_to_bgra(s, d, fields, alpha)
+    })?,
+    (
+      AVPixelFormat::Bgra
+      | AVPixelFormat::Bgr0
+      | AVPixelFormat::Rgba
+      | AVPixelFormat::Rgb0
+      | AVPixelFormat::Argb
+      | AVPixelFormat::Zrgb
+      | AVPixelFormat::Abgr
+      | AVPixelFormat::Zbgr,
+      PixelHint::Bitfields(fields),
+    ) => unpack(&frame, 4, |s, d| {
+      pixel_simd::bitfields32_to_bgra(s, d, fields, alpha)
+    })?,
+    (AVPixelFormat::Bgra | AVPixelFormat::Bgr0 | AVPixelFormat::Rgba, _) => frame,
+    (AVPixelFormat::Gray16be, _) => be16(Be16::Gray)?,
+    (AVPixelFormat::Ya16be, _) => be16(Be16::GrayAlpha)?,
+    (AVPixelFormat::Rgb48be, _) => be16(Be16::Rgb)?,
+    (AVPixelFormat::Rgba64be, _) => be16(Be16::Rgba)?,
+    _ => convert(&frame, format, &desc, true, None)?,
+  };
+  // Only a kept frame is still RGBA.
+  let swap = frame.format() == AVPixelFormat::Rgba;
+  let alpha = match pixels {
+    _ if !alpha => Alpha::Opaque,
+    // FFmpeg drops the tRNS chunk of a 1, 2 or 4-bit gray PNG (it compares the scaled samples).
+    // No sample has a key of None.
+    PixelHint::GrayKey(Some(key)) => Alpha::Key(key),
+    PixelHint::GrayKey(None) => Alpha::Opaque,
+    _ => Alpha::Keep,
+  };
+  if swap || alpha != Alpha::Keep {
+    frame.make_writable()?;
+    edit_pixels(&mut frame, swap, alpha)?;
+  }
+  frame.set_format(AVPixelFormat::Bgra);
+  frame.set_colorspace(AVColorSpace::Rgb);
+  frame.set_color_range(AVColorRange::Jpeg);
+  Ok((frame, format))
+}
+
+/// A new BGRA frame from the packed `size`-byte pixels of `src`, each row converted by `row`.
+fn unpack(src: &Frame, size: usize, row: impl Fn(&[u8], &mut [u8])) -> Result<Frame, CodecError> {
+  let mut dst = Frame::new_video(src.width(), src.height(), AVPixelFormat::Bgra)?;
+  check_error(unsafe { av_frame_copy_props(dst.as_mut_ptr(), src.as_ptr()) })?;
+  let (width, stride, dst_stride) = (
+    src.width() as usize,
+    src.linesize(0) as usize,
+    dst.linesize(0) as usize,
+  );
+  let from = src.plane_data(0).ok_or_else(no_pixels)?;
+  let to = dst.plane_data_mut(0).ok_or_else(no_pixels)?;
+  for (from, to) in from.chunks(stride).zip(to.chunks_mut(dst_stride)) {
+    row(&from[..width * size], &mut to[..width * 4]);
+  }
+  Ok(dst)
+}
+
+/// Edit each row of a packed 32-bit frame (see `pixel_simd::edit_bgra`).
+fn edit_pixels(frame: &mut Frame, swap: bool, alpha: Alpha) -> Result<(), CodecError> {
+  let (width, stride) = (frame.width() as usize * 4, frame.linesize(0) as usize);
+  let data = frame.plane_data_mut(0).ok_or_else(no_pixels)?;
+  for row in data.chunks_mut(stride) {
+    pixel_simd::edit_bgra(&mut row[..width], swap, alpha);
+  }
+  Ok(())
+}
+
+/// A lossy WebP frame as Chrome decodes it with libwebp: BGRA, never premultiplied, with the
+/// alpha plane when `alpha` (else alpha 255). FFmpeg's yuv(a)420p planes are libwebp's. Each
+/// pixel takes libwebp's fancy upsampling of the chroma (upsampling.c UPSAMPLE_FUNC over the row
+/// pairs of io_dec.c EmitFancyRGB) and its YUV to RGB math (yuv.h VP8YuvToBgr).
+fn webp_rgb(src: &Frame, alpha: bool) -> Result<Frame, CodecError> {
+  let plane = |i: usize| {
+    src.plane_data(i).map(|data| Plane {
+      data,
+      stride: src.linesize(i) as usize,
+    })
+  };
+  let [Some(y), Some(u), Some(v)] = [0, 1, 2].map(plane) else {
+    return Err(no_pixels());
+  };
+  let planes = Yuva420 {
+    width: src.width() as usize,
+    height: src.height() as usize,
+    y,
+    u,
+    v,
+    a: if alpha { plane(3) } else { None },
+  };
+  let mut dst = Frame::new_video(src.width(), src.height(), AVPixelFormat::Bgra)?;
+  check_error(unsafe { av_frame_copy_props(dst.as_mut_ptr(), src.as_ptr()) })?;
+  let stride = dst.linesize(0) as usize;
+  let out = dst.plane_data_mut(0).ok_or_else(no_pixels)?;
+  pixel_simd::yuva420_to_bgra(&planes, out, stride);
+  dst.set_colorspace(AVColorSpace::Rgb);
+  dst.set_color_range(AVColorRange::Jpeg);
+  Ok(dst)
+}
+
+fn no_pixels() -> CodecError {
+  CodecError::InvalidState("decoded frame has no pixels".into())
 }
 
 /// I444 formats with the planes of FFmpeg's planar RGB (G, B, R).
@@ -282,21 +456,6 @@ fn convert(
   Ok(dst)
 }
 
-/// Resize a kept frame in its own format (ImageDecoder desiredWidth/desiredHeight).
-fn resize(src: &Frame, width: u32, height: u32) -> Result<Frame, CodecError> {
-  let format = src.format();
-  Scaler::new(
-    src.width(),
-    src.height(),
-    format,
-    width,
-    height,
-    format,
-    ScaleAlgorithm::Lanczos, // High quality for images
-  )?
-  .scale_alloc(src)
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -305,6 +464,94 @@ mod tests {
     let c = std::ffi::CString::new(name).unwrap();
     let raw = unsafe { crate::ffi::avutil::av_get_pix_fmt(c.as_ptr()) };
     describe(raw).unwrap()
+  }
+
+  #[test]
+  fn image_formats_have_ffmpegs_values() {
+    use AVPixelFormat as P;
+    for (name, format) in [
+      ("bgr0", P::Bgr0),
+      ("rgb0", P::Rgb0),
+      ("0rgb", P::Zrgb),
+      ("0bgr", P::Zbgr),
+      ("gray16be", P::Gray16be),
+      ("ya16be", P::Ya16be),
+      ("rgb48be", P::Rgb48be),
+      ("rgba64be", P::Rgba64be),
+      ("rgb565le", P::Rgb565le),
+      ("rgb555le", P::Rgb555le),
+      ("rgb444le", P::Rgb444le),
+    ] {
+      let c = std::ffi::CString::new(name).unwrap();
+      let raw = unsafe { crate::ffi::avutil::av_get_pix_fmt(c.as_ptr()) };
+      assert_eq!(raw, format.as_raw(), "{name}");
+      assert_eq!(AVPixelFormat::from_raw(raw), format, "{name}");
+    }
+  }
+
+  /// FFmpeg's Y, U, V, A planes and Chrome 155's bytes for lossy WebPs with an ALPH chunk.
+  #[test]
+  fn webp_rgb_has_chromes_bytes() {
+    type Planes = [&'static [u8]; 4];
+    let cases: [(u32, u32, Planes, &[u8]); 5] = [
+      (1, 1, [&[16], &[128], &[128], &[1]], &[0, 0, 0, 1]),
+      (
+        1,
+        2,
+        [&[16, 16], &[128], &[128], &[255, 0]],
+        &[0, 0, 0, 255, 0, 0, 0, 0],
+      ),
+      (
+        2,
+        2,
+        [&[12, 95, 105, 216], &[102], &[168], &[255, 255, 0, 255]],
+        &[
+          0, 0, 59, 255, 40, 70, 156, 255, 51, 81, 167, 0, 180, 211, 255, 255,
+        ],
+      ),
+      (
+        3,
+        1,
+        [&[105, 64, 39], &[100, 183], &[143, 124], &[7, 41, 11]],
+        &[47, 102, 128, 7, 42, 51, 72, 41, 95, 13, 28, 11],
+      ),
+      (
+        1,
+        3,
+        [&[108, 177, 104], &[164, 91], &[90, 72], &[33, 41, 201]],
+        &[180, 124, 46, 33, 224, 215, 120, 41, 64, 151, 21, 201],
+      ),
+    ];
+    for (width, height, planes, chrome) in cases {
+      let mut frame = Frame::new_video(width, height, AVPixelFormat::Yuva420p).unwrap();
+      for (i, plane) in planes.into_iter().enumerate() {
+        let row_width = if matches!(i, 1 | 2) {
+          width.div_ceil(2)
+        } else {
+          width
+        } as usize;
+        let stride = frame.linesize(i) as usize;
+        let data = frame.plane_data_mut(i).unwrap();
+        for (row, from) in plane.chunks(row_width).enumerate() {
+          data[row * stride..][..row_width].copy_from_slice(from);
+        }
+      }
+      let bgra = |alpha| {
+        let out = webp_rgb(&frame, alpha).unwrap();
+        let stride = out.linesize(0) as usize;
+        let data = out.plane_data(0).unwrap();
+        (0..height as usize)
+          .flat_map(|row| data[row * stride..][..width as usize * 4].to_vec())
+          .collect::<Vec<u8>>()
+      };
+      assert_eq!(bgra(true), chrome, "{width}x{height}");
+      // without alpha (BGRX): the same colours, with 255 in the fourth byte
+      let opaque: Vec<u8> = chrome
+        .chunks(4)
+        .flat_map(|px| [px[0], px[1], px[2], 255])
+        .collect();
+      assert_eq!(bgra(false), opaque, "{width}x{height}");
+    }
   }
 
   #[test]
