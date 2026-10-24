@@ -745,7 +745,7 @@ test('ImageDecoder: reset() rejects a JPEG decode() that waits for data with Abo
 })
 
 // A decode() made before the header is here waits for the tracks. reset() does not resolve
-// tracks.ready (Chrome keeps it pending too); the decode() rejects once the tracks are ready.
+// tracks.ready (Chrome keeps it pending too); like Chrome, it rejects the decode() at once.
 test('ImageDecoder: reset() before the JPEG header leaves tracks.ready pending', async (t) => {
   for (const [name, format] of [
     ['444-progressive-33x17.jpg', 'I444'],
@@ -774,28 +774,59 @@ test('ImageDecoder: reset() before the JPEG header leaves tracks.ready pending',
 // @napi-rs/canvas has no aarch64 Windows build
 const canvasTest = process.platform === 'win32' && process.arch === 'arm64' ? test.skip : test
 
+// 4000x3000 of noise (about 10 MB): libjpeg-turbo takes tens of ms, so a reset() made after a
+// decode() comes while its frame work runs. Made once, for the tests that use it.
+let noise: Promise<Uint8Array> | undefined
+function noiseJpeg() {
+  noise ??= import('@napi-rs/canvas').then(({ createCanvas }) => {
+    const canvas = createCanvas(4000, 3000)
+    const ctx = canvas.getContext('2d')
+    const image = ctx.createImageData(4000, 3000)
+    const pixels = image.data
+    let seed = 1
+    for (let i = 0; i < pixels.length; i += 4) {
+      seed = (Math.imul(seed, 1103515245) + 12345) >>> 0
+      pixels[i] = seed >>> 24
+      pixels[i + 1] = (seed >>> 16) & 255
+      pixels[i + 2] = (seed >>> 8) & 255
+      pixels[i + 3] = 255
+    }
+    ctx.putImageData(image, 0, 0)
+    return new Uint8Array(canvas.encodeSync('jpeg', 90))
+  })
+  return noise
+}
+
+// Like Chrome, reset() rejects the decode() in its own call (ImageDecoderExternal::reset), also
+// while the frame work runs: the result of that work is dropped. Checked after one microtask, with
+// no timer.
+canvasTest('ImageDecoder: reset() rejects a JPEG decode() at once while its frame work runs, like Chrome', async (t) => {
+  const data = await noiseJpeg()
+  const decoder = new ImageDecoder({ data, type: 'image/jpeg' })
+  await decoder.tracks.ready
+  const stale = decoder.decode()
+  let seen = 'pending'
+  stale.then(
+    () => (seen = 'frame'),
+    (error: DOMException) => (seen = `${error.name}: ${error.message}`),
+  )
+  await sleep(0)
+  decoder.reset()
+  await Promise.resolve()
+  t.is(seen, 'AbortError: Aborted by reset.')
+  const { image } = await decoder.decode()
+  t.deepEqual([image.codedWidth, image.codedHeight], [4000, 3000])
+  image.close()
+  t.is(seen, 'AbortError: Aborted by reset.')
+  decoder.close()
+})
+
 // A reset() while a decode()'s frame work runs: like Chrome, the reset() drops what the work finds.
 // The work fails here, but the decode() rejects with AbortError and the decoder stays open. Chrome's
 // decoder stays failed, so the next decode() fails and closes it. A reset() before the work starts
 // gives the same results.
 canvasTest('ImageDecoder: a JPEG frame that fails after reset() closes the decoder at the next decode(), like Chrome', async (t) => {
-  const { createCanvas } = await import('@napi-rs/canvas')
-  // 4000x3000 of noise (about 10 MB): libjpeg-turbo takes tens of ms, and the reset() below comes
-  // while it runs
-  const canvas = createCanvas(4000, 3000)
-  const ctx = canvas.getContext('2d')
-  const noise = ctx.createImageData(4000, 3000)
-  const pixels = noise.data
-  let seed = 1
-  for (let i = 0; i < pixels.length; i += 4) {
-    seed = (Math.imul(seed, 1103515245) + 12345) >>> 0
-    pixels[i] = seed >>> 24
-    pixels[i + 1] = (seed >>> 16) & 255
-    pixels[i + 2] = (seed >>> 8) & 255
-    pixels[i + 3] = 255
-  }
-  ctx.putImageData(noise, 0, 0)
-  const jpeg = new Uint8Array(canvas.encodeSync('jpeg', 90))
+  const jpeg = await noiseJpeg()
   const sos = jpeg.findIndex((byte, i) => byte === 0xff && jpeg[i + 1] === 0xda)
   // the data ends inside the scan
   const data = jpeg.subarray(0, sos + Math.floor((jpeg.length - sos) * 0.9))

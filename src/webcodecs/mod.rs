@@ -4,12 +4,16 @@
 //! See: https://developer.mozilla.org/en-US/docs/Web/API/WebCodecs_API
 
 pub(crate) mod after_task;
+mod apng;
 mod audio_data;
 mod audio_decoder;
 mod audio_encoder;
 mod avif;
 mod avif_rgb;
+pub mod bmp_decoder;
 pub(crate) mod buffer_source;
+#[cfg(test)]
+mod chrome_cases;
 pub(crate) mod codec_pressure;
 pub mod codec_string;
 pub(crate) mod decoded_frame;
@@ -19,6 +23,7 @@ mod encoded_video_chunk;
 pub mod error;
 pub(crate) mod event_target;
 mod flush_tracker;
+pub mod gif_decoder;
 mod hardware;
 pub(crate) mod hw_fallback;
 mod image_decoder;
@@ -34,6 +39,7 @@ mod video_encoder;
 mod video_frame;
 mod webm_demuxer;
 mod webm_muxer;
+mod webp;
 
 pub use audio_data::{AudioData, AudioDataCopyToOptions, AudioDataInit, AudioSampleFormat};
 pub use audio_decoder::AudioDecoder;

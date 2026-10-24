@@ -3,7 +3,7 @@
 //! Provides utility functions for memory, frames, and general helpers.
 
 use super::types::*;
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::{c_char, c_int, c_uint, c_void};
 
 unsafe extern "C" {
   // ========================================================================
@@ -139,6 +139,15 @@ unsafe extern "C" {
     width: c_int,
     height: c_int,
     align: c_int,
+  ) -> c_int;
+
+  /// Check if the given dimension of an image is valid: 0 if so, a negative AVERROR if not.
+  /// av_frame_get_buffer fails a video frame that this check rejects.
+  pub fn av_image_check_size(
+    w: c_uint,
+    h: c_uint,
+    log_offset: c_int,
+    log_ctx: *mut c_void,
   ) -> c_int;
 
   // ========================================================================

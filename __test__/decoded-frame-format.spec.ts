@@ -339,7 +339,7 @@ const IMAGE_CASES: [string, Uint8Array, string, VideoPixelFormat, number[]][] = 
     'BGRA',
     [0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 0, 0, 0, 0, 255, 0, 0, 255, 0, 255, 0, 255],
   ],
-  // FFmpeg returns only the first frame of a GIF without graphic control extensions
+  // frame 0 of 2, without graphic control extensions
   [
     'GIF with 2 frames and no graphic control extension (bgra)',
     gif(4, 2, GIF_PALETTE, [
@@ -392,6 +392,31 @@ const IMAGE_CASES: [string, Uint8Array, string, VideoPixelFormat, number[]][] = 
     'image/bmp',
     'BGRX',
     [0, 0, 255, 255, 0, 255, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255],
+  ],
+  // RLE: runs, an absolute run, a delta and early ends of line and image; the pixels they skip
+  // are opaque black
+  [
+    '8-bit RLE BMP',
+    bmp(4, 3, 8, [], {
+      compression: 1,
+      palette: GIF_PALETTE,
+      raw: [3, 1, 0, 0, 0, 3, 2, 0, 3, 0, 0, 0, 0, 2, 1, 0, 2, 2, 0, 1],
+    }),
+    'image/bmp',
+    'BGRX',
+    [0, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 0, 0, 0, 255].concat(
+      [255, 0, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255, 0, 0, 0, 255],
+      [0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 0, 0, 255],
+    ),
+  ],
+  [
+    '4-bit RLE BMP',
+    bmp(5, 2, 4, [], { compression: 2, palette: GIF_PALETTE, raw: [5, 0x12, 0, 0, 0, 3, 0x30, 0x20, 0, 1] }),
+    'image/bmp',
+    'BGRX',
+    [255, 255, 255, 255, 0, 0, 255, 255, 255, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255].concat(
+      [0, 255, 0, 255, 255, 0, 0, 255, 0, 255, 0, 255, 255, 0, 0, 255, 0, 255, 0, 255],
+    ),
   ],
   // 32-bit: alpha only from a V3+ bitfield alpha mask, or a V4+ BI_RGB alpha mask
   ['32-bit BMP with alpha bytes (bgra)', bmp(2, 1, 32, [[30, 20, 10, 128, 60, 50, 40, 0]]), 'image/bmp', 'BGRX', [30, 20, 10, 255, 60, 50, 40, 255]],
@@ -1455,7 +1480,7 @@ test('ImageDecoder: reset() keeps an AVIF track that ended before its last sampl
   t.true(decoder.closed)
 })
 
-test('ImageDecoder: keeps frames decoded before a corrupt AVIF sample', async (t) => {
+test('ImageDecoder: keeps frames decoded before a corrupt AVIF sample and checks its declared bounds', async (t) => {
   const data = Buffer.from(avifFixture('anim8_420.avif'))
   const stco = data.indexOf('stco')
   const stsz = data.indexOf('stsz')
@@ -1470,6 +1495,82 @@ test('ImageDecoder: keeps frames decoded before a corrupt AVIF sample', async (t
   data.fill(0xff, secondStart, secondStart + sizes[1])
 
   const decoder = new ImageDecoder({ data, type: 'image/avif' })
+  await decoder.tracks.ready
+  t.is(decoder.tracks.selectedTrack?.frameCount, 3)
+  await t.throwsAsync(decoder.decode({ frameIndex: 3 }), {
+    name: 'RangeError',
+    message: 'Frame index 3 out of bounds (image has 3 frames)',
+  })
+  t.false(decoder.closed)
+  const { image } = await decoder.decode({ frameIndex: 0 })
+  t.is(image.format, 'BGRX')
+  image.close()
+  await t.throwsAsync(decoder.decode({ frameIndex: 1 }), {
+    name: 'EncodingError',
+    message: 'Failed to decode frame at index 1',
+  })
+  t.true(decoder.closed)
+})
+
+test('ImageDecoder: keeps the valid prefix when an AVIF sample gives no frame', async (t) => {
+  const data = avifFixture('anim8_420.avif')
+  // The third sample starts at 2771. Changing its frame OBU to reserved type 14 makes FFmpeg
+  // ignore it without an error. Libaom returns 1,1,0 immediately; libdav1d delays all three
+  // outputs and flushes the valid two.
+  data[2773] ^= 0x40
+
+  const decoder = new ImageDecoder({ data, type: 'image/avif' })
+  await decoder.tracks.ready
+  t.is(decoder.tracks.selectedTrack?.frameCount, 3)
+  await t.throwsAsync(decoder.decode({ frameIndex: 3 }), {
+    name: 'RangeError',
+    message: 'Frame index 3 out of bounds (image has 3 frames)',
+  })
+  t.false(decoder.closed)
+  for (const [frameIndex, timestamp] of [
+    [0, 0],
+    [1, 33333],
+  ]) {
+    const { image } = await decoder.decode({ frameIndex })
+    t.is(image.format, 'BGRX')
+    t.is(image.timestamp, timestamp)
+    image.close()
+    t.false(decoder.closed)
+  }
+  await t.throwsAsync(decoder.decode({ frameIndex: 2 }), {
+    name: 'EncodingError',
+    message: 'Failed to decode frame at index 2',
+  })
+  t.true(decoder.closed)
+})
+
+test('ImageDecoder: an out-of-range decode of a streamed corrupt AVIF waits for EOF', async (t) => {
+  const data = avifFixture('anim8_420.avif')
+  data.fill(0xff, 1941, 2771)
+  let endStream!: () => void
+  const stream = new ReadableStream({
+    start(controller) {
+      endStream = () => controller.close()
+      controller.enqueue(data)
+    },
+  })
+  const decoder = new ImageDecoder({ data: stream, type: 'image/avif' })
+  const completed = decoder.completed
+  await decoder.tracks.ready
+  const outOfRange = decoder.decode({ frameIndex: 3 })
+  const outcome = outOfRange.then(
+    () => 'resolved',
+    (error: Error) => error.name,
+  )
+  t.is(await Promise.race([outcome, new Promise((resolve) => setTimeout(resolve, 50, 'pending'))]), 'pending')
+  t.false(decoder.closed)
+  endStream()
+  await completed
+  await t.throwsAsync(outOfRange, {
+    name: 'RangeError',
+    message: 'Frame index 3 out of bounds (image has 3 frames)',
+  })
+  t.false(decoder.closed)
   const { image } = await decoder.decode({ frameIndex: 0 })
   t.is(image.format, 'BGRX')
   image.close()
@@ -1506,24 +1607,74 @@ test('ImageDecoder: preserves an earlier frame when a corrupt AVIF sample stream
   t.true(decoder.closed)
 })
 
-test('ImageDecoder: rejects a corrupt AVIF sample while the stream is open', async (t) => {
+test('ImageDecoder: a corrupt AVIF sample rejects decode() and completed while the stream is open', async (t) => {
   const data = avifFixture('anim8_420.avif')
   data.fill(0xff, 1941, 2771)
-  let endStream: (() => void) | undefined
   const stream = new ReadableStream({
     start(controller) {
-      endStream = () => controller.error(new Error('done'))
       controller.enqueue(data)
     },
   })
   const decoder = new ImageDecoder({ data: stream, type: 'image/avif' })
+  const completed = decoder.completed
   await decoder.tracks.ready
+  t.is(decoder.tracks.selectedTrack?.frameCount, 3)
+  const { image } = await decoder.decode({ frameIndex: 0 })
+  t.is(image.format, 'BGRX')
+  image.close()
   await t.throwsAsync(decoder.decode({ frameIndex: 1 }), {
     name: 'EncodingError',
     message: 'Failed to decode frame at index 1',
   })
   t.true(decoder.closed)
-  endStream?.()
+  t.false(decoder.complete)
+  await t.throwsAsync(completed, {
+    instanceOf: DOMException,
+    name: 'AbortError',
+    message: 'Aborted by close.',
+  })
+})
+
+test('ImageDecoder: mixed AVIF failures reject the first bad sample on an open stream', async (t) => {
+  const data = avifFixture('anim8_420.avif')
+  // Sample 1 gives no frame without an error; sample 2 has an explicit decode error.
+  data[1943] ^= 0x40
+  data.fill(0xff, 2771)
+
+  const buffered = new ImageDecoder({ data: data.slice(), type: 'image/avif' })
+  await buffered.tracks.ready
+  t.is(buffered.tracks.selectedTrack?.frameCount, 3)
+  await t.throwsAsync(buffered.decode({ frameIndex: 3 }), {
+    name: 'RangeError',
+    message: 'Frame index 3 out of bounds (image has 3 frames)',
+  })
+  t.false(buffered.closed)
+  buffered.close()
+
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(data)
+    },
+  })
+  const decoder = new ImageDecoder({ data: stream, type: 'image/avif' })
+  const completed = decoder.completed
+  await decoder.tracks.ready
+  t.is(decoder.tracks.selectedTrack?.frameCount, 3)
+  const { image } = await decoder.decode({ frameIndex: 0 })
+  t.is(image.format, 'BGRX')
+  image.close()
+  t.false(decoder.closed)
+  await t.throwsAsync(decoder.decode({ frameIndex: 1 }), {
+    name: 'EncodingError',
+    message: 'Failed to decode frame at index 1',
+  })
+  t.true(decoder.closed)
+  t.false(decoder.complete)
+  await t.throwsAsync(completed, {
+    instanceOf: DOMException,
+    name: 'AbortError',
+    message: 'Aborted by close.',
+  })
 })
 
 test('ImageDecoder: reset() keeps terminal-stream rules for a truncated AVIF item, like Chrome', async (t) => {

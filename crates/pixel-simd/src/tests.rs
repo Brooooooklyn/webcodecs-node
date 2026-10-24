@@ -387,6 +387,113 @@ fn bitfields_match_scalar() {
   }
 }
 
+#[test]
+fn bitfield_reads_like_the_image_crate() {
+  // its tables: 1 bit v * 255, 2 bits v * 85, 3 to 6 bits rounded, 7 bits (v << 1) | (v >> 6)
+  let read = |len, v| Bitfield { shift: 0, len }.read(v);
+  assert_eq!((read(1, 1), read(2, 2)), (255, 170));
+  assert_eq!(
+    (read(3, 2), read(4, 7), read(5, 3), read(6, 11)),
+    (73, 119, 25, 45)
+  );
+  assert_eq!(read(7, 100), 201);
+  // a mask: contiguous, inside the word; past 8 bits its top 8
+  assert_eq!(
+    Bitfield::from_mask(0xFFC0, 16),
+    Some(Bitfield { shift: 8, len: 8 })
+  );
+  assert_eq!(Bitfield::from_mask(0x1F0000, 16), None);
+  assert_eq!(Bitfield::from_mask(0xF801, 16), None);
+}
+
+#[test]
+fn opaque_matches_scalar() {
+  let (scalar, simd) = levels();
+  let mut rng = Rng(5);
+  for px in widths() {
+    for layout in [Opaque::Bgr, Opaque::Bgrx, Opaque::Xbgr] {
+      let extra = rng.below(3);
+      let src = rng.bytes(px * layout.size() + extra);
+      let dst = rng.bytes(4 * px);
+      let mut want = dst.clone();
+      opaque_to_bgra_with(scalar, &src, &mut want, layout);
+      // the 32-bit bitfields each layout stands for; a 24-bit pixel is that of BI_RGB without
+      // its unused byte
+      let fields = match layout {
+        Opaque::Bgr | Opaque::Bgrx => [0xFF0000, 0xFF00, 0xFF, 0],
+        Opaque::Xbgr => [0xFF00_0000, 0xFF_0000, 0xFF00, 0],
+      }
+      .map(|mask| Bitfield::from_mask(mask, 32).unwrap());
+      let words: Vec<u8> = src
+        .chunks_exact(layout.size())
+        .flat_map(|p| [p, &[0]].concat()[..4].to_vec())
+        .collect();
+      let mut read = dst.clone();
+      scalar::bitfields_to_bgra(&words, &mut read, 4, fields, false);
+      assert_eq!(read, want, "{px} px {layout:?} bitfields");
+      for &isa in &simd {
+        let got = fenced(&[&src, &dst], &mut rng, |b| {
+          let (src, dst) = b.split_at_mut(1);
+          opaque_to_bgra_with(isa, src[0].bytes(), dst[0].bytes(), layout)
+        });
+        assert_eq!(got[1], want, "{isa:?} {px} px {layout:?}");
+      }
+    }
+  }
+}
+
+#[test]
+fn palette_matches_scalar() {
+  let (scalar, simd) = levels();
+  let mut rng = Rng(6);
+  // sizes around every table size of the SIMD lookups
+  let lens = [
+    0, 1, 2, 3, 4, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63, 64, 65, 127, 128, 129, 255, 256,
+  ];
+  for px in widths() {
+    for bits in [1, 2, 4, 8] {
+      let lens = if bits == 8 {
+        &lens[..]
+      } else {
+        &lens[rng.below(lens.len())..][..1]
+      };
+      for &len in lens {
+        let colors = rng.bytes(3 * len);
+        let palette = Palette::new(colors.as_chunks().0.iter().copied());
+        // whole bytes, and up to 2 more
+        let n = (px * bits).div_ceil(8) + rng.below(3);
+        let src = if rng.below(2) == 0 {
+          rng.bytes(n)
+        } else {
+          (0..n).map(|_| rng.below(len + 1) as u8).collect()
+        };
+        let dst = rng.bytes(4 * px);
+        let mut want = dst.clone();
+        assert!(!palette_lookup(scalar, bits as u32, len));
+        palette_to_bgra_with(scalar, &src, &mut want, bits as u32, &palette);
+        for (x, px) in want.as_chunks::<4>().0.iter().enumerate() {
+          let index = src[x * bits / 8] >> (8 - bits - x * bits % 8) & ((1 << bits) - 1) as u8;
+          assert_eq!(*px, palette.color(index), "{bits}-bit pixel {x}");
+        }
+        for &isa in &simd {
+          let mut done = 0;
+          let got = fenced(&[&src, &dst], &mut rng, |b| {
+            let (src, dst) = b.split_at_mut(1);
+            done = palette_to_bgra_with(isa, src[0].bytes(), dst[0].bytes(), bits as u32, &palette);
+          });
+          assert_eq!(got[1], want, "{isa:?} {px} px {bits}-bit, {len} colors");
+          // `Palette::simd` (the BMP decoder skips the call without a SIMD path) tells whether
+          // a row of a whole vector of indexes (128 pixels or more) takes one
+          if px >= 128 {
+            let lookup = palette_lookup(isa, bits as u32, len);
+            assert_eq!(done > 0, lookup, "{isa:?} {px} px {bits}-bit, {len} colors");
+          }
+        }
+      }
+    }
+  }
+}
+
 /// A frame's planes, with `pad` bytes past each row.
 struct Frame {
   width: usize,

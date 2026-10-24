@@ -627,14 +627,12 @@ ImageDecoder supports all W3C spec options:
 | Option                 | Status | Notes                                                                             |
 | ---------------------- | ------ | --------------------------------------------------------------------------------- |
 | `desiredWidth/Height`  | ✅     | Like Chrome: scales JPEG only, to M/8 of its size; other formats stay full size   |
-| `preferAnimation`      | ✅     | When `false`, only decodes the first frame (AVIF: its still image, like Chrome)   |
+| `preferAnimation`      | ✅     | `false`: GIF first frame only, AVIF still image; APNG/WebP ignore it, like Chrome |
 | `colorSpaceConversion` | ✅     | `"default"` extracts color space metadata, `"none"` ignores it (Chromium-aligned) |
 
 **Note:** `desiredWidth` and `desiredHeight` follow Chrome, not the spec. A missing one, or a 0, is no error: the desired size is then ignored. Chrome decodes a JPEG at M/8 of its size (rounded up), where M = ⌊8 × √(desired area / image area)⌋, or 8 when the desired area is at least the image's. A JPEG scaled this way is BGRX. When even 1/8 is too large (M = 0), `tracks.ready` rejects with `InvalidStateError` and the decoder closes. Like Chrome, libjpeg-turbo scales the JPEG while it decodes it.
 
-### Platform-Specific Notes
-
-- **ImageDecoder GIF animation**: FFmpeg may return only the first frame. Use `VideoDecoder` with GIF codec for full animation.
+**Note:** GIF and BMP are not decoded by FFmpeg, but by decoders that follow Chrome: Wuffs' rules for GIF, the `image` crate's for BMP. Every GIF frame is decoded; it lasts its delay (0 too) and starts when the frames before it end. A frame that fails to decode rejects with `RangeError`; once every frame failed, `decode()` rejects with `EncodingError` and the decoder closes.
 
 ### Per-Frame Quantizer Control
 
