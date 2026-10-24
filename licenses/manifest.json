@@ -299,6 +299,45 @@
       "upstream": "https://raw.githubusercontent.com/FFmpeg/nv-codec-headers/n13.0.19.0/include/ffnvcodec/nvEncodeAPI.h",
       "excerpt": true,
       "sha256": "72b60be67644d841bfd54a042875b5846294d357040dd7ac8e38bde20d9e8f97"
+    },
+    {
+      "file": "libjpeg-turbo-LICENSE.md.txt",
+      "project": "libjpeg-turbo",
+      "upstream": "https://chromium.googlesource.com/chromium/deps/libjpeg_turbo",
+      "revision": "640f254ad0fa03f6b1f29f89b7dd9366f2f6e533",
+      "ref": "Chrome 155.0.8059.79 DEPS",
+      "upstreamPath": "LICENSE.md",
+      "excerpt": false,
+      "sha256": "96f5b328adbb78eeaaec6980d73fd558cb1e4d62560ed615646bc3cf5e532430"
+    },
+    {
+      "file": "libjpeg-turbo-README.ijg.txt",
+      "project": "libjpeg-turbo",
+      "upstream": "https://chromium.googlesource.com/chromium/deps/libjpeg_turbo",
+      "revision": "640f254ad0fa03f6b1f29f89b7dd9366f2f6e533",
+      "ref": "Chrome 155.0.8059.79 DEPS",
+      "upstreamPath": "README.ijg",
+      "excerpt": false,
+      "sha256": "75815e3bf6484201a3c3d17a1bbf10f2e8e3237f84df10a2357ea896db2a81d6"
+    },
+    {
+      "file": "libjpeg-turbo-CHROMIUM_LICENSE.txt",
+      "project": "Chromium",
+      "upstream": "https://chromium.googlesource.com/chromium/src",
+      "ref": "Chrome 155.0.8059.79",
+      "upstreamPath": "LICENSE",
+      "excerpt": false,
+      "sha256": "368cca1106be99d39ecd32a38d8305585d802a475effb66380b91ffc9bcf709b"
+    },
+    {
+      "file": "libjpeg-turbo-jsimdext.inc.txt",
+      "project": "libjpeg-turbo",
+      "upstream": "https://chromium.googlesource.com/chromium/deps/libjpeg_turbo",
+      "revision": "640f254ad0fa03f6b1f29f89b7dd9366f2f6e533",
+      "ref": "Chrome 155.0.8059.79 DEPS",
+      "upstreamPath": "simd/nasm/jsimdext.inc",
+      "excerpt": false,
+      "sha256": "000b2df5469d2f94ea20a1b3d638b94031dad296f006600e1dbff79eded5facb"
     }
   ]
 }

@@ -11,6 +11,7 @@ pub mod frame;
 pub mod hwdevice;
 pub mod hwframes;
 pub mod io_buffer;
+pub mod jpeg;
 pub mod mp4_faststart;
 pub mod muxer;
 pub mod packet;

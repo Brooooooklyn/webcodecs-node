@@ -15,8 +15,8 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-napi = { version = "3", features = ["async", "napi7", "web_stream"] }
-napi-derive = { version = "3" }
+napi = { version = "3.15.0", features = ["async", "napi7", "web_stream"] }
+napi-derive = { version = "3.6.13" }
 
 futures = "0.3"
 
@@ -39,8 +39,15 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 # Pixel loops with SIMD paths
 pixel-simd = { path = "crates/pixel-simd" }
 
+# Host functions (libuv) looked up at run time, as napi-sys looks up Node-API
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+libloading = "0.9"
+
+[dev-dependencies]
+sha2 = "0.11.0"
+
 [build-dependencies]
-napi-build = "2"
+napi-build = "2.6.0"
 cc = "1"
 sha2 = "0.11.0"
 

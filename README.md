@@ -630,7 +630,7 @@ ImageDecoder supports all W3C spec options:
 | `preferAnimation`      | ✅     | When `false`, only decodes first frame for animated formats                       |
 | `colorSpaceConversion` | ✅     | `"default"` extracts color space metadata, `"none"` ignores it (Chromium-aligned) |
 
-**Note:** `desiredWidth` and `desiredHeight` follow Chrome, not the spec. A missing one, or a 0, is no error: the desired size is then ignored. Chrome decodes a JPEG at M/8 of its size (rounded up), where M = ⌊8 × √(desired area / image area)⌋, or 8 when the desired area is at least the image's. A JPEG scaled this way is BGRX. When even 1/8 is too large (M = 0), `tracks.ready` rejects with `InvalidStateError` and the decoder closes. The scaled pixels come from FFmpeg and an area filter, not from libjpeg-turbo, so they can differ from Chrome's.
+**Note:** `desiredWidth` and `desiredHeight` follow Chrome, not the spec. A missing one, or a 0, is no error: the desired size is then ignored. Chrome decodes a JPEG at M/8 of its size (rounded up), where M = ⌊8 × √(desired area / image area)⌋, or 8 when the desired area is at least the image's. A JPEG scaled this way is BGRX. When even 1/8 is too large (M = 0), `tracks.ready` rejects with `InvalidStateError` and the decoder closes. Like Chrome, libjpeg-turbo scales the JPEG while it decodes it.
 
 ### Platform-Specific Notes
 
@@ -723,6 +723,9 @@ For full API documentation, see the [W3C WebCodecs specification](https://w3c.gi
 - Rust (latest stable)
 - Node.js 18+
 - pnpm
+- NASM 2.15.05 or newer, for x86_64 builds (libjpeg-turbo's SIMD code): `brew install nasm`,
+  `apt-get install nasm` (Ubuntu 22.04 or Debian 11 and newer) or `choco install nasm` (then
+  add `C:\Program Files\NASM` to `PATH`), or set `NASM` to its path
 
 The build downloads the pinned FFmpeg 9.0 release by default. If you opt out
 of that download or set `FFMPEG_DIR`, the supplied FFmpeg headers and libraries
