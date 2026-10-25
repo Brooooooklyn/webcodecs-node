@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 
 import test from 'ava'
 
@@ -688,78 +688,36 @@ interface FlushAtomicityResult {
   summary: FlushAtomicitySummary
 }
 
-function runFlushAtomicityProbe(): Promise<FlushAtomicityResult> {
+function runFlushAtomicityProbe(): FlushAtomicityResult {
   const marker = 'FLUSH_ATOMICITY_SUMMARY '
-  const maxOutputLength = 32 * 1024 * 1024
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ['__test__/helpers/flush-atomicity-probe.cjs'], {
-      env: { ...process.env, WEBCODECS_LOG: 'trace', FLUSH_ATOMICITY_ITERATIONS: '2000' },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-    let pending = ''
-    let outputLength = 0
-    let summary: FlushAtomicitySummary | undefined
-    let settled = false
-
-    const fail = (error: Error) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timeout)
-      child.kill('SIGKILL')
-      reject(error)
-    }
-    const parseLine = (line: string) => {
-      if (!line.startsWith(marker)) return
-      try {
-        summary = JSON.parse(line.slice(marker.length)) as FlushAtomicitySummary
-      } catch (error) {
-        fail(new Error(`Invalid flush atomicity summary: ${String(error)}`))
-      }
-    }
-    const consume = (chunk: string) => {
-      outputLength += chunk.length
-      if (outputLength > maxOutputLength) {
-        fail(new Error(`Flush atomicity probe exceeded ${maxOutputLength} output characters`))
-        return
-      }
-      pending += chunk
-      let newline = pending.indexOf('\n')
-      while (newline >= 0) {
-        parseLine(pending.slice(0, newline))
-        pending = pending.slice(newline + 1)
-        newline = pending.indexOf('\n')
-      }
-      // Native tracing is line-oriented; never retain an unbounded partial line.
-      if (pending.length > 65_536) pending = ''
-    }
-    const timeout = setTimeout(() => {
-      fail(new Error('Flush atomicity probe timed out'))
-    }, 60_000)
-
-    child.stdout.setEncoding('utf8')
-    child.stderr.setEncoding('utf8')
-    child.stdout.on('data', consume)
-    child.stderr.on('data', consume)
-    child.on('error', fail)
-    child.on('close', (code, signal) => {
-      if (settled) return
-      parseLine(pending)
-      settled = true
-      clearTimeout(timeout)
-      if (!summary) {
-        reject(new Error(`Flush atomicity probe produced no summary (code=${code}, signal=${signal})`))
-        return
-      }
-      resolve({ code, signal, summary })
-    })
+  // Synchronous draining keeps a busy AVA parent from filling the trace pipe
+  // and blocking the codec worker before it can answer Flush.
+  const result = spawnSync(process.execPath, ['__test__/helpers/flush-atomicity-probe.cjs'], {
+    env: { ...process.env, WEBCODECS_LOG: 'trace', FLUSH_ATOMICITY_ITERATIONS: '2000' },
+    encoding: 'utf8',
+    timeout: 60_000,
+    maxBuffer: 32 * 1024 * 1024,
   })
+  if (result.error) throw result.error
+  const line = result.stdout
+    .trim()
+    .split('\n')
+    .find((entry) => entry.startsWith(marker))
+  if (!line) {
+    throw new Error(`Flush atomicity probe produced no summary (code=${result.status}, signal=${result.signal})`)
+  }
+  return {
+    code: result.status,
+    signal: result.signal,
+    summary: JSON.parse(line.slice(marker.length)) as FlushAtomicitySummary,
+  }
 }
 
 // This is a bounded stress regression, not a deterministic schedule. Native
 // tracing widens the locked reconfigure window that used to let flush settle
 // between its optimistic delivery check and the pending-output drain.
-test('flush rechecks delivery under the codec lock before worker-error migration drains outputs', async (t) => {
-  const { code, signal, summary } = await runFlushAtomicityProbe()
+test('flush rechecks delivery under the codec lock before worker-error migration drains outputs', (t) => {
+  const { code, signal, summary } = runFlushAtomicityProbe()
   const details = JSON.stringify(summary)
   t.is(signal, null, details)
   t.is(summary.completed, summary.iterations, details)
