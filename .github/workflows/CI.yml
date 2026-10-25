@@ -526,13 +526,14 @@ jobs:
       - name: Prepare license notices for every npm package
         run: pnpm licenses:prepare
       - name: Check packed license files
-        run: pnpm licenses:check
+        run: |
+          npm install -g npm
+          pnpm licenses:check
       - name: List packages
         run: ls -R ./npm
         shell: bash
       - name: Publish
         run: |
-          npm install -g npm
           npm config set provenance true
           if git log -1 --pretty=%B | grep "^v\?[0-9]\+\.[0-9]\+\.[0-9]\+$";
           then
