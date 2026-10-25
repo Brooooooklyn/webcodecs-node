@@ -25,6 +25,7 @@ use crate::webcodecs::flush_tracker::{FlushAbort, FlushTracker};
 use crate::webcodecs::hw_fallback::{
   is_hw_encoding_disabled, record_hw_encoding_failure, record_hw_encoding_success,
 };
+use crate::webcodecs::output_delivery::{DeliveryCompletion, OutputDelivery};
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
 use crate::webcodecs::{
   AlphaOption, AvcBitstreamFormat, EncodedVideoChunk, HardwareAcceleration, HevcBitstreamFormat,
@@ -330,6 +331,8 @@ struct VideoEncoderInner {
   failure_name: Option<DOMExceptionName>,
   /// Pending flush operations, tracked independently for overlapping calls.
   flushes: FlushTracker,
+  /// Outputs sent through the threadsafe output callback, awaited by flush().
+  output_delivery: Arc<OutputDelivery>,
   /// Maps frame PTS (encoder time_base units) to input timestamps (µs) and
   /// durations (µs). B-frame encoders emit packets in decode order, so a FIFO
   /// misattributes timestamps; keying by packet PTS keeps each label on its
@@ -497,6 +500,7 @@ impl VideoEncoderInner {
       &self.output_callback,
       self.generation,
       buffered_output(FnArgs::from((chunk, metadata))),
+      &self.output_delivery,
     );
   }
 
@@ -647,6 +651,7 @@ impl VideoEncoder {
   /// @param init - Init dictionary containing output and error callbacks
   #[napi(constructor)]
   pub fn new(
+    env: Env,
     #[napi(
       ts_arg_type = "{ output: (chunk: EncodedVideoChunk, metadata?: EncodedVideoChunkMetadata) => void, error: (error: DOMException) => void }"
     )]
@@ -665,6 +670,7 @@ impl VideoEncoder {
       event_state: event_state.clone(),
       failure_name: None,
       flushes: FlushTracker::default(),
+      output_delivery: OutputDelivery::new(&env)?,
       timestamp_map: BTreeMap::new(),
       // Hardware acceleration tracking
       is_hardware: false,
@@ -2389,6 +2395,7 @@ impl VideoEncoder {
         &inner.output_callback,
         inner.generation,
         buffered_output(FnArgs::from((chunk, metadata))),
+        &inner.output_delivery,
       );
     }
     inner.epoch.send_error(
@@ -3404,7 +3411,7 @@ impl VideoEncoder {
   /// This ensures that if reset() is called from a callback, the abort flag is checked
   /// AFTER the callback returns, allowing flush() to return AbortError.
   #[napi(ts_return_type = "Promise<void>")]
-  pub fn flush<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
+  pub fn flush<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, Unknown<'env>>> {
     // Create abort flag for this flush operation
     let flush_abort = Arc::new(FlushAbort::default());
     // Create a response channel before registering this individual operation.
@@ -3498,6 +3505,12 @@ impl VideoEncoder {
     // Clone references for the callback closure
     let inner_clone = self.inner.clone();
     let output_callback_ref = self.output_callback_ref.clone();
+    let output_delivery = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?
+      .output_delivery
+      .clone();
 
     env.spawn_future_with_callback(
       async move {
@@ -3519,54 +3532,83 @@ impl VideoEncoder {
         Ok((result, inner_clone, flush_abort, flush_id))
       },
       move |env, (result, inner, abort, flush_id)| {
-        // Drain pending chunks and call output callback SYNCHRONOUSLY
-        // This runs on the main thread with Env access
-        let chunks = {
-          let mut guard = inner
-            .lock()
-            .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-          guard.flushes.begin_output_delivery(flush_id);
-          if abort.is_aborted() {
-            Vec::new()
-          } else {
-            std::mem::take(&mut guard.pending_chunks)
-          }
-        };
-
-        // Call output callback for each chunk synchronously
-        // If callback calls reset(), abort will be set before next iteration
-        let callback_result = (|| -> Result<()> {
-          let callback = output_callback_ref.borrow_back(env)?;
-          for (chunk, metadata) in chunks {
-            // Check abort flag before each callback - exit early if reset() was called
-            if abort.is_aborted() {
-              break;
+        let mut result = Some(result);
+        output_delivery.after_delivered(env, abort.clone(), move |env| {
+          // Drain pending chunks and call output callback SYNCHRONOUSLY
+          // This runs on the main thread with Env access
+          let chunks = {
+            let mut guard = inner
+              .lock()
+              .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+            // Migration locks inner before tracking outputs, so this recheck is atomic with the drain.
+            if !abort.is_aborted() && !guard.output_delivery.is_delivered() {
+              return Ok(DeliveryCompletion::Retry);
             }
-            callback.call((chunk, metadata).into())?;
+            guard.flushes.begin_output_delivery(flush_id);
+            if abort.is_aborted() {
+              Vec::new()
+            } else {
+              std::mem::take(&mut guard.pending_chunks)
+            }
+          };
+
+          // Call output callback for each chunk synchronously
+          // If callback calls reset(), abort will be set before next iteration
+          let mut recovered = Vec::new();
+          let callback_result = (|| -> Result<()> {
+            let callback = output_callback_ref.borrow_back(env)?;
+            let mut chunks = chunks.into_iter();
+            while let Some((chunk, metadata)) = chunks.next() {
+              // Check abort flag before each callback - exit early if reset() was called
+              if abort.is_aborted() {
+                break;
+              }
+              if let Err(error) = callback.call((chunk, metadata).into()) {
+                if !abort.is_aborted() {
+                  recovered = chunks.collect();
+                }
+                return Err(error);
+              }
+            }
+            Ok(())
+          })();
+
+          // Always release this operation, including when the JS callback throws.
+          {
+            let mut guard = inner
+              .lock()
+              .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+            if !recovered.is_empty() {
+              let recovered = recovered
+                .into_iter()
+                .map(|(chunk, metadata)| buffered_output(FnArgs::from((chunk, metadata))))
+                .collect();
+              guard.epoch.recover_flush_outputs(
+                &guard.output_callback,
+                guard.generation,
+                recovered,
+                &guard.output_delivery,
+              );
+            }
+            guard.flushes.finish(flush_id);
           }
-          Ok(())
-        })();
+          callback_result?;
 
-        // Always release this operation, including when the JS callback throws.
-        {
-          let mut guard = inner
-            .lock()
-            .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-          guard.flushes.finish(flush_id);
-        }
-        callback_result?;
+          // Check abort flag after draining all chunks
+          // close()/reset() abort the flush; an error that closed the codec fails it
+          if abort.is_aborted() {
+            let (name, message) = abort.rejection();
+            return Err(native_dom_exception_rejection_error(env, name, message)?);
+          }
 
-        // Check abort flag after draining all chunks
-        // close()/reset() abort the flush; an error that closed the codec fails it
-        if abort.is_aborted() {
-          let (name, message) = abort.rejection();
-          return Err(native_dom_exception_rejection_error(env, name, message)?);
-        }
-
-        match result {
-          Ok(()) => Ok(()),
-          Err(error) => Err(dom_exception_rejection_error(env, error)?),
-        }
+          let result = result
+            .take()
+            .expect("flush result consumed only on final completion");
+          match result {
+            Ok(()) => Ok(DeliveryCompletion::Complete),
+            Err(error) => Err(dom_exception_rejection_error(env, error)?),
+          }
+        })
       },
     )
   }

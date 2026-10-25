@@ -1,6 +1,7 @@
 use std::ptr;
 
 use napi::{
+  JsValue,
   bindgen_prelude::{Env, FnArgs, Function, JsObjectValue, PromiseRaw, Result},
   check_status, sys,
 };
@@ -58,16 +59,16 @@ pub(crate) fn reject_with_type_error<'env, T>(
 /// (from report_error) to run first.
 ///
 /// Creates a proper JavaScript DOMException and rejects the promise with it.
-pub(crate) fn reject_with_dom_exception_async<'env>(
+pub(crate) fn reject_with_dom_exception_async<'env, T>(
   env: &'env Env,
   name: DOMExceptionName,
   message: &str,
-) -> Result<PromiseRaw<'env, ()>> {
+) -> Result<PromiseRaw<'env, T>> {
   // Convert to owned strings for use in closure
   let name_str = name.as_str().to_string();
   let message_str = message.to_string();
 
-  env
+  let promise = env
     .spawn_future(async move { Ok(()) })?
     .then(move |ctx| {
       // Get global DOMException constructor and create instance
@@ -78,5 +79,6 @@ pub(crate) fn reject_with_dom_exception_async<'env>(
         dom_exception_constructor.new_instance((message_str.clone(), name_str.clone()).into())?;
       PromiseRaw::<()>::reject(&ctx.env, error)
     })?
-    .then(|_| Ok(()))
+    .then(|_| Ok(()))?;
+  Ok(PromiseRaw::new(env.raw(), promise.raw()))
 }

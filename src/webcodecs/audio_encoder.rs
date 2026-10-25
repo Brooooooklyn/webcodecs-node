@@ -4,7 +4,7 @@
 //! See: https://w3c.github.io/webcodecs/#audioencoder-interface
 
 use crate::codec::{
-  AudioEncoderConfig as InternalAudioEncoderConfig, AudioSampleBuffer, CodecContext, Frame,
+  AudioEncoderConfig as InternalAudioEncoderConfig, AudioSampleBuffer, CodecContext, Frame, Packet,
   Resampler, context::get_audio_encoder_name,
 };
 use crate::ffi::{AVCodecID, AVSampleFormat};
@@ -17,6 +17,7 @@ use crate::webcodecs::error::{
 };
 use crate::webcodecs::event_target::CodecEventState;
 use crate::webcodecs::flush_tracker::{FlushAbort, FlushTracker};
+use crate::webcodecs::output_delivery::{DeliveryCompletion, OutputDelivery};
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
 use crate::webcodecs::{
   AacBitstreamFormat, AudioData, AudioEncoderConfig, AudioEncoderSupport, EncodedAudioChunk,
@@ -182,7 +183,11 @@ struct AudioEncoderInner {
   flushes: FlushTracker,
   /// Queue of input timestamps for correlation with output packets
   /// (needed because FFmpeg may buffer frames internally)
-  timestamp_queue: std::collections::VecDeque<i64>,
+  timestamp_queue: std::collections::VecDeque<TimestampWithPhase>,
+  /// Exact timing of the last output, used when the timestamp queue is empty.
+  last_output: Option<LastOutputTiming>,
+  /// Outputs sent through the threadsafe output callback, awaited by flush().
+  output_delivery: Arc<OutputDelivery>,
   /// Base timestamp from the first input AudioData (for timestamp calculation)
   base_timestamp: Option<i64>,
   /// W3C spec: Flag to suppress output delivery after reset()
@@ -337,6 +342,111 @@ impl Drop for AudioEncoder {
   }
 }
 
+#[derive(Clone, Copy)]
+struct TimestampWithPhase {
+  timestamp: i64,
+  /// Fractional microseconds, expressed as a numerator over the sample rate.
+  phase: i64,
+}
+
+#[derive(Clone, Copy)]
+struct LastOutputTiming {
+  timestamp: i64,
+  phase: i64,
+  duration_samples: i64,
+}
+
+fn output_timestamp_overflow() -> Error {
+  Error::new(
+    Status::GenericFailure,
+    "EncodingError: Audio output timestamp overflow",
+  )
+}
+
+fn output_duration_overflow() -> Error {
+  Error::new(
+    Status::GenericFailure,
+    "EncodingError: Audio output duration overflow",
+  )
+}
+
+fn timestamp_with_phase(
+  timestamp: i64,
+  frame_count: u64,
+  frame_size: i64,
+  sample_rate: i64,
+) -> TimestampWithPhase {
+  let rate = sample_rate as i128;
+  // Reduce each factor before multiplying so large input offsets cannot overflow.
+  let frames = frame_count as i128 % rate;
+  let frame_size = frame_size as i128 % rate;
+  let input_offset = (frames * frame_size) % rate;
+  let phase = (input_offset * (1_000_000i128 % rate)) % rate;
+  TimestampWithPhase {
+    timestamp,
+    phase: phase as i64,
+  }
+}
+
+fn samples_to_microseconds(duration_samples: i64, sample_rate: i64) -> Result<i64> {
+  let duration = (duration_samples as i128 * 1_000_000i128) / (sample_rate as i128);
+  i64::try_from(duration).map_err(|_| output_duration_overflow())
+}
+
+impl AudioEncoderInner {
+  fn next_output_timestamp(
+    &mut self,
+    duration_samples: i64,
+    sample_rate: i64,
+  ) -> Result<Option<i64>> {
+    let (timestamp, phase) = if let Some(queued) = self.timestamp_queue.pop_front() {
+      (queued.timestamp, queued.phase)
+    } else {
+      let Some(previous) = self.last_output else {
+        return Ok(None);
+      };
+      let rate = sample_rate as i128;
+      let numerator = previous.phase as i128 + previous.duration_samples as i128 * 1_000_000i128;
+      let whole = numerator / rate;
+      let phase = numerator % rate;
+      let timestamp = (previous.timestamp as i128)
+        .checked_add(whole)
+        .ok_or_else(output_timestamp_overflow)?;
+      let timestamp = i64::try_from(timestamp).map_err(|_| output_timestamp_overflow())?;
+      let phase = i64::try_from(phase).map_err(|_| output_timestamp_overflow())?;
+      (timestamp, phase)
+    };
+
+    self.last_output = Some(LastOutputTiming {
+      timestamp,
+      phase,
+      duration_samples,
+    });
+    Ok(Some(timestamp))
+  }
+
+  fn next_output_timing(
+    &mut self,
+    packet: &Packet,
+    fallback_duration_samples: i64,
+    sample_rate: i64,
+  ) -> Result<(Option<i64>, Option<i64>)> {
+    let native_duration = packet.duration();
+    let duration_samples = if native_duration > 0 {
+      Some(native_duration)
+    } else if packet.is_empty() {
+      None
+    } else {
+      Some(fallback_duration_samples)
+    };
+    let duration_us = duration_samples
+      .map(|duration| samples_to_microseconds(duration, sample_rate))
+      .transpose()?;
+    let timestamp = self.next_output_timestamp(duration_samples.unwrap_or(0), sample_rate)?;
+    Ok((timestamp, duration_us))
+  }
+}
+
 #[napi]
 impl AudioEncoder {
   /// Create a new AudioEncoder with init dictionary (per WebCodecs spec)
@@ -344,6 +454,7 @@ impl AudioEncoder {
   /// @param init - Init dictionary containing output and error callbacks
   #[napi(constructor)]
   pub fn new(
+    env: Env,
     #[napi(
       ts_arg_type = "{ output: (chunk: EncodedAudioChunk, metadata?: EncodedAudioChunkMetadata) => void, error: (error: DOMException) => void }"
     )]
@@ -365,6 +476,8 @@ impl AudioEncoder {
       event_state: event_state.clone(),
       flushes: FlushTracker::default(),
       timestamp_queue: std::collections::VecDeque::new(),
+      last_output: None,
+      output_delivery: OutputDelivery::new(&env)?,
       base_timestamp: None,
       output_suppressed: false,
       pending_chunks: Vec::new(),
@@ -599,7 +712,9 @@ impl AudioEncoder {
       frame_to_encode.set_pts(frame_timestamp);
 
       // Push timestamp to queue BEFORE encoding (for output correlation)
-      guard.timestamp_queue.push_back(frame_timestamp);
+      let queued_timestamp =
+        timestamp_with_phase(frame_timestamp, guard.frame_count, frame_size, sample_rate);
+      guard.timestamp_queue.push_back(queued_timestamp);
 
       // Encode the frame
       let context = match guard.context.as_mut() {
@@ -620,9 +735,6 @@ impl AudioEncoder {
 
       guard.frame_count += 1;
 
-      // Calculate duration per frame in microseconds
-      let duration_us = (frame_size * 1_000_000) / sample_rate;
-
       // Process output packets - call callback for each
       // Pop timestamp from queue to preserve original input timestamp
       let adts_params = if guard.use_adts {
@@ -631,10 +743,17 @@ impl AudioEncoder {
         None
       };
       for packet in packets {
-        let output_timestamp = guard.timestamp_queue.pop_front();
+        let (output_timestamp, duration_us) =
+          match guard.next_output_timing(&packet, frame_size, sample_rate) {
+            Ok(timing) => timing,
+            Err(error) => {
+              Self::close_with_error(&mut guard, event_state, &error.reason);
+              return;
+            }
+          };
         let chunk = EncodedAudioChunk::from_packet_with_adts(
           packet,
-          Some(duration_us),
+          duration_us,
           output_timestamp,
           adts_params,
         );
@@ -701,6 +820,7 @@ impl AudioEncoder {
             &guard.output_callback,
             guard.generation,
             buffered_output(FnArgs::from((chunk, metadata))),
+            &guard.output_delivery,
           );
         }
       }
@@ -800,7 +920,9 @@ impl AudioEncoder {
         frame.set_pts(frame_timestamp);
 
         // Push timestamp to queue for output correlation
-        guard.timestamp_queue.push_back(frame_timestamp);
+        let queued_timestamp =
+          timestamp_with_phase(frame_timestamp, guard.frame_count, frame_size, sample_rate);
+        guard.timestamp_queue.push_back(queued_timestamp);
 
         let context = match guard.context.as_mut() {
           Some(ctx) => ctx,
@@ -825,17 +947,24 @@ impl AudioEncoder {
             ));
           }
         };
-        let duration_us = (frame.nb_samples() as i64 * 1_000_000) / sample_rate;
+        let remainder_duration_samples = frame.nb_samples() as i64;
         let adts_params = if guard.use_adts {
           guard.adts_params
         } else {
           None
         };
         for packet in packets {
-          let output_timestamp = guard.timestamp_queue.pop_front();
+          let (output_timestamp, duration_us) =
+            match guard.next_output_timing(&packet, remainder_duration_samples, sample_rate) {
+              Ok(timing) => timing,
+              Err(error) => {
+                Self::report_error(&mut guard, &error.reason);
+                return Err(error);
+              }
+            };
           let chunk = EncodedAudioChunk::from_packet_with_adts(
             packet,
-            Some(duration_us),
+            duration_us,
             output_timestamp,
             adts_params,
           );
@@ -909,9 +1038,22 @@ impl AudioEncoder {
         None
       };
       for packet in packets {
-        let output_timestamp = guard.timestamp_queue.pop_front();
-        let chunk =
-          EncodedAudioChunk::from_packet_with_adts(packet, None, output_timestamp, adts_params);
+        // Packet durations are in the encoder time base of 1/sample_rate.
+        // A nonempty drain packet without one still represents one encoder frame.
+        let (output_timestamp, duration_us) =
+          match guard.next_output_timing(&packet, frame_size, sample_rate) {
+            Ok(timing) => timing,
+            Err(error) => {
+              Self::report_error(&mut guard, &error.reason);
+              return Err(error);
+            }
+          };
+        let chunk = EncodedAudioChunk::from_packet_with_adts(
+          packet,
+          duration_us,
+          output_timestamp,
+          adts_params,
+        );
         // Create decoderConfig: FLAC on every chunk, others only on first chunk
         let decoder_config = if is_flac {
           // FLAC: Always include decoderConfig with fresh extradata
@@ -997,6 +1139,7 @@ impl AudioEncoder {
     // Clear codec-local work state. Do not reset encode_queue_size here:
     // main-thread encode() calls after this FIFO command are already counted.
     guard.timestamp_queue.clear();
+    guard.last_output = None;
     guard.frame_count = 0;
     guard.extradata_sent = false;
     guard.base_timestamp = None;
@@ -1150,6 +1293,7 @@ impl AudioEncoder {
         &inner.output_callback,
         inner.generation,
         buffered_output(FnArgs::from((chunk, metadata))),
+        &inner.output_delivery,
       );
     }
     inner.epoch.send_error(
@@ -1621,7 +1765,7 @@ impl AudioEncoder {
   /// This ensures that if reset() is called from a callback, the abort flag is checked
   /// AFTER the callback returns, allowing flush() to return AbortError.
   #[napi(ts_return_type = "Promise<void>")]
-  pub fn flush<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
+  pub fn flush<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, Unknown<'env>>> {
     // Create abort flag for this flush operation
     let flush_abort = Arc::new(FlushAbort::default());
     let (response_sender, response_receiver) = channel::bounded::<Result<()>>(1);
@@ -1712,6 +1856,12 @@ impl AudioEncoder {
     // Clone references for the callback closure
     let inner_clone = self.inner.clone();
     let output_callback_ref = self.output_callback_ref.clone();
+    let output_delivery = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?
+      .output_delivery
+      .clone();
 
     env.spawn_future_with_callback(
       async move {
@@ -1733,55 +1883,84 @@ impl AudioEncoder {
         Ok((result, inner_clone, flush_abort, flush_id))
       },
       move |env, (result, inner, abort, flush_id)| {
-        // Drain pending chunks and call output callback SYNCHRONOUSLY
-        // This runs on the main thread with Env access
-        let chunks = {
-          let mut guard = inner
-            .lock()
-            .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-          guard.flushes.begin_output_delivery(flush_id);
-          if abort.is_aborted() {
-            Vec::new()
-          } else {
-            std::mem::take(&mut guard.pending_chunks)
-          }
-        };
-
-        // Call output callback for each chunk synchronously
-        // If callback calls reset(), abort will be set before next iteration
-        let callback_result = (|| -> Result<()> {
-          let callback = output_callback_ref.borrow_back(env)?;
-          for (chunk, metadata) in chunks {
-            // Check abort flag before each callback - exit early if reset() was called
-            if abort.is_aborted() {
-              break;
+        let mut result = Some(result);
+        output_delivery.after_delivered(env, abort.clone(), move |env| {
+          // Drain pending chunks and call output callback SYNCHRONOUSLY
+          // This runs on the main thread with Env access
+          let chunks = {
+            let mut guard = inner
+              .lock()
+              .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+            // Migration locks inner before tracking outputs, so this recheck is atomic with the drain.
+            if !abort.is_aborted() && !guard.output_delivery.is_delivered() {
+              return Ok(DeliveryCompletion::Retry);
             }
-            callback.call((chunk, metadata).into())?;
+            guard.flushes.begin_output_delivery(flush_id);
+            if abort.is_aborted() {
+              Vec::new()
+            } else {
+              std::mem::take(&mut guard.pending_chunks)
+            }
+          };
+
+          // Call output callback for each chunk synchronously
+          // If callback calls reset(), abort will be set before next iteration
+          let mut recovered = Vec::new();
+          let callback_result = (|| -> Result<()> {
+            let callback = output_callback_ref.borrow_back(env)?;
+            let mut chunks = chunks.into_iter();
+            while let Some((chunk, metadata)) = chunks.next() {
+              // Check abort flag before each callback - exit early if reset() was called
+              if abort.is_aborted() {
+                break;
+              }
+              if let Err(error) = callback.call((chunk, metadata).into()) {
+                if !abort.is_aborted() {
+                  recovered = chunks.collect();
+                }
+                return Err(error);
+              }
+            }
+            Ok(())
+          })();
+
+          // Always release this operation, including when the JS callback throws.
+          {
+            let mut guard = inner
+              .lock()
+              .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+            if !recovered.is_empty() {
+              let recovered = recovered
+                .into_iter()
+                .map(|(chunk, metadata)| buffered_output(FnArgs::from((chunk, metadata))))
+                .collect();
+              guard.epoch.recover_flush_outputs(
+                &guard.output_callback,
+                guard.generation,
+                recovered,
+                &guard.output_delivery,
+              );
+            }
+            guard.flushes.finish(flush_id);
           }
-          Ok(())
-        })();
+          callback_result?;
 
-        // Always release this operation, including when the JS callback throws.
-        {
-          let mut guard = inner
-            .lock()
-            .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-          guard.flushes.finish(flush_id);
-        }
-        callback_result?;
+          // Check abort flag after draining all chunks
+          // close()/reset() abort the flush; an error that closed the codec fails it
+          if abort.is_aborted() {
+            let (name, message) = abort.rejection();
+            return Err(native_dom_exception_rejection_error(env, name, message)?);
+          }
 
-        // Check abort flag after draining all chunks
-        // close()/reset() abort the flush; an error that closed the codec fails it
-        if abort.is_aborted() {
-          let (name, message) = abort.rejection();
-          return Err(native_dom_exception_rejection_error(env, name, message)?);
-        }
-
-        // Worker errors carry their DOMException name as a message prefix
-        match result {
-          Ok(()) => Ok(()),
-          Err(error) => Err(dom_exception_rejection_error(env, error)?),
-        }
+          // Worker errors carry their DOMException name as a message prefix
+          let result = result
+            .take()
+            .expect("flush result consumed only on final completion");
+          match result {
+            Ok(()) => Ok(DeliveryCompletion::Complete),
+            Err(error) => Err(dom_exception_rejection_error(env, error)?),
+          }
+        })
       },
     )
   }
@@ -1831,6 +2010,7 @@ impl AudioEncoder {
     inner.encode_queue_size = 0;
     CodecEventState::clear_queue(&self.event_state, &env, cleared_queue);
     inner.timestamp_queue.clear();
+    inner.last_output = None;
     inner.base_timestamp = None;
     // Clear flush-related state
     inner.flushes.clear();

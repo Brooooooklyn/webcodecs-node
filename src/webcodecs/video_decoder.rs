@@ -16,6 +16,7 @@ use crate::webcodecs::error::{
 };
 use crate::webcodecs::event_target::CodecEventState;
 use crate::webcodecs::flush_tracker::{FlushAbort, FlushTracker};
+use crate::webcodecs::output_delivery::{DeliveryCompletion, OutputDelivery};
 use crate::webcodecs::promise_reject::{reject_with_dom_exception_async, reject_with_type_error};
 use crate::webcodecs::video_frame::VideoColorSpaceInit;
 use crate::webcodecs::{
@@ -200,6 +201,8 @@ struct VideoDecoderInner {
   failure_name: Option<DOMExceptionName>,
   /// Pending flush operations, tracked independently for overlapping calls.
   flushes: FlushTracker,
+  /// Outputs sent through the threadsafe output callback, awaited by flush().
+  output_delivery: Arc<OutputDelivery>,
   /// Next chunk sequence number for opaque identity tagging (1-based)
   next_chunk_seq: u64,
   /// Sequence number -> (timestamp, duration) for chunks in flight
@@ -315,6 +318,7 @@ impl VideoDecoderInner {
       &self.output_callback,
       self.generation,
       buffered_output(frame),
+      &self.output_delivery,
     );
   }
 }
@@ -424,6 +428,7 @@ impl VideoDecoder {
   /// @param init - Init dictionary containing output and error callbacks
   #[napi(constructor)]
   pub fn new(
+    env: Env,
     #[napi(
       ts_arg_type = "{ output: (frame: VideoFrame) => void, error: (error: DOMException) => void }"
     )]
@@ -442,6 +447,7 @@ impl VideoDecoder {
       keyframe_received: false,
       failure_name: None,
       flushes: FlushTracker::default(),
+      output_delivery: OutputDelivery::new(&env)?,
       next_chunk_seq: 1,
       chunk_meta: ChunkMetaMap::new(),
       pending_frames: Vec::new(),
@@ -1389,6 +1395,7 @@ impl VideoDecoder {
         &inner.output_callback,
         inner.generation,
         buffered_output(frame),
+        &inner.output_delivery,
       );
     }
     inner.epoch.send_error(
@@ -1825,7 +1832,7 @@ impl VideoDecoder {
   /// This ensures that if reset() is called from a callback, the abort flag is checked
   /// AFTER the callback returns, allowing flush() to return AbortError.
   #[napi(ts_return_type = "Promise<void>")]
-  pub fn flush<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
+  pub fn flush<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, Unknown<'env>>> {
     // Create abort flag for this flush operation
     let flush_abort = Arc::new(FlushAbort::default());
     let (response_sender, response_receiver) = channel::bounded::<Result<()>>(1);
@@ -1919,6 +1926,12 @@ impl VideoDecoder {
     // Clone references for the callback closure
     let inner_clone = self.inner.clone();
     let output_callback_ref = self.output_callback_ref.clone();
+    let output_delivery = self
+      .inner
+      .lock()
+      .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?
+      .output_delivery
+      .clone();
 
     env.spawn_future_with_callback(
       async move {
@@ -1940,55 +1953,81 @@ impl VideoDecoder {
         Ok((result, inner_clone, flush_abort, flush_id))
       },
       move |env, (result, inner, abort, flush_id)| {
-        // Drain pending frames and call output callback SYNCHRONOUSLY
-        // This runs on the main thread with Env access
-        let frames = {
-          let mut guard = inner
-            .lock()
-            .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-          guard.flushes.begin_output_delivery(flush_id);
-          if abort.is_aborted() {
-            Vec::new()
-          } else {
-            std::mem::take(&mut guard.pending_frames)
-          }
-        };
-
-        // Call output callback for each frame synchronously
-        // If callback calls reset(), abort will be set before next iteration
-        let callback_result = (|| -> Result<()> {
-          let callback = output_callback_ref.borrow_back(env)?;
-          for frame in frames {
-            // Check abort flag before each callback - exit early if reset() was called
-            if abort.is_aborted() {
-              break;
+        let mut result = Some(result);
+        output_delivery.after_delivered(env, abort.clone(), move |env| {
+          // Drain pending frames and call output callback SYNCHRONOUSLY
+          // This runs on the main thread with Env access
+          let frames = {
+            let mut guard = inner
+              .lock()
+              .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+            // Migration locks inner before tracking outputs, so this recheck is atomic with the drain.
+            if !abort.is_aborted() && !guard.output_delivery.is_delivered() {
+              return Ok(DeliveryCompletion::Retry);
             }
-            callback.call(frame)?;
+            guard.flushes.begin_output_delivery(flush_id);
+            if abort.is_aborted() {
+              Vec::new()
+            } else {
+              std::mem::take(&mut guard.pending_frames)
+            }
+          };
+
+          // Call output callback for each frame synchronously
+          // If callback calls reset(), abort will be set before next iteration
+          let mut recovered = Vec::new();
+          let callback_result = (|| -> Result<()> {
+            let callback = output_callback_ref.borrow_back(env)?;
+            let mut frames = frames.into_iter();
+            while let Some(frame) = frames.next() {
+              // Check abort flag before each callback - exit early if reset() was called
+              if abort.is_aborted() {
+                break;
+              }
+              if let Err(error) = callback.call(frame) {
+                if !abort.is_aborted() {
+                  recovered = frames.collect();
+                }
+                return Err(error);
+              }
+            }
+            Ok(())
+          })();
+
+          // Always release this operation, including when the JS callback throws.
+          {
+            let mut guard = inner
+              .lock()
+              .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
+            if !recovered.is_empty() {
+              let recovered = recovered.into_iter().map(buffered_output).collect();
+              guard.epoch.recover_flush_outputs(
+                &guard.output_callback,
+                guard.generation,
+                recovered,
+                &guard.output_delivery,
+              );
+            }
+            guard.flushes.finish(flush_id);
           }
-          Ok(())
-        })();
+          callback_result?;
 
-        // Always release this operation, including when the JS callback throws.
-        {
-          let mut guard = inner
-            .lock()
-            .map_err(|_| Error::new(Status::GenericFailure, "Lock poisoned"))?;
-          guard.flushes.finish(flush_id);
-        }
-        callback_result?;
+          // Check abort flag after draining all frames
+          // close()/reset() abort the flush; an error that closed the codec fails it
+          if abort.is_aborted() {
+            let (name, message) = abort.rejection();
+            return Err(native_dom_exception_rejection_error(env, name, message)?);
+          }
 
-        // Check abort flag after draining all frames
-        // close()/reset() abort the flush; an error that closed the codec fails it
-        if abort.is_aborted() {
-          let (name, message) = abort.rejection();
-          return Err(native_dom_exception_rejection_error(env, name, message)?);
-        }
-
-        // Worker errors carry their DOMException name as a message prefix
-        match result {
-          Ok(()) => Ok(()),
-          Err(error) => Err(dom_exception_rejection_error(env, error)?),
-        }
+          // Worker errors carry their DOMException name as a message prefix
+          let result = result
+            .take()
+            .expect("flush result consumed only on final completion");
+          match result {
+            Ok(()) => Ok(DeliveryCompletion::Complete),
+            Err(error) => Err(dom_exception_rejection_error(env, error)?),
+          }
+        })
       },
     )
   }
