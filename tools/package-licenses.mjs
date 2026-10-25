@@ -107,8 +107,10 @@ if (check) {
         shell: process.platform === 'win32',
       }),
     )
-    assert.equal(packed.length, 1, `Unexpected npm pack result for ${name}`)
-    const files = new Set(packed[0].files.map((file) => file.path))
+    // npm 11 returns an array; npm 12 returns an object keyed by package name.
+    const packedPackages = Array.isArray(packed) ? packed : Object.values(packed)
+    assert.equal(packedPackages.length, 1, `Unexpected npm pack result for ${name}`)
+    const files = new Set(packedPackages[0].files.map((file) => file.path))
     for (const file of [...requiredFiles, ...(binary ? [binary] : [])]) {
       assert(files.has(file), `${name}: npm pack excludes ${file}`)
     }
