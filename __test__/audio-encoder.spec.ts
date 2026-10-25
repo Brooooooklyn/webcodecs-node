@@ -588,8 +588,11 @@ test('AudioEncoder: AAC timestamp overflow preserves valid output and rejects fl
     });
   `
 
+  const env = { ...process.env }
+  delete env.WEBCODECS_LOG
   const output = execFileSync(process.execPath, ['-e', script], {
     cwd: process.cwd(),
+    env,
     encoding: 'utf8',
     timeout: 5000,
   })

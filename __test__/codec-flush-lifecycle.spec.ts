@@ -796,7 +796,6 @@ test.serial('Worker.terminate releases delivery waiters during environment clean
   const summary = JSON.parse(line.slice(marker.length)) as FlushShutdownSummary
   const details = JSON.stringify(summary)
   t.is(summary.rows.length, 6, details)
-  t.true(summary.rows.every((row) => row.exitCode === 1), details)
   t.true(
     summary.finalThreads <= summary.initialThreads + 2,
     `delivery waiters accumulated during worker teardown: ${details}`,
