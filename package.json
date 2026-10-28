@@ -85,7 +85,7 @@
     "lint-staged": "^17.5.1",
     "mediabunny": "1.62.1",
     "npm-run-all2": "^9.0.3",
-    "oxfmt": "^0.74.0",
+    "oxfmt": "^0.75.0",
     "oxlint": "^1.83.0",
     "oxlint-tsgolint": "^7.0.2001",
     "prettier": "^3.9.6",
