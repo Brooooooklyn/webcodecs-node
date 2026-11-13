@@ -4,11 +4,23 @@ const { AudioData, AudioDecoder, AudioEncoder, EncodedAudioChunk } = require('..
 
 const ITERATIONS = Number(process.env.FLUSH_ATOMICITY_ITERATIONS || 2000)
 const SUMMARY_MARKER = 'FLUSH_ATOMICITY_SUMMARY '
+const FLUSH_TIMEOUT_MS = 5000
+const ERROR_TIMEOUT_MS = 5000
 const AUDIO_CONFIG = {
   codec: 'mp4a.40.2',
   sampleRate: 48000,
   numberOfChannels: 2,
   bitrate: 128000,
+}
+
+function waitWithTimeout(promise, timeoutMs, message) {
+  let timer
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs)
+    }),
+  ]).finally(() => clearTimeout(timer))
 }
 
 function audioInput(index) {
@@ -87,6 +99,14 @@ async function runOnce(iteration, chunks, decoderConfig, expected) {
   let outputsAfterError = 0
   let atSettle = -1
   let settlement = 'pending'
+  let notifyError
+  // Resolve from error() so we wait for the callback itself, not a sleep that
+  // close() can outrun. Flush does not wait for this configure-error tail:
+  // send_error is a later ThreadsafeFunction wakeup, and close() advances the
+  // epoch which drops an undelivered Work error (Chrome-compatible).
+  const errorSeen = new Promise((resolve) => {
+    notifyError = resolve
+  })
   const decoder = new AudioDecoder({
     output(data) {
       if (errors > 0) outputsAfterError++
@@ -96,6 +116,7 @@ async function runOnce(iteration, chunks, decoderConfig, expected) {
     error() {
       errors++
       outputsAtError = outputs
+      notifyError()
     },
   })
   decoder.configure(decoderConfig)
@@ -115,23 +136,20 @@ async function runOnce(iteration, chunks, decoderConfig, expected) {
     },
   )
 
-  let timer
   try {
-    await Promise.race([
-      observed,
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`flush timeout at iteration ${iteration}`)), 5000)
-      }),
-    ])
+    await waitWithTimeout(observed, FLUSH_TIMEOUT_MS, `flush timeout at iteration ${iteration}`)
+    await waitWithTimeout(
+      errorSeen,
+      ERROR_TIMEOUT_MS,
+      `error callback timeout at iteration ${iteration}`,
+    )
   } finally {
-    clearTimeout(timer)
+    try {
+      decoder.close()
+    } catch {}
   }
 
-  const deadline = Date.now() + 100
-  while ((outputs < expected || errors < 1) && Date.now() < deadline) {
-    await new Promise((resolve) => setImmediate(resolve))
-  }
-  const result = {
+  return {
     iteration,
     settlement,
     atSettle,
@@ -139,10 +157,6 @@ async function runOnce(iteration, chunks, decoderConfig, expected) {
     errors,
     ordered: errors === 1 && outputsAtError === expected && outputsAfterError === 0,
   }
-  try {
-    decoder.close()
-  } catch {}
-  return result
 }
 
 async function main() {
