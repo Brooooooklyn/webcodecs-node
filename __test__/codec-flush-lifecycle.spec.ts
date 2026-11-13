@@ -715,7 +715,9 @@ function runFlushAtomicityProbe(): FlushAtomicityResult {
 
 // This is a bounded stress regression, not a deterministic schedule. Native
 // tracing widens the locked reconfigure window that used to let flush settle
-// between its optimistic delivery check and the pending-output drain.
+// between its optimistic delivery check and the pending-output drain. The
+// probe waits for the configure-error callback itself before close(); a fixed
+// sleep here used to drop that callback on slow Windows runners.
 test('flush rechecks delivery under the codec lock before worker-error migration drains outputs', (t) => {
   const { code, signal, summary } = runFlushAtomicityProbe()
   const details = JSON.stringify(summary)
